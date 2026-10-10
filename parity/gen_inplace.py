@@ -121,7 +121,12 @@ for torch, d in sigs.items():
         emitted.add(key)
         # call of the out-of-place op with the snapshot `x` in self's position
         call_args = [pname(p) for p in o['plist']]
-        call_args[o['self']] = 'x'
+        # An operand that IS the target (a.addcmul_(a, a)) must read the snapshot too: the target itself is about to be
+        # overwritten and to become the write's output, so recording it as an input would put a cycle in the graph.
+        for j, p in enumerate(o['plist']):
+            if j != o['self'] and ptype(p) == ptype(o['plist'][o['self']]):
+                call_args[j] = f'ReferenceEquals({pname(p)}, {self_name}) ? snapshot : {pname(p)}'
+        call_args[o['self']] = 'snapshot'
         others = [pname(p) for p in plist if ptype(p) == f'Tensor<{elem}>']
         others_arg = (', ' + ', '.join(others)) if others else ''
         decls.append(
@@ -143,7 +148,7 @@ for torch, d in sigs.items():
             f'    public virtual {unsafe_kw}void {name}{gen}({sig_params})\n'
             f'    {{\n'
             f'{fast}'
-            f'        ApplyInPlace({self_name}, "{name}", (e, x) => e.{base}({lam_args}){others_arg});\n'
+            f'        ApplyInPlace({self_name}, "{name}", (e, snapshot) => e.{base}({lam_args}){others_arg});\n'
             f'    }}\n')
     for cat in d['cats']:
         coverage[f'{cat}:{torch}'] = sorted(syms)[0]

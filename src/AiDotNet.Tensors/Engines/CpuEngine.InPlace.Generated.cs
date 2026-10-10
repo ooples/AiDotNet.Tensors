@@ -9,754 +9,754 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual void TensorAbsInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorAbsInPlace", (e, x) => e.TensorAbs(x));
+        ApplyInPlace(tensor, "TensorAbsInPlace", (e, snapshot) => e.TensorAbs(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorAcosInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Math.Acos)) return;
-        ApplyInPlace(tensor, "TensorAcosInPlace", (e, x) => e.TensorAcos(x));
+        ApplyInPlace(tensor, "TensorAcosInPlace", (e, snapshot) => e.TensorAcos(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorAcoshInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, AcoshScalar)) return;
-        ApplyInPlace(tensor, "TensorAcoshInPlace", (e, x) => e.TensorAcosh(x));
+        ApplyInPlace(tensor, "TensorAcoshInPlace", (e, snapshot) => e.TensorAcosh(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorAddbmmInPlace<T>(Tensor<T> input, Tensor<T> batch1, Tensor<T> batch2, double beta = 1, double alpha = 1)
     {
-        ApplyInPlace(input, "TensorAddbmmInPlace", (e, x) => e.TensorAddbmm(x, batch1, batch2, beta, alpha), batch1, batch2);
+        ApplyInPlace(input, "TensorAddbmmInPlace", (e, snapshot) => e.TensorAddbmm(snapshot, ReferenceEquals(batch1, input) ? snapshot : batch1, ReferenceEquals(batch2, input) ? snapshot : batch2, beta, alpha), batch1, batch2);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAddcdivInPlace<T>(Tensor<T> input, Tensor<T> tensor1, Tensor<T> tensor2, double value = 1)
     {
-        ApplyInPlace(input, "TensorAddcdivInPlace", (e, x) => e.TensorAddcdiv(x, tensor1, tensor2, value), tensor1, tensor2);
+        ApplyInPlace(input, "TensorAddcdivInPlace", (e, snapshot) => e.TensorAddcdiv(snapshot, ReferenceEquals(tensor1, input) ? snapshot : tensor1, ReferenceEquals(tensor2, input) ? snapshot : tensor2, value), tensor1, tensor2);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAddcmulInPlace<T>(Tensor<T> input, Tensor<T> tensor1, Tensor<T> tensor2, double value = 1)
     {
-        ApplyInPlace(input, "TensorAddcmulInPlace", (e, x) => e.TensorAddcmul(x, tensor1, tensor2, value), tensor1, tensor2);
+        ApplyInPlace(input, "TensorAddcmulInPlace", (e, snapshot) => e.TensorAddcmul(snapshot, ReferenceEquals(tensor1, input) ? snapshot : tensor1, ReferenceEquals(tensor2, input) ? snapshot : tensor2, value), tensor1, tensor2);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAddMMInPlace<T>(Tensor<T> input, Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(input, "TensorAddMMInPlace", (e, x) => e.TensorAddMM(x, a, b), a, b);
+        ApplyInPlace(input, "TensorAddMMInPlace", (e, snapshot) => e.TensorAddMM(snapshot, ReferenceEquals(a, input) ? snapshot : a, ReferenceEquals(b, input) ? snapshot : b), a, b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAddMMInPlace<T>(Tensor<T> input, Tensor<T> a, Tensor<T> b, T alpha, T beta)
     {
-        ApplyInPlace(input, "TensorAddMMInPlace", (e, x) => e.TensorAddMM(x, a, b, alpha, beta), a, b);
+        ApplyInPlace(input, "TensorAddMMInPlace", (e, snapshot) => e.TensorAddMM(snapshot, ReferenceEquals(a, input) ? snapshot : a, ReferenceEquals(b, input) ? snapshot : b, alpha, beta), a, b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAddmvInPlace<T>(Tensor<T> input, Tensor<T> mat, Tensor<T> vec, double beta = 1, double alpha = 1)
     {
-        ApplyInPlace(input, "TensorAddmvInPlace", (e, x) => e.TensorAddmv(x, mat, vec, beta, alpha), mat, vec);
+        ApplyInPlace(input, "TensorAddmvInPlace", (e, snapshot) => e.TensorAddmv(snapshot, ReferenceEquals(mat, input) ? snapshot : mat, ReferenceEquals(vec, input) ? snapshot : vec, beta, alpha), mat, vec);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAddrInPlace<T>(Tensor<T> input, Tensor<T> vec1, Tensor<T> vec2, double beta = 1, double alpha = 1)
     {
-        ApplyInPlace(input, "TensorAddrInPlace", (e, x) => e.TensorAddr(x, vec1, vec2, beta, alpha), vec1, vec2);
+        ApplyInPlace(input, "TensorAddrInPlace", (e, snapshot) => e.TensorAddr(snapshot, ReferenceEquals(vec1, input) ? snapshot : vec1, ReferenceEquals(vec2, input) ? snapshot : vec2, beta, alpha), vec1, vec2);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAlphaDropoutInPlace<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
     {
-        ApplyInPlace(tensor, "TensorAlphaDropoutInPlace", (e, x) => e.TensorAlphaDropout(x, p, training, seed));
+        ApplyInPlace(tensor, "TensorAlphaDropoutInPlace", (e, snapshot) => e.TensorAlphaDropout(snapshot, p, training, seed));
     }
 
     /// <inheritdoc/>
     public virtual void TensorAsinInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Math.Asin)) return;
-        ApplyInPlace(tensor, "TensorAsinInPlace", (e, x) => e.TensorAsin(x));
+        ApplyInPlace(tensor, "TensorAsinInPlace", (e, snapshot) => e.TensorAsin(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorAsinhInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, AsinhScalar)) return;
-        ApplyInPlace(tensor, "TensorAsinhInPlace", (e, x) => e.TensorAsinh(x));
+        ApplyInPlace(tensor, "TensorAsinhInPlace", (e, snapshot) => e.TensorAsinh(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorAtan2InPlace<T>(Tensor<T> y, Tensor<T> x)
     {
-        ApplyInPlace(y, "TensorAtan2InPlace", (e, x) => e.TensorAtan2(x, x), x);
+        ApplyInPlace(y, "TensorAtan2InPlace", (e, snapshot) => e.TensorAtan2(snapshot, ReferenceEquals(x, y) ? snapshot : x), x);
     }
 
     /// <inheritdoc/>
     public virtual void TensorAtanInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Math.Atan)) return;
-        ApplyInPlace(tensor, "TensorAtanInPlace", (e, x) => e.TensorAtan(x));
+        ApplyInPlace(tensor, "TensorAtanInPlace", (e, snapshot) => e.TensorAtan(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorAtanhInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, AtanhScalar)) return;
-        ApplyInPlace(tensor, "TensorAtanhInPlace", (e, x) => e.TensorAtanh(x));
+        ApplyInPlace(tensor, "TensorAtanhInPlace", (e, snapshot) => e.TensorAtanh(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorBaddbmmInPlace<T>(Tensor<T> input, Tensor<T> batch1, Tensor<T> batch2, double beta = 1, double alpha = 1)
     {
-        ApplyInPlace(input, "TensorBaddbmmInPlace", (e, x) => e.TensorBaddbmm(x, batch1, batch2, beta, alpha), batch1, batch2);
+        ApplyInPlace(input, "TensorBaddbmmInPlace", (e, snapshot) => e.TensorBaddbmm(snapshot, ReferenceEquals(batch1, input) ? snapshot : batch1, ReferenceEquals(batch2, input) ? snapshot : batch2, beta, alpha), batch1, batch2);
     }
 
     /// <inheritdoc/>
     public virtual void TensorBitwiseAndInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorBitwiseAndInPlace", (e, x) => e.TensorBitwiseAnd(x, b), b);
+        ApplyInPlace(a, "TensorBitwiseAndInPlace", (e, snapshot) => e.TensorBitwiseAnd(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorBitwiseLeftShiftInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorBitwiseLeftShiftInPlace", (e, x) => e.TensorBitwiseLeftShift(x, b), b);
+        ApplyInPlace(a, "TensorBitwiseLeftShiftInPlace", (e, snapshot) => e.TensorBitwiseLeftShift(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorBitwiseNotInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorBitwiseNotInPlace", (e, x) => e.TensorBitwiseNot(x));
+        ApplyInPlace(tensor, "TensorBitwiseNotInPlace", (e, snapshot) => e.TensorBitwiseNot(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorBitwiseOrInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorBitwiseOrInPlace", (e, x) => e.TensorBitwiseOr(x, b), b);
+        ApplyInPlace(a, "TensorBitwiseOrInPlace", (e, snapshot) => e.TensorBitwiseOr(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorBitwiseRightShiftInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorBitwiseRightShiftInPlace", (e, x) => e.TensorBitwiseRightShift(x, b), b);
+        ApplyInPlace(a, "TensorBitwiseRightShiftInPlace", (e, snapshot) => e.TensorBitwiseRightShift(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorBitwiseXorInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorBitwiseXorInPlace", (e, x) => e.TensorBitwiseXor(x, b), b);
+        ApplyInPlace(a, "TensorBitwiseXorInPlace", (e, snapshot) => e.TensorBitwiseXor(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual unsafe void TensorCeilingInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, null, static (s, d, n) => Simd.SimdKernels.CeilingUnsafe(s, d, n), static (s, d, n) => Simd.SimdKernels.CeilingUnsafe(s, d, n))) return;
-        ApplyInPlace(tensor, "TensorCeilingInPlace", (e, x) => e.TensorCeiling(x));
+        ApplyInPlace(tensor, "TensorCeilingInPlace", (e, snapshot) => e.TensorCeiling(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorCeluInPlace<T>(Tensor<T> tensor, double alpha = 1.0)
     {
-        ApplyInPlace(tensor, "TensorCeluInPlace", (e, x) => e.TensorCelu(x, alpha));
+        ApplyInPlace(tensor, "TensorCeluInPlace", (e, snapshot) => e.TensorCelu(snapshot, alpha));
     }
 
     /// <inheritdoc/>
     public virtual void TensorClampInPlace<T>(Tensor<T> tensor, T min, T max)
     {
-        ApplyInPlace(tensor, "TensorClampInPlace", (e, x) => e.TensorClamp(x, min, max));
+        ApplyInPlace(tensor, "TensorClampInPlace", (e, snapshot) => e.TensorClamp(snapshot, min, max));
     }
 
     /// <inheritdoc/>
     public virtual void TensorClampMaxInPlace<T>(Tensor<T> tensor, T max)
     {
-        ApplyInPlace(tensor, "TensorClampMaxInPlace", (e, x) => e.TensorClampMax(x, max));
+        ApplyInPlace(tensor, "TensorClampMaxInPlace", (e, snapshot) => e.TensorClampMax(snapshot, max));
     }
 
     /// <inheritdoc/>
     public virtual void TensorClampMinInPlace<T>(Tensor<T> tensor, T min)
     {
-        ApplyInPlace(tensor, "TensorClampMinInPlace", (e, x) => e.TensorClampMin(x, min));
+        ApplyInPlace(tensor, "TensorClampMinInPlace", (e, snapshot) => e.TensorClampMin(snapshot, min));
     }
 
     /// <inheritdoc/>
     public virtual void TensorClipInPlace<T>(Tensor<T> tensor, T minValue, T maxValue)
     {
-        ApplyInPlace(tensor, "TensorClipInPlace", (e, x) => e.TensorClip(x, minValue, maxValue));
+        ApplyInPlace(tensor, "TensorClipInPlace", (e, snapshot) => e.TensorClip(snapshot, minValue, maxValue));
     }
 
     /// <inheritdoc/>
     public virtual void TensorComplexConjugateInPlace<T>(Tensor<T> a)
     {
-        ApplyInPlace(a, "TensorComplexConjugateInPlace", (e, x) => e.TensorComplexConjugate(x));
+        ApplyInPlace(a, "TensorComplexConjugateInPlace", (e, snapshot) => e.TensorComplexConjugate(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorCopysignInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorCopysignInPlace", (e, x) => e.TensorCopysign(x, b), b);
+        ApplyInPlace(a, "TensorCopysignInPlace", (e, snapshot) => e.TensorCopysign(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorCosInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorCosInPlace", (e, x) => e.TensorCos(x));
+        ApplyInPlace(tensor, "TensorCosInPlace", (e, snapshot) => e.TensorCos(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorCoshInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorCoshInPlace", (e, x) => e.TensorCosh(x));
+        ApplyInPlace(tensor, "TensorCoshInPlace", (e, snapshot) => e.TensorCosh(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorCumProdInPlace<T>(Tensor<T> tensor, int axis)
     {
-        ApplyInPlace(tensor, "TensorCumProdInPlace", (e, x) => e.TensorCumProd(x, axis));
+        ApplyInPlace(tensor, "TensorCumProdInPlace", (e, snapshot) => e.TensorCumProd(snapshot, axis));
     }
 
     /// <inheritdoc/>
     public virtual void TensorCumSumInPlace<T>(Tensor<T> tensor, int axis)
     {
-        ApplyInPlace(tensor, "TensorCumSumInPlace", (e, x) => e.TensorCumSum(x, axis));
+        ApplyInPlace(tensor, "TensorCumSumInPlace", (e, snapshot) => e.TensorCumSum(snapshot, axis));
     }
 
     /// <inheritdoc/>
     public virtual void TensorDeg2RadInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorDeg2RadInPlace", (e, x) => e.TensorDeg2Rad(x));
+        ApplyInPlace(tensor, "TensorDeg2RadInPlace", (e, snapshot) => e.TensorDeg2Rad(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorDigammaInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorDigammaInPlace", (e, x) => e.TensorDigamma(x));
+        ApplyInPlace(tensor, "TensorDigammaInPlace", (e, snapshot) => e.TensorDigamma(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void ELUInPlace<T>(Tensor<T> tensor, double alpha = 1.0)
     {
-        ApplyInPlace(tensor, "ELUInPlace", (e, x) => e.ELU(x, alpha));
+        ApplyInPlace(tensor, "ELUInPlace", (e, snapshot) => e.ELU(snapshot, alpha));
     }
 
     /// <inheritdoc/>
     public virtual void TensorEqualsInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorEqualsInPlace", (e, x) => e.TensorEquals(x, b), b);
+        ApplyInPlace(a, "TensorEqualsInPlace", (e, snapshot) => e.TensorEquals(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorEqualsInPlace<T>(Tensor<T> tensor, T value)
     {
-        ApplyInPlace(tensor, "TensorEqualsInPlace", (e, x) => e.TensorEquals(x, value));
+        ApplyInPlace(tensor, "TensorEqualsInPlace", (e, snapshot) => e.TensorEquals(snapshot, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorErfInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorErfInPlace", (e, x) => e.TensorErf(x));
+        ApplyInPlace(tensor, "TensorErfInPlace", (e, snapshot) => e.TensorErf(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorErfcInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorErfcInPlace", (e, x) => e.TensorErfc(x));
+        ApplyInPlace(tensor, "TensorErfcInPlace", (e, snapshot) => e.TensorErfc(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorErfinvInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorErfinvInPlace", (e, x) => e.TensorErfinv(x));
+        ApplyInPlace(tensor, "TensorErfinvInPlace", (e, snapshot) => e.TensorErfinv(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorExp2InPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, x => Math.Pow(2.0, x))) return;
-        ApplyInPlace(tensor, "TensorExp2InPlace", (e, x) => e.TensorExp2(x));
+        ApplyInPlace(tensor, "TensorExp2InPlace", (e, snapshot) => e.TensorExp2(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorExpInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorExpInPlace", (e, x) => e.TensorExp(x));
+        ApplyInPlace(tensor, "TensorExpInPlace", (e, snapshot) => e.TensorExp(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorExpm1InPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Expm1Scalar)) return;
-        ApplyInPlace(tensor, "TensorExpm1InPlace", (e, x) => e.TensorExpm1(x));
+        ApplyInPlace(tensor, "TensorExpm1InPlace", (e, snapshot) => e.TensorExpm1(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorFeatureAlphaDropoutInPlace<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
     {
-        ApplyInPlace(tensor, "TensorFeatureAlphaDropoutInPlace", (e, x) => e.TensorFeatureAlphaDropout(x, p, training, seed));
+        ApplyInPlace(tensor, "TensorFeatureAlphaDropoutInPlace", (e, snapshot) => e.TensorFeatureAlphaDropout(snapshot, p, training, seed));
     }
 
     /// <inheritdoc/>
     public virtual void TensorChannelDropoutInPlace<T>(Tensor<T> tensor, double p, bool training, int spatialDims, int? seed = null)
     {
-        ApplyInPlace(tensor, "TensorChannelDropoutInPlace", (e, x) => e.TensorChannelDropout(x, p, training, spatialDims, seed));
+        ApplyInPlace(tensor, "TensorChannelDropoutInPlace", (e, snapshot) => e.TensorChannelDropout(snapshot, p, training, spatialDims, seed));
     }
 
     /// <inheritdoc/>
     public virtual void TensorTruncInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Math.Truncate)) return;
-        ApplyInPlace(tensor, "TensorTruncInPlace", (e, x) => e.TensorTrunc(x));
+        ApplyInPlace(tensor, "TensorTruncInPlace", (e, snapshot) => e.TensorTrunc(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorFloatPowerInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorFloatPowerInPlace", (e, x) => e.TensorFloatPower(x, b), b);
+        ApplyInPlace(a, "TensorFloatPowerInPlace", (e, snapshot) => e.TensorFloatPower(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual unsafe void TensorFloorInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, null, static (s, d, n) => Simd.SimdKernels.FloorUnsafe(s, d, n), static (s, d, n) => Simd.SimdKernels.FloorUnsafe(s, d, n))) return;
-        ApplyInPlace(tensor, "TensorFloorInPlace", (e, x) => e.TensorFloor(x));
+        ApplyInPlace(tensor, "TensorFloorInPlace", (e, snapshot) => e.TensorFloor(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorFloorDivideInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorFloorDivideInPlace", (e, x) => e.TensorFloorDivide(x, b), b);
+        ApplyInPlace(a, "TensorFloorDivideInPlace", (e, snapshot) => e.TensorFloorDivide(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorFmodInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorFmodInPlace", (e, x) => e.TensorFmod(x, b), b);
+        ApplyInPlace(a, "TensorFmodInPlace", (e, snapshot) => e.TensorFmod(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorFracInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorFracInPlace", (e, x) => e.TensorFrac(x));
+        ApplyInPlace(tensor, "TensorFracInPlace", (e, snapshot) => e.TensorFrac(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorGcdInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorGcdInPlace", (e, x) => e.TensorGcd(x, b), b);
+        ApplyInPlace(a, "TensorGcdInPlace", (e, snapshot) => e.TensorGcd(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorGreaterEqualInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorGreaterEqualInPlace", (e, x) => e.TensorGreaterEqual(x, b), b);
+        ApplyInPlace(a, "TensorGreaterEqualInPlace", (e, snapshot) => e.TensorGreaterEqual(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorGreaterThanInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorGreaterThanInPlace", (e, x) => e.TensorGreaterThan(x, b), b);
+        ApplyInPlace(a, "TensorGreaterThanInPlace", (e, snapshot) => e.TensorGreaterThan(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorGreaterThanInPlace<T>(Tensor<T> tensor, T value)
     {
-        ApplyInPlace(tensor, "TensorGreaterThanInPlace", (e, x) => e.TensorGreaterThan(x, value));
+        ApplyInPlace(tensor, "TensorGreaterThanInPlace", (e, snapshot) => e.TensorGreaterThan(snapshot, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorHardSigmoidInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorHardSigmoidInPlace", (e, x) => e.TensorHardSigmoid(x));
+        ApplyInPlace(tensor, "TensorHardSigmoidInPlace", (e, snapshot) => e.TensorHardSigmoid(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void HardSwishInPlace<T>(Tensor<T> input)
     {
-        ApplyInPlace(input, "HardSwishInPlace", (e, x) => e.HardSwish(x));
+        ApplyInPlace(input, "HardSwishInPlace", (e, snapshot) => e.HardSwish(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorHardtanhInPlace<T>(Tensor<T> tensor, double minValue = -1.0, double maxValue = 1.0)
     {
-        ApplyInPlace(tensor, "TensorHardtanhInPlace", (e, x) => e.TensorHardtanh(x, minValue, maxValue));
+        ApplyInPlace(tensor, "TensorHardtanhInPlace", (e, snapshot) => e.TensorHardtanh(snapshot, minValue, maxValue));
     }
 
     /// <inheritdoc/>
     public virtual void TensorHeavisideInPlace<T>(Tensor<T> tensor, Tensor<T> values)
     {
-        ApplyInPlace(tensor, "TensorHeavisideInPlace", (e, x) => e.TensorHeaviside(x, values), values);
+        ApplyInPlace(tensor, "TensorHeavisideInPlace", (e, snapshot) => e.TensorHeaviside(snapshot, ReferenceEquals(values, tensor) ? snapshot : values), values);
     }
 
     /// <inheritdoc/>
     public virtual void TensorHypotInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorHypotInPlace", (e, x) => e.TensorHypot(x, b), b);
+        ApplyInPlace(a, "TensorHypotInPlace", (e, snapshot) => e.TensorHypot(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorI0InPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorI0InPlace", (e, x) => e.TensorI0(x));
+        ApplyInPlace(tensor, "TensorI0InPlace", (e, snapshot) => e.TensorI0(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorIgammaInPlace<T>(Tensor<T> a, Tensor<T> x)
     {
-        ApplyInPlace(a, "TensorIgammaInPlace", (e, x) => e.TensorIgamma(x, x), x);
+        ApplyInPlace(a, "TensorIgammaInPlace", (e, snapshot) => e.TensorIgamma(snapshot, ReferenceEquals(x, a) ? snapshot : x), x);
     }
 
     /// <inheritdoc/>
     public virtual void TensorIgammacInPlace<T>(Tensor<T> a, Tensor<T> x)
     {
-        ApplyInPlace(a, "TensorIgammacInPlace", (e, x) => e.TensorIgammac(x, x), x);
+        ApplyInPlace(a, "TensorIgammacInPlace", (e, snapshot) => e.TensorIgammac(snapshot, ReferenceEquals(x, a) ? snapshot : x), x);
     }
 
     /// <inheritdoc/>
     public virtual void TensorIndexAddInPlace<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
     {
-        ApplyInPlace(tensor, "TensorIndexAddInPlace", (e, x) => e.TensorIndexAdd(x, axis, indices, source), source);
+        ApplyInPlace(tensor, "TensorIndexAddInPlace", (e, snapshot) => e.TensorIndexAdd(snapshot, axis, indices, ReferenceEquals(source, tensor) ? snapshot : source), source);
     }
 
     /// <inheritdoc/>
     public virtual void TensorIndexCopyInPlace<T>(Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
     {
-        ApplyInPlace(tensor, "TensorIndexCopyInPlace", (e, x) => e.TensorIndexCopy(x, axis, indices, source), source);
+        ApplyInPlace(tensor, "TensorIndexCopyInPlace", (e, snapshot) => e.TensorIndexCopy(snapshot, axis, indices, ReferenceEquals(source, tensor) ? snapshot : source), source);
     }
 
     /// <inheritdoc/>
     public virtual void TensorIndexFillInPlace<T>(Tensor<T> tensor, int axis, Tensor<int> indices, T value)
     {
-        ApplyInPlace(tensor, "TensorIndexFillInPlace", (e, x) => e.TensorIndexFill(x, axis, indices, value));
+        ApplyInPlace(tensor, "TensorIndexFillInPlace", (e, snapshot) => e.TensorIndexFill(snapshot, axis, indices, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorIndexPutInPlace<T>(Tensor<T> tensor, Tensor<int>[] indices, Tensor<T> source, bool accumulate = false)
     {
-        ApplyInPlace(tensor, "TensorIndexPutInPlace", (e, x) => e.TensorIndexPut(x, indices, source, accumulate), source);
+        ApplyInPlace(tensor, "TensorIndexPutInPlace", (e, snapshot) => e.TensorIndexPut(snapshot, indices, ReferenceEquals(source, tensor) ? snapshot : source, accumulate), source);
     }
 
     /// <inheritdoc/>
     public virtual void TensorIndexReduceInPlace<T>(Tensor<T> tensor, int dim, Tensor<int> index, Tensor<T> source, ScatterReduceMode reduce, bool includeSelf = true)
     {
-        ApplyInPlace(tensor, "TensorIndexReduceInPlace", (e, x) => e.TensorIndexReduce(x, dim, index, source, reduce, includeSelf), source);
+        ApplyInPlace(tensor, "TensorIndexReduceInPlace", (e, snapshot) => e.TensorIndexReduce(snapshot, dim, index, ReferenceEquals(source, tensor) ? snapshot : source, reduce, includeSelf), source);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLcmInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorLcmInPlace", (e, x) => e.TensorLcm(x, b), b);
+        ApplyInPlace(a, "TensorLcmInPlace", (e, snapshot) => e.TensorLcm(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLdexpInPlace<T>(Tensor<T> x, Tensor<int> exp)
     {
-        ApplyInPlace(x, "TensorLdexpInPlace", (e, x) => e.TensorLdexp(x, exp));
+        ApplyInPlace(x, "TensorLdexpInPlace", (e, snapshot) => e.TensorLdexp(snapshot, exp));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLessEqualInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorLessEqualInPlace", (e, x) => e.TensorLessEqual(x, b), b);
+        ApplyInPlace(a, "TensorLessEqualInPlace", (e, snapshot) => e.TensorLessEqual(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLerpInPlace<T>(Tensor<T> a, Tensor<T> b, T t)
     {
-        ApplyInPlace(a, "TensorLerpInPlace", (e, x) => e.TensorLerp(x, b, t), b);
+        ApplyInPlace(a, "TensorLerpInPlace", (e, snapshot) => e.TensorLerp(snapshot, ReferenceEquals(b, a) ? snapshot : b, t), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLessThanInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorLessThanInPlace", (e, x) => e.TensorLessThan(x, b), b);
+        ApplyInPlace(a, "TensorLessThanInPlace", (e, snapshot) => e.TensorLessThan(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLessThanInPlace<T>(Tensor<T> tensor, T value)
     {
-        ApplyInPlace(tensor, "TensorLessThanInPlace", (e, x) => e.TensorLessThan(x, value));
+        ApplyInPlace(tensor, "TensorLessThanInPlace", (e, snapshot) => e.TensorLessThan(snapshot, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLgammaInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorLgammaInPlace", (e, x) => e.TensorLgamma(x));
+        ApplyInPlace(tensor, "TensorLgammaInPlace", (e, snapshot) => e.TensorLgamma(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLog10InPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Math.Log10)) return;
-        ApplyInPlace(tensor, "TensorLog10InPlace", (e, x) => e.TensorLog10(x));
+        ApplyInPlace(tensor, "TensorLog10InPlace", (e, snapshot) => e.TensorLog10(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLog1pInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Log1pScalar)) return;
-        ApplyInPlace(tensor, "TensorLog1pInPlace", (e, x) => e.TensorLog1p(x));
+        ApplyInPlace(tensor, "TensorLog1pInPlace", (e, snapshot) => e.TensorLog1p(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLog2InPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Log2Scalar)) return;
-        ApplyInPlace(tensor, "TensorLog2InPlace", (e, x) => e.TensorLog2(x));
+        ApplyInPlace(tensor, "TensorLog2InPlace", (e, snapshot) => e.TensorLog2(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLogInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorLogInPlace", (e, x) => e.TensorLog(x));
+        ApplyInPlace(tensor, "TensorLogInPlace", (e, snapshot) => e.TensorLog(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLogicalAndInPlace(Tensor<Bit> a, Tensor<Bit> b)
     {
-        ApplyInPlace(a, "TensorLogicalAndInPlace", (e, x) => e.TensorLogicalAnd(x, b), b);
+        ApplyInPlace(a, "TensorLogicalAndInPlace", (e, snapshot) => e.TensorLogicalAnd(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLogicalNotInPlace(Tensor<Bit> a)
     {
-        ApplyInPlace(a, "TensorLogicalNotInPlace", (e, x) => e.TensorLogicalNot(x));
+        ApplyInPlace(a, "TensorLogicalNotInPlace", (e, snapshot) => e.TensorLogicalNot(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorLogicalOrInPlace(Tensor<Bit> a, Tensor<Bit> b)
     {
-        ApplyInPlace(a, "TensorLogicalOrInPlace", (e, x) => e.TensorLogicalOr(x, b), b);
+        ApplyInPlace(a, "TensorLogicalOrInPlace", (e, snapshot) => e.TensorLogicalOr(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLogicalXorInPlace(Tensor<Bit> a, Tensor<Bit> b)
     {
-        ApplyInPlace(a, "TensorLogicalXorInPlace", (e, x) => e.TensorLogicalXor(x, b), b);
+        ApplyInPlace(a, "TensorLogicalXorInPlace", (e, snapshot) => e.TensorLogicalXor(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorLogitInPlace<T>(Tensor<T> tensor, double? eps = null)
     {
-        ApplyInPlace(tensor, "TensorLogitInPlace", (e, x) => e.TensorLogit(x, eps));
+        ApplyInPlace(tensor, "TensorLogitInPlace", (e, snapshot) => e.TensorLogit(snapshot, eps));
     }
 
     /// <inheritdoc/>
     public virtual void TensorMaskedFillInPlace<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
     {
-        ApplyInPlace(tensor, "TensorMaskedFillInPlace", (e, x) => e.TensorMaskedFill(x, mask, value));
+        ApplyInPlace(tensor, "TensorMaskedFillInPlace", (e, snapshot) => e.TensorMaskedFill(snapshot, mask, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorMaskedFillInPlace<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
     {
-        ApplyInPlace(tensor, "TensorMaskedFillInPlace", (e, x) => e.TensorMaskedFill(x, mask, value));
+        ApplyInPlace(tensor, "TensorMaskedFillInPlace", (e, snapshot) => e.TensorMaskedFill(snapshot, mask, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorMaskedFillInPlace<T>(Tensor<T> tensor, bool[] mask, T value)
     {
-        ApplyInPlace(tensor, "TensorMaskedFillInPlace", (e, x) => e.TensorMaskedFill(x, mask, value));
+        ApplyInPlace(tensor, "TensorMaskedFillInPlace", (e, snapshot) => e.TensorMaskedFill(snapshot, mask, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorMaskedScatterInPlace<T>(Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source)
     {
-        ApplyInPlace(tensor, "TensorMaskedScatterInPlace", (e, x) => e.TensorMaskedScatter(x, mask, source), source);
+        ApplyInPlace(tensor, "TensorMaskedScatterInPlace", (e, snapshot) => e.TensorMaskedScatter(snapshot, mask, ReferenceEquals(source, tensor) ? snapshot : source), source);
     }
 
     /// <inheritdoc/>
     public virtual void TensorMvlgammaInPlace<T>(Tensor<T> tensor, int p)
     {
-        ApplyInPlace(tensor, "TensorMvlgammaInPlace", (e, x) => e.TensorMvlgamma(x, p));
+        ApplyInPlace(tensor, "TensorMvlgammaInPlace", (e, snapshot) => e.TensorMvlgamma(snapshot, p));
     }
 
     /// <inheritdoc/>
     public virtual void TensorNanToNumInPlace<T>(Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null)
     {
-        ApplyInPlace(tensor, "TensorNanToNumInPlace", (e, x) => e.TensorNanToNum(x, nan, posinf, neginf));
+        ApplyInPlace(tensor, "TensorNanToNumInPlace", (e, snapshot) => e.TensorNanToNum(snapshot, nan, posinf, neginf));
     }
 
     /// <inheritdoc/>
     public virtual void TensorNotEqualsInPlace<T>(Tensor<T> tensor, T value)
     {
-        ApplyInPlace(tensor, "TensorNotEqualsInPlace", (e, x) => e.TensorNotEquals(x, value));
+        ApplyInPlace(tensor, "TensorNotEqualsInPlace", (e, snapshot) => e.TensorNotEquals(snapshot, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorNotEqualsInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorNotEqualsInPlace", (e, x) => e.TensorNotEquals(x, b), b);
+        ApplyInPlace(a, "TensorNotEqualsInPlace", (e, snapshot) => e.TensorNotEquals(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorNegateInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorNegateInPlace", (e, x) => e.TensorNegate(x));
+        ApplyInPlace(tensor, "TensorNegateInPlace", (e, snapshot) => e.TensorNegate(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorNextAfterInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorNextAfterInPlace", (e, x) => e.TensorNextAfter(x, b), b);
+        ApplyInPlace(a, "TensorNextAfterInPlace", (e, snapshot) => e.TensorNextAfter(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorPolygammaInPlace<T>(Tensor<T> tensor, int n)
     {
-        ApplyInPlace(tensor, "TensorPolygammaInPlace", (e, x) => e.TensorPolygamma(n, x));
+        ApplyInPlace(tensor, "TensorPolygammaInPlace", (e, snapshot) => e.TensorPolygamma(n, snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorPowInPlace<T>(Tensor<T> tensor, T exponent)
     {
-        ApplyInPlace(tensor, "TensorPowInPlace", (e, x) => e.TensorPow(x, exponent));
+        ApplyInPlace(tensor, "TensorPowInPlace", (e, snapshot) => e.TensorPow(snapshot, exponent));
     }
 
     /// <inheritdoc/>
     public virtual void TensorPutInPlace<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
     {
-        ApplyInPlace(tensor, "TensorPutInPlace", (e, x) => e.TensorPut(x, indices, source), source);
+        ApplyInPlace(tensor, "TensorPutInPlace", (e, snapshot) => e.TensorPut(snapshot, indices, ReferenceEquals(source, tensor) ? snapshot : source), source);
     }
 
     /// <inheritdoc/>
     public virtual void TensorRad2DegInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorRad2DegInPlace", (e, x) => e.TensorRad2Deg(x));
+        ApplyInPlace(tensor, "TensorRad2DegInPlace", (e, snapshot) => e.TensorRad2Deg(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorReciprocalInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorReciprocalInPlace", (e, x) => e.TensorReciprocal(x));
+        ApplyInPlace(tensor, "TensorReciprocalInPlace", (e, snapshot) => e.TensorReciprocal(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorRemainderInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
-        ApplyInPlace(a, "TensorRemainderInPlace", (e, x) => e.TensorRemainder(x, b), b);
+        ApplyInPlace(a, "TensorRemainderInPlace", (e, snapshot) => e.TensorRemainder(snapshot, ReferenceEquals(b, a) ? snapshot : b), b);
     }
 
     /// <inheritdoc/>
     public virtual void TensorRenormInPlace<T>(Tensor<T> tensor, double p, int dim, double maxNorm)
     {
-        ApplyInPlace(tensor, "TensorRenormInPlace", (e, x) => e.TensorRenorm(x, p, dim, maxNorm));
+        ApplyInPlace(tensor, "TensorRenormInPlace", (e, snapshot) => e.TensorRenorm(snapshot, p, dim, maxNorm));
     }
 
     /// <inheritdoc/>
     public virtual void TensorRoundInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorRoundInPlace", (e, x) => e.TensorRound(x));
+        ApplyInPlace(tensor, "TensorRoundInPlace", (e, snapshot) => e.TensorRound(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorRReLUInPlace<T>(Tensor<T> tensor, double lower = 0.125, double upper = 0.333, bool training = true, int? seed = null)
     {
-        ApplyInPlace(tensor, "TensorRReLUInPlace", (e, x) => e.TensorRReLU(x, lower, upper, training, seed));
+        ApplyInPlace(tensor, "TensorRReLUInPlace", (e, snapshot) => e.TensorRReLU(snapshot, lower, upper, training, seed));
     }
 
     /// <inheritdoc/>
     public virtual void TensorRreluInPlace<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
-        ApplyInPlace(tensor, "TensorRreluInPlace", (e, x) => e.TensorRrelu(x, lower, upper, training, seed));
+        ApplyInPlace(tensor, "TensorRreluInPlace", (e, snapshot) => e.TensorRrelu(snapshot, lower, upper, training, seed));
     }
 
     /// <inheritdoc/>
     public virtual void TensorRsqrtInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, x => 1.0 / Math.Sqrt(x))) return;
-        ApplyInPlace(tensor, "TensorRsqrtInPlace", (e, x) => e.TensorRsqrt(x));
+        ApplyInPlace(tensor, "TensorRsqrtInPlace", (e, snapshot) => e.TensorRsqrt(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void ScatterInPlace<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
-        ApplyInPlace(input, "ScatterInPlace", (e, x) => e.Scatter(x, indices, values, axis), values);
+        ApplyInPlace(input, "ScatterInPlace", (e, snapshot) => e.Scatter(snapshot, indices, ReferenceEquals(values, input) ? snapshot : values, axis), values);
     }
 
     /// <inheritdoc/>
     public virtual void ScatterAddInPlace<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
-        ApplyInPlace(input, "ScatterAddInPlace", (e, x) => e.ScatterAdd(x, indices, values, axis), values);
+        ApplyInPlace(input, "ScatterAddInPlace", (e, snapshot) => e.ScatterAdd(snapshot, indices, ReferenceEquals(values, input) ? snapshot : values, axis), values);
     }
 
     /// <inheritdoc/>
     public virtual void TensorScatterReduceInPlace<T>(Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source, ScatterReduceMode mode, bool includeSelf = true)
     {
-        ApplyInPlace(tensor, "TensorScatterReduceInPlace", (e, x) => e.TensorScatterReduce(x, dim, indices, source, mode, includeSelf), source);
+        ApplyInPlace(tensor, "TensorScatterReduceInPlace", (e, snapshot) => e.TensorScatterReduce(snapshot, dim, indices, ReferenceEquals(source, tensor) ? snapshot : source, mode, includeSelf), source);
     }
 
     /// <inheritdoc/>
     public virtual void TensorSELUInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorSELUInPlace", (e, x) => e.TensorSELU(x));
+        ApplyInPlace(tensor, "TensorSELUInPlace", (e, snapshot) => e.TensorSELU(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorSignInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorSignInPlace", (e, x) => e.TensorSign(x));
+        ApplyInPlace(tensor, "TensorSignInPlace", (e, snapshot) => e.TensorSign(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorSinInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorSinInPlace", (e, x) => e.TensorSin(x));
+        ApplyInPlace(tensor, "TensorSinInPlace", (e, snapshot) => e.TensorSin(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorSincInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorSincInPlace", (e, x) => e.TensorSinc(x));
+        ApplyInPlace(tensor, "TensorSincInPlace", (e, snapshot) => e.TensorSinc(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorSinhInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorSinhInPlace", (e, x) => e.TensorSinh(x));
+        ApplyInPlace(tensor, "TensorSinhInPlace", (e, snapshot) => e.TensorSinh(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorSqrtInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorSqrtInPlace", (e, x) => e.TensorSqrt(x));
+        ApplyInPlace(tensor, "TensorSqrtInPlace", (e, snapshot) => e.TensorSqrt(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorSquareInPlace<T>(Tensor<T> tensor)
     {
-        ApplyInPlace(tensor, "TensorSquareInPlace", (e, x) => e.TensorSquare(x));
+        ApplyInPlace(tensor, "TensorSquareInPlace", (e, snapshot) => e.TensorSquare(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorTanInPlace<T>(Tensor<T> tensor)
     {
         if (TryUnaryInPlaceFast(tensor, Math.Tan)) return;
-        ApplyInPlace(tensor, "TensorTanInPlace", (e, x) => e.TensorTan(x));
+        ApplyInPlace(tensor, "TensorTanInPlace", (e, snapshot) => e.TensorTan(snapshot));
     }
 
     /// <inheritdoc/>
     public virtual void TensorThresholdInPlace<T>(Tensor<T> tensor, T threshold, T value)
     {
-        ApplyInPlace(tensor, "TensorThresholdInPlace", (e, x) => e.TensorThreshold(x, threshold, value));
+        ApplyInPlace(tensor, "TensorThresholdInPlace", (e, snapshot) => e.TensorThreshold(snapshot, threshold, value));
     }
 
     /// <inheritdoc/>
     public virtual void TensorTrilInPlace<T>(Tensor<T> tensor, int diagonal = 0)
     {
-        ApplyInPlace(tensor, "TensorTrilInPlace", (e, x) => e.TensorTril(x, diagonal));
+        ApplyInPlace(tensor, "TensorTrilInPlace", (e, snapshot) => e.TensorTril(snapshot, diagonal));
     }
 
     /// <inheritdoc/>
     public virtual void TensorTriuInPlace<T>(Tensor<T> tensor, int diagonal = 0)
     {
-        ApplyInPlace(tensor, "TensorTriuInPlace", (e, x) => e.TensorTriu(x, diagonal));
+        ApplyInPlace(tensor, "TensorTriuInPlace", (e, snapshot) => e.TensorTriu(snapshot, diagonal));
     }
 
     /// <inheritdoc/>
     public virtual void TensorXlogyInPlace<T>(Tensor<T> x, Tensor<T> y)
     {
-        ApplyInPlace(x, "TensorXlogyInPlace", (e, x) => e.TensorXlogy(x, y), y);
+        ApplyInPlace(x, "TensorXlogyInPlace", (e, snapshot) => e.TensorXlogy(snapshot, ReferenceEquals(y, x) ? snapshot : y), y);
     }
 }

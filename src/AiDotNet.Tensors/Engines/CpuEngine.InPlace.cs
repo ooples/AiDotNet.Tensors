@@ -186,6 +186,7 @@ public partial class CpuEngine
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (source is null) throw new ArgumentNullException(nameof(source));
+        if (ReferenceEquals(source, tensor)) return;   // t.copy_(t) changes nothing, and must not record t as its own input
         // torch broadcasts the source to the tensor written; the gradient flows to the source only.
         ApplyInPlace(tensor, "TensorCopyInPlace",
             (e, x) => ShapesEqual(source._shape, x._shape) ? source : e.TensorBroadcastTo(source, x._shape), source);
