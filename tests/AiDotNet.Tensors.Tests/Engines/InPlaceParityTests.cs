@@ -111,8 +111,8 @@ public class InPlaceParityTests
             foreach (var shape in new[] { new[] { 3, 4 }, new[] { 4, 4 } })
             {
                 var args = ip.GetParameters().Select((p, i) => Argument(p, shape, i)).ToArray();
-                if (args.Any((a, i) => a is null && !ip.GetParameters()[i].ParameterType.IsGenericType
-                        && Nullable.GetUnderlyingType(ip.GetParameters()[i].ParameterType) is null))
+                if (args.Select((a, i) => a is null && !ip.GetParameters()[i].ParameterType.IsGenericType
+                        && Nullable.GetUnderlyingType(ip.GetParameters()[i].ParameterType) is null).Any(missing => missing))
                 {
                     skipped.Add($"{inPlace.Name}: no argument for a parameter"); break;
                 }
