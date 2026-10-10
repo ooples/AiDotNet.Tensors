@@ -2376,7 +2376,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Gets a read-only span over the tensor data. Throws for non-contiguous views.
     /// </summary>
-    public ReadOnlySpan<T> AsSpan()
+    internal ReadOnlySpan<T> AsSpan()
     {
         EnsureMaterialized();
 
@@ -2389,6 +2389,31 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             return _data.AsSpan();
         return _data.AsSpan().Slice(_storageOffset, Length);
     }
+
+    /// <summary><see cref="AsSpan"/> without the escape mark, for leases (which keep this tensor alive).</summary>
+    internal ReadOnlySpan<T> AsSpanUnmarked()
+    {
+        EnsureMaterialized();
+
+        ThrowIfSparse();
+        if (Length == 0) return ReadOnlySpan<T>.Empty;
+        if (!IsContiguous)
+            throw new InvalidOperationException(
+                "Cannot get a contiguous span from a non-contiguous tensor view. Call Contiguous() first.");
+        if (_storageOffset == 0 && _storage.Length == Length)
+            return _data.AsSpanUnmarked();
+        return _data.AsSpanUnmarked().Slice(_storageOffset, Length);
+    }
+
+    /// <summary>
+    /// A read-only view of this object's data that keeps the object alive until the lease is disposed. Use it instead
+    /// of <see cref="AsSpan"/> whenever the object could otherwise become unreachable while the span is in use (a
+    /// temporary result, or a local whose last use is the span); see <see cref="ReadLease{T}"/>.
+    /// </summary>
+    internal ReadLease<T> Lease() => new(this, AsSpanUnmarked());
+
+    /// <summary>The writable form of <see cref="Lease"/>.</summary>
+    internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());
 
     /// <summary>
     /// Gets a writable span over the tensor data. Throws for non-contiguous views.
@@ -2418,6 +2443,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (_storageOffset == 0 && _storage.Length == Length)
             return _storage.AsWritableSpan();
         return _storage.AsWritableSpan().Slice(_storageOffset, Length);
+    }
+
+    /// <summary><see cref="AsWritableSpan"/> without the escape mark, for leases (which keep this tensor alive).</summary>
+    internal Span<T> AsWritableSpanUnmarked()
+    {
+        EnsureMaterialized();
+        EnsureOwnedForWrite();
+
+        if (Length == 0) return Span<T>.Empty;
+        if (!IsContiguous)
+            throw new InvalidOperationException(
+                "Cannot get a contiguous writable span from a non-contiguous tensor view. Call Contiguous() first.");
+        // Route through _storage (not _data) so a read-only mmap alias fails loud via
+        // ThrowIfReadOnlyMapped instead of faulting the mapped pages on write. _storage wraps the same
+        // Vector as _data, so this is transparent for normal tensors; a writable mmap alias is allowed.
+        if (_storageOffset == 0 && _storage.Length == Length)
+            return _storage.AsWritableSpanUnmarked();
+        return _storage.AsWritableSpanUnmarked().Slice(_storageOffset, Length);
     }
 
     /// <summary>

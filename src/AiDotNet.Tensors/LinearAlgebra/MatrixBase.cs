@@ -86,6 +86,9 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[]? PooledArray => _pooledArray;
 
+    /// <summary>Test hook: this matrix's storage without the escape mark (identity checks in recycling tests).</summary>
+    internal ReadOnlyMemory<T> AsMemoryUnmarkedForTests() => _memory;
+
     /// <summary>
     /// Detaches the pooled array reference so it can be safely returned to the pool.
     /// After calling this, the matrix still works but the array won't be returned again.
@@ -137,6 +140,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[] GetDataArray()
     {
+        ResultOwner?.MarkEscaped(); // raw access: see AsSpan
         // If a deferred GPU download is pending, materialize now: callers
         // of GetDataArray either read the data directly or pass it to code
         // that does (host-side serialization, base CPU ops, etc.). The
@@ -171,6 +175,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[]? GetBackingArrayUnsafe()
     {
+        ResultOwner?.MarkEscaped(); // raw access: see AsSpan
         if (_cachedArray is not null)
             return _cachedArray;
 
@@ -190,6 +195,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal bool TryGetBackingArray(out T[] array)
     {
+        ResultOwner?.MarkEscaped(); // raw access: see AsSpan
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
             if (segment.Offset == 0 && segment.Count == segment.Array.Length)
@@ -454,7 +460,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(rows, cols);
         // Use vectorized Fill operation for SIMD acceleration
-        _numOps.Fill(result.AsWritableSpan(), _numOps.One);
+        _numOps.Fill(result.AsWritableSpanUnmarked(), _numOps.One);
 
         return result;
     }
@@ -474,7 +480,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(rows, cols);
         // Use vectorized Fill operation for SIMD acceleration
-        _numOps.Fill(result.AsWritableSpan(), _numOps.Zero);
+        _numOps.Fill(result.AsWritableSpanUnmarked(), _numOps.Zero);
 
         return result;
     }
@@ -592,7 +598,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
         ValidateIndices(row, 0);
         var result = VA.RentUninitialized<T>(_cols);
         var sourceRow = _memory.Span.Slice(row * _cols, _cols);
-        _numOps.Copy(sourceRow, result.AsWritableSpan());
+        _numOps.Copy(sourceRow, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -612,7 +618,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     {
         ValidateIndices(0, col);
         var result = VA.RentUninitialized<T>(_rows);
-        var destSpan = result.AsWritableSpan();
+        var destSpan = result.AsWritableSpanUnmarked();
         var srcSpan = _memory.Span;
         for (int i = 0; i < _rows; i++)
         {
@@ -744,6 +750,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual T ElementWiseMultiplyAndSum(MatrixBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Rows != other.Rows || Columns != other.Columns)
         {
             throw new ArgumentException("Matrices must have the same dimensions for element-wise multiplication.");
@@ -771,11 +778,12 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual MatrixBase<T> Add(MatrixBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for addition.");
 
         var result = CreateInstance(_rows, _cols);
-        var dst = result.AsWritableSpan();
+        var dst = result.AsWritableSpanUnmarked();
         if (dst.Length >= ElementwiseParallelMinLength)
         {
             Memory<T> a = _memory, b = other._memory, r = result._memory;
@@ -806,6 +814,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual void AddInPlace(MatrixBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for addition.");
 
@@ -845,6 +854,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Add(MatrixBase<T> other, Span<T> destination)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for addition.");
         if (destination.Length < _rows * _cols)
@@ -898,11 +908,12 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual MatrixBase<T> Subtract(MatrixBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
 
         var result = CreateInstance(_rows, _cols);
-        var dst = result.AsWritableSpan();
+        var dst = result.AsWritableSpanUnmarked();
         if (dst.Length >= ElementwiseParallelMinLength)
         {
             Memory<T> a = _memory, b = other._memory, r = result._memory;
@@ -928,6 +939,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual void SubtractInPlace(MatrixBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
 
@@ -967,6 +979,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Subtract(MatrixBase<T> other, Span<T> destination)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
         if (destination.Length < _rows * _cols)
@@ -1021,6 +1034,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual MatrixBase<T> Multiply(MatrixBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_cols != other.Rows)
             throw new ArgumentException("Number of columns in the first matrix must equal the number of rows in the second matrix.");
 
@@ -1236,7 +1250,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     public virtual MatrixBase<T> Multiply(T scalar)
     {
         var result = CreateInstance(_rows, _cols);
-        var dst = result.AsWritableSpan();
+        var dst = result.AsWritableSpanUnmarked();
         if (dst.Length >= ElementwiseParallelMinLength)
         {
             Memory<T> a = _memory, r = result._memory;
@@ -1618,7 +1632,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(_rows, _cols);
         // Use vectorized Copy operation to copy entire matrix at once
-        _numOps.Copy(_memory.Span, result.AsWritableSpan());
+        _numOps.Copy(_memory.Span, result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -1667,15 +1681,53 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// This is much faster than copying the entire matrix into a new array, especially for large matrices.
     /// Use this when you need to pass matrix data to GPU or other operations that can work with spans.</para>
     /// </remarks>
-    public ReadOnlySpan<T> AsSpan()
+    internal ReadOnlySpan<T> AsSpan()
     {
         // Issues #561 / #562: a Matrix returned by IEngine.MatrixMultiply on
         // the GPU may be backed by a HostSync-registered
         // array — its GPU buffer is still resident and the host array is
         // empty until first read. Materialize before exposing the span so
         // callers don't see zeros. Mirrors VectorBase.AsSpan's trigger.
+        // Raw access: from here nothing guarantees this matrix outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the matrix alive instead.
+        ResultOwner?.MarkEscaped();
+        return AsSpanUnmarked();
+    }
+
+    /// <summary>
+    /// <see cref="AsSpan"/> without the escape mark, for callers that keep this matrix alive for as long as they use
+    /// the span (leases, and members of this type).
+    /// </summary>
+    internal ReadOnlySpan<T> AsSpanUnmarked()
+    {
         SyncHostFromDevice();
         return _memory.Span;
+    }
+
+    /// <summary>
+    /// A read-only view of this object's data that keeps the object alive until the lease is disposed. Use it instead
+    /// of <see cref="AsSpan"/> whenever the object could otherwise become unreachable while the span is in use (a
+    /// temporary result, or a local whose last use is the span); see <see cref="ReadLease{T}"/>.
+    /// </summary>
+    internal ReadLease<T> Lease() => new(this, AsSpanUnmarked());
+
+    /// <summary>The writable form of <see cref="Lease"/>.</summary>
+    internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());
+
+    /// <summary>
+    /// Copies this matrix's elements into <paramref name="destination"/>, which must hold at least as many elements.
+    /// </summary>
+    /// <remarks>
+    /// The public way to read the data out. Direct views of the backing storage are internal: large results' storage
+    /// is reused once the matrix is collected, so a view that outlived it would read another result's data.
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="destination"/> is too short.</exception>
+    public void CopyTo(Span<T> destination)
+    {
+        var source = AsSpanUnmarked();
+        if (destination.Length < source.Length)
+            throw new ArgumentException($"Destination holds {destination.Length} elements; {source.Length} are needed.", nameof(destination));
+        source.CopyTo(destination);
     }
 
     /// <summary>
@@ -1694,6 +1746,15 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
         // See AsSpan() — a writable view must observe materialized data too,
         // otherwise an "x[i] += y" pattern would read 0 and overwrite the
         // not-yet-downloaded GPU result.
+        // Raw access: from here nothing guarantees this matrix outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the matrix alive instead.
+        ResultOwner?.MarkEscaped();
+        return AsWritableSpanUnmarked();
+    }
+
+    /// <summary><see cref="AsWritableSpan"/> without the escape mark; see <see cref="AsSpanUnmarked"/>.</summary>
+    internal Span<T> AsWritableSpanUnmarked()
+    {
         SyncHostFromDevice();
         MarkDirty();
         return _memory.Span;
@@ -1712,10 +1773,13 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <para><b>For Beginners:</b> This gives you access to the matrix's data in a format
     /// that can be stored and passed around, unlike Span which must be used immediately.</para>
     /// </remarks>
-    public ReadOnlyMemory<T> AsMemory()
+    internal ReadOnlyMemory<T> AsMemory()
     {
         // Memory is held + read later, so we have to materialize NOW; we
         // can't observe the read point of a stored Memory<T>.
+        // Raw access: from here nothing guarantees this matrix outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the matrix alive instead.
+        ResultOwner?.MarkEscaped();
         SyncHostFromDevice();
         return _memory;
     }
@@ -1733,6 +1797,9 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
+        // Raw access: from here nothing guarantees this matrix outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the matrix alive instead.
+        ResultOwner?.MarkEscaped();
         SyncHostFromDevice();
         MarkDirty();
         return _memory;

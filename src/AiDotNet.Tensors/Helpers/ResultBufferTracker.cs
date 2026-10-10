@@ -13,6 +13,28 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 internal sealed class ResultBufferOwner
 {
+    internal ResultBufferOwner(ResultBufferState state) => State = state;
+
+    /// <summary>Shared with the tracker entry, so the escape mark outlives this owner.</summary>
+    internal readonly ResultBufferState State;
+
+    /// <summary>
+    /// Records that raw access other than a lease handed out this array (a span, Memory or the array itself), so it
+    /// is never recycled: nothing guarantees that access ends before every wrapper is collected.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void MarkEscaped()
+    {
+        if (!State.Escaped && ResultBufferTracker.TraceEscapes) ResultBufferTracker.RecordEscape();
+        State.Escaped = true;
+    }
+}
+
+/// <summary>Per-array state the owner and the tracker both reference.</summary>
+internal sealed class ResultBufferState
+{
+    /// <summary>Raw access other than a lease reached the array; it must never be recycled.</summary>
+    internal volatile bool Escaped;
 }
 
 /// <summary>
@@ -41,6 +63,7 @@ internal static class ResultBufferTracker
     private sealed class Entry
     {
         internal GCHandle Owner;
+        internal ResultBufferState State = null!;
         internal Array Array = null!;
         internal long Bytes;
         internal List<Entry> Group = null!;
@@ -59,10 +82,13 @@ internal static class ResultBufferTracker
     private static int s_count;
     private static long s_trackedBytes;
 
-    // Collection pacing: a miss with nothing free collects only once tracked bytes reach this mark. A collection that
-    // frees nothing moves the mark up a budget, so a workload that genuinely holds many large results is not collected
-    // on every rent, and the generation escalates (owners promoted past gen 0 need a deeper collection).
-    private static long s_nextCollectAt = CollectBudgetBytes;
+    // Collection pacing: fresh large bytes allocated (misses with nothing free) since the last gen-0 collection, natural
+    // or induced. Once they pass CollectBudgetBytes, the next miss collects and looks again, so fresh allocation between
+    // collections stays bounded. (Pacing on TOTAL tracked bytes let the mark run away: tracked arrays reached the cap
+    // with no collection, and 46% of results were fresh.) The generation escalates while a collection frees nothing of
+    // the size asked for (owners promoted past gen 0 need a deeper one) and resets once one does.
+    private static long s_freshSinceCollect;
+    private static int s_lastGen0 = -1;
     private static int s_collectGeneration;
 
     /// <summary>Whether result recycling is active (off on .NET Framework, where large results are not pooled).</summary>
@@ -77,13 +103,13 @@ internal static class ResultBufferTracker
     internal static long MinBytes { get; set; } = EnvLong("AIDOTNET_RESULT_RECYCLE_MIN_BYTES", 85_000);
 
     /// <summary>Tracked bytes at which a miss with nothing free induces a collection.</summary>
-    internal static long CollectBudgetBytes { get; set; } = EnvLong("AIDOTNET_RESULT_RECYCLE_COLLECT_BYTES", 64L << 20);
+    internal static long CollectBudgetBytes { get; set; } = EnvLong("AIDOTNET_RESULT_RECYCLE_COLLECT_BYTES", 32L << 20);
 
     /// <summary>Tracked bytes (live and free) past which new results are left untracked (plain GC arrays).</summary>
     internal static long HardCapBytes { get; set; } = EnvLong("AIDOTNET_RESULT_RECYCLE_CAP_BYTES", 1L << 30);
 
     /// <summary>Free (owner collected, not yet reused) bytes kept for reuse; beyond it the oldest free arrays go to the GC.</summary>
-    internal static long FreeCapBytes { get; set; } = EnvLong("AIDOTNET_RESULT_RECYCLE_FREE_BYTES", 256L << 20);
+    internal static long FreeCapBytes { get; set; } = EnvLong("AIDOTNET_RESULT_RECYCLE_FREE_BYTES", 64L << 20);
 
     /// <summary>
     /// Test mode: every large miss collects first, freed arrays are poisoned before reuse, and wrapping a tracked
@@ -91,10 +117,47 @@ internal static class ResultBufferTracker
     /// </summary>
     internal static bool Stress { get; set; } = EnvTrue("AIDOTNET_RECYCLE_STRESS");
 
+    /// <summary>
+    /// Diagnostic: records which member first escaped each tracked array (AIDOTNET_RECYCLE_TRACE_ESCAPES=1), to rank the
+    /// call sites still keeping results from being recycled. Costs a stack walk per escape; off by default.
+    /// </summary>
+    internal static bool TraceEscapes { get; set; } = EnvTrue("AIDOTNET_RECYCLE_TRACE_ESCAPES");
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> s_escapeSites = new();
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static void RecordEscape()
+    {
+        // Frame 0 is this method, 1 MarkEscaped, 2 the raw accessor, 3+ the caller; skip accessors of the storage types.
+        var trace = new System.Diagnostics.StackTrace(2, false);
+        for (int i = 0; i < trace.FrameCount; i++)
+        {
+            var method = trace.GetFrame(i)?.GetMethod();
+            var type = method?.DeclaringType;
+            if (method is null || type is null) continue;
+            string ns = type.Namespace ?? "";
+            if (ns == "AiDotNet.Tensors.LinearAlgebra" && (type.Name.StartsWith("VectorBase") || type.Name.StartsWith("MatrixBase")
+                || type.Name.StartsWith("TensorBase") || type.Name.StartsWith("TensorStorage"))) continue;
+            s_escapeSites.AddOrUpdate($"{type.Name}.{method.Name}", 1, static (_, n) => n + 1);
+            return;
+        }
+    }
+
+    /// <summary>The most frequent first-escape sites recorded since the last reset, as (site, count).</summary>
+    internal static System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, int>> TopEscapeSites(int count)
+    {
+        var list = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, int>>(s_escapeSites);
+        list.Sort((a, b) => b.Value.CompareTo(a.Value));
+        if (list.Count > count) list.RemoveRange(count, list.Count - count);
+        return list;
+    }
+
     internal static int TrackedCount => Volatile.Read(ref s_count);
     internal static long TrackedBytes => Interlocked.Read(ref s_trackedBytes);
     internal static long InducedCollections;
     internal static long ReusedArrays;
+    /// <summary>Arrays whose results were collected but could not be reused because raw access escaped them.</summary>
+    internal static long EscapedArrays;
 
     /// <summary>Whether an array of <paramref name="length"/> elements of <typeparamref name="T"/> is tracked.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -115,7 +178,8 @@ internal static class ResultBufferTracker
         long bytes = (long)array.Length * Unsafe.SizeOf<T>();
         if (Interlocked.Read(ref s_trackedBytes) + bytes > HardCapBytes) return null;
 
-        var owner = new ResultBufferOwner();
+        var state = new ResultBufferState();
+        var owner = new ResultBufferOwner(state);
         lock (s_lock)
         {
             // Re-issued without an untrack (a path that returned it to the cache directly): the old owner's death must
@@ -124,7 +188,7 @@ internal static class ResultBufferTracker
 
             var key = (typeof(T), array.Length);
             if (!s_bySize.TryGetValue(key, out var group)) s_bySize[key] = group = new List<Entry>();
-            var entry = new Entry { Owner = GCHandle.Alloc(owner, GCHandleType.Weak), Array = array, Bytes = bytes, Group = group };
+            var entry = new Entry { Owner = GCHandle.Alloc(owner, GCHandleType.Weak), State = state, Array = array, Bytes = bytes, Group = group };
             group.Add(entry);
             s_byArray[array] = entry;
             s_trackedBytes += bytes;
@@ -191,15 +255,24 @@ internal static class ResultBufferTracker
         }
 
         var array = TakeFreeOnce<T>(length);
-        if (array is not null || Interlocked.Read(ref s_trackedBytes) < Volatile.Read(ref s_nextCollectAt)) return array;
+        if (array is not null) return array;
+
+        // A collection since the last look (natural or induced) restarts the fresh-bytes count.
+        int gen0 = GC.CollectionCount(0);
+        if (gen0 != Volatile.Read(ref s_lastGen0))
+        {
+            Volatile.Write(ref s_lastGen0, gen0);
+            Interlocked.Exchange(ref s_freshSinceCollect, 0);
+        }
+        long bytes = (long)length * Unsafe.SizeOf<T>();
+        if (Interlocked.Add(ref s_freshSinceCollect, bytes) < CollectBudgetBytes) return null;
 
         int generation = Volatile.Read(ref s_collectGeneration);
         GC.Collect(generation, GCCollectionMode.Forced, blocking: true);
         Interlocked.Increment(ref InducedCollections);
+        Volatile.Write(ref s_lastGen0, GC.CollectionCount(0));
+        Interlocked.Exchange(ref s_freshSinceCollect, 0);
         array = TakeFreeOnce<T>(length);
-
-        long tracked = Interlocked.Read(ref s_trackedBytes);
-        Volatile.Write(ref s_nextCollectAt, tracked + CollectBudgetBytes);
         // Freed nothing of this size: the dead owners are older than this generation (or the workload really holds
         // these results), so the next collection goes one generation deeper.
         Volatile.Write(ref s_collectGeneration,
@@ -216,9 +289,13 @@ internal static class ResultBufferTracker
             if (!s_bySize.TryGetValue((typeof(T), length), out var group)) return null;
             for (int i = group.Count - 1; i >= 0; i--)
             {
-                if (group[i].Owner.Target is not null) continue;
-                found = group[i];
-                RemoveLocked(found);
+                var candidate = group[i];
+                if (candidate.Owner.Target is not null) continue;
+                RemoveLocked(candidate);
+                // Raw access that is not a lease reached it: whatever holds that access may still be using it, so it
+                // is left to the GC, never reused.
+                if (candidate.State.Escaped) { Interlocked.Increment(ref EscapedArrays); continue; }
+                found = candidate;
                 break;
             }
         }

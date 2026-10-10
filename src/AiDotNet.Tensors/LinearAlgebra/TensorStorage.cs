@@ -344,6 +344,14 @@ internal sealed class TensorStorage<T>
         return _data.AsWritableSpan();
     }
 
+    /// <summary><see cref="AsWritableSpan"/> without the escape mark, for leases (which keep the owner alive).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal Span<T> AsWritableSpanUnmarked()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.AsWritableSpanUnmarked();
+    }
+
     /// <summary>
     /// Gets the underlying data as Memory&lt;T&gt; for pinning/GPU transfer.
     /// </summary>

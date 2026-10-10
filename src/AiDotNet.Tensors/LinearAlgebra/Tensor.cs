@@ -3649,7 +3649,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// For GPU-resident tensors, this triggers synchronization and data download.
     /// For CPU-resident tensors, this returns the backing array directly.
     /// </summary>
-    public T[] GetCpuData()
+    internal T[] GetCpuData()
     {
         if (IsGpuResident)
         {
