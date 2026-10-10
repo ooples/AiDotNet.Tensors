@@ -1913,6 +1913,14 @@ internal static partial class SimdGemm
             return;
         }
 #if NET5_0_OR_GREATER
+        // Not gated on allowParallel: the same shape must sum in the same order on one thread or many. .NET 5+ only,
+        // like the direct kernels each slice runs.
+        if (!t_inSplitK && QualifiesForSplitK(transA, transB, m, k, n))
+        {
+            SgemmSplitK(a, lda, b, ldb, c, m, k, n, clearedOutput, allowParallel);
+            return;
+        }
+
         // Ahead of the column panel below: on the shapes both take, direct-2D measured 75 vs 150 us (16x576x1024),
         // 114 vs 183 (64x784x512), 174 vs 186 (32x144x4096) and tied at 128x512x512. The column panel still serves
         // what direct-2D does not (accumulating output, shapes past its bounds).
@@ -2023,28 +2031,13 @@ internal static partial class SimdGemm
                 var bT = ArrayPool<float>.Shared.Rent(k * n);
                 try
                 {
-                    // B is [n, k] row-major (since transB=true). Lay it
-                    // out as [k, n] row-major in bT so SgemmDirect reads
-                    // contiguous K-rows of length N.
-                    for (int j = 0; j < n; j++)
-                    {
-                        int bRowStart = j * ldb;
-                        for (int p = 0; p < k; p++)
-                        {
-                            bT[p * n + j] = b[bRowStart + p];
-                        }
-                    }
-                    // Same parallel-M dispatch as the !transB branch above.
-                    if (allowParallel
-                        && directWork >= ParallelDirectWorkThreshold
-                        && m >= ParallelDirectMinM)
-                    {
-                        SgemmDirectParallelM(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n, clearedOutput);
-                    }
-                    else
-                    {
-                        SgemmDirect(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n, clearedOutput);
-                    }
+                    // B is [n, k] row-major (since transB=true): tile-transpose it to [k, n], then dispatch the
+                    // untransposed product. A serial strided copy followed by the M-only split cost 5x the
+                    // untransposed GEMM on a [64x128]x[128x3136] input gradient (64 rows give the M split
+                    // ~10 chunks); the untransposed dispatch reaches the 2-D direct path, which splits N too.
+                    TransposeInto(b, ldb, n, k, bT, allowParallel);
+                    SgemmAddInternal(a, lda, false, new ReadOnlySpan<float>(bT, 0, k * n), n, false, c, m, k, n,
+                        allowParallel, clearedOutput);
                 }
                 finally
                 {
@@ -2135,6 +2128,124 @@ internal static partial class SimdGemm
     /// <c>C = op(A) . op(B)</c> with each transposed operand copied into row-major scratch first, then the untransposed
     /// product dispatched through <see cref="SgemmAddInternal"/>.
     /// </summary>
+    // dst += src, vectorized.
+    private static void AddInto(Span<float> dst, ReadOnlySpan<float> src)
+    {
+        int vw = System.Numerics.Vector<float>.Count;
+        var dv = System.Runtime.InteropServices.MemoryMarshal.Cast<float, System.Numerics.Vector<float>>(dst);
+        var sv = System.Runtime.InteropServices.MemoryMarshal.Cast<float, System.Numerics.Vector<float>>(src);
+        for (int v = 0; v < dv.Length && v < sv.Length; v++) dv[v] += sv[v];
+        for (int i = Math.Min(dv.Length, sv.Length) * vw; i < dst.Length; i++) dst[i] += src[i];
+    }
+
+    // Set while a split-K slice (or its single-slice fallback) runs, so the dispatch it calls cannot split again.
+    [ThreadStatic] private static bool t_inSplitK;
+
+    /// <summary>A/B and test toggle for <see cref="SgemmSplitK"/>.</summary>
+    internal static bool UseSplitK = true;
+
+    /// <summary>
+    /// Whether <see cref="SgemmAddInternal"/> splits this shape over K: a small output (few row/column tiles) with a long
+    /// K. The single source of the gate, so a caller that routes shapes here for split-K (BlasManaged) cannot drift
+    /// from it. Depends on the shape only, never on the thread budget.
+    /// </summary>
+    internal static bool QualifiesForSplitK(bool transA, bool transB, int m, int k, int n)
+    {
+#if NET5_0_OR_GREATER
+        return !transA && !transB && UseSplitK
+            && m >= Mr && m <= DirectParallel2DMaxM && n >= Nr && k > DirectParallel2DMaxK
+            && (long)m * n <= SplitKDirectMaxOutput
+            && (long)m * k * n >= ParallelWorkThreshold;
+#else
+        return false;
+#endif
+    }
+    // Largest output (m*n) split over K: a bigger output has enough row/column tiles for the 2-D paths.
+    private const long SplitKDirectMaxOutput = 64L * 1024;
+
+    // Smallest K slice a split-K worker gets (keeps each slice's direct kernel efficient).
+    private const int SplitKMinSlice = 256;
+
+    // Most K slices a split-K GEMM is cut into: a constant, so the plan never follows the thread budget.
+    private const int SplitKMaxSlices = 16;
+
+    // Split-K for a small output with a long K ([64 x 3136] x [3136 x 128], a flatten-to-dense layer): the output
+    // has too few tiles to fill the pool and K exceeds the 2-D direct path's L1 bound, so it went to the packed
+    // path nearly serial (~100 GFLOP/s). Each worker runs the serial direct kernel on one K slice into its own
+    // partial buffer; the partials are then summed in fixed slice order over a shape-only slice plan, so the
+    // result does not depend on the thread budget.
+    private static unsafe void SgemmSplitK(
+        ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c,
+        int m, int k, int n, bool clearedOutput, bool allowParallel)
+    {
+        // The slice plan depends on the shape alone, never on the thread budget: the partial sums are added in a
+        // fixed order, so the result is bit-identical on a quiet machine and a loaded one (GEMM determinism contract).
+        int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
+        int byWork = CapDirectChunksByWork(SplitKMaxSlices, (long)m * k * n);
+        int slices = Math.Max(1, Math.Min(byWork, k / SplitKMinSlice));
+        if (slices <= 1)
+        {
+            // Not reachable with today's bounds (k > 1024 and the work floor give at least 4 slices), but a single
+            // slice must neither re-enter split-K nor overwrite an accumulating call: dispatch once, unsplit.
+            bool prev = t_inSplitK;
+            t_inSplitK = true;
+            try { SgemmAddInternal(a, lda, false, b, ldb, false, c, m, k, n, allowParallel, clearedOutput); }
+            finally { t_inSplitK = prev; }
+            return;
+        }
+        int outSize = m * n;
+        var partials = ArrayPool<float>.Shared.Rent(slices * outSize);
+        try
+        {
+            fixed (float* pA = a, pB = b)
+            {
+                IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB;
+                int aLen = a.Length, bLen = b.Length;
+                void Slice(int sIdx)
+                {
+                    int k0 = (int)((long)sIdx * k / slices), k1 = (int)((long)(sIdx + 1) * k / slices);
+                    var aSlice = new ReadOnlySpan<float>((float*)ipA + k0, aLen - k0);
+                    var bSlice = new ReadOnlySpan<float>((float*)ipB + (long)k0 * ldb, bLen - k0 * ldb);
+                    var part = new Span<float>(partials, sIdx * outSize, outSize);
+                    part.Clear();
+                    // A slice longer than the 2-D bound would otherwise split again on this (worker) thread.
+                    bool prev = t_inSplitK;
+                    t_inSplitK = true;
+                    try
+                    {
+                        SgemmAddInternal(aSlice, lda, false, bSlice, ldb, false, part, m, k1 - k0, n,
+                            allowParallel: false, clearedOutput: true);
+                    }
+                    finally { t_inSplitK = prev; }
+                }
+                if (allowParallel && cores > 1) Helpers.CpuParallelSettings.LightweightParallel(slices, Slice);
+                else for (int sIdx = 0; sIdx < slices; sIdx++) Slice(sIdx);
+            }
+            // Reduce in slice order, parallel over output chunks.
+            int chunks = allowParallel ? Math.Min(cores, Math.Max(1, outSize / 4096)) : 1;
+            int per = (outSize + chunks - 1) / chunks;
+            fixed (float* pC = c)
+            {
+                IntPtr ipC = (IntPtr)pC;
+                bool cleared = clearedOutput;
+                Helpers.CpuParallelSettings.LightweightParallel(chunks, ch =>
+                {
+                    int i0 = ch * per, i1 = Math.Min(outSize, i0 + per);
+                    if (i0 >= i1) return;
+                    var dst = new Span<float>((float*)ipC + i0, i1 - i0);
+                    if (cleared) new ReadOnlySpan<float>(partials, i0, i1 - i0).CopyTo(dst);
+                    else AddInto(dst, new ReadOnlySpan<float>(partials, i0, i1 - i0));
+                    for (int sIdx = 1; sIdx < slices; sIdx++)
+                        AddInto(dst, new ReadOnlySpan<float>(partials, sIdx * outSize + i0, i1 - i0));
+                });
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(partials);
+        }
+    }
+
     private static void SgemmWithMaterializedTransposes(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -2178,33 +2289,48 @@ internal static partial class SimdGemm
     private static unsafe void TransposeInto(ReadOnlySpan<float> src, int ld, int rows, int cols, float[] dst, bool allowParallel)
     {
         int rowTiles = (rows + TransposeTile - 1) / TransposeTile;
+        int colTiles = (cols + TransposeTile - 1) / TransposeTile;
         fixed (float* ps = src)
         fixed (float* pd = dst)
         {
             float* s = ps, d = pd;
-            void Tile(int rt)
+            // One work item per tile of the 2-D grid, not per row strip: a backward operand is often short and
+            // wide ([64, 3136] as A^T of a weight gradient), which made only two row strips, so the transpose ran
+            // on two threads and cost more than the GEMM it fed.
+            void Tile(int t)
             {
+                int rt = t / colTiles, ct = t % colTiles;
                 int r0 = rt * TransposeTile, r1 = Math.Min(rows, r0 + TransposeTile);
-                for (int c0 = 0; c0 < cols; c0 += TransposeTile)
+                int c0 = ct * TransposeTile, c1 = Math.Min(cols, c0 + TransposeTile);
+                for (int r = r0; r < r1; r++)
                 {
-                    int c1 = Math.Min(cols, c0 + TransposeTile);
-                    for (int r = r0; r < r1; r++)
-                    {
-                        float* row = s + (long)r * ld;
-                        for (int col = c0; col < c1; col++)
-                            d[(long)col * rows + r] = row[col];
-                    }
+                    float* row = s + (long)r * ld;
+                    for (int col = c0; col < c1; col++)
+                        d[(long)col * rows + r] = row[col];
                 }
             }
-
-            if (allowParallel && rowTiles > 1 && (long)rows * cols >= TransposeParallelElements)
-                Helpers.CpuParallelSettings.LightweightParallel(rowTiles, Tile);
+            int tiles = rowTiles * colTiles;
+            if (!allowParallel || tiles <= 1 || (long)rows * cols < TransposeParallelElements)
+            {
+                for (int t = 0; t < tiles; t++) Tile(t);
+                return;
+            }
+            // Strips along whichever axis has more tiles. A short, wide operand ([64, 3136] as A^T of a weight
+            // gradient) has two row strips, which left the transpose on two threads; its column strips each write
+            // whole destination rows contiguously. (One pool item per 32x32 tile was slower than both.)
+            if (rowTiles >= colTiles)
+                Helpers.CpuParallelSettings.LightweightParallel(rowTiles, rt =>
+                {
+                    for (int ct = 0; ct < colTiles; ct++) Tile(rt * colTiles + ct);
+                });
             else
-                for (int rt = 0; rt < rowTiles; rt++) Tile(rt);
+                Helpers.CpuParallelSettings.LightweightParallel(colTiles, ct =>
+                {
+                    for (int rt = 0; rt < rowTiles; rt++) Tile(rt * colTiles + ct);
+                });
         }
     }
 
-    // Below 64K elements (256 KB) the transpose costs less than a parallel dispatch.
     private const long TransposeParallelElements = 64L * 1024;
 
     // Tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at

@@ -193,9 +193,16 @@ public static class CpuParallelSettings
     /// </remarks>
     public const int ElementwiseGrainSize = 32 * 1024;
 
+    /// <summary>
+    /// The grain in effect: <see cref="ElementwiseGrainSize"/> unless AIDOTNET_ELEMENTWISE_GRAIN sets a positive value.
+    /// The one knob for every elementwise split (CpuEngine.ElementwiseChunks reads it too).
+    /// </summary>
+    internal static readonly int ElementwiseGrain =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_ELEMENTWISE_GRAIN"), out var grain) && grain > 0 ? grain : ElementwiseGrainSize;
+
     /// <summary>Number of chunks to split an elementwise kernel of <paramref name="length"/> elements into.</summary>
     internal static int ElementwiseChunkCount(int length)
-        => Math.Min(MaxDegreeOfParallelism, Math.Max(1, length / ElementwiseGrainSize));
+        => Math.Min(MaxDegreeOfParallelism, Math.Max(1, length / ElementwiseGrain));
 
     /// <summary>
     /// How long a pool worker keeps spinning for the next parallel operation before it parks.
