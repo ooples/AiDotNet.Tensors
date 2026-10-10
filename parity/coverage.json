@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 23,
+  "gapBaseline": 21,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -7878,8 +7878,9 @@
       "source": "name-match"
     },
     "optim:Adafactor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Optimization.Optimizers.AdafactorOptimizer",
+      "source": "reviewed"
     },
     "optim:Adagrad": {
       "status": "mapped",
@@ -7907,8 +7908,9 @@
       "source": "name-match"
     },
     "optim:Muon": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Optimization.Optimizers.MuonOptimizer",
+      "source": "reviewed"
     },
     "optim:NAdam": {
       "status": "mapped",
