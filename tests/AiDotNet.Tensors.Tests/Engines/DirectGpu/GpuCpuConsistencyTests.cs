@@ -252,7 +252,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var cuda = Gpu.TestBackend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
         Skip.If(cuda is null, "Multi-tensor gradient kernels are CUDA-only.");
 
-        // Ragged sizes across chunk boundaries (chunk = 256), more chunks than the reduction's block cap.
+        // Ragged sizes across 256-element boundaries; the gradient table now chunks by 4096 (#1106), see the next test.
         int[] sizes = { 1, 255, 256, 257, 4096, 300_000 };
         var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 1_000_003 + i)).ToArray()).ToArray();
         double exact = host.Sum(a => a.Sum(v => (double)v * v));
@@ -300,6 +300,53 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             scale.Dispose();
         }
     }
+    /// <summary>
+    /// #1106: the multi-tensor norm and scale kernels chunk the gradient table by 4096 elements, read float4s, and
+    /// stride a bounded grid over the chunks. Sizes straddle every 4096 / float4 boundary, and one 5M-element tensor
+    /// makes 1221 chunks, more than the reduction's 1024-block grid, so the grid-stride wrap is exercised. Every
+    /// scaled element is checked, not a sample.
+    /// </summary>
+    [SkippableFact]
+    public void MultiTensorSumOfSquaresAndScale_ChunkTailsAndGridStride_MatchExactValues()
+    {
+        SkipIfNoDirectGpu();
+        var cuda = Gpu.TestBackend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+        Skip.If(cuda is null, "Multi-tensor gradient kernels are CUDA-only.");
+
+        int[] sizes = { 3, 4, 5, 4095, 4096, 4097, 8191, 8196, 5_000_000 };
+        var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 7_000_003 + i)).ToArray()).ToArray();
+        double exact = host.Sum(a => a.Sum(v => (double)v * v));
+        var buffers = host.Select(a => cuda!.AllocateBuffer(a)).ToList();
+        var sumSq = cuda!.AllocateBuffer(2);
+        var scale = cuda.AllocateBuffer(1);
+        try
+        {
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            double got = BitConverter.ToDouble(cuda.DownloadByteBuffer(sumSq, sizeof(double)), 0);
+            Assert.True(Math.Abs(got - exact) <= 1e-9 * exact, $"sum of squares {got} vs exact {exact}");
+
+            double norm = Math.Sqrt(exact);
+            float maxNorm = (float)(norm / 3);
+            cuda.ClipScaleFromSumOfSquares(sumSq, maxNorm, scale);
+            float coefficient = cuda.DownloadBuffer(scale)[0];
+            Assert.True(Math.Abs(coefficient - maxNorm / (norm + 1e-6)) <= 1e-6, $"coefficient {coefficient}");
+            cuda.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            for (int t = 0; t < sizes.Length; t++)
+            {
+                var scaled = cuda.DownloadBuffer(buffers[t]);
+                for (int i = 0; i < sizes[t]; i++)
+                    Assert.True(scaled[i] == host[t][i] * coefficient,
+                        $"tensor {t} (size {sizes[t]})[{i}]: {scaled[i]} vs {host[t][i] * coefficient}");
+            }
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
+            sumSq.Dispose();
+            scale.Dispose();
+        }
+    }
+
     [SkippableTheory]
     [InlineData(64, 96, 256)]   // N-BEATS first FC layer, batch 64 (AiDotNet #1804)
     [InlineData(7, 13, 5)]      // ragged, below any tile size

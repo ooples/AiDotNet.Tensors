@@ -13645,6 +13645,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // Upper bound on the multi-tensor reduction's grid: enough blocks to fill the device, few enough that the one
     // atomic per block does not serialize.
     private const int MultiTensorReductionMaxBlocks = 1024;
+    // Elements per gradient-table chunk for the multi-tensor norm and scale kernels (MT_CHUNK in
+    // CudaOptimizerKernels must match): 16 per thread as four float4s, so a 10M-parameter model is ~2.4K chunks
+    // rather than ~39K 256-element ones (#1106).
+    private const int GradientTableChunk = 4096;
+    // Grid cap for the grid-stride multi-tensor scale.
+    private const int MultiTensorScaleMaxBlocks = 4096;
 
     private MultiTensorTable GetGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
     {
@@ -13673,15 +13679,15 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             handles[t] = tensors[t].Handle;
             WriteAddress(addresses, t, handles[t]);
             sizeArray[t] = size;
-            totalChunks += (size + MultiTensorChunk - 1) / MultiTensorChunk;
+            totalChunks += (size + GradientTableChunk - 1) / GradientTableChunk;
         }
         var chunkTensor = new int[totalChunks];
         var chunkStart = new int[totalChunks];
         int c = 0;
         for (int t = 0; t < n; t++)
         {
-            int chunks = (sizeArray[t] + MultiTensorChunk - 1) / MultiTensorChunk;
-            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
+            int chunks = (sizeArray[t] + GradientTableChunk - 1) / GradientTableChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * GradientTableChunk; c++; }
         }
 
         // Build the replacement completely before retiring the cached table: a failed allocation or upload disposes
@@ -13758,15 +13764,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (tensors is null || tensors.Count == 0) return;
         if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         lock (_gradientTableSync)
         {
             var table = GetGradientTable(tensors, sizes);
             using var _ = PushContext();
             IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
             IntPtr scH = scale.Handle;
-            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
-            LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+            int totalChunks = table.TotalChunks;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH; args[5] = &totalChunks;
+            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), MultiTensorChunk, args);
         }
     }
 
