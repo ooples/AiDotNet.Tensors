@@ -90,6 +90,9 @@ internal static class ResultBufferTracker
     private static long s_freshSinceCollect;
     private static int s_lastGen0 = -1;
     private static int s_collectGeneration;
+    // Backoff: a collection that freed nothing usable doubles the budget for the next one (up to 32x), so a workload
+    // whose large results all escape, or that holds them, does not pay a collection every few calls. Reset on success.
+    private static int s_budgetShift;
 
     /// <summary>Whether result recycling is active (off on .NET Framework, where large results are not pooled).</summary>
     internal static readonly bool Enabled =
@@ -265,7 +268,7 @@ internal static class ResultBufferTracker
             Interlocked.Exchange(ref s_freshSinceCollect, 0);
         }
         long bytes = (long)length * Unsafe.SizeOf<T>();
-        if (Interlocked.Add(ref s_freshSinceCollect, bytes) < CollectBudgetBytes) return null;
+        if (Interlocked.Add(ref s_freshSinceCollect, bytes) < (CollectBudgetBytes << Volatile.Read(ref s_budgetShift))) return null;
 
         int generation = Volatile.Read(ref s_collectGeneration);
         GC.Collect(generation, GCCollectionMode.Forced, blocking: true);
@@ -273,10 +276,19 @@ internal static class ResultBufferTracker
         Volatile.Write(ref s_lastGen0, GC.CollectionCount(0));
         Interlocked.Exchange(ref s_freshSinceCollect, 0);
         array = TakeFreeOnce<T>(length);
-        // Freed nothing of this size: the dead owners are older than this generation (or the workload really holds
-        // these results), so the next collection goes one generation deeper.
-        Volatile.Write(ref s_collectGeneration,
-            array is not null ? 0 : Math.Min(GC.MaxGeneration, generation + 1));
+        // Freed nothing of this size: the dead owners may be older than gen 0, so the next collection includes gen 1, and
+        // waits twice as long. Never gen 2: a full collection costs too much in a large heap (an inference loop whose
+        // results all escaped paid 0.35 ms per call that way) and the GC runs gen 2 on its own schedule anyway.
+        if (array is not null)
+        {
+            Volatile.Write(ref s_collectGeneration, 0);
+            Volatile.Write(ref s_budgetShift, 0);
+        }
+        else
+        {
+            Volatile.Write(ref s_collectGeneration, 1);
+            Volatile.Write(ref s_budgetShift, Math.Min(5, Volatile.Read(ref s_budgetShift) + 1));
+        }
         TrimFree();
         return array;
     }

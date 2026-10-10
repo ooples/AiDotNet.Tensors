@@ -141,7 +141,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// vector access; callers must treat the returned array as read-only.
     /// </summary>
     internal T[]? GetBackingArrayForCacheLookupUnsafe()
-        => _data.GetBackingArrayForReadOnlyAccess();
+        => _data.GetBackingArrayIdentity();   // identity for cache lookups; does not escape the array
 
     /// <summary>
     /// The no-upcast resident form of a streaming int8 weight (int8 + per-row scales). Non-null
@@ -2517,6 +2517,50 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
+    /// <see cref="GetDataArray"/> without the escape mark, for an op that keeps this tensor alive while it uses the
+    /// array (its own result, or an input held with a <see cref="KeepAliveScope"/>).
+    /// </summary>
+    internal T[] GetDataArrayUnmarked()
+    {
+        // COW: GetDataArray hands back a live, writable backing array (specializations pin it and
+        // expect later writes to land), so privatize first if this is a shared COW clone. No-op for
+        // every normal tensor. Stage 1 conservatively treats this as a write-intent accessor; the
+        // read/write split that avoids privatizing on engine reads is Stage 2.
+        EnsureOwnedForWrite();
+        // Eager simple-layout CPU tensors: hand back the backing array
+        // directly. Specializations (TryBuildSpecializedForward) capture
+        // this reference at compile time and need later writes — notably
+        // user-supplied graph-input data landing in a placeholder — to
+        // show up at replay. Returning a copy here was the missing piece
+        // that produced "importer plan outputs all zeros" on ONNX graphs:
+        // specializations pinned the placeholder's zero-initialized state
+        // and never saw the user's Execute-time input.
+        //
+        // GPU-resident or non-full layouts still go through ToArray() so the
+        // realized CPU snapshot is what the caller sees. That path
+        // preserves the BERT-SQuAD × 100 fix: a lazy tensor whose
+        // upstream hasn't run yet would have had its placeholder-filled
+        // backing pinned, leaking stale/zero bytes into every replay.
+        var live = GetLiveBackingArrayIdentityOrNull();
+        if (live is not null)
+        {
+            // Force any PENDING GPU download before handing the array out.
+            // DirectGpuTensorEngine.FinishGpuOp returns a GC.AllocateUninitializedArray and
+            // registers a HostSync keyed on it, documenting that the data is
+            // "populated lazily when code first accesses the data (via HostSync
+            // triggered by GetDataArray/AsSpan/indexer)". VectorBase.GetDataArray does call
+            // TryMaterialize; this accessor did NOT, so reading a deferred GPU result through the
+            // TENSOR accessor returned UNINITIALISED memory. Fresh pages read as zero, which is why
+            // 13 Parity210 GPU ops (Erfc, Lgamma, Erfinv, I0, Flip, Roll, CumSum, CumMax,
+            // LogCumSumExp, LogAddExp, Hypot, DiagEmbed, NanToNum) each reported gpu=0 against
+            // every CPU value. TryMaterialize is a no-op for arrays with nothing pending.
+            Helpers.HostSync.TryMaterialize(live);
+            return live;
+        }
+        return ToArray();
+    }
+
+    /// <summary>
     /// COW Stage 2 (issue #624): a READ-ONLY view of the live backing array that does
     /// <b>not</b> privatize a copy-on-write clone. A full contiguous CPU view can also
     /// return its shared backing array: reading it neither transfers ownership nor
@@ -2531,6 +2575,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal T[] GetReadOnlyDataArray()
     {
         var live = LazySource is null ? GetLiveBackingArrayOrNull() : null;
+        if (live is not null)
+        {
+            // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
+            // has to see materialised data.
+            Helpers.HostSync.TryMaterialize(live);
+            return live;
+        }
+        return ToArray();
+    }
+
+    /// <summary><see cref="GetReadOnlyDataArray"/> without the escape mark, for a caller holding this tensor with a <see cref="KeepAliveScope"/>.</summary>
+    internal T[] GetReadOnlyDataArrayUnmarked()
+    {
+        var live = LazySource is null ? GetLiveBackingArrayIdentityOrNull() : null;
         if (live is not null)
         {
             // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
@@ -2568,6 +2626,25 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (_device != TensorDevice.CPU)
             return null;
         return _storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset)
+            && baseOffset == 0
+            ? array
+            : null;
+    }
+
+    /// <summary><see cref="GetLiveBackingArrayOrNull"/> without the escape mark (for the unmarked accessors).</summary>
+    internal T[]? GetLiveBackingArrayIdentityOrNull()
+    {
+        if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
+            return null;
+        // GPU-resident tensors keep the authoritative data on-device; the
+        // CPU backing array may hold stale/placeholder bytes that haven't
+        // been copied back. Pinning that into a specialization would read
+        // the wrong values at replay. Force these callers onto the AsSpan
+        // path, which goes through EnsureMaterialized and copies GPU→CPU
+        // before the caller touches the buffer.
+        if (_device != TensorDevice.CPU)
+            return null;
+        return _storage.TryGetBackingArrayIdentity(out var array, out int baseOffset)
             && baseOffset == 0
             ? array
             : null;

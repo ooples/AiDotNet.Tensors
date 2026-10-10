@@ -11735,6 +11735,9 @@ public partial class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
+        // The input is read through its raw array below: hold it to the end of the method so a recycled result buffer
+        // cannot be handed out from under the kernel. The result is returned, so it is alive across its writes.
+        using var keepInput = new KeepAliveScope(tensor);
         // RentUninitialized — ReLU writes every element, no need to zero
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
@@ -11745,8 +11748,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // offset so views don't copy. JIT path stays for the small
             // cases that already hit it; large cases use the Vector256
             // 4× unrolled max(0, x) implementation.
-            var srcArr = (float[])(object)tensor._storage.GetDataArray();
-            var dstArr = (float[])(object)result._storage.GetDataArray();
+            var srcArr = (float[])(object)tensor._storage.GetDataArrayUnmarked();
+            var dstArr = (float[])(object)result._storage.GetDataArrayUnmarked();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
             int reluChunks = ElementwiseChunks(length);
             if (reluChunks >= 2)
@@ -11782,8 +11785,8 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house ReLU(double) via SimdKernels.ReLUUnsafe(double*).
-            var srcArr = (double[])(object)tensor._storage.GetDataArray();
-            var dstArr = (double[])(object)result._storage.GetDataArray();
+            var srcArr = (double[])(object)tensor._storage.GetDataArrayUnmarked();
+            var dstArr = (double[])(object)result._storage.GetDataArrayUnmarked();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
             fixed (double* pSrcFix = srcArr, pDstFix = dstArr)
             {
@@ -13626,6 +13629,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // RentUninitialized: BLAS GEMM with beta=0 overwrites every element
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, p });
+        // The inputs are read through raw arrays and spans below: hold both to the end of the method so a recycled result
+        // buffer cannot be handed out from under the kernel. The result is returned, so it is alive across its writes.
+        using var keepA = new KeepAliveScope(a);
+        using var keepB = new KeepAliveScope(b);
 
 #if NET5_0_OR_GREATER
         // A streamed inference weight is stored in the quantized kernel layout [P,N]
@@ -13659,9 +13666,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (typeof(T) == typeof(float))
                 {
-                    var aArr = (float[])(object)a.GetReadOnlyDataArray();
-                    var bArr = (float[])(object)b.GetReadOnlyDataArray();
-                    var rArr = (float[])(object)result.GetDataArray();
+                    var aArr = (float[])(object)a.GetReadOnlyDataArrayUnmarked();
+                    var bArr = (float[])(object)b.GetReadOnlyDataArrayUnmarked();
+                    var rArr = (float[])(object)result.GetDataArrayUnmarked();
                     var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = handle };
                     Engines.BlasManaged.BlasManaged.Gemm<float>(
                         aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
@@ -13669,9 +13676,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    var aArr = (double[])(object)a.GetReadOnlyDataArray();
-                    var bArr = (double[])(object)b.GetReadOnlyDataArray();
-                    var rArr = (double[])(object)result.GetDataArray();
+                    var aArr = (double[])(object)a.GetReadOnlyDataArrayUnmarked();
+                    var bArr = (double[])(object)b.GetReadOnlyDataArrayUnmarked();
+                    var rArr = (double[])(object)result.GetDataArrayUnmarked();
                     var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = handle };
                     Engines.BlasManaged.BlasManaged.Gemm<double>(
                         aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
@@ -13694,9 +13701,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Our JIT'd AVX2 GEMM (opt-in). C[m,p] = A[m,n]·B[n,p] ⇒ TryMultiply(M=m,N=p,K=n).
         if (_jitGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
-            var aJ = (float[])(object)a.GetReadOnlyDataArray();
-            var bJ = (float[])(object)b.GetReadOnlyDataArray();
-            var rJ = (float[])(object)result.GetDataArray();
+            var aJ = (float[])(object)a.GetReadOnlyDataArrayUnmarked();
+            var bJ = (float[])(object)b.GetReadOnlyDataArrayUnmarked();
+            var rJ = (float[])(object)result.GetDataArrayUnmarked();
             if (Simd.JitGemmAvx2.TryMultiply(aJ.AsSpan(0, m * n), bJ.AsSpan(0, n * p), rJ.AsSpan(0, m * p), m, p, n))
                 return result;
         }
@@ -13706,9 +13713,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // is unavailable (TrySgemm returns false without mutating C).
         if (_oneDnnGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
-            var aArrO = (float[])(object)a.GetReadOnlyDataArray();
-            var bArrO = (float[])(object)b.GetReadOnlyDataArray();
-            var rArrO = (float[])(object)result.GetDataArray();
+            var aArrO = (float[])(object)a.GetReadOnlyDataArrayUnmarked();
+            var bArrO = (float[])(object)b.GetReadOnlyDataArrayUnmarked();
+            var rArrO = (float[])(object)result.GetDataArrayUnmarked();
             unsafe
             {
                 fixed (float* pA = aArrO, pB = bArrO, pC = rArrO)
@@ -13729,9 +13736,9 @@ public partial class CpuEngine : ITensorLevelEngine
             // costing 1.61x through this wrapper vs the direct kernel (measured --ab-shortm: engine 184 vs
             // direct 296 GF with a GPU present; 377 vs 329 = no penalty with the copy gone). AsSpan is a no-op
             // on genuinely CPU-resident data and skips the per-call snapshot on CPU-resident-but-GPU-tagged.
-            var aArrF = ((Tensor<float>)(object)a).AsSpan();
-            var bArrF = ((Tensor<float>)(object)b).AsSpan();
-            var rArrF = (float[])(object)result.GetDataArray();
+            var aArrF = ((Tensor<float>)(object)a).AsSpanUnmarked();
+            var bArrF = ((Tensor<float>)(object)b).AsSpanUnmarked();
+            var rArrF = (float[])(object)result.GetDataArrayUnmarked();
             // #573 follow-up: above a row-count floor, route through BlasManaged.Gemm (the same
             // dispatcher the pre-packed path above uses) instead of the legacy full-trans
             // SimdGemm.Sgemm overload. With NO PackedB handle it still packs B fresh every call
@@ -13788,7 +13795,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // MatrixMultiplyHelper.MultiplyBlocked accumulates (c += a·b) and does
         // NOT clear the destination. Pre-clear result here so the accumulation
         // starts from zero and we get matmul (c = a·b), not c += a·b.
-        result.AsWritableSpan().Clear();
+        result.AsWritableSpanUnmarked().Clear();
         MatrixMultiplyHelper.MultiplyBlocked(
             numOps, a.ReadOnlyData, b.ReadOnlyData, result.Data, m, n, p, n, p, p);
 

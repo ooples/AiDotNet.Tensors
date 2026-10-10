@@ -524,10 +524,15 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     internal T[]? GetBackingArrayForReadOnlyAccess()
     {
         ResultOwner?.MarkEscaped(); // raw access: see AsSpan
-        return TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int offset) && offset == 0
-            ? array
-            : null;
+        return GetBackingArrayIdentity();
     }
+
+    /// <summary>
+    /// The backing array as an IDENTITY only (cache and epoch keys, release bookkeeping): does not mark the array
+    /// escaped. Never read or write data through it; use a lease or a marking accessor for that.
+    /// </summary>
+    internal T[]? GetBackingArrayIdentity()
+        => TryGetBackingArrayIdentity(out var array, out int offset) && offset == 0 ? array : null;
 
     /// <summary>
     /// Gets the actual managed backing array and the offset at which this
@@ -553,6 +558,14 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     internal bool TryGetBackingArraySegmentForReadOnlyAccess(out T[]? array, out int offset)
     {
         ResultOwner?.MarkEscaped(); // raw access: see AsSpan
+        return TryGetBackingArrayIdentity(out array, out offset);
+    }
+
+    /// <summary>
+    /// <see cref="TryGetBackingArraySegmentForReadOnlyAccess"/> as an IDENTITY only (see <see cref="GetBackingArrayIdentity"/>).
+    /// </summary>
+    internal bool TryGetBackingArrayIdentity(out T[]? array, out int offset)
+    {
         // Memory<T>.Empty is backed by the process-wide Array.Empty<T>() singleton. A
         // zero-allocation GPU vector therefore has an implementation array, but it does
         // not yet have a host backing store. Exposing that singleton as cache identity
@@ -596,6 +609,16 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
         // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
         // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
         ResultOwner?.MarkEscaped();
+        return GetDataArrayUnmarked();
+    }
+
+    /// <summary>
+    /// <see cref="GetDataArray"/> without the escape mark, for a caller that keeps this vector alive for as long as it
+    /// uses the array: an op writing the result it returns, or reading an input it holds with a
+    /// <see cref="KeepAliveScope"/>.
+    /// </summary>
+    internal T[] GetDataArrayUnmarked()
+    {
         _beforeWrite?.Invoke();
         EnsureMaterialized();
 

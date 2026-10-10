@@ -197,7 +197,7 @@ internal sealed class TensorStorage<T>
         _data = data ?? throw new ArgumentNullException(nameof(data));
         _refCount = 1;
         if (shareExternalGpuCacheEpoch
-            && data.TryGetBackingArraySegmentForReadOnlyAccess(out var externalArray, out _)
+            && data.TryGetBackingArrayIdentity(out var externalArray, out _)   // identity: the epoch table key
             && externalArray is not null)
         {
             _externalArray = externalArray;
@@ -207,7 +207,7 @@ internal sealed class TensorStorage<T>
         if (Helpers.HostSync.HasPendingMaterializations)
         {
             _trackGpuCacheVersion = Helpers.HostSync.IsPending(data)
-                || (data.GetBackingArrayForReadOnlyAccess() is { } array
+                || (data.GetBackingArrayIdentity() is { } array
                     && Helpers.HostSync.IsPending(array));
             if (_trackGpuCacheVersion && ExternalEpoch(create: true) is { } external)
                 Volatile.Write(ref external.IsTracked, true);
@@ -372,6 +372,14 @@ internal sealed class TensorStorage<T>
         return _data.GetDataArray();
     }
 
+    /// <summary><see cref="GetDataArray"/> without the escape mark; see <see cref="VectorBase{T}.GetDataArrayUnmarked"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal T[] GetDataArrayUnmarked()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.GetDataArrayUnmarked();
+    }
+
     /// <summary>
     /// Gets the actual managed backing array and the base offset of this
     /// storage without materializing a copy.
@@ -384,6 +392,11 @@ internal sealed class TensorStorage<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal bool TryGetBackingArraySegmentForReadOnlyAccess(out T[]? array, out int offset)
         => _data.TryGetBackingArraySegmentForReadOnlyAccess(out array, out offset);
+
+    /// <summary>Backing lookup as an IDENTITY only: does not mark the array escaped (see VectorBase.GetBackingArrayIdentity).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetBackingArrayIdentity(out T[]? array, out int offset)
+        => _data.TryGetBackingArrayIdentity(out array, out offset);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ThrowIfReadOnlyMapped()
