@@ -415,41 +415,6 @@ public partial class DirectGpuTensorEngine
 
     // ---- CpuEngine.TorchPool.cs ----
 
-    /// <inheritdoc/>
-    public override Tensor<T> TensorAdaptiveAvgPool1D<T>(Tensor<T> input, int outputSize)
-    {
-        GpuLaunchProbe.OnFallback("TensorAdaptiveAvgPool1D: no device kernel", null);
-        return base.TensorAdaptiveAvgPool1D<T>(input, outputSize);
-    }
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorAdaptiveAvgPool3D<T>(Tensor<T> input, int[] outputSize)
-    {
-        GpuLaunchProbe.OnFallback("TensorAdaptiveAvgPool3D: no device kernel", null);
-        return base.TensorAdaptiveAvgPool3D<T>(input, outputSize);
-    }
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorAdaptiveMaxPool1D<T>(Tensor<T> input, int outputSize)
-    {
-        GpuLaunchProbe.OnFallback("TensorAdaptiveMaxPool1D: no device kernel", null);
-        return base.TensorAdaptiveMaxPool1D<T>(input, outputSize);
-    }
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorAdaptiveMaxPool3D<T>(Tensor<T> input, int[] outputSize)
-    {
-        GpuLaunchProbe.OnFallback("TensorAdaptiveMaxPool3D: no device kernel", null);
-        return base.TensorAdaptiveMaxPool3D<T>(input, outputSize);
-    }
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorLpPool<T>(Tensor<T> input, double power, int[] kernelSize, int[]? stride = null)
-    {
-        GpuLaunchProbe.OnFallback("TensorLpPool: no device kernel", null);
-        return base.TensorLpPool<T>(input, power, kernelSize, stride);
-    }
-
     // ---- CpuEngine.TorchRandom.cs ----
 
     /// <inheritdoc/>
