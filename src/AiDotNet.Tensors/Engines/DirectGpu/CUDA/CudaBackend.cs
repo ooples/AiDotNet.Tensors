@@ -1950,7 +1950,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         return devicePtr;
     }
 
-    public IGpuBuffer AllocateBuffer(int size)
+    public IGpuBuffer AllocateBuffer(int size) => AllocateBuffer(size, recordDirectPtxEvidence: true);
+
+    /// <param name="recordDirectPtxEvidence">
+    /// False only for backend-internal setup that is not DirectPtx work -- the per-thread cuBLAS workspace, created
+    /// on a thread's first capture or GEMM. Counting it made a capture of a prewarmed DirectPtx kernel on a fresh
+    /// thread look like an 8 MiB DirectPtx allocation (PrewarmedExperimentalFamilies_AreZeroAllocationAndGraphCapturable).
+    /// </param>
+    private IGpuBuffer AllocateBuffer(int size, bool recordDirectPtxEvidence)
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
@@ -1959,7 +1966,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
-        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
+        if (recordDirectPtxEvidence) RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
@@ -6001,7 +6008,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // AIDOTNET_CUBLAS_WORKSPACE=0: kill switch back to cuBLAS's internal allocator (and per-slice capture GEMMs).
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_WORKSPACE") == "0") throw new InvalidOperationException("cuBLAS workspace disabled");
-            workspace = AllocateBuffer(CublasWorkspaceFloats);
+            workspace = AllocateBuffer(CublasWorkspaceFloats, recordDirectPtxEvidence: false);
             var status = CuBlasNative.cublasSetWorkspace(h, workspace.Handle, (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
             if ((int)status != 0)   // CUBLAS_STATUS_SUCCESS
             {
