@@ -6560,6 +6560,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorAddInPlace(a, b); return; }
         // #3 FP16-act: FP16-native residual add when a is FP16-resident (keeps the activation FP16, no convert).
         if (TryFp16AddInPlace(a, b)) return;
         // Version-counter contract is enforced inside TryRunBinaryInPlace
@@ -6580,6 +6582,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyInPlace(a, b); return; }
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Multiply(bufA, bufB, bufA, size)))
             return;
@@ -6596,6 +6600,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorSubtractInPlace(a, b); return; }
         if (!a.IsContiguous) { base.TensorSubtractInPlace(a, b); return; }
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Subtract(bufA, bufB, bufA, size)))
@@ -6613,6 +6619,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyScalarInPlace(a, scalar); return; }
         if (!a.IsContiguous) { base.TensorMultiplyScalarInPlace(a, scalar); return; }
         var scalarF = ToFloatScalar(scalar);
         if (TryRunUnaryInPlace(a,
@@ -6631,6 +6639,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorBroadcastAddInPlace(a, b); return; }
         // #3 FP16-act: keep the activation FP16 across the add. Same-shape → FP16 residual add; per-channel
         // broadcast ([N,C,H,W] += [.,C,1,1]) → FP16 broadcast-add. Both no-op back to FP32 if not tagged.
         if (ShapesMatch(a.Shape._dims, b.Shape._dims)) { if (TryFp16AddInPlace(a, b)) return; }
@@ -6669,6 +6679,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.SigmoidInPlace(tensor); return; }
         if (TryRunUnaryInPlace(tensor,
             static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
             return;
@@ -6684,6 +6696,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.ReLUInPlace(tensor); return; }
         if (TryRunUnaryInPlace(tensor,
             static (backend, buf, size) => backend.Relu(buf, buf, size)))
             return;

@@ -2771,6 +2771,62 @@ public sealed class GradientTape<T> : IDisposable
 
     private Dictionary<Tensor<T>, List<Action<Tensor<T>, Tensor<T>>>>? _postAccumulateHooks;
 
+    /// <summary>
+    /// Moves <paramref name="target"/>'s autograd history to a snapshot of its current value, before an in-place
+    /// write, and returns the snapshot.
+    /// </summary>
+    /// <remarks>
+    /// <para>Gradients are keyed by tensor object and the graph walk follows <c>GradFn</c>, so a tensor overwritten in
+    /// place would otherwise be both the output of its producer and of the in-place op: the producer would read the
+    /// gradient of the NEW value (the graph walk never even reached it once the in-place op took over
+    /// <c>GradFn</c>). Here the snapshot takes the producer's node and the target's place in every entry recorded
+    /// since that producer (as output or input, with its version), so the old value keeps its history and its
+    /// consumers' gradients, and the caller records the write as old -> target. Unlike torch, consumers of the old
+    /// value still differentiate correctly instead of failing a version check: they now read the snapshot.</para>
+    /// <para>The scan runs from the newest entry back to the target's producer (every consumer of the old value was
+    /// recorded after it), so its cost is the ops since the producer, not the tape length.</para>
+    /// </remarks>
+    internal Tensor<T> RebaseForInPlace(Tensor<T> target)
+    {
+        if (target is null) throw new ArgumentNullException(nameof(target));
+        var old = (Tensor<T>)target.Clone();
+        var node = target.GradFn;
+        old.GradFn = node;
+        if (node is not null && ReferenceEquals(node.Output, target)) node.Output = old;
+        target.GradFn = null;
+        old._pinnedByTape = target._pinnedByTape;
+        for (int i = _entries.Count - 1; i >= 0; i--)
+        {
+            ref var e = ref _entries[i];
+            if (e.Output is null) continue;
+            bool producer = ReferenceEquals(e.Output, target);
+            if (producer) e.Output = old;
+            if (ReferenceEquals(e.Input0, target)) { e.Input0 = old; e.Version0 = old.Version; }
+            if (ReferenceEquals(e.Input1, target)) { e.Input1 = old; e.Version1 = old.Version; }
+            if (ReferenceEquals(e.Input2, target)) { e.Input2 = old; e.Version2 = old.Version; }
+            if (e.InputsOverflow is { } overflow)
+                for (int k = 0; k < overflow.Length; k++)
+                    if (ReferenceEquals(overflow[k], target))
+                    {
+                        overflow[k] = old;
+                        if (e.InputVersionsOverflow is { } versions && k < versions.Length) versions[k] = old.Version;
+                    }
+            if (e.Output.GradFn is { } consumer && !ReferenceEquals(consumer, node)) RepointNodeInputs(consumer, target, old);
+            if (producer) break;
+        }
+        return old;
+    }
+
+    private static void RepointNodeInputs(GradNode<T> n, Tensor<T> from, Tensor<T> to)
+    {
+        if (ReferenceEquals(n.Input0, from)) n.Input0 = to;
+        if (ReferenceEquals(n.Input1, from)) n.Input1 = to;
+        if (ReferenceEquals(n.Input2, from)) n.Input2 = to;
+        if (n.InputsOverflow is { } overflow)
+            for (int k = 0; k < overflow.Length; k++)
+                if (ReferenceEquals(overflow[k], from)) overflow[k] = to;
+    }
+
     private sealed class PostAccumulateHookHandle : IDisposable
     {
         private List<Action<Tensor<T>, Tensor<T>>>? _list;

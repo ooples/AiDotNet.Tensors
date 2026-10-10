@@ -495,31 +495,16 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
-    /// Records a cut in <paramref name="target"/>'s gradient: the walk reaches this entry after every use of the
-    /// tensor recorded later and drops their accumulated gradient, so none of it flows on to the tensor's producer.
-    /// Uses recorded before the cut still contribute. The in-place <c>detach_</c>: the tensor keeps its identity, and
-    /// gradients are keyed by identity, so clearing its <c>GradFn</c> alone would not stop the tape walk.
+    /// Before an in-place write: moves <paramref name="target"/>'s autograd history to a snapshot of its value and
+    /// returns the snapshot, or null when no tape records in-place ops (see <see cref="GradientTape{T}.RebaseForInPlace"/>).
+    /// The in-place op reads the snapshot and records snapshot -> target.
     /// </summary>
-    internal static void RecordGradientCut<T>(Tensor<T> target)
+    internal static Tensor<T>? RebaseForInPlace<T>(Tensor<T> target)
     {
-        if (_anyTapeActive == 0) return;
+        if (_anyTapeActive == 0) return null;
         var tape = GradientTape<T>.Current;
-        if (tape is null || NoGradScope<T>.IsSuppressed) return;
-        ref var slot = ref tape.RecordSlot(out bool accepted);
-        if (!accepted) return;
-        var placeholder = GradientCutPlaceholder<T>.Instance;
-        slot.OperationName = "GradientCut";
-        slot.Output = target;
-        slot.Backward = BackwardFunctions<T>.GradientCutBackward;
-        slot.SavedState = null;
-        slot.Input0 = placeholder;   // an entry needs one input; nothing ever writes this one
-        slot.InputCount = 1;
-        slot.Version0 = placeholder.Version;
-    }
-
-    private static class GradientCutPlaceholder<T>
-    {
-        internal static readonly Tensor<T> Instance = new Tensor<T>(new[] { 0 });
+        if (tape is null || !tape.Options.RecordInPlace || NoGradScope<T>.IsSuppressed) return null;
+        return tape.RebaseForInPlace(target);
     }
 
     /// <summary>

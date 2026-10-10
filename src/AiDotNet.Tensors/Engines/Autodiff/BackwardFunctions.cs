@@ -371,12 +371,6 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
         => DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
 
-    /// <summary>A gradient cut (<c>detach_</c>): drops the gradient that reached the tensor, passing nothing on.</summary>
-    internal static void GradientCutBackward(
-        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
-        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
-        => grads.Remove(output);
-
     /// <summary>d(acosh(x))/dx = grad / sqrt(x^2 - 1)</summary>
     internal static void AcoshBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

@@ -15,7 +15,9 @@ namespace AiDotNet.Tensors.Engines;
 /// GPU engine runs its kernels) and writes the result over the tensor: through <see cref="IEngine.TensorCopy{T}"/>
 /// for a contiguous tensor, element by element through the view otherwise, so every alias of the storage sees the
 /// write. It records like the hand-written in-place ops (<see cref="ReLUInPlace{T}"/> ...): under graph capture as
-/// an in-place node, under a gradient tape with the op reading a snapshot of the pre-write value.</para>
+/// an in-place node; under a gradient tape the tensor's history first moves to a snapshot of its value
+/// (<see cref="DifferentiableOps.RebaseForInPlace{T}"/>), the op reads the snapshot, and the write is recorded
+/// snapshot -> tensor.</para>
 /// <para><b>True in place.</b> Where the result is bit-identical to the out-of-place op, and nothing records, the
 /// elementwise ops write the tensor's own buffer with no temporary (<see cref="TryUnaryInPlaceFast{U}"/>).</para>
 /// <para><b>Layout ops</b> (<c>squeeze_</c>, <c>t_</c>, <c>as_strided_</c>, <c>set_</c>, <c>resize_</c>) change the
@@ -52,10 +54,12 @@ public partial class CpuEngine
 
     private static void InPlaceEager<U>(IEngine engine, Tensor<U> target, string opName, Func<IEngine, Tensor<U>, Tensor<U>> op)
     {
-        bool record = IsRecordingInPlace<U>();
-        // Under a tape the op reads a snapshot: its recorded input must keep the pre-write value its backward needs.
-        var input = record ? target.Clone() : target;
-        var result = op(engine, input);
+        // Under a tape the target's history moves to a snapshot of its current value (the op's recorded input keeps
+        // the pre-write value its backward needs, and the producer's gradient stays the old value's), and the write
+        // is recorded snapshot -> target.
+        var old = DifferentiableOps.RebaseForInPlace(target);
+        bool record = old is not null;
+        var result = op(engine, old ?? target);
         if (!ShapesEqual(result._shape, target._shape))
             throw new InvalidOperationException(
                 $"{opName}: the result has shape [{string.Join(", ", result._shape)}] but the tensor written in place has " +
@@ -65,7 +69,8 @@ public partial class CpuEngine
         if (record) DifferentiableOps.RecordUnary(opName, target, result, BackwardFunctions<U>.InPlaceAssignBackward);
     }
 
-    private static bool IsRecordingInPlace<U>()
+    // True when a gradient tape records in-place writes on this thread: in-place ops then take the recorded path.
+    internal static bool IsRecordingInPlace<U>()
     {
         if (DifferentiableOps._anyTapeActive == 0) return false;
         var tape = GradientTape<U>.Current;
@@ -114,7 +119,7 @@ public partial class CpuEngine
         int length = tensor.Length;
         if (typeof(U) == typeof(float))
         {
-            var span = System.Runtime.InteropServices.MemoryMarshal.Cast<U, float>(tensor.AsWritableSpan());
+            Span<float> span = ((Tensor<float>)(object)tensor).AsWritableSpan();
             fixed (float* p = span)
             {
                 var ptr = (IntPtr)p;
@@ -130,7 +135,7 @@ public partial class CpuEngine
         }
         else
         {
-            var span = System.Runtime.InteropServices.MemoryMarshal.Cast<U, double>(tensor.AsWritableSpan());
+            Span<double> span = ((Tensor<double>)(object)tensor).AsWritableSpan();
             fixed (double* p = span)
             {
                 var ptr = (IntPtr)p;
@@ -159,7 +164,8 @@ public partial class CpuEngine
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, opName);
         IEngine engine = this;
         Tensor<U>? recorded = null;
-        if (IsRecordingInPlace<U>()) recorded = viewOp(engine, tensor.Clone());
+        var old = DifferentiableOps.RebaseForInPlace(tensor);
+        if (old is not null) recorded = viewOp(engine, old);
         Tensor<U> layout;
         using (new NoGradScope<U>()) layout = viewOp(engine, tensor);
         tensor.AdoptFrom(layout);
@@ -189,9 +195,9 @@ public partial class CpuEngine
     public virtual void TensorDetachInPlace<T>(Tensor<T> tensor)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        // The tensor keeps its identity, and the tape keys gradients by identity: a cut entry absorbs the gradient of
-        // every use recorded after this point, so none of it reaches the producer, while uses recorded before still do.
-        DifferentiableOps.RecordGradientCut(tensor);
+        // The history moves to a snapshot that every use recorded so far now reads, so those uses still reach the
+        // producer; the tensor itself is left with none, and gradients of later uses stop at it.
+        DifferentiableOps.RebaseForInPlace(tensor);
         tensor.GradFn = null;
     }
 
