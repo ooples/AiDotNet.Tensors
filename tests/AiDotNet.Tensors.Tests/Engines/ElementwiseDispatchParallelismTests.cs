@@ -26,11 +26,14 @@ public class ElementwiseDispatchParallelismTests
         return dst;
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Ops))]
     public void LargeFloatElementwise_FansOut_SmallStaysSerial(string op)
     {
-        if (!CpuJitSelfTest.IsVerified) return;   // the JIT dispatchers only run when the self-test verified them
+        // The JIT dispatchers only run once the self-test verifies them. Unsupported hardware (no AVX2/FMA, not
+        // Windows x64, or .NET Framework) skips; a supported machine whose self-test fails is a real failure.
+        Skip.IfNot(CpuJitKernels.IsSupported, "The CPU JIT is not supported on this machine.");
+        Assert.True(CpuJitSelfTest.IsVerified, "The CPU JIT is supported here but its self-test failed.");
         int previousDop = CpuParallelSettings.MaxDegreeOfParallelism;
         CpuParallelSettings.MaxDegreeOfParallelism = 8;
         try

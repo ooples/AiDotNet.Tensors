@@ -46333,6 +46333,14 @@ public partial class CpuEngine : ITensorLevelEngine
     #region JIT Dispatch Helpers
 
     /// <summary>
+    /// Chunks the last float JIT elementwise dispatch on this thread fanned out to (0 = ran serially). A test hook:
+    /// these dispatchers once returned through the SERIAL path whenever the array was large enough to split,
+    /// leaving every large float add/subtract/multiply/divide/min/max/relu on one core -- correct values, so only
+    /// a dispatch assertion catches it (ElementwiseDispatchParallelismTests).
+    /// </summary>
+    [ThreadStatic] internal static int t_lastElementwiseDispatchChunks;
+
+    /// <summary>
     /// Runs a float binary elementwise op (Add / Subtract / Multiply / Divide) on SimdKernels, split across threads
     /// at the shared <see cref="ElementwiseGrain"/> (one chunk per grain, at most the pool width).
     /// </summary>
@@ -46341,14 +46349,6 @@ public partial class CpuEngine : ITensorLevelEngine
     /// a 1M-element float subtract in 30 chunks: the JIT kernel 602 µs in parallel and 155 µs serial,
     /// <see cref="SimdKernels"/> 25.5 µs in parallel and 124 µs serial (libtorch: 32 µs).
     /// </remarks>
-    /// <summary>
-    /// Chunks the last float JIT elementwise dispatch on this thread fanned out to (0 = ran serially). A test hook:
-    /// these dispatchers once returned through the SERIAL path whenever the array was large enough to split,
-    /// leaving every large float add/subtract/multiply/divide/min/max/relu on one core -- correct values, so only
-    /// a dispatch assertion catches it (ElementwiseDispatchParallelismTests).
-    /// </summary>
-    [ThreadStatic] internal static int t_lastElementwiseDispatchChunks;
-
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
         int numChunks = ElementwiseChunks(length);
