@@ -59,14 +59,22 @@ public class SharedMemoryAndPostAccumulateHookTests
         IEngine engine = new CpuEngine();
         var x = new Tensor<double>(new double[] { 1, 2 }, new[] { 2 });
         int calls = 0;
-        using var tape = new GradientTape<double>();
-        var handle = tape.RegisterPostAccumulateGradHook(x, (_, g) => { calls++; Assert.Equal(new double[] { 3, 3 }, g.ToArray()); });
-        var loss = engine.ReduceSum(engine.TensorMultiplyScalar(x, 3.0), null);
-        tape.ComputeGradientsStreaming(loss, new[] { x }, (_, _) => { });
+        using (var tape = new GradientTape<double>())
+        {
+            tape.RegisterPostAccumulateGradHook(x, (_, g) => { calls++; Assert.Equal(new double[] { 3, 3 }, g.ToArray()); });
+            var loss = engine.ReduceSum(engine.TensorMultiplyScalar(x, 3.0), null);
+            tape.ComputeGradientsStreaming(loss, new[] { x }, (_, _) => { });
+        }
         Assert.Equal(1, calls);
-        handle.Dispose();
-        var loss2 = engine.ReduceSum(engine.TensorMultiplyScalar(x, 3.0), null);
-        tape.ComputeGradients(loss2, new[] { x });
+
+        // A streaming backward releases the tape's graph, so the removal is checked on a tape of its own.
+        using (var tape = new GradientTape<double>())
+        {
+            var handle = tape.RegisterPostAccumulateGradHook(x, (_, _) => calls++);
+            handle.Dispose();
+            var loss = engine.ReduceSum(engine.TensorMultiplyScalar(x, 3.0), null);
+            tape.ComputeGradients(loss, new[] { x });
+        }
         Assert.Equal(1, calls);
     }
 }

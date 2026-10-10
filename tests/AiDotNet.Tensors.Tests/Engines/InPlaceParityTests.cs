@@ -95,12 +95,17 @@ public class InPlaceParityTests
         {
             string baseName = inPlace.Name.Substring(0, inPlace.Name.Length - "InPlace".Length);
             var ipParams = inPlace.GetParameters();
-            // The out-of-place op with the same parameter types (the in-place form puts the tensor first).
+            // The out-of-place op with exactly the same parameter types once constructed (the in-place form puts the tensor
+            // first, so the order may differ). Comparing constructed types matters: Tensor<int> and Tensor<T> share a name.
+            static Type[] Constructed(System.Reflection.MethodInfo m)
+                => (m.IsGenericMethodDefinition ? m.MakeGenericMethod(typeof(double)) : m).GetParameters()
+                    .Select(p => p.ParameterType).OrderBy(t => t.FullName).ToArray();
+            if (!inPlace.IsGenericMethodDefinition && inPlace.GetParameters()[0].ParameterType != typeof(Tensor<Bit>)) continue;
+            var ipTypes = Constructed(inPlace);
             var outOfPlace = typeof(IEngine).GetMethods().FirstOrDefault(m =>
-                m.Name == baseName && m.GetParameters().Length == ipParams.Length &&
-                m.GetParameters().Select(p => p.ParameterType.Name).OrderBy(s => s)
-                    .SequenceEqual(ipParams.Select(p => p.ParameterType.Name).OrderBy(s => s)) &&
-                m.ReturnType.IsGenericType);
+                m.Name == baseName && m.GetParameters().Length == ipParams.Length && m.ReturnType.IsGenericType &&
+                (m.IsGenericMethodDefinition ? m.GetGenericArguments().Length == 1 : true) &&
+                Constructed(m).SequenceEqual(ipTypes));
             if (outOfPlace is null) continue;   // hand-written forms are covered by the tests below
 
             var ip = inPlace.IsGenericMethodDefinition ? inPlace.MakeGenericMethod(typeof(double)) : inPlace;
@@ -123,10 +128,12 @@ public class InPlaceParityTests
                 for (int j = 0; j < opArgs.Length; j++)
                 {
                     var pj = op.GetParameters()[j];
-                    int k = Enumerable.Range(0, args.Length).First(i => !used[i] && ip.GetParameters()[i].ParameterType == pj.ParameterType && (i != 0 || pj.ParameterType == typeof(Tensor<double>)));
+                    int k = Enumerable.Range(0, args.Length).Where(i => !used[i] && ip.GetParameters()[i].ParameterType == pj.ParameterType).DefaultIfEmpty(-1).First();
+                    if (k < 0) break;
                     used[k] = true;
                     opArgs[j] = k == 0 ? self.Clone() : args[k];
                 }
+                if (used.Any(x => !x)) { skipped.Add($"{inPlace.Name}: parameters do not pair with {baseName}"); break; }
                 Tensor<double> expected;
                 try { expected = (Tensor<double>)op.Invoke(_engine, opArgs)!; }
                 catch (TargetInvocationException) { continue; }   // this shape is outside the op's contract; try the next
