@@ -97,6 +97,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorArange<T>(double start, double end, double step = 1)
     {
+        if (TryRangeOnDevice<T>("TensorArange", start, step, RangeCount(start, end, step, Math.Ceiling((end - start) / step))) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorArange: no device kernel", null);
         return base.TensorArange<T>(start, end, step);
     }
@@ -104,6 +105,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRange<T>(double start, double end, double step = 1)
     {
+        if (TryRangeOnDevice<T>("TensorRange", start, step, RangeCount(start, end, step, Math.Floor((end - start) / step + 1))) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRange: no device kernel", null);
         return base.TensorRange<T>(start, end, step);
     }
@@ -111,6 +113,9 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorLogspace<T>(double start, double end, int steps, double logBase = 10)
     {
+        if (steps >= 0 && TryGenerateOnDevice<T>("TensorLogspace", new[] { steps }, steps,
+                (k, _, output) => k.TorchParityLogspace(output, steps, start, end - start, steps - 1, logBase, steps == 1)) is { } onDevice)
+            return onDevice;
         GpuLaunchProbe.OnFallback("TensorLogspace: no device kernel", null);
         return base.TensorLogspace<T>(start, end, steps, logBase);
     }
@@ -118,6 +123,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorZerosLike<T>(Tensor<T> tensor)
     {
+        if (TryFillLikeOnDevice("TensorZerosLike", tensor, 0) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorZerosLike: no device kernel", null);
         return base.TensorZerosLike<T>(tensor);
     }
@@ -125,6 +131,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorOnesLike<T>(Tensor<T> tensor)
     {
+        if (TryFillLikeOnDevice("TensorOnesLike", tensor, 1) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorOnesLike: no device kernel", null);
         return base.TensorOnesLike<T>(tensor);
     }
@@ -132,6 +139,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorFullLike<T>(Tensor<T> tensor, T value)
     {
+        if (TryFillLikeOnDevice("TensorFullLike", tensor, MathHelper.GetNumericOperations<T>().ToDouble(value)) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorFullLike: no device kernel", null);
         return base.TensorFullLike<T>(tensor, value);
     }
@@ -139,6 +147,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorEmptyLike<T>(Tensor<T> tensor)
     {
+        if (TryFillLikeOnDevice("TensorEmptyLike", tensor, 0) is { } onDevice) return onDevice;   // the CPU zero-fills too
         GpuLaunchProbe.OnFallback("TensorEmptyLike: no device kernel", null);
         return base.TensorEmptyLike<T>(tensor);
     }
@@ -181,6 +190,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorHannWindow<T>(int length, bool periodic = true)
     {
+        if (TryWindowOnDevice<T>("TensorHannWindow", length, periodic, 0, 0, 0) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorHannWindow: no device kernel", null);
         return base.TensorHannWindow<T>(length, periodic);
     }
@@ -188,6 +198,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorHammingWindow<T>(int length, bool periodic = true, double alpha = 0.54, double beta = 0.46)
     {
+        if (TryWindowOnDevice<T>("TensorHammingWindow", length, periodic, 1, alpha, beta) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorHammingWindow: no device kernel", null);
         return base.TensorHammingWindow<T>(length, periodic, alpha, beta);
     }
@@ -195,6 +206,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorBlackmanWindow<T>(int length, bool periodic = true)
     {
+        if (TryWindowOnDevice<T>("TensorBlackmanWindow", length, periodic, 2, 0, 0) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorBlackmanWindow: no device kernel", null);
         return base.TensorBlackmanWindow<T>(length, periodic);
     }
@@ -202,6 +214,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorBartlettWindow<T>(int length, bool periodic = true)
     {
+        if (TryWindowOnDevice<T>("TensorBartlettWindow", length, periodic, 3, 0, 0) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorBartlettWindow: no device kernel", null);
         return base.TensorBartlettWindow<T>(length, periodic);
     }
@@ -209,6 +222,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorKaiserWindow<T>(int length, bool periodic = true, double beta = 12)
     {
+        if (TryWindowOnDevice<T>("TensorKaiserWindow", length, periodic, 4, beta, 0) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorKaiserWindow: no device kernel", null);
         return base.TensorKaiserWindow<T>(length, periodic, beta);
     }
@@ -216,6 +230,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorTrilIndices<T>(int row, int col, int offset = 0)
     {
+        if (TryTriIndicesOnDevice<T>("TensorTrilIndices", row, col, offset, lower: true) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorTrilIndices: no device kernel", null);
         return base.TensorTrilIndices<T>(row, col, offset);
     }
@@ -223,6 +238,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorTriuIndices<T>(int row, int col, int offset = 0)
     {
+        if (TryTriIndicesOnDevice<T>("TensorTriuIndices", row, col, offset, lower: false) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorTriuIndices: no device kernel", null);
         return base.TensorTriuIndices<T>(row, col, offset);
     }
@@ -653,6 +669,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorIsReal<T>(Tensor<T> tensor)
     {
+        if (TryFillLikeOnDevice("TensorIsReal", tensor, 1) is { } onDevice) return onDevice;   // every real element is real
         GpuLaunchProbe.OnFallback("TensorIsReal: no device kernel", null);
         return base.TensorIsReal<T>(tensor);
     }
@@ -771,6 +788,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorIgamma<T>(Tensor<T> a, Tensor<T> x)
     {
+        if (TryParityBinaryOnDevice(a, x, TorchParityBinaryOp.Igamma) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorIgamma: no device kernel", null);
         return base.TensorIgamma<T>(a, x);
     }
@@ -778,6 +796,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorIgammac<T>(Tensor<T> a, Tensor<T> x)
     {
+        if (TryParityBinaryOnDevice(a, x, TorchParityBinaryOp.Igammac) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorIgammac: no device kernel", null);
         return base.TensorIgammac<T>(a, x);
     }
@@ -785,6 +804,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorMvlgamma<T>(Tensor<T> tensor, int p)
     {
+        // p < 1 stays on the CPU path, which rejects it; p travels as a float, exact up to 2^24.
+        if (p >= 1 && p <= (1 << 24) && TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.Mvlgamma, p, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorMvlgamma: no device kernel", null);
         return base.TensorMvlgamma<T>(tensor, p);
     }
@@ -816,6 +837,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorLogNdtr<T>(Tensor<T> tensor)
     {
+        if (TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.LogNdtr, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorLogNdtr: no device kernel", null);
         return base.TensorLogNdtr<T>(tensor);
     }
@@ -879,6 +901,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorModifiedBesselK0<T>(Tensor<T> tensor)
     {
+        if (TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.ModifiedBesselK0, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorModifiedBesselK0: no device kernel", null);
         return base.TensorModifiedBesselK0<T>(tensor);
     }
@@ -886,6 +909,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorModifiedBesselK1<T>(Tensor<T> tensor)
     {
+        if (TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.ModifiedBesselK1, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorModifiedBesselK1: no device kernel", null);
         return base.TensorModifiedBesselK1<T>(tensor);
     }
@@ -893,6 +917,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorScaledModifiedBesselK0<T>(Tensor<T> tensor)
     {
+        if (TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.ScaledModifiedBesselK0, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorScaledModifiedBesselK0: no device kernel", null);
         return base.TensorScaledModifiedBesselK0<T>(tensor);
     }
@@ -900,6 +925,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorScaledModifiedBesselK1<T>(Tensor<T> tensor)
     {
+        if (TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.ScaledModifiedBesselK1, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorScaledModifiedBesselK1: no device kernel", null);
         return base.TensorScaledModifiedBesselK1<T>(tensor);
     }
@@ -907,6 +933,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorSphericalBesselJ0<T>(Tensor<T> tensor)
     {
+        if (TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.SphericalBesselJ0, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorSphericalBesselJ0: no device kernel", null);
         return base.TensorSphericalBesselJ0<T>(tensor);
     }
@@ -914,6 +941,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorAiryAi<T>(Tensor<T> tensor)
     {
+        if (TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.AiryAi, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorAiryAi: no device kernel", null);
         return base.TensorAiryAi<T>(tensor);
     }
@@ -921,6 +949,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorChebyshevPolynomialT<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 0, false, "TensorChebyshevPolynomialT") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorChebyshevPolynomialT: no device kernel", null);
         return base.TensorChebyshevPolynomialT<T>(x, n);
     }
@@ -928,6 +957,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorChebyshevPolynomialU<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 1, false, "TensorChebyshevPolynomialU") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorChebyshevPolynomialU: no device kernel", null);
         return base.TensorChebyshevPolynomialU<T>(x, n);
     }
@@ -935,6 +965,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorChebyshevPolynomialV<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 2, false, "TensorChebyshevPolynomialV") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorChebyshevPolynomialV: no device kernel", null);
         return base.TensorChebyshevPolynomialV<T>(x, n);
     }
@@ -942,6 +973,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorChebyshevPolynomialW<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 3, false, "TensorChebyshevPolynomialW") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorChebyshevPolynomialW: no device kernel", null);
         return base.TensorChebyshevPolynomialW<T>(x, n);
     }
@@ -949,6 +981,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorShiftedChebyshevPolynomialT<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 0, true, "TensorShiftedChebyshevPolynomialT") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorShiftedChebyshevPolynomialT: no device kernel", null);
         return base.TensorShiftedChebyshevPolynomialT<T>(x, n);
     }
@@ -956,6 +989,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorShiftedChebyshevPolynomialU<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 1, true, "TensorShiftedChebyshevPolynomialU") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorShiftedChebyshevPolynomialU: no device kernel", null);
         return base.TensorShiftedChebyshevPolynomialU<T>(x, n);
     }
@@ -963,6 +997,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorShiftedChebyshevPolynomialV<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 2, true, "TensorShiftedChebyshevPolynomialV") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorShiftedChebyshevPolynomialV: no device kernel", null);
         return base.TensorShiftedChebyshevPolynomialV<T>(x, n);
     }
@@ -970,6 +1005,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorShiftedChebyshevPolynomialW<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 3, true, "TensorShiftedChebyshevPolynomialW") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorShiftedChebyshevPolynomialW: no device kernel", null);
         return base.TensorShiftedChebyshevPolynomialW<T>(x, n);
     }
@@ -977,6 +1013,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorHermitePolynomialH<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 4, false, "TensorHermitePolynomialH") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorHermitePolynomialH: no device kernel", null);
         return base.TensorHermitePolynomialH<T>(x, n);
     }
@@ -984,6 +1021,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorHermitePolynomialHe<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 5, false, "TensorHermitePolynomialHe") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorHermitePolynomialHe: no device kernel", null);
         return base.TensorHermitePolynomialHe<T>(x, n);
     }
@@ -991,6 +1029,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorLaguerrePolynomialL<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 6, false, "TensorLaguerrePolynomialL") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorLaguerrePolynomialL: no device kernel", null);
         return base.TensorLaguerrePolynomialL<T>(x, n);
     }
@@ -998,6 +1037,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorLegendrePolynomialP<T>(Tensor<T> x, Tensor<T> n)
     {
+        if (TryPolynomialOnDevice(x, n, 7, false, "TensorLegendrePolynomialP") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorLegendrePolynomialP: no device kernel", null);
         return base.TensorLegendrePolynomialP<T>(x, n);
     }

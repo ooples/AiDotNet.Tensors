@@ -74,7 +74,7 @@ public partial class CpuEngine
         return FromDoubles<T>(new[] { count }, i => start + i * step);
     }
 
-    private static int RangeCount(double start, double end, double step, double size)
+    private protected static int RangeCount(double start, double end, double step, double size)
     {
         if (double.IsNaN(start) || double.IsInfinity(start)) throw new ArgumentOutOfRangeException(nameof(start), "start must be finite.");
         if (double.IsNaN(end) || double.IsInfinity(end)) throw new ArgumentOutOfRangeException(nameof(end), "end must be finite.");

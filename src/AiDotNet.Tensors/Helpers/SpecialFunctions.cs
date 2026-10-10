@@ -470,6 +470,9 @@ internal static class SpecialFunctions
         return sum * half;
     }
 
+    /// <summary>The n-node Gauss–Legendre rule on [-1, 1] (nodes, weights), as the CPU quadratures use it.</summary>
+    internal static (double[] X, double[] W) GaussLegendreRule(int n) => GaussLegendreRules.GetOrAdd(n, ComputeGaussLegendre);
+
     private static (double[] X, double[] W) ComputeGaussLegendre(int n)
     {
         var x = new double[n];
