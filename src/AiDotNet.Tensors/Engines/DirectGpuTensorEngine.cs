@@ -28266,7 +28266,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            uploaded?.Dispose();
+            // The deinterleave kernel may still be queued: release the upload only after that work (the legacy
+            // buffer pool would otherwise hand the allocation to the next request while the kernel still reads it).
+            if (uploaded is not null) DisposeBufferAfterQueuedUse(backend, uploaded);
         }
     }
 

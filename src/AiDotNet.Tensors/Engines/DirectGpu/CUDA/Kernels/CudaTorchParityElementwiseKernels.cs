@@ -25,12 +25,12 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_celu(const float* __r
     y[i] = v > 0.0f ? v : alpha * (expf(v / alpha) - 1.0f);
 }
 
-// hardtanh: min(max(x, lo), hi), NaN propagating (Math.Max / Math.Min semantics)
+// hardtanh: min(max(x, lo), hi), NaN propagating from x OR either bound (Math.Max / Math.Min semantics)
 extern ""C"" __global__ __launch_bounds__(256) void parity_hardtanh(const float* __restrict__ x, float* __restrict__ y, int n, float lo, float hi)
 {
     PARITY_INDEX
     float v = x[i];
-    y[i] = isnan(v) ? v : (v < lo ? lo : (v > hi ? hi : v));
+    y[i] = (isnan(v) || isnan(lo) || isnan(hi)) ? NAN : (v < lo ? lo : (v > hi ? hi : v));
 }
 
 // logsigmoid: min(x, 0) - log(1 + exp(-|x|)) (the stable form the CPU uses), NaN propagating
@@ -49,12 +49,12 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_softsign(const float*
     y[i] = v / (1.0f + fabsf(v));
 }
 
-// logit: c = min(max(x, lo), hi) (lo/hi are -inf/+inf without eps), log(c / (1 - c)), NaN propagating
+// logit: c = min(max(x, lo), hi) (lo/hi are -inf/+inf without eps), log(c / (1 - c)), NaN propagating from x or a bound
 extern ""C"" __global__ __launch_bounds__(256) void parity_logit(const float* __restrict__ x, float* __restrict__ y, int n, float lo, float hi)
 {
     PARITY_INDEX
     float v = x[i];
-    float c = isnan(v) ? v : (v < lo ? lo : (v > hi ? hi : v));
+    float c = (isnan(v) || isnan(lo) || isnan(hi)) ? NAN : (v < lo ? lo : (v > hi ? hi : v));
     y[i] = logf(c / (1.0f - c));
 }
 

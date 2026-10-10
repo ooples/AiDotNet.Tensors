@@ -243,6 +243,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // call site instead of an opaque "kernel not found" deep in dispatch.
     private bool _fusedAdvancedKernelsAvailable;
     private IntPtr _activationModule;
+    private IntPtr _torchParityElementwiseModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
     private IntPtr _poolingModule;
@@ -1139,7 +1140,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // PyTorch-parity elementwise ops that computed on the host (#1112). useFastMath:false -- erff, log1pf, expf
         // and sinpif must be the accurate versions to match the CPU's double-precision reference.
-        CompileKernelModule(device, Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity_elementwise_kernels",
+        _torchParityElementwiseModule = CompileKernelModule(device, Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity_elementwise_kernels",
             Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
@@ -17948,6 +17949,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             CudaNativeBindings.cuModuleUnload(_activationModule);
             _activationModule = IntPtr.Zero;
+        }
+
+        if (_torchParityElementwiseModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
+            _torchParityElementwiseModule = IntPtr.Zero;
         }
 
         if (_parity210Module != IntPtr.Zero)

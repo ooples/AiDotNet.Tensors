@@ -12,8 +12,13 @@ internal enum TorchParityBinaryOp { Fmax, Fmin, Heaviside, GreaterEqual, LessEqu
 
 /// <summary>
 /// Backends with device kernels for the PyTorch-parity elementwise ops that otherwise compute on the host. Optional:
-/// a backend without it keeps the recorded host fallback.
+/// a backend without it keeps the recorded host fallback (<c>GpuLaunchProbe.OnFallback</c>).
 /// </summary>
+/// <remarks>
+/// Implemented by the CUDA backend. Not yet implemented, each tracked by its own follow-up issue: HIP (#1124),
+/// Metal (#1125), OpenCL (#1126), Vulkan (#1127) and WebGPU (#1128). Until then those backends compute these ops on
+/// the host.
+/// </remarks>
 internal interface ITorchParityElementwiseBackend
 {
     /// <summary><paramref name="output"/>[i] = op(<paramref name="input"/>[i]; p0, p1) for i in [0, n).</summary>

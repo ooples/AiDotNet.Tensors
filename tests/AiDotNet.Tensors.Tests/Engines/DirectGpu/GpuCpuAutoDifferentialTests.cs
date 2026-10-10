@@ -451,6 +451,18 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     // 7.3e-7 relative: exact FP32 agreement, reported as a GPU defect.
     private static double ScaledError(double gpu, double cpu) => Math.Abs(gpu - cpu) / Math.Max(1.0, Math.Abs(cpu));
 
+    private static double ComponentError(float gpu, float cpu, int index)
+    {
+        bool g = float.IsNaN(gpu) || float.IsInfinity(gpu), c = float.IsNaN(cpu) || float.IsInfinity(cpu);
+        if (g || c)
+        {
+            Assert.True(g == c && (float.IsNaN(gpu) == float.IsNaN(cpu)) && (float.IsNaN(gpu) || gpu == cpu),
+                $"GPU/CPU diverged at complex index {index}: GPU={gpu} CPU={cpu}");
+            return 0;
+        }
+        return ScaledError(gpu, cpu);
+    }
+
     private static double CompareValue(object gpu, object cpu)
     {
         if (gpu is Tensor<float> gf && cpu is Tensor<float> cf)
@@ -486,7 +498,9 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
             double m = 0;
             for (int i = 0; i < ca.Length; i++)
             {
-                double er = ScaledError(ga[i].Real, ca[i].Real), ei = ScaledError(ga[i].Imaginary, ca[i].Imaginary);
+                // Non-finite parity per component BEFORE scaling: an infinite CPU component would make the scaled error
+                // Inf/Inf = NaN, which no "e > m" comparison ever records.
+                double er = ComponentError(ga[i].Real, ca[i].Real, i), ei = ComponentError(ga[i].Imaginary, ca[i].Imaginary, i);
                 if (er > m) m = er; if (ei > m) m = ei;
             }
             return m;

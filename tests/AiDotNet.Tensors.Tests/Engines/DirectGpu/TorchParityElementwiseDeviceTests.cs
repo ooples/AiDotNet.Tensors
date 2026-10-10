@@ -59,20 +59,29 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
         }
     }
 
+    // GpuLaunchProbe.Fallbacks entries read "<count>x <op>: <detail>"; sum the counts recorded for this op.
+    internal static long FallbackCount(string op) => GpuLaunchProbe.Fallbacks.Sum(entry =>
+    {
+        int x = entry.IndexOf("x ", StringComparison.Ordinal);
+        if (x <= 0 || !long.TryParse(entry.Substring(0, x), out long count)) return 0L;
+        string key = entry.Substring(x + 2);
+        return key == op || key.StartsWith(op + ":", StringComparison.Ordinal) ? count : 0L;
+    });
+
     private static Tensor<float> OnDevice(string op, Func<Tensor<float>> run)
     {
         long launches = GpuLaunchProbe.Count;
-        int fallbacks = GpuLaunchProbe.Fallbacks.Count(f => f.StartsWith(op, StringComparison.Ordinal));
+        long fallbacks = FallbackCount(op);
         var r = run();
         _ = r[0];   // materialize the deferred device result
         Assert.True(GpuLaunchProbe.Count > launches, $"{op}: no kernel launched");
-        Assert.Equal(fallbacks, GpuLaunchProbe.Fallbacks.Count(f => f.StartsWith(op, StringComparison.Ordinal)));
+        Assert.Equal(fallbacks, FallbackCount(op));
         return r;
     }
 
     public static TheoryData<string> UnaryOps() => new()
     {
-        "celu", "celu2", "hardtanh", "logsigmoid", "softsign", "logit", "logitEps", "sinc", "erf",
+        "celu", "celu2", "hardtanh", "hardtanhNaNBound", "logsigmoid", "softsign", "logit", "logitEps", "logitNaNEps", "sinc", "erf",
         "besselJ0", "besselJ1", "besselY0", "besselY1", "modifiedBesselI0", "modifiedBesselI1", "erfcx", "ndtr", "ndtri",
         "entr", "signbit", "isPosInf", "isNegInf",
     };
@@ -94,10 +103,12 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
             "celu" => e => e.TensorCelu(x),
             "celu2" => e => e.TensorCelu(x, 2.5),
             "hardtanh" => e => e.TensorHardtanh(x, -0.75, 2.0),
+            "hardtanhNaNBound" => e => e.TensorHardtanh(x, double.NaN, 2.0),   // NaN bound: every output NaN, as on the CPU
             "logsigmoid" => e => e.TensorLogSigmoid(x),
             "softsign" => e => e.TensorSoftsign(x),
             "logit" => e => e.TensorLogit(x),
             "logitEps" => e => e.TensorLogit(x, 1e-3),
+            "logitNaNEps" => e => e.TensorLogit(x, double.NaN),
             "sinc" => e => e.TensorSinc(x),
             "erf" => e => e.TensorErf(x),
             "besselJ0" => e => e.TensorBesselJ0(x),
@@ -116,7 +127,9 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
         };
         // CUDA's Bessel / erfcx / ndtri carry a few 1e-6 of error against the CPU's double-precision quadratures.
         double tolerance = op.Contains("essel") || op == "erfcx" || op == "ndtri" ? 1e-5 : 2e-6;
-        string probeName = "Tensor" + char.ToUpperInvariant(op[0]) + op.Substring(1);
+        // The fallback record is keyed by the engine op, not by this case's variant label.
+        string baseOp = op == "celu2" ? "celu" : op.StartsWith("hardtanh") ? "hardtanh" : op.StartsWith("logit") ? "logit" : op;
+        string probeName = "Tensor" + char.ToUpperInvariant(baseOp[0]) + baseOp.Substring(1);
         AssertMatches(op, f(cpu), OnDevice(probeName, () => f(gpu)), tolerance);
     }
 

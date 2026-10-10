@@ -71,11 +71,11 @@ public class TorchParityPoolingDeviceTests : IClassFixture<DirectGpuTensorEngine
 
         var expected = f(cpu);
         long launches = GpuLaunchProbe.Count;
-        int fallbacks = GpuLaunchProbe.Fallbacks.Count(s => s.StartsWith(probe, StringComparison.Ordinal));
+        long fallbacks = TorchParityElementwiseDeviceTests.FallbackCount(probe);
         var actual = f(gpu);
         _ = actual[0];
         Assert.True(GpuLaunchProbe.Count > launches, $"{op}: no device work launched");
-        Assert.Equal(fallbacks, GpuLaunchProbe.Fallbacks.Count(s => s.StartsWith(probe, StringComparison.Ordinal)));
+        Assert.Equal(fallbacks, TorchParityElementwiseDeviceTests.FallbackCount(probe));
         AssertMatches(op, expected, actual);
     }
 }
