@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DevicePrimitives;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
@@ -58,6 +59,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorAngle<T>(Tensor<T> input)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryParityUnaryOnDevice(input, TorchParityUnaryOp.Angle, 0f, 0f) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorAngle: no device kernel", null);
         return base.TensorAngle<T>(input);
     }
@@ -80,6 +83,8 @@ public partial class DirectGpuTensorEngine
     /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorAll<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryTruthinessOnDevice("TensorAll", tensor, axes, keepDims, all: true) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorAll: no device kernel", null);
         return base.TensorAll<T>(tensor, axes, keepDims);
     }
@@ -90,6 +95,8 @@ public partial class DirectGpuTensorEngine
     /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorAny<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryTruthinessOnDevice("TensorAny", tensor, axes, keepDims, all: false) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorAny: no device kernel", null);
         return base.TensorAny<T>(tensor, axes, keepDims);
     }
@@ -284,6 +291,8 @@ public partial class DirectGpuTensorEngine
     /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryQuantileOnDevice("TensorQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: false) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorQuantile: no device kernel", null);
         return base.TensorQuantile<T>(tensor, q, dim, keepDim, interpolation);
     }
@@ -294,6 +303,8 @@ public partial class DirectGpuTensorEngine
     /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorNanQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryQuantileOnDevice("TensorNanQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: true) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorNanQuantile: no device kernel", null);
         return base.TensorNanQuantile<T>(tensor, q, dim, keepDim, interpolation);
     }
@@ -411,6 +422,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorMsort<T>(Tensor<T> tensor)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryMsortOnDevice(tensor) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorMsort: no device kernel", null);
         return base.TensorMsort<T>(tensor);
     }
@@ -418,6 +431,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorDiagflat<T>(Tensor<T> tensor, int offset = 0)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryDiagflatOnDevice(tensor, offset) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorDiagflat: no device kernel", null);
         return base.TensorDiagflat<T>(tensor, offset);
     }
@@ -425,6 +440,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorDiagonalScatter<T>(Tensor<T> input, Tensor<T> src, int offset = 0, int dim1 = 0, int dim2 = 1)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryDiagonalScatterOnDevice(input, src, offset, dim1, dim2) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorDiagonalScatter: no device kernel", null);
         return base.TensorDiagonalScatter<T>(input, src, offset, dim1, dim2);
     }
@@ -717,6 +734,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorFloorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (TryParityBinaryOnDevice(a, b, TorchParityBinaryOp.FloorDivide) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorFloorDivide: no device kernel", null);
         return base.TensorFloorDivide<T>(a, b);
     }

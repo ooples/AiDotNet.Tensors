@@ -35,6 +35,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         TorchParityUnaryOp.SphericalBesselJ0 => "parity_spherical_bessel_j0",
         TorchParityUnaryOp.AiryAi => "parity_airy_ai",
         TorchParityUnaryOp.Mvlgamma => "parity_mvlgamma",
+        TorchParityUnaryOp.Angle => "parity_angle",
+        TorchParityUnaryOp.NonZero => "parity_nonzero",
         _ => throw new ArgumentOutOfRangeException(nameof(op)),
     };
 
@@ -47,6 +49,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         TorchParityBinaryOp.LessEqual => "parity_less_equal",
         TorchParityBinaryOp.Igamma => "parity_igamma",
         TorchParityBinaryOp.Igammac => "parity_igammac",
+        TorchParityBinaryOp.FloorDivide => "parity_floor_divide",
         _ => throw new ArgumentOutOfRangeException(nameof(op)),
     };
 
@@ -128,6 +131,59 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         void** args = stackalloc void*[6];
         args[0] = &py; args[1] = &row; args[2] = &col; args[3] = &offset; args[4] = &isLower; args[5] = &total;
         LaunchKernel(triKernel, ParityGrid(row), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityDiagflat(IGpuBuffer input, IGpuBuffer output, int n, int size, int offset)
+    {
+        int total = size * size;
+        if (total <= 0) return;
+        IntPtr diagflatKernel = ParityKernel("parity_diagflat");
+        using var _ = PushContext();
+        IntPtr px = input.Handle, py = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &px; args[1] = &py; args[2] = &total; args[3] = &size; args[4] = &offset; args[5] = &n;
+        LaunchKernel(diagflatKernel, ParityGrid(total), DefaultBlockSize, args);
+    }
+
+    // Mirrors the kernel's by-value ParityDiagonalGeometry.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private unsafe struct ParityDiagonalGeometry
+    {
+        public int OtherRank;
+        public fixed int OtherExtent[8];
+        public fixed int OtherStride[8];
+        public int Stride1, Stride2, Start1, Start2, Diagonal;
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityDiagonalScatter(IGpuBuffer src, IGpuBuffer output, int count,
+        int[] otherExtents, int[] otherStrides, int stride1, int stride2, int start1, int start2, int diagonal)
+    {
+        if (count <= 0) return;
+        if (otherExtents.Length > 8) throw new ArgumentOutOfRangeException(nameof(otherExtents), "at most 8 other axes.");
+        IntPtr scatterKernel = ParityKernel("parity_diagonal_scatter");
+        var geometry = new ParityDiagonalGeometry
+        {
+            OtherRank = otherExtents.Length, Stride1 = stride1, Stride2 = stride2, Start1 = start1, Start2 = start2, Diagonal = diagonal,
+        };
+        for (int k = 0; k < otherExtents.Length; k++) { geometry.OtherExtent[k] = otherExtents[k]; geometry.OtherStride[k] = otherStrides[k]; }
+        using var _ = PushContext();
+        IntPtr ps = src.Handle, py = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &ps; args[1] = &py; args[2] = &count; args[3] = &geometry;
+        LaunchKernel(scatterKernel, ParityGrid(count), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityQuantileRows(IGpuBuffer sorted, IGpuBuffer output, int rows, int length,
+        double q, int mode, bool ignoreNan)
+    {
+        if (rows <= 0) return;
+        IntPtr quantileKernel = ParityKernel("parity_quantile_rows");
+        using var _ = PushContext();
+        IntPtr ps = sorted.Handle, py = output.Handle;
+        int ignore = ignoreNan ? 1 : 0;
+        void** args = stackalloc void*[7];
+        args[0] = &ps; args[1] = &py; args[2] = &rows; args[3] = &length; args[4] = &q; args[5] = &mode; args[6] = &ignore;
+        LaunchKernel(quantileKernel, ParityGrid(rows), DefaultBlockSize, args);
     }
 
     unsafe void ITorchParityElementwiseBackend.TorchParityBinary(

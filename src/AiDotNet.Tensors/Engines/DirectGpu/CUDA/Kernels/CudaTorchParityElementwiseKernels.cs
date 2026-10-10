@@ -542,6 +542,78 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_tri_indices(float* __
         y[total + at] = (float)j;
     }
 }
+
+// Index, reduction-feeding and order-statistic ops (#1112 tier 6).
+
+// angle of a real number: NaN stays NaN, negatives (including -inf) give pi, everything else (including -0) 0.
+PARITY_UNARY_D(parity_angle, isnan(v) ? v : (v < 0.0 ? PARITY_PI : 0.0))
+// all / any indicator: 1 where the element is non-zero (NaN counts as non-zero), else 0.
+PARITY_UNARY_D(parity_nonzero, v != 0.0 ? 1.0 : 0.0)
+
+// floor_divide on floats: floor(a / b) in double, as the CPU's Math.Floor(x / y).
+extern ""C"" __global__ __launch_bounds__(256) void parity_floor_divide(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ y, int n)
+{
+    PARITY_INDEX
+    y[i] = (float)floor((double)a[i] / (double)b[i]);
+}
+
+// diagflat: a size x size matrix with the n input values on diagonal `offset`, zeros elsewhere.
+extern ""C"" __global__ __launch_bounds__(256) void parity_diagflat(const float* __restrict__ x, float* __restrict__ y, int total, int size, int offset, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int r = idx / size, c = idx % size;
+    int k = offset >= 0 ? (c - r == offset ? r : -1) : (r - c == -offset ? c : -1);
+    y[idx] = (k >= 0 && k < n) ? x[k] : 0.0f;
+}
+
+// diagonal_scatter: writes src (torch.diagonal's layout: the other axes in order, then the diagonal) into the copy of
+// the input already in y. Geometry by value: the other axes' extents and strides, the two diagonal strides and starts.
+struct ParityDiagonalGeometry
+{
+    int otherRank;
+    int otherExtent[8];
+    int otherStride[8];
+    int stride1, stride2, start1, start2, diagonal;
+};
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_diagonal_scatter(const float* __restrict__ src, float* __restrict__ y, int count,
+    ParityDiagonalGeometry g)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    int o = idx / g.diagonal, t = idx % g.diagonal;
+    int base = 0, rest = o;
+    for (int j = g.otherRank - 1; j >= 0; j--) { base += rest % g.otherExtent[j] * g.otherStride[j]; rest /= g.otherExtent[j]; }
+    y[base + (t + g.start1) * g.stride1 + (t + g.start2) * g.stride2] = src[idx];
+}
+
+// quantile over sorted rows (ascending, NaN last): per row, the CPU's order statistics and interpolation.
+// mode: 0 linear, 1 lower, 2 higher, 3 nearest (ties to even), 4 midpoint. Without ignoreNan a row holding a NaN
+// gives NaN; with it the NaNs are dropped first. A row with no values gives NaN.
+extern ""C"" __global__ __launch_bounds__(256) void parity_quantile_rows(const float* __restrict__ sorted, float* __restrict__ y,
+    int rows, int length, double q, int mode, int ignoreNan)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* s = sorted + (long long)r * length;
+    int lo = 0, hi = length;   // the first NaN (NaN sorts last)
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (isnan(s[mid])) hi = mid; else lo = mid + 1; }
+    int count = lo;
+    if (count == 0 || (count < length && !ignoreNan)) { y[r] = NAN; return; }
+    double position = q * (count - 1);
+    int below = (int)floor(position), above = (int)ceil(position);
+    double w = position - below;
+    switch (mode)
+    {
+        case 1: above = below; w = 0.0; break;
+        case 2: below = above; w = 0.0; break;
+        case 3: below = above = (int)rint(position); w = 0.0; break;
+        case 4: w = below == above ? 0.0 : 0.5; break;
+        default: break;
+    }
+    y[r] = (float)((1.0 - w) * (double)s[below] + w * (double)s[above]);
+}
 ";
         }
 
@@ -570,6 +642,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_tri_indices(float* __
             "parity_polynomial", "parity_log_ndtr", "parity_bessel_k0", "parity_bessel_k1", "parity_bessel_k0e", "parity_bessel_k1e",
             "parity_spherical_bessel_j0", "parity_airy_ai", "parity_mvlgamma", "parity_igamma", "parity_igammac",
             "parity_range", "parity_logspace", "parity_window", "parity_tri_indices",
+            "parity_angle", "parity_nonzero", "parity_floor_divide", "parity_diagflat", "parity_diagonal_scatter", "parity_quantile_rows",
         };
     }
 }

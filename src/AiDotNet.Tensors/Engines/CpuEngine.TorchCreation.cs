@@ -15,7 +15,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 public partial class CpuEngine
 {
-    private static int NormalizeDim(int dim, int rank)
+    private protected static int NormalizeDim(int dim, int rank)
     {
         int d = dim < 0 ? dim + rank : dim;
         if (d < 0 || d >= rank) throw new ArgumentOutOfRangeException(nameof(dim), $"dim {dim} is out of range for rank {rank}.");

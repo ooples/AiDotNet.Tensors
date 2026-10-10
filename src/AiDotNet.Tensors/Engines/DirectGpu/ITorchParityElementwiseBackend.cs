@@ -6,10 +6,11 @@ internal enum TorchParityUnaryOp
     Celu, Hardtanh, LogSigmoid, Softsign, Logit, Sinc, Erf,
     BesselJ0, BesselJ1, BesselY0, BesselY1, ModifiedBesselI0, ModifiedBesselI1, Erfcx, Ndtr, Ndtri, Entr, Signbit, IsPosInf, IsNegInf,
     LogNdtr, ModifiedBesselK0, ModifiedBesselK1, ScaledModifiedBesselK0, ScaledModifiedBesselK1, SphericalBesselJ0, AiryAi, Mvlgamma,
+    Angle, NonZero,
 }
 
 /// <summary>Binary (same-shape) PyTorch-parity elementwise ops with a device kernel (#1112).</summary>
-internal enum TorchParityBinaryOp { Fmax, Fmin, Heaviside, GreaterEqual, LessEqual, Igamma, Igammac }
+internal enum TorchParityBinaryOp { Fmax, Fmin, Heaviside, GreaterEqual, LessEqual, Igamma, Igammac, FloorDivide }
 
 /// <summary>
 /// Backends with device kernels for the PyTorch-parity elementwise ops that otherwise compute on the host. Optional:
@@ -49,4 +50,21 @@ internal interface ITorchParityElementwiseBackend
 
     /// <summary>The [2, total] lower (j - i &lt;= offset) or upper (j - i &gt;= offset) triangle indices of a row x col grid.</summary>
     void TorchParityTriIndices(IGpuBuffer output, int row, int col, int offset, bool lower, int total);
+
+    /// <summary>A size x size matrix holding the n values of <paramref name="input"/> on diagonal <paramref name="offset"/>.</summary>
+    void TorchParityDiagflat(IGpuBuffer input, IGpuBuffer output, int n, int size, int offset);
+
+    /// <summary>
+    /// Writes <paramref name="src"/> (torch.diagonal's layout) onto the diagonal of <paramref name="output"/>, which already
+    /// holds the input. The other axes (at most 8) are given by extent and stride; the diagonal by its two strides and
+    /// starting indices.
+    /// </summary>
+    void TorchParityDiagonalScatter(IGpuBuffer src, IGpuBuffer output, int count, int[] otherExtents, int[] otherStrides,
+        int stride1, int stride2, int start1, int start2, int diagonal);
+
+    /// <summary>
+    /// The q-quantile of each of <paramref name="rows"/> sorted rows (ascending, NaN last); mode 0 linear, 1 lower,
+    /// 2 higher, 3 nearest, 4 midpoint.
+    /// </summary>
+    void TorchParityQuantileRows(IGpuBuffer sorted, IGpuBuffer output, int rows, int length, double q, int mode, bool ignoreNan);
 }

@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.Autodiff;
 using System;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -14,7 +15,7 @@ public partial class DirectGpuTensorEngine
 {
     private Tensor<T>? TryParityUnaryOnDevice<T>(Tensor<T> input, TorchParityUnaryOp op, float p0, float p1)
     {
-        if (input.Length == 0 || IsTapeActive<T>(op.ToString()) || !TryGetBackend(out var backend)
+        if (input is null || input.Length == 0 || IsTapeActive<T>(op.ToString()) || !TryGetBackend(out var backend)
             || backend is not ITorchParityElementwiseBackend kernels || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
         try
@@ -132,5 +133,156 @@ public partial class DirectGpuTensorEngine
         if (like is null) return null;   // the CPU throws ArgumentNullException
         int n = like.Length;
         return TryGenerateOnDevice<T>(opName, (int[])like._shape.Clone(), n, (_, backend, output) => backend.Fill(output, (float)value, n));
+    }
+
+    // all / any: the non-zero indicator on the device, then the engine's device min / max reduction (constants, so no
+    // gradient, as on the CPU).
+    private Tensor<T>? TryTruthinessOnDevice<T>(string opName, Tensor<T> tensor, int[]? axes, bool keepDims, bool all)
+    {
+        if (tensor is null || tensor.Length == 0) return null;
+        var indicator = TryParityUnaryOnDevice(tensor, TorchParityUnaryOp.NonZero, 0f, 0f);
+        if (indicator is null) return null;
+        var reduceAxes = axes ?? AllAxes(tensor.Rank);
+        Tensor<T> reduced;
+        using (new NoGradScope<T>())
+            reduced = all ? TensorAmin(indicator, reduceAxes, keepDims) : ReduceMax(indicator, reduceAxes, keepDims);
+        // The CPU's ReduceMax gives a full reduction shape [1] where the device one gives rank 0 (#1132); all / any
+        // keep the CPU's shape.
+        return reduced.Rank == 0 ? Reshape(reduced, new[] { 1 }) : reduced;
+    }
+
+    private Tensor<T>? TryDiagflatOnDevice<T>(Tensor<T> tensor, int offset)
+    {
+        if (tensor is null || IsTapeActive<T>("TensorDiagflat")) return null;
+        int n = tensor.Length;
+        long sizeLong = (long)n + Math.Abs((long)offset);
+        if (n == 0 || sizeLong * sizeLong > int.MaxValue) return null;
+        int size = (int)sizeLong;
+        if (!TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
+            || DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return null;
+        try
+        {
+            var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            using var x = GetOrAllocateBuffer(backend, source);
+            return DispatchDeferredGpuOp<T>(backend, size * size, new[] { size, size },
+                output => kernels.TorchParityDiagflat(x.Buffer, output, n, size, offset));
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorDiagflat", ex);
+            return null;
+        }
+    }
+
+    // Invalid arguments return null so the CPU implementation raises its exception.
+    private Tensor<T>? TryDiagonalScatterOnDevice<T>(Tensor<T> input, Tensor<T> src, int offset, int dim1, int dim2)
+    {
+        if (input is null || src is null || input.Rank < 2 || IsTapeActive<T>("TensorDiagonalScatter")) return null;
+        int rank = input.Rank;
+        int d1 = dim1 < 0 ? dim1 + rank : dim1, d2 = dim2 < 0 ? dim2 + rank : dim2;
+        if (d1 < 0 || d1 >= rank || d2 < 0 || d2 >= rank || d1 == d2 || rank - 2 > 8) return null;
+        var shape = input._shape;
+        var strides = new int[rank];
+        for (int k = rank - 1, s = 1; k >= 0; s *= shape[k], k--) strides[k] = s;
+        int diagonal = Math.Max(0, Math.Min(shape[d1] - Math.Max(0, -offset), shape[d2] - Math.Max(0, offset)));
+        var others = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Where(System.Linq.Enumerable.Range(0, rank), k => k != d1 && k != d2));
+        int otherCount = 1;
+        foreach (int k in others) otherCount *= shape[k];
+        if (src.Length != otherCount * diagonal || input.Length == 0) return null;
+        if (!TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
+            || DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return null;
+        try
+        {
+            var inputSource = input.IsContiguous ? input : input.Contiguous();
+            var srcSource = src.IsContiguous ? src : src.Contiguous();
+            using var x = GetOrAllocateBuffer(backend, inputSource);
+            using var s = GetOrAllocateBuffer(backend, srcSource);
+            int n = input.Length, count = src.Length;
+            var otherExtents = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(others, k => shape[k]));
+            var otherStrides = System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(others, k => strides[k]));
+            return DispatchDeferredGpuOp<T>(backend, n, (int[])shape.Clone(), output =>
+            {
+                backend.Copy(x.Buffer, output, n);
+                kernels.TorchParityDiagonalScatter(s.Buffer, output, count, otherExtents, otherStrides,
+                    strides[d1], strides[d2], Math.Max(0, -offset), Math.Max(0, offset), diagonal);
+            });
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorDiagonalScatter", ex);
+            return null;
+        }
+    }
+
+    // msort: transpose [extent, inner] to rows, bitonic-sort each row (torch order, NaN last), transpose back.
+    private Tensor<T>? TryMsortOnDevice<T>(Tensor<T> tensor)
+    {
+        if (tensor is null || tensor.Rank == 0 || tensor.Length == 0 || typeof(T) != typeof(float)
+            || IsTapeActive<T>("TensorMsort") || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int extent = tensor._shape[0], inner = tensor.Length / extent;
+            var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            using var x = GetOrAllocateBuffer(backend, source);
+            using var rows = AllocateOutputBuffer(backend, tensor.Length);
+            backend.Transpose(x.Buffer, rows.Buffer, extent, inner);
+            var (sorted, indices) = BitonicSortRowsToBuffers(backend, rows.Buffer, inner, extent, descending: false);
+            using (sorted)
+            using (indices)
+                return DispatchDeferredGpuOp<T>(backend, tensor.Length, (int[])tensor._shape.Clone(),
+                    output => backend.Transpose(sorted.Buffer, output, inner, extent));
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorMsort", ex);
+            return null;
+        }
+    }
+
+    // quantile / nanquantile: the reduced axis moved last ([outer, extent, inner] -> [outer, inner, extent]), each row
+    // bitonic-sorted (NaN last), then one thread per row reads the order statistics. Invalid q / dim go to the CPU.
+    private Tensor<T>? TryQuantileOnDevice<T>(string opName, Tensor<T> tensor, double q, int? dim, bool keepDim,
+        QuantileInterpolation interpolation, bool ignoreNan)
+    {
+        if (tensor is null || tensor.Length == 0 || double.IsNaN(q) || q < 0 || q > 1 || typeof(T) != typeof(float)
+            || IsTapeActive<T>(opName) || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels)
+            return null;
+        int rank = Math.Max(1, tensor.Rank);
+        int d = 0;
+        if (dim is not null)
+        {
+            d = dim.Value < 0 ? dim.Value + tensor.Rank : dim.Value;
+            if (d < 0 || d >= tensor.Rank) return null;
+        }
+        int[] shape = dim is null ? new[] { tensor.Length } : tensor._shape;
+        int extent = shape[d], outer = 1, inner = 1;
+        for (int k = 0; k < d; k++) outer *= shape[k];
+        for (int k = d + 1; k < shape.Length; k++) inner *= shape[k];
+        int rowsCount = outer * inner;
+        int[] outShape = keepDim
+            ? (dim is null ? System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Repeat(1, tensor.Rank))
+                : System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Select(shape, (s, k) => k == d ? 1 : s)))
+            : System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Where(shape, (_, k) => k != d));
+        try
+        {
+            var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            using var x = GetOrAllocateBuffer(backend, source);
+            using var rows = AllocateOutputBuffer(backend, tensor.Length);
+            if (inner == 1) backend.Copy(x.Buffer, rows.Buffer, tensor.Length);
+            else backend.Permute(x.Buffer, rows.Buffer, new[] { outer, extent, inner }, new[] { 0, 2, 1 });
+            var (sorted, indices) = BitonicSortRowsToBuffers(backend, rows.Buffer, rowsCount, extent, descending: false);
+            using (sorted)
+            using (indices)
+                return DispatchDeferredGpuOp<T>(backend, rowsCount, outShape,
+                    output => kernels.TorchParityQuantileRows(sorted.Buffer, output, rowsCount, extent, q, (int)interpolation, ignoreNan));
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback(opName, ex);
+            return null;
+        }
     }
 }
