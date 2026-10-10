@@ -4162,8 +4162,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             {
                 var biasResult = Helpers.AutoTensorCache.RentOrAllocate<T>(_shape);
                 var aData = GetDataArray();
-                var bData = other.GetDataArray();
-                var rData = biasResult.GetDataArray();
+                using var bDataLease = other.LeaseArray();
+                var bData = bDataLease.Array;
+                using var rDataLease = biasResult.LeaseArray();
+                var rData = rDataLease.Array;
                 // Specialize for float to avoid interface dispatch in tight loop.
                 // #319 SIMD: per-row bias-add was a scalar loop on the hot path
                 // (TransformerBlock benchmark measured 711 µs/call at [197, 768]

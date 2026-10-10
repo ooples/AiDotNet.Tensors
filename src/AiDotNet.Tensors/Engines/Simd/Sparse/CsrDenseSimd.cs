@@ -52,8 +52,10 @@ internal static class CsrDenseSimd
         int n)
     {
         int width = Vector<float>.Count;
-        var bSpan = b.AsSpan();
-        var outSpan = output.AsSpan();
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
+        using var outSpanLease = output.Lease();
+        var outSpan = outSpanLease.Span;
 
         for (int r = 0; r < rows; r++)
         {
@@ -116,8 +118,10 @@ internal static class CsrDenseSimd
         int n)
     {
         int width = Vector<double>.Count;
-        var bSpan = b.AsSpan();
-        var outSpan = output.AsSpan();
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
+        using var outSpanLease = output.Lease();
+        var outSpan = outSpanLease.Span;
 
         for (int r = 0; r < rows; r++)
         {

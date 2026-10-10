@@ -95,6 +95,16 @@ internal sealed class HostSync
         => AnyExists && s_byKey.TryGetValue(array, out var sync) ? sync : null;
 
     /// <summary>
+    /// Forgets <paramref name="array"/>'s state entirely, as if the array had been collected: for an array that is
+    /// handed to a new owner (<see cref="ResultBufferTracker"/> reuse). Every storage that cached the old state is dead
+    /// by then, and the new owner must not inherit its pending download, released flag, retention or device binding.
+    /// </summary>
+    internal static void Forget(object array)
+    {
+        if (AnyExists) s_byKey.Remove(array);
+    }
+
+    /// <summary>
     /// Makes <paramref name="array"/> share <paramref name="sync"/> (a lazily backed storage just got its host
     /// array). An array that already has a state keeps it.
     /// </summary>

@@ -4689,7 +4689,8 @@ internal static class BackwardFunctions<T>
 
             // Step 1: Fused ReLU mask — pool the masked gradient buffer
             var maskedTensor = Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { M, N });
-            var maskedArr = maskedTensor.GetDataArray();
+            using var maskedArrLease = maskedTensor.LeaseArray();
+            var maskedArr = maskedArrLease.Array;
             fixed (float* pG = gArr, pPA = paArr, pM = maskedArr)
             {
                 SimdKernels.ReluBackwardUnsafe(pG, pPA, pM, M * N);
@@ -4697,9 +4698,11 @@ internal static class BackwardFunctions<T>
 
             // Step 2 + 3: gradInput / gradWeight via SimdGemm or BLAS
             var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-            var gradInputArr = (float[])(object)gradInput.GetDataArray();
+            using var gradInputArrLease = gradInput.LeaseArray();
+            var gradInputArr = (float[])(object)gradInputArrLease.Array;
             var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
+            using var gradWeightArrLease = gradWeight.LeaseArray();
+            var gradWeightArr = (float[])(object)gradWeightArrLease.Array;
 
             if (UseSimdGemmBackward(backwardWork))
             {
@@ -4723,7 +4726,8 @@ internal static class BackwardFunctions<T>
 
             // Step 4: gradBias = sum(maskedGrad, axis=0) — single SIMD pass, pooled buffer
             var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-            var biasArr = (float[])(object)gradBias.GetDataArray();
+            using var biasArrLease = gradBias.LeaseArray();
+            var biasArr = (float[])(object)biasArrLease.Array;
             Array.Clear(biasArr, 0, N);
             fixed (float* pM = maskedArr, pB = biasArr)
             {

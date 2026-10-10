@@ -316,7 +316,7 @@ internal static class ResultBufferTracker
         var array = (T[])found.Array;
         // The previous result's device copies and pending downloads are keyed by this array; drop them before reuse.
         PooledArrayRecycling.Notify(array);
-        HostSync.ClearReleased(array);
+        HostSync.Forget(array);
         if (Stress) Poison(array);
         Interlocked.Increment(ref ReusedArrays);
         return array;

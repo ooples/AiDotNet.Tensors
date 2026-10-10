@@ -31,9 +31,12 @@ internal static class CpuJitSelfTest
             using var srcB = new AlignedBuffer(testSize);
             using var dst = new AlignedBuffer(testSize);
 
-            var spanA = srcA.AsSpan();
-            var spanB = srcB.AsSpan();
-            var spanDst = dst.AsSpan();
+            using var spanALease = srcA.Lease();
+            var spanA = spanALease.Span;
+            using var spanBLease = srcB.Lease();
+            var spanB = spanBLease.Span;
+            using var spanDstLease = dst.Lease();
+            var spanDst = spanDstLease.Span;
 
             // Fill with known values
             for (int i = 0; i < testSize; i++)
@@ -100,8 +103,10 @@ internal static class CpuJitSelfTest
         using var src = new AlignedBuffer(testSize);
         using var jitDst = new AlignedBuffer(testSize);
 
-        var spanSrc = src.AsSpan();
-        var spanJitDst = jitDst.AsSpan();
+        using var spanSrcLease = src.Lease();
+        var spanSrc = spanSrcLease.Span;
+        using var spanJitDstLease = jitDst.Lease();
+        var spanJitDst = spanJitDstLease.Span;
 
         // Test full range including boundary regions
         for (int i = 0; i < testSize; i++)

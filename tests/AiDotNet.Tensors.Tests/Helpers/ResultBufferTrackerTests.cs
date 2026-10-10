@@ -139,6 +139,26 @@ public sealed class ResultBufferTrackerTests
     }
 
     [Fact]
+    public void ReusedArray_DoesNotInheritThePreviousOwnersHostSyncState()
+    {
+        var source = Source();
+        // The dropped result had device-side state keyed by its array: a device binding and a retention mark.
+        var dropped = ProduceAndDrop(source, r =>
+        {
+            var array = r.AsSpanUnmarkedArray();
+            HostSync.ForArray(array).GetOrCreateDevice();
+            HostSync.MarkRetained(array);
+        });
+        Collect();
+
+        var next = source.Multiply(3.0);
+
+        Assert.Same(dropped.Target, next.AsSpanUnmarkedArray());
+        Assert.Null(HostSync.FindForArray(next.AsSpanUnmarkedArray()));
+        GC.KeepAlive(next);
+    }
+
+    [Fact]
     public void Stress_PoisonsFreedArraysBeforeReuse()
     {
         bool saved = ResultBufferTracker.Stress;

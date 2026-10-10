@@ -966,6 +966,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (IsDisposed || !Helpers.HostSync.AnyExists) return;
         if (Helpers.HostSync.IsPending(array))
             Helpers.HostSync.Remove(array);
+        // The persistent weight cache and its version maps are keyed by the array too. A new owner's version can equal
+        // the one recorded for the old owner, so a surviving entry would serve the old owner's device data.
+        if (_persistentBufferCache.ContainsKey(array))
+        {
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryRemove(array, out var pe)) pe.Dispose();
+                _tensorVersions.TryRemove(array, out _);
+                _persistentWeightHostVersion.TryRemove(array, out _);
+            }
+        }
         if (!_activationCache.ContainsKey(array)) return;
         ActivationCacheEntry? removed = null;
         lock (_activationCacheLock)

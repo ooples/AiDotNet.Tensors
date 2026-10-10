@@ -1429,8 +1429,10 @@ public partial class CpuEngine
             if (ax == r - 1 && tensor.IsContiguous)
             {
                 var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-                var src = (float[])(object)tensor.GetDataArray();
-                var dst = (float[])(object)result.GetDataArray();
+                using var srcLease = tensor.LeaseArray();
+                var src = (float[])(object)srcLease.Array;
+                using var dstLease = result.LeaseArray();
+                var dst = (float[])(object)dstLease.Array;
                 int axisLen = tensor._shape[ax];
                 int outer = tensor.Length / axisLen;
                 for (int o = 0; o < outer; o++)
@@ -1474,8 +1476,10 @@ public partial class CpuEngine
             if (ax == r - 1 && tensor.IsContiguous)
             {
                 var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-                var src = (float[])(object)tensor.GetDataArray();
-                var dst = (float[])(object)result.GetDataArray();
+                using var srcLease = tensor.LeaseArray();
+                var src = (float[])(object)srcLease.Array;
+                using var dstLease = result.LeaseArray();
+                var dst = (float[])(object)dstLease.Array;
                 int axisLen = tensor._shape[ax];
                 int outer = tensor.Length / axisLen;
                 for (int o = 0; o < outer; o++)

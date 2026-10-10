@@ -63,7 +63,8 @@ public static class MeshConvolutionOperations
         var output = new T[numVertices * outputChannels];
         var vertexData = vertexFeatures.ToArray();
         var indicesData = spiralIndices.ToArray();
-        var weightsData = weights.GetDataArray();
+        using var weightsDataLease = weights.LeaseArray();
+        var weightsData = weightsDataLease.Array;
         var biasData = biases.ToArray();
 
         // Process vertices in parallel
@@ -179,7 +180,8 @@ public static class MeshConvolutionOperations
 
         var gradData = outputGradient.ToArray();
         var indicesData = spiralIndices.ToArray();
-        var weightsData = weights.GetDataArray();
+        using var weightsDataLease = weights.LeaseArray();
+        var weightsData = weightsDataLease.Array;
 
         // Process vertices in parallel
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>

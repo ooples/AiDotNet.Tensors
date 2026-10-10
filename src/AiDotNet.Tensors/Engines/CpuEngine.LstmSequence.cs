@@ -914,7 +914,8 @@ public partial class CpuEngine
                 new ReadOnlyMemory<T>(wHhT, 0, hidden * gateRows),
                 hhMem,
                 batch, hidden, gateRows, hidden, gateRows, gateRows, allowParallel: true);
-            var hhSpan = hhBuf.AsSpan();
+            using var hhSpanLease = hhBuf.Lease();
+            var hhSpan = hhSpanLease.Span;
             var hCurr = hbufs[nxt];
             var cCurr = cbufs[nxt];
             using var hCurrSpanLease = hCurr.LeaseWritable();

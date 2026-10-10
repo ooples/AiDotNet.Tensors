@@ -70,8 +70,10 @@ public static class Losses
         // here so we pattern-match on the concrete data array.
         using var inArrLease = input.LeaseArray();
         var inArr = inArrLease.Array;
-        var tgtArr = target.GetDataArray();
-        var outArr = output.GetDataArray();
+        using var tgtArrLease = target.LeaseArray();
+        var tgtArr = tgtArrLease.Array;
+        using var outArrLease = output.LeaseArray();
+        var outArr = outArrLease.Array;
         if (inArr is double[] iD && tgtArr is double[] tD && outArr is double[] oD)
         {
             int n = inSpan.Length;
@@ -199,9 +201,12 @@ public static class Losses
         // via concrete-array pattern match.
         using var inArrLease = input.LeaseArray();
         var inArr = inArrLease.Array;
-        var tgtArr = target.GetDataArray();
-        var varArr = variance.GetDataArray();
-        var outArr = output.GetDataArray();
+        using var tgtArrLease = target.LeaseArray();
+        var tgtArr = tgtArrLease.Array;
+        using var varArrLease = variance.LeaseArray();
+        var varArr = varArrLease.Array;
+        using var outArrLease = output.LeaseArray();
+        var outArr = outArrLease.Array;
         if (inArr is double[] iD && tgtArr is double[] tD && varArr is double[] vD && outArr is double[] oD)
         {
             int n = inSpan.Length;

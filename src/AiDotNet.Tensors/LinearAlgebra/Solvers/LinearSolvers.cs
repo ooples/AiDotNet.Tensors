@@ -29,7 +29,8 @@ internal static class LinearSolvers
                 var (factor, info) = Decompositions.CholeskyDecomposition.Compute(a, upper: false);
                 // All info entries must be 0 for Cholesky path; otherwise fall through to LU.
                 bool cholOk = true;
-                var iData = info.GetDataArray();
+                using var iDataLease = info.LeaseArray();
+                var iData = iDataLease.Array;
                 for (int i = 0; i < info.Length; i++) if (iData[i] != 0) { cholOk = false; break; }
                 if (cholOk)
                     return Decompositions.CholeskyDecomposition.Solve(factor, b, upper: false);
@@ -148,8 +149,10 @@ internal static class LinearSolvers
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= a.Shape[i];
 
-        var aData = a.GetDataArray();
-        var xData = x.GetDataArray();
+        using var aDataLease = a.LeaseArray();
+        var aData = aDataLease.Array;
+        using var xDataLease = x.LeaseArray();
+        var xData = xDataLease.Array;
         int aStride = n * n;
         int xStride = bIsVector ? n : n * nrhs;
 
