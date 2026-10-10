@@ -1136,6 +1136,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // catch that degraded silently to the CPU. See CudaMissingLookupKernels.
         CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
             Kernels.CudaMissingLookupKernels.GetKernelNames());
+
+        // PyTorch-parity elementwise ops that computed on the host (#1112). useFastMath:false -- erff, log1pf, expf
+        // and sinpif must be the accurate versions to match the CPU's double-precision reference.
+        CompileKernelModule(device, Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity_elementwise_kernels",
+            Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
