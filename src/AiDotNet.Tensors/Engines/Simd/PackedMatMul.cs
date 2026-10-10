@@ -1,4 +1,6 @@
 using AiDotNet.Tensors.NumericOperations;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -38,6 +40,7 @@ internal static class PackedMatMul
     /// <param name="m">Rows of A / C.</param>
     /// <param name="k">Cols of A / rows of B (must be even).</param>
     /// <param name="n">Cols of B / C.</param>
+    [MethodImpl(Hot)]
     public static void Int4WeightMatMul(
         ReadOnlySpan<PackedInt4> a, QuantizationScale aScale,
         ReadOnlySpan<float> b,
@@ -107,6 +110,7 @@ internal static class PackedMatMul
     /// <param name="m">Rows of A / C.</param>
     /// <param name="k">Inner dim; must be multiple of 8.</param>
     /// <param name="n">Cols of B / C.</param>
+    [MethodImpl(Hot)]
     public static void Int1MatMulXnor(
         ReadOnlySpan<PackedInt1> a, QuantizationScale aScale,
         ReadOnlySpan<PackedInt1> b, QuantizationScale bScale,
@@ -173,6 +177,7 @@ internal static class PackedMatMul
     /// 1-bit layout <see cref="Int1MatMulXnor"/> expects: output is
     /// [N × K/8] where byte (j, b) holds K-lanes k=8b..8b+7 of column j.
     /// </summary>
+    [MethodImpl(Hot)]
     public static QuantizationScale PackBTransposed(
         ReadOnlySpan<float> b, int k, int n,
         Span<PackedInt1> packed,
@@ -246,6 +251,7 @@ internal static class PackedMatMul
     /// popcount. Used internally when the row length makes it worth
     /// the Vector512 setup.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static int XnorPopCountBlock(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, int nBytes)
     {
 #if NET8_0_OR_GREATER
@@ -296,6 +302,7 @@ internal static class PackedMatMul
     /// Weight-only int2 matmul mirroring <see cref="Int4WeightMatMul"/>.
     /// K must be a multiple of <see cref="PackedInt2.ValuesPerByte"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Int2WeightMatMul(
         ReadOnlySpan<PackedInt2> a, QuantizationScale aScale,
         ReadOnlySpan<float> b, Span<float> c,
@@ -347,6 +354,7 @@ internal static class PackedMatMul
     /// Weight-only int3 matmul. K must be a multiple of
     /// <see cref="PackedInt3Block.ValuesPerBlock"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Int3WeightMatMul(
         ReadOnlySpan<PackedInt3Block> a, QuantizationScale aScale,
         ReadOnlySpan<float> b, Span<float> c,
@@ -414,6 +422,7 @@ internal static class PackedMatMul
         int m, int k, int n)
         => Fp4FamilyMatMul(a, aScale, b, c, m, k, n, Fp4E2M1.Table);
 
+    [MethodImpl(Hot)]
     private static void Fp4FamilyMatMul(
         ReadOnlySpan<PackedInt4> a, QuantizationScale aScale,
         ReadOnlySpan<float> b, Span<float> c,

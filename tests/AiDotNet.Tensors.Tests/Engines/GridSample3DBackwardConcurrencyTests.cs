@@ -20,6 +20,9 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// and matches a serial (single-thread) reference across repeated runs — which
 /// the racing implementation could not guarantee.
 /// </summary>
+// Changes process-wide CpuParallelSettings: runs in the non-parallel collection so it never races the
+// other tests that change or depend on them.
+[Collection("CpuParallelSettings")]
 public class GridSample3DBackwardConcurrencyTests
 {
     private readonly CpuEngine E = new();

@@ -7,6 +7,7 @@ using System.Runtime.Intrinsics.X86;
 #endif
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -25,6 +26,7 @@ internal static class Im2ColHelper
     /// Output shape: [batch, channels * kernelH * kernelW, outputH * outputW]
     /// This transforms input patches into columns for efficient GEMM-based convolution.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Im2Col(
         ReadOnlySpan<float> input,
         Span<float> output,
@@ -80,6 +82,7 @@ internal static class Im2ColHelper
     /// lambda can't close over <c>float*</c>); the <c>fixed</c> block outlives the
     /// synchronous parallel call.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void Im2ColChannelParallel(
         ReadOnlySpan<float> input,
         Span<float> output,
@@ -101,46 +104,49 @@ internal static class Im2ColHelper
 
         int kHW = kernelH * kernelW;
         int colW = outputH * outputW;
-        output.Slice(0, channels * kHW * colW).Clear(); // padding handled once up front
-        long work = (long)channels * kHW * colW;
+        int rows = channels * kHW;
+        long work = (long)rows * colW;
         fixed (float* inP = input)
         fixed (float* outP = output)
         {
             IntPtr inPtr = (IntPtr)inP;
             IntPtr outPtr = (IntPtr)outP;
+            // One task per column-matrix ROW (channel, kh, kw): each clears and fills only its own
+            // row, so the padding no longer needs a serial whole-matrix Clear up front and the work
+            // splits C*kH*kW ways instead of C ways. A 1x16x64x64 3x3 im2col (16 channels, 144 rows)
+            // took 380 µs channel-parallel with the serial clear.
             AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
-                0, channels, work, c =>
+                0, rows, work, [MethodImpl(Hot)] (row) =>
                 {
-                    float* inputPtr = (float*)inPtr;
-                    float* outputPtr = (float*)outPtr;
-                    int channelOffset = c * height * width;
-                    int rowIdx = c * kHW;
-                    for (int kh = 0; kh < kernelH; kh++)
+                    int c = row / kHW;
+                    int kh = (row % kHW) / kernelW;
+                    int kw = row % kernelW;
+                    float* inputPtr = (float*)inPtr + (long)c * height * width;
+                    float* outRow = (float*)outPtr + (long)row * colW;
+
+                    int ohStart = Math.Max(0, padH - kh);
+                    int ohEnd = Math.Min(outputH, height + padH - kh);
+                    int owStart = Math.Max(0, padW - kw);
+                    int owEnd = Math.Min(outputW, width + padW - kw);
+                    int validWidth = owEnd - owStart;
+                    if (validWidth <= 0 || ohEnd <= ohStart)
                     {
-                        int ohStart = Math.Max(0, padH - kh);
-                        int ohEnd = Math.Min(outputH, height + padH - kh);
-                        for (int kw = 0; kw < kernelW; kw++)
-                        {
-                            int owStart = Math.Max(0, padW - kw);
-                            int owEnd = Math.Min(outputW, width + padW - kw);
-                            int validWidth = owEnd - owStart;
-                            if (validWidth > 0 && ohEnd > ohStart)
-                            {
-                                float* outRow = outputPtr + rowIdx * colW;
-                                for (int oh = ohStart; oh < ohEnd; oh++)
-                                {
-                                    int ih = oh + kh - padH;
-                                    int inputStart = channelOffset + ih * width + (owStart + kw - padW);
-                                    int outputStart = oh * outputW + owStart;
-                                    Buffer.MemoryCopy(
-                                        inputPtr + inputStart,
-                                        outRow + outputStart,
-                                        validWidth * sizeof(float),
-                                        validWidth * sizeof(float));
-                                }
-                            }
-                            rowIdx++;
-                        }
+                        new Span<float>(outRow, colW).Clear();
+                        return;
+                    }
+
+                    // Rows above / below the valid window are all padding.
+                    if (ohStart > 0) new Span<float>(outRow, ohStart * outputW).Clear();
+                    if (ohEnd < outputH) new Span<float>(outRow + ohEnd * outputW, (outputH - ohEnd) * outputW).Clear();
+                    int leftPad = owStart, rightPad = outputW - owEnd;
+                    for (int oh = ohStart; oh < ohEnd; oh++)
+                    {
+                        float* dst = outRow + oh * outputW;
+                        if (leftPad > 0) new Span<float>(dst, leftPad).Clear();
+                        int ih = oh + kh - padH;
+                        new ReadOnlySpan<float>(inputPtr + ih * width + (owStart + kw - padW), validWidth)
+                            .CopyTo(new Span<float>(dst + owStart, validWidth));
+                        if (rightPad > 0) new Span<float>(dst + owEnd, rightPad).Clear();
                     }
                 }, deterministicSafe: true);
         }
@@ -164,6 +170,7 @@ internal static class Im2ColHelper
     /// channel owns a disjoint <c>kernelH*kernelW</c>-row block, so no synchronisation.
     /// Bit-identical to the full-matrix im2col over the same output columns.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void Im2ColRowBlockFloat(
         ReadOnlySpan<float> input,
         Span<float> output,
@@ -186,7 +193,7 @@ internal static class Im2ColHelper
             IntPtr inPtr = (IntPtr)inP;
             IntPtr outPtr = (IntPtr)outP;
             AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
-                0, channels, work, c =>
+                0, channels, work, [MethodImpl(Hot)] (c) =>
                 {
                     float* inputPtr = (float*)inPtr;
                     float* outputPtr = (float*)outPtr;
@@ -246,6 +253,7 @@ internal static class Im2ColHelper
     /// Performs im2col on a single image (no batch dimension).
     /// Optimized row-by-row processing for better cache utilization and SIMD.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Im2ColSingleImage(
         ReadOnlySpan<float> input,
         Span<float> output,
@@ -350,6 +358,7 @@ internal static class Im2ColHelper
     /// Optimized row processing for stride=1, dilation=1 case.
     /// Uses bulk memory copies for contiguous regions instead of element-by-element access.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Im2ColRowOptimized(
         float* input,
         float* outRow,
@@ -405,6 +414,7 @@ internal static class Im2ColHelper
     /// <summary>
     /// General row processing for arbitrary stride and dilation.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Im2ColRowGeneral(
         float* input,
         float* outRow,
@@ -443,6 +453,7 @@ internal static class Im2ColHelper
         }
     }
 
+    [MethodImpl(Hot)]
     private static void ProcessColumnArray(
         float[] input,
         float[] output,
@@ -489,6 +500,7 @@ internal static class Im2ColHelper
         }
     }
 
+    [MethodImpl(Hot)]
     private static void ProcessColumnSpan(
         ReadOnlySpan<float> input,
         Span<float> output,
@@ -542,6 +554,7 @@ internal static class Im2ColHelper
     /// #403 N-concatenated Conv2DBackwardInput path to scatter each batch's
     /// slice of a shared <c>[colH, batch*colW]</c> GEMM result in place.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Col2ImAccumulateStrided(
         ReadOnlySpan<float> colData, int colRowStride, int colColOffset,
         Span<float> imageData,
@@ -595,6 +608,7 @@ internal static class Im2ColHelper
     /// With <c>channelStart = 0, channelEnd = channels</c> this is identical to
     /// <see cref="Col2ImAccumulate(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Col2ImAccumulateChannelRange(
         ReadOnlySpan<float> colData,
         Span<float> imageData,
@@ -638,6 +652,7 @@ internal static class Im2ColHelper
     /// Double-precision counterpart of
     /// <see cref="Col2ImAccumulateChannelRange(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Col2ImAccumulateChannelRange(
         ReadOnlySpan<double> colData,
         Span<double> imageData,
@@ -695,6 +710,7 @@ internal static class Im2ColHelper
     /// was not.
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Col2ImAccumulateChannelParallel(
         float[] colData, int colOffset,
         float[] imageData, int imgOffset,
@@ -710,7 +726,7 @@ internal static class Im2ColHelper
         long totalWork = (long)channels * kHW * colW;
         int hw = height * width;
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
-            0, channels, totalWork, c =>
+            0, channels, totalWork, [MethodImpl(Hot)] (c) =>
             {
                 int colIdx = colOffset + c * kHW * colW;
                 int imgChannelBase = imgOffset + c * hw;
@@ -742,6 +758,7 @@ internal static class Im2ColHelper
     /// overlapping receptive fields), so values are ADDED (not overwritten). The output
     /// buffer must be zero-initialized before calling.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Col2ImAccumulate(
         ReadOnlySpan<float> colData,
         Span<float> imageData,
@@ -781,6 +798,7 @@ internal static class Im2ColHelper
     /// Double-precision variant of <see cref="Col2ImAccumulate(ReadOnlySpan{float}, Span{float}, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
     /// Used by the BLAS fast-path in <c>Conv2DBackwardInput</c> when T=double.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Col2ImAccumulate(
         ReadOnlySpan<double> colData,
         Span<double> imageData,
@@ -829,6 +847,7 @@ internal static class Im2ColHelper
     /// <c>colRowStride = colW, colColOffset = 0</c> this is identical to the
     /// contiguous overload.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Col2ImAccumulateStrided(
         ReadOnlySpan<double> colData, int colRowStride, int colColOffset,
         Span<double> imageData,
@@ -872,6 +891,7 @@ internal static class Im2ColHelper
     /// This is significantly faster than naive nested loops for large convolutions.
     /// </summary>
     /// <returns>True if GEMM was used successfully, false if fallback is needed</returns>
+    [MethodImpl(Hot)]
     public static bool TryConv2DWithGemm(
         ReadOnlySpan<float> input,
         ReadOnlySpan<float> kernel,
@@ -955,6 +975,7 @@ internal static class Im2ColHelper
     /// Blocked matrix multiplication fallback when BLAS is not available.
     /// C = A @ B where A is [m, k], B is [k, n], C is [m, n]
     /// </summary>
+    [MethodImpl(Hot)]
     private static void MultiplyMatrixBlocked(
         ReadOnlySpan<float> a,
         ReadOnlySpan<float> b,
@@ -1007,6 +1028,7 @@ internal static class Im2ColHelper
     /// Performs im2col transformation for double precision tensors.
     /// Same algorithm as the float version but operates on double data.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Im2Col(
         ReadOnlySpan<double> input,
         Span<double> output,
@@ -1078,6 +1100,7 @@ internal static class Im2ColHelper
     /// Each channel owns a disjoint block of <c>kernelH*kernelW</c> destination rows
     /// (row block base <c>c*kernelH*kernelW</c>), so distinct channel ranges write to
     /// disjoint rows and the build parallelizes over channels with no synchronization.</summary>
+    [MethodImpl(Hot)]
     public static unsafe void Im2ColStridedSingleChannelRange(
         ReadOnlySpan<double> input,
         Span<double> output, int colRowStride, int colColOffset,
@@ -1182,6 +1205,7 @@ internal static class Im2ColHelper
     /// Float counterpart of the <c>double</c> channel-range overload — each channel owns
     /// a disjoint <c>kernelH*kernelW</c>-row block, so the build parallelizes over
     /// channels with no synchronization.</summary>
+    [MethodImpl(Hot)]
     public static unsafe void Im2ColStridedSingleChannelRange(
         ReadOnlySpan<float> input,
         Span<float> output, int colRowStride, int colColOffset,
@@ -1266,6 +1290,7 @@ internal static class Im2ColHelper
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void Im2ColSingleImageDouble(
         ReadOnlySpan<double> input,
         Span<double> output,
@@ -1382,6 +1407,7 @@ internal static class Im2ColHelper
     /// Blocked matrix multiplication for double precision.
     /// C = A @ B where A is [m, k], B is [k, n], C is [m, n]
     /// </summary>
+    [MethodImpl(Hot)]
     internal static void MultiplyMatrixBlockedDouble(
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
@@ -1517,6 +1543,7 @@ internal static class Im2ColHelper
     /// that capped parallelism (e.g. shared-tenant CI runner, deterministic-
     /// mode tests) is honoured.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void RunPackedGemmDouble(
         ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
         int m, int k, int n, int BlockSize,
@@ -1550,7 +1577,7 @@ internal static class Im2ColHelper
                 IntPtr ipB = (IntPtr)bBase;
                 IntPtr ipPb = (IntPtr)pbBase;
 
-                PersistentParallelExecutor.Instance.Execute(packChunksLocal, chunk =>
+                PersistentParallelExecutor.Instance.Execute(packChunksLocal, [MethodImpl(Hot)] (chunk) =>
                 {
                     int chunkSize = (packTaskCountLocal + packChunksLocal - 1) / packChunksLocal;
                     int taskStart = chunk * chunkSize;
@@ -1600,7 +1627,7 @@ internal static class Im2ColHelper
                 int gemmChunksLocal = gemmChunks;
                 IntPtr ipA = (IntPtr)aBase, ipC = (IntPtr)cBase, ipPb = (IntPtr)pbBase;
 
-                PersistentParallelExecutor.Instance.Execute(gemmChunksLocal, chunk =>
+                PersistentParallelExecutor.Instance.Execute(gemmChunksLocal, [MethodImpl(Hot)] (chunk) =>
                 {
                     int chunkSize = (totalTilesLocal + gemmChunksLocal - 1) / gemmChunksLocal;
                     int tileStart = chunk * chunkSize;
@@ -1640,6 +1667,7 @@ internal static class Im2ColHelper
     /// (one cache line worth of doubles). RyuJIT auto-vectorizes the
     /// inner axpy as well.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void MultiplyPackedTilePtr(
         double* a, double* packedB, double* c,
         int ii, int iEnd, int jj, int jEnd, int kk, int kEnd,
@@ -1667,6 +1695,7 @@ internal static class Im2ColHelper
     /// the given output tile so the whole inner reduction lives in this
     /// task and can be JIT-auto-vectorized in place.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void MultiplyBlockedDoubleTilePtr(
         double* a, double* b, double* c,
         int ii, int iEnd, int jj, int jEnd,
@@ -1695,6 +1724,7 @@ internal static class Im2ColHelper
     /// Span overload — handles the contiguous row range [ii, iEnd) of C
     /// when called from the serial path (no thread crossing).
     /// </summary>
+    [MethodImpl(Hot)]
     private static void MultiplyBlockedDoubleRowSlabSpan(
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
@@ -1742,6 +1772,7 @@ internal static class Im2ColHelper
     /// blocks, etc.) — measured ~14× speedup at DCGAN gen scale on x64 + MKL.
     /// </remarks>
     /// <returns>True on success; false if BLAS is unavailable (caller falls back to naive).</returns>
+    [MethodImpl(Hot)]
     public static bool TryConvTranspose2DWithGemm(
         float[] input,
         float[] kernel,
@@ -1851,6 +1882,7 @@ internal static class Im2ColHelper
     /// Double-precision counterpart of the float
     /// <see cref="TryConvTranspose2DWithGemm(float[], float[], float[], int, int, int, int, int, int, int, int, int, int, int, int, int)"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static bool TryConvTranspose2DWithGemm(
         double[] input,
         double[] kernel,
@@ -2028,6 +2060,7 @@ internal static class Im2ColHelper
     private const int DgemmFatAMc = 64;
     private const int DgemmFatAMr = 2;
 
+    [MethodImpl(Hot)]
     internal static void DgemmTransA_N16_FatA(
         double[] a, int kernelOffset, int lda,
         double[] b, int bOffset, int ldb,
@@ -2079,7 +2112,7 @@ internal static class Im2ColHelper
             AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel<double[]>(
                 mcBlocks, procs,
                 localInit: () => pool.Rent(packedSize),
-                body: (mb, packedA) =>
+                body: [MethodImpl(Hot)] (mb, packedA) =>
                 {
                     int mcStart = mb * Mc;
                     PackAPanel_TransA_N16_Mr2(a, kernelOffset, lda, packedA, mcStart, Mc, k);
@@ -2169,7 +2202,7 @@ internal static class Im2ColHelper
     /// Mr=2 doubles (16 bytes) per kk step — well inside one cache line
     /// per 4 steps, keeping the Mr × K = 8 KB working set in L1.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void PackAPanel_TransA_N16_Mr2(
         double[] a, int aOffset, int lda,
         double[] packed, int mcStart, int mc, int k)
@@ -2203,7 +2236,7 @@ internal static class Im2ColHelper
     /// accumulators. No branching in the K loop; JIT emits a tight
     /// straight-line unroll.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void Microkernel_TransA_N16_Mr2(
         double[] packedA, int packedOffset,
         double[] b, int bOffset, int ldb,
@@ -2290,6 +2323,7 @@ internal static class Im2ColHelper
     /// BLIS-style packed-A + Mc=64 macro-blocking and parallel-Mc dispatch as
     /// the AVX2 path; only the row-tile width and microkernel ISA differ.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void DgemmTransA_N16_FatA_Avx512(
         double[] a, int kernelOffset, int lda,
         double[] b, int bOffset, int ldb,
@@ -2315,7 +2349,7 @@ internal static class Im2ColHelper
             AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel<double[]>(
                 mcBlocks, procs,
                 localInit: () => pool.Rent(packedSize),
-                body: (mb, packedA) =>
+                body: [MethodImpl(Hot)] (mb, packedA) =>
                 {
                     int mcStart = mb * Mc;
                     PackAPanel_TransA_N16_Mr8(a, kernelOffset, lda, packedA, mcStart, Mc, k);
@@ -2378,7 +2412,7 @@ internal static class Im2ColHelper
     }
 
     /// <summary>Mr=8 BLIS pack: packed[mrOuter, kk, ri] for ri in 0..7.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void PackAPanel_TransA_N16_Mr8(
         double[] a, int aOffset, int lda,
         double[] packed, int mcStart, int mc, int k)
@@ -2409,7 +2443,7 @@ internal static class Im2ColHelper
     /// multiply-adds into 16 ZMM accumulators (8 rows × 2 halves). Mirrors the
     /// proven Avx512Fp64_8x16 FMA pattern in the BlasManaged subsystem.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void Microkernel_TransA_N16_Mr8(
         double[] packedA, int packedOffset,
         double[] b, int bOffset, int ldb,

@@ -2662,7 +2662,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
                 if (leafBuffer is null) continue;
                 var leafData = leaf.GetDataArray();
-                if (leafBuffer.Size < leafData.Length) continue;
+                if (leafBuffer.Size < leaf.Length) continue;
                 cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
                 leaf._gpuBufferVersion = leaf.GpuCacheVersion;
             }
@@ -2687,7 +2687,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             buf = bound;
         }
         var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
-        if (buf.Size < data.Length) return allLive;
+        if (buf.Size < inT.Length) return allLive;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         inT._gpuBufferVersion = inT.GpuCacheVersion;
         return allLive;

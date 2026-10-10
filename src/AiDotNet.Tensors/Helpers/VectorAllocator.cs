@@ -53,8 +53,6 @@ public static class VectorAllocator
 #if NET5_0_OR_GREATER
         // Tier 1: Thread-local cache — zero allocation after warmup.
         T[]? cached = ThreadLocalTensorCache<T>.TryRent(length);
-        if (cached is null && length >= ArrayPoolThreshold)
-            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(length));
         if (cached is not null)
         {
             Array.Clear(cached, 0,
@@ -66,7 +64,7 @@ public static class VectorAllocator
         // Tier 2: ArrayPool for large allocations.
         if (length >= ArrayPoolThreshold)
         {
-            T[] pooled = ArrayPool<T>.Shared.Rent(length);
+            T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(length);
             Array.Clear(pooled, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : length);
             var memory = new Memory<T>(pooled, 0, length);
@@ -124,7 +122,7 @@ public static class VectorAllocator
 #if NET5_0_OR_GREATER
         if (length >= ArrayPoolThreshold)
         {
-            T[] pooled = ArrayPool<T>.Shared.Rent(length);
+            T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(length);
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 Array.Clear(pooled, 0, pooled.Length);
             var memory = new Memory<T>(pooled, 0, length);
@@ -159,7 +157,7 @@ public static class VectorAllocator
 
         if (length >= ArrayPoolThreshold)
         {
-            T[] pooled = ArrayPool<T>.Shared.Rent(length);
+            T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(length);
             data.AsSpan().CopyTo(pooled.AsSpan(0, length));
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>() && pooled.Length > length)
                 Array.Clear(pooled, length, pooled.Length - length);
@@ -189,32 +187,14 @@ public static class VectorAllocator
         {
             vector.DetachPooledArray();
 #if NET5_0_OR_GREATER
-            // Tier 1: Try thread-local cache first — zero contention, instant reuse.
-            if (ThreadLocalTensorCache<T>.TryReturn(pooledArray))
-                return;
-
-            // Tier 2: Cache full — fall through to ArrayPool.
-            ArrayPool<T>.Shared.Return(pooledArray,
-                clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+            // Exact-size arrays (ThreadLocalTensorCache.RentOrAllocateExact) go back to this thread's
+            // cache; when it declines, the GC takes them. They are not ArrayPool bucket sizes, so
+            // ArrayPool.Return would reject them.
+            ThreadLocalTensorCache<T>.TryReturn(pooledArray);
 #else
             ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
 #endif
         }
     }
 
-    /// <summary>
-    /// Computes the ArrayPool bucket size for a given request.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int ArrayPoolBucketSize(int requestedSize)
-    {
-        if (requestedSize <= 16) return 16;
-        int v = requestedSize - 1;
-        v |= v >> 1;
-        v |= v >> 2;
-        v |= v >> 4;
-        v |= v >> 8;
-        v |= v >> 16;
-        return v + 1;
-    }
 }

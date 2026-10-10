@@ -1369,15 +1369,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Fused recurrence / LM-head kernels are optional.
         }
 
-        // Compile GRU sequence kernels (forward/backward for BPTT training)
-        // Needs cooperative_groups.h which may not be in minimal CUDA Toolkit installs.
+        // Compile GRU sequence kernels (forward/backward for BPTT training). The module used to include
+        // cooperative_groups.h, which NVRTC cannot find without a full toolkit install, so it failed to compile and every
+        // GRU kernel was missing; nothing in it uses cooperative groups any more.
         try
         {
             _gruModule = CompileKernelModule(device, CudaGruKernels.GetSource(), "gru_kernels", CudaGruKernels.GetKernelNames());
         }
         catch
         {
-            // GRU kernels need cooperative_groups.h — optional.
+            // Optional: the GRU entry points throw "kernel not found" when the module is unavailable.
         }
 
         // Compile WMMA Tensor Core kernels for Volta+ (sm_70+)
@@ -6914,10 +6915,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_kernel");
 
         using var _ = PushContext();
-        const int BLOCK = 16;
-        uint gx = (uint)((kernelW + BLOCK - 1) / BLOCK);
-        uint gy = (uint)((kernelH + BLOCK - 1) / BLOCK);
-        uint gz = (uint)(outChannels * inChannels);
+        // One thread per gradKernel element (see the kernel): a flat 1D grid has no 65,535 limit.
+        const int BLOCK = 256;
+        long total = (long)outChannels * inChannels * kernelH * kernelW;
+        uint grid = (uint)((total + BLOCK - 1) / BLOCK);
 
         IntPtr inputPtr = input.Handle;
         IntPtr gradOutputPtr = gradOutput.Handle;
@@ -6941,7 +6942,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         args[15] = &padW;
         args[16] = &dilationH;
         args[17] = &dilationW;
-        LaunchKernel3D(cudaKernel, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, args, 0);
+        LaunchKernel(cudaKernel, grid, BLOCK, args);
     }
 
     public unsafe void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
@@ -10347,22 +10348,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchUnaryKernel("hardswish", A, B, size);
     }
 
-    public unsafe void Selu(IGpuBuffer A, IGpuBuffer B, float alpha, float scale, int size)
+    public void Selu(IGpuBuffer A, IGpuBuffer B, float alpha, float scale, int size)
     {
-        if (!_kernelCache.TryGetValue("selu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: selu");
-
-        using var _ = PushContext();
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr aPtr = A.Handle;
-        IntPtr bPtr = B.Handle;
-        void** args = stackalloc void*[5];
-        args[0] = &aPtr;
-        args[1] = &bPtr;
-        args[2] = &alpha;
-        args[3] = &scale;
-        args[4] = &size;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        // The "selu" kernel is selu(input, output, int size) with the standard constants built in (they are fixed by
+        // SELU's definition and every caller passes exactly them). Launching it with (input, output, alpha, scale,
+        // size) handed the kernel alpha's bit pattern (~1.07e9) as `size`, so its bounds check never fired: every
+        // thread of the last block read past the input and wrote past the output, into whatever allocation came
+        // next. It surfaced as the engine's cached ones vectors turning into selu(1) = 1.0507 deep into the parity
+        // suite, and from there as wrong gradients in unrelated ops. OpenCL had the same fix under #775.
+        _ = alpha; _ = scale;
+        LaunchUnaryKernel("selu", A, B, size);
     }
 
     public void Hardsigmoid(IGpuBuffer A, IGpuBuffer B, int size)
@@ -10462,13 +10457,13 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IntPtr inputPtr = input.Handle;
         IntPtr gradInPtr = gradInput.Handle;
         int n = size;
-        void** args = stackalloc void*[6];
+        // selu_backward(gradOutput, input, gradInput, int size) has SELU's fixed constants built in (alpha and scale are
+        // not forwarded). Passing them as well put alpha's bit pattern in `size`, so the kernel ran past all three buffers.
+        void** args = stackalloc void*[4];
         args[0] = &gradOutPtr;
         args[1] = &inputPtr;
         args[2] = &gradInPtr;
-        args[3] = &alpha;
-        args[4] = &scale;
-        args[5] = &n;
+        args[3] = &n;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -11500,7 +11495,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public unsafe float MseLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
-        if (!_kernelCache.TryGetValue("mse_loss", out var kernel))
+        if (!_kernelCache.TryGetValue("mse_loss_elementwise", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: mse_loss");
 
         using var _ = PushContext();
@@ -11648,7 +11643,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
-        if (!_kernelCache.TryGetValue("huber_loss", out var kernel))
+        if (!_kernelCache.TryGetValue("huber_loss_elementwise", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: huber_loss");
 
         using var _ = PushContext();
@@ -12270,8 +12265,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException("CUDA kernel not found: contrastive_loss_backward");
 
         using var _ = PushContext();
-        int totalSize = batchSize * embeddingDim;
-        uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize); // one thread per sample
         IntPtr output1Ptr = output1.Handle;
         IntPtr output2Ptr = output2.Handle;
         IntPtr labelsPtr = labels.Handle;
@@ -17661,7 +17655,13 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         uint grid = (uint)batch;
 
         // Shared memory size for accumulated hidden gradients (one float per thread)
-        uint sharedMemSize = (uint)(DefaultBlockSize * sizeof(float));
+        uint sharedMemSize = (uint)(4 * hiddenSize * sizeof(float)); // one step's r/z/n/r*n gate gradients
+
+        // The kernel accumulates weight and bias gradients over batch rows and time steps: start them at zero.
+        Fill(gradWeightsIh, 0f, 3 * hiddenSize * inputSize);
+        Fill(gradWeightsHh, 0f, 3 * hiddenSize * hiddenSize);
+        Fill(gradBiasIh, 0f, 3 * hiddenSize);
+        Fill(gradBiasHh, 0f, 3 * hiddenSize);
 
         IntPtr gradOutputPtr = gradOutput.Handle;
         IntPtr allHPtr = allH.Handle;
@@ -17696,8 +17696,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         args[15] = &inputSize;
         args[16] = &hiddenSize;
 
-        // Use cooperative kernel launch for grid-wide synchronization (grid.sync())
-        LaunchCooperativeKernel(kernel, grid, (uint)hiddenSize, sharedMemSize, args);
+                LaunchKernelWithSharedMem(kernel, grid, (uint)hiddenSize, sharedMemSize, args); // block = one batch row's hidden units
     }
 
     public unsafe void GruCellBackward(

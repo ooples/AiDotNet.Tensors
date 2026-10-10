@@ -18,6 +18,9 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
+// Changes process-wide CpuParallelSettings: runs in the non-parallel collection so it never races the
+// other tests that change or depend on them.
+[Collection("CpuParallelSettings")]
 public class PersistentExecutorGrainSizeTests
 {
     /// <summary>

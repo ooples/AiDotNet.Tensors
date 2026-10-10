@@ -71,7 +71,17 @@ public class TinyShapeBypassTest
         BlasOptions<float> automatic = default;
         var forced = new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth };
 
+        // The tile depends on the ISA the runtime exposes: 8x8 / 6x16 under AVX2, 16x16 under AVX-512,
+        // and 4x4 where no intrinsics are available (all of .NET Framework). Shapes are therefore
+        // judged against the tile actually picked rather than an AVX2 constant.
+        var (mr, nr) = BlasManagedLib.GetEvolutionTuningTile<float>(PackingMode.Auto, deterministic: true);
         Assert.True(BlasManagedLib.IsTinyShapeBypassEligible(
+            m: mr - 1, n: nr, k: 4, in automatic, deterministic: true));
+        Assert.True(BlasManagedLib.IsTinyShapeBypassEligible(
+            m: mr, n: nr - 1, k: 4, in automatic, deterministic: true));
+        Assert.False(BlasManagedLib.IsTinyShapeBypassEligible(
+            m: mr, n: nr, k: 4, in automatic, deterministic: true));
+        Assert.Equal(8 < mr || 6 < nr, BlasManagedLib.IsTinyShapeBypassEligible(
             m: 8, n: 6, k: 4, in automatic, deterministic: true));
         Assert.False(BlasManagedLib.IsTinyShapeBypassEligible(
             m: 16, n: 16, k: 16, in automatic, deterministic: true));

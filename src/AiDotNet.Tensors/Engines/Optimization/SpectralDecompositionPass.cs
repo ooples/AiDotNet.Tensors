@@ -111,7 +111,7 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
                 var fftOut = FftConv.Conv2DSame(fftInput, fftWeight, fftBias);
                 var fftData = fftOut.GetDataArray();
                 var outArr = (float[])(object)output.GetDataArray();
-                System.Array.Copy(fftData, outArr, fftData.Length);
+                System.Array.Copy(fftData, outArr, fftOut.Length);
             },
             step.OutputBuffer,
             step.Inputs,

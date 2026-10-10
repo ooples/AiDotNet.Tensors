@@ -17,4 +17,8 @@
   <Import Project="$(MSBuildThisFileDirectory)AiDotNet.Tensors.Enterprise.targets"
           Condition="Exists('$(MSBuildThisFileDirectory)AiDotNet.Tensors.Enterprise.targets')" />
 
+  <!-- Deploys shaderc_shared (Vulkan GLSL compiler) for .NET Framework consumers; see that file. -->
+  <Import Project="$(MSBuildThisFileDirectory)AiDotNet.Tensors.NativeAssets.targets"
+          Condition="Exists('$(MSBuildThisFileDirectory)AiDotNet.Tensors.NativeAssets.targets')" />
+
 </Project>

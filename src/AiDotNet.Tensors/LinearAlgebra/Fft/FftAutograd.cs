@@ -128,7 +128,7 @@ internal static class FftAutograd
         var src = packed.GetDataArray();
         var dst = result.GetDataArray();
         int last = packed.Shape[packed.Rank - 1];
-        int batch = src.Length / last;
+        int batch = packed.Length / last;
         bool evenN = n % 2 == 0;
 
         for (int b = 0; b < batch; b++)
@@ -322,7 +322,7 @@ internal static class FftAutograd
         var src = packed.GetDataArray();
         var dst = result.GetDataArray();
         int last = packed.Shape[packed.Rank - 1];
-        int batch = src.Length / last;
+        int batch = packed.Length / last;
         for (int b = 0; b < batch; b++)
         {
             int off = b * last;

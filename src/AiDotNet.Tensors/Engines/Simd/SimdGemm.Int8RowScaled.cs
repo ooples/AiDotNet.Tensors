@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 // Copyright (c) AiDotNet. All rights reserved.
 // Tensors#401 / AiDotNet#1349: per-row-scaled INT8 weight-only GEMM.
 //
@@ -34,7 +36,6 @@
 // itself doesn't compile on net471's lower SIMD baseline either).
 #if NET5_0_OR_GREATER
 using System;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -230,6 +231,7 @@ internal static partial class SimdGemm
         }
     }
 
+    [MethodImpl(Hot)]
     private static bool RowScalesEqual(float[] cached, ReadOnlySpan<float> current)
     {
         if (cached.Length != current.Length) return false;
@@ -336,6 +338,7 @@ internal static partial class SimdGemm
     /// <c>bInt8</c> as <c>[n, k]</c>, so the same logical element is
     /// at <c>bInt8[(jc + jj) * k + (pc + p)]</c>.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void PackBInt8FromNK(
         sbyte[] bInt8, sbyte[] packed,
         int k, int n,
@@ -383,6 +386,7 @@ internal static partial class SimdGemm
     /// the panel's kc rows), and the cache key is the consumer's
     /// sbyte[] weight reference.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void SgemmTiledWithInt8RowScaledCached(
         ReadOnlySpan<float> a,
         Int8RowScaledPrePackedB cached,
@@ -529,6 +533,7 @@ internal static partial class SimdGemm
     /// the same <c>[n, k]</c> layout in FP32 — the caller passes this to
     /// SgemmAddInternal with <c>transB:true</c>.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void DequantizeInt8WithRowScalesToFloat32_Reference(
         sbyte[] bInt8, Span<float> output, ReadOnlySpan<float> rowScales, int n, int k)
     {
@@ -594,6 +599,7 @@ internal static partial class SimdGemm
         Avx.MaskStore(row + 8, m1f, Fma.MultiplyAdd(v1, s1, e1));
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void MicroKernel6x16Int8RowScaledFused(
         float[] packedA, int aOffset,
         sbyte[] packedBInt8, int bOffset,
@@ -639,6 +645,7 @@ internal static partial class SimdGemm
         StoreScaledAccumRow(ref cRef, cRow + 5, cCol, ldc, c50, c51, s0, s1);
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void MicroKernelMxNMaskedInt8RowScaledFused(
         float[] packedA, int aOffset,
         sbyte[] packedBInt8, int bOffset,
@@ -699,6 +706,7 @@ internal static partial class SimdGemm
     /// buffer). <paramref name="rowScaleBase"/> is the column offset of this
     /// sub-block within the per-row-scale array.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void MacroKernelInt8RowScaledFused(
         float[] packedA, sbyte[] packedBInt8,
         float[] rowScales, int rowScaleBase,

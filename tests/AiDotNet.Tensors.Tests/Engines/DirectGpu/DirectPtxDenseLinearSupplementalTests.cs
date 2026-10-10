@@ -13,6 +13,9 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 // Supplemental #836 tests retained while integrating the independently-authored
 // dense-linear kernel families on the same PR branch.
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public partial class DirectPtxWmmaTests
 {
     [Fact]

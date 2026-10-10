@@ -16,6 +16,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// An eager-only implementation can appear correct on the trace batch while freezing its output
 /// as a leaf, which severs both upstream gradients and subsequent replay updates.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class CompiledCustomKernelCaptureTests
 {
     private delegate Tensor<float> Forward(CpuEngine engine, Tensor<float>[] parameters);

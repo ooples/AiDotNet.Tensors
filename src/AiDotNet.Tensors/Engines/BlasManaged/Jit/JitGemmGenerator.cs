@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics.X86;
 #endif
@@ -54,6 +56,7 @@ internal static class JitGemmGenerator
     /// (caller falls back) when N is not a multiple of 8, when unsupported, or on any emit failure.
     /// Mr is tiled by 6, Nr by 16 then 8.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe bool TryRunFp32(
         float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k,
         float* bias = null, bool relu = false)
@@ -87,6 +90,7 @@ internal static class JitGemmGenerator
     /// <summary>C[m×n] := A[m×k]·B[k×n] (row-major, overwrite) via specialized JIT tiles, FP64.
     /// Returns false when N is not a multiple of 4 (no AVX2 mask), unsupported, or on emit failure.
     /// No fused epilogue (FP64 callers apply it managed).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe bool TryRunFp64(
         double* a, int lda, double* b, int ldb, double* c, int ldc, int m, int n, int k)
     {
@@ -148,6 +152,7 @@ internal static class JitGemmGenerator
     /// only safe when no GEMM is in flight on any thread (the same contract the rest of
     /// <see cref="BlasManaged.ClearCaches"/> assumes).
     /// </summary>
+    [MethodImpl(Hot)]
     internal static void ClearCache()
     {
         lock (s_emitLock)
@@ -163,6 +168,7 @@ internal static class JitGemmGenerator
     // Canonical body register layout: rcx=A, rdx=B, r8=C, r9=K. Accumulators ymm0..(Mr*nVec-1)
     // (≤12), B-load scratch ymm12..(12+nVec-1), A-broadcast scratch ymm14. Mr≤6, nVec≤2.
 
+    [MethodImpl(Hot)]
     private static byte[] EmitDirectTileWindows(int mr, int nVec, int lda, int ldb, int ldc, bool f64, bool hasBias, bool relu)
     {
         const int RSP = 4, R10 = 10;
@@ -202,6 +208,7 @@ internal static class JitGemmGenerator
     /// rdx=B, r8=C, r9=K. Each ymm spans 32 B regardless of dtype, so the v·32 displacements and
     /// the +32 store strides are shared; only the element size, FMA, broadcast, and load/store
     /// opcodes differ between FP32 and FP64.</summary>
+    [MethodImpl(Hot)]
     private static void EmitDirectBody(X64Assembler asm, int mr, int nVec, int lda, int ldb, int ldc, bool f64, bool hasBias, bool relu)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10;

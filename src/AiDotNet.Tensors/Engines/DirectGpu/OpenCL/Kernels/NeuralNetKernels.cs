@@ -34,18 +34,6 @@ inline void atomic_add_float(volatile __global float *ptr, float val) {
 // ACTIVATION GRADIENT KERNELS
 // ===========================================================================
 
-// ReLU backward: grad * (input > 0)
-__kernel void relu_backward(
-    __global const float* gradOutput,
-    __global const float* input,
-    __global float* gradInput,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    gradInput[idx] = input[idx] > 0.0f ? gradOutput[idx] : 0.0f;
-}
 
 // Sigmoid backward: grad * output * (1 - output)
 __kernel void sigmoid_backward(
@@ -151,19 +139,6 @@ __kernel void leaky_relu_forward(
     output[idx] = x > 0.0f ? x : alpha * x;
 }
 
-// Leaky ReLU backward
-__kernel void leaky_relu_backward(
-    __global const float* gradOutput,
-    __global const float* input,
-    __global float* gradInput,
-    const float alpha,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    gradInput[idx] = input[idx] > 0.0f ? gradOutput[idx] : alpha * gradOutput[idx];
-}
 
 // ELU forward: x > 0 ? x : alpha * (exp(x) - 1)
 __kernel void elu_forward(
@@ -283,40 +258,6 @@ __kernel void hardswish_forward(
 // LOSS FUNCTION KERNELS
 // ===========================================================================
 
-// Cross-entropy loss (with softmax input)
-// Returns per-sample loss, needs reduction afterwards
-__kernel void cross_entropy_loss(
-    __global const float* predictions,
-    __global const float* targets,
-    __global float* losses,
-    const int batchSize,
-    const int numClasses)
-{
-    const int b = get_global_id(0);
-    if (b >= batchSize) return;
-
-    // Find max for numerical stability
-    float maxVal = -INFINITY;
-    for (int c = 0; c < numClasses; c++) {
-        maxVal = fmax(maxVal, predictions[b * numClasses + c]);
-    }
-
-    // Compute log-sum-exp
-    float sumExp = 0.0f;
-    for (int c = 0; c < numClasses; c++) {
-        sumExp += exp(predictions[b * numClasses + c] - maxVal);
-    }
-    float logSumExp = maxVal + log(sumExp);
-
-    // Compute cross-entropy: -sum(target * log(softmax(pred)))
-    float loss = 0.0f;
-    for (int c = 0; c < numClasses; c++) {
-        int idx = b * numClasses + c;
-        float logProb = predictions[idx] - logSumExp;
-        loss -= targets[idx] * logProb;
-    }
-    losses[b] = loss;
-}
 
 // Cross-entropy backward (combined softmax + cross-entropy gradient)
 __kernel void cross_entropy_backward(
@@ -349,22 +290,6 @@ __kernel void cross_entropy_backward(
     gradInput[idx] = (softmax - targets[idx]) / (float)batchSize;
 }
 
-// Binary cross-entropy loss
-__kernel void bce_loss(
-    __global const float* predictions,
-    __global const float* targets,
-    __global float* losses,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float p = predictions[idx];
-    float t = targets[idx];
-    // Clamp to avoid log(0)
-    p = fmax(fmin(p, 1.0f - 1e-7f), 1e-7f);
-    losses[idx] = -(t * log(p) + (1.0f - t) * log(1.0f - p));
-}
 
 // Binary cross-entropy backward
 __kernel void bce_backward(
@@ -889,97 +814,7 @@ __kernel void scatter_add_kernel_deterministic(
 // LSTM KERNELS
 // ===========================================================================
 
-__kernel void lstm_cell_forward(
-    __global const float* gates,
-    __global const float* cellPrev,
-    __global float* cellNext,
-    __global float* hiddenNext,
-    __global float* gateActivations,
-    const int batchSize,
-    const int hiddenSize)
-{
-    const int idx = get_global_id(0);
-    const int totalSize = batchSize * hiddenSize;
-    if (idx >= totalSize) return;
 
-    const int b = idx / hiddenSize;
-    const int h = idx % hiddenSize;
-    const int gateOffset = b * 4 * hiddenSize;
-
-    float gi = gates[gateOffset + h];
-    float gf = gates[gateOffset + hiddenSize + h];
-    float gg = gates[gateOffset + 2 * hiddenSize + h];
-    float go = gates[gateOffset + 3 * hiddenSize + h];
-
-    float i = 1.0f / (1.0f + exp(-gi));
-    float f = 1.0f / (1.0f + exp(-gf));
-    float g = tanh(gg);
-    float o = 1.0f / (1.0f + exp(-go));
-
-    float cPrev = cellPrev[idx];
-    float c = f * cPrev + i * g;
-    float tanhC = tanh(c);
-    float hNew = o * tanhC;
-
-    cellNext[idx] = c;
-    hiddenNext[idx] = hNew;
-
-    gateActivations[gateOffset + h] = i;
-    gateActivations[gateOffset + hiddenSize + h] = f;
-    gateActivations[gateOffset + 2 * hiddenSize + h] = g;
-    gateActivations[gateOffset + 3 * hiddenSize + h] = o;
-}
-
-__kernel void lstm_cell_backward(
-    __global const float* gradHidden,
-    __global const float* gradCellNext,
-    __global const float* gateActivations,
-    __global const float* cellPrev,
-    __global const float* cellNext,
-    __global float* gradGates,
-    __global float* gradCellPrev,
-    const int batchSize,
-    const int hiddenSize)
-{
-    const int idx = get_global_id(0);
-    const int totalSize = batchSize * hiddenSize;
-    if (idx >= totalSize) return;
-
-    const int b = idx / hiddenSize;
-    const int h = idx % hiddenSize;
-    const int gateOffset = b * 4 * hiddenSize;
-
-    float i = gateActivations[gateOffset + h];
-    float f = gateActivations[gateOffset + hiddenSize + h];
-    float g = gateActivations[gateOffset + 2 * hiddenSize + h];
-    float o = gateActivations[gateOffset + 3 * hiddenSize + h];
-
-    float cPrev = cellPrev[idx];
-    float c = cellNext[idx];
-    float tanhC = tanh(c);
-
-    float dH = gradHidden[idx];
-    float dO = dH * tanhC;
-    float dTanhC = dH * o;
-    float dC = dTanhC * (1.0f - tanhC * tanhC);
-    dC += gradCellNext[idx];
-
-    float dF = dC * cPrev;
-    float dI = dC * g;
-    float dG = dC * i;
-    float dCPrev = dC * f;
-
-    float gradGi = dI * i * (1.0f - i);
-    float gradGf = dF * f * (1.0f - f);
-    float gradGg = dG * (1.0f - g * g);
-    float gradGo = dO * o * (1.0f - o);
-
-    gradGates[gateOffset + h] = gradGi;
-    gradGates[gateOffset + hiddenSize + h] = gradGf;
-    gradGates[gateOffset + 2 * hiddenSize + h] = gradGg;
-    gradGates[gateOffset + 3 * hiddenSize + h] = gradGo;
-    gradCellPrev[idx] = dCPrev;
-}
 
 __kernel void lstm_gates_precompute(
     __global const float* input,
@@ -1016,89 +851,7 @@ __kernel void lstm_gates_precompute(
 // GRU KERNELS
 // ===========================================================================
 
-__kernel void gru_cell_forward(
-    __global const float* gatesRZ,
-    __global const float* gateN_input,
-    __global const float* gateN_hidden,
-    __global const float* hiddenPrev,
-    __global float* hiddenNext,
-    __global float* gateActivations,
-    const int batchSize,
-    const int hiddenSize)
-{
-    const int idx = get_global_id(0);
-    const int totalSize = batchSize * hiddenSize;
-    if (idx >= totalSize) return;
 
-    const int b = idx / hiddenSize;
-    const int h = idx % hiddenSize;
-
-    float gr = gatesRZ[b * 2 * hiddenSize + h];
-    float gz = gatesRZ[b * 2 * hiddenSize + hiddenSize + h];
-
-    float r = 1.0f / (1.0f + exp(-gr));
-    float z = 1.0f / (1.0f + exp(-gz));
-
-    float nInput = gateN_input[idx];
-    float nHidden = gateN_hidden[idx];
-    float nPre = nInput + r * nHidden;
-    float n = tanh(nPre);
-
-    float hPrev = hiddenPrev[idx];
-    float hNew = (1.0f - z) * n + z * hPrev;
-
-    hiddenNext[idx] = hNew;
-
-    const int actOffset = b * 3 * hiddenSize;
-    gateActivations[actOffset + h] = r;
-    gateActivations[actOffset + hiddenSize + h] = z;
-    gateActivations[actOffset + 2 * hiddenSize + h] = n;
-}
-
-__kernel void gru_cell_backward(
-    __global const float* gradHidden,
-    __global const float* gateActivations,
-    __global const float* hiddenPrev,
-    __global const float* gateN_hidden,
-    __global float* gradGatesRZ,
-    __global float* gradGateN,
-    __global float* gradHiddenPrev,
-    const int batchSize,
-    const int hiddenSize)
-{
-    const int idx = get_global_id(0);
-    const int totalSize = batchSize * hiddenSize;
-    if (idx >= totalSize) return;
-
-    const int b = idx / hiddenSize;
-    const int h = idx % hiddenSize;
-
-    const int actOffset = b * 3 * hiddenSize;
-    float r = gateActivations[actOffset + h];
-    float z = gateActivations[actOffset + hiddenSize + h];
-    float n = gateActivations[actOffset + 2 * hiddenSize + h];
-
-    float hPrev = hiddenPrev[idx];
-    float dH = gradHidden[idx];
-
-    float dZ = dH * (hPrev - n);
-    float dN = dH * (1.0f - z);
-    float dHPrev = dH * z;
-
-    float dNPre = dN * (1.0f - n * n);
-
-    float nHidden = gateN_hidden[idx];
-    float dR = dNPre * nHidden;
-    dHPrev += dNPre * r;
-
-    float gradGr = dR * r * (1.0f - r);
-    float gradGz = dZ * z * (1.0f - z);
-
-    gradGatesRZ[b * 2 * hiddenSize + h] = gradGr;
-    gradGatesRZ[b * 2 * hiddenSize + hiddenSize + h] = gradGz;
-    gradGateN[idx] = dNPre;
-    gradHiddenPrev[idx] = dHPrev;
-}
 
 // ===========================================================================
 // ADDITIONAL SCATTER OPERATIONS FOR GNNs
@@ -1885,15 +1638,14 @@ __kernel void scatter_softmax_backward_rows(
             return new string[]
             {
                 // Activation gradients
-                "relu_backward", "sigmoid_backward", "tanh_backward",
+                "sigmoid_backward", "tanh_backward",
                 "gelu_backward", "softmax_backward",
-                "leaky_relu_forward", "leaky_relu_backward",
-                "elu_forward", "elu_backward",
+                "leaky_relu_forward", "elu_forward", "elu_backward",
                 "swish_forward", "swish_backward",
                 "silu_forward", "mish_forward", "softplus_forward", "hardswish_forward",
                 // Loss functions
-                "cross_entropy_loss", "cross_entropy_backward",
-                "bce_loss", "bce_backward",
+                "cross_entropy_backward",
+                "bce_backward",
                 "mse_loss", "mse_backward",
                 "smooth_l1_loss", "smooth_l1_backward",
                 // Optimizers
@@ -1907,9 +1659,8 @@ __kernel void scatter_softmax_backward_rows(
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
                 "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows", "scatter_softmax_rows", "scatter_add_backward_rows", "scatter_mean_backward_rows", "scatter_max_backward_rows", "scatter_softmax_backward_rows",
                 // LSTM kernels
-                "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
+                "lstm_gates_precompute",
                 // GRU kernels
-                "gru_cell_forward", "gru_cell_backward",
                 // Additional scatter operations
                 "scatter_add_batched", "scatter_add_batched_deterministic",
                 "scatter_mean_accumulate", "scatter_mean_accumulate_deterministic",

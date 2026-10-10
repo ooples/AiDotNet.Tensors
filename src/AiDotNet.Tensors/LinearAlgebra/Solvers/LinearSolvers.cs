@@ -30,7 +30,7 @@ internal static class LinearSolvers
                 // All info entries must be 0 for Cholesky path; otherwise fall through to LU.
                 bool cholOk = true;
                 var iData = info.GetDataArray();
-                for (int i = 0; i < iData.Length; i++) if (iData[i] != 0) { cholOk = false; break; }
+                for (int i = 0; i < info.Length; i++) if (iData[i] != 0) { cholOk = false; break; }
                 if (cholOk)
                     return Decompositions.CholeskyDecomposition.Solve(factor, b, upper: false);
                 goto default;

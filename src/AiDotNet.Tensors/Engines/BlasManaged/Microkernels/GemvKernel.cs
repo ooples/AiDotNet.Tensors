@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 #if !NET471
 using System.Runtime.Intrinsics;
@@ -74,6 +76,7 @@ internal static class GemvKernel
         throw new ArgumentException($"GemvKernel.Run requires m==1 or n==1 or k==1; got ({m}, {n}, {k}).");
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void RunOuterProduct<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
@@ -179,6 +182,7 @@ internal static class GemvKernel
         throw new NotSupportedException($"GemvKernel does not support T={typeof(T).Name}.");
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void RunRowTimesMatrix<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
@@ -293,6 +297,7 @@ internal static class GemvKernel
         throw new NotSupportedException($"GemvKernel does not support T={typeof(T).Name}.");
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void RunMatrixTimesCol<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,

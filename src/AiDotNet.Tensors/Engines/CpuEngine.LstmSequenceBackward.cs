@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -53,6 +55,7 @@ public partial class CpuEngine
     /// Math.Exp sigmoid to ~1e-6, so the saved gate values — and the σ(1-σ) gradients computed
     /// from them — are unchanged within the finite-difference tolerance.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void SigmoidExactInPlace(float[] buf, int off, int len)
     {
         ScaleInPlace(buf, off, len, -1f);
@@ -89,6 +92,7 @@ public partial class CpuEngine
     /// tanh(x) = 2/(1+exp(-2x)) - 1 (no e^{2x}, so large x → ±1, never NaN). Same exp seam and
     /// ~1e-6 accuracy as <see cref="SigmoidExactInPlace"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void TanhExactInPlace(float[] buf, int off, int len)
     {
         ScaleInPlace(buf, off, len, -2f);
@@ -112,6 +116,7 @@ public partial class CpuEngine
     /// a single fused BPTT node on the active tape. Called from LstmSequenceForward when
     /// a gradient tape is active and T == float.
     /// </summary>
+    [MethodImpl(Hot)]
     private Tensor<float> LstmSequenceForwardFloatTrain(
         Tensor<float> input, Tensor<float>? h0, Tensor<float>? c0,
         Tensor<float> wIh, Tensor<float> wHh, Tensor<float>? bIh, Tensor<float>? bHh,
@@ -732,6 +737,7 @@ public partial class CpuEngine
     /// A gradient the active relevance filter says nothing reads (the data input's, typically) is not computed. Runs
     /// with tape recording suppressed (standard backward context), so the internal GEMMs are plain compute.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void LstmSequenceBackwardFloat(
         Tensor<float> gradOutput, Tensor<float>[] inp, Tensor<float> output,
         object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads)
@@ -1007,6 +1013,7 @@ public partial class CpuEngine
     /// <remarks>"Exact" distinguishes this from the approximated vectorized variants: the backward
     /// pass reuses these activations to form gradients, so an approximation error here is amplified
     /// through the whole BPTT chain.</remarks>
+    [MethodImpl(Hot)]
     private static void SigmoidExactInPlaceD(double[] buf, int off, int len)
     {
         for (int i = off; i < off + len; i++) buf[i] = 1.0 / (1.0 + Math.Exp(-buf[i]));
@@ -1015,6 +1022,7 @@ public partial class CpuEngine
     /// <summary>In-place hyperbolic tangent over a double span, at full precision.</summary>
     /// <remarks>Uses the overflow-safe 2/(1+e^-2x) - 1 form, so a large magnitude saturates to
     /// +/-1 rather than producing NaN.</remarks>
+    [MethodImpl(Hot)]
     private static void TanhExactInPlaceD(double[] buf, int off, int len)
     {
         // tanh(x) = 2/(1+exp(-2x)) - 1 (overflow-safe; large |x| → ±1, never NaN).
@@ -1030,6 +1038,7 @@ public partial class CpuEngine
     /// under an active gradient tape: the fused node records a backward edge only for the sequence
     /// output, so a returned final hidden/cell would silently carry no gradient.
     /// </remarks>
+    [MethodImpl(Hot)]
     private Tensor<double> LstmSequenceForwardDoubleTrain(
         Tensor<double> input, Tensor<double>? h0, Tensor<double>? c0,
         Tensor<double> wIh, Tensor<double> wHh, Tensor<double>? bIh, Tensor<double>? bHh,
@@ -1234,6 +1243,7 @@ public partial class CpuEngine
     /// Native double arithmetic; pooled backward scratch; big GEMMs via the generic parallel
     /// BlasManaged.Gemm&lt;double&gt;, the per-step recurrent GEMM sequential.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void LstmSequenceBackwardDouble(
         Tensor<double> gradOutput, Tensor<double>[] inp, Tensor<double> output,
         object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads)

@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -39,6 +41,7 @@ public partial class CpuEngine
     // ==================================================================
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorRoll<T>(Tensor<T> tensor, int[] shifts, int[] axes)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -115,6 +118,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorFlip<T>(Tensor<T> tensor, int[] axes)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -172,6 +176,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorRepeatInterleave<T>(Tensor<T> tensor, int repeats, int dim)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -252,6 +257,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorRot90<T>(Tensor<T> tensor, int k = 1, int[]? axes = null)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -285,6 +291,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorSwapAxes<T>(Tensor<T> tensor, int axis1, int axis2)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -301,6 +308,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMoveDim<T>(Tensor<T> tensor, int source, int destination)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -366,6 +374,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorVStack<T>(Tensor<T>[] tensors)
     {
         if (tensors == null || tensors.Length == 0) throw new ArgumentNullException(nameof(tensors));
@@ -379,6 +388,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorDStack<T>(Tensor<T>[] tensors)
     {
         if (tensors == null || tensors.Length == 0) throw new ArgumentNullException(nameof(tensors));
@@ -390,6 +400,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorColumnStack<T>(Tensor<T>[] tensors)
     {
         if (tensors == null || tensors.Length == 0) throw new ArgumentNullException(nameof(tensors));
@@ -437,6 +448,7 @@ public partial class CpuEngine
     // partial-class duplicate-definition error.
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorTake<T>(Tensor<T> tensor, Tensor<int> indices)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -476,6 +488,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorTakeAlongDim<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -591,6 +604,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorDot<T>(Tensor<T> a, Tensor<T> b, int[] axesA, int[] axesB)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -997,6 +1011,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorInner<T>(Tensor<T> a, Tensor<T> b)
     {
         // Inner product over the last axis (torch.inner). Output shape is
@@ -1037,6 +1052,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorCartesianProd<T>(Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
@@ -1092,6 +1108,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T>[] TensorMeshgrid<T>(Tensor<T>[] tensors, string indexing = "ij")
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
@@ -1550,6 +1567,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual bool TensorAllClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false)
     {
         var mask = TensorIsClose(a, b, rtol, atol, equalNan);
@@ -1638,6 +1656,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -1789,6 +1808,7 @@ public partial class CpuEngine
         => BitBinary(a, b, (av, bv) => (bool)av ^ (bool)bv);
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<Bit> TensorLogicalNot(Tensor<Bit> a)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -1799,6 +1819,7 @@ public partial class CpuEngine
         return new Tensor<Bit>(dst, a._shape);
     }
 
+    [MethodImpl(Hot)]
     private static Tensor<Bit> BitBinary(
         Tensor<Bit> a, Tensor<Bit> b, Func<Bit, Bit, bool> f)
     {
@@ -1816,6 +1837,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<Bit> TensorIsIn<T>(Tensor<T> elements, Tensor<T> testElements, bool invert = false)
     {
         if (elements == null) throw new ArgumentNullException(nameof(elements));
@@ -1996,6 +2018,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorSelectScatter<T>(
         Tensor<T> tensor, Tensor<T> source, int dim, int index)
     {
@@ -2221,6 +2244,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorIndexCopy<T>(
         Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source)
     {
@@ -2304,6 +2328,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T>[] TensorBroadcastTensors<T>(Tensor<T>[] tensors)
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
@@ -2408,6 +2433,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorSliceScatter<T>(
         Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
     {
@@ -2465,6 +2491,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorIndexFill<T>(
         Tensor<T> tensor, int axis, Tensor<int> indices, T value)
     {
@@ -2646,6 +2673,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMaskedScatter<T>(
         Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source)
     {
@@ -3018,6 +3046,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int sections, int dim = 0)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -3046,6 +3075,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T>[] TensorTensorSplit<T>(Tensor<T> tensor, int[] indices, int dim = 0)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -3078,6 +3108,7 @@ public partial class CpuEngine
     /// Produces a contiguous tensor; empty-slice (end <= start) returns an
     /// empty tensor with the sliced dim zero.
     /// </summary>
+    [MethodImpl(Hot)]
     private static Tensor<T> SliceAlongAxis<T>(Tensor<T> tensor, int dim, int start, int end)
     {
         int rank = tensor.Rank;
@@ -3105,6 +3136,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -3219,6 +3251,7 @@ public partial class CpuEngine
     /// <summary>
     /// Scalar Hurwitz zeta via Euler-Maclaurin with eight Bernoulli corrections.
     /// </summary>
+    [MethodImpl(Hot)]
     private static double ZetaScalar(double x, double q)
     {
         // Pole at x = 1.
@@ -3342,9 +3375,9 @@ public partial class CpuEngine
             float[] vsArr = (float[])(object)values.GetDataArray();
             ReadOnlySpan<float> seqSpan = seqArr;
             if (right)
-                for (int i = 0; i < vsArr.Length; i++) dst[i] = Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
             else
-                for (int i = 0; i < vsArr.Length; i++) dst[i] = Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
             return result;
         }
 
@@ -3436,6 +3469,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<int> TensorBinCount(Tensor<int> input, int? minLength = null)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
@@ -3462,6 +3496,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMultiDot<T>(Tensor<T>[] matrices)
     {
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));
@@ -3756,6 +3791,7 @@ public partial class CpuEngine
     /// step n in increments of ±1023 so each individual multiply by 2¹⁰²³ stays
     /// inside the double range, then a final multiply for the remainder.
     /// </summary>
+    [MethodImpl(Hot)]
     private static double LdexpScalar(double x, int n)
     {
 #if NET6_0_OR_GREATER
@@ -3838,6 +3874,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
@@ -3968,6 +4005,7 @@ public partial class CpuEngine
     ///                             + Σ_{k≥1} B_{2k} · (2k+n-1)!/(2k)! / x^(2k+n) ]
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     private static double PolygammaScalar(int n, double x)
     {
         // For non-positive integer arguments polygamma has poles at x = 0, -1, -2, ...
@@ -4019,6 +4057,7 @@ public partial class CpuEngine
     }
 
     /// <summary>Natural log of k! via lgamma(k+1). Safe for k up to 170.</summary>
+    [MethodImpl(Hot)]
     private static double FactorialLogD(int k)
     {
         if (k <= 1) return 0.0;
@@ -4243,6 +4282,7 @@ public partial class CpuEngine
     // Helpers
     // ==================================================================
 
+    [MethodImpl(Hot)]
     private static int[] ComputeRowMajorStrides(int[] shape)
     {
         var strides = new int[shape.Length];
@@ -4255,6 +4295,7 @@ public partial class CpuEngine
         return strides;
     }
 
+    [MethodImpl(Hot)]
     private Tensor<T> CumulativeAlongAxis<T>(
         Tensor<T> tensor,
         int axis,
@@ -4317,6 +4358,7 @@ public partial class CpuEngine
     /// when the shapes match exactly (linear index works verbatim).
     /// Throws when they can't broadcast.
     /// </summary>
+    [MethodImpl(Hot)]
     private static int[]? ValidateAndComputeClampBroadcastStrides(int[] target, int[]? bounds)
     {
         if (bounds == null) return null;
@@ -4347,6 +4389,7 @@ public partial class CpuEngine
     }
 
     /// <summary>Flat-index lookup into a broadcast-strided bounds tensor.</summary>
+    [MethodImpl(Hot)]
     private static int BroadcastLookup(int[] idx, int[] strides)
     {
         int pos = 0;
@@ -4354,6 +4397,7 @@ public partial class CpuEngine
         return pos;
     }
 
+    [MethodImpl(Hot)]
     private static Tensor<T> ElementwiseUnary<T>(
         Tensor<T> tensor, Func<T, T> f, string opName)
     {
@@ -4400,6 +4444,7 @@ public partial class CpuEngine
             backward, savedState);
     }
 
+    [MethodImpl(Hot)]
     private static Tensor<T> ElementwiseBinary<T>(
         Tensor<T> a, Tensor<T> b, Func<T, T, T> f, string opName)
     {

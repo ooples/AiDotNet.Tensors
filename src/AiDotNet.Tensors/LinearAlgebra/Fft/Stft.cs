@@ -171,7 +171,7 @@ public static class Stft
             // srcD layout: outer * 2 * nFrames (re/im interleaved per frame)
             // dstD layout: outer * nFrames * 2 (re/im pair per frame)
             // Both are the same byte order — it's just a reshape of the last axis.
-            Array.Copy(srcD, dstD, srcD.Length);
+            Array.Copy(srcD, dstD, output.Length);
             return reshaped;
         }
 

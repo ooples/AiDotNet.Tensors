@@ -25,7 +25,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 GpuLaunchProbe.OnKernelMiss(name);
                 throw new KeyNotFoundException($"The given key '{name}' was not present in the dictionary.");
             }
-            set => _map[name] = value;
+            set
+            {
+                // A second program defining the same kernel name silently replaced the first, so a host call written
+                // for one signature launched the other (mse_loss: 4 arguments set on a 5-argument kernel, -52 at
+                // launch). Every name must come from exactly one program; the duplicates are recorded for the test.
+                if (_map.ContainsKey(name)) _reregistered.Add(name);
+                _map[name] = value;
+            }
         }
 
 #if NET471
@@ -41,6 +48,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public bool ContainsKey(string name) => _map.ContainsKey(name);
         public int Count => _map.Count;
         public Dictionary<string, DirectOpenClKernel>.ValueCollection Values => _map.Values;
-        public void Clear() => _map.Clear();
+        public void Clear()
+        {
+            _map.Clear();
+            _reregistered.Clear();
+        }
+
+        /// <summary>Kernel names registered more than once since the last <see cref="Clear"/>: each one replaced an
+        /// earlier program's kernel of the same name.</summary>
+        internal IReadOnlyCollection<string> ReregisteredNames => _reregistered;
+
+        private readonly HashSet<string> _reregistered = new();
     }
 }

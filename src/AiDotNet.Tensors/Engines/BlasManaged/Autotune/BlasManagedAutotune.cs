@@ -2,6 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers.Autotune;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -337,6 +339,7 @@ internal static class BlasManagedAutotune
     /// "M N K fp64 transA transB strategy mc nc kc threadCount". Seeds only where no
     /// local learned entry exists (local always wins); version-tagged via StoreStrategy.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static void EnsurePrewarmLoaded()
     {
         if (System.Threading.Interlocked.CompareExchange(ref _prewarmLoaded, 1, 0) != 0) return;

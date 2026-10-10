@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -34,6 +35,7 @@ public static class Int8Quantizer
     /// <c>max|x| / 127</c>. Returns 1f if all values are zero (avoids divide
     /// by zero — int8 quantize then dequantizes back to zero, correct).
     /// </summary>
+    [MethodImpl(Hot)]
     public static float ComputeSymmetricScale(ReadOnlySpan<float> data)
     {
         if (data.Length == 0) return 1f;
@@ -89,6 +91,7 @@ public static class Int8Quantizer
     /// are clamped to [-127, 127] (asymmetric -128 lane left unused so negation
     /// is exact).
     /// </summary>
+    [MethodImpl(Hot)]
     public static void QuantizeFloat32ToInt8(
         ReadOnlySpan<float> input, Span<sbyte> output, float scale)
     {
@@ -151,6 +154,7 @@ public static class Int8Quantizer
     /// Dequantize a length-N int8 vector back to float, multiplying by the
     /// per-tensor scale. Inverse of <see cref="QuantizeFloat32ToInt8"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void DequantizeInt8ToFloat32(
         ReadOnlySpan<sbyte> input, Span<float> output, float scale)
     {
@@ -210,6 +214,7 @@ public static class Int8Quantizer
     /// <param name="k">Column count.</param>
     /// <param name="outU8">Output unsigned bytes, length ≥ <c>m·k</c>.</param>
     /// <param name="outScale">Output per-row scales, length ≥ <c>m</c>.</param>
+    [MethodImpl(Hot)]
     public static void QuantizeActivationsPerRowToUint8(
         ReadOnlySpan<float> a, int m, int k, Span<byte> outU8, Span<float> outScale)
     {
@@ -281,6 +286,7 @@ public static class Int8Quantizer
     /// near zero quantize to 0 and produce 100% relative error by definition;
     /// use SNR or RMS for headline quality assessment.
     /// </summary>
+    [MethodImpl(Hot)]
     public static (double MaxRelLarge, double Rms, double SnrDb) RoundTripError(
         ReadOnlySpan<float> input)
     {

@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -35,7 +36,7 @@ internal static class FusedAttention
     /// <summary>
     /// Flash Attention forward: O = softmax(Q @ K^T / sqrt(d)) @ V
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void FlashAttentionForward(
         float[] q, float[] k, float[] v, float[] output,
         int seqQ, int seqK, int headDim,
@@ -90,7 +91,7 @@ internal static class FusedAttention
     }
 
     /// <summary>AVX2 FMA dot product for score tile computation.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void ComputeScoreTileSimd(
         float* q, float* k, float* scores,
         int qi, int kj, int br, int bc, int headDim, float scale)
@@ -108,7 +109,7 @@ internal static class FusedAttention
     }
 
     /// <summary>AVX2 FMA vectorized dot product — 8 floats per cycle.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe float DotProductSimd(float* a, float* b, int length)
     {
         float sum = 0f;
@@ -155,7 +156,7 @@ internal static class FusedAttention
     }
 
     /// <summary>Online softmax with AVX2 exp + V accumulation via FMA.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void OnlineSoftmaxAndAccumulate(
         float* scores, float* v, float* output,
         float* rowMax, float* rowSum,
@@ -228,7 +229,7 @@ internal static class FusedAttention
     }
 
     /// <summary>AVX2 row rescale: row[i] *= scale</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void RescaleRowSimd(float* row, float scale, int length)
     {
         int i = 0;
@@ -246,7 +247,7 @@ internal static class FusedAttention
     }
 
     /// <summary>AVX2 FMA row accumulate: dst[i] += weight * src[i]</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void AccumulateRowSimd(float* dst, float* src, float weight, int length)
     {
         int i = 0;
@@ -264,7 +265,7 @@ internal static class FusedAttention
     }
 
     /// <summary>Normalize output rows by their softmax sum.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void NormalizeOutput(float* output, float* rowSum, int qi, int br, int headDim)
     {
         for (int r = 0; r < br; r++)
@@ -276,7 +277,7 @@ internal static class FusedAttention
     }
 
     /// <summary>Apply causal mask: scores[r,c] = -inf where qi+r < kj+c</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void ApplyCausalMask(float* scores, int qi, int kj, int br, int bc)
     {
         for (int r = 0; r < br; r++)
@@ -326,6 +327,7 @@ internal static class FusedAttention
     /// Same algorithm as the array-based form but skips the array
     /// allocations for scratch buffers (uses thread-local).
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void FlashAttentionForwardPtr(
         float* pQ, float* pK, float* pV, float* pO,
         int seqQ, int seqK, int headDim,

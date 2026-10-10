@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -776,6 +777,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// you'll get [2,4,6]. This is useful for operations like scaling data or applying mathematical
     /// transformations to your values.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, TResult> function)
     {
         EnsureMaterialized();
@@ -801,6 +803,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// depends on where the element is located in the vector. For example, you might want to multiply
     /// each element by its position: [1,2,3] would become [1*0, 2*1, 3*2] = [0,2,6].</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, int, TResult> function)
     {
         EnsureMaterialized();

@@ -1,4 +1,6 @@
 using AiDotNet.Tensors.Engines.CpuJit;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -65,6 +67,7 @@ internal readonly struct CpuSigmoidKernel
     }
 
     /// <summary>Executes the resolved implementation over the complete buffer.</summary>
+    [MethodImpl(Hot)]
     internal unsafe void Invoke(float* input, float* output)
     {
         switch (Kind)

@@ -4,6 +4,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -101,6 +103,7 @@ public static class CpuParallelSettings
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetLogicalProcessorInformation(IntPtr buffer, ref uint returnLength);
 
+    [MethodImpl(Hot)]
     private static unsafe int DetectPhysicalCoresWindows()
     {
         uint len = 0;
@@ -122,6 +125,7 @@ public static class CpuParallelSettings
     /// <summary>Linux file that lists per-logical-processor topology used for physical-core counting.</summary>
     private const string LinuxCpuInfoPath = "/proc/cpuinfo";
 
+    [MethodImpl(Hot)]
     private static int DetectPhysicalCoresLinux()
     {
         var seen = new HashSet<string>();
@@ -178,6 +182,47 @@ public static class CpuParallelSettings
     /// Operations on arrays smaller than this threshold will run sequentially.
     /// </remarks>
     public static int ParallelThreshold { get; set; } = 50000;
+
+    /// <summary>
+    /// Elements per parallel chunk for elementwise kernels (add, subtract, multiply, divide, activations).
+    /// </summary>
+    /// <remarks>
+    /// 32,768, the grain libtorch uses (<c>at::internal::GRAIN_SIZE</c>). The previous per-op grains of
+    /// 250K-500K elements put a 1M-element float subtract on two threads: 86 µs against libtorch's 26 µs
+    /// in the same process; at 32K it takes 25 µs. Smaller grains (16K) measured far slower again.
+    /// </remarks>
+    public const int ElementwiseGrainSize = 32 * 1024;
+
+    /// <summary>
+    /// The grain in effect: <see cref="ElementwiseGrainSize"/> unless AIDOTNET_ELEMENTWISE_GRAIN sets a positive value.
+    /// The one knob for every elementwise split (CpuEngine.ElementwiseChunks reads it too).
+    /// </summary>
+    internal static readonly int ElementwiseGrain =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_ELEMENTWISE_GRAIN"), out var grain) && grain > 0 ? grain : ElementwiseGrainSize;
+
+    /// <summary>Number of chunks to split an elementwise kernel of <paramref name="length"/> elements into.</summary>
+    internal static int ElementwiseChunkCount(int length)
+        => Math.Min(MaxDegreeOfParallelism, Math.Max(1, length / ElementwiseGrain));
+
+    /// <summary>
+    /// How long a pool worker keeps spinning for the next parallel operation before it parks.
+    /// </summary>
+    /// <remarks>
+    /// <para>Default 200 ms, the block time OpenMP (and therefore libtorch) uses: after a parallel
+    /// operation the workers keep spinning for the next one, so calls a few milliseconds apart do not pay
+    /// an operating-system wake-up (measured 125-147 µs -> 12-15 µs for a 1M-element op after a 1-5 ms
+    /// pause). The cost is CPU time while the pool is idle inside the window, as with libtorch. Set a
+    /// shorter window (or zero) to favour idle CPU over latency, e.g. when sharing the machine with
+    /// another runtime that also spins.</para>
+    /// <para>The spin yields its core periodically and is skipped when the previous operation already
+    /// used every core. <see cref="TimeSpan.Zero"/> parks immediately. The
+    /// <c>AIDOTNET_PPE_WARMWINDOW_US</c> environment variable sets the initial value in microseconds.</para>
+    /// </remarks>
+    public static TimeSpan WorkerSpinTime
+    {
+        get => PersistentParallelExecutor.WarmWindow;
+        set => PersistentParallelExecutor.WarmWindow = value;
+    }
 
     /// <summary>
     /// Gets or sets whether AVX2 hardware gather instructions are used for strided memory access.
@@ -321,6 +366,7 @@ public static class CpuParallelSettings
     /// </remarks>
     /// <param name="count">Number of partitions / iterations.</param>
     /// <param name="body">Body invoked with each partition index.</param>
+    [MethodImpl(Hot)]
     public static void ParallelForRegion(int count, Action<int> body)
     {
         if (count <= 0) return;
@@ -411,6 +457,7 @@ public static class CpuParallelSettings
     /// NOT for recursive/nested fork-join, which a fixed-worker pool serializes by design — keep those
     /// on the TPL or restructure to iterative chunking.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void LightweightInvoke(params Action[] actions)
     {
         if (actions is null) throw new ArgumentNullException(nameof(actions));
@@ -481,6 +528,7 @@ public static class CpuParallelSettings
     /// Grain-size-aware parallel loop with a per-dispatch degree cap. The process-wide cap still
     /// wins, so a global single-thread setting cannot be overridden by a tuned kernel plan.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void ParallelForOrSerial(
         int fromInclusive,
         int toExclusive,
@@ -567,7 +615,7 @@ public static class CpuParallelSettings
         if (s_capChunksAtParticipants)
             chunks = Math.Min(chunks, PersistentParallelExecutor.Instance.WorkerCount + 1);
         int from = fromInclusive;
-        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [System.Runtime.CompilerServices.MethodImpl(Compatibility.MethodImplHelper.Hot)] (int chunk) =>
+        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [MethodImpl(Hot)] (chunk) =>
         {
             using var _region = EnterParallelRegion();
             int cs = from + (int)((long)chunk * count / chunks);
@@ -632,6 +680,7 @@ public static class CpuParallelSettings
     /// <c>Parallel.For</c>'s <c>Func&lt;int, ParallelLoopState, TLocal, TLocal&gt;</c>.</param>
     /// <param name="localFinally">Action invoked once per task with the final
     /// per-task local — typically merges the local into a shared accumulator.</param>
+    [MethodImpl(Hot)]
     public static void ParallelForOrSerial<TLocal>(
         int fromInclusive,
         int toExclusive,
@@ -698,7 +747,7 @@ public static class CpuParallelSettings
             chunks,
             maxDegree,
             localInit,
-            (chunk, local) =>
+            [MethodImpl(Hot)] (chunk, local) =>
             {
                 using var _region = EnterParallelRegion();
                 int cs = from + (int)((long)chunk * count / chunks);

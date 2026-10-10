@@ -118,31 +118,19 @@ public class MathInvariantExtendedTests
     [Fact]
     public void Copy_RentedSource_TightlySizedDestination_DoesNotOverrun()
     {
-        // TensorAllocator.Rent only routes through ArrayPool on NET5+. On
-        // net471 the function falls through to `new Tensor<T>(shape)` which
-        // returns an exactly-sized array — the bug this test guards (over-
-        // allocated backing array overrunning a tightly-sized destination)
-        // structurally cannot occur there. Skip the test silently on net471
-        // rather than fail its own precondition.
-#if !NET5_0_OR_GREATER
-        return;
-#else
-        // TensorAllocator.Rent only routes through ArrayPool at or above
-        // ArrayPoolThresholdValue elements. Below that, Rent returns an
-        // exactly-sized backing array and the test passes even on the
-        // pre-fix (buggy) implementation — making the regression check
-        // toothless. Force a size past the threshold so the pool actually
-        // hands back an over-allocated bucket, then hard-assert that
-        // over-allocation occurred before proceeding.
-        int N = Math.Max(TensorAllocator.ArrayPoolThresholdValue + 1, 1025);
-        var src = TensorAllocator.Rent<float>(new[] { N });
-        try
+        // The bug this test guards: a source whose backing array is longer than the tensor (an
+        // arena or sliced buffer; pooled arrays used to be padded too) overrunning a tightly-sized
+        // destination because the copy indexed by backing-array length. The pool now hands out
+        // exact-size arrays, so the padded source is built explicitly.
+        const int N = 262_145;
+        var padded = new float[N + 1023];
+        var src = Tensor<float>.FromMemory(new Memory<float>(padded, 0, N), new[] { N });
         {
             int backingLength = src.GetDataArray().Length;
             Assert.True(
                 backingLength > src.Length,
                 $"Test precondition failed: backing length {backingLength} must exceed logical length {src.Length}. " +
-                $"ArrayPool did not over-allocate at N={N}; this run would pass even on the buggy pre-fix impl.");
+                "the padded source must expose its longer backing array, or this run would pass even on the buggy pre-fix impl.");
 
             // Fill source with a known pattern.
             var srcWritable = src.AsWritableSpan();
@@ -160,11 +148,6 @@ public class MathInvariantExtendedTests
             for (int i = 0; i < N; i++)
                 Assert.True(System.Math.Abs(dstSpan[i] - (i + 0.5f)) < Tol, $"[{i}] expected {i + 0.5f} got {dstSpan[i]}");
         }
-        finally
-        {
-            TensorAllocator.Return(src);
-        }
-#endif
     }
     [Fact] public void Fill_AllSameValue() { var t = new Tensor<float>(new float[64], [64]); E.TensorFill(t, 3.14f); var d = t.GetDataArray(); for (int i = 0; i < d.Length; i++) Assert.Equal(3.14f, d[i], Tol); }
 
@@ -230,10 +213,13 @@ public class MathInvariantExtendedTests
     [Fact]
     public void DropoutMask_Seeded_DropRateApproximatelyCorrect_LargeParallel()
     {
-        var m = E.TensorDropoutMask<float>(new[] { 50000 }, 0.3f, 1f / 0.7f, 99).GetDataArray();
+        var mask = E.TensorDropoutMask<float>(new[] { 50000 }, 0.3f, 1f / 0.7f, 99);
+        // GetDataArray can return a pooled bucket longer than the tensor (its zeroed padding is not part
+        // of the mask), so count over the tensor's length.
+        var m = mask.GetDataArray();
         int dropped = 0;
-        for (int i = 0; i < m.Length; i++) if (m[i] == 0f) dropped++;
-        double observed = (double)dropped / m.Length;
+        for (int i = 0; i < mask.Length; i++) if (m[i] == 0f) dropped++;
+        double observed = (double)dropped / mask.Length;
         Assert.True(Math.Abs(observed - 0.3) < 0.02, $"drop rate {observed:F4} deviates from 0.3");
     }
 

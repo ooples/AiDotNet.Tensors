@@ -270,7 +270,7 @@ public sealed class GpuScope : IDisposable
 /// <para>For concurrent weight updates during inference, consider using separate engine instances
 /// or implementing external synchronization around weight update + invalidation sequences.</para>
 /// </remarks>
-public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable, Engines.Gpu.IInferenceGraphCaptureEngine
+public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable, Engines.Gpu.IInferenceGraphCaptureEngine, Helpers.IRecycledArrayListener
 {
     private readonly DirectGpuEngine? _directGpu;
     private readonly bool _ownsDirectGpu;
@@ -571,7 +571,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
         if (t._gpuBuffer is not { } buf || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
         var data = t.GetDataArray();
-        if (buf.Size < data.Length) return;
+        if (buf.Size < t.Length) return;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         t._gpuBufferVersion = t.GpuCacheVersion;
     }
@@ -592,7 +592,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         var data = t.GetDataArray();
         if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda && t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
-            && existing.Handle != System.IntPtr.Zero && existing.Size >= data.Length)
+            && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
         {
             cuda.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
@@ -942,6 +942,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _directGpu = new DirectGpuEngine();
         _ownsDirectGpu = true;
         RegisterAsBackendOwner();
+        Helpers.PooledArrayRecycling.Register(this);
     }
 
     public DirectGpuTensorEngine(DirectGpuEngine directGpu)
@@ -949,6 +950,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _directGpu = directGpu;
         _ownsDirectGpu = false;
         RegisterAsBackendOwner();
+        Helpers.PooledArrayRecycling.Register(this);
+    }
+
+    /// <summary>
+    /// A pooled array is being recycled: its tensor is gone, so a device copy cached under it would be served to
+    /// the next tensor that rents the array (the cache key is the array, and the new storage's GPU-cache version
+    /// can equal the recorded one). Drop the entry, and drop rather than run any pending download into the
+    /// array: its data belongs to nobody now.
+    /// </summary>
+    void Helpers.IRecycledArrayListener.OnArrayRecycled(object array)
+    {
+        if (IsDisposed || !Helpers.HostSync.AnyExists) return;
+        if (Helpers.HostSync.IsPending(array))
+            Helpers.HostSync.Remove(array);
+        if (!_activationCache.ContainsKey(array)) return;
+        ActivationCacheEntry? removed = null;
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryRemove(array, out var entry))
+                removed = entry;
+        }
+        removed?.Dispose();
     }
 
     // Which engine placed data on a backend, so a consumer holding only a tensor (its _gpuBackend) can run follow-up
@@ -7447,7 +7470,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var aData = a.GetDataArray();
         var bData = b.GetReadOnlyDataArray();
-        if (aData.Length != bData.Length)
+        // Compared against bData, not b.Length, on purpose: the device op reads bData from index 0, so bData must
+        // be exactly b's elements. A padded backing array or a view's shared source is longer than b and would
+        // be read at the wrong offset; rejecting it costs only a fall back to the correct CPU path.
+        if (a.Length != bData.Length)
             return false;
 
         using var bufferA = GetOrAllocateBuffer(backend, a);
@@ -7457,17 +7483,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // reference) can be SMALLER than the logical array when a pooled
         // backing array is reused at a new, larger shape — the cache still
         // maps that reference to the old, smaller buffer. Running the op at
-        // aData.Length would index past the device allocation, and the
+        // a.Length would index past the device allocation, and the
         // short download would then throw "source array was not long enough"
         // in the copy-back (seen crashing eager LayerNormBackward on the GPU
         // when a varying-shape step falls off the fused path). Bail to the
         // correct CPU implementation instead of corrupting device memory.
         // (A LARGER cached buffer — e.g. power-of-two padded — is fine: the op
-        // touches the first aData.Length elements and the copy-back is bounded.)
-        if (bufferA.Buffer.Size < aData.Length || bufferB.Buffer.Size < bData.Length)
+        // touches the first a.Length elements and the copy-back is bounded.)
+        if (bufferA.Buffer.Size < a.Length || bufferB.Buffer.Size < bData.Length)
             return false;
 
-        op(backend, bufferA.Buffer, bufferB.Buffer, aData.Length);
+        op(backend, bufferA.Buffer, bufferB.Buffer, a.Length);
 
         // `a` can be bound to a device buffer of its own that is not the one resolved from its backing array (the
         // compiled resident step binds its gradient accumulators that way). The op above did not touch it, yet the
@@ -7477,9 +7503,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer (ordered before the download, whose stream sync covers it), or drop a binding that cannot hold it.
         if (a._gpuBuffer is { } bound && !ReferenceEquals(bound, bufferA.Buffer) && bound.Handle != bufferA.Buffer.Handle)
         {
-            if (ReferenceEquals(a._gpuBackend, backend) && bound.Handle != System.IntPtr.Zero && bound.Size >= aData.Length)
+            if (ReferenceEquals(a._gpuBackend, backend) && bound.Handle != System.IntPtr.Zero && bound.Size >= a.Length)
             {
-                backend.Copy(bufferA.Buffer, bound, aData.Length);
+                backend.Copy(bufferA.Buffer, bound, a.Length);
             }
             else
             {
@@ -7532,15 +7558,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // See TryRunBinaryInPlace: a stale cached buffer can be smaller than the
         // logical array when a pooled backing array is reused at a larger shape.
         // Bail to the correct CPU path rather than index past the allocation.
-        if (buffer.Buffer.Size < data.Length)
+        if (buffer.Buffer.Size < tensor.Length)
             return false;
 
-        op(backend, buffer.Buffer, data.Length);
+        op(backend, buffer.Buffer, tensor.Length);
 
         // Download result back into tensor's backing array
         float[] resultFloat = backend.DownloadBuffer(buffer.Buffer);
         var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-        Array.Copy(resultT, data, data.Length);
+        Array.Copy(resultT, data, tensor.Length);
         // Same version-counter contract as TryRunBinaryInPlace: bump
         // Version + sync _gpuBufferVersion so subsequent GPU ops reuse
         // the freshly-written buffer instead of re-uploading.
@@ -7651,9 +7677,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // RecordUnary / RecordBinary calls and causing IEngine-typed callers to
     // skip the tape entirely.
 
+    /// <summary>
+    /// True when a scalar reduction of <paramref name="tensor"/> should run on the device: its current
+    /// value is there and the host copy is not authoritative (device-tagged or awaiting a deferred
+    /// download, updated in place by an on-device optimizer, or an FP16-resident activation).
+    /// </summary>
+    /// <remarks>
+    /// Reductions run where the data lives. Uploading a host tensor to reduce it to one number costs a
+    /// transfer plus a synchronize (about 80 µs for 1,000 elements, against well under 1 µs on the CPU)
+    /// and gains nothing. <see cref="double"/> reductions always take the CPU path so they accumulate in
+    /// fp64: the backend reduce kernels are fp32-only, and a sum of 100K doubles in fp32 loses about
+    /// half its significant digits.
+    /// </remarks>
+    private bool ShouldReduceOnDevice<T>(Tensor<T> tensor)
+    {
+        if (typeof(T) == typeof(double)) return false;
+        return tensor.HasPendingGpuData || IsDeviceAuthoritative(tensor) || IsFp16Resident(tensor);
+    }
+
     T IEngine.TensorSum<T>(Tensor<T> tensor)
     {
-        if (!TryGetBackend(out var backend))
+        if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor);
@@ -7664,7 +7708,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMaxValue<T>(Tensor<T> tensor)
     {
-        if (!TryGetBackend(out var backend))
+        if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor);
@@ -7675,7 +7719,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMinValue<T>(Tensor<T> tensor)
     {
-        if (!TryGetBackend(out var backend))
+        if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor);
@@ -16814,7 +16858,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for vocabulary size {vocabSize}.");
@@ -16871,7 +16915,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for vocabulary size {vocabSize}.");
@@ -17328,8 +17372,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                     kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW));
         }
-        catch
+        catch (Exception ex)
         {
+            // Recorded, not swallowed: a silent host fallback here moves the weight gradient off the device.
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("Conv2DBackwardKernel", ex);
             return base.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
         }
     }
@@ -23163,7 +23210,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= sourceRows)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for axis size {sourceRows}.");
@@ -23216,7 +23263,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for vocabulary size {vocabSize}.");
@@ -24979,7 +25026,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new IndexOutOfRangeException(
                             $"Index {indexData[i]} is out of bounds for axis size {axisSize}");
@@ -25691,7 +25738,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // backend implements; only the scalar comes back. It used the fused ReduceSumOfSquares through
         // IGpuBatchExecution, which only Vulkan implements, so on CUDA/OpenCL/HIP every call took the CPU base and
         // downloaded the whole tensor (e.g. every gradient, every step, in global-norm clipping).
-        if (typeof(T) == typeof(float) && tensor.Length > 0 && TryGetBackend(out var backend))
+        if (typeof(T) == typeof(float) && tensor.Length > 0 && ShouldReduceOnDevice(tensor) && TryGetBackend(out var backend))
         {
             try
             {
@@ -26953,6 +27000,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public void Dispose()
     {
         IsDisposed = true;
+        Helpers.PooledArrayRecycling.Unregister(this);
         UnregisterAsBackendOwner();
         // Clear activation cache to free GPU memory from cached activations
         ClearActivationCache();
@@ -27003,7 +27051,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMean<T>(Tensor<T> input)
     {
-        if (TryGetBackend(out var b))
+        if (ShouldReduceOnDevice(input) && TryGetBackend(out var b))
         {
             try
             {

@@ -225,7 +225,7 @@ public sealed class AutocastScope : IDisposable
         var fp32Data = fp32.GetDataArray();
         var fp16Tensor = new LinearAlgebra.Tensor<Half>(fp32._shape);
         var fp16Span = fp16Tensor.AsWritableSpan();
-        for (int i = 0; i < fp32Data.Length; i++)
+        for (int i = 0; i < fp32.Length; i++)
             fp16Span[i] = (Half)fp32Data[i];
         _fp16Cache[name] = fp16Tensor;
         return fp16Tensor;

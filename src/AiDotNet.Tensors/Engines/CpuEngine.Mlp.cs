@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -62,6 +64,7 @@ public partial class CpuEngine
     /// <see cref="FusedActivationType.None"/> (raw logits — the common
     /// classification-head shape).
     /// </param>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> MlpForward<T>(
         Tensor<T> input,
         IReadOnlyList<Tensor<T>> weights,

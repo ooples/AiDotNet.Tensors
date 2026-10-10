@@ -9,6 +9,7 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -80,6 +81,7 @@ internal static class SortKernels
     /// (≤8 elements) a single masked comparison + popcount gives the
     /// answer without any branches.
     /// </summary>
+    [MethodImpl(Hot)]
     public static int LowerBoundFloat(ReadOnlySpan<float> sortedSequence, float value)
     {
 #if NET5_0_OR_GREATER
@@ -103,6 +105,7 @@ internal static class SortKernels
     /// Branchless upper-bound. Returns the insertion index of
     /// <paramref name="value"/> after any existing copies (right-bias).
     /// </summary>
+    [MethodImpl(Hot)]
     public static int UpperBoundFloat(ReadOnlySpan<float> sortedSequence, float value)
     {
         int lo = 0, hi = sortedSequence.Length;
@@ -121,6 +124,7 @@ internal static class SortKernels
     /// <c>torch.topk(largest=true, sorted=true)</c> semantics). Falls
     /// back to a heap-based quickselect when k is small relative to n.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void TopKFloat(
         ReadOnlySpan<float> values, int k,
         Span<float> topValues, Span<int> topIndices)
@@ -175,7 +179,7 @@ internal static class SortKernels
     // Canonical 8-element bitonic network:
     //   6 stages, 20 compare-exchanges.
     // We use SSE swaps via shuffles to align the compare partners.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static void BitonicSort8(Span<float> data)
     {
         // Pad to 8 with +Inf so the network sorts correctly for shorter inputs.
@@ -220,13 +224,14 @@ internal static class SortKernels
     }
 #endif
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static void HeapifyMin(Span<float> v, Span<int> i)
     {
         for (int p = (v.Length - 2) / 2; p >= 0; p--)
             SiftDownMin(v, i, p);
     }
 
+    [MethodImpl(Hot)]
     private static void SiftDownMin(Span<float> v, Span<int> i, int p)
     {
         int n = v.Length;

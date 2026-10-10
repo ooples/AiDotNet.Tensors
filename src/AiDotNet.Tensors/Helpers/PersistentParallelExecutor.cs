@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -16,6 +17,13 @@ internal sealed class PersistentParallelExecutor
         new(() => new PersistentParallelExecutor(), LazyThreadSafetyMode.ExecutionAndPublication);
 
     internal static PersistentParallelExecutor Instance => LazyInstance.Value;
+
+    /// <summary>
+    /// The most threads one dispatch runs on: the pool's workers plus the calling thread. A split sized from
+    /// <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/> alone (128 on a 128-thread host) hands this pool
+    /// several tasks per participant, and the slowest participant's extra task sets the dispatch's time.
+    /// </summary>
+    internal int MaxParticipants => _numWorkers + 1;
 
     // Per-worker MRES spin count before a parked worker truly blocks.
     //
@@ -141,6 +149,7 @@ internal sealed class PersistentParallelExecutor
     // Serialize concurrent Execute calls
     private readonly object _executeLock = new();
 
+    [MethodImpl(Hot)]
     private PersistentParallelExecutor()
     {
         // Size the parked pool to the MACHINE width (cores-1, ceiling 32), NOT
@@ -204,16 +213,54 @@ internal sealed class PersistentParallelExecutor
     // starved the dispatcher; the periodic yield removes that (verified: 64-chunk/32-
     // worker dispatch stays ~equal to Parallel.For instead of the 1.8× regression the
     // busy-spin showed). Env override AIDOTNET_PPE_WARMWINDOW_US sets the window in
-    // microseconds; 0 disables (park immediately). Default 200 µs.
-    private static readonly long _warmWindowTicks = ComputeWarmWindowTicks();
+    // microseconds; 0 disables (park immediately). Settable at run time through
+    // CpuParallelSettings.WorkerSpinTime.
+    //
+    // Default 200 ms, OpenMP's block time (KMP_BLOCKTIME), which is how libtorch stays fast on calls a
+    // few milliseconds apart. Measured in a process of its own (no other spinning runtime): a 1M-element
+    // subtract 1-5 ms after the previous op took 125-147 µs with the old 200 µs window and 12-15 µs
+    // with 200 ms; a [32768, 64] LayerNorm 189-389 µs against 68-100 µs. (An earlier A/B ran inside a
+    // process that also hosted libtorch, whose own 64 spinning OpenMP threads competed with ours and
+    // made the long window look worse.) Workers yield their core periodically while spinning.
+    internal const long DefaultWarmWindowMicros = 200_000;
+
+    private static long _warmWindowTicks = ComputeWarmWindowTicks();
 
     private static long ComputeWarmWindowTicks()
     {
-        long micros = 200;
+        long micros = DefaultWarmWindowMicros;
         if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARMWINDOW_US"), out var us) && us >= 0)
             micros = us;
-        // ticks = seconds * frequency = (micros / 1e6) * Stopwatch.Frequency
-        return (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+        return ToStopwatchTicks(micros * (TimeSpan.TicksPerMillisecond / 1000));
+    }
+
+    // Exact TimeSpan-tick -> Stopwatch-tick conversion. A positive duration rounds UP, so a small window never
+    // becomes 0, which would park workers immediately instead of spinning; the multiply runs in decimal, so it
+    // neither overflows nor loses the low digits a double would.
+    private static long ToStopwatchTicks(long timeSpanTicks)
+    {
+        if (timeSpanTicks <= 0) return 0;
+        decimal ticks = Math.Ceiling((decimal)timeSpanTicks * System.Diagnostics.Stopwatch.Frequency / TimeSpan.TicksPerSecond);
+        return ticks >= long.MaxValue ? long.MaxValue : (long)ticks;
+    }
+
+    private static TimeSpan FromStopwatchTicks(long stopwatchTicks)
+    {
+        decimal ticks = (decimal)stopwatchTicks * TimeSpan.TicksPerSecond / System.Diagnostics.Stopwatch.Frequency;
+        return TimeSpan.FromTicks(ticks >= long.MaxValue ? long.MaxValue : (long)Math.Ceiling(ticks));
+    }
+
+    /// <summary>
+    /// How long a worker keeps spinning for the next dispatch before it parks. Zero parks immediately.
+    /// </summary>
+    internal static TimeSpan WarmWindow
+    {
+        get => FromStopwatchTicks(System.Threading.Volatile.Read(ref _warmWindowTicks));
+        set
+        {
+            if (value < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(value), "Spin time cannot be negative.");
+            System.Threading.Volatile.Write(ref _warmWindowTicks, ToStopwatchTicks(value.Ticks));
+        }
     }
 
     // Timestamp (Stopwatch ticks) of the most recent dispatch. Workers read this to
@@ -230,6 +277,87 @@ internal sealed class PersistentParallelExecutor
     // change. Written on every Execute.
     private int _lastWorkersNeeded;
 
+    private static readonly int s_hardwareThreads = Environment.ProcessorCount;
+
+#if NET5_0_OR_GREATER
+    private static readonly Lazy<(ushort Group, byte Number)[]> s_workerCores =
+        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.UsableCoresInCurrentGroup);
+
+
+    private static readonly Lazy<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain[]> s_physicalCores =
+        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.DetectPhysicalCores);
+
+    // Every processor of the first worker's group that its physical cores cover: the affinity that undoes a core bind
+    // when the mode later turns binding off on a host where the #653 core pinning is not eligible.
+    private static readonly Lazy<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain?> s_groupDomain = new(() =>
+    {
+        var cores = s_workerCores.Value;
+        if (cores.Length == 0) return null;
+        ulong mask = 0;
+        foreach (var c in s_physicalCores.Value)
+            if (c.Group == cores[0].Group) mask |= c.Mask;
+        return mask == 0 ? null
+            : new AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain(mask, cores[0].Group, System.Numerics.BitOperations.PopCount(mask));
+    });
+
+    private static bool CoreBindingAvailable => s_workerCores.Value.Length >= 2;
+
+    [ThreadStatic] private static bool t_dispatcherHinted;
+
+    /// <summary>
+    /// Gives a dispatching thread core 0 of the worker list as its ideal processor (a hint, not an affinity), once per
+    /// thread, while workers are bound: it runs a chunk of every dispatch and the bound workers hold the other cores,
+    /// so left to chance it shared one of theirs and finished last.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void HintDispatcherCore()
+    {
+        if (t_dispatcherHinted) return;
+        t_dispatcherHinted = true;
+        if (CpuParallelSettings.WorkerPinning == WorkerPinning.Never || !CoreBindingAvailable) return;
+        var (group, number) = s_workerCores.Value[0];
+        AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TrySetCurrentThreadIdealProcessor(group, number);
+    }
+
+    /// <summary>
+    /// Keeps a worker on its own physical core, so the chunk it is handed every dispatch stays in that core's caches.
+    /// A .NET GC suspends every managed thread, and on resume Windows placed most workers on whichever cores were
+    /// idle: on a 16-CCX Threadripper 3990X, 23 of 31 chunks of a 1M-element sqrt ran on a different CPU after each GC
+    /// and pulled every line they wrote out of another CCX first, ~160 µs instead of ~11 µs (libtorch's OpenMP threads
+    /// are native and never suspended by the GC). Each worker gets one physical core of the process's group as its
+    /// ideal processor and an affinity to that core's hardware threads; the dispatching thread gets core 0 as a hint.
+    /// Measured on that host: the sqrt right after a GC 16-20 µs bound against 169-182 µs unbound, and a 512^3 GEMM
+    /// steady at ~145 µs across processes instead of 150-210 µs. Windows only; elsewhere this does nothing.
+    /// Applied by <see cref="ApplyPinning"/> unless the mode is <see cref="WorkerPinning.Never"/>.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static void BindWorkerToCore(int slot)
+    {
+        var cores = s_workerCores.Value;
+        if (cores.Length < 2) return;
+        // Core 0 of the list is the dispatching thread's (see HintDispatcherCore); workers take cores 1..n-1 and wrap
+        // within them, never onto core 0. With 32 cores for 32 workers (a process limited to one group of a 128-thread
+        // host) the last worker used to wrap onto core 0 and share it with the dispatcher, which runs a chunk of every
+        // dispatch, and that chunk set the time: a 512^3 GEMM measured ~305 µs bound against ~203 µs unbound.
+        var (group, number) = cores[1 + slot % (cores.Length - 1)];
+        AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TrySetCurrentThreadIdealProcessor(group, number);
+
+        // Bind to that physical core: both of its hardware threads, no other worker's. A whole-L3-domain affinity let
+        // the scheduler stack two FMA-bound workers on one core's SMT pair while another core of the domain idled:
+        // under BenchmarkDotNet a 512^3 GEMM took 336 µs bound to the domain against 139 µs bound to the core
+        // (256^3: 47 -> 27 µs; a 1M double exp: 81 -> 56 µs), with the GC-migration fix kept.
+        ulong bit = 1UL << number;
+        foreach (var c in s_physicalCores.Value)
+        {
+            if (c.Group == group && (c.Mask & bit) != 0)
+            {
+                AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(c);
+                return;
+            }
+        }
+    }
+#endif
+
     /// <summary>
     /// Runs one participant's strided chunk set: chunks <paramref name="firstChunk"/>,
     /// firstChunk+Stride, … &lt; <c>job.NumChunks</c>. In normal mode calls <c>job.Action</c> per chunk;
@@ -239,7 +367,7 @@ internal sealed class PersistentParallelExecutor
     /// re-throw first" semantics. Shared by the main thread and every worker (each passed the SAME
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
-    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
+    [MethodImpl(Hot)]
     private static Exception? RunParticipantChunks(Job job, int firstChunk)
     {
         Exception? first = null;
@@ -298,6 +426,12 @@ internal sealed class PersistentParallelExecutor
         s_unpinnedDomain = default;
         s_pinEligible = false;
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || Environment.ProcessorCount > 64) return;
+        // Environment.ProcessorCount honours the process affinity: a process restricted to one 64-processor group
+        // of a 128-thread host (BenchmarkDotNet does this) reports 64 and passes the full-mask check below, while
+        // the physical-core list spans both groups. Pinning there measured 390 µs for a 512^3 GEMM against 203 µs
+        // unpinned. Any process that does not see every processor of the machine counts as restricted.
+        if (AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.MachineLogicalProcessorCount() is int machine
+            && machine > Environment.ProcessorCount) return;
         try
         {
             ulong processMask = (ulong)(long)System.Diagnostics.Process.GetCurrentProcess().ProcessorAffinity;
@@ -319,20 +453,46 @@ internal sealed class PersistentParallelExecutor
         }
     }
 
+    // Worker placement, re-evaluated on every wake (CpuParallelSettings.WorkerPinning can change between ops):
+    //   Never                                   -> unbound
+    //   #653 core pinning eligible and (Always, or Auto with MaxDegreeOfParallelism <= physical cores)
+    //                                           -> pinned to a physical core, #653's mapping
+    //   otherwise, with physical cores detected -> bound to a physical core (BindWorkerToCore), core 0 left to the
+    //                                              dispatching thread
+    //   otherwise                               -> unbound
+    // #653's pinning is only eligible up to 64 logical processors with an unrestricted affinity; above that, and above
+    // the core count in Auto, BindWorkerToCore keeps a worker's chunk in its core's caches across GC suspensions.
     private static void ApplyPinning(int slot)
     {
-        if (!s_pinEligible) return;
         var mode = CpuParallelSettings.WorkerPinning;
-        bool pin = mode == WorkerPinning.Always
-                   || (mode == WorkerPinning.Auto && CpuParallelSettings.MaxDegreeOfParallelism <= s_pinCores.Length);
-        int desired = pin ? 1 : 2;
+        int desired;   // 1 = #653 core pin, 2 = unbound, 3 = core bind
+        if (mode == WorkerPinning.Never) desired = 2;
+        else if (s_pinEligible && (mode == WorkerPinning.Always || CpuParallelSettings.MaxDegreeOfParallelism <= s_pinCores.Length)) desired = 1;
+        else if (CoreBindingAvailable) desired = 3;
+        else desired = 2;
         if (t_pinState == desired) return;
+        int previous = t_pinState;
         t_pinState = desired;
-        // Slot i takes core i + 1: the calling thread, which runs participant 0, is left core 0's share.
-        if (pin) AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(s_pinCores[(slot + 1) % s_pinCores.Length]);
-        else AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(s_unpinnedDomain);
+        if (desired == 1)
+        {
+            // Slot i takes core i + 1: the calling thread, which runs participant 0, is left core 0's share.
+            AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(s_pinCores[(slot + 1) % s_pinCores.Length]);
+        }
+        else if (desired == 3)
+        {
+            BindWorkerToCore(slot);
+        }
+        else if (s_pinEligible)
+        {
+            AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(s_unpinnedDomain);
+        }
+        else if (previous != 0 && s_groupDomain.Value is { } group)
+        {
+            AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(group);
+        }
     }
 #endif
+    [MethodImpl(Hot)]
     private void WorkerLoop(int slot)
     {
         while (true)
@@ -341,18 +501,20 @@ internal sealed class PersistentParallelExecutor
             // being dispatched to (recency window), but yield the core periodically so
             // we never oversubscribe the dispatcher, and give up to a blocking park
             // once the pool goes idle past the window.
-            long warm = _warmWindowTicks;
-            // Only warm-spin when the last dispatch left a spare logical CPU (participants =
-            // workers + the dispatcher < ProcessorCount). When a dispatch saturates the
-            // machine, spinning steals the core the dispatcher needs → oversubscription; park
-            // instead so the wakeup overlaps the (already large) op. The test used to compare
-            // against the POOL size, which the 32-worker ceiling makes much smaller than the
-            // machine on a many-core box: on 128 logical CPUs every dispatch of 33+ chunks
-            // counted as saturating, so all 32 workers parked after it and the next dispatch
-            // paid 32 kernel wake-ups -- measured 130 us per dispatch vs 6.3 us for 32 chunks,
-            // and 65% of a FusedLinear forward on that box.
-            if (warm > 0 && System.Threading.Volatile.Read(ref _lastWorkersNeeded) + 1 < Environment.ProcessorCount
-                && !_workReady[slot].IsSet)
+            long warm = System.Threading.Volatile.Read(ref _warmWindowTicks);
+            // Only warm-spin when the last dispatch left spare cores (workersNeeded <
+            // _numWorkers). When a dispatch saturates the machine, spinning steals the
+            // core the dispatcher needs → oversubscription; park instead so the wakeup
+            // overlaps the (already large, since saturating dispatches are big-work) op.
+            // "Saturating" is judged against the MACHINE, not the pool: the team (workers + the
+            // dispatching thread) must leave a hardware thread free. Comparing against _numWorkers made
+            // every dispatch of 33+ chunks park on hosts wider than the 32-worker pool, so the next
+            // dispatch re-woke all 32 parked workers: ~100 µs per dispatch instead of ~14 µs on a
+            // 128-thread host. On machines with no spare thread the behaviour is unchanged.
+            // Only a slot the last dispatch actually used keeps warm: dispatches of a hot loop wake the same
+            // first slots, and a slot outside them would spin for a wake-up that is not coming.
+            int lastWorkers = System.Threading.Volatile.Read(ref _lastWorkersNeeded);
+            if (warm > 0 && slot < lastWorkers && lastWorkers + 1 < s_hardwareThreads && !_workReady[slot].IsSet)
             {
                 int spins = 0;
                 while (!_workReady[slot].IsSet)
@@ -446,7 +608,7 @@ internal sealed class PersistentParallelExecutor
     /// combined. Compared against <see cref="DefaultSerialGrainSize"/>
     /// to decide between serial inline and parallel dispatch.</param>
     /// <param name="action">Per-chunk callback.</param>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public void Execute(int numChunks, long totalWork, Action<int> action)
     {
         if (numChunks <= 0) return;
@@ -487,6 +649,7 @@ internal sealed class PersistentParallelExecutor
     /// still wins). The drop-in for a <c>Parallel.For</c> whose <c>ParallelOptions.MaxDegreeOfParallelism</c>
     /// is set per call (e.g. the SpMM row loop's thread pin).
     /// </summary>
+    [MethodImpl(Hot)]
     public void Execute(int numChunks, int maxDop, Action<int> action)
     {
         if (numChunks <= 0)
@@ -556,6 +719,9 @@ internal sealed class PersistentParallelExecutor
 
         lock (_executeLock)
         {
+#if NET5_0_OR_GREATER
+            HintDispatcherCore();
+#endif
             _isExecuting = true;
             try
             {
@@ -627,6 +793,7 @@ internal sealed class PersistentParallelExecutor
     /// calls <paramref name="localFinally"/> ONCE — so a per-worker rented buffer is rented/returned
     /// once per participant, not per chunk. <paramref name="maxDop"/> &lt;= 0 uses the global cap.
     /// </summary>
+    [MethodImpl(Hot)]
     public void Execute<TLocal>(int numChunks, int maxDop,
         Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
     {
@@ -675,6 +842,9 @@ internal sealed class PersistentParallelExecutor
 
         lock (_executeLock)
         {
+#if NET5_0_OR_GREATER
+            HintDispatcherCore();
+#endif
             _isExecuting = true;
             try
             {

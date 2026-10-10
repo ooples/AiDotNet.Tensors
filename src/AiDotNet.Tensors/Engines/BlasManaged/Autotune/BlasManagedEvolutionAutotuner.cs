@@ -2,6 +2,8 @@ using System.Globalization;
 using AiDotNet.Evolution;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Helpers.Autotune;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -80,6 +82,7 @@ public static class BlasManagedEvolutionAutotuner
     }
 
     /// <summary>Creates validated heuristic seeds plus any locally valid external/pre-warm seeds.</summary>
+    [MethodImpl(Hot)]
     public static IReadOnlyList<BlasManagedGemmConfiguration> GetSeeds<T>(
         int m,
         int n,
@@ -148,6 +151,7 @@ public static class BlasManagedEvolutionAutotuner
     /// Attempts to materialize the complete canonical configuration space without exceeding a caller-owned bound.
     /// A false result returns no partial space, so it cannot accidentally be presented as exhaustive evidence.
     /// </summary>
+    [MethodImpl(Hot)]
     public static bool TryGetExhaustiveConfigurations<T>(
         int m,
         int n,
@@ -810,6 +814,7 @@ public static class BlasManagedEvolutionAutotuner
         public string Id => "blas-managed-gemm-constrained-variation";
         public string VersionHash => "1";
 
+        [MethodImpl(Hot)]
         public ValueTask<BlasManagedGemmConfiguration> ProposeAsync(
             EvolutionVariationContext<BlasManagedGemmConfiguration> context,
             CancellationToken cancellationToken = default)

@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -29,6 +31,7 @@ internal static class Avx512Streaming
     /// Compute C += op(A) · op(B) directly without packing. C is read-modify-write.
     /// FP64: 8-wide blocks via Vector512&lt;double&gt;.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         ReadOnlySpan<double> b, int ldb, bool transB,
@@ -89,6 +92,7 @@ internal static class Avx512Streaming
     /// FP32 mirror of <see cref="RunFp64"/>. Uses Vector512&lt;float&gt; (16 lanes)
     /// and processes 16-col blocks per inner loop iteration.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,

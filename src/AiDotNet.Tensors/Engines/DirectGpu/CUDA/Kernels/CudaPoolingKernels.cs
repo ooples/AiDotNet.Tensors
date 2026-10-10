@@ -86,9 +86,13 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
 // cells whose indices[outIdx] selected this input cell. Atomic-free, so bit-reproducible.
 //
 // Only an output cell whose pooling window covers (ih, iw) can have selected it (the forward stores the window's
-// argmax), so the scan visits exactly those output cells -- oh in [ceil((ih+padH-kH+1)/sH), floor((ih+padH)/sH)],
-// likewise ow -- instead of the whole output plane. The terms added, and their order, are the same as a full
-// scan's, so the result is bit-identical; the cost drops from O(outH*outW) to O(ceil(kH/sH)*ceil(kW/sW)) per cell.
+// argmax), so the scan visits only output cells that could cover it instead of the whole output plane. The engine's
+// backward does not know the forward's padding (the stored indices are absolute, so the gradient never needed it),
+// and padH/padW arrive as 0 from there; so the bound covers ANY padding p in [0, P], P = max(padH, kH-1):
+// oh in [ceil((ih-kH+1)/sH), floor((ih+P)/sH)], likewise ow. A window the scan visits that does not actually cover
+// the cell cannot hold its index, so the terms added, and their order, are the same as a full scan's and the result
+// is bit-identical; the cost is O((kH+P)/sH * (kW+P)/sW) per cell instead of O(outH*outW). (Bounding with the passed
+// padding alone dropped gradient for every padded pool reached through the engine: k3 s2 p1 lost 8 of 60 cells.)
 // The one exception is the forward's fallback index 0, stored when no window element compared greater than
 // -INFINITY (an all -inf/NaN window): it can point outside the window, so cell 0 keeps the full scan.
 extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_deterministic(
@@ -105,12 +109,14 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
     int targetMaxIdx = ih * inWidth + iw;
     int ohLo = 0, ohHi = outHeight - 1, owLo = 0, owHi = outWidth - 1;
     if (targetMaxIdx != 0) {
-        int hNum = ih + padH - kernelH + 1;
-        int wNum = iw + padW - kernelW + 1;
+        int padHMax = padH > kernelH - 1 ? padH : kernelH - 1;
+        int padWMax = padW > kernelW - 1 ? padW : kernelW - 1;
+        int hNum = ih - kernelH + 1;
+        int wNum = iw - kernelW + 1;
         ohLo = hNum <= 0 ? 0 : (hNum + strideH - 1) / strideH;
         owLo = wNum <= 0 ? 0 : (wNum + strideW - 1) / strideW;
-        int hHi = (ih + padH) / strideH;
-        int wHi = (iw + padW) / strideW;
+        int hHi = (ih + padHMax) / strideH;
+        int wHi = (iw + padWMax) / strideW;
         if (hHi < ohHi) ohHi = hHi;
         if (wHi < owHi) owHi = wHi;
     }

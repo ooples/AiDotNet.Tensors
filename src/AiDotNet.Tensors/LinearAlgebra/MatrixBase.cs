@@ -9,6 +9,7 @@ using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using MA = AiDotNet.Tensors.Helpers.MatrixAllocator;
 using VA = AiDotNet.Tensors.Helpers.VectorAllocator;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -513,6 +514,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <para><b>For Beginners:</b> This method replaces an entire column of the matrix with new values.
     /// The vector must have the same number of elements as the matrix has rows.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual void SetColumn(int columnIndex, Vector<T> vector)
     {
         if (columnIndex < 0 || columnIndex >= Columns)
@@ -597,6 +599,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// For example, if you have a 3x4 matrix and call GetColumn(2), you'll get a vector with 3 elements containing
     /// all values from the third column (remember that indices start at 0).</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual Vector<T> GetColumn(int col)
     {
         ValidateIndices(0, col);
@@ -619,6 +622,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// (e.g., positions [0,0], [1,1], [2,2], etc.). This method extracts these elements into a vector.
     /// The length of the diagonal vector will be the minimum of the matrix's row and column counts.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual Vector<T> Diagonal()
     {
         int minDimension = Math.Min(Rows, Columns);
@@ -647,6 +651,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// For example, SubMatrix(1, 2, 3, 2) would extract a 3ÃƒÂ¯Ã‚Â¿Ã‚Â½2 matrix starting from position [1,2]
     /// (the 2nd row and 3rd column, since indices start at 0).</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> SubMatrix(int startRow, int startCol, int numRows, int numCols)
     {
         if (startRow < 0 || startCol < 0 || startRow + numRows > Rows || startCol + numCols > Columns)
@@ -680,6 +685,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// It takes all rows from startRow up to (but not including) endRow, and only includes the columns specified in columnIndices.
     /// This is useful when you need to work with a specific subset of your data.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> SubMatrix(int startRow, int endRow, List<int> columnIndices)
     {
         if (columnIndices is null)
@@ -761,8 +767,17 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             throw new ArgumentException("Matrix dimensions must match for addition.");
 
         var result = CreateInstance(_rows, _cols);
+        var dst = result.AsWritableSpan();
+        if (dst.Length >= ElementwiseParallelMinLength)
+        {
+            Memory<T> a = _memory, b = other._memory, r = result._memory;
+            CpuParallelSettings.ParallelForChunks(dst.Length, ElementwiseParallelGrain(dst.Length),
+                (start, count) => _numOps.Add(a.Span.Slice(start, count), b.Span.Slice(start, count), r.Span.Slice(start, count)));
+            return result;
+        }
+
         // Use vectorized Add operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Add(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Add(_memory.Span, other._memory.Span, dst);
 
         return result;
     }
@@ -879,7 +894,16 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
 
         var result = CreateInstance(_rows, _cols);
-        _numOps.Subtract(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        var dst = result.AsWritableSpan();
+        if (dst.Length >= ElementwiseParallelMinLength)
+        {
+            Memory<T> a = _memory, b = other._memory, r = result._memory;
+            CpuParallelSettings.ParallelForChunks(dst.Length, ElementwiseParallelGrain(dst.Length),
+                (start, count) => _numOps.Subtract(a.Span.Slice(start, count), b.Span.Slice(start, count), r.Span.Slice(start, count)));
+            return result;
+        }
+
+        _numOps.Subtract(_memory.Span, other._memory.Span, dst);
         return result;
     }
 
@@ -1204,9 +1228,41 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     public virtual MatrixBase<T> Multiply(T scalar)
     {
         var result = CreateInstance(_rows, _cols);
-        _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpan());
+        var dst = result.AsWritableSpan();
+        if (dst.Length >= ElementwiseParallelMinLength)
+        {
+            Memory<T> a = _memory, r = result._memory;
+            CpuParallelSettings.ParallelForChunks(dst.Length, ElementwiseParallelGrain(dst.Length),
+                (start, count) => _numOps.MultiplyScalar(a.Span.Slice(start, count), scalar, r.Span.Slice(start, count)));
+            return result;
+        }
+
+        _numOps.MultiplyScalar(_memory.Span, scalar, dst);
         return result;
     }
+
+    /// <summary>
+    /// Element count from which the allocating elementwise operations (<see cref="Add"/>,
+    /// <see cref="Subtract"/>, <see cref="Multiply(T)"/>) split across threads.
+    /// </summary>
+    /// <remarks>
+    /// These operations are bound by memory bandwidth and, because the result is freshly allocated,
+    /// by first-touch page faults on its pages; one core saturates neither. Measured on a 16-core
+    /// Ryzen (double, allocate + add): 90K elements 81 → 45 µs, 250K 329 → 217 µs, 1M 1753 → 1083 µs.
+    /// </remarks>
+    private const int ElementwiseParallelMinLength = 1 << 16;
+
+    /// <summary>
+    /// Chunk size for the parallel elementwise path: about eight chunks, never below 32K elements or above 128K.
+    /// </summary>
+    /// <remarks>
+    /// A fresh large result is written once, and the first write to each page faults it in: the OS zeroes the page on
+    /// the faulting core, so the store that follows hits cache. Spreading those first touches over more cores is what
+    /// the split buys. On a Threadripper 3990X (double, allocate + scale, 250K elements, one process per variant):
+    /// 2 chunks 162 µs, 8 chunks 74.5 µs, 16 chunks 104 µs. The 32K floor keeps the 16-core Ryzen result that
+    /// motivated the old two-chunk rule out of reach (16K-element chunks there: 493 µs vs 217 µs for two chunks).
+    /// </remarks>
+    private static int ElementwiseParallelGrain(int length) => Math.Min(1 << 17, Math.Max(1 << 15, length / 8));
 
     /// <summary>
     /// Multiplies this matrix by a scalar value in-place.
@@ -1269,6 +1325,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <para><b>Performance:</b> Uses cache-blocked algorithm with parallel execution for large matrices.
     /// Block size is tuned for L1 cache (32x32 blocks). Parallel execution provides 2-4x speedup on multi-core systems.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual MatrixBase<T> Transpose()
     {
         var result = CreateInstance(_cols, _rows);
@@ -1276,6 +1333,27 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
         var srcSpan = _memory.Span;
         int rows = _rows;
         int cols = _cols;
+
+#if NET5_0_OR_GREATER
+        // AVX register-transpose kernel. Works on spans, so it also covers pooled results whose
+        // rented array is longer than rows * cols (TryGetBackingArray rejects those).
+        if (typeof(T) == typeof(double))
+        {
+            SimdTranspose.Transpose(
+                MemoryMarshal.CreateReadOnlySpan(ref Unsafe.As<T, double>(ref MemoryMarshal.GetReference(srcSpan)), srcSpan.Length),
+                MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref MemoryMarshal.GetReference(resultSpan)), resultSpan.Length),
+                rows, cols);
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            SimdTranspose.Transpose(
+                MemoryMarshal.CreateReadOnlySpan(ref Unsafe.As<T, float>(ref MemoryMarshal.GetReference(srcSpan)), srcSpan.Length),
+                MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref MemoryMarshal.GetReference(resultSpan)), resultSpan.Length),
+                rows, cols);
+            return result;
+        }
+#endif
 
         // For small matrices, use simple approach
         if (rows * cols < 4096)
@@ -1317,7 +1395,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             int numRowBlocks = (rows + BlockSize - 1) / BlockSize;
 
             // Parallel processing of row blocks
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)rows * cols, iiBlock =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)rows * cols, [MethodImpl(Hot)] (iiBlock) =>
             {
                 int ii = iiBlock * BlockSize;
                 int iEnd = Math.Min(ii + BlockSize, rows);
@@ -1397,6 +1475,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// Only works for square matrices (same number of rows and columns).</para>
     /// <para><b>Performance:</b> Zero-allocation transpose with parallel execution for large matrices.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual void TransposeInPlace()
     {
         if (_rows != _cols)
@@ -1446,7 +1525,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             int numBlocks = (n + BlockSize - 1) / BlockSize;
 
             // Process diagonal and upper-triangular blocks in parallel
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numBlocks, (long)n * n, iiBlock =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numBlocks, (long)n * n, [MethodImpl(Hot)] (iiBlock) =>
             {
                 int ii = iiBlock * BlockSize;
                 int iEnd = Math.Min(ii + BlockSize, n);
@@ -1661,6 +1740,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// This is useful for displaying the matrix contents in a readable format,
     /// for example when debugging or logging.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public override string ToString()
     {
         var sb = new StringBuilder();

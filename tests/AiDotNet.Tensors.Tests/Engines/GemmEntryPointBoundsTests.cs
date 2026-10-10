@@ -113,10 +113,9 @@ namespace AiDotNet.Tensors.Tests.Engines
                 // which is exactly why the inventory is reflected rather than listed: these live in
                 // partial-class files (SimdGemm.Fp16Weight.cs, .Int8Int8.cs, .Int8RowScaled.cs) and a
                 // file-scoped search of SimdGemm.cs does not see them at all.
-#if NET5_0_OR_GREATER
-                // System.Half is the ONLY net5-only API in this file, so it is the only thing
-                // guarded. Guarding the whole class instead left net471 -- a supported target --
-                // with no bounds coverage for any GEMM entry point at all.
+                // Unguarded: SgemmFp16WeightB is public on every framework, and on net471 the library's own System.Half
+                // shim (Compatibility/HalfCompat.cs) supplies Half. Guarding this driver left net471 with an entry point
+                // the inventory discovers but nothing drives, which this test reports as missing coverage.
                 ["SgemmFp16WeightB"] = (m, k, n) => WithGuardedOutputF(m, n, c =>
                 {
                     var a = RandF(m * k, 771);
@@ -125,7 +124,6 @@ namespace AiDotNet.Tensors.Tests.Engines
                     for (int i = 0; i < b.Length; i++) b[i] = (Half)(rng.NextDouble() * 2 - 1);
                     SimdGemm.SgemmFp16WeightB(a, b, c, m, k, n);
                 }),
-#endif
                 ["SgemmA8W8RowScaledCachedB"] = (m, k, n) => WithGuardedOutputF(m, n, c =>
                     SimdGemm.SgemmA8W8RowScaledCachedB(
                         RandF(m * k, 773), RandI8(n * k, 774), RandF(n, 775), c, m, k, n)),
@@ -214,11 +212,16 @@ namespace AiDotNet.Tensors.Tests.Engines
                     + string.Join("\n  ", missing));
 
             // And the reflection must actually be finding things — a filter that silently matched
-            // nothing would make the assertion above vacuous forever.
+            // nothing would make the assertion above vacuous forever. With nothing missing, finding at
+            // least as many entry points as there are drivers means the two sets are identical, on
+            // every target framework: net471 compiles only the entry points outside SimdGemm's
+            // NET5_0_OR_GREATER blocks, and the driver table shrinks with it, so a fixed floor cannot
+            // hold on both.
             Assert.True(
-                discovered.Count >= 10,
-                $"Only {discovered.Count} public span-taking GEMM entry points were discovered; the "
-                    + "reflection filter has probably gone stale.");
+                discovered.Count >= Drivers.Count,
+                $"Only {discovered.Count} public span-taking GEMM entry points were discovered for "
+                    + $"{Drivers.Count} drivers; the reflection filter has probably gone stale, or a "
+                    + "driver targets an entry point that no longer exists.");
         }
 
         private static bool TakesSpansAndDims(MethodInfo m)

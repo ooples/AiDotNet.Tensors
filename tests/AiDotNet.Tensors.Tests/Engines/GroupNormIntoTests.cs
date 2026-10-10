@@ -14,6 +14,9 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// reference (CpuEngine.GroupNorm), covering both float (uses pinned GroupNormFloatPtr)
 /// and double (uses the inline numOps generic loop).
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class GroupNormIntoTests
 {
     public enum UndersizedAffineParameter

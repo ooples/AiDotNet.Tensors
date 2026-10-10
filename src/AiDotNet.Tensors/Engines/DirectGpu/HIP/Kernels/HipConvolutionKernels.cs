@@ -161,12 +161,16 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_kernel(
     int kernelH, int kernelW, int strideH, int strideW,
     int padH, int padW, int dilationH, int dilationW)
 {
-    int kw = blockIdx.x * blockDim.x + threadIdx.x;
-    int kh = blockIdx.y * blockDim.y + threadIdx.y;
-    int ic = blockIdx.z % inChannels;
-    int oc = blockIdx.z / inChannels;
-
-    if (kw >= kernelW || kh >= kernelH || oc >= outChannels) return;
+    // One thread per gradKernel element over a flat 1D grid. Mapping outChannels * inChannels onto
+    // gridDim.z failed to launch once the product passed 65,535 (any 256x256 or wider conv layer), and
+    // 16x16 blocks over a 3x3 kernel left 247 of every 256 threads idle.
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)outChannels * inChannels * kernelH * kernelW;
+    if (idx >= total) return;
+    int kw = (int)(idx % kernelW);
+    int kh = (int)((idx / kernelW) % kernelH);
+    int ic = (int)((idx / ((long)kernelW * kernelH)) % inChannels);
+    int oc = (int)(idx / ((long)kernelW * kernelH * inChannels));
 
     float sum = 0.0f;
     for (int b = 0; b < batch; b++) {
@@ -182,7 +186,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_backward_kernel(
             }
         }
     }
-    gradKernel[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw] = sum;
+    gradKernel[idx] = sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d(

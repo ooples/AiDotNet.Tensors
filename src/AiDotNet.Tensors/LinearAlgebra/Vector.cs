@@ -8,6 +8,7 @@ using System.Runtime.Intrinsics.Arm;
 #endif
 using AiDotNet.Tensors.Helpers;
 using VA = AiDotNet.Tensors.Helpers.VectorAllocator;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -273,7 +274,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// Multiplies each element by a scalar in-place using inline SIMD.
     /// Sealed override eliminates virtual dispatch; inline AVX2 eliminates method call overhead.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public sealed override void MultiplyInPlace(T scalar)
     {
 #if NET5_0_OR_GREATER
@@ -349,7 +350,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// <summary>
     /// Adds another vector in-place using inline SIMD.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public sealed override void AddInPlace(VectorBase<T> other)
     {
         if (Length != other.Length)
@@ -402,7 +403,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// <summary>
     /// Subtracts another vector in-place using inline SIMD.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public sealed override void SubtractInPlace(VectorBase<T> other)
     {
         if (Length != other.Length)
@@ -462,6 +463,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> This allows you to use the vector in foreach loops,
     /// making it easy to process each element one by one.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public IEnumerator<T> GetEnumerator()
     {
         // Use Memory<T>.Span for efficient iteration
@@ -608,6 +610,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> This is similar to Select, but specifically designed for
     /// mathematical transformations. It applies a function to each element in your vector.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public new Vector<TResult> Transform<TResult>(Func<T, TResult> function)
     {
         var resultArray = new TResult[Length];
@@ -630,6 +633,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// of each element. This is useful when the transformation depends on where the element is located
     /// in the vector.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public new Vector<TResult> Transform<TResult>(Func<T, int, TResult> function)
     {
         var resultArray = new TResult[Length];
@@ -946,6 +950,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// you where the value would be if it were in the vector. The vector must be sorted
     /// for this to work correctly.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public int BinarySearch(T value)
     {
         IComparer<T> comparer = Comparer<T>.Default;
@@ -1288,6 +1293,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// This is the standard mathematical interpretation of transposing a row vector to a column vector.
     /// Useful when you need to perform matrix operations that require column vectors.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> Transpose()
     {
         // Create a column matrix (Nx1) from this vector
@@ -1313,6 +1319,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// This is particularly useful in machine learning when adding a bias term to feature vectors.
     /// A feature vector [x1, x2, x3] becomes [x1, x2, x3, 1] for linear regression with bias.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> AppendAsMatrix(T value)
     {
         // Create a 1×(N+1) row matrix: [v1, v2, ..., vN, value]
@@ -1335,6 +1342,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> This method lets you pick specific elements from your vector by their positions.
     /// For example, if your vector is [10,20,30,40,50] and you specify indices [1,3], the result will be [20,40].</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Vector<T> GetElements(IEnumerable<int> indices)
     {
         var indexList = indices.ToList();
@@ -1433,6 +1441,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> This method is similar to the other Concatenate method but accepts
     /// a list of vectors instead of individual parameters. It joins all vectors in the list together end-to-end.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public static Vector<T> Concatenate(List<Vector<T>> vectors)
     {
         if (vectors.Count == 0)

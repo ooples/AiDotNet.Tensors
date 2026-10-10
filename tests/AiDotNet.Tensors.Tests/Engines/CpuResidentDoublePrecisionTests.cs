@@ -32,6 +32,9 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// single-precision round trip cannot reproduce the double answer.
 /// </para>
 /// </remarks>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class CpuResidentDoublePrecisionTests : IDisposable
 {
     // DirectGpuTensorEngine's default constructor OWNS the underlying DirectGpuEngine, so an

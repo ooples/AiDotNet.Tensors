@@ -5,6 +5,8 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers.Autotune;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -69,6 +71,7 @@ internal static class BlockSizeSweep
     /// calling thread.
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     public static void PrepopulateCommonShapes()
     {
         // Save/restore (don't hard-reset): these are [ThreadStatic] flags and a
@@ -134,6 +137,7 @@ internal static class BlockSizeSweep
     /// <summary>
     /// Benchmark candidate blockings for the given shape and return the fastest.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static (ParallelismAxis Axis, int Mc, int Nc, int Kc, int ThreadCount, double MeasuredMs)
         Measure<T>(
             int m, int n, int k,
@@ -191,6 +195,7 @@ internal static class BlockSizeSweep
     /// <see cref="Runs"/> single-GEMM timings (median damps a one-off scheduler
     /// hiccup better than the mean for a handful of samples).
     /// </summary>
+    [MethodImpl(Hot)]
     private static double TimeCandidate<T>(
         (int Mc, int Nc, int Kc) cand,
         T[] a, int aLen, int lda, bool transA,
@@ -230,6 +235,7 @@ internal static class BlockSizeSweep
         }
     }
 
+    [MethodImpl(Hot)]
     private static double Median(Span<double> values)
     {
         // Small N — insertion sort in place, then pick the middle.
@@ -281,6 +287,7 @@ internal static class BlockSizeSweep
     /// [-1, 1]. Values are irrelevant to timing; they only need to be finite to
     /// avoid denormal/NaN slow paths.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void FillRandom<T>(Span<T> span) where T : unmanaged
     {
         var rng = new Random(42);

@@ -4,13 +4,14 @@ using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Engines;
+using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Jobs;
 using TorchSharp;
 using TorchTensor = TorchSharp.torch.Tensor;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 5, iterationCount: 15)]
+[Config(typeof(SteadyAndColdCallConfig))]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class TorchSharpCpuComparisonBenchmarks
@@ -187,7 +188,19 @@ public class TorchSharpCpuComparisonBenchmarks
         _torchDoubleConvKernel?.Dispose();
     }
 
-    [IterationSetup]
+    // Arms with an iteration setup are timed as ONE call per iteration in every job, SteadyState included:
+    // BenchmarkDotNet forces a single invocation when a setup runs before each iteration. They carry the
+    // ColdCallOnly category so their SteadyState rows are not read as steady-state numbers.
+    private const string ColdCallOnly = "ColdCallOnly";
+
+    // Only the arms that mutate the shared input vectors in place need it reset between iterations.
+    // A class-wide [IterationSetup] forced BenchmarkDotNet to time ONE cold call per iteration for every
+    // benchmark in the suite; the ColdCall job now measures that regime explicitly for all of them.
+    [IterationSetup(Targets = new[]
+    {
+        nameof(AiDotNet_TensorAdd), nameof(AiDotNet_TensorMultiply), nameof(AiDotNet_ReLU), nameof(AiDotNet_Sigmoid),
+        nameof(TorchSharp_Add), nameof(TorchSharp_Add_1Thread), nameof(TorchSharp_Multiply), nameof(TorchSharp_ReLU), nameof(TorchSharp_Sigmoid),
+    })]
     public void IterationSetup()
     {
         foreach (var size in VectorSizes)
@@ -407,8 +420,12 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(256)]
     [Arguments(512)]
-    public Tensor<float> AiDotNet_TensorMatMul(int size)
-        => AiDotNetEngine.Current.TensorMatMul(_aiMatricesA[size], _aiMatricesB[size]);
+    public void AiDotNet_TensorMatMul(int size)
+    {
+        // Pool-return the result like the other arms and like torch's `using var result`.
+        var r = AiDotNetEngine.Current.TensorMatMul(_aiMatricesA[size], _aiMatricesB[size]);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     [Arguments(256)]
@@ -426,6 +443,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public Tensor<float> AiDotNet_TensorAdd(int size)
     {
         _cpuEngine.TensorAddInPlace(_aiVectorsA[size], _aiVectorsB[size]);
@@ -446,6 +464,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Add(int size)
     {
         torch.add_(_torchVectorsA[size], _torchVectorsB[size]);
@@ -454,6 +473,7 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Add_1Thread(int size)
     {
         int prev = (int)torch.get_num_threads();
@@ -466,6 +486,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public Tensor<float> AiDotNet_TensorMultiply(int size)
     {
         _cpuEngine.TensorMultiplyInPlace(_aiVectorsA[size], _aiVectorsB[size]);
@@ -475,6 +496,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Multiply(int size)
     {
         torch.mul_(_torchVectorsA[size], _torchVectorsB[size]);
@@ -574,12 +596,14 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Activations
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void AiDotNet_ReLU()
     {
         _cpuEngine.ReLUInPlace(_aiVectorsA[LargeSize]);
     }
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_ReLU()
     {
         _torchVectorsA[LargeSize].relu_();
@@ -587,6 +611,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void AiDotNet_Sigmoid()
     {
         _cpuEngine.SigmoidInPlace(_aiVectorsA[LargeSize]);
@@ -601,6 +626,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Sigmoid()
     {
         _torchVectorsA[LargeSize].sigmoid_();
@@ -801,7 +827,11 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Conv2D()
-        => AiDotNetEngine.Current.Conv2D(_aiConvInput!, _aiConvKernel!, _convStride, _convPadding, _convDilation);
+    {
+        // Pool-return the result like the other arms and like torch's `using var result`.
+        var r = AiDotNetEngine.Current.Conv2D(_aiConvInput!, _aiConvKernel!, _convStride, _convPadding, _convDilation);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void AiDotNet_Conv2D_ZeroAlloc()
@@ -880,7 +910,12 @@ public class TorchSharpCpuComparisonBenchmarks
     {
         if (_aiNormInput is null || _aiNormGamma is null || _aiNormBeta is null)
             throw new InvalidOperationException("Setup not called");
-        _cpuEngine.GroupNorm(_aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5, out _, out _);
+        // Pool-return the output and statistics, as the LayerNorm / BatchNorm arms do and as torch's
+        // `using var result` does; without it every call allocated a fresh 8 MB result.
+        var r = _cpuEngine.GroupNorm(_aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5, out var gnMean, out var gnVar);
+        TensorPool.Return(r);
+        TensorPool.Return(gnMean);
+        TensorPool.Return(gnVar);
     }
 
     [Benchmark]
@@ -1129,3 +1164,19 @@ public class TorchSharpCpuComparisonBenchmarks
     #endregion
 }
 #endif
+
+/// <summary>
+/// Two jobs: <c>SteadyState</c> (back-to-back calls, as in the ML.NET / TensorFlow.NET suites) and
+/// <c>ColdCall</c> (one invocation per iteration, so the call lands after the pause between iterations,
+/// when thread pools have parked and caches have cooled).
+/// </summary>
+public sealed class SteadyAndColdCallConfig : ManualConfig
+{
+    public SteadyAndColdCallConfig()
+    {
+        var baseJob = Job.Default.WithRuntime(BenchmarkDotNet.Environments.CoreRuntime.Core10_0)
+            .WithLaunchCount(1).WithWarmupCount(5).WithIterationCount(15);
+        AddJob(baseJob.WithId("SteadyState"));
+        AddJob(baseJob.WithInvocationCount(1).WithUnrollFactor(1).WithId("ColdCall"));
+    }
+}

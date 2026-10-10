@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -45,6 +47,7 @@ internal static class Avx512Vnni
     /// <paramref name="length"/>. The contract a future VNNI SIMD kernel
     /// must preserve bit-exact.
     /// </summary>
+    [MethodImpl(Hot)]
     public static int DotInt8(ReadOnlySpan<byte> a, ReadOnlySpan<sbyte> b, int length)
     {
         if (a.Length < length || b.Length < length)

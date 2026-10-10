@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
 /// <summary>
@@ -23,6 +25,7 @@ internal static class MachineCodeFmaKernel
     internal static int PanelKUnroll = 4;
 
     /// <summary>Emit the Windows-x64 12-accumulator FP64 FMA loop. Returns the machine-code bytes.</summary>
+    [MethodImpl(Hot)]
     internal static byte[] EmitFp64x12Windows()
     {
         const int RSP = 4, R8 = 8, RDX = 2;
@@ -83,6 +86,7 @@ internal static class MachineCodeFmaKernel
     /// <summary>When <paramref name="overwrite"/> the SAVE writes C = acc (store only, no load+add) — used
     /// for the FIRST K-panel so the caller can skip the ZeroCBlock zero-pass + the panel-0 C read-back.
     /// (True non-temporal stores don't fit: C is L2-resident and RMW'd across K-panels.)</summary>
+    [MethodImpl(Hot)]
     internal static byte[] EmitFp32TileWindows(int mr, int nrYmm, bool overwrite)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RSP = 4;
@@ -149,6 +153,7 @@ internal static class MachineCodeFmaKernel
     /// rdi=packedA, rsi=packedB, rdx=c, rcx=ldcBytes, r8=kc — and ALL xmm are caller-saved, so there is no
     /// save/restore frame (no SubRsp/xmm6-15 spill). Body (FMA loop + SAVE) is otherwise identical to the
     /// Win-x64 kernel, so it produces bit-identical results.</summary>
+    [MethodImpl(Hot)]
     internal static byte[] EmitFp32TileSysV(int mr, int nrYmm, bool overwrite)
     {
         const int RCX = 1, RDX = 2, RSI = 6, RDI = 7, R8 = 8, R10 = 10, R11 = 11;
@@ -207,6 +212,7 @@ internal static class MachineCodeFmaKernel
     /// loads 8 bf16 per nr-YMM (vpmovzxwd m128→8×u32) and widens to fp32 in-register (vpslld 16 — bf16 is
     /// the high 16 bits of fp32). A stays fp32 (broadcast). Same signature/SAVE as the fp32 kernel; the only
     /// change is the B load+widen and B advancing nrYmm*16 bytes/iter (half of fp32's nrYmm*32).</summary>
+    [MethodImpl(Hot)]
     internal static byte[] EmitBf16BTileWindows(int mr, int nrYmm, bool overwrite)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RSP = 4;
@@ -271,6 +277,7 @@ internal static class MachineCodeFmaKernel
     /// args: rdi=packedA, rsi=packedB(bf16), rdx=c, rcx=ldcBytes, r8=kc; all xmm caller-saved ⇒ no
     /// save/restore frame. ABI handling mirrors <see cref="EmitFp32TileSysV"/>; the bf16 B load+widen body
     /// is identical to the Win-x64 bf16 kernel, so it produces bit-identical results to it.</summary>
+    [MethodImpl(Hot)]
     internal static byte[] EmitBf16BTileSysV(int mr, int nrYmm, bool overwrite)
     {
         const int RCX = 1, RDX = 2, RSI = 6, RDI = 7, R8 = 8, R10 = 10, R11 = 11;
@@ -329,6 +336,7 @@ internal static class MachineCodeFmaKernel
             ? EmitBf16BTileWindows(mr, nrYmm, overwrite)
             : EmitBf16BTileSysV(mr, nrYmm, overwrite);
 
+    [MethodImpl(Hot)]
     internal static byte[] EmitFp64_6x8_PackedWindows()
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0, RSP = 4;
@@ -443,6 +451,7 @@ internal static class MachineCodeFmaKernel
     // each tile rdx already points at the next stripe — no stride arithmetic needed. A
     // is reset to its base each tile; C advances by one 16-float tile (64 bytes).
 
+    [MethodImpl(Hot)]
     internal static byte[] EmitFp32_6x16_PanelWindows()
     {
         const int RCX = 1, R10 = 10, RAX = 0, RSI = 6, R12 = 12, R13 = 13, R9 = 9, RSP = 4;
@@ -505,6 +514,7 @@ internal static class MachineCodeFmaKernel
     // where aStrideBytes = effKc*Mr*4 (the byte gap between packed-A Mr-stripes), and cBase
     // advances by Mr*ldc*4 (6 rows) per Mr-block. Bit-identical to the per-Mr-block panel path
     // (same per-tile FMA order; C tiles disjoint; K accumulates ascending).
+    [MethodImpl(Hot)]
     internal static byte[] EmitFp32_6x16_MacroWindows()
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0,
@@ -570,6 +580,7 @@ internal static class MachineCodeFmaKernel
     /// <summary>Outer Mr-loop wrapping the panel tile-loop. Assumes rsi=A-base, r14=B-base,
     /// r15=C-base, rbx=numMr, rbp=njr, r12=kc, rdi=aStrideBytes, rax=ldc*4, r9=ldc. EmitPanelLoop
     /// touches none of rsi/r14/r15/rbx/rbp/rdi/r9, so the masters survive each tile sweep.</summary>
+    [MethodImpl(Hot)]
     private static void EmitMacroPanelLoop_Fp32_6x16(X64Assembler asm)
     {
         const int RDX = 2, R8 = 8, R13 = 13, RSI = 6, RDI = 7, RBX = 3, RBP = 5, R14 = 14, R15 = 15, RAX = 0;
@@ -592,6 +603,7 @@ internal static class MachineCodeFmaKernel
     /// <summary>Register-level FP32 6×16 panel loop. Assumes rsi=A-base, r12=kc, r13=njr,
     /// rax=ldc*4 (row stride bytes), r8=C, r9=ldc; clobbers ymm0–15, rcx, rdx, r10, r11,
     /// advances r8/r13/rdx; rsi/r12/rax preserved across iterations. ABI-agnostic.</summary>
+    [MethodImpl(Hot)]
     private static void EmitPanelLoop_Fp32_6x16(X64Assembler asm)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R10 = 10, R11 = 11, RAX = 0, RSI = 6, R12 = 12, R13 = 13;
@@ -715,6 +727,7 @@ internal static class MachineCodeFmaKernel
     /// accumulators/scratch (callee must preserve them on Windows; on SysV they are
     /// volatile so nothing is saved).
     /// </summary>
+    [MethodImpl(Hot)]
     private static void EmitBody_Fp32_6x16(X64Assembler asm)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;
@@ -767,6 +780,7 @@ internal static class MachineCodeFmaKernel
 
     /// <summary>Windows x64: kc (5th arg) is at [rsp+0x28]; xmm6–15 are nonvolatile.
     /// Load kc→r10 (before moving rsp), reserve frame, save xmm6–15.</summary>
+    [MethodImpl(Hot)]
     private static void EmitWindowsPrologue(X64Assembler asm)
     {
         asm.MovRegFromRsp(R10_, 0x28);
@@ -776,6 +790,7 @@ internal static class MachineCodeFmaKernel
         for (int i = 0; i < 10; i++) asm.VmovupsXmmStoreD32(RSP_, i * 0x10, 6 + i);
     }
 
+    [MethodImpl(Hot)]
     private static void EmitWindowsEpilogue(X64Assembler asm)
     {
         for (int i = 0; i < 10; i++) asm.VmovupsXmmLoadD32(6 + i, RSP_, i * 0x10);
@@ -838,6 +853,7 @@ internal static class MachineCodeFmaKernel
     /// r8=c, r9=ldc(elements), r10=kc; clobbers ymm0–15, rax, r11 and advances
     /// rcx/rdx/r10. ABI-agnostic — the caller supplies the prologue/epilogue.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void EmitBody_Fp64_6x8_U4(X64Assembler asm)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;
@@ -965,6 +981,7 @@ internal static class MachineCodeFmaKernel
 
     /// <summary>Register-level AVX-512 FP64 6×16 body (zmm0–15). rcx=A, rdx=B, r8=c,
     /// r9=ldc, r10=kc; clobbers zmm0–15, rax, r11; advances rcx/rdx/r10.</summary>
+    [MethodImpl(Hot)]
     private static void EmitBody_Avx512_Fp64_6x16(X64Assembler asm)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;
@@ -1012,6 +1029,7 @@ internal static class MachineCodeFmaKernel
 
     /// <summary>Register-level AVX-512 FP32 6×32 body (zmm0–15). rcx=A, rdx=B, r8=c,
     /// r9=ldc, r10=kc; clobbers zmm0–15, rax, r11; advances rcx/rdx/r10.</summary>
+    [MethodImpl(Hot)]
     private static void EmitBody_Avx512_Fp32_6x32(X64Assembler asm)
     {
         const int RCX = 1, RDX = 2, R8 = 8, R9 = 9, R10 = 10, R11 = 11, RAX = 0;

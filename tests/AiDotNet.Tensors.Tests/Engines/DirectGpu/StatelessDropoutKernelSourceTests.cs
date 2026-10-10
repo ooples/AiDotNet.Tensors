@@ -13,7 +13,9 @@ public sealed class StatelessDropoutKernelSourceTests
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.LossForwardKernels", "GetSource")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalResidentKernels", "Source")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanResidentKernels", "StatelessDropoutMask")]
+#if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuKernels", "StatelessDropoutMaskSource")]
+#endif
     public void EveryBackendUsesTheSharedIntegerPcgContract(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);

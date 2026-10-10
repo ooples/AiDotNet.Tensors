@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -103,6 +105,7 @@ internal static class Avx2Fp64_4x8
     /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static unsafe void Run(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> packedB,
@@ -231,6 +234,7 @@ internal static class Avx2Fp64_4x8
     /// Same loop structure as <see cref="Run"/>, but B is read in caller-supplied
     /// stride <paramref name="ldb"/> instead of packed stride <see cref="Nr"/>=8.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunStridedB(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> b,

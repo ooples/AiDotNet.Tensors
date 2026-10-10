@@ -1,5 +1,7 @@
 using System;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -36,6 +38,7 @@ internal static class NchwcConv2D
     /// NCHWc8 direct conv. All shapes derive from the channel-block tiling:
     /// <c>cgIn = inC / 8</c>, <c>cgOut = outC / 8</c>. Pad is symmetric.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Run(
         float[] input,                       // [N, cgIn, H, W, 8]
         float[] kernel,                      // [cgOut, cgIn, kH, kW, 8_in, 8_out]
@@ -92,7 +95,7 @@ internal static class NchwcConv2D
 #endif
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, totalTasks,
-            (long)totalTasks * _outStrideCg, taskIdx =>
+            (long)totalTasks * _outStrideCg, [MethodImpl(Hot)] (taskIdx) =>
         {
             int n = taskIdx / _cgOut;
             int ocg = taskIdx % _cgOut;

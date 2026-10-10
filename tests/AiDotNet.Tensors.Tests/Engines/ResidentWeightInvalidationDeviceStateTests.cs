@@ -43,6 +43,9 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// run successfully, but the current step cannot engage the fused path". Observed in production as PPO
 /// bake-off runs failing at <c>status=fit</c> with zero return and zero trades.</para>
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public sealed class ResidentWeightInvalidationDeviceStateTests
 {
     private static Tensor<float> Weights(int rows, int cols, float scale)

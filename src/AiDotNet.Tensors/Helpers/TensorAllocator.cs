@@ -161,6 +161,48 @@ public static class TensorAllocator
     public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
 
     /// <summary>
+    /// Arrays of at least this many bytes are allocated on the Large Object Heap.
+    /// </summary>
+    private const int LargeObjectHeapThresholdBytes = 85_000;
+
+    /// <summary>
+    /// True when a <paramref name="totalSize"/>-element array is rented from the pool, so that
+    /// <see cref="Return{T}"/> can recycle it: at or above <see cref="ArrayPoolThresholdValue"/>
+    /// elements, or whenever it would land on the Large Object Heap.
+    /// </summary>
+    /// <remarks>
+    /// The element threshold alone left LOH-sized arrays unpooled (a 100K-element float result is
+    /// 400 KB): returning such a result was a no-op, every op allocated a fresh LOH array, and the LOH
+    /// budget drove frequent gen2 collections. A 100K-element float subtract measured 42 µs this way
+    /// against libtorch's 14 µs in the same process.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool UsesArrayPool<T>(int totalSize)
+        => totalSize >= ArrayPoolThreshold
+           || (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>() >= LargeObjectHeapThresholdBytes;
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// A pooled backing array of exactly <paramref name="totalSize"/> elements: one this thread returned
+    /// earlier (<see cref="ThreadLocalTensorCache{T}"/> is keyed by exact length), or a new one.
+    /// </summary>
+    /// <remarks>
+    /// Pooled arrays used to come from <see cref="ArrayPool{T}.Shared"/>, which rounds up to a power of
+    /// two, so <c>GetDataArray()</c> returned an array longer than the tensor. Code that took that
+    /// array's length as the element count (118 sites in the library at the time, plus tests) read the
+    /// padding, and the padding itself caused the #311 / #318 divergence fixes. Exact sizes remove that
+    /// class; the cost is no reuse between different sizes, which repeated-shape workloads never need.
+    /// </remarks>
+    private static T[] RentExactArray<T>(int totalSize, bool zeroed)
+    {
+        T[] array = ThreadLocalTensorCache<T>.RentOrAllocateExact(totalSize);
+        if (zeroed || RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            Array.Clear(array, 0, array.Length);
+        return array;
+    }
+#endif
+
+    /// <summary>
     /// Creates a zero-initialized tensor with the given shape that's pinned
     /// to the current <see cref="TensorArena"/>'s long-lived tier. Pinned
     /// allocations survive <see cref="TensorArena.Reset"/> — use this for
@@ -436,42 +478,21 @@ public static class TensorAllocator
 #if NET5_0_OR_GREATER
         // Tier 1: Thread-local cache — zero allocation after warmup.
         T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
-        if (cached is null && totalSize >= ArrayPoolThreshold)
-            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
         if (cached is not null)
         {
-            // Issue #311: clear the ENTIRE pooled array, not just the
-            // logical portion. The pooled buffer may exceed totalSize
-            // (ArrayPool buckets pad to the next power of two; a 401,408-
-            // element rent returns a 524,288-element array), and the
-            // padding region carries the previous renter's bytes.
-            // Downstream kernels that read past the logical extent via
-            // SIMD overhang then observe non-zero garbage — making two
-            // forward passes through "logically identical" tensors
-            // diverge by 3-4% after a couple of layers (DBM clone-after-
-            // train). Clearing the whole array makes the zero-init
-            // contract layout-invariant: identical logical content +
-            // identical padding (= zero) → identical SIMD reduction
-            // order across pooled and freshly-allocated tensors.
+            // Exactly totalSize elements (see RentExactArray), so there is no padding to carry a
+            // previous renter's bytes; clearing it gives Rent's zero-init contract.
             Array.Clear(cached, 0, cached.Length);
-            var memory = new Memory<T>(cached, 0, totalSize);
-            return Tensor<T>.FromPooledMemory(memory, shape, cached);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
         }
 
-        // Tier 3: ArrayPool for large reference types — Rent may return a fresh array
-        // or reuse a pooled one; the underlying ArrayPool tracks reuse so we record
-        // unconditionally here (RentUninitialized records on the same path).
-        if (totalSize >= ArrayPoolThreshold)
+        // Tier 3: pooled sizes get an exact-size array marked as pooled, so Return can recycle it.
+        if (UsesArrayPool<T>(totalSize))
         {
             MemoryProfiler.RecordAllocation(
                 "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
-            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // Issue #311: clear the entire array, including the padding
-            // beyond totalSize. See the matching comment on the cached
-            // path above.
-            Array.Clear(pooled, 0, pooled.Length);
-            var memory = new Memory<T>(pooled, 0, totalSize);
-            return Tensor<T>.FromPooledMemory(memory, shape, pooled);
+            T[] pooled = new T[totalSize];
+            return Tensor<T>.FromPooledMemory(new Memory<T>(pooled), shape, pooled);
         }
 
         // Tier 4: Standard managed allocation for small tensors — always a fresh alloc.
@@ -518,41 +539,20 @@ public static class TensorAllocator
 #if NET5_0_OR_GREATER
         // Thread-local cache: skip Array.Clear
         T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
-        if (cached is null && totalSize >= ArrayPoolThreshold)
-            cached = ThreadLocalTensorCache<T>.TryRent(ArrayPoolBucketSize(totalSize));
         if (cached is not null)
         {
-            // Reference types: must clear EVERYTHING so we don't retain
-            // stale objects in the GC graph.
-            // Value types (issue #311): clear only the padding region
-            // (totalSize..cached.Length). The caller's contract is that
-            // it writes every element of the LOGICAL region, but
-            // downstream readers can still SIMD-overhang into padding
-            // and observe the prior renter's garbage — that produces
-            // ~3-4% drift between original (pooled-padded) and clone
-            // (freshly-allocated) Predict outputs after a few layers.
-            // Clearing only the padding preserves the "skip clear of
-            // logical region" optimization that is the whole point of
-            // RentUninitialized; the clear-padding-only cost is the
-            // ~25% bucket overhead, not the full buffer.
+            // Reference types: must clear so we don't retain stale objects in the GC graph. Value
+            // types skip the clear: the array is exactly totalSize elements (see RentExactArray), so
+            // there is no padding past the logical region for a previous renter's bytes to sit in.
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 Array.Clear(cached, 0, cached.Length);
-            else if (cached.Length > totalSize)
-                Array.Clear(cached, totalSize, cached.Length - totalSize);
-            var memory = new Memory<T>(cached, 0, totalSize);
-            return Tensor<T>.FromPooledMemory(memory, shape, cached);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
         }
 
-        if (totalSize >= ArrayPoolThreshold)
+        if (UsesArrayPool<T>(totalSize))
         {
-            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            // See matching #311 comment on the cached path above.
-            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                Array.Clear(pooled, 0, pooled.Length);
-            else if (pooled.Length > totalSize)
-                Array.Clear(pooled, totalSize, pooled.Length - totalSize);
-            var memory = new Memory<T>(pooled, 0, totalSize);
-            return Tensor<T>.FromPooledMemory(memory, shape, pooled);
+            T[] pooled = RentExactArray<T>(totalSize, zeroed: false);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(pooled), shape, pooled);
         }
 
         // Small allocation (below the ArrayPool threshold — the common case for
@@ -574,24 +574,6 @@ public static class TensorAllocator
 #endif
     }
 
-    /// <summary>
-    /// Computes the ArrayPool bucket size for a given request.
-    /// ArrayPool returns power-of-2 sizes, so we need to match on return.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int ArrayPoolBucketSize(int requestedSize)
-    {
-        // ArrayPool.Shared uses power-of-2 buckets starting at 16
-        if (requestedSize <= 16) return 16;
-        // Round up to next power of 2
-        int v = requestedSize - 1;
-        v |= v >> 1;
-        v |= v >> 2;
-        v |= v >> 4;
-        v |= v >> 8;
-        v |= v >> 16;
-        return v + 1;
-    }
 
     /// <summary>
     /// Creates a tensor backed by NativeMemory (64-byte aligned, zero GC overhead).
@@ -729,14 +711,11 @@ public static class TensorAllocator
 
 #if NET5_0_OR_GREATER
         ReadOnlySpan<T> src = data.AsSpan();
-        if (totalSize >= ArrayPoolThreshold)
+        if (UsesArrayPool<T>(totalSize))
         {
-            T[] pooled = ArrayPool<T>.Shared.Rent(totalSize);
-            src.CopyTo(pooled.AsSpan(0, totalSize));
-            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>() && pooled.Length > totalSize)
-                Array.Clear(pooled, totalSize, pooled.Length - totalSize);
-            var memory = new Memory<T>(pooled, 0, totalSize);
-            return Tensor<T>.FromPooledMemory(memory, shape, pooled);
+            T[] pooled = RentExactArray<T>(totalSize, zeroed: false);
+            src.CopyTo(pooled);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(pooled), shape, pooled);
         }
 
         T[] array = GC.AllocateUninitializedArray<T>(totalSize);
@@ -765,14 +744,12 @@ public static class TensorAllocator
         {
             tensor.DetachPooledArray();
 #if NET5_0_OR_GREATER
-            // Tier 1: Try thread-local cache first — zero contention, instant reuse.
-            if (ThreadLocalTensorCache<T>.TryReturn(pooledArray))
-                return;
-
-            // Tier 2: Cache full — fall through to ArrayPool.
-            ArrayPool<T>.Shared.Return(pooledArray,
-                clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+            // Exact-size arrays go back to this thread's cache for the next rent of that size. When the
+            // cache declines (bucket full or over its byte budget) the array is left to the GC: exact
+            // sizes are not ArrayPool bucket sizes, so ArrayPool.Return would reject them.
+            ThreadLocalTensorCache<T>.TryReturn(pooledArray);
 #else
+            PooledArrayRecycling.Notify(pooledArray);
             ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
 #endif
         }

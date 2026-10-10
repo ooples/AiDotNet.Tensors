@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Helpers;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -18,7 +19,7 @@ internal static class NhwcConv
     /// <summary>
     /// Converts NCHW [batch, channels, height, width] to NHWC [batch, height, width, channels].
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static void NchwToNhwc(ReadOnlySpan<float> nchw, Span<float> nhwc,
         int batch, int channels, int height, int width)
     {
@@ -42,7 +43,7 @@ internal static class NhwcConv
     /// <summary>
     /// Converts NHWC [batch, height, width, channels] to NCHW [batch, channels, height, width].
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static void NhwcToNchw(ReadOnlySpan<float> nhwc, Span<float> nchw,
         int batch, int channels, int height, int width)
     {
@@ -69,6 +70,7 @@ internal static class NhwcConv
     /// </summary>
     /// <param name="workspace">Pre-allocated workspace of size [outH*outW, inChannels*kernelH*kernelW].
     /// Pass null to allocate internally (adds GC pressure on hot paths).</param>
+    [MethodImpl(Hot)]
     internal static void Conv2DNhwc(
         float[] inputNhwc, float[] kernelFlat, float[] outputNhwc,
         int batch, int inChannels, int height, int width,
@@ -120,6 +122,7 @@ internal static class NhwcConv
     /// im2col for NHWC layout — channels contiguous per patch position.
     /// Output: [outH * outW, kernelH * kernelW * inChannels]
     /// </summary>
+    [MethodImpl(Hot)]
     private static void Im2ColNhwc(
         float[] input, int inputOffset, float[] output,
         int channels, int height, int width,

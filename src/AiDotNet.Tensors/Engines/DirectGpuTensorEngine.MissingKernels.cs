@@ -623,7 +623,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousFaces))
             {
                 var faceData = contiguousFaces.GetDataArray();
-                for (int i = 0; i < faceData.Length; i++)
+                for (int i = 0; i < contiguousFaces.Length; i++)
                     if (faceData[i] < 0 || faceData[i] >= numVertices)
                         throw new ArgumentOutOfRangeException(nameof(faces),
                             $"Face vertex {faceData[i]} at position {i} is out of bounds for {numVertices} vertices.");
@@ -2230,7 +2230,7 @@ public partial class DirectGpuTensorEngine
         if (!HasResidentIndexStorage(contiguousIndices))
         {
             var indexData = contiguousIndices.GetDataArray();
-            for (int i = 0; i < indexData.Length; i++)
+            for (int i = 0; i < contiguousIndices.Length; i++)
                 if ((uint)indexData[i] >= (uint)destinationAxis)
                     throw new ArgumentOutOfRangeException(nameof(indices),
                         $"indices[{i}]={indexData[i]} is out of range for axis length {destinationAxis}.");
@@ -3686,7 +3686,7 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("NanMedian requires a non-empty tensor");
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || !ShouldReduceOnDevice(input) || !TryGetBackend(out var backend))
             return base.TensorNanMedian(input);
         try
         {
@@ -4315,7 +4315,7 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("Median requires a non-empty tensor");
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || !ShouldReduceOnDevice(input) || !TryGetBackend(out var backend))
             return base.TensorMedian(input);
         try
         {
@@ -7077,6 +7077,25 @@ public partial class DirectGpuTensorEngine
                 input, h0, c0, wIh, wHh, bIh, bHh,
                 wantState, out finalHidden, out finalCell, returnSequences);
 
+        // Training from a zero initial state: the device forward + BPTT pair (TryLstmSequenceTrain), whose backward
+        // stays on the device. The recording path further down downloads the gates and computes every gradient on
+        // the host, so a GPU training step left the device at each LSTM. Biases fold into the one [4H] bias that op
+        // takes, through a recorded add, so each still receives its gradient.
+        if (!wantState && h0 is null && c0 is null && DifferentiableOps.IsRecording<T>())
+        {
+            var bias = bIh is not null && bHh is not null ? TensorAdd(bIh, bHh)
+                : bIh ?? bHh ?? new Tensor<T>(new[] { gateRows });
+            if (TryLstmSequenceTrain(input, wIh, wHh, bias) is { } sequence)
+            {
+                finalHidden = null;
+                finalCell = null;
+                // The last step through a device slice (contiguous): a narrowed view of the time axis is strided, and
+                // reshaping it materialized the view on the host.
+                return returnSequences ? sequence
+                    : Reshape(TensorSlice(sequence, new[] { 0, S - 1, 0 }, new[] { B, 1, Hd }), new[] { B, Hd });
+            }
+        }
+
         // Engine weights/bias/gates (PyTorch i,f,g,o; [4*hidden, *]) match the kernel exactly. The kernel
         // ALSO reads input and writes output in [batch, seq, *] order (inputOffset/output use
         // (b*timeSteps+t)), which is the engine's native layout — so NO sequence transpose is needed. The
@@ -7664,7 +7683,7 @@ public partial class DirectGpuTensorEngine
     public override T TensorTrace<T>(Tensor<T> tensor)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (typeof(T) != typeof(float) || tensor.Rank != 2 || !TryGetBatchBackend(out var backend))
+        if (typeof(T) != typeof(float) || tensor.Rank != 2 || !ShouldReduceOnDevice(tensor) || !TryGetBatchBackend(out var backend))
             return base.TensorTrace(tensor);
 
         // trace = sum of the diagonal. Extract the diagonal with the GPU kernel, then GPU reduce-sum;
@@ -7906,7 +7925,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new ArgumentException(
                             $"Index {indexData[i]} is out of bounds for axis size {axisSize}");
@@ -7958,7 +7977,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new ArgumentException(
                             $"Index {indexData[i]} is out of bounds for axis size {axisSize}");
@@ -8010,7 +8029,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= columns)
                         throw new IndexOutOfRangeException(
                             $"Index {indexData[i]} is out of bounds for axis size {columns}");
@@ -8071,7 +8090,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 int[] indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= sourceAxis)
                         throw new IndexOutOfRangeException(
                             $"indices[{i}]={indexData[i]} out of range for axis size {sourceAxis}");
@@ -8132,7 +8151,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 int[] indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= destinationAxis)
                         throw new IndexOutOfRangeException(
                             $"indices[{i}]={indexData[i]} out of range for axis size {destinationAxis}");
@@ -8303,8 +8322,8 @@ public partial class DirectGpuTensorEngine
                 if (!resident)
                 {
                     byte[] values = contiguousIndices.GetDataArray();
-                    var nativeValues = new int[values.Length];
-                    for (int i = 0; i < values.Length; i++)
+                    var nativeValues = new int[contiguousIndices.Length];
+                    for (int i = 0; i < contiguousIndices.Length; i++)
                     {
                         nativeValues[i] = values[i];
                         if (nativeValues[i] >= vocabSize)

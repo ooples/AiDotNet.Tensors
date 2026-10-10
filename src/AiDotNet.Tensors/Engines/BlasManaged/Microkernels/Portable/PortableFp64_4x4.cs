@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -64,6 +65,7 @@ internal static class PortableFp64_4x4
     /// <param name="c">Output buffer; the kernel reads and writes the C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C, at least <see cref="Nr"/>.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static unsafe void Run(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> packedB,
@@ -117,6 +119,7 @@ internal static class PortableFp64_4x4
     /// <param name="c">Output buffer; reads and writes the C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static unsafe void RunStridedB(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> b,

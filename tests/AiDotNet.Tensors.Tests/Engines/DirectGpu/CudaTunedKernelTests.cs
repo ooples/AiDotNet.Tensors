@@ -36,9 +36,11 @@ public sealed class CudaTunedKernelTests
         return a;
     }
 
-    private static void AssertClose(float[] expected, float[] actual, int count, string what)
+    // termScale: the magnitude of the terms an output is a difference of. An output that cancels to (near) zero, such as
+    // LayerNorm's dx on a one-column row, is only accurate relative to those terms, not to its own value.
+    private static void AssertClose(float[] expected, float[] actual, int count, string what, double termScale = 1e-30)
     {
-        double scale = 1e-30;
+        double scale = termScale;
         for (int i = 0; i < count; i++) scale = Math.Max(scale, Math.Abs(expected[i]));
         for (int i = 0; i < count; i++)
         {
@@ -148,6 +150,7 @@ public sealed class CudaTunedKernelTests
             var dBeta = new float[n];
             var dGammaD = new double[n];
             var dBetaD = new double[n];
+            double dxTermScale = 1e-30; // max over rows of invStd * |dy * gamma|: dx is a difference of such terms
             for (int r = 0; r < rows; r++)
             {
                 double m = 0, v = 0;
@@ -163,6 +166,7 @@ public sealed class CudaTunedKernelTests
                     double xhat = (x[r * n + i] - m) * iv;
                     y[r * n + i] = (float)(gamma[i] * xhat + beta[i]);
                     double g = (double)dy[r * n + i] * gamma[i];
+                    dxTermScale = Math.Max(dxTermScale, Math.Abs(g) * iv);
                     sumDy += g;
                     sumDyXmu += g * (x[r * n + i] - m);
                     dGammaD[i] += dy[r * n + i] * xhat;
@@ -207,7 +211,7 @@ public sealed class CudaTunedKernelTests
             {
                 c.Execute(bwd);
                 backend.Synchronize();
-                AssertClose(dx, backend.DownloadBuffer(dxb), dx.Length, $"{c.Id} dx {rows}x{n}");
+                AssertClose(dx, backend.DownloadBuffer(dxb), dx.Length, $"{c.Id} dx {rows}x{n}", dxTermScale);
             }
             var par = new CudaNormBackwardArgs(dyb, xb, null, mcpu, icpu, dgb, dbb, rows, n);
             foreach (var c in Applicable(backend.LayerNormGradParametersSlot, shape))
@@ -258,7 +262,9 @@ public sealed class CudaTunedKernelTests
         foreach (string id in backend.SoftmaxSlot.CandidateIds.Skip(1))
             Assert.StartsWith("generated.softmax.lanes", id);
         Assert.Equal(1 + CudaTunedRowKernels.RowLanes.Length, backend.SoftmaxSlot.CandidateIds.Count);
-        Assert.Equal(1 + CudaTunedRowKernels.ColumnRowLanes.Length, backend.LayerNormGradParametersSlot.CandidateIds.Count);
+        // Reference, one generated variant per column-row lane count, and the direct-PTX D64 kernel.
+        Assert.Equal(1 + CudaTunedRowKernels.ColumnRowLanes.Length + 1, backend.LayerNormGradParametersSlot.CandidateIds.Count);
+        Assert.Equal("directptx.layernorm_grad_params.d64", backend.LayerNormGradParametersSlot.CandidateIds[backend.LayerNormGradParametersSlot.CandidateIds.Count - 1]);
 
         const int rows = 2048, n = 64;
         float[] x = Values(rows * n, 3, 4f);

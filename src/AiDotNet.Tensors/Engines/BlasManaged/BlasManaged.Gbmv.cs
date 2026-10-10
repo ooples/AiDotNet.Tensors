@@ -2,6 +2,8 @@ using System;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -100,6 +102,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static void GbmvFloat(
         bool transA, int m, int n, int kl, int ku, float alpha,
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> x, int incx, float beta,
@@ -127,6 +130,7 @@ public static partial class BlasManaged
             }
     }
 
+    [MethodImpl(Hot)]
     private static void GbmvDouble(
         bool transA, int m, int n, int kl, int ku, double alpha,
         ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> x, int incx, double beta,

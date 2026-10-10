@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 // Copyright (c) AiDotNet. All rights reserved.
 
 #if NET5_0_OR_GREATER
@@ -32,6 +34,7 @@ public static class HalfKernels
     /// accumulator is float. Non-transposed, row-major; row strides are caller-supplied so an
     /// ldc-padded / offset slice works.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Matmul(
         ReadOnlySpan<Half> a, int aRowStride,
         ReadOnlySpan<Half> b, int bRowStride,

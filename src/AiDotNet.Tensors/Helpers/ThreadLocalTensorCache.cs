@@ -130,6 +130,22 @@ internal static class ThreadLocalTensorCache<T>
     }
 
     /// <summary>
+    /// An array of exactly <paramref name="size"/> elements: one this thread returned earlier, or a new
+    /// one (uninitialized for value types, so callers that need zeros must clear it).
+    /// </summary>
+    /// <remarks>
+    /// The allocators use this instead of <see cref="System.Buffers.ArrayPool{T}.Shared"/>, whose
+    /// power-of-two buckets handed out arrays longer than the tensor, vector or matrix they backed.
+    /// Arrays from here are not ArrayPool bucket sizes and must never be passed to ArrayPool.Return.
+    /// </remarks>
+#if NET5_0_OR_GREATER
+    internal static T[] RentOrAllocateExact(int size)
+        => TryRent(size) ?? (RuntimeHelpers.IsReferenceOrContainsReferences<T>()
+            ? new T[size]
+            : GC.AllocateUninitializedArray<T>(size));
+#endif
+
+    /// <summary>
     /// Returns a buffer to the thread-local cache for reuse.
     /// If the bucket for this size is full, or caching the buffer would exceed
     /// <see cref="MaxRetainedBytes"/> even after trimming, the buffer is not cached (let GC collect
@@ -139,6 +155,8 @@ internal static class ThreadLocalTensorCache<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryReturn(T[] array)
     {
+        // The array's owner is gone and the next rent hands it to another tensor: drop device copies keyed by it.
+        PooledArrayRecycling.Notify(array);
         _cache ??= new Dictionary<int, Bucket>();
 
         int size = array.Length;

@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -112,6 +114,7 @@ public partial class CpuEngine
     private static double SigD(double x) => 1.0 / (1.0 + Math.Exp(-x));
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void RgLruForwardDouble(
         double[] V, double[] R, double[] I, double[] decay, double[] outp,
         int batch, int seqLen, int recDim)
@@ -125,7 +128,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bb = b;
-            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, (cStart, cCount) =>
+            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, [MethodImpl(Hot)] (cStart, cCount) =>
             {
                 int cEnd = cStart + cCount;
                 for (int c = cStart; c < cEnd; c++)
@@ -152,6 +155,7 @@ public partial class CpuEngine
     /// </summary>
     private const int RgLruChannelGrain = 8;
 
+    [MethodImpl(Hot)]
     private static void RgLruBackwardDouble(
         double[] dOut, double[] V, double[] R, double[] I, double[] decay,
         double[] dV, double[] dR, double[] dI, double[] dDecay,
@@ -167,7 +171,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bb = b;
-            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, (cStart, cCount) =>
+            CpuParallelSettings.ParallelForChunks(recDim, RgLruChannelGrain, [MethodImpl(Hot)] (cStart, cCount) =>
             {
                 var hTrajC = new double[seqLen]; // this channel's post-update state over time
                 int cEnd = cStart + cCount;

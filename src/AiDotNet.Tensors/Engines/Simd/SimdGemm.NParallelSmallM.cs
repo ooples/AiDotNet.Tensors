@@ -14,6 +14,7 @@ using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Helpers;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -28,6 +29,7 @@ internal static partial class SimdGemm
     /// (lda=k, ldb=n, ldc=n). Partitions N across cores. When <paramref name="clearedOutput"/> is
     /// true the output is overwritten; otherwise it is accumulated into (SgemmAdd semantics).
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SgemmNParallelSmallM(
         ReadOnlySpan<float> a, int lda,
         ReadOnlySpan<float> b, int ldb,
@@ -46,7 +48,7 @@ internal static partial class SimdGemm
             int kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb, mCap = m;
             bool cleared = clearedOutput;
 
-            PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+            PersistentParallelExecutor.Instance.Execute(numChunks, [MethodImpl(Hot)] (chunk) =>
             {
                 int j0 = chunk * colsPerChunk;
                 if (j0 >= nCap) return;

@@ -13,7 +13,9 @@ public sealed class LerpKernelSourceTests
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.FusedKernels", "GetSource", "fma(t, b[idx] - a[idx], a[idx])")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalKernels", "ElementWiseKernels", "fma(t, B[gid] - A[gid], A[gid])")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels", "BinaryElementwise", "fma(v0, y - x, x)")]
+#if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuKernels", "LerpFusedSource", "fma(lp_params.t, lp_b[idx] - lp_a[idx], lp_a[idx])")]
+#endif
     public void EveryBackendUsesExplicitFusedMultiplyAdd(
         string typeName, string memberName, string expectedExpression)
     {
@@ -28,7 +30,9 @@ public sealed class LerpKernelSourceTests
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.FusedKernels", "GetSource", "fma(scaleA, a[idx], scaleB * b[idx])")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalKernels", "ElementWiseKernels", "fma(scaleA, A[gid], scaleB * B[gid])")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels", "BinaryElementwise", "fma(v0, x, v1 * y)")]
+#if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuKernels", "AddScaledSource", "fma(as_params.scaleA, as_a[idx], as_params.scaleB * as_b[idx])")]
+#endif
     public void EveryBackendUsesExplicitFusedMultiplyAddForAddScaled(
         string typeName, string memberName, string expectedExpression)
     {

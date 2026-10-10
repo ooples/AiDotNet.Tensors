@@ -46,7 +46,7 @@ internal static class QrDecomposition
 
         for (int b = 0; b < batch; b++)
         {
-            ComputeSingle(inData, b * inStride, qData, qData.Length == 0 ? 0 : b * qStride,
+            ComputeSingle(inData, b * inStride, qData, Q.Length == 0 ? 0 : b * qStride,
                 rData, b * rStride, m, n, qCols, mode != "r");
         }
 

@@ -1505,6 +1505,34 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// <c>output[i] = input[i] * scale + bias</c> (one fused multiply-add per element). Used by the
+        /// normalization layers after the per-group / per-row statistics are folded into one scale and bias.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static unsafe void AffineUnsafe(float* input, float* output, int length, float scale, float bias)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Fma.IsSupported && length >= 8)
+            {
+                var vs = Vector256.Create(scale);
+                var vb = Vector256.Create(bias);
+                for (; i + 32 <= length; i += 32)
+                {
+                    Avx.Store(output + i, Fma.MultiplyAdd(Avx.LoadVector256(input + i), vs, vb));
+                    Avx.Store(output + i + 8, Fma.MultiplyAdd(Avx.LoadVector256(input + i + 8), vs, vb));
+                    Avx.Store(output + i + 16, Fma.MultiplyAdd(Avx.LoadVector256(input + i + 16), vs, vb));
+                    Avx.Store(output + i + 24, Fma.MultiplyAdd(Avx.LoadVector256(input + i + 24), vs, vb));
+                }
+                for (; i + 8 <= length; i += 8)
+                    Avx.Store(output + i, Fma.MultiplyAdd(Avx.LoadVector256(input + i), vs, vb));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] * scale + bias;
+        }
+
+        /// <summary>
         /// Pointer-based Tanh with zero bounds-checking.
         /// </summary>
         [MethodImpl(HotInline)]
@@ -1514,34 +1542,18 @@ namespace AiDotNet.Tensors.Engines.Simd
             // MKL VML path: SVML tanh, zero-overhead function pointer
             if (VmlProvider.TryTanh(input, output, length))
                 return;
-#endif
 
             // The former 2*FastSigmoid256(2*x)-1 path cancelled near zero and exceeded the
-            // public parity contract by hundreds of ULP. AccurateTanh256 avoids that cancellation
-            // (Cephes tanhf: an odd polynomial below |x| = 0.625, 1 - 2/(e^2|x| + 1) above it, with
-            // a minimax exp), so the portable path no longer falls back to a scalar MathF.Tanh loop,
-            // which ran 10-16x slower than the other activations when MKL VML is absent.
-            int i = 0;
-#if NET5_0_OR_GREATER
-            if (Avx2.IsSupported && Fma.IsSupported)
+            // public parity contract by hundreds of ULP. AccurateTanh is a Cephes-style vector
+            // tanh verified exhaustively over every finite float (AccurateTanhTests).
+            if (AccurateTanh.IsSupported)
             {
-                int simdLength = length & ~7;
-                for (; i < simdLength; i += 8)
-                    Avx.Store(output + i, AccurateTanh256(Avx.LoadVector256(input + i)));
-                // The last 1-7 elements go through the same kernel via a padded block, so an element's
-                // result never depends on its position in the buffer.
-                if (i < length)
-                {
-                    float* block = stackalloc float[8];
-                    int rem = length - i;
-                    for (int j = 0; j < 8; j++) block[j] = j < rem ? input[i + j] : 0f;
-                    Avx.Store(block, AccurateTanh256(Avx.LoadVector256(block)));
-                    for (int j = 0; j < rem; j++) output[i + j] = block[j];
-                    i = length;
-                }
+                AccurateTanh.Tanh(input, output, length);
+                return;
             }
 #endif
-            for (; i < length; i++)
+
+            for (int i = 0; i < length; i++)
             {
                 output[i] = MathF.Tanh(input[i]);
             }
@@ -3271,8 +3283,8 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             // Extract exponent and mantissa via integer bit manipulation
             var xi = x.AsInt64();
-            // Exponent: shift right 52, subtract bias 1023
-            var eLong = Avx2.Subtract(Avx2.ShiftRightLogical(xi, 52), Vector256.Create(1023L));
+            // Biased exponent field (0..2047); the 1023 bias is removed after conversion to double below.
+            var eLong = Avx2.ShiftRightLogical(xi, 52);
             // Mantissa: clear exponent bits, set exponent to bias (1023 << 52)
             var mantissaBits = Avx2.Or(
                 Avx2.And(xi, Vector256.Create(0x000FFFFFFFFFFFFFL)),
@@ -3290,11 +3302,12 @@ namespace AiDotNet.Tensors.Engines.Simd
             var eMask = Avx2.And(gtSqrt2.AsInt64(), Vector256.Create(1L));
             eLong = Avx2.Add(eLong, eMask);
 
-            // Convert int64 exponent to double via int32 (safe — exponents fit in int32)
-            var eLow = Vector128.Create(
-                (int)eLong.GetElement(0), (int)eLong.GetElement(1),
-                (int)eLong.GetElement(2), (int)eLong.GetElement(3));
-            var e = Avx.ConvertToVector256Double(eLow);
+            // int64 -> double without leaving the vector unit: the biased exponent (0..2048) placed in the
+            // mantissa of 2^52 is exactly 2^52 + eBiased, so subtracting 2^52 + 1023 yields the unbiased
+            // exponent. The previous four scalar GetElement extracts per vector dominated this kernel.
+            var e = Avx.Subtract(
+                Avx2.Or(eLong, Vector256.Create(0x4330000000000000L)).AsDouble(),
+                Vector256.Create(4503599627370496.0 + 1023.0));
 
             // f = m - 1.0
             var one = Vector256.Create(1.0);
@@ -5453,14 +5466,31 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             if (Avx.IsSupported && length >= 16)
             {
-                var vs = Vector256.Create(scalar);
-                int simdLength = length & ~15;
-                for (; i < simdLength; i += 16)
+                // Stores aligned to 32 bytes. .NET aligns array data to 8 bytes only, so whether an unaligned
+                // 32-byte store splits a cache line depended on where the GC placed the destination: 1000 doubles
+                // took 74 ns or 128 ns depending on the process (TensorPrimitives, which aligns, a steady 64 ns).
+                // Leading elements are done scalar until the destination is aligned.
+                unsafe
                 {
-                    WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), vs));
-                    WriteVector256Double(result, i + 4, Avx.Multiply(ReadVector256Double(a, i + 4), vs));
-                    WriteVector256Double(result, i + 8, Avx.Multiply(ReadVector256Double(a, i + 8), vs));
-                    WriteVector256Double(result, i + 12, Avx.Multiply(ReadVector256Double(a, i + 12), vs));
+                    fixed (double* pa = a, pr = result)
+                    {
+                        int head = (int)(((32 - ((long)pr & 31)) & 31) / sizeof(double));
+                        if (((long)pr & 7) != 0) head = 0; // not even element-aligned: alignment cannot be reached
+                        for (; i < head; i++) pr[i] = pa[i] * scalar;
+                        var vs = Vector256.Create(scalar);
+                        int simdEnd = i + ((length - i) & ~15);
+                        for (; i < simdEnd; i += 16)
+                        {
+                            var v0 = Avx.Multiply(Avx.LoadVector256(pa + i), vs);
+                            var v1 = Avx.Multiply(Avx.LoadVector256(pa + i + 4), vs);
+                            var v2 = Avx.Multiply(Avx.LoadVector256(pa + i + 8), vs);
+                            var v3 = Avx.Multiply(Avx.LoadVector256(pa + i + 12), vs);
+                            Avx.Store(pr + i, v0);
+                            Avx.Store(pr + i + 4, v1);
+                            Avx.Store(pr + i + 8, v2);
+                            Avx.Store(pr + i + 12, v3);
+                        }
+                    }
                 }
             }
             if (Avx.IsSupported && length - i >= 4)
@@ -6098,12 +6128,37 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 #if NET5_0_OR_GREATER
-            double max = double.NegativeInfinity;
-            for (int i = 0; i < data.Length; i++)
+            // 4 independent AVX accumulators (the scalar loop this replaced ran ~5x slower than Sum).
+            // acc = Max(v, acc): x86 MAXPD returns its SECOND operand when either is NaN, so a NaN
+            // element leaves the accumulator unchanged, the same NaN-skipping result as the scalar
+            // `x > acc` comparison below.
+            double result = double.NegativeInfinity;
+            int i = 0;
+            if (Avx.IsSupported && data.Length >= 16)
             {
-                if (data[i] > max) max = data[i];
+                ref double r0 = ref MemoryMarshal.GetReference(data);
+                var acc0 = Vector256.Create(double.NegativeInfinity);
+                var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                int simdLength = data.Length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    acc0 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)i), acc0);
+                    acc1 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 4)), acc1);
+                    acc2 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 8)), acc2);
+                    acc3 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 12)), acc3);
+                }
+                var acc = Avx.Max(Avx.Max(acc0, acc1), Avx.Max(acc2, acc3));
+                for (int l = 0; l < 4; l++)
+                {
+                    double v = acc.GetElement(l);
+                    if (v > result) result = v;
+                }
             }
-            return max;
+            for (; i < data.Length; i++)
+            {
+                if (data[i] > result) result = data[i];
+            }
+            return result;
 #else
             return SystemNumericsVectorBridge.Max(data);
 #endif
@@ -6115,12 +6170,37 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 #if NET5_0_OR_GREATER
-            double min = double.PositiveInfinity;
-            for (int i = 0; i < data.Length; i++)
+            // 4 independent AVX accumulators (the scalar loop this replaced ran ~5x slower than Sum).
+            // acc = Min(v, acc): x86 MINPD returns its SECOND operand when either is NaN, so a NaN
+            // element leaves the accumulator unchanged, the same NaN-skipping result as the scalar
+            // `x < acc` comparison below.
+            double result = double.PositiveInfinity;
+            int i = 0;
+            if (Avx.IsSupported && data.Length >= 16)
             {
-                if (data[i] < min) min = data[i];
+                ref double r0 = ref MemoryMarshal.GetReference(data);
+                var acc0 = Vector256.Create(double.PositiveInfinity);
+                var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                int simdLength = data.Length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    acc0 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)i), acc0);
+                    acc1 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 4)), acc1);
+                    acc2 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 8)), acc2);
+                    acc3 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 12)), acc3);
+                }
+                var acc = Avx.Min(Avx.Min(acc0, acc1), Avx.Min(acc2, acc3));
+                for (int l = 0; l < 4; l++)
+                {
+                    double v = acc.GetElement(l);
+                    if (v < result) result = v;
+                }
             }
-            return min;
+            for (; i < data.Length; i++)
+            {
+                if (data[i] < result) result = data[i];
+            }
+            return result;
 #else
             return SystemNumericsVectorBridge.Min(data);
 #endif
@@ -6676,6 +6756,7 @@ namespace AiDotNet.Tensors.Engines.Simd
     /// <summary>
     /// Converts float span to Half span. Uses unrolled loop for better throughput.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void ConvertToHalf(ReadOnlySpan<float> source, Span<Half> destination)
     {
         int i = 0;
@@ -6754,6 +6835,7 @@ namespace AiDotNet.Tensors.Engines.Simd
     /// (normal, subnormal, ±zero, ±Inf, and NaN payloads — note <c>(float)Half</c> quiets NaNs by forcing
     /// the float quiet bit, which this path reproduces).
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void HalfToSingleRange(Half* src, float* dst, int start, int end)
     {
         int j = start;
@@ -6843,6 +6925,7 @@ namespace AiDotNet.Tensors.Engines.Simd
     /// <summary>
     /// Converts double span to float span using AVX narrowing conversion.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void ConvertDoubleToFloat(ReadOnlySpan<double> source, Span<float> destination)
     {
         int i = 0;
@@ -6878,6 +6961,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Each row of length <paramref name="axisSize"/> is processed independently.
         /// Uses unsafe pointers for maximum throughput.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void Softmax(ReadOnlySpan<float> input, Span<float> output, int outerSize, int axisSize)
         {
             int totalElements = outerSize * axisSize;
@@ -6975,6 +7059,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// VML-accelerated softmax row: SIMD max → subtract → VML exp (SVML) → SIMD sum → SIMD divide.
         /// Returns false if VML exp fails (caller falls through to polynomial path).
         /// </summary>
+        [MethodImpl(Hot)]
         private static unsafe bool SoftmaxRowVml(float* input, float* output, int length)
         {
             // Pass 1: Find max (SIMD 4x unrolled)
@@ -7054,6 +7139,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// VML-accelerated log-softmax: max → subtract → VML exp → sum → log(sum) → subtract.
         /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
         /// </summary>
+        [MethodImpl(Hot)]
         private static unsafe bool LogSoftmaxRowVml(float* input, float* output, int length)
         {
             // Pass 1: Find max
@@ -7139,6 +7225,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 #endif
 
+        [MethodImpl(Hot)]
         private static unsafe void SoftmaxRowSmall(float* input, float* output, int length)
         {
 #if NET5_0_OR_GREATER
@@ -7537,6 +7624,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// SIMD-accelerated ReLU backward: result[i] = input[i] > 0 ? grad[i] : 0
         /// Uses AVX2 compare + bitwise AND for zero-branch vectorization.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void ReluBackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             int i = 0;
@@ -7636,6 +7724,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Writes directly into the grad buffer, eliminating one memory stream and one allocation.
         /// Only 2 arrays touched (grad read+write, input read) vs 3 for the allocating path.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void ReluBackwardInPlaceUnsafe(float* grad, float* input, int length)
         {
             int i = 0;
@@ -7695,6 +7784,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// This is equivalent to MeanBackward + ReLU backward but reads only 1 array instead of 2,
         /// halving memory bandwidth and eliminating a 4MB allocation for 1M-element tensors.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void ReluBackwardScalarUnsafe(float scale, float* input, float* output, int length)
         {
             int i = 0;
@@ -7756,6 +7846,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// d/dx[GELU(x)] = 0.5*(1 + tanh(k)) + 0.5*x*(1 - tanh(k)^2)*k'
         /// where k = sqrt(2/pi)*(x + 0.044715*x^3)
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void GeluBackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             const float sqrtTwoPi = 0.7978845608028654f;
@@ -7844,6 +7935,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// SIMD-accelerated Sigmoid backward: result[i] = grad[i] * sigmoid_out[i] * (1 - sigmoid_out[i])
         /// Uses the output of sigmoid forward (savedState), NOT the input, avoiding recomputation.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SigmoidBackwardUnsafe(float* grad, float* sigmoidOutput, float* output, int length)
         {
             int i = 0;
@@ -7873,6 +7965,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// SIMD-accelerated Tanh backward: result[i] = grad[i] * (1 - tanh_out[i]^2)
         /// Uses the output of tanh forward.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void TanhBackwardUnsafe(float* grad, float* tanhOutput, float* output, int length)
         {
             int i = 0;
@@ -7902,6 +7995,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// SIMD-accelerated Swish/SiLU backward: result[i] = grad[i] * (s + x * s * (1 - s))
         /// where s = sigmoid(x). Uses input x to compute sigmoid.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SwishBackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             int i = 0;
@@ -7939,6 +8033,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated LeakyReLU backward: result[i] = input[i] >= 0 ? grad[i] : alpha * grad[i]
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void LeakyReluBackwardUnsafe(float* grad, float* input, float* output, int length, float alpha)
         {
             int i = 0;
@@ -7966,6 +8061,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated ELU backward: result[i] = input[i] >= 0 ? grad[i] : grad[i] * (output[i] + alpha)
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void EluBackwardUnsafe(float* grad, float* input, float* eluOutput, float* output, int length, float alpha)
         {
             int i = 0;
@@ -8025,6 +8121,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// SIMD-accelerated Mish backward: d/dx[x*tanh(softplus(x))]
         /// derivative = tanh(sp) + x * sech^2(sp) * sigmoid(x)
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void MishBackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             int i = 0;
@@ -8069,6 +8166,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated Softplus backward: result[i] = grad[i] * sigmoid(beta * input[i])
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SoftplusBackwardUnsafe(float* grad, float* input, float* output, int length, float beta)
         {
             int i = 0;
@@ -8101,6 +8199,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated SELU backward.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SeluBackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             const float lambda = 1.0507009873554805f;
@@ -8196,6 +8295,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated ReLU backward for double: result[i] = input[i] > 0 ? grad[i] : 0
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void ReluBackwardDouble(double* grad, double* input, double* output, int length)
         {
             int i = 0;
@@ -8218,6 +8318,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated Sigmoid backward for double: result[i] = grad[i] * s[i] * (1 - s[i])
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SigmoidBackwardDouble(double* grad, double* sigmoidOutput, double* output, int length)
         {
             int i = 0;
@@ -8245,6 +8346,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated Tanh backward for double: result[i] = grad[i] * (1 - t[i]^2)
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void TanhBackwardDouble(double* grad, double* tanhOutput, double* output, int length)
         {
             int i = 0;
@@ -8272,6 +8374,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated LeakyReLU backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void LeakyReluBackwardDouble(double* grad, double* input, double* output, int length, double alpha)
         {
             int i = 0;
@@ -8299,6 +8402,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// SIMD-accelerated HardSwish backward for float.
         /// d/dx[x*(x+3)/6] = (2x+3)/6 for -3 &lt; x &lt; 3, 0 for x &lt;= -3, 1 for x >= 3
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void HardSwishBackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             int i = 0;
@@ -8340,6 +8444,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// SIMD-accelerated HardSigmoid backward for float.
         /// d/dx[clip((x+3)/6, 0, 1)] = 1/6 for -3 &lt; x &lt; 3, else 0
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void HardSigmoidBackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             int i = 0;
@@ -8373,6 +8478,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated ReLU6 backward for float.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void Relu6BackwardUnsafe(float* grad, float* input, float* output, int length)
         {
             int i = 0;
@@ -8407,6 +8513,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated GELU backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void GeluBackwardDouble(double* grad, double* input, double* output, int length)
         {
             int i = 0;
@@ -8494,6 +8601,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated Swish backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SwishBackwardDouble(double* grad, double* input, double* output, int length)
         {
             for (int i = 0; i < length; i++)
@@ -8507,6 +8615,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated ELU backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void EluBackwardDouble(double* grad, double* input, double* eluOutput, double* output, int length, double alpha)
         {
             for (int i = 0; i < length; i++)
@@ -8516,6 +8625,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated Mish backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void MishBackwardDouble(double* grad, double* input, double* output, int length)
         {
             for (int i = 0; i < length; i++)
@@ -8531,6 +8641,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated Softplus backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SoftplusBackwardDouble(double* grad, double* input, double* output, int length, double beta)
         {
             for (int i = 0; i < length; i++)
@@ -8540,6 +8651,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated SELU backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SeluBackwardDouble(double* grad, double* input, double* output, int length)
         {
             const double lambda = 1.0507009873554805;
@@ -8551,6 +8663,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// SIMD-accelerated HardSwish backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void HardSwishBackwardDouble(double* grad, double* input, double* output, int length)
         {
             for (int i = 0; i < length; i++)
@@ -8562,6 +8675,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         // Missing double backward kernels
+        [MethodImpl(Hot)]
         public static unsafe void HardSigmoidBackwardDouble(double* grad, double* input, double* output, int length)
         {
             for (int i = 0; i < length; i++)
@@ -8571,6 +8685,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
         }
 
+        [MethodImpl(Hot)]
         public static unsafe void Relu6BackwardDouble(double* grad, double* input, double* output, int length)
         {
             for (int i = 0; i < length; i++)
@@ -8618,6 +8733,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// Softmax backward for float: grad_input[i] = softmax[i] * (grad[i] - dot(grad, softmax))
         /// Per-row operation where each row is processed independently.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SoftmaxBackwardUnsafe(float* grad, float* softmaxOutput, float* output, int batchSize, int features)
         {
             for (int b = 0; b < batchSize; b++)
@@ -8706,6 +8822,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// BatchNorm backward for float.
         /// Computes gradients for input, gamma (scale), and beta (shift).
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void BatchNormBackwardUnsafe(
             float* gradOutput, float* input, float* gamma,
             float* mean, float* variance, float epsilon,
@@ -8807,6 +8924,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// LayerNorm backward for float.
         /// Computes gradient for input given gradOutput, normalized input, gamma.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void LayerNormBackwardUnsafe(
             float* gradOutput, float* input, float* gamma,
             float* mean, float* variance, float epsilon,
@@ -8935,6 +9053,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Softmax backward for double.
         /// </summary>
+        [MethodImpl(Hot)]
         public static unsafe void SoftmaxBackwardDouble(double* grad, double* softmaxOutput, double* output, int batchSize, int features)
         {
             for (int b = 0; b < batchSize; b++)
@@ -8986,6 +9105,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>BatchNorm backward for double.</summary>
+        [MethodImpl(Hot)]
         public static unsafe void BatchNormBackwardDouble(
             double* gradOutput, double* input, double* gamma,
             double* mean, double* variance, double epsilon,
@@ -9076,6 +9196,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>LayerNorm backward for double.</summary>
+        [MethodImpl(Hot)]
         public static unsafe void LayerNormBackwardDouble(
             double* gradOutput, double* input, double* gamma,
             double* mean, double* variance, double epsilon,

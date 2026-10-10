@@ -1,5 +1,7 @@
 using System;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -88,6 +90,7 @@ internal static class Avx512SgemmDouble
     /// and the single port on Zen 4 — Zen 4 will get half-throughput
     /// vs Intel but still ~2× the AVX2 baseline).
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Run8x16Tile(
         double* aPtr, int lda,
         double* bPtr, int ldb,
@@ -144,6 +147,7 @@ internal static class Avx512SgemmDouble
     /// microkernel's inner K loop reads streamed memory instead of chasing
     /// lda-strided rows. Same approach as the FP32 Avx512Sgemm driver.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunTiledMnAligned(
         ReadOnlySpan<double> a, int lda,
         ReadOnlySpan<double> b, int ldb,
@@ -161,6 +165,7 @@ internal static class Avx512SgemmDouble
             int kLocal = k, ldaLocal = lda, ldbLocal = ldb, ldcLocal = n;
             int nTilesLocal = nTiles;
 
+            [MethodImpl(Hot)]
             void RunMTile(int mt)
             {
                 var packed = new double[8 * kLocal];
@@ -195,6 +200,7 @@ internal static class Avx512SgemmDouble
     /// <c>panel[row * k + kk]</c> = original A[row, kk]. Stage 7 first-cut:
     /// scalar pack; OK because PackA cost amortises over 16 N-tiles.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackARowMajor8(double* aPtr, int lda, double* panel, int k)
     {
         for (int r = 0; r < 8; r++)

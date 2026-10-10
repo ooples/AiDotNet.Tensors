@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -62,6 +64,7 @@ internal static class Avx512Tail
     /// in [Kc × Mr=8] vpanel, packed-B in [Kc × Nr=16]. Stores only the first
     /// effectiveNr cols of C via ConditionalSelect masking.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp64_8xN(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> packedB,
@@ -107,6 +110,7 @@ internal static class Avx512Tail
     /// <summary>
     /// AVX-512 FP32 16×N microkernel where N = effectiveNr ∈ [1, 16].
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp32_16xN(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,

@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -163,6 +165,7 @@ public partial class CpuEngine
         return output;
     }
 
+    [MethodImpl(Hot)]
     private static void EnsureSameShape<T>(Tensor<T> reference, Tensor<T> other, string paramName)
     {
         if (other.Rank != reference.Rank)
@@ -183,6 +186,7 @@ public partial class CpuEngine
     private static double Sig(double x) => 1.0 / (1.0 + Math.Exp(-x));
 
     // ── Double fast path ────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void Rwkv7ForwardDouble(
         double[] R, double[] KAP, double[] KT, double[] V, double[] D, double[] A, double[] outp,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
@@ -190,7 +194,7 @@ public partial class CpuEngine
         int hh = headDim * headDim;
         // Each (batch, head) pair is fully independent (private state, disjoint output); parallelize
         // lock-free over the combined (b*numHeads) axis. See GlaForwardDouble for the pattern.
-        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var S = new double[hh];
             var kh = new double[headDim];
@@ -247,6 +251,7 @@ public partial class CpuEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static void Rwkv7BackwardDouble(
         double[] dOut, double[] R, double[] KAP, double[] KT, double[] V, double[] D, double[] A,
         double[] dR, double[] dKAP, double[] dKT, double[] dV, double[] dD, double[] dA,
@@ -254,7 +259,7 @@ public partial class CpuEngine
     {
         int hh = headDim * headDim;
         // Lock-free over the independent (b*numHeads) axis with per-chunk scratch; see GlaBackwardDouble.
-        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             // S_t (post-update) for every t, reused per (b,h). FOOTPRINT: seqLen * headDim^2 doubles
             // PER PARALLEL CHUNK, so it scales with core count — ~33 MB per worker at seqLen 1024 /

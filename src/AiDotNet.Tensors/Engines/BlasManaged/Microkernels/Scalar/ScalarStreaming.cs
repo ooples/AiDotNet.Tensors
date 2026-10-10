@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -19,6 +21,7 @@ internal static class ScalarStreaming
     /// <summary>
     /// Compute C += op(A) · op(B) directly without packing. C is read-modify-write.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void RunFp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         ReadOnlySpan<double> b, int ldb, bool transB,
@@ -49,6 +52,7 @@ internal static class ScalarStreaming
     /// FP64 internal accumulators also keep summation error to O(eps_fp64 · K),
     /// well below the routing-shim test's correctness bound.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void RunFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,

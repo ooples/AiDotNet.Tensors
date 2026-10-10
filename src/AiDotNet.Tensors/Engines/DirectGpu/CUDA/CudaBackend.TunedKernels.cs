@@ -434,7 +434,7 @@ public sealed partial class CudaBackend
                     candidates.Add(new CudaTunedKernelCandidate<CudaNormBackwardArgs>(
                         "directptx.layernorm_backward.d64", TunedKernelOrigin.Generated, true, IsDirectPtxD64Shape,
                         (in CudaNormBackwardArgs a) => RequireDirectPtx(TryDirectPtxRowNormalizationCandidate(
-                            DirectPtxRowNormalizationOperation.LayerNormBackwardInput, a.Rows, 0f,
+                            DirectPtxRowNormalizationOperation.LayerNormBackwardInput, a.Rows, BackwardEpsilonPlaceholder,
                             a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0))));
                     _layerNormBackwardSlot = new TunedKernelSlot<CudaNormBackwardArgs>(TunedKernelOp.LayerNormBackward,
                         TunedDeviceKey,
@@ -480,6 +480,11 @@ public sealed partial class CudaBackend
         args[6] = &rows; args[7] = &n;
         LaunchKernel(kernel, RowGrid(rows, lanes), 256, args);
     }
+
+    // The direct-PTX row-normalization entry points all declare epsilon, and the kernel validates it as positive, but only
+    // the forward kernels read it: the backward and parameter-gradient kernels work from the saved per-row statistics.
+    // Passing 0f made those candidates throw ArgumentOutOfRangeException (epsilon) instead of launching.
+    private const float BackwardEpsilonPlaceholder = 1e-5f;
 
     // ---------------------------------------------------------------- column reductions (affine gradients)
 
@@ -533,10 +538,10 @@ public sealed partial class CudaBackend
             TunedKernelOrigin.Generated, true, IsDirectPtxD64Shape,
             rms
                 ? new TunedKernelInvoker<CudaNormBackwardArgs>((in CudaNormBackwardArgs a) => RequireDirectPtx(TryDirectPtxRowNormalizationCandidate(
-                    DirectPtxRowNormalizationOperation.RmsNormGradGamma, a.Rows, 0f,
+                    DirectPtxRowNormalizationOperation.RmsNormGradGamma, a.Rows, BackwardEpsilonPlaceholder,
                     a.GradOutput, a.Input, a.Stat0, a.Out0)))
                 : new TunedKernelInvoker<CudaNormBackwardArgs>((in CudaNormBackwardArgs a) => RequireDirectPtx(TryDirectPtxRowNormalizationCandidate(
-                    DirectPtxRowNormalizationOperation.LayerNormGradParameters, a.Rows, 0f,
+                    DirectPtxRowNormalizationOperation.LayerNormGradParameters, a.Rows, BackwardEpsilonPlaceholder,
                     a.GradOutput, a.Input, a.Stat0, Required(a.Stat1), a.Out0, Required(a.Out1))))));
         return new TunedKernelSlot<CudaNormBackwardArgs>(op, TunedDeviceKey,
             new CudaTunedKernelHarness<CudaNormBackwardArgs>(this, RowOpTolerance,

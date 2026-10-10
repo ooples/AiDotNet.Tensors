@@ -316,6 +316,12 @@ public sealed class DirectPtxDenseLinearBackendTests
             (deviceCountBefore, deviceBytesBefore),
             backend.DirectPtxEvidenceDeviceAllocations);
 
+        // Warm the capture path once, as the launches above were warmed. A thread's first capture builds its
+        // cuBLAS handle and 8 MiB workspace before the stream begins capturing (EnterCapture rebinds the
+        // handle to the capture stream); that one-time setup is outside the graph and not the launch's doing.
+        IntPtr warmGraph = backend.CaptureGraph(() => launch());
+        if (warmGraph != IntPtr.Zero) backend.DestroyCapturedGraph(warmGraph);
+
         bool captureLaunchSucceeded = false;
         (long captureCountBefore, long captureBytesBefore) =
             backend.DirectPtxEvidenceDeviceAllocations;

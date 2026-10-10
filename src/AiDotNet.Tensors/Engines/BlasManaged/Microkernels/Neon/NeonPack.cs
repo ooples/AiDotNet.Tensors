@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -56,6 +58,7 @@ internal static class NeonPack
     /// <param name="mc">Rows of A to pack (must be exactly divisible by mr).</param>
     /// <param name="kc">Cols of A to pack (one Kc block).</param>
     /// <param name="mr">Microkernel row-tile width; must be 4 for the Neon FP64 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackA_Fp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         Span<double> packed, int mc, int kc, int mr)
@@ -118,6 +121,7 @@ internal static class NeonPack
     /// <param name="mc">Rows of A to pack (must be exactly divisible by mr).</param>
     /// <param name="kc">Cols of A to pack (one Kc block).</param>
     /// <param name="mr">Microkernel row-tile width; must be 8 for the Neon FP32 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackA_Fp32(
         ReadOnlySpan<float> a, int lda, bool transA,
         Span<float> packed, int mc, int kc, int mr)
@@ -180,6 +184,7 @@ internal static class NeonPack
     /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
     /// <param name="kc">Rows of B to pack (one Kc block).</param>
     /// <param name="nr">Microkernel col-tile width; must be 4 for the Neon FP64 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackB_Fp64(
         ReadOnlySpan<double> b, int ldb, bool transB,
         Span<double> packed, int nc, int kc, int nr)
@@ -243,6 +248,7 @@ internal static class NeonPack
     /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
     /// <param name="kc">Rows of B to pack (one Kc block).</param>
     /// <param name="nr">Microkernel col-tile width; must be 4 for the Neon FP32 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackB_Fp32(
         ReadOnlySpan<float> b, int ldb, bool transB,
         Span<float> packed, int nc, int kc, int nr)

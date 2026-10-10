@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System;
 using System.Buffers;
@@ -18,6 +20,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 internal static class StrassenGemm
 {
     /// <summary>dst[h×h, contiguous] = x ± y, where x,y are h×h blocks with row-stride ld (e.g. quadrants).</summary>
+    [MethodImpl(Hot)]
     private static unsafe void Combine2(float* x, float* y, int ld, float* dst, int h, bool sub)
     {
         for (int i = 0; i < h; i++)
@@ -34,6 +37,7 @@ internal static class StrassenGemm
     }
 
     /// <summary>Write a C quadrant (row-stride ldc) = sum of up to four contiguous h×h M-temps with signs.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void WriteQuad(float* c, int ldc, int h,
         float* t0, int s0, float* t1, int s1, float* t2, int s2, float* t3, int s3)
     {

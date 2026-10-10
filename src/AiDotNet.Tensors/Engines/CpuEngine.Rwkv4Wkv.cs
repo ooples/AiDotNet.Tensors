@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -116,6 +118,7 @@ public partial class CpuEngine
     }
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void Rwkv4ForwardDouble(
         double[] R, double[] K, double[] V, double[] timeDecay, double[] timeFirst, double[] outp,
         int batch, int seqLen, int modelDim)
@@ -130,7 +133,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bIdx = b;
-            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, (cStart, cCount) =>
+            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, [MethodImpl(Hot)] (cStart, cCount) =>
             {
                 int cEnd = cStart + cCount;
                 for (int c = cStart; c < cEnd; c++)
@@ -165,6 +168,7 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void Rwkv4BackwardDouble(
         double[] dOut, double[] R, double[] K, double[] V, double[] timeDecay, double[] timeFirst,
         double[] dR, double[] dK, double[] dV, double[] dTimeDecay, double[] dTimeFirst,
@@ -181,7 +185,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bIdx = b;
-            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, (cStart, cCount) =>
+            CpuParallelSettings.ParallelForChunks(modelDim, RgLruChannelGrain, [MethodImpl(Hot)] (cStart, cCount) =>
             {
                 var aaTrajC = new double[seqLen];
                 var bbTrajC = new double[seqLen];
@@ -429,6 +433,7 @@ public partial class CpuEngine
     private static T MaxT<T>(INumericOperations<T> ops, T a, T b)
         => ops.GreaterThan(a, b) ? a : b;
 
+    [MethodImpl(Hot)]
     private static int[] ShapeOf<T>(Tensor<T> t)
     {
         var s = new int[t.Rank];

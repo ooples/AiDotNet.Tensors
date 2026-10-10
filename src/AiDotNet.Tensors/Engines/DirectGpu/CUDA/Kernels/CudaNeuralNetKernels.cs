@@ -232,7 +232,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bce_backward(
     gradInput[idx] = (p - t) / (p * (1.0f - p) * (float)size);
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void mse_loss(
+extern ""C"" __global__ __launch_bounds__(256) void mse_loss_elementwise(
     const float* __restrict__ predictions, const float* __restrict__ targets, float* __restrict__ loss, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -366,7 +366,7 @@ extern ""C"" __global__ __launch_bounds__(256) void triplet_loss_backward(
 // ===========================================================================
 
 // Huber Loss
-extern ""C"" __global__ __launch_bounds__(256) void huber_loss(
+extern ""C"" __global__ __launch_bounds__(256) void huber_loss_elementwise(
     const float* __restrict__ predicted, const float* __restrict__ actual, float* __restrict__ output,
     float delta, int size)
 {
@@ -659,55 +659,51 @@ extern ""C"" __global__ __launch_bounds__(256) void elastic_net_gradient(
 }
 
 // Contrastive Loss
+// Contrastive loss (Hadsell et al.) over [batchSize, embeddingDim] embeddings, one thread per sample:
+// L_b = (1 - y_b) * 0.5 * D^2 + y_b * 0.5 * max(0, margin - D)^2 with D = ||pred1_b - pred2_b||_2 (label 0 = similar,
+// 1 = dissimilar). The previous kernel was elementwise (pred[idx] as a 1-D sample, label[idx] per element) and took
+// (margin, size) while the backend passed (batchSize, embeddingDim, margin): margin got batchSize's bits as a float and
+// the bound became embeddingDim, so it wrote past the batchSize-element output whenever embeddingDim > batchSize.
 extern ""C"" __global__ __launch_bounds__(256) void contrastive_loss(
     const float* pred1, const float* pred2, const float* label, float* output,
-    float margin, int size)
+    int batchSize, int embeddingDim, float margin)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-
-    float diff = pred1[idx] - pred2[idx];
-    float dist_sq = diff * diff;
-    float l = label[idx];
-
-    // Similar pairs (label=0): minimize distance
-    // Dissimilar pairs (label=1): push apart up to margin
-    float dist = sqrtf(dist_sq);
-    float margin_diff = fmaxf(0.0f, margin - dist);
-    output[idx] = (1.0f - l) * 0.5f * dist_sq + l * 0.5f * margin_diff * margin_diff;
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batchSize) return;
+    const float* p1 = pred1 + (long long)b * embeddingDim;
+    const float* p2 = pred2 + (long long)b * embeddingDim;
+    float distSq = 0.0f;
+    for (int d = 0; d < embeddingDim; d++) { float diff = p1[d] - p2[d]; distSq += diff * diff; }
+    float l = label[b];
+    float marginDiff = fmaxf(0.0f, margin - sqrtf(distSq));
+    output[b] = (1.0f - l) * 0.5f * distSq + l * 0.5f * marginDiff * marginDiff;
 }
 
+// Gradient of the batch mean of contrastive_loss, one thread per sample (the distance is per sample, so an element
+// thread cannot compute it; the old kernel also read label[] at element indices past batchSize).
 extern ""C"" __global__ __launch_bounds__(256) void contrastive_loss_backward(
     const float* pred1, const float* pred2, const float* label,
     float* grad1, float* grad2, int batchSize, int embeddingDim, float margin)
 {
-    int totalSize = batchSize * embeddingDim;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= totalSize) return;
-
-    float diff = pred1[idx] - pred2[idx];
-    float dist = sqrtf(diff * diff);
-    float l = label[idx];
-
-    // Scale by 1/batchSize to match forward pass batch reduction
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batchSize) return;
+    long long base = (long long)b * embeddingDim;
+    float distSq = 0.0f;
+    for (int d = 0; d < embeddingDim; d++) { float diff = pred1[base + d] - pred2[base + d]; distSq += diff * diff; }
+    float dist = sqrtf(distSq);
+    float l = label[b];
     float scale = 1.0f / (float)batchSize;
-
-    float gradient;
-    if (l < 0.5f) {
-        // Similar pair: d_loss/d_pred1 = diff * scale
-        gradient = diff * scale;
-    } else {
-        // Dissimilar pair
-        float margin_diff = margin - dist;
-        if (margin_diff > 0.0f && dist > 1e-7f) {
-            gradient = -margin_diff * diff / dist * scale;
-        } else {
-            gradient = 0.0f;
-        }
+    // d/dpred1 of 0.5*D^2 is diff; of 0.5*max(0, m - D)^2 it is -(m - D) * diff / D while m > D.
+    float coeff = (1.0f - l);
+    float marginDiff = margin - dist;
+    if (marginDiff > 0.0f && dist > 1e-7f) coeff -= l * marginDiff / dist;
+    coeff *= scale;
+    for (int d = 0; d < embeddingDim; d++)
+    {
+        float g = coeff * (pred1[base + d] - pred2[base + d]);
+        grad1[base + d] = g;
+        grad2[base + d] = -g;
     }
-
-    grad1[idx] = gradient;
-    grad2[idx] = -gradient;
 }
 
 // ===========================================================================
@@ -2859,14 +2855,14 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "cross_entropy_backward",
                 "bce_loss",
                 "bce_backward",
-                "mse_loss",
+                "mse_loss_elementwise",
                 "mse_backward",
                 "smooth_l1_loss",
                 "smooth_l1_backward",
                 "triplet_loss",
                 "triplet_loss_backward",
                 // Additional loss functions
-                "huber_loss",
+                "huber_loss_elementwise",
                 "huber_gradient",
                 "focal_loss",
                 "focal_gradient",

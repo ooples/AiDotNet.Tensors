@@ -126,8 +126,8 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
             scale[oc] = gammaData[oc] / MathF.Sqrt(varData[oc] + (float)epsilon);
 
         // Fuse into weights: W_fused[oc, ...] = scale[oc] * W[oc, ...]
-        int weightsPerChannel = weightsData.Length / outChannels;
-        var fusedWeightsData = new float[weightsData.Length];
+        int weightsPerChannel = convWeights.Length / outChannels;
+        var fusedWeightsData = new float[convWeights.Length];
         for (int oc = 0; oc < outChannels; oc++)
         {
             int offset = oc * weightsPerChannel;

@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -19,6 +21,7 @@ internal sealed class X64Assembler
     private readonly List<(int pos, int label)> _rel8Fixups = new();
     private readonly List<(int pos, int label)> _rel32Fixups = new();
 
+    [MethodImpl(Hot)]
     internal byte[] ToArray()
     {
         foreach (var (pos, label) in _rel8Fixups)

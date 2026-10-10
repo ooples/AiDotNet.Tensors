@@ -99,7 +99,7 @@ public class Fp16HeteroScratchFreeTests
     // Run one ISOLATED forward (+ backward for the grad fingerprint) with the forward Half-resident store on/off,
     // returning the param-grad L2 norm and the resident activation-cache bytes right AFTER the forward (before
     // the backward adds grads/scratch) — so the measurement isolates the activation STORAGE dtype.
-    private static (double gradNorm, long cacheBytesAfterForward) RunForwardStoreOnce(DirectGpuTensorEngine gpu, bool store)
+    private static (double gradNorm, long cacheBytesAfterForward, bool collected) RunForwardStoreOnce(DirectGpuTensorEngine gpu, bool store)
     {
         var prevEnv = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE");
         // store on = default (env unset); store off = opt out via env (engages the FP32 up-cast store).
@@ -114,10 +114,12 @@ public class Fp16HeteroScratchFreeTests
             gpu.ResetOwnedResultTracking();
             try
             {
+                int gen0 = GC.CollectionCount(0);
                 plan.Forward();
                 // Resident activation storage right after the forward: the activation cache PLUS the results that own
                 // their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
                 long bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
+                bool collected = GC.CollectionCount(0) != gen0;
                 var grads = plan.Backward();
                 double sum = 0;
                 foreach (var kv in grads.Fp32)
@@ -125,7 +127,7 @@ public class Fp16HeteroScratchFreeTests
                     var a = kv.Value.ToArray();
                     for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
                 }
-                return (Math.Sqrt(sum), bytes);
+                return (Math.Sqrt(sum), bytes, collected);
             }
             finally { gpu.ResumeActivationEviction(); DirectGpuTensorEngine.TrackOwnedResultBytes = false; }
         }
@@ -152,8 +154,26 @@ public class Fp16HeteroScratchFreeTests
 
         // (2) The win: the Half-resident matmul activations occupy 2 bytes/elem vs 4 (FP32 up-cast), so the
         // resident activation-cache bytes after the forward are strictly lower with the store on.
-        Assert.True(on.cacheBytesAfterForward < off.cacheBytesAfterForward,
-            $"forward Half-store should lower resident activation bytes: on={on.cacheBytesAfterForward} off={off.cacheBytesAfterForward}.");
+        // As in the scratch-free test below: entries die with their storage, so a collection during either forward frees
+        // entries by itself (net471: on=65540 off=32768 in about one run in six). Compared on the first attempt neither arm
+        // collected in; the test fails if no attempt is clean, so it never passes without making the comparison.
+        const int Attempts = 8;
+        for (int attempt = 0; ; attempt++)
+        {
+            if (!on.collected && !off.collected)
+            {
+                Assert.True(on.cacheBytesAfterForward < off.cacheBytesAfterForward,
+                    $"forward Half-store should lower resident activation bytes: on={on.cacheBytesAfterForward} off={off.cacheBytesAfterForward}.");
+                return;
+            }
+            Assert.True(attempt + 1 < Attempts,
+                $"a garbage collection ran during every one of {Attempts} attempts, so the resident-bytes comparison was never made.");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            off = RunForwardStoreOnce(gpu, store: false);
+            on = RunForwardStoreOnce(gpu, store: true);
+        }
     }
 
     [SkippableFact]

@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using AiDotNet.Tensors.Helpers;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -127,6 +129,7 @@ internal static class BackgroundAutotuner
         t.Start();
     }
 
+    [MethodImpl(Hot)]
     private static void WorkerLoop()
     {
         foreach (var id in _queue.GetConsumingEnumerable())
@@ -141,6 +144,7 @@ internal static class BackgroundAutotuner
     /// <summary>Synchronous measurement entry point for tests + the pre-warm pipeline.</summary>
     internal static void MeasureNowForTest(SightingTracker.ShapeId id) => Measure(id);
 
+    [MethodImpl(Hot)]
     private static void Measure(SightingTracker.ShapeId id)
     {
         bool deterministic = BlasProvider.IsDeterministicMode;
@@ -167,6 +171,7 @@ internal static class BackgroundAutotuner
             mc: 64, nc: 64, kc: 64, threadCount: Environment.ProcessorCount, BlasKernelVersion.Current);
     }
 
+    [MethodImpl(Hot)]
     private static double TimeFp32(SightingTracker.ShapeId id, PackingMode mode)
     {
         int aRows = id.TransA ? id.K : id.M, aCols = id.TransA ? id.M : id.K;
@@ -189,6 +194,7 @@ internal static class BackgroundAutotuner
     /// pick the wrong winner. The MIN captures the contention-free slice — the strategy's true
     /// cost — and is what makes the learned choice match a clean micro-benchmark.
     /// </summary>
+    [MethodImpl(Hot)]
     private static double MinOfN<T>(
         T[] a, int aCols, bool transA, T[] b, int bCols, bool transB,
         T[] c, int m, int n, int k, in BlasOptions<T> opts, int reps = 12) where T : unmanaged
@@ -205,6 +211,7 @@ internal static class BackgroundAutotuner
         return best;
     }
 
+    [MethodImpl(Hot)]
     private static double TimeFp64(SightingTracker.ShapeId id, PackingMode mode)
     {
         int aRows = id.TransA ? id.K : id.M, aCols = id.TransA ? id.M : id.K;

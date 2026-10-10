@@ -12,6 +12,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// fp32 <c>Sgemm</c>. The W8A8 program only proceeds to the full fused entry point
 /// if int8 actually wins on AVX2-only hardware (see the env-gated bench below).
 /// </summary>
+// Changes process-wide CpuParallelSettings: runs in the non-parallel collection so it never races the
+// other tests that change or depend on them.
+[Collection("CpuParallelSettings")]
 public class Int8Int8GemmPhase0Tests
 {
     private readonly ITestOutputHelper _output;

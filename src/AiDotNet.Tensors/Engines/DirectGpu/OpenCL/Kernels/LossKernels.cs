@@ -124,7 +124,7 @@ __kernel void loss_cross_entropy_gradient(
 // Formula: loss = 0.5 * diff² if |diff| <= delta, else delta * (|diff| - 0.5*delta)
 // Gradient: d_loss/d_predicted = diff if |diff| <= delta, else delta * sign(diff)
 // ---------------------------------------------------------------------------
-__kernel void huber_loss(
+__kernel void huber_loss_elementwise(
     __global const float* predicted,
     __global const float* actual,
     __global float* output,
@@ -298,71 +298,56 @@ __kernel void triplet_loss_backward(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Contrastive Loss (for siamese networks)
-// Formula: loss = (1-label) * 0.5 * dist² + label * 0.5 * max(0, margin-dist)²
-// ---------------------------------------------------------------------------
+// Contrastive loss per pair of embeddings (one work-item per batch row), the CUDA kernel's contract:
+// D = ||pred1[b] - pred2[b]||, output[b] = (1 - label) * D^2 / 2 + label * max(0, margin - D)^2 / 2 (label 1 = dissimilar).
 __kernel void contrastive_loss(
     __global const float* pred1,
     __global const float* pred2,
     __global const float* label,
     __global float* output,
-    const float margin,
-    const int size)
+    const int batchSize,
+    const int embeddingDim,
+    const float margin)
 {
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-    
-    float diff = pred1[idx] - pred2[idx];
-    float dist_sq = diff * diff;
-    float l = label[idx];
-    
-    // Similar pairs (label=0): minimize distance
-    // Dissimilar pairs (label=1): push apart up to margin
-    output[idx] = (1.0f - l) * 0.5f * dist_sq +
-                  l * 0.5f * pow(fmax(0.0f, margin - sqrt(dist_sq)), 2.0f);
+    const int b = get_global_id(0);
+    if (b >= batchSize) return;
+    const long base = (long)b * embeddingDim;
+    float distSq = 0.0f;
+    for (int d = 0; d < embeddingDim; d++) { float diff = pred1[base + d] - pred2[base + d]; distSq += diff * diff; }
+    float l = label[b];
+    float marginDiff = fmax(0.0f, margin - sqrt(distSq));
+    output[b] = (1.0f - l) * 0.5f * distSq + l * 0.5f * marginDiff * marginDiff;
 }
 
-// ---------------------------------------------------------------------------
-// Contrastive Loss Gradient
-// d_loss/d_pred1 = (1-l)*diff + l*(margin-dist > 0 ? -diff/dist * (margin-dist) : 0)
-// d_loss/d_pred2 = -d_loss/d_pred1
-// ---------------------------------------------------------------------------
-__kernel void contrastive_loss_gradient(
+// Gradient of the batch-mean contrastive loss with respect to both embeddings, one work-item per batch row:
+// d/dpred1 of D^2 / 2 is diff, of max(0, m - D)^2 / 2 it is -(m - D) * diff / D while m > D; pred2 gets the negative.
+__kernel void contrastive_loss_backward(
     __global const float* pred1,
     __global const float* pred2,
     __global const float* label,
     __global float* grad1,
     __global float* grad2,
-    const float margin,
-    const int size)
+    const int batchSize,
+    const int embeddingDim,
+    const float margin)
 {
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float diff = pred1[idx] - pred2[idx];
-    float dist = sqrt(diff * diff);
-    float l = label[idx];
-
-    // For similar pairs (label=0): gradient = diff (minimize distance)
-    // For dissimilar pairs (label=1): gradient = -(margin-dist)*diff/dist (push apart if dist < margin)
-    float gradient;
-    if (l < 0.5f) {
-        // Similar pair: d_loss/d_pred1 = diff
-        gradient = diff;
-    } else {
-        // Dissimilar pair
-        float margin_diff = margin - dist;
-        if (margin_diff > 0.0f && dist > 1e-7f) {
-            // d_loss/d_pred1 = -(margin - dist) * diff / dist
-            gradient = -margin_diff * diff / dist;
-        } else {
-            gradient = 0.0f;
-        }
+    const int b = get_global_id(0);
+    if (b >= batchSize) return;
+    const long base = (long)b * embeddingDim;
+    float distSq = 0.0f;
+    for (int d = 0; d < embeddingDim; d++) { float diff = pred1[base + d] - pred2[base + d]; distSq += diff * diff; }
+    float dist = sqrt(distSq);
+    float l = label[b];
+    float coeff = 1.0f - l;
+    float marginDiff = margin - dist;
+    if (marginDiff > 0.0f && dist > 1e-7f) coeff -= l * marginDiff / dist;
+    coeff /= (float)batchSize;
+    for (int d = 0; d < embeddingDim; d++)
+    {
+        float g = coeff * (pred1[base + d] - pred2[base + d]);
+        grad1[base + d] = g;
+        grad2[base + d] = -g;
     }
-
-    grad1[idx] = gradient;
-    grad2[idx] = -gradient;
 }
 
 // ---------------------------------------------------------------------------
@@ -906,13 +891,13 @@ __kernel void elastic_net_gradient(
             // Cross-Entropy Loss (prefixed to avoid collision with NeuralNetKernels)
             "loss_cross_entropy", "loss_cross_entropy_gradient",
             // Huber Loss
-            "huber_loss", "huber_gradient",
+            "huber_loss_elementwise", "huber_gradient",
             // Focal Loss
             "focal_loss", "focal_gradient",
             // Triplet Loss
             "triplet_loss", "triplet_loss_backward",
             // Contrastive Loss
-            "contrastive_loss", "contrastive_loss_gradient",
+            "contrastive_loss", "contrastive_loss_backward",
             // MAE Loss
             "mae_loss", "mae_gradient",
             // Log-Cosh Loss

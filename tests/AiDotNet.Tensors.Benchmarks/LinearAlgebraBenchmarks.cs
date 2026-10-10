@@ -1,11 +1,13 @@
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Jobs;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using MathNet.Numerics.LinearAlgebra;
 using MathNet.Numerics.LinearAlgebra.Double;
 using NumSharp;
 using System.Numerics.Tensors;
+using Tensor = AiDotNet.Tensors.LinearAlgebra.Tensor<double>;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -15,7 +17,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// - NumSharp (NumPy-like library for .NET)
 /// - System.Numerics.Tensors (built-in .NET SIMD primitives)
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class LinearAlgebraBenchmarks
@@ -36,6 +38,9 @@ public class LinearAlgebraBenchmarks
     private MathNet.Numerics.LinearAlgebra.Vector<double> _mnVector2 = null!;
     private MathNet.Numerics.LinearAlgebra.Matrix<double> _mnMatrix1 = null!;
     private MathNet.Numerics.LinearAlgebra.Matrix<double> _mnMatrix2 = null!;
+
+    // AiDotNet tensor over the same data as _aiMatrix1 (for the O(1) view transpose)
+    private Tensor _aiTensor1 = null!;
 
     // NumSharp types
     private NDArray _nsVector1 = null!;
@@ -96,6 +101,7 @@ public class LinearAlgebraBenchmarks
         _aiMatrix2 = new AiDotNet.Tensors.LinearAlgebra.Matrix<double>(matData2);
         _mnMatrix1 = DenseMatrix.OfArray(matData1);
         _mnMatrix2 = DenseMatrix.OfArray(matData2);
+        _aiTensor1 = new Tensor((double[])flatMat1.Clone(), new[] { N, N });
         _nsMatrix1 = np.array(flatMat1).reshape(N, N);
         _nsMatrix2 = np.array(flatMat2).reshape(N, N);
     }
@@ -205,6 +211,13 @@ public class LinearAlgebraBenchmarks
         return _mnVector1.Subtract(_mnVector2);
     }
 
+    [Benchmark(Description = "Vector Subtract - NumSharp")]
+    [BenchmarkCategory("VectorSubtract")]
+    public NDArray VectorSubtractNumSharp()
+    {
+        return _nsVector1 - _nsVector2;
+    }
+
     [Benchmark(Description = "Vector Subtract - TensorPrimitives")]
     [BenchmarkCategory("VectorSubtract")]
     public void VectorSubtractTensorPrimitives()
@@ -255,6 +268,13 @@ public class LinearAlgebraBenchmarks
         return _mnVector1.Multiply(2.5);
     }
 
+    [Benchmark(Description = "Vector Scalar Multiply - NumSharp")]
+    [BenchmarkCategory("VectorScalarMul")]
+    public NDArray VectorScalarMultiplyNumSharp()
+    {
+        return _nsVector1 * 2.5;
+    }
+
     [Benchmark(Description = "Vector Scalar Multiply - TensorPrimitives")]
     [BenchmarkCategory("VectorScalarMul")]
     public void VectorScalarMultiplyTensorPrimitives()
@@ -303,6 +323,13 @@ public class LinearAlgebraBenchmarks
     public double VectorNormMathNet()
     {
         return _mnVector1.L2Norm();
+    }
+
+    [Benchmark(Description = "L2 Norm - NumSharp")]
+    [BenchmarkCategory("VectorNorm")]
+    public double VectorNormNumSharp()
+    {
+        return (double)np.linalg.norm(_nsVector1);
     }
 
     [Benchmark(Description = "L2 Norm - TensorPrimitives")]
@@ -391,6 +418,13 @@ public class LinearAlgebraBenchmarks
         return _mnMatrix1.Subtract(_mnMatrix2);
     }
 
+    [Benchmark(Description = "Matrix Subtract - NumSharp")]
+    [BenchmarkCategory("MatrixSubtract")]
+    public NDArray MatrixSubtractNumSharp()
+    {
+        return _nsMatrix1 - _nsMatrix2;
+    }
+
     #endregion
 
     #region Matrix Subtract In-Place (Zero Allocation)
@@ -418,6 +452,13 @@ public class LinearAlgebraBenchmarks
     public MathNet.Numerics.LinearAlgebra.Matrix<double> MatrixScalarMultiplyMathNet()
     {
         return _mnMatrix1.Multiply(2.5);
+    }
+
+    [Benchmark(Description = "Matrix Scalar Multiply - NumSharp")]
+    [BenchmarkCategory("MatrixScalarMul")]
+    public NDArray MatrixScalarMultiplyNumSharp()
+    {
+        return _nsMatrix1 * 2.5;
     }
 
     #endregion
@@ -453,6 +494,21 @@ public class LinearAlgebraBenchmarks
     [BenchmarkCategory("Transpose")]
     public NDArray MatrixTransposeNumSharp()
     {
+        // .T is a strided view in NumSharp (as in NumPy); copy() materializes it like the other arms.
+        return _nsMatrix1.T.copy();
+    }
+
+    [Benchmark(Description = "Transpose (view) - AiDotNet")]
+    [BenchmarkCategory("TransposeView")]
+    public Tensor MatrixTransposeViewAiDotNet()
+    {
+        return _aiTensor1.Transpose();
+    }
+
+    [Benchmark(Description = "Transpose (view) - NumSharp")]
+    [BenchmarkCategory("TransposeView")]
+    public NDArray MatrixTransposeViewNumSharp()
+    {
         return _nsMatrix1.T;
     }
 
@@ -474,7 +530,7 @@ public class LinearAlgebraBenchmarks
 /// Benchmarks for small matrix operations where overhead matters more.
 /// These sizes are typical for neural network layer computations.
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class SmallMatrixBenchmarks
@@ -621,7 +677,7 @@ public class SmallMatrixBenchmarks
 /// <summary>
 /// Benchmarks for element-wise operations using TensorPrimitives
 /// </summary>
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
+[SimpleJob(RuntimeMoniker.Net10_0)]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class ElementWiseBenchmarks
@@ -632,6 +688,10 @@ public class ElementWiseBenchmarks
 
     private AiDotNet.Tensors.LinearAlgebra.Vector<double> _aiVector1 = null!;
     private AiDotNet.Tensors.LinearAlgebra.Vector<double> _aiVector2 = null!;
+
+    private Tensor _aiTensor1 = null!;
+    private Tensor _aiTensor2 = null!;
+    private IEngine _engine = null!;
 
     private NDArray _nsVector1 = null!;
     private NDArray _nsVector2 = null!;
@@ -657,10 +717,21 @@ public class ElementWiseBenchmarks
         _aiVector1 = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(_data1);
         _aiVector2 = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(_data2);
 
+        // CPU against CPU, as in the TorchSharp / ML.NET / TensorFlow.NET suites: on a GPU host the
+        // module initializer would otherwise make DirectGpuTensorEngine the default.
+        _engine = new CpuEngine();
+        _aiTensor1 = new Tensor((double[])_data1.Clone(), new[] { N });
+        _aiTensor2 = new Tensor((double[])_data2.Clone(), new[] { N });
+
         _nsVector1 = np.array(_data1);
         _nsVector2 = np.array(_data2);
     }
 
+    // Multiply and Exp: the TensorPrimitives arms write into the preallocated _result, so they are a
+    // non-allocating lower bound, while the NumSharp and AiDotNet arms return a new array as their APIs do, so
+    // their time includes that allocation. Compare those two with each other, and read MemoryDiagnoser's
+    // Allocated column alongside the ratio to the baseline. Sum and Max return a double in every arm, so no
+    // result array is allocated there and the ratios compare like with like.
     #region Multiply Element-wise
 
     [Benchmark(Description = "Multiply - TensorPrimitives", Baseline = true)]
@@ -675,6 +746,13 @@ public class ElementWiseBenchmarks
     public NDArray MultiplyNumSharp()
     {
         return _nsVector1 * _nsVector2;
+    }
+
+    [Benchmark(Description = "Multiply - AiDotNet")]
+    [BenchmarkCategory("Multiply")]
+    public Tensor MultiplyAiDotNet()
+    {
+        return _engine.TensorMultiply(_aiTensor1, _aiTensor2);
     }
 
     #endregion
@@ -695,6 +773,13 @@ public class ElementWiseBenchmarks
         return np.exp(_nsVector1);
     }
 
+    [Benchmark(Description = "Exp - AiDotNet")]
+    [BenchmarkCategory("Exp")]
+    public Tensor ExpAiDotNet()
+    {
+        return _engine.TensorExp(_aiTensor1);
+    }
+
     #endregion
 
     #region Sum
@@ -713,6 +798,13 @@ public class ElementWiseBenchmarks
         return (double)np.sum(_nsVector1);
     }
 
+    [Benchmark(Description = "Sum - AiDotNet")]
+    [BenchmarkCategory("Sum")]
+    public double SumAiDotNet()
+    {
+        return _engine.TensorSum(_aiTensor1);
+    }
+
     #endregion
 
     #region Max
@@ -729,6 +821,13 @@ public class ElementWiseBenchmarks
     public double MaxNumSharp()
     {
         return (double)np.max(_nsVector1);
+    }
+
+    [Benchmark(Description = "Max - AiDotNet")]
+    [BenchmarkCategory("Max")]
+    public double MaxAiDotNet()
+    {
+        return _engine.TensorMaxValue(_aiTensor1);
     }
 
     #endregion
