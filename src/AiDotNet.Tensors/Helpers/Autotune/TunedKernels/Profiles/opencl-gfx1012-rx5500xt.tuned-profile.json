@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "device": "opencl:Advanced Micro Devices, Inc.:gfx1012*",
+  "entries": [
+    {
+      "op": "Softmax",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes16",
+      "speedup": 1.447
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes32",
+      "speedup": 1.228
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.softmax.group",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes16",
+      "speedup": 1.207
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes16",
+      "speedup": 1.362
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_forward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_forward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_forward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 1.182
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 12.966
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 5.307
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 18.465
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 8.373
+    }
+  ]
+}

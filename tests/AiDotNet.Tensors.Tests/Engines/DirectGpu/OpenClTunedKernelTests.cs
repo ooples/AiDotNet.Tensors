@@ -296,7 +296,8 @@ public sealed class OpenClTunedKernelTests
         TunedKernelPolicy.BudgetMilliseconds = 60_000;
         try
         {
-            const int rows = 8192, n = 32;
+            // A shape no shipped profile covers: the registry must measure it, and the in-place call must not.
+            const int rows = 8192, n = 48;
             float[] x = Values(rows * n, 99, 5f);
             using var input = backend.AllocateBuffer(x);
             using var viaRegistry = backend.AllocateBuffer(x.Length);

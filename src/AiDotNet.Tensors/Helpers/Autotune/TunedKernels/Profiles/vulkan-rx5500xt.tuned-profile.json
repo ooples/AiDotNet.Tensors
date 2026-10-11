@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "device": "vulkan:Radeon RX 5500 XT",
+  "entries": [
+    {
+      "op": "Softmax",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes16",
+      "speedup": 2.737
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes32",
+      "speedup": 7.407
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "vulkan.softmax.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes16",
+      "speedup": 2.309
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes32",
+      "speedup": 2.917
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes32",
+      "speedup": 8.696
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes16",
+      "speedup": 3.744
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes16",
+      "speedup": 3.102
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 20.605
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes8",
+      "speedup": 23.285
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes8",
+      "speedup": 18.083
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 22.671
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes16",
+      "speedup": 19.331
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 22.564
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes16",
+      "speedup": 18.808
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 20.086
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 25.649
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 19.299
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 25.401
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 22.207
+    }
+  ]
+}
