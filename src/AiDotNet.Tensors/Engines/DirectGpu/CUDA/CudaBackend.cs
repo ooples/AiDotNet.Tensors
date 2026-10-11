@@ -243,6 +243,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // call site instead of an opaque "kernel not found" deep in dispatch.
     private bool _fusedAdvancedKernelsAvailable;
     private IntPtr _activationModule;
+    private IntPtr _torchParityElementwiseModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
     private IntPtr _poolingModule;
@@ -1136,6 +1137,22 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // catch that degraded silently to the CPU. See CudaMissingLookupKernels.
         CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
             Kernels.CudaMissingLookupKernels.GetKernelNames());
+
+        // PyTorch-parity elementwise ops that computed on the host (#1112). useFastMath:false -- erff, log1pf, expf
+        // and sinpif must be the accurate versions to match the CPU's double-precision reference.
+        // Optional: if this module fails to compile, its kernels stay out of the cache, every parity launcher throws
+        // "kernel not found", and the engine's device helpers fall back to the CPU (recording the fallback) -- the rest
+        // of the backend stays available.
+        try
+        {
+            _torchParityElementwiseModule = CompileKernelModule(device, Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity_elementwise_kernels",
+                Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
+        }
+        catch (Exception ex)
+        {
+            _torchParityElementwiseModule = IntPtr.Zero;
+            System.Diagnostics.Trace.TraceWarning($"CUDA torch-parity kernels unavailable; those ops use the CPU path: {ex.Message}");
+        }
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
@@ -17943,6 +17960,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             CudaNativeBindings.cuModuleUnload(_activationModule);
             _activationModule = IntPtr.Zero;
+        }
+
+        if (_torchParityElementwiseModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
+            _torchParityElementwiseModule = IntPtr.Zero;
         }
 
         if (_parity210Module != IntPtr.Zero)

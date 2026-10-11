@@ -67,7 +67,8 @@ public static class OpParityRegistry
         GraphOutputDependency[]? graphOutputDependencies = null,
         TensorOutputOverload outputOverload = TensorOutputOverload.Unspecified,
         GraphCaptureSignatureConstraint graphCaptureSignatureConstraint = GraphCaptureSignatureConstraint.None,
-        GraphCaptureSignatureOverload graphCaptureSignatureOverload = GraphCaptureSignatureOverload.Unspecified)
+        GraphCaptureSignatureOverload graphCaptureSignatureOverload = GraphCaptureSignatureOverload.Unspecified,
+        GpuReadbackContract gpuReadbackContract = GpuReadbackContract.None)
     {
         var op = new OpCase(
             name,
@@ -85,7 +86,8 @@ public static class OpParityRegistry
             GraphCaptureSignatureOverload = graphCaptureSignatureOverload,
             TensorOutputComparisons = outputComparisons,
             GraphOutputDependencies = graphOutputDependencies,
-            TensorOutputOverload = outputOverload
+            TensorOutputOverload = outputOverload,
+            GpuReadbackContract = gpuReadbackContract
         };
         if (graphCaptureSignatureConstraint != GraphCaptureSignatureConstraint.None)
             op.GraphCaptureSignatureConstraint = graphCaptureSignatureConstraint;
@@ -814,7 +816,8 @@ public static class OpParityRegistry
         yield return HomogeneousOutputCase("TensorUnravelIndex[all-outputs]", "index", "TensorUnravelIndex",
             e => e.TensorUnravelIndex(new Tensor<float>(new float[] { 0, 5, 11, 7 }, new[] { 4 }), new[] { 3, 4 }),
             e => e.TensorUnravelIndex(new Tensor<double>(new double[] { 0, 5, 11, 7 }, new[] { 4 }), new[] { 3, 4 }), ParityTol.Exact,
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary,
+            gpuReadbackContract: GpuReadbackContract.ElementValidation);
         yield return HomogeneousOutputCase("TensorStdMean[all-outputs]", "reduction", "TensorStdMean",
             e => { var (std, mean) = e.TensorStdMean(x.F(), new[] { 1 }); return new[] { std, mean }; },
             e => { var (std, mean) = e.TensorStdMean(x.D(), new[] { 1 }); return new[] { std, mean }; }, ParityTol.Accum(1e-5));
