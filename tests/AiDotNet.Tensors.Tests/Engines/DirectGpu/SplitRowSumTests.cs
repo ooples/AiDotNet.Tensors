@@ -45,7 +45,10 @@ public class SplitRowSumTests : IClassFixture<DirectGpuTensorEngineTestFixture>
         var x = Values(n, n);
         double expected = x.ToArray().Sum(v => (double)v);
         GpuLaunchProbe.Reset();
+        var cuda = (Tensors.Engines.DirectGpu.CUDA.CudaBackend)((DirectGpuTensorEngine)gpu).GetBackend()!;
+        long splits = cuda.SplitRowSumLaunches;
         AssertExact(expected, gpu.ReduceSum(x, null).ToArray()[0], $"sum of {n}");
+        Assert.True(cuda.SplitRowSumLaunches > splits, "the full sum did not take the split-row path");
         Assert.Empty(GpuLaunchProbe.Fallbacks);
         float mean = gpu.ReduceMean(x, new[] { 0 }, keepDims: false).ToArray()[0];
         Assert.True(Math.Abs(expected / n - mean) <= 1e-6 * Math.Max(1, Math.Abs(expected / n)), $"mean of {n}: expected {expected / n}, got {mean}");

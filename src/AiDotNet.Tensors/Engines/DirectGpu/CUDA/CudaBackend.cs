@@ -136,6 +136,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <summary>Shortest row SumAxis reduces with one block per row; see <see cref="SumAxis"/>.</summary>
     internal const int SumAxisRowsMinReduce = 32;
 
+    // How many row sums took the split path (#1150): lets tests assert the dispatch, not only the result.
+    private long _splitRowSumLaunches;
+    internal long SplitRowSumLaunches => System.Threading.Interlocked.Read(ref _splitRowSumLaunches);
+
     // #1150: rows at least this long, when there are fewer than two per SM, are split across blocks.
     internal const int SplitRowMinReduce = 64 * 1024;
 
@@ -5136,10 +5140,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (reduceSize >= SplitRowMinReduce && outerSize < 2 * Math.Max(1, ComputeUnits)
             && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
         {
-            int chunks = Math.Max(2, Math.Min((reduceSize + SplitRowChunkMin - 1) / SplitRowChunkMin,
-                4 * Math.Max(1, ComputeUnits) / outerSize));
-            int chunkLen = (reduceSize + chunks - 1) / chunks;
-            chunks = (reduceSize + chunkLen - 1) / chunkLen;
+            // Ceilings in 64 bits: reduceSize can be close to int.MaxValue.
+            int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SplitRowChunkMin - 1) / SplitRowChunkMin,
+                4L * Math.Max(1, ComputeUnits) / outerSize));
+            int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+            chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
             using var partial = AllocateStreamOrderedScratchBuffer(outerSize * chunks);
             using (PushContext())
             {
@@ -5153,6 +5158,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                     LaunchKernel2D(splitKernel, (uint)chunks, (uint)outerSize, DefaultBlockSize, 1, splitArgs);
                 }
             }
+            System.Threading.Interlocked.Increment(ref _splitRowSumLaunches);
             SumAxis(partial, B, outerSize, chunks);
             return;
         }
