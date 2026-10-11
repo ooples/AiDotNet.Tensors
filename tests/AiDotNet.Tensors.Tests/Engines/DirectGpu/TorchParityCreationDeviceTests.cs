@@ -13,17 +13,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// element (shape included), launch device work, and record no host fallback; invalid arguments must still raise the
 /// CPU's exceptions.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class TorchParityCreationDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public abstract class TorchParityCreationDeviceTestsBase
 {
-    private readonly DirectGpuTensorEngineTestFixture _fixture;
-    public TorchParityCreationDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+    private readonly IDirectGpuTensorEngineFixture _fixture;
+    protected TorchParityCreationDeviceTestsBase(IDirectGpuTensorEngineFixture fixture) => _fixture = fixture;
 
     private DirectGpuTensorEngine GpuOrSkip()
     {
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "These device kernels are CUDA-only.");
+        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels.");
         return gpu;
     }
 
@@ -116,4 +115,18 @@ public class TorchParityCreationDeviceTests : IClassFixture<DirectGpuTensorEngin
         Assert.Equal(cpu.TensorHannWindow<float>(0)._shape, gpu.TensorHannWindow<float>(0)._shape);
         Assert.Equal(cpu.TensorTriuIndices<float>(3, 2, 5)._shape, gpu.TensorTriuIndices<float>(3, 2, 5)._shape);
     }
+}
+
+/// <summary>The cases above on the machine's default DirectGpu backend.</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityCreationDeviceTests : TorchParityCreationDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    public TorchParityCreationDeviceTests(DirectGpuTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+/// <summary>The cases above on the Vulkan backend (#1127).</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityCreationVulkanDeviceTests : TorchParityCreationDeviceTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
+{
+    public TorchParityCreationVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }

@@ -15,17 +15,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// torch's: NaN after +inf ascending and first descending, ties by original index, and padding never leaking into a
 /// row whose length is not a power of two.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class TorchParityIndexDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public abstract class TorchParityIndexDeviceTestsBase
 {
-    private readonly DirectGpuTensorEngineTestFixture _fixture;
-    public TorchParityIndexDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+    private readonly IDirectGpuTensorEngineFixture _fixture;
+    protected TorchParityIndexDeviceTestsBase(IDirectGpuTensorEngineFixture fixture) => _fixture = fixture;
 
     private DirectGpuTensorEngine GpuOrSkip()
     {
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "These device kernels are CUDA-only.");
+        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels.");
         return gpu;
     }
 
@@ -169,4 +168,18 @@ public class TorchParityIndexDeviceTests : IClassFixture<DirectGpuTensorEngineTe
             }
         }
     }
+}
+
+/// <summary>The cases above on the machine's default DirectGpu backend.</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityIndexDeviceTests : TorchParityIndexDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    public TorchParityIndexDeviceTests(DirectGpuTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+/// <summary>The cases above on the Vulkan backend (#1127).</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityIndexVulkanDeviceTests : TorchParityIndexDeviceTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
+{
+    public TorchParityIndexVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }

@@ -25,8 +25,8 @@ namespace AiDotNet.Tensors.Engines;
 /// The remaining parity ops (special functions, orthogonal polynomials, window functions, samplers, index
 /// construction, pooling variants, complex conversions, quantiles, volumetric grid sampling) try a device path first:
 /// the <c>Try*OnDevice</c> helpers in the TorchParity* partials, which run on backends implementing
-/// <see cref="ITorchParityElementwiseBackend"/>. Only CUDA implements it today (#1112); HIP, Metal, OpenCL, Vulkan
-/// and WebGPU are tracked in #1124, #1125, #1126, #1127 and #1128. When a helper declines (another backend, a tape or
+/// <see cref="ITorchParityElementwiseBackend"/>. CUDA (#1112) and Vulkan (#1127) implement it today; HIP, Metal,
+/// OpenCL and WebGPU are tracked in #1124, #1125, #1126 and #1128. When a helper declines (another backend, a tape or
 /// graph recording it must not bypass, an argument error the CPU reports, or a precision policy), the override falls
 /// through to the host implementation EXPLICITLY: the call records a <see cref="GpuLaunchProbe"/> fallback
 /// (<c>"&lt;op&gt;: no device kernel"</c> in <see cref="GpuLaunchProbe.Fallbacks"/>), so a GPU workload that reaches
