@@ -75,4 +75,33 @@ public class DepthwiseConvFloatPathTests
             }
         }
     }
+
+    // #639: a pointwise conv's weight gradient at a tiny spatial size takes a direct outer-product path; it must equal
+    // dW[o, c] = sum over (b, p) of dY[b, o, p] * X[b, c, p] (and the GEMM path just past the threshold).
+    [Theory]
+    [InlineData(1, 168, 672, 1, 1)]   // SE expand at 1x1
+    [InlineData(1, 672, 168, 1, 1)]
+    [InlineData(2, 40, 120, 4, 4)]    // 32 positions
+    [InlineData(1, 30, 50, 8, 8)]     // 64 positions: the threshold
+    [InlineData(1, 30, 50, 9, 9)]     // 81 positions: the GEMM path
+    public void PointwiseWeightGrad_MatchesDirectSum(int batch, int inC, int outC, int h, int w)
+    {
+        var rng = new Random(inC + outC);
+        var x = new float[batch * inC * h * w];
+        var dy = new float[batch * outC * h * w];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < dy.Length; i++) dy[i] = (float)(rng.NextDouble() * 2 - 1);
+        var dw = new CpuEngine().Conv2DBackwardKernel(new Tensor<float>(dy, new[] { batch, outC, h, w }),
+            new Tensor<float>(x, new[] { batch, inC, h, w }), new[] { outC, inC, 1, 1 }, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
+        int positions = h * w;
+        for (int o = 0; o < outC; o++)
+            for (int c = 0; c < inC; c++)
+            {
+                double sum = 0;
+                for (int b = 0; b < batch; b++)
+                    for (int q = 0; q < positions; q++)
+                        sum += (double)dy[(b * outC + o) * positions + q] * x[(b * inC + c) * positions + q];
+                Assert.True(Math.Abs(sum - dw[o * inC + c]) <= 1e-4 * Math.Max(1.0, Math.Abs(sum)), $"dW[{o},{c}]: {dw[o * inC + c]} vs {sum}");
+            }
+    }
 }

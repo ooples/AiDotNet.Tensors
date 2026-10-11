@@ -16155,6 +16155,19 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         // im2col + GEMM fast path for float: gradKernel += gradOutput × im2col^T
+        if (typeof(T) == typeof(float) && kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+            && padH == 0 && padW == 0 && batch * height * width <= PointwiseDirectMaxPositions)
+        {
+            // #639: a pointwise conv's weight gradient at a tiny spatial size (MobileNet / SE blocks at 1x1-4x4) is a
+            // sum of a few outer products, dW[o, c] = sum over (b, p) of dY[b, o, p] * X[b, c, p]. The im2col + GEMM
+            // route spent its time staging and transposing for a K = 1..16 product.
+            var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
+            var inputF = (float[])(object)input.GetFlattenedData();
+            var gradKernelF = new float[outChannels * inChannels];
+            PointwiseWeightGradFloat(gradOutputF, inputF, gradKernelF, batch, outChannels, inChannels, height * width);
+            return RentFloatResult<T>(kernelShape, gradKernelF);
+        }
+
         if (typeof(T) == typeof(float))
         {
             int colH = inChannels * kernelHeight * kernelWidth;
@@ -18069,6 +18082,46 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         });
+    }
+
+    // Spatial positions (batch x height x width) up to which a pointwise conv's weight gradient skips im2col + GEMM.
+    private const int PointwiseDirectMaxPositions = 64;
+
+    /// <summary>
+    /// dW[o, c] = sum over b, p of dY[b, o, p] * X[b, c, p] for a 1x1 stride-1 conv, with the positions transposed once
+    /// to [b, p, c] rows so each term is a contiguous axpy over the input channels; parallel over output channels
+    /// (each task owns its dW row, so the sum order does not depend on the thread count).
+    /// </summary>
+    private static void PointwiseWeightGradFloat(float[] dY, float[] x, float[] dW, int batch, int outChannels, int inChannels,
+        int positions)
+    {
+        int rows = batch * positions;
+        var xT = System.Buffers.ArrayPool<float>.Shared.Rent(rows * inChannels);
+        try
+        {
+            for (int b = 0; b < batch; b++)
+                for (int c = 0; c < inChannels; c++)
+                {
+                    int src = (b * inChannels + c) * positions;
+                    for (int p = 0; p < positions; p++) xT[(b * positions + p) * inChannels + c] = x[src + p];
+                }
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels, (long)outChannels * rows * inChannels, o =>
+            {
+                int dst = o * inChannels;
+                Array.Clear(dW, dst, inChannels);
+                for (int b = 0; b < batch; b++)
+                    for (int p = 0; p < positions; p++)
+                    {
+                        float g = dY[(b * outChannels + o) * positions + p];
+                        if (g == 0f) continue;
+                        Axpy(g, xT, (b * positions + p) * inChannels, dW, dst, inChannels);
+                    }
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(xT);
+        }
     }
 
     /// <summary>
