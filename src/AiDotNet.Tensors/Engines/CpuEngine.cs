@@ -3563,8 +3563,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// <c>r = a op b</c> where <paramref name="b"/> repeats along the leading axes of <paramref name="a"/> in tiles of
-    /// <paramref name="tile"/> elements (the [N, M] op [M] bias pattern). Float and double run a typed vector loop
-    /// over the tiles (no per-tile interface call), split across threads from <see cref="TrailingRepeatParallelMin"/>
+    /// <paramref name="tile"/> elements (the [N, M] op [M] bias pattern). Float and double call the SIMD kernels
+    /// directly per tile (no per-tile interface call), split across threads from <see cref="TrailingRepeatParallelMin"/>
     /// elements (#653: the former single loop ran every row-bias add and scale on one core at every size -- 4.9 ms for
     /// an 8M-element float tensor at DOP 1 through 64). Each element is one IEEE add or multiply, so the result is the
     /// same as the serial INumericOperations loop, which other element types (and non-addressable backings) keep.
@@ -3614,22 +3614,14 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void TrailingRepeatFloatTiles(float[] a, int aOff, float[] b, int bOff, float[] r, int rOff, int tile, int t0, int t1,
         bool multiply)
     {
-        int w = System.Numerics.Vector<float>.Count;
+        // The same SIMD kernels the INumericOperations span overloads reach, without the per-tile interface dispatch.
+        var bias = new ReadOnlySpan<float>(b, bOff, tile);
         for (int t = t0; t < t1; t++)
         {
-            int ao = aOff + t * tile, ro = rOff + t * tile, i = 0;
-            if (multiply)
-            {
-                for (; i <= tile - w; i += w)
-                    (new System.Numerics.Vector<float>(a, ao + i) * new System.Numerics.Vector<float>(b, bOff + i)).CopyTo(r, ro + i);
-                for (; i < tile; i++) r[ro + i] = a[ao + i] * b[bOff + i];
-            }
-            else
-            {
-                for (; i <= tile - w; i += w)
-                    (new System.Numerics.Vector<float>(a, ao + i) + new System.Numerics.Vector<float>(b, bOff + i)).CopyTo(r, ro + i);
-                for (; i < tile; i++) r[ro + i] = a[ao + i] + b[bOff + i];
-            }
+            var src = new ReadOnlySpan<float>(a, aOff + t * tile, tile);
+            var dst = new Span<float>(r, rOff + t * tile, tile);
+            if (multiply) Simd.SimdKernels.VectorMultiply(src, bias, dst);
+            else Simd.SimdKernels.VectorAdd(src, bias, dst);
         }
     }
 
@@ -3646,22 +3638,14 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void TrailingRepeatDoubleTiles(double[] a, int aOff, double[] b, int bOff, double[] r, int rOff, int tile, int t0, int t1,
         bool multiply)
     {
-        int w = System.Numerics.Vector<double>.Count;
+        // The same SIMD kernels the INumericOperations span overloads reach, without the per-tile interface dispatch.
+        var bias = new ReadOnlySpan<double>(b, bOff, tile);
         for (int t = t0; t < t1; t++)
         {
-            int ao = aOff + t * tile, ro = rOff + t * tile, i = 0;
-            if (multiply)
-            {
-                for (; i <= tile - w; i += w)
-                    (new System.Numerics.Vector<double>(a, ao + i) * new System.Numerics.Vector<double>(b, bOff + i)).CopyTo(r, ro + i);
-                for (; i < tile; i++) r[ro + i] = a[ao + i] * b[bOff + i];
-            }
-            else
-            {
-                for (; i <= tile - w; i += w)
-                    (new System.Numerics.Vector<double>(a, ao + i) + new System.Numerics.Vector<double>(b, bOff + i)).CopyTo(r, ro + i);
-                for (; i < tile; i++) r[ro + i] = a[ao + i] + b[bOff + i];
-            }
+            var src = new ReadOnlySpan<double>(a, aOff + t * tile, tile);
+            var dst = new Span<double>(r, rOff + t * tile, tile);
+            if (multiply) Simd.SimdKernels.VectorMultiply(src, bias, dst);
+            else Simd.SimdKernels.VectorAdd(src, bias, dst);
         }
     }
 
