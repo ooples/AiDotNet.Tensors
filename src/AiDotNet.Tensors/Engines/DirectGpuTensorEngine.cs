@@ -28180,20 +28180,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Decomposes Tensor<Complex<T>> to split real/imag GPU buffers,
     // dispatches via IDirectGpuBackend.SplitComplex*, recomposes result.
 
-    private static (float[] real, float[] imag) DecomposeComplex<T>(Tensor<Complex<T>> tensor)
-    {
-        var ops = MathHelper.GetNumericOperations<T>();
-        int n = tensor.Length;
-        var real = new float[n];
-        var imag = new float[n];
-        for (int i = 0; i < n; i++)
-        {
-            real[i] = (float)ops.ToDouble(tensor[i].Real);
-            imag[i] = (float)ops.ToDouble(tensor[i].Imaginary);
-        }
-        return (real, imag);
-    }
-
     /// <summary>
     /// Creates a logical complex tensor whose physical GPU buffer contains two
     /// contiguous float32 planes: real values followed by imaginary values.
@@ -28298,21 +28284,52 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        var (hostReal, hostImaginary) = DecomposeComplex(tensor);
-        IGpuBuffer? uploadedReal = null;
-        IGpuBuffer? uploadedImaginary = null;
+        // A host complex tensor goes up ONCE, interleaved as it is laid out, and is split into the real and imaginary
+        // planes by the device's deinterleave kernel. Splitting it on the host first (two passes through the
+        // per-element indexer and two uploads) left the work of every complex op on a host input on the CPU -- the
+        // GPU residency probe saw TensorReal / TensorImag launch no kernel at all (#1112).
+        var interleaved = InterleaveComplexHost(tensor);
+        IGpuBuffer? uploaded = null;
+        IGpuBuffer? deviceReal = null;
+        IGpuBuffer? deviceImaginary = null;
         try
         {
-            uploadedReal = backend.AllocateBuffer(hostReal);
-            uploadedImaginary = backend.AllocateBuffer(hostImaginary);
-            return (new OwnedBuffer(uploadedReal, true), new OwnedBuffer(uploadedImaginary, true));
+            uploaded = backend.AllocateBuffer(interleaved);
+            deviceReal = backend.AllocateBuffer(n);
+            deviceImaginary = backend.AllocateBuffer(n);
+            backend.DeinterleaveComplex(uploaded, deviceReal, deviceImaginary, n);
+            return (new OwnedBuffer(deviceReal, true), new OwnedBuffer(deviceImaginary, true));
         }
         catch
         {
-            uploadedReal?.Dispose();
-            uploadedImaginary?.Dispose();
+            deviceReal?.Dispose();
+            deviceImaginary?.Dispose();
             throw;
         }
+        finally
+        {
+            // The deinterleave kernel may still be queued: release the upload only after that work (the legacy
+            // buffer pool would otherwise hand the allocation to the next request while the kernel still reads it).
+            if (uploaded is not null) DisposeBufferAfterQueuedUse(backend, uploaded);
+        }
+    }
+
+    /// <summary>
+    /// The tensor's logical elements as interleaved float32 (re, im) pairs -- the per-element conversion the former host split
+    /// used (ToDouble, then float), read through one logical-order pass.
+    /// </summary>
+    private static float[] InterleaveComplexHost<T>(Tensor<Complex<T>> tensor)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var source = tensor.GetFlattenedData();
+        int n = tensor.Length;
+        var interleaved = new float[2 * n];
+        for (int i = 0; i < n; i++)
+        {
+            interleaved[2 * i] = (float)ops.ToDouble(source[i].Real);
+            interleaved[2 * i + 1] = (float)ops.ToDouble(source[i].Imaginary);
+        }
+        return interleaved;
     }
 
     private static int[] NormalizeFftAxes(int[] axes, int rank)

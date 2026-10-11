@@ -26,7 +26,8 @@ public enum GpuReadbackContract
 {
     None = 0,
     DynamicResultShape,
-    LegacyHostOutput
+    LegacyHostOutput,
+    ElementValidation
 }
 
 /// <summary>
@@ -598,6 +599,7 @@ public sealed class OpCase
         GpuReadbackContract.None => 0,
         GpuReadbackContract.DynamicResultShape => 1,
         GpuReadbackContract.LegacyHostOutput => 1,
+        GpuReadbackContract.ElementValidation => 1,
         _ => throw new InvalidOperationException($"Unknown GPU readback contract: {GpuReadbackContract}.")
     };
 
@@ -608,6 +610,8 @@ public sealed class OpCase
             "One metadata transfer is required to construct the synchronous host-owned Tensor.Shape.",
         GpuReadbackContract.LegacyHostOutput =>
             "One transfer is required by the legacy host-owned output; a tensor-valued overload is the resident alternative.",
+        GpuReadbackContract.ElementValidation =>
+            "One 8-byte validation-flag transfer raises the CPU's exception for an invalid element (a data-dependent argument check).",
         _ => throw new InvalidOperationException($"Unknown GPU readback contract: {GpuReadbackContract}.")
     };
 

@@ -62,12 +62,16 @@ public partial class CpuEngine
             double draw = SampleBinomialBtrs(n, q, rng);
             return flip ? n - draw : draw;
         }
-        double logQ = Math.Log(1 - q);
+        // Log1p: for q below ~1e-16, Math.Log(1 - q) rounds to 0, the step became -infinity, and its (long) cast
+        // (saturating on .NET 9+) kept the position negative forever. Each step is checked against the remaining
+        // trials before it is added, so an enormous step ends the walk instead of overflowing the position.
+        double logQ = SpecialFunctions.Log1p(-q);
         long successes = 0, position = 0;
         while (true)
         {
-            position += (long)Math.Floor(Math.Log(1 - rng.NextDouble()) / logQ) + 1;
-            if (position > n) break;
+            double step = Math.Floor(Math.Log(1 - rng.NextDouble()) / logQ) + 1;
+            if (!(step <= n - position)) break;
+            position += (long)step;
             successes++;
         }
         return flip ? n - successes : successes;
@@ -193,7 +197,9 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorGeometric<T>(int[] shape, double p, int? seed = null)
     {
         if (p <= 0 || p > 1) throw new ArgumentOutOfRangeException(nameof(p), "p must be in (0, 1].");
-        return Sample<T>(shape, seed, rng => p == 1 ? 1 : Math.Max(1, Math.Ceiling(Math.Log(1 - rng.NextDouble()) / Math.Log(1 - p))));
+        // Log1p: for p below ~1e-16, Math.Log(1 - p) rounds to 0 and every draw would be infinite.
+        double logQ = SpecialFunctions.Log1p(-p);
+        return Sample<T>(shape, seed, rng => p == 1 ? 1 : Math.Max(1, Math.Ceiling(Math.Log(1 - rng.NextDouble()) / logQ)));
     }
 
     /// <inheritdoc/>
