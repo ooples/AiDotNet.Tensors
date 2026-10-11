@@ -135,6 +135,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     /// <summary>Shortest row SumAxis reduces with one block per row; see <see cref="SumAxis"/>.</summary>
     internal const int SumAxisRowsMinReduce = 32;
+
+    // How many row sums took the split path (#1150): lets tests assert the dispatch, not only the result.
+    private long _splitRowSumLaunches;
+    internal long SplitRowSumLaunches => System.Threading.Interlocked.Read(ref _splitRowSumLaunches);
+
+    // #1150: rows at least this long, when there are fewer than two per SM, are split across blocks.
+    internal const int SplitRowMinReduce = 64 * 1024;
+
+    // ... into chunks of at least this many elements (32 per thread of a 256-thread block).
+    internal const int SplitRowChunkMin = 8 * 1024;
     private const int MaxRnnBlockSize = 1024;
     // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
     private const int Fp16ByteWidth = 2;
@@ -1194,6 +1204,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Optional P2 serving kernel; its public call degrades gracefully.
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
+        CompileFusedAttentionModule(device);   // #1141: optional; on failure the engine keeps its other attention paths
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         try
         {
@@ -5124,6 +5135,35 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // uncoalesced, and serial when there are few rows. It was 97.8% of GPU time in N-BEATS training, whose
         // bias and basis gradients are ≤256 rows (#1804). Short rows keep sum_axis: a block per 2-element row
         // would idle most of its threads.
+        // #1150: few long rows (a full reduction is one) would leave all but a handful of SMs idle with a block per
+        // row -- 33.5M floats took 2.3 ms on one block. Split each row into chunks of about 4 blocks per SM, sum them
+        // into partials, then reduce the partials with this same method. Fixed partition and order: deterministic.
+        if (reduceSize >= SplitRowMinReduce && outerSize < 2 * Math.Max(1, ComputeUnits)
+            && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
+        {
+            // Ceilings in 64 bits: reduceSize can be close to int.MaxValue.
+            int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SplitRowChunkMin - 1) / SplitRowChunkMin,
+                4L * Math.Max(1, ComputeUnits) / outerSize));
+            int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+            chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+            using var partial = AllocateStreamOrderedScratchBuffer(outerSize * chunks);
+            using (PushContext())
+            {
+                IntPtr inPtr = A.Handle, partialPtr = partial.Handle;
+                int reduceArg = reduceSize, chunksArg = chunks, lenArg = chunkLen;
+                unsafe
+                {
+                    void** splitArgs = stackalloc void*[5];
+                    splitArgs[0] = &inPtr; splitArgs[1] = &partialPtr; splitArgs[2] = &reduceArg;
+                    splitArgs[3] = &chunksArg; splitArgs[4] = &lenArg;
+                    LaunchKernel2D(splitKernel, (uint)chunks, (uint)outerSize, DefaultBlockSize, 1, splitArgs);
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _splitRowSumLaunches);
+            SumAxis(partial, B, outerSize, chunks);
+            return;
+        }
+
         bool blockPerRow = reduceSize >= SumAxisRowsMinReduce;
         string kernelName = blockPerRow ? "sum_axis_rows" : "sum_axis";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
@@ -17991,6 +18031,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             _activationModule = IntPtr.Zero;
         }
 
+        if (_fusedAttentionModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_fusedAttentionModule);
+            _fusedAttentionModule = IntPtr.Zero;
+        }
         if (_torchParityElementwiseModule != IntPtr.Zero)
         {
             CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
