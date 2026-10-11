@@ -262,11 +262,22 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
     }
 
+    // The size-only shorthands below push exactly one word. A kernel whose push-constant block is larger must pass
+    // every word explicitly: vkCmdPushConstants would otherwise read past the one-element array.
+    private static void RequireSizeOnlyPush(uint pushConstantSize)
+    {
+        if (pushConstantSize != sizeof(uint))
+            throw new ArgumentException(
+                $"This kernel declares {pushConstantSize} bytes of push constants; pass each value explicitly instead of the size-only shorthand.",
+                nameof(pushConstantSize));
+    }
+
     /// <summary>
     /// Executes a GLSL-compiled compute pipeline with 2 buffers + push constants.
     /// </summary>
     private void GlslUnaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         // Single-parameter shorthand — pushes {size} as the only push constant
         GlslUnaryOp(glslSource, A, B, size, new uint[] { (uint)size }, pushConstantSize);
     }
@@ -323,6 +334,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslBinaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslBinaryOp(glslSource, A, B, C, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -379,6 +391,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslGenerateOp(string glslSource, IGpuBuffer O, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslGenerateOp(glslSource, O, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -403,6 +416,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslQuadOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslQuadOp(glslSource, A, B, C, D, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -428,6 +442,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslQuintOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, IGpuBuffer E, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslQuintOp(glslSource, A, B, C, D, E, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -775,6 +790,11 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         int workgroupSize = VulkanKernels.WorkgroupSize)
     {
         if (workgroupSize <= 0) throw new ArgumentOutOfRangeException(nameof(workgroupSize));
+        if (pushConstants is null) throw new ArgumentNullException(nameof(pushConstants));
+        if ((long)pushConstants.Length * sizeof(uint) < pushConstantSize)
+            throw new ArgumentException(
+                $"The kernel declares {pushConstantSize} bytes of push constants but only {pushConstants.Length * sizeof(uint)} were supplied.",
+                nameof(pushConstants));
         // Batch mode: record into batch command buffer without immediate submit
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
