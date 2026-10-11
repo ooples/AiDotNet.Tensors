@@ -100,6 +100,14 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         => TryRent(size, GpuBufferPoolAffinity.Global, out buffer);
 
     public bool TryRent(int size, GpuBufferPoolAffinity affinity, out TBuffer? buffer)
+        => TryRent(size, affinity, exactCapacity: false, out buffer);
+
+    /// <summary>
+    /// Rents a pooled buffer. With <paramref name="exactCapacity"/> only a buffer of exactly
+    /// <paramref name="size"/> elements is taken, for a backend whose buffers cannot carry a logical size smaller
+    /// than their allocation.
+    /// </summary>
+    public bool TryRent(int size, GpuBufferPoolAffinity affinity, bool exactCapacity, out TBuffer? buffer)
     {
         buffer = null;
         if (Volatile.Read(ref _disposed) != 0 || size <= 0 || size > _maxSize)
@@ -123,7 +131,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 // Power-of-two bucketing can contain different physical capacities (for example,
                 // both 6272 and 8192 elements in bucket 8192). Keep searching instead of turning
                 // an undersized top entry into a false miss when a sufficient entry is also pooled.
-                if (candidate.Capacity < size)
+                if (candidate.Capacity < size || (exactCapacity && candidate.Capacity != size))
                 {
                     (undersized ??= new List<TBuffer>()).Add(candidate);
                     continue;

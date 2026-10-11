@@ -1397,6 +1397,47 @@ class Program
             return;
         }
 
+        // Cost of allocating and freeing a Vulkan device buffer, alone and around a small op
+        if (args[0] == "--vulkan-alloc")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            static double Median(Func<double> sample)
+            {
+                var samples = new double[9];
+                for (int s = 0; s < samples.Length; s++) samples[s] = sample();
+                Array.Sort(samples);
+                return samples[samples.Length / 2];
+            }
+            foreach (int n in new[] { 16, 4096, 262144, 4194304 })
+            {
+                using var x = vb.AllocateBuffer(new float[n]);
+                for (int i = 0; i < 50; i++) { using var w = vb.AllocateBuffer(n); vb.Abs(x, w, n); }
+                const int calls = 200;
+                double alloc = Median(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < calls; i++) { using var t = vb.AllocateBuffer(n); }
+                    return sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                });
+                double opFresh = Median(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < calls; i++) { using var t = vb.AllocateBuffer(n); vb.Abs(x, t, n); }
+                    return sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                });
+                using var reused = vb.AllocateBuffer(n);
+                double opReused = Median(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < calls; i++) vb.Abs(x, reused, n);
+                    return sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                });
+                Console.WriteLine($"VKALLOC n={n} allocate+free={alloc:F1}us abs-into-new-buffer={opFresh:F1}us abs-into-reused-buffer={opReused:F1}us");
+            }
+            return;
+        }
+
         // Run Vulkan backend diagnostics and bottleneck analysis
         if (args[0] == "--vulkan")
         {
