@@ -202,6 +202,37 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <summary>
     /// Gets or creates a compute pipeline for the specified kernel.
     /// </summary>
+    /// <summary>Validates and journals one dispatch (#996) so a device fault can be attributed to the kernel.</summary>
+    private static void JournalDispatch(VulkanComputePipeline pipeline, uint workgroups, int workgroupSize)
+    {
+        long global = (long)workgroups * workgroupSize;
+        GpuKernelDiagnostics.ValidateLaunch(pipeline.Name, handleIsValid: pipeline.Handle != IntPtr.Zero, stagedArgCount: 0,
+            declaredArgCount: -1, globalSize: global, localSize: workgroupSize);
+        GpuKernelDiagnostics.RecordLaunch(pipeline.Name, global, workgroupSize, 0);
+    }
+
+    private static readonly Lazy<Dictionary<string, string>> GlslShaderNames = new Lazy<Dictionary<string, string>>(() =>
+    {
+        var names = new Dictionary<string, string>(StringComparer.Ordinal);
+        const System.Reflection.BindingFlags Statics = System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        foreach (var type in new[] { typeof(VulkanGlslKernels), typeof(VulkanBatchExecutionKernels) })
+        {
+            foreach (var property in type.GetProperties(Statics))
+                if (property.PropertyType == typeof(string) && property.GetIndexParameters().Length == 0
+                    && property.GetValue(null) is string source && !names.ContainsKey(source))
+                    names[source] = type.Name + "." + property.Name;
+            foreach (var field in type.GetFields(Statics))
+                if (field.FieldType == typeof(string) && field.GetValue(null) is string source && !names.ContainsKey(source))
+                    names[source] = type.Name + "." + field.Name;
+        }
+        return names;
+    });
+
+    /// <summary>The shader's declaring member when it is one of the library's GLSL sources, else a source-hash tag.</summary>
+    private static string GlslShaderName(string source, string sourceHash)
+        => GlslShaderNames.Value.TryGetValue(source, out var name) ? name : "glsl:" + sourceHash.Substring(0, 12);
+
     private VulkanComputePipeline? GetOrCreatePipeline(VulkanKernelType kernelType, int bindingCount, uint pushConstantSize = 0)
     {
         var cacheKey = (kernelType, bindingCount, pushConstantSize);
@@ -217,6 +248,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
+        if (pipeline is not null) pipeline.Name = kernelType.ToString();
         if (pipeline != null)
         {
             _pipelineCache.TryAdd(cacheKey, pipeline);
@@ -251,6 +283,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         try
         {
             var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
+        if (pipeline is not null) pipeline.Name = GlslShaderName(glslSource, sourceHash);
             if (pipeline is not null)
                 _glslPipelineCache.TryAdd(cacheKey, pipeline);
             return pipeline;
@@ -790,6 +823,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
                 VulkanNativeBindings.vkCmdPushConstants(batchCmd, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, ptr);
             }
             uint batchWgCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
+            JournalDispatch(pipeline, batchWgCount, workgroupSize);
             VulkanNativeBindings.vkCmdDispatch(batchCmd, batchWgCount, 1, 1);
             _batchDispatchCount++;
             return;
@@ -817,6 +851,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         uint workgroupCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
+        JournalDispatch(pipeline, workgroupCount, workgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
         VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
         _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
@@ -870,6 +905,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
             // Dispatch
             uint wgCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+            JournalDispatch(pipeline, wgCount, VulkanKernels.WorkgroupSize);
             VulkanNativeBindings.vkCmdDispatch(batchCmd, wgCount, 1, 1);
 
             _batchDispatchCount++;
@@ -911,6 +947,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             0, sizeof(uint), &size);
 
         uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+        JournalDispatch(pipeline, workgroupCount, VulkanKernels.WorkgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
         VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
@@ -972,6 +1009,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         // Dispatch compute
         uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+        JournalDispatch(pipeline, workgroupCount, VulkanKernels.WorkgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
         // End recording

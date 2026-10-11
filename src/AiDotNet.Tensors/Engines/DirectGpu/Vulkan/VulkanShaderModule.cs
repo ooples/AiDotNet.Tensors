@@ -190,6 +190,9 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
     private readonly VulkanDevice _device;
     private IntPtr _descriptorSetLayout;
     private Action? _pendingBatchFlush;
+
+    /// <summary>What the launch journal calls this pipeline (#996).</summary>
+    internal string Name { get; set; } = "vulkan-pipeline";
     private IntPtr _pipelineLayout;
     private IntPtr _pipeline;
     private IntPtr _descriptorPool;

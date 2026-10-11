@@ -65,6 +65,13 @@ public sealed class WebGpuShaderModule : IDisposable
         return moduleId;
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> PipelineNames =
+        new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
+
+    /// <summary>The module and entry point a pipeline id was created from, for the launch journal.</summary>
+    internal static string DescribePipeline(int pipelineId)
+        => PipelineNames.TryGetValue(pipelineId, out var name) ? name : "webgpu-pipeline#" + pipelineId;
+
     /// <summary>
     /// Creates or retrieves a cached compute pipeline.
     /// </summary>
@@ -92,6 +99,7 @@ public sealed class WebGpuShaderModule : IDisposable
         }
 
         _pipelines[pipelineKey] = pipelineId;
+        PipelineNames[pipelineId] = "webgpu:" + pipelineKey;
         return pipelineId;
     }
 
@@ -173,6 +181,9 @@ public sealed class WebGpuBindGroup : IDisposable
         }
 
         _pipelineId = pipelineId;
+        // Every dispatch binds a group first, so this is where the launch journal sees WebGPU work (#996). The
+        // work size is set by the dispatch that follows, so it is recorded as unknown (0).
+        GpuKernelDiagnostics.RecordLaunch(WebGpuShaderModule.DescribePipeline(pipelineId), 0, 0, buffers.Length);
 
         var bufferIds = new int[buffers.Length];
         for (int i = 0; i < buffers.Length; i++)

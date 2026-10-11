@@ -449,7 +449,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             var function = _shaderLibrary.GetFunction(library, kernelName);
             try
             {
-                return _shaderLibrary.CreatePipelineState(function);
+                var state = _shaderLibrary.CreatePipelineState(function);
+                // Names the pipeline in the launch journal (#996).
+                GpuKernelDiagnostics.RegisterKernelName(state.Handle, libraryName + ":" + kernelName);
+                return state;
             }
             finally
             {
