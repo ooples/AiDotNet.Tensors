@@ -22,8 +22,9 @@ public partial class Tensor<T>
     private const string Ellipsis = "...";
     private string?[]? _names;
 
-    /// <summary>The name of each dimension; null entries are unnamed (torch <c>Tensor.names</c>).</summary>
-    public IReadOnlyList<string?> Names => _names ?? new string?[Rank];
+    /// <summary>The name of each dimension; null entries are unnamed (torch <c>Tensor.names</c>). A read-only view of
+    /// the tensor's own copy: changing the array a caller passed in, or casting this back, cannot change the names.</summary>
+    public IReadOnlyList<string?> Names => Array.AsReadOnly(_names ?? new string?[Rank]);
 
     /// <summary>True when any dimension has a name (torch <c>has_names</c>).</summary>
     public bool HasNames() => _names is not null && _names.Any(n => n is not null);
@@ -84,6 +85,12 @@ public partial class Tensor<T>
     public Tensor<T> AlignTo(params string[] names)
     {
         if (names is null) throw new ArgumentNullException(nameof(names));
+        // Validate before building the order: null / empty names would become dimensions that later name checks
+        // reject, and a second "..." could slip through when the first expands to nothing.
+        if (names.Any(n => n is null || n.Length == 0))
+            throw new ArgumentException("align_to names must be non-null and non-empty.", nameof(names));
+        if (names.Count(n => n == Ellipsis) > 1)
+            throw new ArgumentException("At most one \"...\" per name list.", nameof(names));
         var current = Names;
         if (current.Any(n => n is null)) throw new InvalidOperationException("align_to needs every dimension of the tensor named.");
         // "..." covers the tensor's dimensions not listed, in their order.
@@ -98,15 +105,55 @@ public partial class Tensor<T>
             if (!order.Contains(c!)) throw new InvalidOperationException($"align_to would drop dimension '{c}'; list it or use \"...\".");
         if (order.Distinct().Count() != order.Count) throw new ArgumentException("align_to names must be distinct.", nameof(names));
 
-        IEngine engine = AiDotNetEngine.Current;
-        var present = order.Where(n => current.Contains(n)).ToList();
-        var perm = present.Select(n => current.ToList().IndexOf(n)).ToArray();
-        var permuted = perm.SequenceEqual(Enumerable.Range(0, Rank)) ? this : engine.TensorPermute(this, perm);
-        var shape = order.Select(n => current.Contains(n) ? _shape[current.ToList().IndexOf(n)] : 1).ToArray();
-        var aligned = shape.SequenceEqual(permuted._shape) ? permuted : engine.Reshape(permuted, shape);
-        var result = ReferenceEquals(aligned, this) ? NamedAlias() : aligned;
+        var currentList = current.ToList();
+        var present = order.Where(n => currentList.Contains(n)).ToList();
+        var perm = present.Select(n => currentList.IndexOf(n)).ToArray();
+        if (perm.SequenceEqual(Enumerable.Range(0, Rank)) && order.Count == Rank)
+        {
+            var same = NamedAlias();
+            same._names = order.Cast<string?>().ToArray();
+            return same;
+        }
+        if (IsSparse)
+        {
+            // A sparse tensor has no strided storage to view: permute and reshape through the engine (recorded ops).
+            IEngine engine = AiDotNetEngine.Current;
+            var permuted = engine.TensorPermute(this, perm);
+            var sparseShape = order.Select(n => currentList.Contains(n) ? _shape[currentList.IndexOf(n)] : 1).ToArray();
+            var sparseAligned = sparseShape.SequenceEqual(permuted._shape) ? permuted : engine.Reshape(permuted, sparseShape);
+            sparseAligned._names = order.Cast<string?>().ToArray();
+            return sparseAligned;
+        }
+
+        // One strided view over the same storage (host and device): each listed dimension keeps its stride, each
+        // inserted size-1 dimension takes stride 0. A permute followed by a reshape would materialize the
+        // non-contiguous permutation, so writes through the result would not reach this tensor.
+        var shape = new int[order.Count];
+        var strides = new int[order.Count];
+        for (int i = 0; i < order.Count; i++)
+        {
+            int source = currentList.IndexOf(order[i]);
+            shape[i] = source >= 0 ? _shape[source] : 1;
+            strides[i] = source >= 0 ? _strides[source] : 0;
+        }
+        var result = CreateStorageView(shape, strides, _storageOffset);
+        DifferentiableOps.RecordUnary("AlignTo", result, this, AlignToBackward,
+            new object[] { perm, perm.Select(d => _shape[d]).ToArray() });
         result._names = order.Cast<string?>().ToArray();
         return result;
+    }
+
+    // The gradient of AlignTo: drop the inserted size-1 dimensions, then undo the permutation.
+    private static void AlignToBackward(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var perm = (int[])savedState[0];
+        var permutedShape = (int[])savedState[1];
+        var squeezed = engine.Reshape(gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous(), permutedShape);
+        var inverse = new int[perm.Length];
+        for (int i = 0; i < perm.Length; i++) inverse[perm[i]] = i;
+        var back = engine.TensorPermute(squeezed, inverse);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], back.IsContiguous ? back : back.Contiguous(), engine);
     }
 
     /// <summary><see cref="AlignTo"/> the names of <paramref name="other"/> (torch <c>align_as</c>).</summary>
@@ -130,12 +177,14 @@ public partial class Tensor<T>
         return tensors.Select(t => t.AlignTo(order)).ToArray();
     }
 
-    // A tape-tracked view over the same storage, the result of every naming operation.
+    // A tape-tracked view over the same storage, the result of every naming operation. Dense tensors -- contiguous or
+    // not, host or device -- get a storage view (CreateStorageView carries a device buffer as a non-owning alias, so a
+    // write through either side reaches the other); a sparse tensor has no strided storage to view and is copied.
     private Tensor<T> NamedAlias()
     {
-        var alias = IsSparse || !IsContiguous && IsGpuResident
+        var alias = IsSparse
             ? (Tensor<T>)Clone()
-            : new Tensor<T>(DataVector, _shape, _strides, _storageOffset, _storage);
+            : CreateStorageView((int[])_shape.Clone(), (int[])_strides.Clone(), _storageOffset);
         DifferentiableOps.RecordUnary("Rename", alias, this, BackwardFunctions<T>.InPlaceAssignBackward);
         return alias;
     }
@@ -174,6 +223,7 @@ public partial class Tensor<T>
         return r;
     }
 
+    // Validates names and returns the tensor's own copy of them.
     private static string?[] CheckNames(string?[] names)
     {
         var seen = new HashSet<string>();
@@ -183,6 +233,6 @@ public partial class Tensor<T>
             if (n.Length == 0 || n == Ellipsis) throw new ArgumentException($"'{n}' is not a dimension name.");
             if (!seen.Add(n)) throw new ArgumentException($"The name '{n}' is used for two dimensions.");
         }
-        return names;
+        return (string?[])names.Clone();
     }
 }

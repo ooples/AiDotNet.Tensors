@@ -13,21 +13,46 @@ public partial class SparseTensor<T>
 {
     /// <summary>
     /// The COO indices as a [2, nnz] tensor, row indices then column indices, in coalesced (row-major, duplicates
-    /// summed) order (torch <c>Tensor.indices()</c>, which requires a coalesced tensor).
+    /// summed) order (torch <c>Tensor.indices()</c>, which requires a coalesced tensor). A stored zero keeps its
+    /// index, as torch's coalesce keeps it.
     /// </summary>
     public Tensor<int> Indices()
     {
-        var c = Coalesce();
-        int nnz = c.NonZeroCount;
+        var (rows, cols, _) = CoalesceKeepZeros(this);
+        int nnz = rows.Length;
         var data = new int[2 * nnz];
-        Array.Copy(c.RowIndices, 0, data, 0, nnz);
-        Array.Copy(c.ColumnIndices, 0, data, nnz, nnz);
+        Array.Copy(rows, 0, data, 0, nnz);
+        Array.Copy(cols, 0, data, nnz, nnz);
         return new Tensor<int>(data, new[] { 2, nnz });
+    }
+
+    // Coalesces the stored entries -- sorted row-major, duplicate coordinates summed -- WITHOUT dropping entries whose
+    // value (or sum) is zero: a stored position is part of the sparsity pattern whatever its value. The general
+    // Coalesce() elides zeros, which would silently drop stored positions here.
+    private static (int[] Rows, int[] Cols, T[] Values) CoalesceKeepZeros(SparseTensor<T> tensor)
+    {
+        var coo = tensor.ToCoo();
+        int n = coo.NonZeroCount;
+        var vals = coo.DataVector.AsSpan();
+        var order = new int[n];
+        for (int i = 0; i < n; i++) order[i] = i;
+        var r = coo.RowIndices; var c = coo.ColumnIndices;
+        Array.Sort(order, (x, y) => r[x] != r[y] ? r[x].CompareTo(r[y]) : c[x] != c[y] ? c[x].CompareTo(c[y]) : x.CompareTo(y));
+        var ops = MathHelper.GetNumericOperations<T>();
+        var rows = new List<int>(n); var cols = new List<int>(n); var values = new List<T>(n);
+        foreach (int i in order)
+        {
+            int last = rows.Count - 1;
+            if (last >= 0 && rows[last] == r[i] && cols[last] == c[i]) values[last] = ops.Add(values[last], vals[i]);
+            else { rows.Add(r[i]); cols.Add(c[i]); values.Add(vals[i]); }
+        }
+        return (rows.ToArray(), cols.ToArray(), values.ToArray());
     }
 
     /// <summary>
     /// A sparse tensor with <paramref name="mask"/>'s sparsity pattern and <paramref name="source"/>'s values at those
-    /// positions (torch <c>source.sparse_mask(mask)</c>). A sparse source contributes zero where it stores nothing.
+    /// positions (torch <c>source.sparse_mask(mask)</c>). Every index the mask stores is kept -- zero-valued entries and
+    /// duplicates included, each taking the source value. A sparse source contributes zero where it stores nothing.
     /// </summary>
     public static SparseTensor<T> SparseMask(Tensor<T> source, SparseTensor<T> mask)
     {
@@ -36,7 +61,7 @@ public partial class SparseTensor<T>
         if (source.Rank != 2 || source.Shape[0] != mask.Rows || source.Shape[1] != mask.Columns)
             throw new ArgumentException($"The source must be [{mask.Rows}, {mask.Columns}] like the mask.", nameof(source));
         var dense = source is SparseTensor<T> s ? s.ToDense() : source;
-        var pattern = mask.Coalesce();
+        var pattern = mask.ToCoo();   // the mask's own indices, as stored: no zero elision, no duplicate merging
         int nnz = pattern.NonZeroCount;
         var values = new T[nnz];
         for (int i = 0; i < nnz; i++) values[i] = dense[pattern.RowIndices[i], pattern.ColumnIndices[i]];
@@ -53,8 +78,8 @@ public partial class SparseTensor<T>
         int n = dense.Shape[1];
         var ri = new int[rows.Count * n]; var ci = new int[rows.Count * n]; var v = new T[rows.Count * n];
         int k = 0;
-        foreach (int r in rows)
-            for (int c = 0; c < n; c++) { ri[k] = r; ci[k] = c; v[k] = product[r * n + c]; k++; }
+        for (int a = 0; a < rows.Count; a++)
+            for (int c = 0; c < n; c++) { ri[k] = rows[a]; ci[k] = c; v[k] = product[a * n + c]; k++; }
         return new SparseTensor<T>(sparse.Rows, n, ri, ci, v);
     }
 
@@ -80,7 +105,9 @@ public partial class SparseTensor<T>
             throw new ArgumentException($"input is [{input.Rows}, {input.Columns}] but mat1 @ mat2 is [{product.Rows}, {product.Columns}].", nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var a = input.ToCoo(); var b = product;
-        int na = a.NonZeroCount, nb = b.NonZeroCount;
+        // beta == 0 ignores the input entirely, as torch.addmm: a NaN or infinity stored there must not leak in as
+        // 0 * NaN.
+        int na = ops.Equals(beta, ops.Zero) ? 0 : a.NonZeroCount, nb = b.NonZeroCount;
         var ri = new int[na + nb]; var ci = new int[na + nb]; var v = new T[na + nb];
         var av = a.DataVector.AsSpan(); var bv = b.DataVector.AsSpan();
         for (int i = 0; i < na; i++) { ri[i] = a.RowIndices[i]; ci[i] = a.ColumnIndices[i]; v[i] = ops.Multiply(beta, av[i]); }
@@ -92,7 +119,9 @@ public partial class SparseTensor<T>
     public static SparseTensor<T> Sspaddmm(SparseTensor<T> input, SparseTensor<T> mat1, Tensor<T> mat2, T beta, T alpha)
         => Saddmm(input, mat1, mat2, beta, alpha);
 
-    // The dense product restricted to the rows of `sparse` that store something: (those rows, row-major product).
+    // The dense product restricted to the rows of `sparse` that store something -- zero-valued entries included -- as
+    // (those rows, their products row-major by active-row ordinal): one row of n values per active row, not per row
+    // of the matrix (a 1,000,000-row matrix with one stored row needs one row of product).
     private static (List<int> Rows, T[] Product) RowProduct(SparseTensor<T> sparse, Tensor<T> dense)
     {
         if (sparse is null) throw new ArgumentNullException(nameof(sparse));
@@ -100,20 +129,23 @@ public partial class SparseTensor<T>
         if (dense.Rank != 2 || dense.Shape[0] != sparse.Columns)
             throw new ArgumentException($"Expected a dense [{sparse.Columns}, N] operand.", nameof(dense));
         var ops = MathHelper.GetNumericOperations<T>();
-        var c = sparse.Coalesce();
+        var (er, ec, ev) = CoalesceKeepZeros(sparse);
         int n = dense.Shape[1];
         var d = dense.IsContiguous ? dense : dense.Contiguous();
         var ds = d.AsSpan();
-        var product = new T[sparse.Rows * n];
-        for (int i = 0; i < product.Length; i++) product[i] = ops.Zero;
         var rows = new List<int>();
-        var vals = c.DataVector.AsSpan();
-        for (int e = 0; e < c.NonZeroCount; e++)
+        for (int e = 0; e < er.Length; e++)
+            if (rows.Count == 0 || rows[rows.Count - 1] != er[e]) rows.Add(er[e]);   // coalesced: rows ascend
+        var product = new T[rows.Count * n];
+        for (int i = 0; i < product.Length; i++) product[i] = ops.Zero;
+        int ordinal = -1, previous = -1;
+        for (int e = 0; e < er.Length; e++)
         {
-            int r = c.RowIndices[e], k = c.ColumnIndices[e];
-            if (rows.Count == 0 || rows[rows.Count - 1] != r) rows.Add(r);   // coalesced: rows ascend
-            T a = vals[e];
-            for (int j = 0; j < n; j++) product[r * n + j] = ops.Add(product[r * n + j], ops.Multiply(a, ds[k * n + j]));
+            if (er[e] != previous) { ordinal++; previous = er[e]; }
+            int k = ec[e];
+            T a = ev[e];
+            for (int j = 0; j < n; j++)
+                product[ordinal * n + j] = ops.Add(product[ordinal * n + j], ops.Multiply(a, ds[k * n + j]));
         }
         return (rows, product);
     }
