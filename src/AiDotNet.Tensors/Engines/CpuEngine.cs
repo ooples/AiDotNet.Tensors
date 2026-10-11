@@ -8179,10 +8179,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ReduceSum2DColumns(float[] src, float[] dst, int rows, int cols)
     {
-        int blocks = (cols + ReduceColumnBlock - 1) / ReduceColumnBlock;
+        int block = ReductionInnerBlock(1, cols);   // a [8192, 256] column sum had four 64-wide units
+        int blocks = (cols + block - 1) / block;
         CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * cols, blk =>
         {
-            int c0 = blk * ReduceColumnBlock, c1 = Math.Min(cols, c0 + ReduceColumnBlock);
+            int c0 = blk * block, c1 = Math.Min(cols, c0 + block);
             Array.Clear(dst, c0, c1 - c0);
             for (int r = 0; r < rows; r++)
             {
@@ -8194,10 +8195,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ReduceSum2DColumns(double[] src, double[] dst, int rows, int cols)
     {
-        int blocks = (cols + ReduceColumnBlock - 1) / ReduceColumnBlock;
+        int block = ReductionInnerBlock(1, cols);   // a [8192, 256] column sum had four 64-wide units
+        int blocks = (cols + block - 1) / block;
         CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * cols, blk =>
         {
-            int c0 = blk * ReduceColumnBlock, c1 = Math.Min(cols, c0 + ReduceColumnBlock);
+            int c0 = blk * block, c1 = Math.Min(cols, c0 + block);
             Array.Clear(dst, c0, c1 - c0);
             for (int r = 0; r < rows; r++)
             {
@@ -33332,11 +33334,15 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputShape = GetReductionOutputShape(inputShape, normalizedAxes, keepDims);
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
-        var outputData = new T[outputSize];
-        maxIndices = new int[outputSize];
+        T minVal = numOps.MinValue;
+        // The dense single-axis path initializes every cell itself, in parallel: skip the zeroing and the serial init.
+        bool denseMax = normalizedAxes.Length == 1 && input.IsContiguous && (typeof(T) == typeof(float) || typeof(T) == typeof(double));
+        var outputData = denseMax ? UninitializedArray<T>(outputSize) : new T[outputSize];
+        maxIndices = denseMax ? UninitializedArray<int>(outputSize) : new int[outputSize];
+        if (denseMax && TryReduceMaxSingleAxisDense(inputData, outputData, maxIndices, inputShape, normalizedAxes[0], minVal))
+            goto maxRecord;
 
         // Initialize with minimum values
-        T minVal = numOps.MinValue;
         for (int i = 0; i < outputSize; i++)
         {
             outputData[i] = minVal;
@@ -33346,9 +33352,6 @@ public partial class CpuEngine : ITensorLevelEngine
         // Allocation-free odometer (replaces per-element FlatToMultiIndex +
         // new List<int> + MultiToFlatIndex + Contains). inputData is logical
         // row-major; advance the output flat index incrementally as we walk it.
-        if (normalizedAxes.Length == 1 && input.IsContiguous
-            && TryReduceMaxSingleAxisDense(inputData, outputData, maxIndices, inputShape, normalizedAxes[0], minVal))
-            goto maxRecord;
 
         int maxRank = inputShape.Length;
         var maxOutStrideForDim = BuildReducedOutStrideForDim(inputShape, outputShape, normalizedAxes);
@@ -33522,6 +33525,25 @@ public partial class CpuEngine : ITensorLevelEngine
     // Inner-axis block a ReduceMean work unit covers (see TryReduceMeanSingleAxisDense).
     private const int ReduceMeanInnerBlock = 64;
 
+    // Inner columns per work unit: 64 (vector-friendly, a cache line per row read), halved down to 8 until there are
+    // about four units per thread -- a [8192, 256] axis-0 reduction otherwise had four units. Each column is still
+    // summed / scanned in axis order, so the result does not depend on the block.
+    private static int ReductionInnerBlock(int outer, int inner)
+    {
+        int block = ReduceMeanInnerBlock, wanted = 4 * Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
+        while (block > 8 && (long)outer * ((inner + block - 1) / block) < wanted) block >>= 1;
+        return block;
+    }
+
+    private static TItem[] UninitializedArray<TItem>(int length)
+    {
+#if NET5_0_OR_GREATER
+        return GC.AllocateUninitializedArray<TItem>(length);
+#else
+        return new TItem[length];
+#endif
+    }
+
     /// <summary>
     /// Mean over ONE axis of a dense row-major float/double array: work units are (outer index, 64-wide inner block),
     /// split across threads, so it parallelizes whether the reduced axis is the last one (many outer rows) or the first
@@ -33539,7 +33561,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outer = 1, inner = 1, axisSize = shape[axis];
         for (int d = 0; d < axis; d++) outer *= shape[d];
         for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
-        int blocks = (inner + ReduceMeanInnerBlock - 1) / ReduceMeanInnerBlock;
+        int block = ReductionInnerBlock(outer, inner);
+        int blocks = (inner + block - 1) / block;
         long units = (long)outer * blocks;
         if (units > int.MaxValue) return false;
         long work = (long)outer * axisSize * inner;
@@ -33548,7 +33571,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var src = (double[])(object)data; var dst = (double[])(object)outData; double init = (double)(object)minValue!;
             CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
             {
-                int o = u / blocks, j0 = (u % blocks) * ReduceMeanInnerBlock, j1 = Math.Min(inner, j0 + ReduceMeanInnerBlock);
+                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
                 int ob = o * inner, ib = o * axisSize * inner;
                 for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
                 for (int a = 0; a < axisSize; a++)
@@ -33563,7 +33586,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var src = (float[])(object)data; var dst = (float[])(object)outData; float init = (float)(object)minValue!;
             CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
             {
-                int o = u / blocks, j0 = (u % blocks) * ReduceMeanInnerBlock, j1 = Math.Min(inner, j0 + ReduceMeanInnerBlock);
+                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
                 int ob = o * inner, ib = o * axisSize * inner;
                 for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
                 for (int a = 0; a < axisSize; a++)
@@ -33582,7 +33605,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outer = 1, inner = 1, axisSize = shape[axis];
         for (int d = 0; d < axis; d++) outer *= shape[d];
         for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
-        int blocks = (inner + ReduceMeanInnerBlock - 1) / ReduceMeanInnerBlock;
+        int block = ReductionInnerBlock(outer, inner);
+        int blocks = (inner + block - 1) / block;
         long units = (long)outer * blocks;
         if (units > int.MaxValue) return false;
         long work = (long)outer * axisSize * inner;
@@ -33592,7 +33616,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double inv = 1.0 / axisSize;
             CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
             {
-                int o = u / blocks, j0 = (u % blocks) * ReduceMeanInnerBlock, j1 = Math.Min(inner, j0 + ReduceMeanInnerBlock);
+                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
                 int ob = o * inner, ib = o * axisSize * inner;
                 for (int j = j0; j < j1; j++) dst[ob + j] = 0;
                 for (int a = 0; a < axisSize; a++)
@@ -33609,7 +33633,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float inv = 1.0f / axisSize;
             CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
             {
-                int o = u / blocks, j0 = (u % blocks) * ReduceMeanInnerBlock, j1 = Math.Min(inner, j0 + ReduceMeanInnerBlock);
+                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
                 int ob = o * inner, ib = o * axisSize * inner;
                 for (int j = j0; j < j1; j++) dst[ob + j] = 0;
                 for (int a = 0; a < axisSize; a++)
@@ -35859,7 +35883,8 @@ public partial class CpuEngine : ITensorLevelEngine
         outputShape[axis] = totalAxisSize;
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
-        var outputData = new T[outputSize];
+        // Every path below writes every element, so skip the (serial) zeroing of a fresh array.
+        var outputData = UninitializedArray<T>(outputSize);
 
         // NCHWc8 fast path: channel-axis concat where every input is
         // NCHWc8 and each C is divisible by the cBlock. Physical layout is
