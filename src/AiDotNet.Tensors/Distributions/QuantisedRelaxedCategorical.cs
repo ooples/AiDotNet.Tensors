@@ -167,7 +167,8 @@ public sealed class RelaxedOneHotCategoricalInt4Distribution : DistributionBase
         var quant = SampleInt4(logits.AsSpan(), rng);
         var dense = Dequantize(quant);
         var output = new Tensor<float>((int[])logits._shape.Clone());
-        var dst = output.AsWritableSpan();
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < dense.Length; i++) dst[i] = dense[i];
 
         if (DifferentiableOps._anyTapeActive == 0) return output;
@@ -533,7 +534,8 @@ public sealed class RelaxedOneHotCategoricalFp4Distribution : DistributionBase
         var packed = SampleFp4(logits.AsSpan(), rng);
         var dense = Dequantize(packed);
         var output = new Tensor<float>((int[])logits._shape.Clone());
-        var dst = output.AsWritableSpan();
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < dense.Length; i++) dst[i] = dense[i];
 
         if (DifferentiableOps._anyTapeActive == 0) return output;

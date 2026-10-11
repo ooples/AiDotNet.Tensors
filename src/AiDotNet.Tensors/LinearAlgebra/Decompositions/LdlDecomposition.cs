@@ -37,8 +37,10 @@ internal static class LdlDecomposition
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
-        var ldData = ld.GetDataArray();
-        var pivData = pivots.GetDataArray();
+        using var ldDataLease = ld.LeaseArray();
+        var ldData = ldDataLease.Array;
+        using var pivDataLease = pivots.LeaseArray();
+        var pivData = pivDataLease.Array;
         int matStride = n * n;
         int pivStride = n;
 
@@ -67,10 +69,14 @@ internal static class LdlDecomposition
         for (int i = 0; i < rank - 2; i++) batch *= ld._shape[i];
 
         var result = new Tensor<T>((int[])b._shape.Clone());
-        var ldData = ld.GetDataArray();
-        var bData = b.GetDataArray();
-        var xData = result.GetDataArray();
-        var pivData = pivots.GetDataArray();
+        using var ldDataLease = ld.LeaseArray();
+        var ldData = ldDataLease.Array;
+        using var bDataLease = b.LeaseArray();
+        var bData = bDataLease.Array;
+        using var xDataLease = result.LeaseArray();
+        var xData = xDataLease.Array;
+        using var pivDataLease = pivots.LeaseArray();
+        var pivData = pivDataLease.Array;
         int matStride = n * n;
         int rhsStride = b.Rank == ld.Rank ? n * nrhs : n;
         int pivStride = n;
