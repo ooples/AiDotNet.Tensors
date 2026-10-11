@@ -118,6 +118,27 @@ public sealed class GpuBufferPoolAffinityTests
         Assert.Same(undersized, restored);
     }
 
+    [Fact]
+    public void Rent_WithExactCapacity_TakesOnlyAnExactMatch_AndKeepsTheOthersPooled()
+    {
+        using var pool = new GpuBufferPool<FakeBuffer>(maxPerSize: 4, maxSize: 1024);
+        var larger = new FakeBuffer(100);
+        var exact = new FakeBuffer(70);
+        pool.Return(larger);
+
+        // 100 would serve a request for 70 by capacity, but not exactly.
+        Assert.False(pool.TryRent(70, GpuBufferPoolAffinity.Global, exactCapacity: true, out _));
+        Assert.Equal(1, pool.PooledCount);
+        Assert.Equal(0, larger.ReleaseCount);
+
+        pool.Return(exact);
+        Assert.True(pool.TryRent(70, GpuBufferPoolAffinity.Global, exactCapacity: true, out var rented));
+        Assert.Same(exact, rented);
+        Assert.Equal(1, pool.PooledCount);
+        Assert.True(pool.TryRent(100, GpuBufferPoolAffinity.Global, exactCapacity: true, out var rentedLarger));
+        Assert.Same(larger, rentedLarger);
+    }
+
     private sealed class FakeBuffer : IGpuBuffer, IPoolableGpuBuffer
     {
         private int _size;
