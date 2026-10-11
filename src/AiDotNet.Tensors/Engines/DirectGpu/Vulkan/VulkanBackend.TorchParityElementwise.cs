@@ -356,6 +356,27 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         ParityDispatch("int_not", VulkanTorchParityElementwiseKernels.IntNot, n, new[] { (uint)n }, input, output);
     }
 
+    void ITorchParityElementwiseBackend.TorchParityInt64Binary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, int typeCode,
+        IGpuBuffer flag)
+    {
+        if (n <= 0) return;
+        RequireParityCapacity(a, 2L * n, nameof(a), "2n (int64 words)");
+        RequireParityCapacity(b, 2L * n, nameof(b), "2n (int64 words)");
+        RequireParityCapacity(output, 2L * n, nameof(output), "2n (int64 words)");
+        RequireParityInt64("int64_binary");
+        ParityDispatchValidating("int64_binary", VulkanTorchParityElementwiseKernels.Int64Binary, n,
+            new[] { (uint)n, Word(op), Word(typeCode) }, flag, a, b, output);
+    }
+
+    void ITorchParityElementwiseBackend.TorchParityInt64Not(IGpuBuffer input, IGpuBuffer output, int n, int typeCode)
+    {
+        if (n <= 0) return;
+        RequireParityCapacity(input, 2L * n, nameof(input), "2n (int64 words)");
+        RequireParityCapacity(output, 2L * n, nameof(output), "2n (int64 words)");
+        RequireParityInt64("int64_not");
+        ParityDispatch("int64_not", VulkanTorchParityElementwiseKernels.Int64Not, n, new[] { (uint)n, Word(typeCode) }, input, output);
+    }
+
     void ITorchParityElementwiseBackend.TorchParityInclusiveScan(IGpuBuffer input, IGpuBuffer output, int n)
     {
         if (n <= 0) return;

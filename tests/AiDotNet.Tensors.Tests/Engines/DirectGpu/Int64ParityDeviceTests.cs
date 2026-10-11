@@ -13,11 +13,10 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// int64 layout) and equal the CPU element for element -- min / max values, negative and oversized shift counts
 /// included -- with the CPU's exceptions for a zero divisor and for Int64 overflow.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class Int64ParityDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public abstract class Int64ParityDeviceTestsBase
 {
-    private readonly DirectGpuTensorEngineTestFixture _fixture;
-    public Int64ParityDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+    private readonly IDirectGpuTensorEngineFixture _fixture;
+    protected Int64ParityDeviceTestsBase(IDirectGpuTensorEngineFixture fixture) => _fixture = fixture;
 
     // Typed as IEngine: the GPU overrides are reached through the interface (a call on the concrete type can bind to
     // the inherited CPU method).
@@ -25,7 +24,7 @@ public class Int64ParityDeviceTests : IClassFixture<DirectGpuTensorEngineTestFix
     {
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         DirectGpuTensorEngine gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "These device kernels are CUDA-only.");
+        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels.");
         return gpu;
     }
 
@@ -183,4 +182,17 @@ public class Int64ParityDeviceTests : IClassFixture<DirectGpuTensorEngineTestFix
         Assert.True(secondUploads <= 1, $"the chained op uploaded {secondUploads} operands; the resident one should be reused");
         Assert.Equal(cpu.TensorFloorDivide(cpu.TensorBitwiseXor(a, b), b).ToArray(), second.ToArray());
     }
+}
+
+[Collection("VulkanGlobalState")]
+public class Int64ParityDeviceTests : Int64ParityDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    public Int64ParityDeviceTests(DirectGpuTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+/// <summary>The cases above on the Vulkan backend.</summary>
+[Collection("VulkanGlobalState")]
+public class Int64ParityVulkanDeviceTests : Int64ParityDeviceTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
+{
+    public Int64ParityVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }
