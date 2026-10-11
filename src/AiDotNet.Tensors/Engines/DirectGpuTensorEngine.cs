@@ -1640,7 +1640,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the vector's current values.
         return view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
             && shared.Handle != IntPtr.Zero && ReferenceEquals(state.Backend, backend)
-            && !state.IsSplitComplex && !state.ContainsRawInt32
+            && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64
             ? shared
             : null;
     }
@@ -1812,6 +1812,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -1953,6 +1954,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // held index bits rather than one float per element, and GetOrAllocateInt32IndexBuffer
         // forwards such a buffer to its consumer UNCONVERTED.
         tensor._gpuBufferContainsRawInt32 = false;
+        tensor._gpuBufferContainsRawInt64 = false;
         // ...and say so. Device and buffer are set together by Tensor.Gpu() and cleared together by
         // Tensor.Cpu(); leaving _device on a GPU after dropping the buffer produces a tensor that claims
         // GPU residency while nothing holds its data. That state is host-authoritative by this method's
@@ -2192,6 +2194,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Check caches without triggering CPU materialization
