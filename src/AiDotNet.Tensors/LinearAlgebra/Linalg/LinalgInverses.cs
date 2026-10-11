@@ -43,20 +43,16 @@ internal static class LinalgInverses
         double eps = typeof(T) == typeof(float) ? 1.19e-7 : 2.22e-16;
         double cutoff = rcond ?? (Math.Max(m, n) * eps);
 
-        using var sDataLease = S.LeaseArray();
-        var sData = sDataLease.Array;
-        using var uDataLease = U.LeaseArray();
-        var uData = uDataLease.Array;
-        using var vhDataLease = Vh.LeaseArray();
-        var vhData = vhDataLease.Array;
+        var sData = S.GetDataArray();
+        var uData = U.GetDataArray();
+        var vhData = Vh.GetDataArray();
 
         // Result shape: (..., N, M).
         var pShape = (int[])input._shape.Clone();
         pShape[rank - 2] = n;
         pShape[rank - 1] = m;
         var pinv = new Tensor<T>(pShape);
-        using var pDataLease = pinv.LeaseArray();
-        var pData = pDataLease.Array;
+        var pData = pinv.GetDataArray();
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
@@ -101,8 +97,7 @@ internal static class LinalgInverses
     {
         var shape = (int[])inputShape.Clone();
         var eye = new Tensor<T>(shape);
-        using var dataLease = eye.LeaseArray();
-        var data = dataLease.Array;
+        var data = eye.GetDataArray();
         int batch = 1;
         for (int i = 0; i < inputShape.Length - 2; i++) batch *= inputShape[i];
         int stride = n * n;

@@ -622,8 +622,7 @@ public partial class DirectGpuTensorEngine
             var contiguousFaces = faces.IsContiguous ? faces : (Tensor<int>)faces.Contiguous();
             if (!HasResidentIndexStorage(contiguousFaces))
             {
-                using var faceDataLease = contiguousFaces.LeaseArray();
-                var faceData = faceDataLease.Array;
+                var faceData = contiguousFaces.GetDataArray();
                 for (int i = 0; i < contiguousFaces.Length; i++)
                     if (faceData[i] < 0 || faceData[i] >= numVertices)
                         throw new ArgumentOutOfRangeException(nameof(faces),
@@ -1437,8 +1436,7 @@ public partial class DirectGpuTensorEngine
         {
             var prod = TensorMultiply(a, b);           // GPU elementwise [n]
             var sum = ReduceSum(prod, null, false);    // GPU reduce-all -> 1 element
-            using var spanLease = sum.Lease();
-            var span = spanLease.Span;
+            var span = sum.AsSpan();
             if (span.Length != 1) return base.TensorVecDot(a, b);
             return span[0];
         }
@@ -2233,8 +2231,7 @@ public partial class DirectGpuTensorEngine
         var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
         if (!HasResidentIndexStorage(contiguousIndices))
         {
-            using var indexDataLease = contiguousIndices.LeaseArray();
-            var indexData = indexDataLease.Array;
+            var indexData = contiguousIndices.GetDataArray();
             for (int i = 0; i < contiguousIndices.Length; i++)
                 if ((uint)indexData[i] >= (uint)destinationAxis)
                     throw new ArgumentOutOfRangeException(nameof(indices),
@@ -4153,8 +4150,7 @@ public partial class DirectGpuTensorEngine
             || Helpers.HostSync.IsPending(mask.DataVector))
             return false;
 
-        using var valuesLease = mask.Lease();
-        var values = valuesLease.Span;
+        var values = mask.AsSpan();
         for (int i = 0; i < values.Length; i++)
             if ((bool)values[i]) count++;
         return true;
@@ -4678,8 +4674,7 @@ public partial class DirectGpuTensorEngine
             int n = tensor.Length, count = indices.Length;
             if (!HasResidentIndexStorage(ci))
             {
-                using var indexDataLease = ci.LeaseArray();
-                var indexData = indexDataLease.Array;
+                var indexData = ci.GetDataArray();
                 for (int i = 0; i < count; i++)
                     if (indexData[i] < 0 || indexData[i] >= n)
                         throw new IndexOutOfRangeException(
@@ -5639,8 +5634,7 @@ public partial class DirectGpuTensorEngine
 
             if (!HasResidentIndexStorage(ci))
             {
-                using var indexDataLease = ci.LeaseArray();
-                var indexData = indexDataLease.Array;
+                var indexData = ci.GetDataArray();
                 for (int i = 0; i < idxAxis; i++)
                     if (indexData[i] < 0 || indexData[i] >= dstAxis)
                         throw new IndexOutOfRangeException(
@@ -5694,8 +5688,7 @@ public partial class DirectGpuTensorEngine
 
             if (!HasResidentIndexStorage(ci))
             {
-                using var indexDataLease = ci.LeaseArray();
-                var indexData = indexDataLease.Array;
+                var indexData = ci.GetDataArray();
                 for (int i = 0; i < idxAxis; i++)
                     if (indexData[i] < 0 || indexData[i] >= dstAxis)
                         throw new IndexOutOfRangeException(
@@ -7934,8 +7927,7 @@ public partial class DirectGpuTensorEngine
             for (int i = normalizedAxis + 1; i < input.Rank; i++) innerSize *= input.Shape._dims[i];
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                var indexData = indexDataLease.Array;
+                var indexData = contiguousIndices.GetDataArray();
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new ArgumentException(
@@ -7987,8 +7979,7 @@ public partial class DirectGpuTensorEngine
                 return base.Scatter(input, indices, values, axis);   // duplicates: see TensorIndexCopy
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                var indexData = indexDataLease.Array;
+                var indexData = contiguousIndices.GetDataArray();
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new ArgumentException(
@@ -8040,8 +8031,7 @@ public partial class DirectGpuTensorEngine
             var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                var indexData = indexDataLease.Array;
+                var indexData = contiguousIndices.GetDataArray();
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= columns)
                         throw new IndexOutOfRangeException(
@@ -8102,8 +8092,7 @@ public partial class DirectGpuTensorEngine
             int sourceAxis = packed.Shape._dims[normalizedAxis];
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                int[] indexData = indexDataLease.Array;
+                int[] indexData = contiguousIndices.GetDataArray();
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= sourceAxis)
                         throw new IndexOutOfRangeException(
@@ -8164,8 +8153,7 @@ public partial class DirectGpuTensorEngine
                         nameof(source));
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                using var indexDataLease = contiguousIndices.LeaseArray();
-                int[] indexData = indexDataLease.Array;
+                int[] indexData = contiguousIndices.GetDataArray();
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= destinationAxis)
                         throw new IndexOutOfRangeException(
@@ -8322,8 +8310,7 @@ public partial class DirectGpuTensorEngine
                     : (Tensor<int>)intIndices.Contiguous();
                 if (!HasResidentIndexStorage(contiguousIndices))
                 {
-                    using var indexValuesLease = contiguousIndices.LeaseArray();
-                    var indexValues = indexValuesLease.Array;
+                    var indexValues = contiguousIndices.GetDataArray();
                     ValidateEmbeddingIndices(indexValues, vocabSize, nameof(indices));
                 }
                 indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
@@ -8337,8 +8324,7 @@ public partial class DirectGpuTensorEngine
                 bool resident = HasResidentTensorStorage(contiguousIndices);
                 if (!resident)
                 {
-                    using var valuesLease = contiguousIndices.LeaseArray();
-                    byte[] values = valuesLease.Array;
+                    byte[] values = contiguousIndices.GetDataArray();
                     var nativeValues = new int[contiguousIndices.Length];
                     for (int i = 0; i < contiguousIndices.Length; i++)
                     {
@@ -8439,8 +8425,7 @@ public partial class DirectGpuTensorEngine
                 : (Tensor<int>)intIndices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                using var indexValuesLease = contiguousIndices.LeaseArray();
-                var indexValues = indexValuesLease.Array;
+                var indexValues = contiguousIndices.GetDataArray();
                 for (int i = 0; i < numIndices; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -10106,8 +10091,7 @@ public partial class DirectGpuTensorEngine
             return cached;
         }
 
-        using var occupancySpanLease = occupancyBitfield.Lease();
-        ReadOnlySpan<uint> occupancySpan = occupancySpanLease.Span;
+        ReadOnlySpan<uint> occupancySpan = occupancyBitfield.AsSpan();
         var occupancyWords = new int[occupancySpan.Length];
         for (int i = 0; i < occupancyWords.Length; i++)
             occupancyWords[i] = unchecked((int)occupancySpan[i]);

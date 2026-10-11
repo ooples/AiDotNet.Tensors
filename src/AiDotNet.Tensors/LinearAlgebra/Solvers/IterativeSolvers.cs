@@ -22,10 +22,8 @@ internal static class IterativeSolvers
         if (b.Rank != 1) throw new ArgumentException("CG needs a 1D RHS.");
         int n = a.Shape[0];
 
-        using var aDLease = a.LeaseArray();
-        var aD = aDLease.Array;
-        using var bDLease = b.LeaseArray();
-        var bD = bDLease.Array;
+        var aD = a.GetDataArray();
+        var bD = b.GetDataArray();
 
         // Start at x = 0.
         var x = new double[n];
@@ -56,8 +54,7 @@ internal static class IterativeSolvers
         }
 
         var result = new Tensor<T>(new[] { n });
-        using var rdstLease = result.LeaseArray();
-        var rdst = rdstLease.Array;
+        var rdst = result.GetDataArray();
         for (int i = 0; i < n; i++) rdst[i] = FromDouble<T>(x[i]);
         return result;
     }
@@ -70,10 +67,8 @@ internal static class IterativeSolvers
         if (b.Rank != 1) throw new ArgumentException("GMRES needs a 1D RHS.");
         int n = a.Shape[0];
 
-        using var aDLease = a.LeaseArray();
-        var aD = aDLease.Array;
-        using var bDLease = b.LeaseArray();
-        var bD = bDLease.Array;
+        var aD = a.GetDataArray();
+        var bD = b.GetDataArray();
 
         var x = new double[n];
         double rrNorm0 = 0;
@@ -127,8 +122,7 @@ internal static class IterativeSolvers
         }
 
         var result = new Tensor<T>(new[] { n });
-        using var rdstLease = result.LeaseArray();
-        var rdst = rdstLease.Array;
+        var rdst = result.GetDataArray();
         for (int i = 0; i < n; i++) rdst[i] = FromDouble<T>(x[i]);
         return result;
     }
@@ -140,10 +134,8 @@ internal static class IterativeSolvers
         if (a.Rank != 2 || a.Shape[0] != a.Shape[1]) throw new ArgumentException("BiCGSTAB needs a 2D square matrix.");
         if (b.Rank != 1) throw new ArgumentException("BiCGSTAB needs a 1D RHS.");
         int n = a.Shape[0];
-        using var aDLease = a.LeaseArray();
-        var aD = aDLease.Array;
-        using var bDLease = b.LeaseArray();
-        var bD = bDLease.Array;
+        var aD = a.GetDataArray();
+        var bD = b.GetDataArray();
 
         var x = new double[n];
         var r = new double[n];
@@ -194,8 +186,7 @@ internal static class IterativeSolvers
         }
 
         var result = new Tensor<T>(new[] { n });
-        using var rdstLease = result.LeaseArray();
-        var rdst = rdstLease.Array;
+        var rdst = result.GetDataArray();
         for (int i = 0; i < n; i++) rdst[i] = FromDouble<T>(x[i]);
         return result;
     }
@@ -281,12 +272,10 @@ internal static class IterativeSolvers
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         var input = new Tensor<T>(new[] { v.Length });
-        using var idLease = input.LeaseArray();
-        var id = idLease.Array;
+        var id = input.GetDataArray();
         for (int i = 0; i < v.Length; i++) id[i] = FromDouble<T>(v[i]);
         var result = precond(input);
-        using var rdLease = result.LeaseArray();
-        var rd = rdLease.Array;
+        var rd = result.GetDataArray();
         var o = new double[v.Length];
         for (int i = 0; i < v.Length; i++) o[i] = ToDouble(rd[i]);
         return o;

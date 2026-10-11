@@ -54,12 +54,9 @@ public partial class CpuEngine
         if (K == 0) return output;
 
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var bLease = boxes.Lease();
-        var b = bLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var b = boxes.AsSpan();
+        var dst = output.AsWritableSpan();
         double offset = aligned ? 0.5 : 0.0;
 
         for (int k = 0; k < K; k++)
@@ -156,12 +153,9 @@ public partial class CpuEngine
         if (K == 0) return output;
 
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var bLease = boxes.Lease();
-        var b = bLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var b = boxes.AsSpan();
+        var dst = output.AsWritableSpan();
         T negInf = ops.FromDouble(double.NegativeInfinity);
 
         for (int k = 0; k < K; k++)
@@ -253,12 +247,9 @@ public partial class CpuEngine
         if (K == 0) return output;
 
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var bLease = boxes.Lease();
-        var b = bLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var b = boxes.AsSpan();
+        var dst = output.AsWritableSpan();
 
         for (int k = 0; k < K; k++)
         {
@@ -334,12 +325,9 @@ public partial class CpuEngine
         if (K == 0) return output;
 
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var bLease = boxes.Lease();
-        var b = bLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var b = boxes.AsSpan();
+        var dst = output.AsWritableSpan();
 
         for (int k = 0; k < K; k++)
         {
@@ -435,8 +423,7 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var w = new Tensor<T>(new[] { n });
-        using var sLease = w.LeaseWritable();
-        var s = sLease.Span;
+        var s = w.AsWritableSpan();
         for (int i = 0; i < n; i++)
             s[i] = ops.FromDouble(0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / Math.Max(1, n - 1)));
         return w;
@@ -462,11 +449,9 @@ public partial class CpuEngine
     private Tensor<T> AmplitudeToDBImpl<T>(Tensor<T> input, float minAmplitude, float? topDb)
     {
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var src = input.AsSpan();
         var result = new Tensor<T>(input._shape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         double minAmp = Math.Max(1e-20, minAmplitude);
         double peak = double.NegativeInfinity;
         for (int i = 0; i < src.Length; i++)
@@ -497,11 +482,9 @@ public partial class CpuEngine
             throw new ArgumentException("quantizationChannels must be >= 2 (μ = qc − 1 must be positive).",
                 nameof(quantizationChannels));
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var src = input.AsSpan();
         var result = new Tensor<int>(input._shape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         double mu = quantizationChannels - 1;
         double logMu = Log1pFallback(mu);
         for (int i = 0; i < src.Length; i++)
@@ -524,11 +507,9 @@ public partial class CpuEngine
         if (quantizationChannels < 2)
             throw new ArgumentException("quantizationChannels must be >= 2.", nameof(quantizationChannels));
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var src = input.AsSpan();
         var result = new Tensor<T>(input._shape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         double mu = quantizationChannels - 1;
         for (int i = 0; i < src.Length; i++)
         {
@@ -571,10 +552,8 @@ public partial class CpuEngine
 
         var result = new Tensor<T>(input._shape);
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = result.AsWritableSpan();
 
         for (int row = 0; row < leading; row++)
         {
@@ -635,10 +614,8 @@ public partial class CpuEngine
         outShape[waveform.Rank - 1] = tOut;
         var result = new Tensor<T>(outShape);
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = waveform.Lease();
-        var src = srcLease.Span;
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = waveform.AsSpan();
+        var dst = result.AsWritableSpan();
         int leading = waveform.Length / tIn;
 
         for (int row = 0; row < leading; row++)
@@ -724,8 +701,7 @@ public partial class CpuEngine
         var window = new Tensor<T>(new int[] { winLength });
         // Hann window.
         var ops = MathHelper.GetNumericOperations<T>();
-        using var wSpanLease = window.LeaseWritable();
-        var wSpan = wSpanLease.Span;
+        var wSpan = window.AsWritableSpan();
         for (int i = 0; i < winLength; i++)
             wSpan[i] = ops.FromDouble(0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / (winLength - 1)));
 
@@ -757,14 +733,10 @@ public partial class CpuEngine
         var newMag = new Tensor<T>(newShape);
         var newPhase = new Tensor<T>(newShape);
 
-        using var mSpanLease = mag.Lease();
-        var mSpan = mSpanLease.Span;
-        using var pSpanLease = phase.Lease();
-        var pSpan = pSpanLease.Span;
-        using var nmSpanLease = newMag.LeaseWritable();
-        var nmSpan = nmSpanLease.Span;
-        using var npSpanLease = newPhase.LeaseWritable();
-        var npSpan = npSpanLease.Span;
+        var mSpan = mag.AsSpan();
+        var pSpan = phase.AsSpan();
+        var nmSpan = newMag.AsWritableSpan();
+        var npSpan = newPhase.AsWritableSpan();
 
         for (int b = 0; b < leading; b++)
         {

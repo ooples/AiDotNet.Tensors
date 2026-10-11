@@ -69,8 +69,7 @@ public sealed class QuantizedTensor<T> where T : struct
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (scheme != QuantizationScheme.SymmetricPerGroup)
             throw new NotSupportedException("Asymmetric int8 quantization not yet wired.");
-        using var srcLease = source.Lease();
-        var src = srcLease.Span;
+        var src = source.AsSpan();
         var raw = new sbyte[src.Length];
         var scale = QuantizationHelpersInt8.QuantizeInt8(src, raw, groupSize);
         // Reinterpret sbyte[] as byte[] for cross-backend pointer plumbing.
@@ -87,8 +86,7 @@ public sealed class QuantizedTensor<T> where T : struct
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (scheme != QuantizationScheme.SymmetricPerGroup)
             throw new NotSupportedException("Asymmetric int4 quantization not yet wired.");
-        using var srcLease = source.Lease();
-        var src = srcLease.Span;
+        var src = source.AsSpan();
         int packedLen = (src.Length + 1) / 2;
         var packed = new PackedInt4[packedLen];
         var scale = QuantizationHelpers.QuantizeInt4(src, packed, groupSize);
@@ -103,8 +101,7 @@ public sealed class QuantizedTensor<T> where T : struct
     public Tensor<float> Dequantize()
     {
         var t = new Tensor<float>(Shape);
-        using var dstLease = t.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = t.AsWritableSpan();
         if (Bits == QuantizationBits.Int8)
         {
             // Reinterpret byte[] as sbyte[] — same memory, signed view.

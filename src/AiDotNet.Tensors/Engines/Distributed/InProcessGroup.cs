@@ -78,9 +78,7 @@ public sealed class InProcessGroup : IProcessGroup
         _coord.SyncBarrier();
         // Phase 3: every rank copies the reduction into its tensor.
         var result = _coord.GetReduction<T>();
-        using var resultKeep1 = new KeepAliveScope(result);
-        using var tensorKeep1 = new KeepAliveScope(tensor);
-        result.AsSpanUnmarked().CopyTo(tensor.AsWritableSpanUnmarked());
+        result.AsSpan().CopyTo(tensor.AsWritableSpan());
         _coord.SyncBarrier();
     }
 
@@ -94,9 +92,7 @@ public sealed class InProcessGroup : IProcessGroup
         if (Rank == root)
         {
             var reduction = ReduceAcross<T>(_coord.PublishedAsArray<T>(), op);
-            using var reductionKeep1 = new KeepAliveScope(reduction);
-            using var tensorKeep2 = new KeepAliveScope(tensor);
-            reduction.AsSpanUnmarked().CopyTo(tensor.AsWritableSpanUnmarked());
+            reduction.AsSpan().CopyTo(tensor.AsWritableSpan());
         }
         _coord.SyncBarrier();
     }
@@ -111,9 +107,7 @@ public sealed class InProcessGroup : IProcessGroup
         if (Rank != root)
         {
             var src = _coord.GetPublished<T>(root);
-            using var srcKeep1 = new KeepAliveScope(src);
-            using var tensorKeep3 = new KeepAliveScope(tensor);
-            src.AsSpanUnmarked().CopyTo(tensor.AsWritableSpanUnmarked());
+            src.AsSpan().CopyTo(tensor.AsWritableSpan());
         }
         _coord.SyncBarrier();
     }
@@ -130,8 +124,7 @@ public sealed class InProcessGroup : IProcessGroup
         for (int r = 0; r < WorldSize; r++)
         {
             var src = _coord.GetPublished<T>(r);
-            using var srcKeep2 = new KeepAliveScope(src);
-            src.AsSpanUnmarked().CopyTo(output[r].AsWritableSpan());
+            src.AsSpan().CopyTo(output[r].AsWritableSpan());
         }
         _coord.SyncBarrier();
     }
@@ -150,8 +143,7 @@ public sealed class InProcessGroup : IProcessGroup
             for (int r = 0; r < WorldSize; r++)
             {
                 var src = _coord.GetPublished<T>(r);
-                using var srcKeep3 = new KeepAliveScope(src);
-                src.AsSpanUnmarked().CopyTo(output[r].AsWritableSpan());
+                src.AsSpan().CopyTo(output[r].AsWritableSpan());
             }
         }
         _coord.SyncBarrier();
@@ -170,9 +162,7 @@ public sealed class InProcessGroup : IProcessGroup
         }
         _coord.SyncBarrier();
         var slice = _coord.GetSentToRank<T>(Rank);
-        using var sliceKeep1 = new KeepAliveScope(slice);
-        using var outputKeep1 = new KeepAliveScope(output);
-        slice.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
+        slice.AsSpan().CopyTo(output.AsWritableSpan());
         _coord.SyncBarrier();
     }
 
@@ -192,9 +182,7 @@ public sealed class InProcessGroup : IProcessGroup
             perRank[r] = _coord.GetPublishedList<T>(r, Rank);
         }
         var reduced = ReduceAcross(perRank, op);
-        using var reducedKeep1 = new KeepAliveScope(reduced);
-        using var outputKeep2 = new KeepAliveScope(output);
-        reduced.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
+        reduced.AsSpan().CopyTo(output.AsWritableSpan());
         _coord.SyncBarrier();
     }
 
@@ -210,9 +198,7 @@ public sealed class InProcessGroup : IProcessGroup
     {
         ThrowIfDisposed();
         var msg = _coord.RecvP2P<T>(src, Rank, tag);
-        using var msgKeep1 = new KeepAliveScope(msg);
-        using var tensorKeep4 = new KeepAliveScope(tensor);
-        msg.AsSpanUnmarked().CopyTo(tensor.AsWritableSpanUnmarked());
+        msg.AsSpan().CopyTo(tensor.AsWritableSpan());
     }
 
     /// <summary>
@@ -316,14 +302,11 @@ public sealed class InProcessGroup : IProcessGroup
         var ops = MathHelper.GetNumericOperations<T>();
         var first = tensors[0];
         var result = new Tensor<T>((int[])first._shape.Clone());
-        using var firstKeep1 = new KeepAliveScope(first);
-        using var resultKeep2 = new KeepAliveScope(result);
-        first.AsSpanUnmarked().CopyTo(result.AsWritableSpanUnmarked());
+        first.AsSpan().CopyTo(result.AsWritableSpan());
         for (int i = 1; i < tensors.Count; i++)
         {
             var src = tensors[i].AsSpan();
-            using var dstLease = result.LeaseWritable();
-            var dst = dstLease.Span;
+            var dst = result.AsWritableSpan();
             for (int k = 0; k < dst.Length; k++)
             {
                 dst[k] = op switch
@@ -340,8 +323,7 @@ public sealed class InProcessGroup : IProcessGroup
         if (op == ReduceOp.Avg)
         {
             var divisor = ops.FromDouble(tensors.Count);
-            using var dstLease = result.LeaseWritable();
-            var dst = dstLease.Span;
+            var dst = result.AsWritableSpan();
             for (int k = 0; k < dst.Length; k++) dst[k] = ops.Divide(dst[k], divisor);
         }
         return result;
@@ -427,9 +409,7 @@ internal sealed class InProcessGroupCoordinator
         // receiver would observe post-send writes — divergent from
         // every real network transport's value semantics.
         var snapshot = new Tensor<T>((int[])tensor._shape.Clone());
-        using var tensorKeep5 = new KeepAliveScope(tensor);
-        using var snapshotKeep1 = new KeepAliveScope(snapshot);
-        tensor.AsSpanUnmarked().CopyTo(snapshot.AsWritableSpanUnmarked());
+        tensor.AsSpan().CopyTo(snapshot.AsWritableSpan());
         q.Enqueue(snapshot);
         mre.Set();
     }

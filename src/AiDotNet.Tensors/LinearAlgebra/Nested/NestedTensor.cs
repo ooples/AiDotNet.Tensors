@@ -175,8 +175,7 @@ public sealed class NestedTensor<T>
             : new Tensor<T>(new[] { batch, padLen });
 
         var src = Values.AsSpan();
-        using var dstLease = padded.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = padded.AsWritableSpan();
 
         // Pre-fill with padding so short rows tail off cleanly.
         for (int i = 0; i < dst.Length; i++) dst[i] = padding;
@@ -239,8 +238,7 @@ public sealed class NestedTensor<T>
 
         int storedElements = total * (hasFeatureAxis ? featureSize : 1);
         var values = new Tensor<T>(new[] { storedElements });
-        using var srcLease = padded.Lease();
-        var src = srcLease.Span;
+        var src = padded.AsSpan();
         var dst = values.AsWritableSpan();
 
         if (hasFeatureAxis)

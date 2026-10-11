@@ -113,16 +113,11 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
 
         // Compute fused weights and bias at compile time
         int outChannels = gamma.Length;
-        using var gammaDataLease = gamma.LeaseArray();
-        var gammaData = (float[])(object)gammaDataLease.Array;
-        using var betaDataLease = beta.LeaseArray();
-        var betaData = (float[])(object)betaDataLease.Array;
-        using var meanDataLease = runningMean.LeaseArray();
-        var meanData = (float[])(object)meanDataLease.Array;
-        using var varDataLease = runningVar.LeaseArray();
-        var varData = (float[])(object)varDataLease.Array;
-        using var weightsDataLease = convWeights.LeaseArray();
-        var weightsData = (float[])(object)weightsDataLease.Array;
+        var gammaData = (float[])(object)gamma.GetDataArray();
+        var betaData = (float[])(object)beta.GetDataArray();
+        var meanData = (float[])(object)runningMean.GetDataArray();
+        var varData = (float[])(object)runningVar.GetDataArray();
+        var weightsData = (float[])(object)convWeights.GetDataArray();
         float[]? biasData = convBias is not null ? (float[])(object)convBias.GetDataArray() : null;
 
         // Compute scale factors: scale[oc] = gamma[oc] / sqrt(var[oc] + eps)
@@ -194,10 +189,8 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                     if (output.Rank == 4)
                     {
                         int N = output._shape[0], C = output._shape[1], H = output._shape[2], W = output._shape[3];
-                        using var outArrLease = output.LeaseArray();
-                        var outArr = (float[])(object)outArrLease.Array;
-                        using var biasArrLease = ((Tensor<T>)(object)capturedFusedBias).LeaseArray();
-                        var biasArr = (float[])(object)biasArrLease.Array;
+                        var outArr = (float[])(object)output.GetDataArray();
+                        var biasArr = (float[])(object)((Tensor<T>)(object)capturedFusedBias).GetDataArray();
                         if (capturedActivation == FusedActivationType.None
                             || capturedActivation == FusedActivationType.ReLU)
                         {
@@ -228,10 +221,8 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                     cpuEngDw.DepthwiseConv2DInto(output, capturedInput, capturedFusedWeights,
                         capturedStrides, capturedPaddings);
                     int N = output._shape[0], C = output._shape[1], H = output._shape[2], W = output._shape[3];
-                    using var outArrLease = output.LeaseArray();
-                    var outArr = (float[])(object)outArrLease.Array;
-                    using var biasArrLease = ((Tensor<T>)(object)capturedFusedBias).LeaseArray();
-                    var biasArr = (float[])(object)biasArrLease.Array;
+                    var outArr = (float[])(object)output.GetDataArray();
+                    var biasArr = (float[])(object)((Tensor<T>)(object)capturedFusedBias).GetDataArray();
                     var act = capturedActivation == FusedActivationType.None
                         || capturedActivation == FusedActivationType.ReLU
                         ? capturedActivation

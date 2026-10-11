@@ -307,8 +307,7 @@ public static class SavedTensorRecipes
             pack: tensor =>
             {
                 var data = new T[tensor.Length];
-                using var tensorKeep1 = new KeepAliveScope(tensor);
-                tensor.AsSpanUnmarked().CopyTo(data);
+                tensor.AsSpan().CopyTo(data);
                 return new CpuSaved<T>(data, tensor.Shape.ToArray());
             },
             unpack: packed =>
@@ -331,8 +330,7 @@ public static class SavedTensorRecipes
         => SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                using var srcLease = tensor.Lease();
-                var src = srcLease.Span;
+                var src = tensor.AsSpan();
                 var half = new Half[src.Length];
                 for (int i = 0; i < src.Length; i++) half[i] = (Half)src[i];
                 return new HalfSaved(half, tensor.Shape.ToArray());
@@ -361,8 +359,7 @@ public static class SavedTensorRecipes
         => SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                using var dataLease = tensor.Lease();
-                var data = dataLease.Span;
+                var data = tensor.AsSpan();
                 float absMax = 0f;
                 for (int i = 0; i < data.Length; i++)
                 {
@@ -411,8 +408,7 @@ public static class SavedTensorRecipes
         => SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                using var srcLease = tensor.Lease();
-                var src = srcLease.Span;
+                var src = tensor.AsSpan();
                 var bytes = new byte[src.Length * sizeof(float)];
                 System.Runtime.InteropServices.MemoryMarshal
                     .AsBytes(src).CopyTo(bytes);
@@ -483,8 +479,7 @@ public static class SavedTensorRecipes
         return SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                using var srcLease = tensor.Lease();
-                var src = srcLease.Span;
+                var src = tensor.AsSpan();
                 var bytes = new byte[src.Length * sizeof(float)];
                 System.Runtime.InteropServices.MemoryMarshal
                     .AsBytes(src).CopyTo(bytes);

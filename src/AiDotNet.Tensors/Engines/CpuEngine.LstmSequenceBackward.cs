@@ -163,8 +163,7 @@ public partial class CpuEngine
         var output = returnSequences
             ? new Tensor<float>(new[] { batch, seqLen, hidden })
             : new Tensor<float>(new[] { batch, hidden });
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var outSpan = output.AsWritableSpan();
 
         // seqLen == 0 corner case: the timestep loop below is skipped, so the
         // last-hidden output stays at its default zero-init. Match the generic
@@ -185,10 +184,8 @@ public partial class CpuEngine
             {
                 finalHidden = new Tensor<float>(new[] { batch, hidden });
                 finalCell = new Tensor<float>(new[] { batch, hidden });
-                using var fhSpan0Lease = finalHidden.LeaseWritable();
-                var fhSpan0 = fhSpan0Lease.Span;
-                using var fcSpan0Lease = finalCell.LeaseWritable();
-                var fcSpan0 = fcSpan0Lease.Span;
+                var fhSpan0 = finalHidden.AsWritableSpan();
+                var fcSpan0 = finalCell.AsWritableSpan();
                 for (int b = 0; b < batch; b++)
                     for (int h = 0; h < hidden; h++)
                     {
@@ -218,10 +215,8 @@ public partial class CpuEngine
         {
             finalHidden = new Tensor<float>(new[] { batch, hidden });
             finalCell = new Tensor<float>(new[] { batch, hidden });
-            using var fhSpanLease = finalHidden.LeaseWritable();
-            var fhSpan = fhSpanLease.Span;
-            using var fcSpanLease = finalCell.LeaseWritable();
-            var fcSpan = fcSpanLease.Span;
+            var fhSpan = finalHidden.AsWritableSpan();
+            var fcSpan = finalCell.AsWritableSpan();
             for (int b = 0; b < batch; b++)
                 for (int h = 0; h < hidden; h++)
                 {
@@ -304,8 +299,7 @@ public partial class CpuEngine
     {
         if (chunks != 1) return SumChunkPartialsTransposed(parts, chunks, k, G);
         var grad = new Tensor<float>(new[] { G, k });
-        using var gradKeep1 = new KeepAliveScope(grad);
-        parts[0].AsSpan(0, G * k).CopyTo(grad.AsWritableSpanUnmarked());
+        parts[0].AsSpan(0, G * k).CopyTo(grad.AsWritableSpan());
         return grad;
     }
 
@@ -721,17 +715,15 @@ public partial class CpuEngine
                 if (output.IsContiguous && output._gpuBuffer is null && !output.HasPendingGpuData)
                 {
                     // The core writes every output position, so the uninitialized plan buffer needs no clear.
-                    using var outputKeep1 = new KeepAliveScope(output);
                     LstmTrainForwardCoreFloat(inArr, wIhArr, wHhArr, bIhArr, bHhArr, h0Arr, c0Arr,
-                        returnSequences, ws, output.AsWritableSpanUnmarked());
+                        returnSequences, ws, output.AsWritableSpan());
                     output.IncrementVersion();
                 }
                 else
                 {
                     var staged = new Tensor<float>(outputShape);
-                    using var stagedKeep1 = new KeepAliveScope(staged);
                     LstmTrainForwardCoreFloat(inArr, wIhArr, wHhArr, bIhArr, bHhArr, h0Arr, c0Arr,
-                        returnSequences, ws, staged.AsWritableSpanUnmarked().Slice(0, outputLength));
+                        returnSequences, ws, staged.AsWritableSpan().Slice(0, outputLength));
                     DirectGpuTensorEngine.CopyResultInto(eng, staged, output);
                 }
             },
@@ -777,8 +769,7 @@ public partial class CpuEngine
         var scratch = ws.GetBackwardScratch();
         var gradInput = needInput ? new Tensor<float>(new[] { batch, seqLen, inFeatures }) : null;
         int chunks = ws.Chunks;
-        using var gradInputKeep1 = new KeepAliveScope(gradInput);
-        fixed (float* pGradInput = gradInput is null ? Span<float>.Empty : gradInput.AsWritableSpanUnmarked())
+        fixed (float* pGradInput = gradInput is null ? Span<float>.Empty : gradInput.AsWritableSpan())
         {
             // The region is synchronous, so the pinned input gradient outlives every chunk's use of it.
             IntPtr gradInputPtr = (IntPtr)pGradInput;
@@ -814,15 +805,13 @@ public partial class CpuEngine
             if (needBIh)
             {
                 var gb = new Tensor<float>(new[] { G });
-                using var gbKeep1 = new KeepAliveScope(gb);
-                gradB.AsSpan(0, G).CopyTo(gb.AsWritableSpanUnmarked());
+                gradB.AsSpan(0, G).CopyTo(gb.AsWritableSpan());
                 DifferentiableOps.AccumulateGrad(grads, inp[idxBIh], gb, engine);
             }
             if (needBHh)
             {
                 var gb = new Tensor<float>(new[] { G });
-                using var gbKeep2 = new KeepAliveScope(gb);
-                gradB.AsSpan(0, G).CopyTo(gb.AsWritableSpanUnmarked());
+                gradB.AsSpan(0, G).CopyTo(gb.AsWritableSpan());
                 DifferentiableOps.AccumulateGrad(grads, inp[idxBHh], gb, engine);
             }
         }
@@ -832,10 +821,8 @@ public partial class CpuEngine
         {
             var gh0 = needH0 ? new Tensor<float>(new[] { batch, hidden }) : null;
             var gc0 = needC0 ? new Tensor<float>(new[] { batch, hidden }) : null;
-            using var gh0Keep1 = new KeepAliveScope(gh0);
-            var gh0Span = gh0 is null ? Span<float>.Empty : gh0.AsWritableSpanUnmarked();
-            using var gc0Keep1 = new KeepAliveScope(gc0);
-            var gc0Span = gc0 is null ? Span<float>.Empty : gc0.AsWritableSpanUnmarked();
+            var gh0Span = gh0 is null ? Span<float>.Empty : gh0.AsWritableSpan();
+            var gc0Span = gc0 is null ? Span<float>.Empty : gc0.AsWritableSpan();
             for (int c = 0; c < chunks; c++)
             {
                 int b0 = LstmChunkStart(c, batch, chunks), nb = LstmChunkStart(c + 1, batch, chunks) - b0;
@@ -853,8 +840,7 @@ public partial class CpuEngine
         var sum = parts[0];
         for (int c = 1; c < chunks; c++) LstmAddInto(sum, parts[c], k * G);
         var grad = new Tensor<float>(new[] { G, k });
-        using var dstLease = grad.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = grad.AsWritableSpan();
         for (int g = 0; g < G; g++)
             for (int i = 0; i < k; i++)
                 dst[g * k + i] = sum[i * G + g];
@@ -1115,8 +1101,7 @@ public partial class CpuEngine
         var output = returnSequences
             ? new Tensor<double>(new[] { batch, seqLen, hidden })
             : new Tensor<double>(new[] { batch, hidden });
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var outSpan = output.AsWritableSpan();
 
         if (seqLen == 0)
         {
@@ -1345,18 +1330,16 @@ public partial class CpuEngine
 
         // gradInput = dgatesAll @ wIh → [totalRows, inFeatures]
         var gradInput = new Tensor<double>(new[] { batch, seqLen, inFeatures });
-        using var gradInputKeep2 = new KeepAliveScope(gradInput);
         GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, false,
                  wIhSpan.Slice(0, G * inFeatures), inFeatures, false,
-                 gradInput.AsWritableSpanUnmarked(), totalRows, G, inFeatures);
+                 gradInput.AsWritableSpan(), totalRows, G, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
 
         // gradWIh = dgatesAll^T @ input2d → [G, inFeatures]
         var gradWIh = new Tensor<double>(new[] { G, inFeatures });
-        using var gradWIhKeep1 = new KeepAliveScope(gradWIh);
         GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, true,
                  inputSpan, inFeatures, false,
-                 gradWIh.AsWritableSpanUnmarked(), G, totalRows, inFeatures);
+                 gradWIh.AsWritableSpan(), G, totalRows, inFeatures);
         DifferentiableOps.AccumulateGrad(grads, wIh, gradWIh, engine);
 
         // gradWHh = dgatesAll^T @ hPrevAll → [G, hidden]; hPrevAll[b,t] = h_{t-1}.
@@ -1366,10 +1349,9 @@ public partial class CpuEngine
                 Array.Copy(hiddens, (b * (seqLen + 1) + t) * hidden,
                            hPrevAll, (b * seqLen + t) * hidden, hidden);
         var gradWHh = new Tensor<double>(new[] { G, hidden });
-        using var gradWHhKeep1 = new KeepAliveScope(gradWHh);
         GemmBigD(dgatesAll.AsSpan(0, totalRows * G), G, true,
                  hPrevAll.AsSpan(0, totalRows * hidden), hidden, false,
-                 gradWHh.AsWritableSpanUnmarked(), G, totalRows, hidden);
+                 gradWHh.AsWritableSpan(), G, totalRows, hidden);
         DifferentiableOps.AccumulateGrad(grads, wHh, gradWHh, engine);
 
         // gradBIh = gradBHh = column-sum of dgatesAll over (b,t) → [G].
@@ -1398,15 +1380,13 @@ public partial class CpuEngine
         if (idxH0 >= 0)
         {
             var gh0 = new Tensor<double>(new[] { batch, hidden });
-            using var gh0Keep2 = new KeepAliveScope(gh0);
-            dhNext.AsSpan(0, batch * hidden).CopyTo(gh0.AsWritableSpanUnmarked());
+            dhNext.AsSpan(0, batch * hidden).CopyTo(gh0.AsWritableSpan());
             DifferentiableOps.AccumulateGrad(grads, inp[idxH0], gh0, engine);
         }
         if (idxC0 >= 0)
         {
             var gc0 = new Tensor<double>(new[] { batch, hidden });
-            using var gc0Keep2 = new KeepAliveScope(gc0);
-            dcNext.AsSpan(0, batch * hidden).CopyTo(gc0.AsWritableSpanUnmarked());
+            dcNext.AsSpan(0, batch * hidden).CopyTo(gc0.AsWritableSpan());
             DifferentiableOps.AccumulateGrad(grads, inp[idxC0], gc0, engine);
         }
 

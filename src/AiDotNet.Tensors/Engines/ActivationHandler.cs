@@ -22,9 +22,7 @@ internal abstract class ActivationHandler
     public virtual void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input)
     {
         var result = Apply(engine, input);
-        using var resultKeep1 = new KeepAliveScope(result);
-        using var inputKeep1 = new KeepAliveScope(input);
-        result.AsSpanUnmarked().CopyTo(input.AsWritableSpanUnmarked());
+        result.AsSpan().CopyTo(input.AsWritableSpan());
     }
 
     /// <summary>
@@ -57,9 +55,7 @@ internal abstract class ActivationHandler
             return;
         }
         var result = Apply(engine, input, activationParams);
-        using var resultKeep2 = new KeepAliveScope(result);
-        using var inputKeep2 = new KeepAliveScope(input);
-        result.AsSpanUnmarked().CopyTo(input.AsWritableSpanUnmarked());
+        result.AsSpan().CopyTo(input.AsWritableSpan());
     }
 
     /// <summary>Backward with explicit parametric settings. Default ignores them.</summary>
@@ -280,19 +276,15 @@ internal sealed class PointwiseFusedActivationHandler : ActivationHandler
         if (typeof(T) == typeof(float))
         {
             var f = Helpers.CpuFusedOperations.GetFloatActivation(_type, p);
-            using var xiLease = input.LeaseArray();
-            var xi = (float[])(object)xiLease.Array;
-            using var roLease = result.LeaseArray();
-            var ro = (float[])(object)roLease.Array;
+            var xi = (float[])(object)input.GetDataArray();
+            var ro = (float[])(object)result.GetDataArray();
             for (int i = 0; i < n; i++) ro[i] = f(xi[i]);
         }
         else if (typeof(T) == typeof(double))
         {
             var f = Helpers.CpuFusedOperations.GetDoubleActivation(_type, p);
-            using var xiLease = input.LeaseArray();
-            var xi = (double[])(object)xiLease.Array;
-            using var roLease = result.LeaseArray();
-            var ro = (double[])(object)roLease.Array;
+            var xi = (double[])(object)input.GetDataArray();
+            var ro = (double[])(object)result.GetDataArray();
             for (int i = 0; i < n; i++) ro[i] = f(xi[i]);
         }
         else throw new NotSupportedException($"Fused activation backward supports float/double, not {typeof(T).Name}.");
@@ -311,23 +303,17 @@ internal sealed class PointwiseFusedActivationHandler : ActivationHandler
         if (typeof(T) == typeof(float))
         {
             var d = Helpers.CpuFusedOperations.GetFloatActivationDerivative(_type, p);
-            using var xiLease = input.LeaseArray();
-            var xi = (float[])(object)xiLease.Array;
-            using var giLease = gradOutput.LeaseArray();
-            var gi = (float[])(object)giLease.Array;
-            using var roLease = result.LeaseArray();
-            var ro = (float[])(object)roLease.Array;
+            var xi = (float[])(object)input.GetDataArray();
+            var gi = (float[])(object)gradOutput.GetDataArray();
+            var ro = (float[])(object)result.GetDataArray();
             for (int i = 0; i < n; i++) ro[i] = gi[i] * d(xi[i]);
         }
         else if (typeof(T) == typeof(double))
         {
             var d = Helpers.CpuFusedOperations.GetDoubleActivationDerivative(_type, p);
-            using var xiLease = input.LeaseArray();
-            var xi = (double[])(object)xiLease.Array;
-            using var giLease = gradOutput.LeaseArray();
-            var gi = (double[])(object)giLease.Array;
-            using var roLease = result.LeaseArray();
-            var ro = (double[])(object)roLease.Array;
+            var xi = (double[])(object)input.GetDataArray();
+            var gi = (double[])(object)gradOutput.GetDataArray();
+            var ro = (double[])(object)result.GetDataArray();
             for (int i = 0; i < n; i++) ro[i] = gi[i] * d(xi[i]);
         }
         else throw new NotSupportedException($"Fused activation backward supports float/double, not {typeof(T).Name}.");

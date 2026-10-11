@@ -64,12 +64,9 @@ public static class FlashAttention2
         double scaleVal = scale ?? 1.0 / Math.Sqrt(headDim);
         float scaleF = (float)scaleVal;
 
-        using var qLease = query.LeaseArray();
-        var q = qLease.Array;
-        using var kLease = key.LeaseArray();
-        var k = kLease.Array;
-        using var vLease = value.LeaseArray();
-        var v = vLease.Array;
+        var q = query.GetDataArray();
+        var k = key.GetDataArray();
+        var v = value.GetDataArray();
         var bias = attentionBias?.GetDataArray();
         int biasStrideB = 0, biasStrideH = 0;
         if (bias is not null)
@@ -81,8 +78,7 @@ public static class FlashAttention2
         }
 
         var output = new Tensor<float>(new[] { B, H, Sq, Dv });
-        using var oLease = output.LeaseArray();
-        var o = oLease.Array;
+        var o = output.GetDataArray();
         var logsumexp = new float[B * H * Sq];
 
         // Per-Q-block scratch reused for every Q tile.
@@ -266,16 +262,11 @@ public static class FlashAttention2
         double scaleVal = scale ?? 1.0 / Math.Sqrt(headDim);
         float scaleF = (float)scaleVal;
 
-        using var qLease = query.LeaseArray();
-        var q = qLease.Array;
-        using var kLease = key.LeaseArray();
-        var k = kLease.Array;
-        using var vLease = value.LeaseArray();
-        var v = vLease.Array;
-        using var oLease = output.LeaseArray();
-        var o = oLease.Array;
-        using var dOLease = gradOutput.LeaseArray();
-        var dO = dOLease.Array;
+        var q = query.GetDataArray();
+        var k = key.GetDataArray();
+        var v = value.GetDataArray();
+        var o = output.GetDataArray();
+        var dO = gradOutput.GetDataArray();
         var bias = attentionBias?.GetDataArray();
         int biasStrideB = 0, biasStrideH = 0;
         if (bias is not null)
@@ -289,12 +280,9 @@ public static class FlashAttention2
         var dQ = new Tensor<float>(query._shape);
         var dK = new Tensor<float>(key._shape);
         var dV = new Tensor<float>(value._shape);
-        using var dQArrLease = dQ.LeaseArray();
-        var dQArr = dQArrLease.Array;
-        using var dKArrLease = dK.LeaseArray();
-        var dKArr = dKArrLease.Array;
-        using var dVArrLease = dV.LeaseArray();
-        var dVArr = dVArrLease.Array;
+        var dQArr = dQ.GetDataArray();
+        var dKArr = dK.GetDataArray();
+        var dVArr = dV.GetDataArray();
 
         // Precompute D_i = row-wise sum(dO * O) across Dv — used in dS.
         var D = new float[B * H * Sq];

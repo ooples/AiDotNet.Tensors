@@ -44,8 +44,7 @@ public sealed class QuantizationParams
     /// </summary>
     public static QuantizationParams FromTensor(Tensor<float> tensor, QuantizationMode mode = QuantizationMode.Symmetric, int bits = 8)
     {
-        using var spanLease = tensor.Lease();
-        var span = spanLease.Span;
+        var span = tensor.AsSpan();
         float min = float.MaxValue, max = float.MinValue;
         for (int i = 0; i < span.Length; i++)
         {
@@ -89,11 +88,9 @@ public static class Quantization
             throw new ArgumentException("Scale must be positive.", nameof(qparams));
 
         var srcTensor = input.IsContiguous ? input : input.Contiguous();
-        using var srcLease = srcTensor.Lease();
-        var src = srcLease.Span;
+        var src = srcTensor.AsSpan();
         var result = new Tensor<sbyte>(input._shape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         float invScale = 1f / qparams.Scale;
         int zp = qparams.ZeroPoint;
 
@@ -115,11 +112,9 @@ public static class Quantization
     public static Tensor<float> DequantizeInt8(Tensor<sbyte> input, QuantizationParams qparams)
     {
         var srcTensor = input.IsContiguous ? input : input.Contiguous();
-        using var srcLease = srcTensor.Lease();
-        var src = srcLease.Span;
+        var src = srcTensor.AsSpan();
         var result = new Tensor<float>(input._shape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         float scale = qparams.Scale;
         int zp = qparams.ZeroPoint;
 
@@ -137,11 +132,9 @@ public static class Quantization
     public static Tensor<Half> QuantizeFP16(Tensor<float> input)
     {
         var srcTensor = input.IsContiguous ? input : input.Contiguous();
-        using var srcLease = srcTensor.Lease();
-        var src = srcLease.Span;
+        var src = srcTensor.AsSpan();
         var result = new Tensor<Half>(input._shape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
 
         for (int i = 0; i < src.Length; i++)
         {
@@ -157,11 +150,9 @@ public static class Quantization
     public static Tensor<float> DequantizeFP16(Tensor<Half> input)
     {
         var srcTensor = input.IsContiguous ? input : input.Contiguous();
-        using var srcLease = srcTensor.Lease();
-        var src = srcLease.Span;
+        var src = srcTensor.AsSpan();
         var result = new Tensor<float>(input._shape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
 
         for (int i = 0; i < src.Length; i++)
         {
@@ -176,10 +167,8 @@ public static class Quantization
     /// </summary>
     public static double ComputeQuantizationError(Tensor<float> original, Tensor<float> dequantized)
     {
-        using var aLease = original.Lease();
-        var a = aLease.Span;
-        using var bLease = dequantized.Lease();
-        var b = bLease.Span;
+        var a = original.AsSpan();
+        var b = dequantized.AsSpan();
         double sumSqErr = 0;
         for (int i = 0; i < a.Length; i++)
         {

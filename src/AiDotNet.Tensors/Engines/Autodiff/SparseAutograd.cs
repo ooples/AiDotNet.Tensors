@@ -218,8 +218,7 @@ public static class SparseAutograd
         // CSR/BSR-stored sparse tensors return values in a different
         // order. The snapshot fixes that misalignment.
         var gradB = new Tensor<T>(new[] { columns, innerK });
-        using var gradBSpanLease = gradB.LeaseWritable();
-        var gradBSpan = gradBSpanLease.Span;
+        var gradBSpan = gradB.AsWritableSpan();
         // gradB starts zero (Tensor ctor zero-fills); accumulate
         //   gradB[j, k] += A_value[idx] · dY[i, k]    where (i, j) ∈ pattern_A
         // Equivalent to A^T · dY without materialising the dense A.
@@ -229,8 +228,7 @@ public static class SparseAutograd
         // freshly-allocated contiguous storage, so writes are span-fast.
         if (gFastPath)
         {
-            using var gOutSpanLease = gradOutput.Lease();
-            var gOutSpan = gOutSpanLease.Span;
+            var gOutSpan = gradOutput.AsSpan();
             int gOutRowStride = gradOutput.Shape[1];
             for (int idx = 0; idx < nnz; idx++)
             {
@@ -643,10 +641,8 @@ public static class SparseAutograd
         var ops = MathHelper.GetNumericOperations<T>();
         // Broadcast grad_output back over the reduction axis.
         var gradA = new Tensor<T>((int[])aDense._shape.Clone());
-        using var gradSpanLease = gradA.LeaseWritable();
-        var gradSpan = gradSpanLease.Span;
-        using var gradOutSpanLease = gradOutput.Lease();
-        var gradOutSpan = gradOutSpanLease.Span;
+        var gradSpan = gradA.AsWritableSpan();
+        var gradOutSpan = gradOutput.AsSpan();
         int rows = aDense._shape[0], cols = aDense._shape[1];
         if (axis < 0)
         {
@@ -707,12 +703,10 @@ public static class SparseAutograd
         var rowPtr = csr.RowPointers;
         var colIdx = csr.ColumnIndices;
         var smVals = csr.DataVector;
-        using var gradOutSpanLease = gradOutput.Lease();
-        var gradOutSpan = gradOutSpanLease.Span;
+        var gradOutSpan = gradOutput.AsSpan();
         int n = aDense._shape[1];
         var gradA = new Tensor<T>((int[])aDense._shape.Clone());
-        using var gradASpanLease = gradA.LeaseWritable();
-        var gradASpan = gradASpanLease.Span;
+        var gradASpan = gradA.AsWritableSpan();
 
         for (int r = 0; r < aDense._shape[0]; r++)
         {

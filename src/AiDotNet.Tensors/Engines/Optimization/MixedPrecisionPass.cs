@@ -88,8 +88,7 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
                     {
                         if (capturedStep.Inputs[j] is Tensor<float> floatInp)
                         {
-                            using var floatInpDataKeep1 = new KeepAliveScope(floatInp);
-                            var src = floatInp.DataUnmarked.Span;
+                            var src = floatInp.Data.Span;
                             int len = src.Length;
                             if (backups[j] is null || backups[j].Length < len)
                                 backups[j] = new float[len];
@@ -111,8 +110,7 @@ internal sealed class MixedPrecisionPass : ICpuOptimizationPass
                             if (capturedStep.Inputs[j] is Tensor<float> floatInp
                                 && backups[j] is not null)
                             {
-                                using var floatInpDataKeep2 = new KeepAliveScope(floatInp);
-                                var src = floatInp.DataUnmarked.Span;
+                                var src = floatInp.Data.Span;
                                 int len = src.Length;
                                 backups[j].AsSpan(0, len).CopyTo(src);
                             }

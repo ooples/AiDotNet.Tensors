@@ -164,8 +164,7 @@ public sealed class GradScaler<T>
     {
         if (grads is null) throw new ArgumentNullException(nameof(grads));
         var invScale = _numOps.FromDouble(1.0 / _scale);
-        using var dataLease = grads.LeaseArray();
-        var data = dataLease.Array;
+        var data = grads.GetDataArray();
         // Pass 1: scan — no writes. If we find an overflow, bail before
         // mutating so the tensor stays fully scaled (consistent state).
         for (int i = 0; i < grads.Length; i++)
@@ -194,8 +193,7 @@ public sealed class GradScaler<T>
     public bool DetectOverflow(Tensor<T> grad)
     {
         if (grad is null) return false;
-        using var dataLease = grad.LeaseArray();
-        var data = dataLease.Array;
+        var data = grad.GetDataArray();
         for (int i = 0; i < grad.Length; i++)
             if (HasOverflow(data[i])) return true;
         return false;

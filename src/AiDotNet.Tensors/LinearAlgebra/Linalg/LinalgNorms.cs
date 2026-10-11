@@ -43,8 +43,7 @@ internal static class LinalgNorms
             double acc = 0;
             double maxAbs = 0;
             double minAbs = double.PositiveInfinity;
-            using var dataLease = input.LeaseArray();
-            var data = dataLease.Array;
+            var data = input.GetDataArray();
             for (int i = 0; i < input.Length; i++)
             {
                 double av = Math.Abs(ToDouble(data[i]));
@@ -108,10 +107,8 @@ internal static class LinalgNorms
         int n = input.Shape[a1];
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
-        using var inDataLease = input.LeaseArray();
-        var inData = inDataLease.Array;
-        using var rDataLease = result.LeaseArray();
-        var rData = rDataLease.Array;
+        var inData = input.GetDataArray();
+        var rData = result.GetDataArray();
 
         for (int b = 0; b < batch; b++)
         {
@@ -134,8 +131,7 @@ internal static class LinalgNorms
                     var slice = SliceBatch(input, b, m, n);
                     var sv = SvdWrapper.ValuesOnly(slice);
                     double sum = 0;
-                    using var svDLease = sv.LeaseArray();
-                    var svD = svDLease.Array;
+                    var svD = sv.GetDataArray();
                     for (int i = 0; i < sv.Length; i++) sum += ToDouble(svD[i]);
                     val = sum;
                 }
@@ -218,10 +214,8 @@ internal static class LinalgNorms
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         var slice = new Tensor<T>(new[] { m, n });
-        using var srcLease = input.LeaseArray();
-        var src = srcLease.Array;
-        using var dstLease = slice.LeaseArray();
-        var dst = dstLease.Array;
+        var src = input.GetDataArray();
+        var dst = slice.GetDataArray();
         int off = batchIdx * m * n;
         for (int i = 0; i < m * n; i++) dst[i] = src[off + i];
         return slice;
@@ -263,10 +257,8 @@ internal static class LinalgNorms
         var reduced = new bool[input.Rank];
         foreach (int a in axes) reduced[a] = true;
 
-        using var outDataLease = result.LeaseArray();
-        var outData = outDataLease.Array;
-        using var inDataLease = input.LeaseArray();
-        var inData = inDataLease.Array;
+        var outData = result.GetDataArray();
+        var inData = input.GetDataArray();
         var outShape = result._shape;
         var inShape = input._shape;
         var inStrides = input._strides;

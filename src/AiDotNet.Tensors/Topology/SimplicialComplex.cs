@@ -125,15 +125,12 @@ public sealed class SimplicialComplex
         var term = new Matrix<T>(n, n);
         if (kk == 0 || n == 0) return term;
 
-        using var aKeep1 = new KeepAliveScope(a);
-        using var termKeep1 = new KeepAliveScope(term);
         BlasManaged.Syrk<T>(
             Uplo.Lower, trans, n, kk, ops.One,
-            a.AsSpanUnmarked(), a.Columns, ops.Zero, term.AsWritableSpanUnmarked(), n);
+            a.AsSpan(), a.Columns, ops.Zero, term.AsWritableSpan(), n);
 
         // Mirror lower → upper to produce the full symmetric matrix.
-        using var spanLease = term.LeaseWritable();
-        var span = spanLease.Span;
+        var span = term.AsWritableSpan();
         for (int i = 0; i < n; i++)
             for (int j = 0; j < i; j++)
                 span[j * n + i] = span[i * n + j];

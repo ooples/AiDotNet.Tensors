@@ -138,8 +138,7 @@ public sealed class ShardedSafetensorsWriter
 
         // Materialise the byte payload now so the bin-packer has a
         // concrete size to dispatch against.
-        using var tensorKeep1 = new KeepAliveScope(tensor);
-        var bytes = MemoryMarshal.AsBytes(tensor.AsSpanUnmarked()).ToArray();
+        var bytes = MemoryMarshal.AsBytes(tensor.AsSpan()).ToArray();
         var dtype = MapClrTypeToDtype(typeof(T));
         var shape = new long[tensor._shape.Length];
         for (int i = 0; i < shape.Length; i++) shape[i] = tensor._shape[i];

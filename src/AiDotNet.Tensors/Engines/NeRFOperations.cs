@@ -531,10 +531,8 @@ public static class NeRFOperations
     {
         int numRays = tValuesCoarse._shape[0];
         int numCoarseSamples = tValuesCoarse._shape[1];
-        using var tValuesLease = tValuesCoarse.Lease();
-        var tValues = tValuesLease.Span;
-        using var weightsLease = weightsCoarse.Lease();
-        var weights = weightsLease.Span;
+        var tValues = tValuesCoarse.AsSpan();
+        var weights = weightsCoarse.AsSpan();
         var output = new float[checked(numRays * numFineSamples)];
 
         for (int ray = 0; ray < numRays; ray++)

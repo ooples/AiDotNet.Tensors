@@ -985,8 +985,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var data = eng.DownloadResidentBuffer(_finalOutput);
         if (data is null) return false;
         var src = (T[])(object)data;
-        using var dstLease = _finalOutput.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = _finalOutput.AsWritableSpan();
         if (src.Length < dst.Length) return false;
         src.AsSpan(0, dst.Length).CopyTo(dst);
         return true;
@@ -1012,9 +1011,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // under CUDA graph capture it's recorded as a device memcpy node and
         // replays correctly every iteration.
         Execute();
-        using var finalOutputKeep1 = new KeepAliveScope(_finalOutput);
-        using var outputKeep1 = new KeepAliveScope(output);
-        _finalOutput.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
+        _finalOutput.AsSpan().CopyTo(output.AsWritableSpan());
     }
 
     /// <inheritdoc/>
@@ -1044,8 +1041,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             var src = inputs[i] ?? throw new ArgumentException(
                 $"inputs[{i}] is null.", nameof(inputs));
             ValidateShapesMatch(_compiledInputTensors[i], src, $"inputs[{i}]");
-            using var srcKeep1 = new KeepAliveScope(src);
-            src.AsSpanUnmarked().CopyTo(_compiledInputTensors[i].AsWritableSpan());
+            src.AsSpan().CopyTo(_compiledInputTensors[i].AsWritableSpan());
         }
     }
 
@@ -1059,8 +1055,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 $"{nameof(SetInput)} requires exactly one.");
 
         ValidateShapesMatch(_compiledInputTensors[0], input, nameof(input));
-        using var inputKeep1 = new KeepAliveScope(input);
-        input.AsSpanUnmarked().CopyTo(_compiledInputTensors[0].AsWritableSpan());
+        input.AsSpan().CopyTo(_compiledInputTensors[0].AsWritableSpan());
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
@@ -1387,10 +1382,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         step.OpName,
                         (eng, o) =>
                         {
-                            using var srcLease = capturedInput.Lease();
-                            var src = srcLease.Span;
-                            using var dstLease = capturedOutput.LeaseWritable();
-                            var dst = dstLease.Span;
+                            var src = capturedInput.AsSpan();
+                            var dst = capturedOutput.AsWritableSpan();
                             for (int r = 0; r < rows; r++)
                                 for (int c = 0; c < cols; c++)
                                     dst[c * rows + r] = src[r * cols + c];
@@ -1409,9 +1402,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         (eng, o) =>
                         {
                             var transposed = eng.TensorTranspose(capturedInput);
-                            using var transposedKeep1 = new KeepAliveScope(transposed);
-                            using var capturedOutputKeep1 = new KeepAliveScope(capturedOutput);
-                            transposed.AsSpanUnmarked().CopyTo(capturedOutput.AsWritableSpanUnmarked());
+                            transposed.AsSpan().CopyTo(capturedOutput.AsWritableSpan());
                         },
                         step.OutputBuffer,
                         step.Inputs,

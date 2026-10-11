@@ -267,10 +267,8 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
         var present = new Tensor<T>(source._shape);
-        using var spanLease = source.Lease();
-        var span = spanLease.Span;
-        using var maskLease = present.LeaseWritable();
-        var mask = maskLease.Span;
+        var span = source.AsSpan();
+        var mask = present.AsWritableSpan();
         for (int i = 0; i < span.Length; i++) mask[i] = double.IsNaN(ops.ToDouble(span[i])) ? ops.Zero : ops.One;
         return (TensorWhere(present, tensor, new Tensor<T>(source._shape)), present);
     }
@@ -452,14 +450,10 @@ public partial class CpuEngine
             var y = output.IsContiguous ? output : output.Contiguous();
             var dy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             var gx = new Tensor<T>(x._shape);
-            using var xsLease = x.Lease();
-            var xs = xsLease.Span;
-            using var ysLease = y.Lease();
-            var ys = ysLease.Span;
-            using var gsLease = dy.Lease();
-            var gs = gsLease.Span;
-            using var dstLease = gx.LeaseWritable();
-            var dst = dstLease.Span;
+            var xs = x.AsSpan();
+            var ys = y.AsSpan();
+            var gs = dy.AsSpan();
+            var dst = gx.AsWritableSpan();
             for (int i = 0; i < dst.Length; i++)
                 dst[i] = ops.FromDouble(ops.ToDouble(gs[i]) * derivative(ops.ToDouble(xs[i]), ops.ToDouble(ys[i])));
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
@@ -484,16 +478,11 @@ public partial class CpuEngine
             Tensor<T> dy, Interfaces.INumericOperations<T> ops)
         {
             var g = new Tensor<T>(a._shape);
-            using var avLease = a.Lease();
-            var av = avLease.Span;
-            using var bvLease = b.Lease();
-            var bv = bvLease.Span;
-            using var yvLease = y.Lease();
-            var yv = yvLease.Span;
-            using var gvLease = dy.Lease();
-            var gv = gvLease.Span;
-            using var dstLease = g.LeaseWritable();
-            var dst = dstLease.Span;
+            var av = a.AsSpan();
+            var bv = b.AsSpan();
+            var yv = y.AsSpan();
+            var gv = dy.AsSpan();
+            var dst = g.AsWritableSpan();
             for (int i = 0; i < dst.Length; i++)
                 dst[i] = ops.FromDouble(ops.ToDouble(gv[i]) * d(ops.ToDouble(av[i]), ops.ToDouble(bv[i]), ops.ToDouble(yv[i])));
             return g;

@@ -282,9 +282,7 @@ public sealed class DpSgdFusedStep<T> : IDisposable
                 throw new InvalidOperationException(
                     $"DpSgdFusedStep: per-example slot {i} shape changed mid-batch. " +
                     $"Expected {slot.Length} elements, got {src.Length}.");
-            using var srcKeep1 = new KeepAliveScope(src);
-            using var slotKeep1 = new KeepAliveScope(slot);
-            src.AsSpanUnmarked().CopyTo(slot.AsWritableSpanUnmarked());
+            src.AsSpan().CopyTo(slot.AsWritableSpan());
         }
     }
 

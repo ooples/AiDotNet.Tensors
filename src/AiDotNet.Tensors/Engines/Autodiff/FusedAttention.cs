@@ -394,22 +394,18 @@ public static class FusedAttention<T>
     // in float (8 AVX2 lanes) instead of double (4).
     private static Tensor<float> DoubleToFloat(Tensor<double> t)
     {
-        using var srcLease = t.Lease();
-        var src = srcLease.Span;
+        var src = t.AsSpan();
         var result = Tensor<float>.CreateZeros((int[])t._shape.Clone());
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
         return result;
     }
 
     private static Tensor<double> FloatToDouble(Tensor<float> t)
     {
-        using var srcLease = t.Lease();
-        var src = srcLease.Span;
+        var src = t.AsSpan();
         var result = Tensor<double>.CreateZeros((int[])t._shape.Clone());
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++) dst[i] = src[i];
         return result;
     }
@@ -457,8 +453,7 @@ public static class FusedAttention<T>
         if (!scores.IsContiguous) scores = scores.Contiguous();
         // Scores are normally a reshape view. Array access returns a snapshot for views;
         // the causal mask must write through the tensor's COW-aware storage instead.
-        using var dataLease = scores.LeaseWritable();
-        var data = dataLease.Span;
+        var data = scores.AsWritableSpan();
         T negInf = numOps.FromDouble(double.NegativeInfinity);
         for (int i = 0; i < b; i++)
         {
@@ -665,8 +660,7 @@ public static class FusedAttention<T>
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
-            using var sLease = sTile.Lease();
-            var s = sLease.Span;
+            var s = sTile.AsSpan();
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
@@ -697,10 +691,8 @@ public static class FusedAttention<T>
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
-            using var sLease = sTile.Lease();
-            var s = sLease.Span;
-            using var dpLease = dpTile.Lease();
-            var dp = dpLease.Span;
+            var s = sTile.AsSpan();
+            var dp = dpTile.AsSpan();
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
@@ -726,10 +718,8 @@ public static class FusedAttention<T>
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
-            using var sLease = sTile.Lease();
-            var s = sLease.Span;
-            using var dpLease = dpTile.Lease();
-            var dp = dpLease.Span;
+            var s = sTile.AsSpan();
+            var dp = dpTile.AsSpan();
 
             // Masked (j >= jMax) entries stay zero-init, so they contribute nothing to the
             // dV / dK / dQ GEMMs below — exactly the causal mask.
@@ -752,18 +742,15 @@ public static class FusedAttention<T>
 
             // dV_j = Σ_i P_ij · dO_i  -> [BH, bk, Dv]; keys are disjoint per tile, so write.
             var dVtile = engine.TensorBatchMatMul(pTile.TransposeLast2D(), dof);            // [BH, bk, Dv]
-            using var dVtileKeep1 = new KeepAliveScope(dVtile);
-            CopyTileIntoAxis1(dVfull, dVtile.AsSpanUnmarked(), BH, Sk, Dv, j0, bk);
+            CopyTileIntoAxis1(dVfull, dVtile.AsSpan(), BH, Sk, Dv, j0, bk);
             // dK_j = scale · Σ_i dS_ij · q_i -> [BH, bk, Dh]
             var dKtile = engine.TensorMultiplyScalar(
                 engine.TensorBatchMatMul(dsTile.TransposeLast2D(), qf), scaleT);            // [BH, bk, Dh]
-            using var dKtileKeep1 = new KeepAliveScope(dKtile);
-            CopyTileIntoAxis1(dKfull, dKtile.AsSpanUnmarked(), BH, Sk, headDim, j0, bk);
+            CopyTileIntoAxis1(dKfull, dKtile.AsSpan(), BH, Sk, headDim, j0, bk);
             // dQ_i += scale · Σ_j dS_ij · k_j -> [BH, Sq, Dh] (accumulate across tiles)
             var dQtile = engine.TensorMultiplyScalar(
                 engine.TensorBatchMatMul(dsTile, kt), scaleT);                              // [BH, Sq, Dh]
-            using var dqLease = dQtile.Lease();
-            var dq = dqLease.Span;
+            var dq = dQtile.AsSpan();
             for (int idx = 0; idx < dQacc.Length; idx++)
                 dQacc[idx] = numOps.Add(dQacc[idx], dq[idx]);
         }
@@ -802,8 +789,7 @@ public static class FusedAttention<T>
     private static Tensor<T> SliceAxis1(INumericOperations<T> numOps, Tensor<T> src, int BH, int S, int D, int j0, int bk)
     {
         if (!src.IsContiguous) src = src.Contiguous();
-        using var srcDataLease = src.Lease();
-        var srcData = srcDataLease.Span;
+        var srcData = src.AsSpan();
         var dst = new T[BH * bk * D];
         for (int b = 0; b < BH; b++)
             srcData.Slice((b * S + j0) * D, bk * D).CopyTo(dst.AsSpan(b * bk * D, bk * D));
@@ -829,10 +815,8 @@ public static class FusedAttention<T>
         if (!P.IsContiguous) P = P.Contiguous();
         var shape = P._shape;
         int b = shape[0], h = shape[1], sq = shape[2], sk = shape[3];
-        using var pDataLease = P.Lease();
-        var pData = pDataLease.Span;
-        using var dpDataLease = dP.Lease();
-        var dpData = dpDataLease.Span;
+        var pData = P.AsSpan();
+        var dpData = dP.AsSpan();
         var dsData = new T[pData.Length];
         for (int i = 0; i < b; i++)
         {

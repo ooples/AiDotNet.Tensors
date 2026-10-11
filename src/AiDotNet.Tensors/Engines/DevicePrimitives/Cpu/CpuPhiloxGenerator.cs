@@ -47,8 +47,7 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     public void Uniform(Tensor<float> output)
     {
         if (output is null) throw new ArgumentNullException(nameof(output));
-        using var spanLease = output.LeaseWritable();
-        var span = spanLease.Span;
+        var span = output.AsWritableSpan();
         // Each Philox round returns 4 uint32. We pack 4 outputs per
         // counter increment, treating each uint as a uniform [0, 1) by
         // dividing by 2^32.
@@ -75,8 +74,7 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     public void Uniform(Tensor<double> output)
     {
         if (output is null) throw new ArgumentNullException(nameof(output));
-        using var spanLease = output.LeaseWritable();
-        var span = spanLease.Span;
+        var span = output.AsWritableSpan();
         // For doubles we combine two uint32s into one uint53-equivalent
         // and divide by 2^53. Same convention cuRAND's CURAND_RNG_PSEUDO_PHILOX4_32_10
         // double generator uses.
@@ -103,8 +101,7 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     public void Normal(Tensor<float> output, float mean = 0f, float stddev = 1f)
     {
         if (output is null) throw new ArgumentNullException(nameof(output));
-        using var spanLease = output.LeaseWritable();
-        var span = spanLease.Span;
+        var span = output.AsWritableSpan();
         // Each Philox block produces four normals via two Box-Muller
         // pairs. The previous loop's index mutations could fall through
         // every emit on lengths {1, 5} and similar, leaving the tail
@@ -129,8 +126,7 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
     public void Normal(Tensor<double> output, double mean = 0, double stddev = 1)
     {
         if (output is null) throw new ArgumentNullException(nameof(output));
-        using var spanLease = output.LeaseWritable();
-        var span = spanLease.Span;
+        var span = output.AsWritableSpan();
         // Same partial-block fix as the float Normal above — the previous
         // `i + 2 <= span.Length` condition silently dropped the final
         // element on odd-length tensors, so a `Normal(new Tensor<double>(1))`
@@ -154,8 +150,7 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
         if (float.IsNaN(p) || p < 0f || p > 1f)
             throw new ArgumentOutOfRangeException(nameof(p),
                 $"Bernoulli probability must be in [0, 1]; got {p}.");
-        using var spanLease = output.LeaseWritable();
-        var span = spanLease.Span;
+        var span = output.AsWritableSpan();
         // Edge cases: with p exactly 0 or 1, the comparison
         // `(r * Inv2_32 < p)` is technically deterministic but using a
         // straight Fill avoids any rare boundary mis-evaluation that

@@ -41,10 +41,7 @@ public static class TensorPrimitivesHelper<T>
             throw new ArgumentException(VectorsSameLength);
 
         var result = new Vector<T>(x.Length);
-        using var xKeep1 = new KeepAliveScope(x);
-        using var yKeep1 = new KeepAliveScope(y);
-        using var resultKeep1 = new KeepAliveScope(result);
-        NumOps.Add(x.AsSpanUnmarked(), y.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Add(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -58,10 +55,7 @@ public static class TensorPrimitivesHelper<T>
             throw new ArgumentException(VectorsSameLength);
 
         var result = new Vector<T>(x.Length);
-        using var xKeep2 = new KeepAliveScope(x);
-        using var yKeep2 = new KeepAliveScope(y);
-        using var resultKeep2 = new KeepAliveScope(result);
-        NumOps.Subtract(x.AsSpanUnmarked(), y.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Subtract(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -75,10 +69,7 @@ public static class TensorPrimitivesHelper<T>
             throw new ArgumentException(VectorsSameLength);
 
         var result = new Vector<T>(x.Length);
-        using var xKeep3 = new KeepAliveScope(x);
-        using var yKeep3 = new KeepAliveScope(y);
-        using var resultKeep3 = new KeepAliveScope(result);
-        NumOps.Multiply(x.AsSpanUnmarked(), y.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Multiply(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -92,10 +83,7 @@ public static class TensorPrimitivesHelper<T>
             throw new ArgumentException(VectorsSameLength);
 
         var result = new Vector<T>(x.Length);
-        using var xKeep4 = new KeepAliveScope(x);
-        using var yKeep4 = new KeepAliveScope(y);
-        using var resultKeep4 = new KeepAliveScope(result);
-        NumOps.Divide(x.AsSpanUnmarked(), y.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Divide(x.AsSpan(), y.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -147,9 +135,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Exp(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep5 = new KeepAliveScope(x);
-        using var resultKeep5 = new KeepAliveScope(result);
-        NumOps.Exp(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Exp(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -160,9 +146,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Log(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep6 = new KeepAliveScope(x);
-        using var resultKeep6 = new KeepAliveScope(result);
-        NumOps.Log(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Log(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -176,9 +160,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Sqrt(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep7 = new KeepAliveScope(x);
-        using var resultKeep7 = new KeepAliveScope(result);
-        NumOps.Sqrt(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Sqrt(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -189,9 +171,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Tanh(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep8 = new KeepAliveScope(x);
-        using var resultKeep8 = new KeepAliveScope(result);
-        NumOps.Tanh(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Tanh(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -202,9 +182,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Sigmoid(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep9 = new KeepAliveScope(x);
-        using var resultKeep9 = new KeepAliveScope(result);
-        NumOps.Sigmoid(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Sigmoid(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -221,9 +199,7 @@ public static class TensorPrimitivesHelper<T>
     {
         var result = new Vector<T>(x.Length);
         T alphaT = NumOps.FromDouble(alpha);
-        using var xKeep10 = new KeepAliveScope(x);
-        using var resultKeep10 = new KeepAliveScope(result);
-        NumOps.LeakyReLU(x.AsSpanUnmarked(), alphaT, result.AsWritableSpanUnmarked());
+        NumOps.LeakyReLU(x.AsSpan(), alphaT, result.AsWritableSpan());
 
         return result;
     }
@@ -239,9 +215,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> GELU(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep11 = new KeepAliveScope(x);
-        using var resultKeep11 = new KeepAliveScope(result);
-        NumOps.GELU(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.GELU(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -256,9 +230,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Mish(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep12 = new KeepAliveScope(x);
-        using var resultKeep12 = new KeepAliveScope(result);
-        NumOps.Mish(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Mish(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -273,9 +245,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Swish(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep13 = new KeepAliveScope(x);
-        using var resultKeep13 = new KeepAliveScope(result);
-        NumOps.Swish(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Swish(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -292,9 +262,7 @@ public static class TensorPrimitivesHelper<T>
     {
         var result = new Vector<T>(x.Length);
         T alphaT = NumOps.FromDouble(alpha);
-        using var xKeep14 = new KeepAliveScope(x);
-        using var resultKeep14 = new KeepAliveScope(result);
-        NumOps.ELU(x.AsSpanUnmarked(), alphaT, result.AsWritableSpanUnmarked());
+        NumOps.ELU(x.AsSpan(), alphaT, result.AsWritableSpan());
 
         return result;
     }
@@ -305,9 +273,7 @@ public static class TensorPrimitivesHelper<T>
     public static Vector<T> Log2(Vector<T> x)
     {
         var result = new Vector<T>(x.Length);
-        using var xKeep15 = new KeepAliveScope(x);
-        using var resultKeep15 = new KeepAliveScope(result);
-        NumOps.Log2(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.Log2(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }
@@ -321,9 +287,7 @@ public static class TensorPrimitivesHelper<T>
             throw new ArgumentException("Vector cannot be empty", nameof(x));
 
         var result = new Vector<T>(x.Length);
-        using var xKeep16 = new KeepAliveScope(x);
-        using var resultKeep16 = new KeepAliveScope(result);
-        NumOps.SoftMax(x.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        NumOps.SoftMax(x.AsSpan(), result.AsWritableSpan());
 
         return result;
     }

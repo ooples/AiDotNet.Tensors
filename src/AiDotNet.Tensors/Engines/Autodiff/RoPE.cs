@@ -82,8 +82,7 @@ public static class RoPE
             seqLen = tensor._shape[2];
         }
 
-        using var dataLease = tensor.LeaseArray();
-        var data = dataLease.Array;
+        var data = tensor.GetDataArray();
         int innerStride = headDim;
         int seqStride = heads * headDim; // [B, S, H, D] would differ — but canonical is [B, H, S, D]
 

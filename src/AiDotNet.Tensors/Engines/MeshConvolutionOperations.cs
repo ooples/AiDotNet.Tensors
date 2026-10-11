@@ -63,8 +63,7 @@ public static class MeshConvolutionOperations
         var output = new T[numVertices * outputChannels];
         var vertexData = vertexFeatures.ToArray();
         var indicesData = spiralIndices.ToArray();
-        using var weightsDataLease = weights.LeaseArray();
-        var weightsData = weightsDataLease.Array;
+        var weightsData = weights.GetDataArray();
         var biasData = biases.ToArray();
 
         // Process vertices in parallel
@@ -180,8 +179,7 @@ public static class MeshConvolutionOperations
 
         var gradData = outputGradient.ToArray();
         var indicesData = spiralIndices.ToArray();
-        using var weightsDataLease = weights.LeaseArray();
-        var weightsData = weightsDataLease.Array;
+        var weightsData = weights.GetDataArray();
 
         // Process vertices in parallel
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numVertices, numVertices, v =>
@@ -480,8 +478,7 @@ public static class MeshConvolutionOperations
 
         var vertexData = vertexFeatures.ToArray();
         var lapData = laplacian.ToArray();
-        using var weightsDataLease = weights.LeaseArray();
-        var weightsData = weightsDataLease.Array;
+        var weightsData = weights.GetDataArray();
         var biasData = biases.ToArray();
 
         // Extract sparse structure once (O(E) where E = edges) to avoid O(V²) in each multiply
@@ -656,8 +653,7 @@ public static class MeshConvolutionOperations
         var gradData = outputGradient.ToArray();
         var vertexData = vertexFeatures.ToArray();
         var lapData = laplacian.ToArray();
-        using var weightsDataLease = weights.LeaseArray();
-        var weightsData = weightsDataLease.Array;
+        var weightsData = weights.GetDataArray();
 
         // Compute diffused features for weight gradient
         var Lx = new T[numVertices * inputChannels];
@@ -778,8 +774,7 @@ public static class MeshConvolutionOperations
         int numVertices = vertices._shape[0];
         int numFaces = faces._shape[0];
 
-        using var vertexDataLease = vertices.LeaseArray();
-        var vertexData = vertexDataLease.Array;
+        var vertexData = vertices.GetDataArray();
         var faceData = faces.ToArray();
         var laplacian = new double[numVertices * numVertices];
         var lapLocks = new object[numVertices];
@@ -939,8 +934,7 @@ public static class MeshConvolutionOperations
         int numVertices = vertices._shape[0];
         int numFaces = faces._shape[0];
 
-        using var vertexDataLease = vertices.LeaseArray();
-        var vertexData = vertexDataLease.Array;
+        var vertexData = vertices.GetDataArray();
         var faceData = faces.ToArray();
 
         // Build adjacency list using HashSet for O(1) lookups during construction

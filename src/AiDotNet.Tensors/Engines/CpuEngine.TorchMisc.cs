@@ -47,8 +47,7 @@ public partial class CpuEngine
         var rng = training ? RandomSource(seed) : null;
         double evalSlope = (lower + upper) / 2;
         var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
-        using var sourceKeep1 = new KeepAliveScope(source);
-        var values = source.AsSpanUnmarked().ToArray();
+        var values = source.AsSpan().ToArray();
         // PyTorch draws a slope for every x <= 0 (and leaky_relu's derivative at 0 is the slope), so the slope
         // array is also the exact derivative; the backward reads it rather than recovering y / x after rounding.
         var slopes = new double[values.Length];
@@ -123,8 +122,7 @@ public partial class CpuEngine
         var values = (input.IsContiguous ? input : input.Contiguous()).AsSpan().ToArray();
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(outputShape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         for (int o = 0; o < source.Length; o++) dst[o] = source[o] < 0 ? ops.Zero : values[source[o]];
         DifferentiableOps.RecordUnary(opName, result, input, IndexMapBackward<T>, new object[] { source });
         return result;
@@ -137,8 +135,7 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).AsSpan();
         var gx = new Tensor<T>((int[])inputs[0]._shape.Clone());
-        using var dstLease = gx.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = gx.AsWritableSpan();
         for (int o = 0; o < source.Length; o++)
             if (source[o] >= 0) dst[source[o]] = ops.Add(dst[source[o]], g[o]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gx, engine);
@@ -212,8 +209,7 @@ public partial class CpuEngine
         var inputValues = (input.IsContiguous ? input : input.Contiguous()).AsSpan().ToArray();
         var srcValues = (src.IsContiguous ? src : src.Contiguous()).AsSpan().ToArray();
         var result = new Tensor<T>((int[])shape.Clone());
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         for (int i = 0; i < dst.Length; i++) dst[i] = fromSrc[i] < 0 ? inputValues[i] : srcValues[fromSrc[i]];
         DifferentiableOps.RecordBinary("TensorDiagonalScatter", result, input, src, DiagonalScatterBackward<T>, new object[] { fromSrc });
         return result;
@@ -226,10 +222,8 @@ public partial class CpuEngine
         var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).AsSpan();
         var gInput = new Tensor<T>((int[])inputs[0]._shape.Clone());
         var gSrc = new Tensor<T>((int[])inputs[1]._shape.Clone());
-        using var giLease = gInput.LeaseWritable();
-        var gi = giLease.Span;
-        using var gsLease = gSrc.LeaseWritable();
-        var gs = gsLease.Span;
+        var gi = gInput.AsWritableSpan();
+        var gs = gSrc.AsWritableSpan();
         for (int i = 0; i < fromSrc.Length; i++)
         {
             if (fromSrc[i] < 0) gi[i] = g[i];

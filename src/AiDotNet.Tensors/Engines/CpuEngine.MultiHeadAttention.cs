@@ -257,12 +257,9 @@ public partial class CpuEngine
             }
             else
             {
-                using var qWSLease = qWeight.Lease();
-                var qWS = qWSLease.Span;
-                using var kWSLease = kWeight.Lease();
-                var kWS = kWSLease.Span;
-                using var vWSLease = vWeight.Lease();
-                var vWS = vWSLease.Span;
+                var qWS = qWeight.AsSpan();
+                var kWS = kWeight.AsSpan();
+                var vWS = vWeight.AsSpan();
                 var fW = fusedWBuf!.AsSpan();
                 for (int kk = 0; kk < dModel; kk++)
                 {
@@ -307,12 +304,10 @@ public partial class CpuEngine
             }
             else
             {
-                using var outWeightKeep1 = new KeepAliveScope(outWeight);
-                using var outputKeep1 = new KeepAliveScope(output);
                 SimdGemm.Sgemm(
                     concatBuf.AsSpan(0, totalRows * dModel), dModel, false,
-                    outWeight.AsSpanUnmarked(), dModel, false,
-                    output.AsWritableSpanUnmarked(),
+                    outWeight.AsSpan(), dModel, false,
+                    output.AsWritableSpan(),
                     batchSeqRows, dModel, dModel);
             }
 
@@ -354,10 +349,9 @@ public partial class CpuEngine
         }
 #endif
 
-        using var weightKeep1 = new KeepAliveScope(weight);
         SimdGemm.Sgemm(
             input.AsSpan(0, rows * dModel), dModel, false,
-            weight.AsSpanUnmarked(), dModel, false,
+            weight.AsSpan(), dModel, false,
             output.AsSpan(0, rows * dModel), rows, dModel, dModel);
     }
 

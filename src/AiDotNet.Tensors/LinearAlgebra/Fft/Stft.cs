@@ -79,8 +79,7 @@ public static class Stft
             if (window.Rank != 1 || window.Shape[0] != win)
                 throw new ArgumentException($"window must be 1D with length {win}.", nameof(window));
             int pad = (nFft - win) / 2;
-            using var wSrcLease = window.LeaseArray();
-            var wSrc = wSrcLease.Array;
+            var wSrc = window.GetDataArray();
             for (int i = 0; i < win; i++) winPadded[pad + i] = ops.ToDouble(wSrc[i]);
         }
         else
@@ -108,10 +107,8 @@ public static class Stft
         outShape[rank - 1] = nFreqs;
         outShape[rank] = 2 * nFrames;
         var output = new Tensor<T>(outShape);
-        using var inDLease = input.LeaseArray();
-        var inD = inDLease.Array;
-        using var outDLease = output.LeaseArray();
-        var outD = outDLease.Array;
+        var inD = input.GetDataArray();
+        var outD = output.GetDataArray();
 
         double frameScale = normalized ? 1.0 / Math.Sqrt(nFft) : 1.0;
 
@@ -168,10 +165,8 @@ public static class Stft
             reshapedShape[outShape.Length - 1] = nFrames;
             reshapedShape[outShape.Length] = 2;
             var reshaped = new Tensor<T>(reshapedShape);
-            using var srcDLease = output.LeaseArray();
-            var srcD = srcDLease.Array;
-            using var dstDLease = reshaped.LeaseArray();
-            var dstD = dstDLease.Array;
+            var srcD = output.GetDataArray();
+            var dstD = reshaped.GetDataArray();
             int outerCount = batch * nFreqs;
             // srcD layout: outer * 2 * nFrames (re/im interleaved per frame)
             // dstD layout: outer * nFrames * 2 (re/im pair per frame)
@@ -216,8 +211,7 @@ public static class Stft
         if (window is not null)
         {
             int pad = (nFft - win) / 2;
-            using var wSrcLease = window.LeaseArray();
-            var wSrc = wSrcLease.Array;
+            var wSrc = window.GetDataArray();
             for (int i = 0; i < win; i++) winPadded[pad + i] = ops.ToDouble(wSrc[i]);
         }
         else
@@ -249,10 +243,8 @@ public static class Stft
         for (int i = 0; i < rank - 2; i++) outShape[i] = input._shape[i];
         outShape[rank - 2] = outLen;
         var output = new Tensor<T>(outShape);
-        using var inDLease = input.LeaseArray();
-        var inD = inDLease.Array;
-        using var outDLease = output.LeaseArray();
-        var outD = outDLease.Array;
+        var inD = input.GetDataArray();
+        var outD = output.GetDataArray();
 
         double frameScale = normalized ? Math.Sqrt(nFft) : 1.0;
 

@@ -26,8 +26,7 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         if (axis == -1)
         {
             // Reduce all elements to a scalar tensor.
-            using var srcLease = input.Lease();
-            var src = srcLease.Span;
+            var src = input.AsSpan();
             // Empty input has no elements to seed the accumulator. NumPy/
             // PyTorch return the reduction's identity element here (0 for
             // Sum, 1 for Prod, +Inf/-Inf for Min/Max), but we don't have
@@ -57,8 +56,7 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
             T acc = src[0];
             for (int i = 1; i < src.Length; i++) acc = Combine(acc, src[i], ops, kind);
             var scalar = new Tensor<T>(new[] { 1 });
-            using var scalarKeep1 = new KeepAliveScope(scalar);
-            scalar.AsWritableSpanUnmarked()[0] = acc;
+            scalar.AsWritableSpan()[0] = acc;
             return scalar;
         }
         // Reduce along a single axis.
@@ -71,10 +69,8 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         var outShape = new int[input.Rank - 1];
         for (int d = 0, j = 0; d < input.Rank; d++) if (d != axis) outShape[j++] = input._shape[d];
         var output = new Tensor<T>(outShape);
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var outSpan = output.AsWritableSpan();
 
         for (int o = 0; o < outer; o++)
         {
@@ -103,10 +99,8 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         for (int d = actualAxis + 1; d < input.Rank; d++) inner *= input._shape[d];
 
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var outSpan = output.AsWritableSpan();
         T identity = kind switch
         {
             ReductionKind.Sum => ops.Zero,
@@ -152,9 +146,7 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         if (actualAxis < 0 || actualAxis >= input.Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var inputKeep1 = new KeepAliveScope(input);
-        using var outputKeep1 = new KeepAliveScope(output);
-        input.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
+        input.AsSpan().CopyTo(output.AsWritableSpan());
         SortAxis<T>(output, actualAxis, descending, ops);
         return output;
     }
@@ -172,10 +164,8 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         for (int d = actualAxis + 1; d < input.Rank; d++) inner *= input._shape[d];
 
         var indices = new Tensor<int>((int[])input._shape.Clone());
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var idxSpanLease = indices.LeaseWritable();
-        var idxSpan = idxSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var idxSpan = indices.AsWritableSpan();
         var keys = new T[axisLen];
         var idx = new int[axisLen];
 
@@ -219,10 +209,8 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         double widthD = (hiD - loD) / bins;
 
         var output = new Tensor<int>(new[] { bins });
-        using var countsLease = output.LeaseWritable();
-        var counts = countsLease.Span;
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var counts = output.AsWritableSpan();
+        var src = input.AsSpan();
         for (int i = 0; i < src.Length; i++)
         {
             T v = src[i];
@@ -240,8 +228,7 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var src = input.AsSpan();
         if (src.Length == 0)
             return (new Tensor<T>(new[] { 0 }), new Tensor<int>(new[] { 0 }));
 
@@ -257,10 +244,8 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
 
         var vTensor = new Tensor<T>(new[] { values.Count });
         var cTensor = new Tensor<int>(new[] { counts.Count });
-        using var vSpanLease = vTensor.LeaseWritable();
-        var vSpan = vSpanLease.Span;
-        using var cSpanLease = cTensor.LeaseWritable();
-        var cSpan = cSpanLease.Span;
+        var vSpan = vTensor.AsWritableSpan();
+        var cSpan = cTensor.AsWritableSpan();
         for (int i = 0; i < values.Count; i++) { vSpan[i] = values[i]; cSpan[i] = counts[i]; }
         return (vTensor, cTensor);
     }
@@ -280,8 +265,7 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         for (int d = 0; d < axis; d++) outer *= t._shape[d];
         for (int d = axis + 1; d < t.Rank; d++) inner *= t._shape[d];
 
-        using var spanLease = t.LeaseWritable();
-        var span = spanLease.Span;
+        var span = t.AsWritableSpan();
         var buf = new T[axisLen];
         for (int o = 0; o < outer; o++)
         {

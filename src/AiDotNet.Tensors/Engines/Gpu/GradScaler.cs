@@ -96,8 +96,7 @@ public sealed class GradScaler
             // if any element is NaN/Inf. The reduction runs on GPU; only the 1-element
             // scalar result is downloaded to CPU (not the full gradient tensor).
             var sum = engine.TensorMeanDiff(gradients[i]);
-            using var sumDataLease = sum.LeaseArray();
-            var sumData = sumDataLease.Array;
+            var sumData = sum.GetDataArray();
             double sumVal = numOps.ToDouble(sumData[0]);
             if (double.IsInfinity(sumVal) || double.IsNaN(sumVal))
             {

@@ -119,12 +119,9 @@ internal static class LinalgBackward
                 // Vector case: outer product of gradB (n,) and X (n,).
                 int n = A.Shape[A.Rank - 1];
                 gradA = new Tensor<T>((int[])A._shape.Clone());
-                using var gbDataLease = gradB.LeaseArray();
-                var gbData = gbDataLease.Array;
-                using var xDataLease = X.LeaseArray();
-                var xData = xDataLease.Array;
-                using var gaDataLease = gradA.LeaseArray();
-                var gaData = gaDataLease.Array;
+                var gbData = gradB.GetDataArray();
+                var xData = X.GetDataArray();
+                var gaData = gradA.GetDataArray();
                 int batch = 1;
                 for (int i = 0; i < A.Rank - 2; i++) batch *= A._shape[i];
                 for (int b = 0; b < batch; b++)
@@ -228,16 +225,11 @@ internal static class LinalgBackward
             for (int i = 0; i < rank - 2; i++) batch *= V._shape[i];
 
             var gradA = new Tensor<T>((int[])V._shape.Clone());
-            using var gradADataLease = gradA.LeaseArray();
-            var gradAData = gradADataLease.Array;
-            using var VDataLease = V.LeaseArray();
-            var VData = VDataLease.Array;
-            using var wDataLease = w.LeaseArray();
-            var wData = wDataLease.Array;
-            using var gradWDataLease = gradW.LeaseArray();
-            var gradWData = gradWDataLease.Array;
-            using var gradVDataLease = gradOutput.LeaseArray();
-            var gradVData = gradVDataLease.Array;
+            var gradAData = gradA.GetDataArray();
+            var VData = V.GetDataArray();
+            var wData = w.GetDataArray();
+            var gradWData = gradW.GetDataArray();
+            var gradVData = gradOutput.GetDataArray();
 
             const double eps = 1e-12;
 
@@ -349,14 +341,10 @@ internal static class LinalgBackward
             int k = Math.Min(m, n);
 
             var gradA = new Tensor<T>((int[])A._shape.Clone());
-            using var uDataLease = U.LeaseArray();
-            var uData = uDataLease.Array;
-            using var vhDataLease = Vh.LeaseArray();
-            var vhData = vhDataLease.Array;
-            using var gradSDataLease = gradOutput.LeaseArray();
-            var gradSData = gradSDataLease.Array;
-            using var gradADataLease = gradA.LeaseArray();
-            var gradAData = gradADataLease.Array;
+            var uData = U.GetDataArray();
+            var vhData = Vh.GetDataArray();
+            var gradSData = gradOutput.GetDataArray();
+            var gradAData = gradA.GetDataArray();
 
             int batch = 1;
             for (int i = 0; i < rank - 2; i++) batch *= A._shape[i];
@@ -463,10 +451,8 @@ internal static class LinalgBackward
             double scale = gradVal / normVal;
 
             var gradA = new Tensor<T>((int[])a._shape.Clone());
-            using var aDataLease = a.LeaseArray();
-            var aData = aDataLease.Array;
-            using var gDataLease = gradA.LeaseArray();
-            var gData = gDataLease.Array;
+            var aData = a.GetDataArray();
+            var gData = gradA.GetDataArray();
             for (int i = 0; i < a.Length; i++) gData[i] = FromD<T>(scale * ToD(aData[i]));
             Accumulate(grads, a, gradA);
         };
@@ -506,10 +492,8 @@ internal static class LinalgBackward
         shape[rank - 2] = n;
         shape[rank - 1] = m;
         var result = new Tensor<T>(shape);
-        using var srcLease = t.LeaseArray();
-        var src = srcLease.Array;
-        using var dstLease = result.LeaseArray();
-        var dst = dstLease.Array;
+        var src = t.GetDataArray();
+        var dst = result.GetDataArray();
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= t._shape[i];
         for (int b = 0; b < batch; b++)
@@ -559,15 +543,13 @@ internal static class LinalgBackward
 
     private static void Negate<T>(Tensor<T> a) where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        using var dLease = a.LeaseArray();
-        var d = dLease.Array;
+        var d = a.GetDataArray();
         for (int i = 0; i < a.Length; i++) d[i] = FromD<T>(-ToD(d[i]));
     }
 
     private static void ScaleInPlace<T>(Tensor<T> a, double s) where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        using var dLease = a.LeaseArray();
-        var d = dLease.Array;
+        var d = a.GetDataArray();
         for (int i = 0; i < a.Length; i++) d[i] = FromD<T>(s * ToD(d[i]));
     }
 
@@ -575,10 +557,8 @@ internal static class LinalgBackward
     {
         // For det/slogdet gradients: scalar (shape [batch]) broadcasts to (..., M, N) by repeating.
         var r = new Tensor<T>((int[])matShape.Clone());
-        using var sDLease = scalar.LeaseArray();
-        var sD = sDLease.Array;
-        using var rDLease = r.LeaseArray();
-        var rD = rDLease.Array;
+        var sD = scalar.GetDataArray();
+        var rD = r.GetDataArray();
         int rank = matShape.Length;
         int m = matShape[rank - 2], n = matShape[rank - 1];
         int batch = 1;
@@ -593,8 +573,7 @@ internal static class LinalgBackward
         int rank = like.Rank;
         int n = like.Shape[rank - 1];
         var result = new Tensor<T>((int[])like._shape.Clone());
-        using var dLease = result.LeaseArray();
-        var d = dLease.Array;
+        var d = result.GetDataArray();
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= like._shape[i];
         for (int b = 0; b < batch; b++)
@@ -609,8 +588,7 @@ internal static class LinalgBackward
         int n = m.Shape[rank - 1];
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= m._shape[i];
-        using var dLease = m.LeaseArray();
-        var d = dLease.Array;
+        var d = m.GetDataArray();
         for (int b = 0; b < batch; b++)
             for (int i = 0; i < n; i++)
                 for (int j = 0; j < n; j++)

@@ -222,11 +222,9 @@ public sealed class AutocastScope : IDisposable
         _fp32Cache[name] = fp32;
         if (_fp16Cache.TryGetValue(name, out var existing)) return existing;
 
-        using var fp32DataLease = fp32.LeaseArray();
-        var fp32Data = fp32DataLease.Array;
+        var fp32Data = fp32.GetDataArray();
         var fp16Tensor = new LinearAlgebra.Tensor<Half>(fp32._shape);
-        using var fp16SpanLease = fp16Tensor.LeaseWritable();
-        var fp16Span = fp16SpanLease.Span;
+        var fp16Span = fp16Tensor.AsWritableSpan();
         for (int i = 0; i < fp32.Length; i++)
             fp16Span[i] = (Half)fp32Data[i];
         _fp16Cache[name] = fp16Tensor;
@@ -279,10 +277,8 @@ public sealed class AutocastScope : IDisposable
     {
         if (fp16 is null) throw new ArgumentNullException(nameof(fp16));
         var result = new LinearAlgebra.Tensor<float>(fp16._shape);
-        using var srcLease = fp16.Lease();
-        var src = srcLease.Span;
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = fp16.AsSpan();
+        var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
         return result;
     }
@@ -292,10 +288,8 @@ public sealed class AutocastScope : IDisposable
     {
         if (fp32 is null) throw new ArgumentNullException(nameof(fp32));
         var result = new LinearAlgebra.Tensor<Half>(fp32._shape);
-        using var srcLease = fp32.Lease();
-        var src = srcLease.Span;
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = fp32.AsSpan();
+        var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++) dst[i] = (Half)src[i];
         return result;
     }

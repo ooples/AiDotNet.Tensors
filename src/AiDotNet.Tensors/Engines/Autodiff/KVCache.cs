@@ -88,11 +88,9 @@ public sealed class KVCache<T>
 
         // Copy into the [start, start+newLen) slot of the batch row.
         int stepStride = Heads * HeadDim;
-        using var kSrcLease = newKeys.Lease();
-        var kSrc = kSrcLease.Span;
+        var kSrc = newKeys.AsSpan();
         var vSrc = newValues.AsSpan();
-        using var kDstLease = _keys.LeaseWritable();
-        var kDst = kDstLease.Span;
+        var kDst = _keys.AsWritableSpan();
         var vDst = _values.AsWritableSpan();
         int dstBase = (batchIdx * MaxSeq + start) * stepStride;
         kSrc.CopyTo(kDst.Slice(dstBase, newLen * stepStride));
@@ -135,10 +133,8 @@ public sealed class KVCache<T>
         if (len > 0)
         {
             int srcBase = batchIdx * MaxSeq * stepStride;
-            using var kKeep1 = new KeepAliveScope(k);
-            _keys.AsSpan().Slice(srcBase, len * stepStride).CopyTo(k.AsWritableSpanUnmarked());
-            using var vKeep1 = new KeepAliveScope(v);
-            _values.AsSpan().Slice(srcBase, len * stepStride).CopyTo(v.AsWritableSpanUnmarked());
+            _keys.AsSpan().Slice(srcBase, len * stepStride).CopyTo(k.AsWritableSpan());
+            _values.AsSpan().Slice(srcBase, len * stepStride).CopyTo(v.AsWritableSpan());
         }
         return (k, v);
     }

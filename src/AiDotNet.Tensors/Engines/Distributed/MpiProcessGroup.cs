@@ -167,8 +167,7 @@ public sealed class MpiProcessGroup : IProcessGroup
     public void AllReduce<T>(Tensor<T> tensor, ReduceOp op = ReduceOp.Sum)
     {
         var arr = new T[tensor.Length];
-        using var tensorKeep1 = new KeepAliveScope(tensor);
-        tensor.AsSpanUnmarked().CopyTo(arr);
+        tensor.AsSpan().CopyTo(arr);
         var send = GCHandle.Alloc(arr, GCHandleType.Pinned);
         var recv = GCHandle.Alloc(new T[tensor.Length], GCHandleType.Pinned);
         try
@@ -192,15 +191,13 @@ public sealed class MpiProcessGroup : IProcessGroup
     public void Broadcast<T>(Tensor<T> tensor, int root)
     {
         var arr = new T[tensor.Length];
-        using var tensorKeep3 = new KeepAliveScope(tensor);
-        if (Rank == root) tensor.AsSpanUnmarked().CopyTo(arr);
+        if (Rank == root) tensor.AsSpan().CopyTo(arr);
         var h = GCHandle.Alloc(arr, GCHandleType.Pinned);
         try
         {
             int rc = MpiNative.MPI_Bcast(h.AddrOfPinnedObject(), tensor.Length, Type<T>(), root, _commWorld);
             if (rc != MpiNative.MPI_SUCCESS) throw new InvalidOperationException($"MPI_Bcast returned {rc}.");
-            using var tensorKeep4 = new KeepAliveScope(tensor);
-            arr.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
+            arr.AsSpan().CopyTo(tensor.AsWritableSpan());
         }
         finally { h.Free(); }
     }
@@ -209,8 +206,7 @@ public sealed class MpiProcessGroup : IProcessGroup
     public void Reduce<T>(Tensor<T> tensor, int root, ReduceOp op = ReduceOp.Sum)
     {
         var arr = new T[tensor.Length];
-        using var tensorKeep5 = new KeepAliveScope(tensor);
-        tensor.AsSpanUnmarked().CopyTo(arr);
+        tensor.AsSpan().CopyTo(arr);
         var send = GCHandle.Alloc(arr, GCHandleType.Pinned);
         var recv = GCHandle.Alloc(new T[tensor.Length], GCHandleType.Pinned);
         try
@@ -238,8 +234,7 @@ public sealed class MpiProcessGroup : IProcessGroup
     {
         if (output.Count != WorldSize) throw new ArgumentException($"output must have length {WorldSize}.", nameof(output));
         var sendArr = new T[input.Length];
-        using var inputKeep1 = new KeepAliveScope(input);
-        input.AsSpanUnmarked().CopyTo(sendArr);
+        input.AsSpan().CopyTo(sendArr);
         var recvArr = new T[input.Length * WorldSize];
         var send = GCHandle.Alloc(sendArr, GCHandleType.Pinned);
         var recv = GCHandle.Alloc(recvArr, GCHandleType.Pinned);
@@ -284,8 +279,7 @@ public sealed class MpiProcessGroup : IProcessGroup
     public void Send<T>(Tensor<T> tensor, int dst, int tag = 0)
     {
         var arr = new T[tensor.Length];
-        using var tensorKeep7 = new KeepAliveScope(tensor);
-        tensor.AsSpanUnmarked().CopyTo(arr);
+        tensor.AsSpan().CopyTo(arr);
         var h = GCHandle.Alloc(arr, GCHandleType.Pinned);
         try
         {
@@ -304,8 +298,7 @@ public sealed class MpiProcessGroup : IProcessGroup
         {
             int rc = MpiNative.MPI_Recv(h.AddrOfPinnedObject(), tensor.Length, Type<T>(), src, tag, _commWorld, IntPtr.Zero);
             if (rc != MpiNative.MPI_SUCCESS) throw new InvalidOperationException($"MPI_Recv returned {rc}.");
-            using var tensorKeep8 = new KeepAliveScope(tensor);
-            arr.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
+            arr.AsSpan().CopyTo(tensor.AsWritableSpan());
         }
         finally { h.Free(); }
     }

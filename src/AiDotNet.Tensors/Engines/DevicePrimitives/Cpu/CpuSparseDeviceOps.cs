@@ -32,8 +32,7 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         if (rowPtr.Length != rows + 1)
             throw new ArgumentException(
                 $"{component}: rowPtr length must be rows+1 ({rows + 1}); got {rowPtr.Length}.", nameof(rowPtr));
-        using var rpLease = rowPtr.Lease();
-        var rp = rpLease.Span;
+        var rp = rowPtr.AsSpan();
         if (rp[0] != 0)
             throw new ArgumentException($"{component}: rowPtr[0] must be 0; got {rp[0]}.", nameof(rowPtr));
         for (int r = 0; r < rows; r++)
@@ -47,8 +46,7 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         if (colIdx.Length != nnz)
             throw new ArgumentException(
                 $"{component}: colIdx length must equal nnz ({nnz}); got {colIdx.Length}.", nameof(colIdx));
-        using var ciLease = colIdx.Lease();
-        var ci = ciLease.Span;
+        var ci = colIdx.AsSpan();
         for (int i = 0; i < ci.Length; i++)
         {
             if (ci[i] < 0 || ci[i] >= cols)
@@ -68,8 +66,7 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         if (rowPtr.Length != rows + 1)
             throw new ArgumentException(
                 $"{component}: rowPtr length must be rows+1 ({rows + 1}); got {rowPtr.Length}.", nameof(rowPtr));
-        using var rpLease = rowPtr.Lease();
-        var rp = rpLease.Span;
+        var rp = rowPtr.AsSpan();
         if (rp[0] != 0)
             throw new ArgumentException($"{component}: rowPtr[0] must be 0; got {rp[0]}.", nameof(rowPtr));
         for (int r = 0; r < rows; r++)
@@ -86,8 +83,7 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         if (values.Length != nnz)
             throw new ArgumentException(
                 $"{component}: values length must equal nnz ({nnz}); got {values.Length}.", nameof(values));
-        using var ciLease = colIdx.Lease();
-        var ci = ciLease.Span;
+        var ci = colIdx.AsSpan();
         for (int i = 0; i < ci.Length; i++)
         {
             if (ci[i] < 0 || ci[i] >= cols)
@@ -112,15 +108,11 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         if (k != cols) throw new ArgumentException($"Inner dimension mismatch: sparse cols {cols} vs dense rows {k}.");
 
         var output = new Tensor<T>(new[] { rows, n });
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var outSpan = output.AsWritableSpan();
         var vals = csrValues.AsSpan();
-        using var rowPtrLease = csrRowPtr.Lease();
-        var rowPtr = rowPtrLease.Span;
-        using var colIdxLease = csrColIdx.Lease();
-        var colIdx = colIdxLease.Span;
-        using var denseSpanLease = dense.Lease();
-        var denseSpan = denseSpanLease.Span;
+        var rowPtr = csrRowPtr.AsSpan();
+        var colIdx = csrColIdx.AsSpan();
+        var denseSpan = dense.AsSpan();
 
         for (int r = 0; r < rows; r++)
         {
@@ -148,15 +140,11 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         ValidateCsr(csrValues, csrRowPtr, csrColIdx, rows, cols, "SpMV");
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>(new[] { rows });
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var outSpan = output.AsWritableSpan();
         var vals = csrValues.AsSpan();
-        using var rowPtrLease = csrRowPtr.Lease();
-        var rowPtr = rowPtrLease.Span;
-        using var colIdxLease = csrColIdx.Lease();
-        var colIdx = colIdxLease.Span;
-        using var xLease = denseVec.Lease();
-        var x = xLease.Span;
+        var rowPtr = csrRowPtr.AsSpan();
+        var colIdx = csrColIdx.AsSpan();
+        var x = denseVec.AsSpan();
 
         for (int r = 0; r < rows; r++)
         {
@@ -184,15 +172,11 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         ValidateCsr(bValues, bRowPtr, bColIdx, bRows, bCols, "SpGEMM.B");
         var ops = MathHelper.GetNumericOperations<T>();
         var aVals = aValues.AsSpan();
-        using var aRpLease = aRowPtr.Lease();
-        var aRp = aRpLease.Span;
-        using var aCiLease = aColIdx.Lease();
-        var aCi = aCiLease.Span;
+        var aRp = aRowPtr.AsSpan();
+        var aCi = aColIdx.AsSpan();
         var bVals = bValues.AsSpan();
-        using var bRpLease = bRowPtr.Lease();
-        var bRp = bRpLease.Span;
-        using var bCiLease = bColIdx.Lease();
-        var bCi = bCiLease.Span;
+        var bRp = bRowPtr.AsSpan();
+        var bCi = bColIdx.AsSpan();
 
         var rowPtr = new int[aRows + 1];
         var rowAcc = new Dictionary<int, T>();
@@ -226,12 +210,9 @@ public sealed class CpuSparseDeviceOps : ISparseDeviceOps
         var vTensor = new Tensor<T>(new[] { values.Count });
         var ciTensor = new Tensor<int>(new[] { colIdx.Count });
         var rpTensor = new Tensor<int>(new[] { rowPtr.Length });
-        using var vSpanLease = vTensor.LeaseWritable();
-        var vSpan = vSpanLease.Span;
-        using var ciSpanLease = ciTensor.LeaseWritable();
-        var ciSpan = ciSpanLease.Span;
-        using var rpSpanLease = rpTensor.LeaseWritable();
-        var rpSpan = rpSpanLease.Span;
+        var vSpan = vTensor.AsWritableSpan();
+        var ciSpan = ciTensor.AsWritableSpan();
+        var rpSpan = rpTensor.AsWritableSpan();
         for (int i = 0; i < values.Count; i++) { vSpan[i] = values[i]; ciSpan[i] = colIdx[i]; }
         for (int i = 0; i < rowPtr.Length; i++) rpSpan[i] = rowPtr[i];
         _ = aRows; _ = bCols;

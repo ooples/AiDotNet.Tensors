@@ -94,13 +94,10 @@ public sealed class PagedKVCache<T>
 
         int len = _lengths[seqId];
         int stepStride = Heads * HeadDim;
-        using var kSrcLease = newKeys.Lease();
-        var kSrc = kSrcLease.Span;
+        var kSrc = newKeys.AsSpan();
         var vSrc = newValues.AsSpan();
-        using var kDstLease = _keyBlocks.LeaseWritable();
-        var kDst = kDstLease.Span;
-        using var vDstLease = _valueBlocks.LeaseWritable();
-        var vDst = vDstLease.Span;
+        var kDst = _keyBlocks.AsWritableSpan();
+        var vDst = _valueBlocks.AsWritableSpan();
 
         for (int i = 0; i < newLen; i++)
         {
@@ -137,14 +134,10 @@ public sealed class PagedKVCache<T>
 
         var table = _blockTables[seqId];
         int stepStride = Heads * HeadDim;
-        using var kSrcLease = _keyBlocks.Lease();
-        var kSrc = kSrcLease.Span;
-        using var vSrcLease = _valueBlocks.Lease();
-        var vSrc = vSrcLease.Span;
-        using var kDstLease = k.LeaseWritable();
-        var kDst = kDstLease.Span;
-        using var vDstLease = v.LeaseWritable();
-        var vDst = vDstLease.Span;
+        var kSrc = _keyBlocks.AsSpan();
+        var vSrc = _valueBlocks.AsSpan();
+        var kDst = k.AsWritableSpan();
+        var vDst = v.AsWritableSpan();
         int copied = 0;
         for (int b = 0; b < table.Count && copied < len; b++)
         {

@@ -105,8 +105,7 @@ public sealed class MaskedTensor<T>
     {
         var result = new Tensor<T>(Shape);
         var src = Values.AsSpan();
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
+        var dst = result.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
             dst[i] = IsValid(i) ? src[i] : fill;
         return result;

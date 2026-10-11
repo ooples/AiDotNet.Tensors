@@ -68,8 +68,7 @@ public partial class DirectGpuTensorEngine
         if (!x.IsContiguous) x = x.Contiguous();
         if (!degree.IsContiguous) degree = degree.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
-        using var degreeKeep1 = new KeepAliveScope(degree);
-        foreach (var value in degree.AsSpanUnmarked())
+        foreach (var value in degree.AsSpan())
         {
             double d = ops.ToDouble(value);
             if (double.IsInfinity(d) || d > (1 << 20)) return null;

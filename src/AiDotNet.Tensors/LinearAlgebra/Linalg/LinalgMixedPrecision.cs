@@ -105,10 +105,8 @@ public static class LinalgMixedPrecision
     private static Tensor<float> CastDoubleToFloat(Tensor<double> src)
     {
         var dst = new Tensor<float>((int[])src._shape.Clone());
-        using var sdLease = src.LeaseArray();
-        var sd = sdLease.Array;
-        using var ddLease = dst.LeaseArray();
-        var dd = ddLease.Array;
+        var sd = src.GetDataArray();
+        var dd = dst.GetDataArray();
         for (int i = 0; i < src.Length; i++) dd[i] = (float)sd[i];
         return dst;
     }
@@ -116,10 +114,8 @@ public static class LinalgMixedPrecision
     private static Tensor<double> CastFloatToDouble(Tensor<float> src)
     {
         var dst = new Tensor<double>((int[])src._shape.Clone());
-        using var sdLease = src.LeaseArray();
-        var sd = sdLease.Array;
-        using var ddLease = dst.LeaseArray();
-        var dd = ddLease.Array;
+        var sd = src.GetDataArray();
+        var dd = dst.GetDataArray();
         for (int i = 0; i < src.Length; i++) dd[i] = sd[i];
         return dst;
     }
@@ -130,14 +126,10 @@ public static class LinalgMixedPrecision
     {
         // r = b - A·x, all at FP64. Supports vector and matrix b.
         var result = new Tensor<double>((int[])b._shape.Clone());
-        using var aDLease = a.LeaseArray();
-        var aD = aDLease.Array;
-        using var xDLease = x.LeaseArray();
-        var xD = xDLease.Array;
-        using var bDLease = b.LeaseArray();
-        var bD = bDLease.Array;
-        using var rDLease = result.LeaseArray();
-        var rD = rDLease.Array;
+        var aD = a.GetDataArray();
+        var xD = x.GetDataArray();
+        var bD = b.GetDataArray();
+        var rD = result.GetDataArray();
 
         bool bIsVector = b.Rank == a.Rank - 1;
         int rank = a.Rank;
@@ -176,18 +168,15 @@ public static class LinalgMixedPrecision
     private static double NormF64(Tensor<double> t)
     {
         double s = 0;
-        using var dLease = t.LeaseArray();
-        var d = dLease.Array;
+        var d = t.GetDataArray();
         for (int i = 0; i < t.Length; i++) s += d[i] * d[i];
         return Math.Sqrt(s);
     }
 
     private static void AddInPlace(Tensor<double> a, Tensor<double> b)
     {
-        using var aDLease = a.LeaseArray();
-        var aD = aDLease.Array;
-        using var bDLease = b.LeaseArray();
-        var bD = bDLease.Array;
+        var aD = a.GetDataArray();
+        var bD = b.GetDataArray();
         for (int i = 0; i < a.Length; i++) aD[i] += bD[i];
     }
 }

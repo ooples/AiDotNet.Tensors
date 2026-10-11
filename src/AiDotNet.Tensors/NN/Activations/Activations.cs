@@ -21,10 +21,8 @@ public static class Activations
         if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
             double v = ops.ToDouble(src[i]);
@@ -40,10 +38,8 @@ public static class Activations
         if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
             double v = ops.ToDouble(src[i]);
@@ -61,10 +57,8 @@ public static class Activations
         if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
             double v = ops.ToDouble(src[i]);
@@ -80,10 +74,8 @@ public static class Activations
         if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
         T fill = ops.FromDouble(value);
         for (int i = 0; i < src.Length; i++)
         {
@@ -100,10 +92,8 @@ public static class Activations
         if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
             double v = ops.ToDouble(src[i]);
@@ -121,10 +111,8 @@ public static class Activations
         if (input is null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
         const double C = 0.7978845608028654; // sqrt(2/π)
         for (int i = 0; i < src.Length; i++)
         {
@@ -171,10 +159,8 @@ public static class Activations
 
         int outer = 1;
         for (int d = 0; d < input.Rank - 1; d++) outer *= input._shape[d];
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
 
         for (int o = 0; o < outer; o++)
         {

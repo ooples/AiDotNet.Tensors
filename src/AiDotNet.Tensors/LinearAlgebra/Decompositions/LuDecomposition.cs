@@ -87,10 +87,8 @@ internal static class LuDecomposition
         var pivots = new Tensor<int>(pivotShape);
 
         int batch = BatchSize(input._shape, rank);
-        using var luDataLease = luCopy.LeaseArray();
-        var luData = luDataLease.Array;
-        using var pivDataLease = pivots.LeaseArray();
-        var pivData = pivDataLease.Array;
+        var luData = luCopy.GetDataArray();
+        var pivData = pivots.GetDataArray();
         int matStride = m * n;
         int pivStride = k;
 
@@ -124,12 +122,9 @@ internal static class LuDecomposition
         Array.Copy(b.GetDataArray(), x.GetDataArray(), b.Length);
 
         int batch = BatchSize(lu._shape, rank);
-        using var luDataLease = lu.LeaseArray();
-        var luData = luDataLease.Array;
-        using var pivDataLease = pivots.LeaseArray();
-        var pivData = pivDataLease.Array;
-        using var xDataLease = x.LeaseArray();
-        var xData = xDataLease.Array;
+        var luData = lu.GetDataArray();
+        var pivData = pivots.GetDataArray();
+        var xData = x.GetDataArray();
         int luStride = n * n;
         int pivStride = n;
         int xStride = bIsVector ? n : n * nrhs;
@@ -270,16 +265,11 @@ internal static class LuDecomposition
         int batchIdx, int m, int n, int k)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        using var luDataLease = luPacked.LeaseArray();
-        var luData = luDataLease.Array;
-        using var pivDataLease = pivots.LeaseArray();
-        var pivData = pivDataLease.Array;
-        using var lDataLease = L.LeaseArray();
-        var lData = lDataLease.Array;
-        using var uDataLease = U.LeaseArray();
-        var uData = uDataLease.Array;
-        using var pDataLease = P.LeaseArray();
-        var pData = pDataLease.Array;
+        var luData = luPacked.GetDataArray();
+        var pivData = pivots.GetDataArray();
+        var lData = L.GetDataArray();
+        var uData = U.GetDataArray();
+        var pData = P.GetDataArray();
         int luStride = m * n;
         int pivStride = k;
         int lStride = m * k;

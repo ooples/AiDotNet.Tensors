@@ -305,8 +305,7 @@ public static class Fft
     {
         if (n <= 0) throw new ArgumentException("n must be positive.", nameof(n));
         var result = new Tensor<T>(new[] { n });
-        using var dataLease = result.LeaseArray();
-        var data = dataLease.Array;
+        var data = result.GetDataArray();
         double scale = 1.0 / (d * n);
         int split = (n + 1) / 2; // number of non-negative frequencies
         for (int i = 0; i < split; i++) data[i] = FromDouble<T>(i * scale);
@@ -325,8 +324,7 @@ public static class Fft
         if (n <= 0) throw new ArgumentException("n must be positive.", nameof(n));
         int m = n / 2 + 1;
         var result = new Tensor<T>(new[] { m });
-        using var dataLease = result.LeaseArray();
-        var data = dataLease.Array;
+        var data = result.GetDataArray();
         double scale = 1.0 / (d * n);
         for (int i = 0; i < m; i++) data[i] = FromDouble<T>(i * scale);
         return result;
@@ -380,10 +378,8 @@ public static class Fft
 
         int batch = 1;
         for (int i = 0; i < rank - 1; i++) batch *= input._shape[i];
-        using var inDLease = input.LeaseArray();
-        var inD = inDLease.Array;
-        using var rDLease = result.LeaseArray();
-        var rD = rDLease.Array;
+        var inD = input.GetDataArray();
+        var rD = result.GetDataArray();
         int inStride = 2 * nIn;
         int outStride = 2 * n;
 
@@ -450,10 +446,8 @@ public static class Fft
 
         int batch = 1;
         for (int i = 0; i < rank - 1; i++) batch *= input._shape[i];
-        using var inDLease = input.LeaseArray();
-        var inD = inDLease.Array;
-        using var rDLease = result.LeaseArray();
-        var rD = rDLease.Array;
+        var inD = input.GetDataArray();
+        var rD = result.GetDataArray();
         int inStride = last;
         int outStride = outShape[rank - 1];
 
@@ -586,10 +580,8 @@ public static class Fft
         var outShape = (int[])prm._shape.Clone();
         outShape[prmRank - 2] = n; // crop/pad
         var outTensor = new Tensor<T>(outShape);
-        using var inDLease = prm.LeaseArray();
-        var inD = inDLease.Array;
-        using var outDLease = outTensor.LeaseArray();
-        var outD = outDLease.Array;
+        var inD = prm.GetDataArray();
+        var outD = outTensor.GetDataArray();
         int inRowStride = 2 * innerComplex;
         int outRowStride = 2 * innerComplex;
         int inMatStride = targetLen * inRowStride;
@@ -775,10 +767,8 @@ public static class Fft
 
         var src = input.Contiguous();
         var result = new Tensor<T>((int[])src._shape.Clone());
-        using var srcDataLease = src.LeaseArray();
-        var srcData = srcDataLease.Array;
-        using var dstDataLease = result.LeaseArray();
-        var dstData = dstDataLease.Array;
+        var srcData = src.GetDataArray();
+        var dstData = result.GetDataArray();
 
         int outer = 1;
         for (int i = 0; i < axis; i++) outer *= src._shape[i];
@@ -802,10 +792,8 @@ public static class Fft
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         var result = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.LeaseArray();
-        var src = srcLease.Array;
-        using var dstLease = result.LeaseArray();
-        var dst = dstLease.Array;
+        var src = input.GetDataArray();
+        var dst = result.GetDataArray();
         var ops = MathHelper.GetNumericOperations<T>();
         int last = input.Shape[input.Rank - 1];
         int batch = input.Length / last;

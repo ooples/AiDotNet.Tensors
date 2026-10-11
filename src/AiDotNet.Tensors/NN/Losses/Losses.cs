@@ -48,12 +48,9 @@ public static class Losses
         EnsureSameShape(input, target);
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var tgtSpanLease = target.Lease();
-        var tgtSpan = tgtSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var tgtSpan = target.AsSpan();
+        var outSpan = output.AsWritableSpan();
 
         // beta == 0 is a degenerate case where the quadratic branch
         // would divide by zero. PyTorch documents this as equivalent
@@ -68,12 +65,9 @@ public static class Losses
         // measured 4× speedup on this exact loop shape (per-element
         // ToDouble + scalar arithmetic + FromDouble). T is unconstrained
         // here so we pattern-match on the concrete data array.
-        using var inArrLease = input.LeaseArray();
-        var inArr = inArrLease.Array;
-        using var tgtArrLease = target.LeaseArray();
-        var tgtArr = tgtArrLease.Array;
-        using var outArrLease = output.LeaseArray();
-        var outArr = outArrLease.Array;
+        var inArr = input.GetDataArray();
+        var tgtArr = target.GetDataArray();
+        var outArr = output.GetDataArray();
         if (inArr is double[] iD && tgtArr is double[] tD && outArr is double[] oD)
         {
             int n = inSpan.Length;
@@ -147,12 +141,9 @@ public static class Losses
         EnsureSameShape(input, target);
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var tgtSpanLease = target.Lease();
-        var tgtSpan = tgtSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var tgtSpan = target.AsSpan();
+        var outSpan = output.AsWritableSpan();
         for (int i = 0; i < inSpan.Length; i++)
         {
             double xi = ops.ToDouble(inSpan[i]);
@@ -186,27 +177,19 @@ public static class Losses
         EnsureSameShape(input, variance);
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var tgtSpanLease = target.Lease();
-        var tgtSpan = tgtSpanLease.Span;
-        using var varSpanLease = variance.Lease();
-        var varSpan = varSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var tgtSpan = target.AsSpan();
+        var varSpan = variance.AsSpan();
+        var outSpan = output.AsWritableSpan();
         double constTerm = full ? 0.5 * Math.Log(2.0 * Math.PI) : 0.0;
 
         // #294 NumericFastPath: float / double primitive fast paths
         // bypass INumericOperations<T>'s per-element virtual dispatch
         // via concrete-array pattern match.
-        using var inArrLease = input.LeaseArray();
-        var inArr = inArrLease.Array;
-        using var tgtArrLease = target.LeaseArray();
-        var tgtArr = tgtArrLease.Array;
-        using var varArrLease = variance.LeaseArray();
-        var varArr = varArrLease.Array;
-        using var outArrLease = output.LeaseArray();
-        var outArr = outArrLease.Array;
+        var inArr = input.GetDataArray();
+        var tgtArr = target.GetDataArray();
+        var varArr = variance.GetDataArray();
+        var outArr = output.GetDataArray();
         if (inArr is double[] iD && tgtArr is double[] tD && varArr is double[] vD && outArr is double[] oD)
         {
             int n = inSpan.Length;
@@ -267,14 +250,10 @@ public static class Losses
             throw new ArgumentException(
                 $"weight length {weight.Length} must equal classes {classes}.", nameof(weight));
         var output = new Tensor<T>(new[] { batch });
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var tSpanLease = target.Lease();
-        var tSpan = tSpanLease.Span;
-        using var weightKeep1 = new KeepAliveScope(weight);
-        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpanUnmarked();
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var tSpan = target.AsSpan();
+        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpan();
+        var outSpan = output.AsWritableSpan();
         for (int b = 0; b < batch; b++)
         {
             int yi = tSpan[b];
@@ -312,12 +291,9 @@ public static class Losses
         var ops = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], classes = input._shape[1];
         var output = new Tensor<T>(new[] { batch });
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var tSpanLease = target.Lease();
-        var tSpan = tSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var tSpan = target.AsSpan();
+        var outSpan = output.AsWritableSpan();
         var positive = new bool[classes];
         for (int b = 0; b < batch; b++)
         {
@@ -358,14 +334,10 @@ public static class Losses
         var ops = MathHelper.GetNumericOperations<T>();
         int classes = input._shape[input.Rank - 1];
         var output = new Tensor<T>(DropLastDim(input._shape));
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var tSpanLease = target.Lease();
-        var tSpan = tSpanLease.Span;
-        using var weightKeep2 = new KeepAliveScope(weight);
-        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpanUnmarked();
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var tSpan = target.AsSpan();
+        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpan();
+        var outSpan = output.AsWritableSpan();
         int rows = output.Length;
         for (int r = 0; r < rows; r++)
         {
@@ -403,14 +375,10 @@ public static class Losses
         int last = anchor._shape[anchor.Rank - 1];
         int rows = anchor.Length / last;
         var output = new Tensor<T>(DropLastDim(anchor._shape));
-        using var aSpanLease = anchor.Lease();
-        var aSpan = aSpanLease.Span;
-        using var pSpanLease = positive.Lease();
-        var pSpan = pSpanLease.Span;
-        using var nSpanLease = negative.Lease();
-        var nSpan = nSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var aSpan = anchor.AsSpan();
+        var pSpan = positive.AsSpan();
+        var nSpan = negative.AsSpan();
+        var outSpan = output.AsWritableSpan();
         for (int r = 0; r < rows; r++)
         {
             double dPos = 0, dNeg = 0;
@@ -457,24 +425,18 @@ public static class Losses
             EnsureSameShape(dNeg, dPosNeg);
             var ops = MathHelper.GetNumericOperations<T>();
             var swapped = new Tensor<T>((int[])dNeg._shape.Clone());
-            using var srcNLease = dNeg.Lease();
-            var srcN = srcNLease.Span;
-            using var srcPnLease = dPosNeg.Lease();
-            var srcPn = srcPnLease.Span;
-            using var dstLease = swapped.LeaseWritable();
-            var dst = dstLease.Span;
+            var srcN = dNeg.AsSpan();
+            var srcPn = dPosNeg.AsSpan();
+            var dst = swapped.AsWritableSpan();
             for (int i = 0; i < srcN.Length; i++)
                 dst[i] = ops.LessThan(srcPn[i], srcN[i]) ? srcPn[i] : srcN[i];
             dNeg = swapped;
         }
         var loss = new Tensor<T>((int[])dPos._shape.Clone());
         var ops2 = MathHelper.GetNumericOperations<T>();
-        using var dPosSpanLease = dPos.Lease();
-        var dPosSpan = dPosSpanLease.Span;
-        using var dNegSpanLease = dNeg.Lease();
-        var dNegSpan = dNegSpanLease.Span;
-        using var outSpanLease = loss.LeaseWritable();
-        var outSpan = outSpanLease.Span;
+        var dPosSpan = dPos.AsSpan();
+        var dNegSpan = dNeg.AsSpan();
+        var outSpan = loss.AsWritableSpan();
         for (int i = 0; i < outSpan.Length; i++)
             outSpan[i] = ops2.FromDouble(Math.Max(0.0,
                 ops2.ToDouble(dPosSpan[i]) - ops2.ToDouble(dNegSpan[i]) + margin));
@@ -491,14 +453,10 @@ public static class Losses
         EnsureSameShape(input1, y);
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input1._shape.Clone());
-        using var s1Lease = input1.Lease();
-        var s1 = s1Lease.Span;
-        using var s2Lease = input2.Lease();
-        var s2 = s2Lease.Span;
-        using var syLease = y.Lease();
-        var sy = syLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var s1 = input1.AsSpan();
+        var s2 = input2.AsSpan();
+        var sy = y.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < s1.Length; i++)
         {
             double a = ops.ToDouble(s1[i]);
@@ -524,14 +482,10 @@ public static class Losses
             throw new ArgumentException(
                 "y must be rank-1 with one label per input row.", nameof(y));
         var output = new Tensor<T>(new[] { batch });
-        using var s1Lease = x1.Lease();
-        var s1 = s1Lease.Span;
-        using var s2Lease = x2.Lease();
-        var s2 = s2Lease.Span;
-        using var ySpanLease = y.Lease();
-        var ySpan = ySpanLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var s1 = x1.AsSpan();
+        var s2 = x2.AsSpan();
+        var ySpan = y.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int b = 0; b < batch; b++)
         {
             int yi = ySpan[b];
@@ -563,12 +517,9 @@ public static class Losses
             throw new ArgumentException("input and y must have the same length.");
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var ySpanLease = y.Lease();
-        var ySpan = ySpanLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var ySpan = y.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
             double xi = ops.ToDouble(src[i]);
@@ -587,12 +538,9 @@ public static class Losses
         EnsureSameShape(input, target);
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var tgtLease = target.Lease();
-        var tgt = tgtLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var tgt = target.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
             double inputI = ops.ToDouble(src[i]);
@@ -609,15 +557,13 @@ public static class Losses
     {
         if (reduction == LossReduction.None) return input;
         var ops = MathHelper.GetNumericOperations<T>();
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var src = input.AsSpan();
         T acc = ops.Zero;
         for (int i = 0; i < src.Length; i++) acc = ops.Add(acc, src[i]);
         if (reduction == LossReduction.Mean)
             acc = ops.Divide(acc, ops.FromDouble(src.Length));
         var result = new Tensor<T>(new[] { 1 });
-        using var resultKeep1 = new KeepAliveScope(result);
-        result.AsWritableSpanUnmarked()[0] = acc;
+        result.AsWritableSpan()[0] = acc;
         return result;
     }
 

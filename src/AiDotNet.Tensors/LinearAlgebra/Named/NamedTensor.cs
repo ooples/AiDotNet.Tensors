@@ -203,9 +203,7 @@ public sealed class NamedTensor<T>
             newShape[dst] = permutedTensor._shape[i];
         }
         var reshaped = new Tensor<T>(newShape);
-        using var permutedTensorKeep1 = new KeepAliveScope(permutedTensor);
-        using var reshapedKeep1 = new KeepAliveScope(reshaped);
-        permutedTensor.AsSpanUnmarked().CopyTo(reshaped.AsWritableSpanUnmarked());
+        permutedTensor.AsSpan().CopyTo(reshaped.AsWritableSpan());
         return new NamedTensor<T>(reshaped, newNames);
     }
 
@@ -254,9 +252,7 @@ public sealed class NamedTensor<T>
             writer++;
         }
         var flat = new Tensor<T>(newShape);
-        using var TensorKeep1 = new KeepAliveScope(Tensor);
-        using var flatKeep1 = new KeepAliveScope(flat);
-        Tensor.AsSpanUnmarked().CopyTo(flat.AsWritableSpanUnmarked());
+        Tensor.AsSpan().CopyTo(flat.AsWritableSpan());
         return new NamedTensor<T>(flat, newNames);
     }
 
@@ -298,9 +294,7 @@ public sealed class NamedTensor<T>
             writer++;
         }
         var unflat = new Tensor<T>(resultShape);
-        using var TensorKeep2 = new KeepAliveScope(Tensor);
-        using var unflatKeep1 = new KeepAliveScope(unflat);
-        Tensor.AsSpanUnmarked().CopyTo(unflat.AsWritableSpanUnmarked());
+        Tensor.AsSpan().CopyTo(unflat.AsWritableSpan());
         return new NamedTensor<T>(unflat, resultNames);
     }
 
@@ -317,10 +311,8 @@ public sealed class NamedTensor<T>
         var newShape = new int[perm.Length];
         for (int i = 0; i < perm.Length; i++) newShape[i] = tensor._shape[perm[i]];
         var result = new Tensor<T>(newShape);
-        using var dstLease = result.LeaseWritable();
-        var dst = dstLease.Span;
-        using var srcLease = tensor.Lease();
-        var src = srcLease.Span;
+        var dst = result.AsWritableSpan();
+        var src = tensor.AsSpan();
 
         // Use the tensor's own strides — recomputing dense row-major
         // strides from _shape is only correct for contiguous tensors.

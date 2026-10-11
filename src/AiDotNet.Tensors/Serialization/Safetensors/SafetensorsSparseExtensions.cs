@@ -36,8 +36,7 @@ public static class SafetensorsSparseExtensions
         // Values are written as a 1-D dense tensor — safetensors reader
         // gets a normal Tensor<T> back even without sparse-aware code.
         var valuesTensor = new Tensor<T>(new[] { sparse.NonZeroCount });
-        using var valuesTensorKeep1 = new KeepAliveScope(valuesTensor);
-        sparse.DataVector.AsSpan().CopyTo(valuesTensor.AsWritableSpanUnmarked());
+        sparse.DataVector.AsSpan().CopyTo(valuesTensor.AsWritableSpan());
         writer.Add($"{name}.values", valuesTensor);
 
         switch (sparse.Format)
@@ -93,10 +92,8 @@ public static class SafetensorsSparseExtensions
 
         var (kind, rows, cols, blockRow, blockCol) = ParseFormatTag(formatTag);
         var valuesArr = values.AsSpan().ToArray();
-        using var idx0Keep1 = new KeepAliveScope(idx0);
-        var idx0Arr = idx0.AsSpanUnmarked().ToArray();
-        using var idx1Keep1 = new KeepAliveScope(idx1);
-        var idx1Arr = idx1.AsSpanUnmarked().ToArray();
+        var idx0Arr = idx0.AsSpan().ToArray();
+        var idx1Arr = idx1.AsSpan().ToArray();
 
         return kind switch
         {
@@ -112,8 +109,7 @@ public static class SafetensorsSparseExtensions
     private static void AddIntTensor(SafetensorsWriter writer, string name, int[] data)
     {
         var t = new Tensor<int>(new[] { data.Length });
-        using var tKeep1 = new KeepAliveScope(t);
-        data.AsSpan().CopyTo(t.AsWritableSpanUnmarked());
+        data.AsSpan().CopyTo(t.AsWritableSpan());
         writer.Add(name, t);
     }
 

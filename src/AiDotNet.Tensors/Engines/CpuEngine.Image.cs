@@ -230,8 +230,7 @@ internal static class PngCodec
         int H = image._shape[0], W = image._shape[1], C = image._shape[2];
         byte colorType = C switch { 1 => 0, 2 => 4, 3 => 2, 4 => 6, _ => throw new ArgumentException("PNG: unsupported channel count") };
 
-        using var srcLease = image.Lease();
-        var src = srcLease.Span;
+        var src = image.AsSpan();
         var raw = new byte[H * (1 + W * C)];
         int dst = 0;
         for (int y = 0; y < H; y++)
@@ -404,8 +403,7 @@ internal static class JpegBinding
         ulong dstLen = 0;
         try
         {
-            using var imageKeep1 = new KeepAliveScope(image);
-            var srcBytes = image.AsSpanUnmarked().ToArray();
+            var srcBytes = image.AsSpan().ToArray();
             int r = tjCompress2(h, srcBytes, W, 0, H, pixFmt, ref dst, ref dstLen, TJSAMP_444, quality, 0);
             if (r != 0) throw new InvalidDataException("JPEG encode failed.");
             var result = new byte[(int)dstLen];
@@ -465,8 +463,7 @@ internal static class WebPBinding
         if (C != 4) throw new ArgumentException("WebP encode needs 4-channel RGBA; pad if needed.");
         IntPtr outPtr = IntPtr.Zero;
         nuint outLen;
-        using var imageKeep2 = new KeepAliveScope(image);
-        try { outLen = WebPEncodeRGBA(image.AsSpanUnmarked().ToArray(), W, H, W * 4, quality, out outPtr); }
+        try { outLen = WebPEncodeRGBA(image.AsSpan().ToArray(), W, H, W * 4, quality, out outPtr); }
         catch (DllNotFoundException ex)
         {
             throw new PlatformNotSupportedException(

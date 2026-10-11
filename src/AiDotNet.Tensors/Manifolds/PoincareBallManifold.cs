@@ -150,25 +150,21 @@ public sealed class PoincareBallManifold<T>
     {
         EnsureSameLength(a, b);
         var result = new T[a.Length];
-        using var aKeep1 = new KeepAliveScope(a);
-        using var bKeep1 = new KeepAliveScope(b);
-        _ops.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result);
+        _ops.Add(a.AsSpan(), b.AsSpan(), result);
         return new Vector<T>(result);
     }
 
     private Vector<T> Scale(Vector<T> v, T scalar)
     {
         var result = new T[v.Length];
-        using var vKeep1 = new KeepAliveScope(v);
-        _ops.MultiplyScalar(v.AsSpanUnmarked(), scalar, result);
+        _ops.MultiplyScalar(v.AsSpan(), scalar, result);
         return new Vector<T>(result);
     }
 
     private Vector<T> Negate(Vector<T> v)
     {
         var result = new T[v.Length];
-        using var vKeep2 = new KeepAliveScope(v);
-        _ops.Negate(v.AsSpanUnmarked(), result);
+        _ops.Negate(v.AsSpan(), result);
         return new Vector<T>(result);
     }
 

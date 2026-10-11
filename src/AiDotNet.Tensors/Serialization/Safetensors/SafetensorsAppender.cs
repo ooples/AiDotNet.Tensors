@@ -115,8 +115,7 @@ public sealed class SafetensorsAppender
             if (_newTensors[i].Name == name)
                 throw new ArgumentException($"Tensor name '{name}' already staged.", nameof(name));
 
-        using var tensorKeep1 = new KeepAliveScope(tensor);
-        var bytes = MemoryMarshal.AsBytes(tensor.AsSpanUnmarked()).ToArray();
+        var bytes = MemoryMarshal.AsBytes(tensor.AsSpan()).ToArray();
         var dtype = MapClrTypeToDtype(typeof(T));
         var shape = new long[tensor._shape.Length];
         for (int i = 0; i < shape.Length; i++) shape[i] = tensor._shape[i];

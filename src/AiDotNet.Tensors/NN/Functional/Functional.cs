@@ -37,10 +37,8 @@ public static class Functional
         for (int i = actualDim + 1; i < input.Rank; i++) inner *= input._shape[i];
 
         var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
 
         for (int o = 0; o < outer; o++)
         {
@@ -75,10 +73,8 @@ public static class Functional
         Array.Copy(input._shape, newShape, input.Rank);
         newShape[input.Rank] = numClasses;
         var output = new Tensor<int>(newShape);
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
         {
             int cls = src[i];
@@ -110,12 +106,9 @@ public static class Functional
         var ops = MathHelper.GetNumericOperations<T>();
         int batch = x1._shape[0], features = x1._shape[1];
         var output = new Tensor<T>(new[] { batch });
-        using var s1Lease = x1.Lease();
-        var s1 = s1Lease.Span;
-        using var s2Lease = x2.Lease();
-        var s2 = s2Lease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var s1 = x1.AsSpan();
+        var s2 = x2.AsSpan();
+        var dst = output.AsWritableSpan();
         for (int b = 0; b < batch; b++)
         {
             double accum = 0;
@@ -164,11 +157,9 @@ public static class Functional
         // become the "official" representation that backward sees.
         if (maxNorm is not null)
         {
-            using var wSpanLease = weight.LeaseWritable();
-            var wSpan = wSpanLease.Span;
+            var wSpan = weight.AsWritableSpan();
             var visited = new bool[numEmb];
-            using var inputSpanLease = input.Lease();
-            var inputSpan = inputSpanLease.Span;
+            var inputSpan = input.AsSpan();
             for (int i = 0; i < inputSpan.Length; i++)
             {
                 int row = inputSpan[i];
@@ -200,12 +191,9 @@ public static class Functional
         Array.Copy(input._shape, newShape, input.Rank);
         newShape[input.Rank] = embDim;
         var output = new Tensor<T>(newShape);
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var outSpanLease = output.LeaseWritable();
-        var outSpan = outSpanLease.Span;
-        using var weightSpanLease = weight.Lease();
-        var weightSpan = weightSpanLease.Span;
+        var inSpan = input.AsSpan();
+        var outSpan = output.AsWritableSpan();
+        var weightSpan = weight.AsSpan();
         for (int i = 0; i < inSpan.Length; i++)
         {
             int row = inSpan[i];
@@ -263,12 +251,9 @@ public static class Functional
         int bagCount = offsets.Length;
         int embDim = weight._shape[1];
         var output = new Tensor<T>(new[] { bagCount, embDim });
-        using var inSpanLease = input.Lease();
-        var inSpan = inSpanLease.Span;
-        using var weightSpanLease = weight.Lease();
-        var weightSpan = weightSpanLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var inSpan = input.AsSpan();
+        var weightSpan = weight.AsSpan();
+        var dst = output.AsWritableSpan();
 
         // Pre-validate offsets: non-negative, monotonic, and within
         // input.Length. Catches malformed inputs deterministically

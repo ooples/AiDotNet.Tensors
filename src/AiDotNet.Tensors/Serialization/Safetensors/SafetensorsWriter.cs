@@ -119,8 +119,7 @@ public sealed class SafetensorsWriter : IDisposable
                 throw new ArgumentException($"Tensor name '{name}' already added.", nameof(name));
 
         var dtype = MapClrTypeToDtype(typeof(T));
-        using var spanLease = tensor.Lease();
-        var span = spanLease.Span;
+        var span = tensor.AsSpan();
         var bytes = MemoryMarshal.AsBytes(span).ToArray();
 
         var shape = new long[tensor._shape.Length];

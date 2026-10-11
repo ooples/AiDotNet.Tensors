@@ -117,10 +117,8 @@ public static class OptimizerKernels
 
         if (typeof(T) == typeof(float))
         {
-            using var paramDataKeep1 = new KeepAliveScope(param);
-            var paramMem = AsFloatMemory(param.DataUnmarked);
-            using var gradContigDataKeep1 = new KeepAliveScope(gradContig);
-            var gradMem = AsFloatMemory(gradContig.DataUnmarked);
+            var paramMem = AsFloatMemory(param.Data);
+            var gradMem = AsFloatMemory(gradContig.Data);
             using var pinParam = paramMem.Pin();
             using var pinGrad = gradMem.Pin();
             // PR #322 review #12: Unsafe.As reinterprets the typed
@@ -135,10 +133,8 @@ public static class OptimizerKernels
 
         if (typeof(T) == typeof(double))
         {
-            using var paramDataKeep2 = new KeepAliveScope(param);
-            var paramMem = AsDoubleMemory(param.DataUnmarked);
-            using var gradContigDataKeep2 = new KeepAliveScope(gradContig);
-            var gradMem = AsDoubleMemory(gradContig.DataUnmarked);
+            var paramMem = AsDoubleMemory(param.Data);
+            var gradMem = AsDoubleMemory(gradContig.Data);
             using var pinParam = paramMem.Pin();
             using var pinGrad = gradMem.Pin();
             double lrD = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref lr);
@@ -152,10 +148,8 @@ public static class OptimizerKernels
         // everything else goes through the per-element numeric ops
         // dispatch. Still zero-allocation — no intermediate tensor.
         var numOps = MathHelper.GetNumericOperations<T>();
-        using var paramSpanTLease = param.LeaseWritable();
-        var paramSpanT = paramSpanTLease.Span;
-        using var gradSpanTLease = gradContig.Lease();
-        var gradSpanT = gradSpanTLease.Span;
+        var paramSpanT = param.AsWritableSpan();
+        var gradSpanT = gradContig.AsSpan();
         for (int i = 0; i < paramSpanT.Length; i++)
         {
             paramSpanT[i] = numOps.Subtract(
@@ -200,14 +194,10 @@ public static class OptimizerKernels
 
         if (typeof(T) == typeof(float))
         {
-            using var paramDataKeep3 = new KeepAliveScope(param);
-            var paramMem = AsFloatMemory(param.DataUnmarked);
-            using var gradContigDataKeep3 = new KeepAliveScope(gradContig);
-            var gradMem = AsFloatMemory(gradContig.DataUnmarked);
-            using var mDataKeep1 = new KeepAliveScope(m);
-            var mMem = AsFloatMemory(m.DataUnmarked);
-            using var vDataKeep1 = new KeepAliveScope(v);
-            var vMem = AsFloatMemory(v.DataUnmarked);
+            var paramMem = AsFloatMemory(param.Data);
+            var gradMem = AsFloatMemory(gradContig.Data);
+            var mMem = AsFloatMemory(m.Data);
+            var vMem = AsFloatMemory(v.Data);
             using var pinP = paramMem.Pin();
             using var pinG = gradMem.Pin();
             using var pinM = mMem.Pin();
@@ -227,14 +217,10 @@ public static class OptimizerKernels
 
         if (typeof(T) == typeof(double))
         {
-            using var paramDataKeep4 = new KeepAliveScope(param);
-            var paramMem = AsDoubleMemory(param.DataUnmarked);
-            using var gradContigDataKeep4 = new KeepAliveScope(gradContig);
-            var gradMem = AsDoubleMemory(gradContig.DataUnmarked);
-            using var mDataKeep2 = new KeepAliveScope(m);
-            var mMem = AsDoubleMemory(m.DataUnmarked);
-            using var vDataKeep2 = new KeepAliveScope(v);
-            var vMem = AsDoubleMemory(v.DataUnmarked);
+            var paramMem = AsDoubleMemory(param.Data);
+            var gradMem = AsDoubleMemory(gradContig.Data);
+            var mMem = AsDoubleMemory(m.Data);
+            var vMem = AsDoubleMemory(v.Data);
             using var pinP = paramMem.Pin();
             using var pinG = gradMem.Pin();
             using var pinM = mMem.Pin();
@@ -277,14 +263,10 @@ public static class OptimizerKernels
 
         if (typeof(T) == typeof(float))
         {
-            using var paramDataKeep5 = new KeepAliveScope(param);
-            var paramMem = AsFloatMemory(param.DataUnmarked);
-            using var gradContigDataKeep5 = new KeepAliveScope(gradContig);
-            var gradMem = AsFloatMemory(gradContig.DataUnmarked);
-            using var mDataKeep3 = new KeepAliveScope(m);
-            var mMem = AsFloatMemory(m.DataUnmarked);
-            using var vDataKeep3 = new KeepAliveScope(v);
-            var vMem = AsFloatMemory(v.DataUnmarked);
+            var paramMem = AsFloatMemory(param.Data);
+            var gradMem = AsFloatMemory(gradContig.Data);
+            var mMem = AsFloatMemory(m.Data);
+            var vMem = AsFloatMemory(v.Data);
             using var pinP = paramMem.Pin();
             using var pinG = gradMem.Pin();
             using var pinM = mMem.Pin();
@@ -305,14 +287,10 @@ public static class OptimizerKernels
 
         if (typeof(T) == typeof(double))
         {
-            using var paramDataKeep6 = new KeepAliveScope(param);
-            var paramMem = AsDoubleMemory(param.DataUnmarked);
-            using var gradContigDataKeep6 = new KeepAliveScope(gradContig);
-            var gradMem = AsDoubleMemory(gradContig.DataUnmarked);
-            using var mDataKeep4 = new KeepAliveScope(m);
-            var mMem = AsDoubleMemory(m.DataUnmarked);
-            using var vDataKeep4 = new KeepAliveScope(v);
-            var vMem = AsDoubleMemory(v.DataUnmarked);
+            var paramMem = AsDoubleMemory(param.Data);
+            var gradMem = AsDoubleMemory(gradContig.Data);
+            var mMem = AsDoubleMemory(m.Data);
+            var vMem = AsDoubleMemory(v.Data);
             using var pinP = paramMem.Pin();
             using var pinG = gradMem.Pin();
             using var pinM = mMem.Pin();
@@ -332,8 +310,7 @@ public static class OptimizerKernels
 
         // Scalar AdamW = (decoupled decay) ∘ Adam
         var numOps = MathHelper.GetNumericOperations<T>();
-        using var paramSpanLease = param.LeaseWritable();
-        var paramSpan = paramSpanLease.Span;
+        var paramSpan = param.AsWritableSpan();
         T decayFactor = numOps.Subtract(numOps.One, numOps.Multiply(weightDecay, lr));
         for (int i = 0; i < paramSpan.Length; i++)
             paramSpan[i] = numOps.Multiply(paramSpan[i], decayFactor);
@@ -376,14 +353,10 @@ public static class OptimizerKernels
         T lr, T beta1, T beta2, T eps, int step)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        using var pSpanLease = param.LeaseWritable();
-        var pSpan = pSpanLease.Span;
-        using var gSpanLease = grad.Lease();
-        var gSpan = gSpanLease.Span;
-        using var mSpanLease = m.LeaseWritable();
-        var mSpan = mSpanLease.Span;
-        using var vSpanLease = v.LeaseWritable();
-        var vSpan = vSpanLease.Span;
+        var pSpan = param.AsWritableSpan();
+        var gSpan = grad.AsSpan();
+        var mSpan = m.AsWritableSpan();
+        var vSpan = v.AsWritableSpan();
 
         T oneMinusB1 = numOps.Subtract(numOps.One, beta1);
         T oneMinusB2 = numOps.Subtract(numOps.One, beta2);
@@ -482,12 +455,9 @@ public static class OptimizerKernels
         if (param.Length == 0) return lr;
 
         var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
-        using var paramDataKeep7 = new KeepAliveScope(param);
-        using var pinP = param.DataUnmarked.Pin();
-        using var gradContigDataKeep7 = new KeepAliveScope(gradContig);
-        using var pinG = gradContig.DataUnmarked.Pin();
-        using var prevGradDataKeep1 = new KeepAliveScope(prevGrad);
-        using var pinPg = prevGrad.DataUnmarked.Pin();
+        using var pinP = param.Data.Pin();
+        using var pinG = gradContig.Data.Pin();
+        using var pinPg = prevGrad.Data.Pin();
         return FusedOptimizer.HypergradientSgdUpdateSimd(
             (float*)pinP.Pointer, (float*)pinG.Pointer, (float*)pinPg.Pointer,
             param.Length, lr, hyperLr);
@@ -521,12 +491,9 @@ public static class OptimizerKernels
         if (lr == 0f) return weightSum;
 
         var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
-        using var zDataKeep1 = new KeepAliveScope(z);
-        using var pinZ = z.DataUnmarked.Pin();
-        using var xDataKeep1 = new KeepAliveScope(x);
-        using var pinX = x.DataUnmarked.Pin();
-        using var gradContigDataKeep8 = new KeepAliveScope(gradContig);
-        using var pinG = gradContig.DataUnmarked.Pin();
+        using var pinZ = z.Data.Pin();
+        using var pinX = x.Data.Pin();
+        using var pinG = gradContig.Data.Pin();
         return FusedOptimizer.ScheduleFreeSgdUpdateSimd(
             (float*)pinZ.Pointer, (float*)pinX.Pointer, (float*)pinG.Pointer,
             z.Length, lr, weightSum);
@@ -549,12 +516,9 @@ public static class OptimizerKernels
             throw new ArgumentException("ScheduleFreeY requires y, z, and x to be contiguous.");
         if (y.Length == 0) return;
 
-        using var yDataKeep1 = new KeepAliveScope(y);
-        using var pinY = y.DataUnmarked.Pin();
-        using var zDataKeep2 = new KeepAliveScope(z);
-        using var pinZ = z.DataUnmarked.Pin();
-        using var xDataKeep2 = new KeepAliveScope(x);
-        using var pinX = x.DataUnmarked.Pin();
+        using var pinY = y.Data.Pin();
+        using var pinZ = z.Data.Pin();
+        using var pinX = x.Data.Pin();
         FusedOptimizer.ScheduleFreeYUpdateSimd(
             (float*)pinY.Pointer, (float*)pinZ.Pointer, (float*)pinX.Pointer,
             y.Length, beta);
@@ -599,12 +563,9 @@ public static class OptimizerKernels
         if (param.Length == 0) return d;
 
         var gradContig = grad.IsContiguous ? grad : grad.Contiguous();
-        using var paramDataKeep8 = new KeepAliveScope(param);
-        using var pinP = param.DataUnmarked.Pin();
-        using var gradContigDataKeep9 = new KeepAliveScope(gradContig);
-        using var pinG = gradContig.DataUnmarked.Pin();
-        using var sBufDataKeep1 = new KeepAliveScope(sBuf);
-        using var pinS = sBuf.DataUnmarked.Pin();
+        using var pinP = param.Data.Pin();
+        using var pinG = gradContig.Data.Pin();
+        using var pinS = sBuf.Data.Pin();
         return FusedOptimizer.DAdaptationSgdUpdateSimd(
             (float*)pinP.Pointer, (float*)pinG.Pointer, (float*)pinS.Pointer,
             param.Length, d, ref rAccum, lr, growthRate);

@@ -194,14 +194,12 @@ public sealed class DistributedDataParallel<T>
         if (totalLen == 0) return;
 
         var flat = new Tensor<T>(new[] { totalLen });
-        using var flatSpanLease = flat.LeaseWritable();
-        var flatSpan = flatSpanLease.Span;
+        var flatSpan = flat.AsWritableSpan();
         int offset = 0;
         for (int i = start; i < end; i++)
         {
             var g = grads[i];
-            using var gKeep1 = new KeepAliveScope(g);
-            g.AsSpanUnmarked().CopyTo(flatSpan.Slice(offset, g.Length));
+            g.AsSpan().CopyTo(flatSpan.Slice(offset, g.Length));
             offset += g.Length;
         }
 
@@ -213,8 +211,7 @@ public sealed class DistributedDataParallel<T>
         for (int i = start; i < end; i++)
         {
             var g = grads[i];
-            using var gKeep2 = new KeepAliveScope(g);
-            flatSpan.Slice(offset, g.Length).CopyTo(g.AsWritableSpanUnmarked());
+            flatSpan.Slice(offset, g.Length).CopyTo(g.AsWritableSpan());
             offset += g.Length;
         }
     }

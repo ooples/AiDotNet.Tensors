@@ -32,8 +32,7 @@ public static class NestedOps
         var ops = MathHelper.GetNumericOperations<T>();
         var values = new Tensor<T>(new[] { x.Values.Length });
         var src = x.Values.AsSpan();
-        using var biasSpanLease = bias.Lease();
-        var biasSpan = biasSpanLease.Span;
+        var biasSpan = bias.AsSpan();
         var dst = values.AsWritableSpan();
         for (int i = 0; i < src.Length; i++)
             dst[i] = ops.Add(src[i], biasSpan[i % x.FeatureSize]);
@@ -72,8 +71,7 @@ public static class NestedOps
             if (bias.Length != outFeatures)
                 throw new ArgumentException($"Bias length {bias.Length} != outFeatures {outFeatures}.", nameof(bias));
             var ops = MathHelper.GetNumericOperations<T>();
-            using var biasSpanLease = bias.Lease();
-            var biasSpan = biasSpanLease.Span;
+            var biasSpan = bias.AsSpan();
             var span = values.AsWritableSpan();
             for (int i = 0; i < span.Length; i++)
                 span[i] = ops.Add(span[i], biasSpan[i % outFeatures]);
@@ -226,20 +224,16 @@ public static class NestedOps
             var qRow = new Tensor<T>(new[] { rowLen, headDim });
             var kRow = new Tensor<T>(new[] { rowLen, headDim });
             var vRow = new Tensor<T>(new[] { rowLen, headDim });
-            using var qRowKeep1 = new KeepAliveScope(qRow);
-            qSpan.Slice(qOff, rowLen * headDim).CopyTo(qRow.AsWritableSpanUnmarked());
-            using var kRowKeep1 = new KeepAliveScope(kRow);
-            kSpan.Slice(kOff, rowLen * headDim).CopyTo(kRow.AsWritableSpanUnmarked());
-            using var vRowKeep1 = new KeepAliveScope(vRow);
-            vSpan.Slice(vOff, rowLen * headDim).CopyTo(vRow.AsWritableSpanUnmarked());
+            qSpan.Slice(qOff, rowLen * headDim).CopyTo(qRow.AsWritableSpan());
+            kSpan.Slice(kOff, rowLen * headDim).CopyTo(kRow.AsWritableSpan());
+            vSpan.Slice(vOff, rowLen * headDim).CopyTo(vRow.AsWritableSpan());
 
             var kT = Engine.TensorTranspose(kRow);
             var scores = Engine.TensorMatMul(qRow, kT);
             var scaledScores = Engine.TensorMultiplyScalar(scores, invSqrtD);
             var probs = Engine.Softmax(scaledScores, axis: 1);
             var attended = Engine.TensorMatMul(probs, vRow);
-            using var attendedKeep1 = new KeepAliveScope(attended);
-            attended.AsSpanUnmarked().CopyTo(outSpan.Slice(qOff, rowLen * headDim));
+            attended.AsSpan().CopyTo(outSpan.Slice(qOff, rowLen * headDim));
         }
         return NestedTensor<T>.FromValuesOffsets(outValues, (int[])q.Offsets.Clone(), headDim, q.Layout);
     }
@@ -298,12 +292,9 @@ public static class NestedOps
                 var qRow = new Tensor<T>(new[] { rowLen, headDim });
                 var kRow = new Tensor<T>(new[] { rowLen, headDim });
                 var vRow = new Tensor<T>(new[] { rowLen, headDim });
-                using var qDstLease = qRow.LeaseWritable();
-                var qDst = qDstLease.Span;
-                using var kDstLease = kRow.LeaseWritable();
-                var kDst = kDstLease.Span;
-                using var vDstLease = vRow.LeaseWritable();
-                var vDst = vDstLease.Span;
+                var qDst = qRow.AsWritableSpan();
+                var kDst = kRow.AsWritableSpan();
+                var vDst = vRow.AsWritableSpan();
                 for (int s = 0; s < rowLen; s++)
                 {
                     qSpan.Slice(qOff + s * q.FeatureSize + h * headDim, headDim)
@@ -319,8 +310,7 @@ public static class NestedOps
                 var scaledScores = Engine.TensorMultiplyScalar(scores, invSqrtD);
                 var probs = Engine.Softmax(scaledScores, axis: 1);
                 var attended = Engine.TensorMatMul(probs, vRow);
-                using var attSpanLease = attended.Lease();
-                var attSpan = attSpanLease.Span;
+                var attSpan = attended.AsSpan();
 
                 for (int s = 0; s < rowLen; s++)
                 {
@@ -340,8 +330,7 @@ public static class NestedOps
         // grows a zero-copy reshape API for the contiguous case we'll
         // route through it.
         var t = new Tensor<T>(new[] { totalRows, features });
-        using var tKeep1 = new KeepAliveScope(t);
-        x.Values.AsSpan().CopyTo(t.AsWritableSpanUnmarked());
+        x.Values.AsSpan().CopyTo(t.AsWritableSpan());
         return t;
     }
 

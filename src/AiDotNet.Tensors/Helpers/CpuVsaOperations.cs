@@ -53,12 +53,9 @@ public static class CpuVsaOperations
         if (slotCount == 0)
             return;
 
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var identityLease = identityFill.Lease();
-        var identity = identityLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var src = input.AsSpan();
+        var identity = identityFill.AsSpan();
+        var dst = output.AsWritableSpan();
         if (ReferenceEquals(input.GetDataArray(), output.GetDataArray()))
         {
             var tmp = new T[dst.Length];
@@ -86,12 +83,9 @@ public static class CpuVsaOperations
         if (slotCount == 0)
             return;
 
-        using var aLease = seqA.Lease();
-        var a = aLease.Span;
-        using var bLease = seqB.Lease();
-        var b = bLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var a = seqA.AsSpan();
+        var b = seqB.AsSpan();
+        var dst = output.AsWritableSpan();
         if (ReferenceEquals(seqA.GetDataArray(), output.GetDataArray())
             || ReferenceEquals(seqB.GetDataArray(), output.GetDataArray()))
         {
@@ -115,12 +109,9 @@ public static class CpuVsaOperations
         if (slotCount == 0)
             return;
 
-        using var aLease = seqA.Lease();
-        var a = aLease.Span;
-        using var bLease = seqB.Lease();
-        var b = bLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
+        var a = seqA.AsSpan();
+        var b = seqB.AsSpan();
+        var dst = output.AsWritableSpan();
         if (ReferenceEquals(seqA.GetDataArray(), output.GetDataArray())
             || ReferenceEquals(seqB.GetDataArray(), output.GetDataArray()))
         {
@@ -650,10 +641,8 @@ public static class CpuVsaOperations
 
             // Spectral multiplication: result[k] = A[k] * conj?(B[k]).
             // SIMD-vectorised over the interleaved [re, im] pairs.
-            using var ASpanLease = Aspec.LeaseWritable();
-            var ASpan = ASpanLease.Span;
-            using var BSpanLease = Bspec.Lease();
-            var BSpan = BSpanLease.Span;
+            var ASpan = Aspec.AsWritableSpan();
+            var BSpan = Bspec.AsSpan();
             HrrSpectralMultiplyInPlace(ASpan, BSpan, conjugate);
             // AsWritableSpan does NOT bump Version — its contract puts that on the mutating caller
             // ("every CpuEngine in-place kernel already does this"), and this one did not. When
@@ -671,8 +660,7 @@ public static class CpuVsaOperations
             var inverse = Fft.IFft1(Aspec);
             // Output is the real part of the inverse — every other float
             // starting at index 0.
-            using var invSpanLease = inverse.Lease();
-            var invSpan = invSpanLease.Span;
+            var invSpan = inverse.AsSpan();
             for (int i = 0; i < N; i++)
                 outArr[rowOffset + i] = invSpan[2 * i];
         }

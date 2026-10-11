@@ -308,8 +308,7 @@ public partial class CpuEngine
         int batch = flow.Shape[0], height = flow.Shape[2], width = flow.Shape[3];
         var rawWeights = ComputeSplatWeights(flow, height, width, numOps);
         var result = new Tensor<T>([batch, 1, height, width]);
-        using var valuesLease = result.LeaseWritable();
-        var values = valuesLease.Span;
+        var values = result.AsWritableSpan();
         for (int index = 0; index < rawWeights.Length; index++)
             values[index] = numOps.FromDouble(rawWeights[index] == 0.0 ? 1.0 : rawWeights[index]);
         return result;

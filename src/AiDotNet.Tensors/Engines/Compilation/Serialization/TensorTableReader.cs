@@ -71,8 +71,7 @@ internal static class TensorTableReader
             throw new InvalidDataException(
                 $"Truncated tensor data: expected {byteCount} bytes, got {bytes.Length}. File may be corrupt.");
 
-        using var dataLease = tensor.LeaseArray();
-        var data = dataLease.Array;
+        var data = tensor.GetDataArray();
         Buffer.BlockCopy(bytes, 0, data, 0, byteCount);
     }
 }

@@ -182,8 +182,7 @@ internal static class OpSerializationRegistry<T>
             // buffers, so materialize directly into the restored buffer. The
             // odometer keeps mature plan replay allocation-free.
             var source = input.RawStorageSpan;
-            using var targetLease = destination.LeaseWritable();
-            var target = targetLease.Span;
+            var target = destination.AsWritableSpan();
             Span<int> counter = stackalloc int[targetShape.Length];
             int sourceIndex = input._storageOffset;
             for (int flat = 0; flat < target.Length; flat++)
@@ -311,8 +310,7 @@ internal static class OpSerializationRegistry<T>
     private static Tensor<T> ScalarTensor(T value)
     {
         var t = new Tensor<T>(new[] { 1 });
-        using var tKeep1 = new KeepAliveScope(t);
-        t.AsWritableSpanUnmarked()[0] = value;
+        t.AsWritableSpan()[0] = value;
         return t;
     }
 

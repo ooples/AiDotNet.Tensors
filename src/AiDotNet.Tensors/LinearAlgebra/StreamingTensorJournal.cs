@@ -418,9 +418,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
             ValidateDestination(record, destination);
             var staging = new Tensor<T>((int[])record.ShapeInternal.Clone());
             ReadRecordInto(record, staging);
-            using var destinationDataKeep1 = new KeepAliveScope(destination);
-            using var stagingDataKeep1 = new KeepAliveScope(staging);
-            staging.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
+            staging.ReadOnlyData.Span.CopyTo(destination.Data.Span);
             destination.IncrementVersion();
         }
     }

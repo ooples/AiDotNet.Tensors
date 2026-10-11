@@ -136,14 +136,10 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
                 "FlashAttention",
                 (eng, output) =>
                 {
-                    using var qArrLease = capturedQ.LeaseArray();
-                    var qArr = (float[])(object)qArrLease.Array;
-                    using var kArrLease = capturedK.LeaseArray();
-                    var kArr = (float[])(object)kArrLease.Array;
-                    using var vArrLease = capturedV.LeaseArray();
-                    var vArr = (float[])(object)vArrLease.Array;
-                    using var oArrLease = output.LeaseArray();
-                    var oArr = (float[])(object)oArrLease.Array;
+                    var qArr = (float[])(object)capturedQ.GetDataArray();
+                    var kArr = (float[])(object)capturedK.GetDataArray();
+                    var vArr = (float[])(object)capturedV.GetDataArray();
+                    var oArr = (float[])(object)output.GetDataArray();
 
                     FusedAttention.FlashAttentionForward(
                         qArr, kArr, vArr, oArr,
@@ -196,14 +192,10 @@ internal sealed class AttentionFusionPass : ICpuOptimizationPass
                 "FlashAttention",
                 (eng, output) =>
                 {
-                    using var qArrLease = capturedQ.LeaseArray();
-                    var qArr = (float[])(object)qArrLease.Array;
-                    using var kArrLease = capturedK.LeaseArray();
-                    var kArr = (float[])(object)kArrLease.Array;
-                    using var vArrLease = capturedV.LeaseArray();
-                    var vArr = (float[])(object)vArrLease.Array;
-                    using var oArrLease = output.LeaseArray();
-                    var oArr = (float[])(object)oArrLease.Array;
+                    var qArr = (float[])(object)capturedQ.GetDataArray();
+                    var kArr = (float[])(object)capturedK.GetDataArray();
+                    var vArr = (float[])(object)capturedV.GetDataArray();
+                    var oArr = (float[])(object)output.GetDataArray();
 
                     FusedAttention.BatchedFlashAttention(
                         qArr, kArr, vArr, oArr,
