@@ -6,7 +6,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend
+public sealed partial class CudaBackend : IGenericFftBackend
 {
     private const int MaximumGenericFftLength = 1 << 29;
     private const int MaximumGenericFftBatch = 65535;
@@ -127,6 +127,17 @@ public sealed partial class CudaBackend
         CudaNativeBindings.cuModuleUnload(module);
         module = IntPtr.Zero;
     }
+
+bool IGenericFftBackend.SupportsFftElementType(FftElementType type) => SupportsFftElementType(type);
+
+    void IGenericFftBackend.ConvertFloatToFftStorage(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
+        => ConvertFloatToFftStorage(source, destination, count, type);
+
+    void IGenericFftBackend.ConvertFftStorageToFloat(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
+        => ConvertFftStorageToFloat(source, destination, count, type);
+
+    void IGenericFftBackend.LaunchFftGeneric(IGpuBuffer real, IGpuBuffer imaginary, int batch, int n, bool inverse, FftElementType type)
+        => LaunchFftGeneric(real, imaginary, batch, n, inverse, type);
 
     internal bool SupportsFftElementType(FftElementType type)
     {

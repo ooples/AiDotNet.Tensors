@@ -21,8 +21,8 @@ public partial class DirectGpuTensorEngine
     {
         _ = type.ByteSize();
         return TryGetBackend(out var backend)
-            && backend is CudaBackend cuda
-            && cuda.SupportsFftElementType(type);
+            && backend is IGenericFftBackend fft
+            && fft.SupportsFftElementType(type);
     }
 
     /// <inheritdoc/>
@@ -34,7 +34,7 @@ public partial class DirectGpuTensorEngine
         ValidateGenericFftInput(input);
         _ = elementType.ByteSize();
 
-        if (!TryGetBackend(out var backend) || backend is not CudaBackend cuda)
+        if (!TryGetBackend(out var backend) || backend is not IGenericFftBackend fft)
         {
             string backendName = backend?.BackendName ?? "unavailable DirectGpu backend";
             throw new NotSupportedException(
@@ -42,14 +42,14 @@ public partial class DirectGpuTensorEngine
                 $"Tracked backend work: {GenericFftBackendRoadmap}. No host fallback was performed.");
         }
 
-        if (!cuda.SupportsFftElementType(elementType))
+        if (!fft.SupportsFftElementType(elementType))
         {
             throw new NotSupportedException(
-                $"CUDA cannot execute {elementType} FFT storage on this device/toolkit. " +
+                $"{backend.BackendName} cannot execute {elementType} FFT storage on this device/toolkit. " +
                 "The capability result is authoritative; no host fallback was performed.");
         }
 
-        Tensor<float> result = ExecuteCudaFftGeneric(cuda, input, inverse, elementType);
+        Tensor<float> result = ExecuteGenericFft(backend, fft, input, inverse, elementType);
         int n = input._shape[^1] / 2;
         if (inverse)
             FftAutograd.RecordIFft1(result, input, n, FftNorm.Backward);
@@ -78,11 +78,11 @@ public partial class DirectGpuTensorEngine
 
         // Preferred CUDA path: arbitrary length, batched, and fully device-resident.
         // The public Fft module records the backward operation after this method returns.
-        if (backend is CudaBackend cuda && cuda.SupportsFftElementType(FftElementType.Float32))
+        if (backend is IGenericFftBackend fft && fft.SupportsFftElementType(FftElementType.Float32))
         {
             try
             {
-                return ExecuteCudaFftGeneric(cuda, interleaved, inverse, FftElementType.Float32);
+                return ExecuteGenericFft(backend, fft, interleaved, inverse, FftElementType.Float32);
             }
             catch (Exception ex) when (
                 ex is not CudaGenericFftRecoveryException &&
@@ -192,8 +192,9 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    private Tensor<float> ExecuteCudaFftGeneric(
-        CudaBackend cuda,
+    private Tensor<float> ExecuteGenericFft(
+        IDirectGpuBackend cuda,
+        IGenericFftBackend fft,
         Tensor<float> interleaved,
         bool inverse,
         FftElementType elementType)
@@ -230,16 +231,16 @@ public partial class DirectGpuTensorEngine
                 int storageBytes = checked(complexCount * elementType.ByteSize());
                 realStorage = cuda.AllocateByteBuffer(storageBytes);
                 imaginaryStorage = cuda.AllocateByteBuffer(storageBytes);
-                cuda.ConvertFloatToFftStorage(realFloat, realStorage, complexCount, elementType);
-                cuda.ConvertFloatToFftStorage(imaginaryFloat, imaginaryStorage, complexCount, elementType);
+                fft.ConvertFloatToFftStorage(realFloat, realStorage, complexCount, elementType);
+                fft.ConvertFloatToFftStorage(imaginaryFloat, imaginaryStorage, complexCount, elementType);
             }
 
-            cuda.LaunchFftGeneric(realStorage, imaginaryStorage, batch, n, inverse, elementType);
+            fft.LaunchFftGeneric(realStorage, imaginaryStorage, batch, n, inverse, elementType);
 
             if (elementType != FftElementType.Float32)
             {
-                cuda.ConvertFftStorageToFloat(realStorage, realFloat, complexCount, elementType);
-                cuda.ConvertFftStorageToFloat(imaginaryStorage, imaginaryFloat, complexCount, elementType);
+                fft.ConvertFftStorageToFloat(realStorage, realFloat, complexCount, elementType);
+                fft.ConvertFftStorageToFloat(imaginaryStorage, imaginaryFloat, complexCount, elementType);
             }
 
             interleavedOutput = cuda.AllocateBuffer(interleaved.Length);

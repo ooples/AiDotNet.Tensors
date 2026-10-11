@@ -8,6 +8,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Operations;
 using Microsoft.CodeAnalysis.Text;
 
 namespace AiDotNet.Tensors.Analyzers;
@@ -84,9 +85,14 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         "'{0}.{1}' implements '{2}' by calling '{3}', a host round-trip; compute it on the device",
         Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
 
+    internal static readonly DiagnosticDescriptor ConcreteBackendDispatch = new(
+        "TENS0007", "Code dispatches through a concrete backend class",
+        "'{0}.{1}' reaches '{2}' through the concrete class, so no other backend can provide it; put the capability behind an interface every backend implements, or add a tracked baseline entry",
+        Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
+
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get; } = ImmutableArray.Create(
         CapabilityNotOnAllBackends, StubImplementation, StaleBaselineEntry, MalformedBaselineEntry, InvalidRouteExemption,
-        HostRoundTrip);
+        HostRoundTrip, ConcreteBackendDispatch);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -115,7 +121,11 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         var hostReads = new ConcurrentBag<StubCandidate>();
         context.RegisterSymbolAction(c => CollectStub(c, backends, stubs), SymbolKind.Method);
         context.RegisterSyntaxNodeAction(c => CollectHostRead(c, backends, hostReads), SyntaxKind.InvocationExpression);
-        context.RegisterCompilationEndAction(c => Finish(c, backends, stubs, hostReads));
+        var casts = new ConcurrentBag<StubCandidate>();
+        context.RegisterOperationAction(c => CollectConcreteCast(c, backends, casts),
+            OperationKind.IsType, OperationKind.DeclarationPattern, OperationKind.TypePattern, OperationKind.RecursivePattern,
+            OperationKind.Conversion);
+        context.RegisterCompilationEndAction(c => Finish(c, backends, stubs, hostReads, casts));
     }
 
     private static void CollectStub(SymbolAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs)
@@ -169,6 +179,41 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
             calledName, invocation.GetLocation()));
     }
 
+    /// <summary>
+    /// A type test or explicit cast to one backend class outside that backend's own namespace: the engine reaching a
+    /// capability that only that backend can then provide. Implicit conversions (passing a backend where its base is
+    /// expected) are not dispatch.
+    /// </summary>
+    private static void CollectConcreteCast(OperationAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> casts)
+    {
+        ITypeSymbol? target = context.Operation switch
+        {
+            IIsTypeOperation isType => isType.TypeOperand,
+            IDeclarationPatternOperation declaration => declaration.MatchedType,
+            ITypePatternOperation typePattern => typePattern.MatchedType,
+            IRecursivePatternOperation recursive => recursive.MatchedType,
+            IConversionOperation conversion when !conversion.IsImplicit && conversion.Operand.Type is not null
+                && !SymbolEqualityComparer.Default.Equals(conversion.Operand.Type, conversion.Type) => conversion.Type,
+            _ => null
+        };
+        if (target is not INamedTypeSymbol named) return;
+        var backend = backends.FirstOrDefault(b => SymbolEqualityComparer.Default.Equals(b, named.OriginalDefinition));
+        if (backend is null) return;
+
+        var containing = context.ContainingSymbol;
+        while (containing is IMethodSymbol { MethodKind: MethodKind.AnonymousFunction or MethodKind.LocalFunction } inner)
+            containing = inner.ContainingSymbol;
+        string backendNamespace = backend.ContainingNamespace.ToDisplayString();
+        string callerNamespace = containing.ContainingNamespace?.ToDisplayString() ?? "";
+        if (callerNamespace == backendNamespace || callerNamespace.StartsWith(backendNamespace + ".", StringComparison.Ordinal)) return;
+
+        string owner = containing.ContainingType?.Name ?? containing.Name;
+        // An explicit interface implementation's name is qualified (IEngine.SoftmaxBackward); keep the member's own name.
+        string member = containing is IMethodSymbol { MethodKind: MethodKind.Constructor } ? "ctor"
+            : containing.Name.Substring(containing.Name.LastIndexOf('.') + 1);
+        casts.Add(new StubCandidate(backend.Name, owner + "." + member, backend.Name, "", context.Operation.Syntax.GetLocation()));
+    }
+
     /// <summary>The transfer API itself may move data to the host; that is its job.</summary>
     private static bool IsTransferMember(string name) =>
         name.StartsWith("Download", StringComparison.Ordinal) || name.StartsWith("Upload", StringComparison.Ordinal)
@@ -206,7 +251,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
     }
 
     private static void Finish(CompilationAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs,
-        ConcurrentBag<StubCandidate> hostReads)
+        ConcurrentBag<StubCandidate> hostReads, ConcurrentBag<StubCandidate> casts)
     {
         var baseline = Baseline.Load(context);
         var assembly = context.Compilation.Assembly;
@@ -254,7 +299,18 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
                 read.Backend, read.Member, read.Implements, read.Thrown));
         }
 
-        baseline.ReportProblems(context, new HashSet<string>(backends.Select(b => b.Name), StringComparer.Ordinal));
+        foreach (var cast in casts.OrderBy(s => s.Member, StringComparer.Ordinal).ThenBy(s => s.Backend, StringComparer.Ordinal))
+        {
+            if (baseline.Consume("cast " + cast.Member + " " + cast.Backend)) continue;
+            int dot = cast.Member.LastIndexOf('.');
+            context.ReportDiagnostic(Diagnostic.Create(ConcreteBackendDispatch, cast.Location,
+                cast.Member.Substring(0, dot), cast.Member.Substring(dot + 1), cast.Backend));
+        }
+
+        // GPU fast paths that cast are partly compiled only for .NET 5+, so only those builds hold every cast site.
+        bool allCastSitesCompiled = context.Compilation.SyntaxTrees.FirstOrDefault()?.Options.PreprocessorSymbolNames
+            .Contains("NET5_0_OR_GREATER") == true;
+        baseline.ReportProblems(context, new HashSet<string>(backends.Select(b => b.Name), StringComparer.Ordinal), allCastSitesCompiled);
     }
 
     private static bool IsValidRouteExemption(CompilationAnalysisContext context, INamedTypeSymbol iface, List<INamedTypeSymbol> backends)
@@ -346,7 +402,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
             var parts = content.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
             bool valid = parts.Length >= 3 && parts[parts.Length - 1].Length > 1 && parts[parts.Length - 1][0] == '#'
                 && parts[parts.Length - 1].Skip(1).All(char.IsDigit)
-                && ((parts[0] == "capability" && parts.Length == 4)
+                && (((parts[0] == "capability" || parts[0] == "cast") && parts.Length == 4)
                     || ((parts[0] == "stub" || parts[0] == "host") && parts.Length == 3 && parts[1].Contains('.')));
             if (!valid)
             {
@@ -360,7 +416,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
                 _problems.Add(Diagnostic.Create(StaleBaselineEntry, location, content + " (duplicate)"));
                 return;
             }
-            string backend = parts[0] == "capability" ? parts[2] : parts[1].Substring(0, parts[1].IndexOf('.'));
+            string backend = parts[0] == "capability" || parts[0] == "cast" ? parts[2] : parts[1].Substring(0, parts[1].IndexOf('.'));
             _entries[key] = new Entry(content, backend, location);
         }
 
@@ -372,10 +428,11 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         }
 
         /// <summary>Entries for a backend compiled out of this target framework are not stale here.</summary>
-        public void ReportProblems(CompilationAnalysisContext context, HashSet<string> presentBackends)
+        public void ReportProblems(CompilationAnalysisContext context, HashSet<string> presentBackends, bool allCastSitesCompiled)
         {
             foreach (var problem in _problems) context.ReportDiagnostic(problem);
-            foreach (var entry in _entries.Values.Where(e => !e.Used && presentBackends.Contains(e.Backend)))
+            foreach (var entry in _entries.Values.Where(e => !e.Used && presentBackends.Contains(e.Backend)
+                && (allCastSitesCompiled || !e.Text.StartsWith("cast ", StringComparison.Ordinal))))
                 context.ReportDiagnostic(Diagnostic.Create(StaleBaselineEntry, entry.Location, entry.Text));
         }
 
