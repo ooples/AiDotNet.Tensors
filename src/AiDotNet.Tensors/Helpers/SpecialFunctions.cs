@@ -552,9 +552,12 @@ internal static class SpecialFunctions
         }
         // The phase ζ + π/4 for large z: ζ = (2/3)z^{3/2} reaches 6.7e20 at z = 1e14, where one ulp is 131072, so ζ
         // is carried as a double-double hi + lo and sin/cos(ζ + π/4) expanded so ExactTrig reduces hi exactly.
+        // lo reaches ulp(hi)/2 (4e28 at z = 1e30), so it too is reduced exactly, and π/4 is applied last, by
+        // sin/cos(θ + π/4) = (sin θ ± cos θ)/√2: added to such an lo, π/4 rounded away entirely.
         ZetaDoubleDouble(z, out double hi, out double lo);
-        double sh = ExactTrig.Sin(hi), ch = ExactTrig.Cos(hi), sl = Math.Sin(lo + Math.PI / 4), cl = Math.Cos(lo + Math.PI / 4);
-        double sinPhase = sh * cl + ch * sl, cosPhase = ch * cl - sh * sl;
+        double sh = ExactTrig.Sin(hi), ch = ExactTrig.Cos(hi), sl = ExactTrig.Sin(lo), cl = ExactTrig.Cos(lo);
+        double sinTheta = sh * cl + ch * sl, cosTheta = ch * cl - sh * sl;
+        double sinPhase = (sinTheta + cosTheta) / Sqrt2, cosPhase = (cosTheta - sinTheta) / Sqrt2;
         return (sinPhase * even - cosPhase * odd) / (Math.Sqrt(Math.PI) * Math.Pow(z, 0.25));
     }
 
