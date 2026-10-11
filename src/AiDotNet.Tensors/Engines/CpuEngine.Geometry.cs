@@ -593,6 +593,12 @@ public partial class CpuEngine
             // Normalised [-1, 1] -> fractional source index.
             double sx = NormalizedToPixel(gx, W, alignCorners);
             double sy = NormalizedToPixel(gy, H, alignCorners);
+            if (!GridPointSamples(sx) || !GridPointSamples(sy))
+            {
+                // #1134: a NaN, infinite or out-of-int-range point samples nothing, in every mode and padding.
+                for (int c = 0; c < C; c++) dst[((n * C + c) * outH + oy) * outW + ox] = ops.Zero;
+                continue;
+            }
 
             if (mode == GridSampleMode.Nearest)
             {
@@ -671,6 +677,16 @@ public partial class CpuEngine
     /// index. <paramref name="alignCorners"/> switches between the two
     /// conventions; matches torchvision.
     /// </summary>
+    /// <summary>
+    /// True when a source pixel coordinate can be sampled. A NaN, infinite or out-of-int-range coordinate (with room
+    /// for bicubic's +-2 taps) samples nothing (#1134), the rule GridSample3D applies too: a bare (int) cast of such a
+    /// value is runtime-dependent (.NET Framework gives int.MinValue, .NET 9+ saturates NaN to 0 and reads pixel 0),
+    /// and PyTorch's CPU and CUDA kernels disagree with each other here.
+    /// </summary>
+    internal static bool GridPointSamples(double coord) => coord > -GridCoordLimit && coord < GridCoordLimit;
+
+    private const double GridCoordLimit = int.MaxValue - 8.0;
+
     private static double NormalizedToPixel(double coord, int size, bool alignCorners)
     {
         if (alignCorners) return (coord + 1.0) * 0.5 * (size - 1);
