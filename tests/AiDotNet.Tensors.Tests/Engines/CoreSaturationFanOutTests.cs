@@ -40,8 +40,9 @@ public class CoreSaturationFanOutTests
     }
 
     [Theory]
-    [InlineData(false, 4096, 96)]
-    [InlineData(true, 4096, 96)]
+    [InlineData(false, 4096, 96)]   // below the 1M fan-out floor: the typed serial loop
+    [InlineData(false, 10923, 97)]  // ~1.06M elements, ragged row: the fanned-out typed loop
+    [InlineData(true, 10923, 97)]
     [InlineData(false, 7, 33)]   // below the grain: the serial path
     public void TrailingRepeatBroadcast_FansOut_BitIdentical(bool multiply, int rows, int cols)
     {
