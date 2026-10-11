@@ -62,6 +62,8 @@ public class CudaStreamOrderedReuseTests
     {
         // The whole point: an output the next kernel overwrites must not pay a memset (about a launch on WDDM).
         // Reusing the previous owner's buffer makes that observable — its contents survive.
+        Skip.If(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.PoisonUninitializedBuffers,
+            "AIDOTNET_GPU_POISON_UNINITIALIZED fills uninitialized buffers on purpose.");
         Skip.IfNot(TryCuda(out var engine, out var cuda), "CUDA backend not available.");
         using (engine!)
         {

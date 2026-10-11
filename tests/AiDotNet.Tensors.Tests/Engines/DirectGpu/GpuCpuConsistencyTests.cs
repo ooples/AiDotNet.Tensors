@@ -252,7 +252,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var cuda = Gpu.TestBackend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
         Skip.If(cuda is null, "Multi-tensor gradient kernels are CUDA-only.");
 
-        // Ragged sizes across chunk boundaries (chunk = 256), more chunks than the reduction's block cap.
+        // Ragged sizes across 256-element boundaries; the gradient table now chunks by 4096 (#1106), see the next test.
         int[] sizes = { 1, 255, 256, 257, 4096, 300_000 };
         var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 1_000_003 + i)).ToArray()).ToArray();
         double exact = host.Sum(a => a.Sum(v => (double)v * v));
@@ -300,6 +300,56 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             scale.Dispose();
         }
     }
+    /// <summary>
+    /// #1106: the multi-tensor norm and scale kernels chunk the gradient table by 4096 elements, read float4s, and
+    /// stride a bounded grid over the chunks. Sizes straddle every 4096 / float4 boundary, and one 5M-element tensor
+    /// makes 1221 chunks, more than the reduction's 1024-block grid, so the grid-stride wrap is exercised. Every
+    /// scaled element is checked, not a sample.
+    /// </summary>
+    [SkippableFact]
+    public void MultiTensorSumOfSquaresAndScale_ChunkTailsAndGridStride_MatchExactValues()
+    {
+        SkipIfNoDirectGpu();
+        var cuda = Gpu.TestBackend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+        Skip.If(cuda is null, "Multi-tensor gradient kernels are CUDA-only.");
+
+        int[] sizes = { 3, 4, 5, 4095, 4096, 4097, 8191, 8196, 5_000_000 };
+        var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 7_000_003 + i)).ToArray()).ToArray();
+        double exact = host.Sum(a => a.Sum(v => (double)v * v));
+        var buffers = host.Select(a => cuda!.AllocateBuffer(a)).ToList();
+        var sumSq = cuda!.AllocateBuffer(2);
+        var scale = cuda.AllocateBuffer(1);
+        try
+        {
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            double got = BitConverter.ToDouble(cuda.DownloadByteBuffer(sumSq, sizeof(double)), 0);
+            Assert.True(Math.Abs(got - exact) <= 1e-9 * exact, $"sum of squares {got} vs exact {exact}");
+
+            double norm = Math.Sqrt(exact);
+            float maxNorm = (float)(norm / 3);
+            cuda.ClipScaleFromSumOfSquares(sumSq, maxNorm, scale);
+            float coefficient = cuda.DownloadBuffer(scale)[0];
+            Assert.True(Math.Abs(coefficient - maxNorm / (norm + 1e-6)) <= 1e-6, $"coefficient {coefficient}");
+            cuda.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            for (int t = 0; t < sizes.Length; t++)
+            {
+                var scaled = cuda.DownloadBuffer(buffers[t]);
+                for (int i = 0; i < sizes[t]; i++)
+                {
+                    float expected = host[t][i] * coefficient;
+                    if (scaled[i] != expected)   // build the message only on a mismatch (5M elements)
+                        Assert.Fail($"tensor {t} (size {sizes[t]})[{i}]: {scaled[i]} vs {expected}");
+                }
+            }
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
+            sumSq.Dispose();
+            scale.Dispose();
+        }
+    }
+
     [SkippableTheory]
     [InlineData(64, 96, 256)]   // N-BEATS first FC layer, batch 64 (AiDotNet #1804)
     [InlineData(7, 13, 5)]      // ragged, below any tile size
@@ -475,6 +525,39 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
                 Assert.True(Math.Abs(c[i] - g[i]) <= 1e-5f * (1 + Math.Abs(c[i])), $"{name}[{i}] cpu={c[i]} gpu={g[i]}");
         }
     }
+    [SkippableFact]
+    public void LastAxisWindows_MatchCpuExactly()
+    {
+        // Windows over the last axis only (the fused-QKV split): starts 0, inside and at the end, a ragged 3-D
+        // window and a single column. A non-zero start takes the one-launch row copy from a buffer view (#1106).
+        SkipIfNoDirectGpu();
+        var cases = new (int[] Shape, int[] Start, int[] Length)[]
+        {
+            (new[] { 33, 60 }, new[] { 0, 0 }, new[] { 33, 20 }),
+            (new[] { 33, 60 }, new[] { 0, 20 }, new[] { 33, 20 }),
+            (new[] { 33, 60 }, new[] { 0, 40 }, new[] { 33, 20 }),
+            (new[] { 2, 17, 60 }, new[] { 0, 0, 7 }, new[] { 2, 17, 13 }),
+            (new[] { 33, 60 }, new[] { 0, 59 }, new[] { 33, 1 }),
+        };
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            foreach (var (shape, start, length) in cases)
+            {
+                int n = 1; foreach (int s in shape) n *= s;
+                var x = new Tensor<float>(Enumerable.Range(0, n).Select(i => DeterministicValue(5 + i)).ToArray(), shape);
+                var cpu = new CpuEngine().TensorSlice(x, start, length).ToArray();
+                var gpu = Gpu.TensorSlice(x, start, length).ToArray();
+                Assert.Equal(cpu, gpu);
+            }
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+    }
+
     [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
