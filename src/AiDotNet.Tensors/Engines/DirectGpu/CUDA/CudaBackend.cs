@@ -1194,6 +1194,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Optional P2 serving kernel; its public call degrades gracefully.
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
+        CompileFusedAttentionModule(device);   // #1141: optional; on failure the engine keeps its other attention paths
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         try
         {
@@ -17991,6 +17992,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             _activationModule = IntPtr.Zero;
         }
 
+        if (_fusedAttentionModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_fusedAttentionModule);
+            _fusedAttentionModule = IntPtr.Zero;
+        }
         if (_torchParityElementwiseModule != IntPtr.Zero)
         {
             CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
