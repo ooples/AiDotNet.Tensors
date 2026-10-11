@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.135.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.4...v0.135.0) (2026-10-10)
+
+
+### Features
+
+* **parity:** close the pytorch api gaps reported by fullparity_nogapremains ([#1111](https://github.com/ooples/AiDotNet.Tensors/issues/1111)) ([351d46c](https://github.com/ooples/AiDotNet.Tensors/commit/351d46c7b9fa6075fd2585991ec7598540cb5d70))
+
+
+### Bug Fixes
+
+* arena gradients, nchw grid sample, atanh; perf: short-m gemm routing, write-through into ops ([#1098](https://github.com/ooples/AiDotNet.Tensors/issues/1098)) ([ec52dad](https://github.com/ooples/AiDotNet.Tensors/commit/ec52dad2e25697720047921881280391da4dd444))
+* **autodiff:** tape step context accepts sparse parameter-buffer leaves ([#1102](https://github.com/ooples/AiDotNet.Tensors/issues/1102)) ([f25afe9](https://github.com/ooples/AiDotNet.Tensors/commit/f25afe9a9d0ace6ca7697006bf848b97ab04403c))
+* **codegen:** validate CPU kernel contracts and preserve IEEE signs ([#1110](https://github.com/ooples/AiDotNet.Tensors/issues/1110)) ([92670df](https://github.com/ooples/AiDotNet.Tensors/commit/92670dff606c12987ce8e3868ea8787b943f4347))
+* **cpu:** float elementwise dispatch ran serially above the parallel grain ([#1119](https://github.com/ooples/AiDotNet.Tensors/issues/1119)) ([9f7bcb2](https://github.com/ooples/AiDotNet.Tensors/commit/9f7bcb2120e513e96d7dfe45ac09a9386c35f39c))
+* hip broke vulkan loading; perf: fp16-weight gemm, vectorized tanh and mish; real avx-512 gate ([#1103](https://github.com/ooples/AiDotNet.Tensors/issues/1103)) ([44ca3f0](https://github.com/ooples/AiDotNet.Tensors/commit/44ca3f0c2b899c43f171e1131c904b28a9ff64bb))
+
+
+### Performance
+
+* **cpu:** all five cpu parity gates pass; zero-copy optimizer api (cpu + gpu); real zero-1 ([#1109](https://github.com/ooples/AiDotNet.Tensors/issues/1109)) ([356bf44](https://github.com/ooples/AiDotNet.Tensors/commit/356bf44f6617adc2eeb86b2d69c24ef83032fcee))
+* **cpu:** parallel conv, bias-gradient and pool paths for CPU training ([#1093](https://github.com/ooples/AiDotNet.Tensors/issues/1093)) ([dc1ce96](https://github.com/ooples/AiDotNet.Tensors/commit/dc1ce96439b9c73904661de35d0369801a4b6b03))
+* fair NumSharp 0.70 benchmarks + allocator GC, GPU-reduction, transpose and subtract fixes ([#1094](https://github.com/ooples/AiDotNet.Tensors/issues/1094)) ([#1101](https://github.com/ooples/AiDotNet.Tensors/issues/1101)) ([ed13d28](https://github.com/ooples/AiDotNet.Tensors/commit/ed13d286c8e9faed352df5f1a012495fb5b272a5))
+
 ## [0.134.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.3...v0.134.4) (2026-10-03)
 
 

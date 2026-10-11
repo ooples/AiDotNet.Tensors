@@ -1,0 +1,28 @@
+{
+  "note": "Backfilled by hand on 2026-10-10 from the README's description of this run, which predates RunManifest.cs.",
+  "runs": {
+    "vs-all": {
+      "date": "2026-10-08",
+      "commit": "dcb0926f",
+      "runtime": ".NET 10.0.401 SDK",
+      "os": "Windows 11",
+      "machine": "AMD Ryzen Threadripper 3990X (64 cores / 128 threads, AVX2 + FMA, no AVX-512)",
+      "packages": {
+        "TorchSharp": "0.107.0",
+        "Microsoft.ML": "5.0.0",
+        "TensorFlow.NET": "0.150.0"
+      }
+    },
+    "linalg": {
+      "date": "2026-10-08",
+      "commit": "587358ed",
+      "runtime": ".NET 10.0.401 SDK",
+      "os": "Windows 11",
+      "machine": "AMD Ryzen Threadripper 3990X (64 cores / 128 threads, AVX2 + FMA, no AVX-512)",
+      "packages": {
+        "NumSharp": "0.70.0",
+        "MathNet.Numerics": "5.0.0"
+      }
+    }
+  }
+}

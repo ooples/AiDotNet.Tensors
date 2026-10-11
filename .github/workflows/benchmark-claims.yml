@@ -1,0 +1,44 @@
+name: Benchmark Claims
+
+# Every performance number the project publishes must come from committed benchmark reports (#1094: the README and
+# the repository description advertised "3,200x faster than NumSharp", measured against an eight-year-old release).
+# check_benchmark_claims.py regenerates the README tables from tests/AiDotNet.Tensors.Benchmarks/Results/<run>/ and
+# fails on any row, count, multiplier or competitor version that does not match, and on any speed claim in the
+# NuGet or GitHub repository description. It reads only checked-in files and runs in seconds.
+#
+# No path filter, so the check can be marked required without hanging PRs that never trigger it. The daily run
+# exists because editing the repository description (Settings, or gh repo edit) opens no pull request.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-claims-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# contents: read covers the checkout and the repository-description lookup (public repository metadata).
+permissions:
+  contents: read
+
+jobs:
+  claims:
+    name: Benchmark claims
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check published performance claims against the benchmark reports
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          description="$(gh api "repos/$REPO" --jq '.description // ""')"
+          python3 -I tests/AiDotNet.Tensors.Benchmarks/check_benchmark_claims.py --repo-description "$description"
