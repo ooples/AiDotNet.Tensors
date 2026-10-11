@@ -8204,7 +8204,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
         // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
-        int chunks = WorkChunks(rows);
+        int chunks = WorkChunks(rows, (long)rows * cols);
         if (chunks <= 1) { SumRows(src, dst, cols, 0, rows); return; }
         int perChunk = (rows + chunks - 1) / chunks;
         CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols,
@@ -8224,7 +8224,7 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void ReduceSum2DColumns(float[] src, float[] dst, int rows, int cols)
     {
         // Contiguous column ranges, about four per thread (the whole width on one thread), each accumulated row by row.
-        int chunks = (int)Math.Min(WorkChunks(cols), (cols + 15) / 16);
+        int chunks = (int)Math.Min(WorkChunks(cols, (long)rows * cols), (cols + ReductionMinParallelBlock - 1) / ReductionMinParallelBlock);
         if (chunks <= 1) { AccumulateAxisRows(src, 0, cols, rows, dst, 0, cols); return; }
         int perChunk = (cols + chunks - 1) / chunks;
         CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
@@ -8256,7 +8256,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
         // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
-        int chunks = WorkChunks(rows);
+        int chunks = WorkChunks(rows, (long)rows * cols);
         if (chunks <= 1) { SumRows(src, dst, cols, 0, rows); return; }
         int perChunk = (rows + chunks - 1) / chunks;
         CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols,
@@ -8276,7 +8276,7 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void ReduceSum2DColumns(double[] src, double[] dst, int rows, int cols)
     {
         // Contiguous column ranges, about four per thread (the whole width on one thread), each accumulated row by row.
-        int chunks = (int)Math.Min(WorkChunks(cols), (cols + 15) / 16);
+        int chunks = (int)Math.Min(WorkChunks(cols, (long)rows * cols), (cols + ReductionMinParallelBlock - 1) / ReductionMinParallelBlock);
         if (chunks <= 1) { AccumulateAxisRows(src, 0, cols, rows, dst, 0, cols); return; }
         int perChunk = (cols + chunks - 1) / chunks;
         CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
@@ -33623,26 +33623,33 @@ public partial class CpuEngine : ITensorLevelEngine
     // Inner-axis block a ReduceMean work unit covers (see TryReduceMeanSingleAxisDense).
     private const int ReduceMeanInnerBlock = 64;
 
-    // Inner columns per work unit: 64 (vector-friendly, a cache line per row read), halved down to 16 until there are
-    // about four units per thread -- a [8192, 256] axis-0 reduction otherwise had four units. Not below 16 columns
-    // (every unit re-walks the whole axis, so narrower blocks multiply the strided passes), and not at all on one
-    // thread. Each column is still summed / scanned in axis order, so the result does not depend on the block.
+    // Inner columns per work unit on several threads: enough blocks per outer index for about four units per thread,
+    // but never narrower than ReductionMinParallelBlock columns. Every unit re-walks the whole axis, one row segment per
+    // page of input, so narrow blocks (16 columns: 64 bytes per page touched) ran SLOWER on 64 threads than one thread's
+    // single pass. On one thread: 64. Each column is still summed / scanned in axis order, so the result does not
+    // depend on the block.
     private static int ReductionInnerBlock(int outer, int inner)
     {
         int dop = CpuParallelSettings.MaxDegreeOfParallelism;
         if (dop <= 1) return ReduceMeanInnerBlock;
-        int block = ReduceMeanInnerBlock, wanted = 4 * dop;
-        while (block > 16 && (long)outer * ((inner + block - 1) / block) < wanted) block >>= 1;
-        return block;
+        long perOuter = Math.Max(1, (4L * dop + outer - 1) / outer);
+        long block = Math.Max(ReductionMinParallelBlock, (inner + perOuter - 1) / perOuter);
+        return (int)Math.Max(1, Math.Min(block, inner));
     }
 
-    // Work chunks for a loop of `units` independent items: about four per thread, one on a single thread.
-    private static int WorkChunks(long units)
+    private const int ReductionMinParallelBlock = 256;
+
+    // Work chunks for a loop of `units` independent items costing `work` elements in all: about four per thread, but
+    // none smaller than ReductionMinChunkWork elements (a [6144, 32] row sum split 256 ways took 182 us against 107 us
+    // serially), and one on a single thread.
+    private static int WorkChunks(long units, long work)
     {
         int dop = CpuParallelSettings.MaxDegreeOfParallelism;
         if (dop <= 1 || units <= 1) return 1;
-        return (int)Math.Min(units, 4L * dop);
+        return (int)Math.Max(1, Math.Min(Math.Min(units, 4L * dop), work / ReductionMinChunkWork));
     }
+
+    private const int ReductionMinChunkWork = 64 * 1024;
 
     private static TItem[] UninitializedArray<TItem>(int length)
     {
@@ -33676,7 +33683,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (units > int.MaxValue) return false;
         long work = (long)outer * axisSize * inner;
         // Chunks of (outer, block) units, about four per thread, so a serial run is one loop, not a delegate per unit.
-        int chunks = WorkChunks(units), perChunk = (int)((units + chunks - 1) / chunks);
+        int chunks = WorkChunks(units, work), perChunk = (int)((units + chunks - 1) / chunks);
         if (typeof(T) == typeof(double))
         {
             var src = (double[])(object)data; var dst = (double[])(object)outData; double init = (double)(object)minValue!;
@@ -33731,7 +33738,7 @@ public partial class CpuEngine : ITensorLevelEngine
         long work = (long)outer * axisSize * inner;
         // Chunks of (outer, block) units, about four per thread; a chunk's units under one outer index form one
         // contiguous inner range, accumulated row by row (one serial chunk = the whole tensor in a single pass).
-        int chunks = WorkChunks(units), perChunk = (int)((units + chunks - 1) / chunks);
+        int chunks = WorkChunks(units, work), perChunk = (int)((units + chunks - 1) / chunks);
         if (typeof(T) == typeof(double))
         {
             var src = (double[])(object)data; var dst = (double[])(object)outData;
