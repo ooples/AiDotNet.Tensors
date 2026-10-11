@@ -267,6 +267,16 @@ internal sealed class PersistentParallelExecutor
     // decide whether to keep warm-spinning or park. Written on every Execute.
     private long _lastDispatchTicks;
 
+    // Tail parking. A worker whose own chunks ran at least s_longChunkTicks and that is not the last to finish sleeps until
+    // the dispatch completes, then warm-spins for the next one as usual. Spinning through the tail of a long dispatch cost
+    // the cores still computing (the 3990X is power limited): a 1000^3 double GEMM took 19.1 ms with the warm window
+    // against 16.2 ms without it (BenchmarkDotNet). Parking until the NEXT dispatch instead (the first attempt) fixed that
+    // but left the workers asleep after any long dispatch, so the next short op paid their wake-up: cold calls after
+    // setup ran 2x slower (TensorMean 13 -> 29 us). Waking at dispatch end puts that wake-up in the gap between ops.
+    private static readonly long s_longChunkTicks = ToStopwatchTicks(5_000); // 500 us in TimeSpan ticks
+    private readonly object _tailGate = new();
+    private int _tailWaiters;
+
     // Worker count of the most recent dispatch. Warm-spinning only pays off when the
     // dispatch leaves SPARE cores: a worker that busy-spins on a core the dispatcher
     // (or another about-to-run worker) needs just steals it, so a dispatch that
@@ -558,7 +568,9 @@ internal sealed class PersistentParallelExecutor
             var job = _job!;
             // Run this worker's strided chunk set (normal or thread-local mode). Capture the
             // first exception — re-thrown on the caller thread.
+            long chunkStart = System.Diagnostics.Stopwatch.GetTimestamp();
             var workerEx = RunParticipantChunks(job, slot + 1);
+            long chunkTicks = System.Diagnostics.Stopwatch.GetTimestamp() - chunkStart;
             if (workerEx is not null)
                 Interlocked.CompareExchange(ref _workerException, workerEx, null);
 
@@ -567,6 +579,10 @@ internal sealed class PersistentParallelExecutor
             {
                 _allDone.Set();
             }
+            else if (chunkTicks >= s_longChunkTicks)
+            {
+                WaitForDispatchEnd(job);
+            }
         }
     }
 
@@ -574,6 +590,32 @@ internal sealed class PersistentParallelExecutor
     /// Execute an action in parallel with near-zero dispatch overhead.
     /// The main thread executes chunk 0, worker threads execute chunks 1..numChunks-1.
     /// </summary>
+    // Sleeps until the dispatch that published `job` has ended (EndDispatch replaced or cleared _job). The waiter count is
+    // raised before _job is read and EndDispatch writes _job before it reads the count, both with full fences, so either
+    // the waiter sees the new _job or EndDispatch sees the waiter and pulses under the gate: no wake-up is lost.
+    private void WaitForDispatchEnd(Job job)
+    {
+        lock (_tailGate)
+        {
+            Interlocked.Increment(ref _tailWaiters);
+            while (ReferenceEquals(_job, job))
+                System.Threading.Monitor.Wait(_tailGate);
+            Interlocked.Decrement(ref _tailWaiters);
+        }
+    }
+
+    // Clears the finished dispatch and wakes tail-parked workers so they warm-spin for the next one.
+    private void EndDispatch()
+    {
+        _job = null; // release the body's captured references for GC between dispatches
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref _tailWaiters) != 0)
+        {
+            lock (_tailGate)
+                System.Threading.Monitor.PulseAll(_tailGate);
+        }
+    }
+
     [ThreadStatic]
     private static bool _isExecuting;
 
@@ -769,8 +811,6 @@ internal sealed class PersistentParallelExecutor
                 if (workersNeeded > 0)
                     WaitForWorkers();
 
-                _job = null; // release the body's captured references for GC between dispatches
-
                 // Re-throw first captured exception (worker or main thread)
                 var workerEx = _workerException;
                 if (mainException is not null)
@@ -780,6 +820,8 @@ internal sealed class PersistentParallelExecutor
             }
             finally
             {
+                // In finally so no exit path leaves a tail-parked worker asleep (the next dispatch would wait on it).
+                EndDispatch();
                 _isExecuting = false;
             }
         }
@@ -879,14 +921,14 @@ internal sealed class PersistentParallelExecutor
                 if (workersNeeded > 0)
                     WaitForWorkers();
 
-                _job = null; // release the body's captured references for GC between dispatches
-
                 var workerEx = _workerException;
                 if (mainException is not null) throw mainException;
                 if (workerEx is not null) throw workerEx;
             }
             finally
             {
+                // In finally so no exit path leaves a tail-parked worker asleep (the next dispatch would wait on it).
+                EndDispatch();
                 _isExecuting = false;
             }
         }
