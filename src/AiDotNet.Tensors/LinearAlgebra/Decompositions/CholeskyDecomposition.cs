@@ -41,8 +41,10 @@ internal static class CholeskyDecomposition
         var info = new Tensor<int>(infoShape);
 
         int batch = BatchSize(input._shape, rank);
-        var fData = factor.GetDataArray();
-        var iData = info.GetDataArray();
+        using var fDataLease = factor.LeaseArray();
+        var fData = fDataLease.Array;
+        using var iDataLease = info.LeaseArray();
+        var iData = iDataLease.Array;
         int matStride = n * n;
 
         for (int b = 0; b < batch; b++)
