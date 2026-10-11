@@ -22,15 +22,15 @@ namespace AiDotNet.Tensors.Engines;
 /// compose on the device but draw their noise or keep-mask on the host and upload it, so they record a fallback too.
 /// </para>
 /// <para>
-/// The remaining parity ops compute on the host. They are long-tail PyTorch surface (special functions,
-/// orthogonal polynomials, window functions, samplers, index construction, pooling variants, complex
-/// conversions, quantiles, volumetric grid sampling), none of which sits on the training paths this engine keeps
-/// device-resident. Each one is overridden here to fall through to the host implementation EXPLICITLY: every
-/// call records a <see cref="GpuLaunchProbe"/> fallback (<c>"&lt;op&gt;: guard or route declined"</c> in
-/// <see cref="GpuLaunchProbe.Fallbacks"/>), so a GPU workload that reaches one is visible in the residency
-/// diagnostics rather than silently running at host speed. Native kernels on the six backends are tracked in
-/// https://github.com/ooples/AiDotNet.Tensors/issues/1112; when one lands, its override here is replaced by the
-/// device dispatch.
+/// The remaining parity ops (special functions, orthogonal polynomials, window functions, samplers, index
+/// construction, pooling variants, complex conversions, quantiles, volumetric grid sampling) try a device path first:
+/// the <c>Try*OnDevice</c> helpers in the TorchParity* partials, which run on backends implementing
+/// <see cref="ITorchParityElementwiseBackend"/>. Only CUDA implements it today (#1112); HIP, Metal, OpenCL, Vulkan
+/// and WebGPU are tracked in #1124, #1125, #1126, #1127 and #1128. When a helper declines (another backend, a tape or
+/// graph recording it must not bypass, an argument error the CPU reports, or a precision policy), the override falls
+/// through to the host implementation EXPLICITLY: the call records a <see cref="GpuLaunchProbe"/> fallback
+/// (<c>"&lt;op&gt;: no device kernel"</c> in <see cref="GpuLaunchProbe.Fallbacks"/>), so a GPU workload that reaches
+/// the host is visible in the residency diagnostics rather than silently running at host speed.
 /// </para>
 /// </remarks>
 public partial class DirectGpuTensorEngine
@@ -82,9 +82,8 @@ public partial class DirectGpuTensorEngine
         => base.TensorAmin<T>(tensor, axes, keepDims);
 
     /// <inheritdoc/>
-    /// <remarks>Intentional host fallback (a boolean reduction off the training paths): every call records a <see cref="GpuLaunchProbe"/>
-    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
-    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
+    /// <remarks>Runs on the device on CUDA (#1112); other backends fall through to the host and record a
+    /// <see cref="GpuLaunchProbe"/> fallback (follow-ups #1124-#1128).</remarks>
     public override Tensor<T> TensorAll<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
@@ -94,9 +93,8 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
-    /// <remarks>Intentional host fallback (a boolean reduction off the training paths): every call records a <see cref="GpuLaunchProbe"/>
-    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
-    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
+    /// <remarks>Runs on the device on CUDA (#1112); other backends fall through to the host and record a
+    /// <see cref="GpuLaunchProbe"/> fallback (follow-ups #1124-#1128).</remarks>
     public override Tensor<T> TensorAny<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
@@ -184,7 +182,9 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRandint<T>(long low, long high, int[] shape, int? seed = null)
     {
-        if (shape is not null && high > low && TrySampleOnDevice<T>("TensorRandint", shape, 6, low, high - (double)low, seed) is { } onDevice) return onDevice;
+        // Draws travel as float values, exact only within +-2^24.
+        if (shape is not null && high > low && low >= -(1L << 24) && high <= (1L << 24)
+            && TrySampleOnDevice<T>("TensorRandint", shape, 6, low, high - (double)low, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRandint: no device kernel", null);
         return base.TensorRandint<T>(low, high, shape!, seed);
     }
@@ -193,7 +193,8 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorRandintLike<T>(Tensor<T> tensor, long low, long high, int? seed = null)
     {
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
-        if (tensor is not null && high > low && TrySampleOnDevice<T>("TensorRandintLike", tensor._shape, 6, low, high - (double)low, seed) is { } onDevice)
+        if (tensor is not null && high > low && low >= -(1L << 24) && high <= (1L << 24)
+            && TrySampleOnDevice<T>("TensorRandintLike", tensor._shape, 6, low, high - (double)low, seed) is { } onDevice)
             return onDevice;
         GpuLaunchProbe.OnFallback("TensorRandintLike: no device kernel", null);
         return base.TensorRandintLike<T>(tensor!, low, high, seed);
@@ -301,9 +302,8 @@ public partial class DirectGpuTensorEngine
         => base.TensorSumToSize<T>(tensor, size);
 
     /// <inheritdoc/>
-    /// <remarks>Intentional host fallback (a sort-based statistic off the training paths): every call records a <see cref="GpuLaunchProbe"/>
-    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
-    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
+    /// <remarks>Runs on the device on CUDA (#1112); other backends fall through to the host and record a
+    /// <see cref="GpuLaunchProbe"/> fallback (follow-ups #1124-#1128).</remarks>
     public override Tensor<T> TensorQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
@@ -313,9 +313,8 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
-    /// <remarks>Intentional host fallback (a sort-based statistic off the training paths): every call records a <see cref="GpuLaunchProbe"/>
-    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
-    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
+    /// <remarks>Runs on the device on CUDA (#1112); other backends fall through to the host and record a
+    /// <see cref="GpuLaunchProbe"/> fallback (follow-ups #1124-#1128).</remarks>
     public override Tensor<T> TensorNanQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);

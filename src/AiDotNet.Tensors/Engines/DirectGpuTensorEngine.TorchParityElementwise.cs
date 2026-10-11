@@ -7,9 +7,11 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
-/// Device paths for PyTorch-parity elementwise ops that computed on the host (#1112). Under an active tape or graph
-/// recording they defer to the CPU implementation, which records the backward (the convention of the engine's other
-/// parity overrides); so do non-float precisions, mismatched binary shapes and backends without the kernels.
+/// Device paths for PyTorch-parity elementwise ops that computed on the host (#1112). They run on backends implementing
+/// <see cref="ITorchParityElementwiseBackend"/>, which today is CUDA only; HIP, Metal, OpenCL, Vulkan and WebGPU take the
+/// recorded host fallback until #1124, #1125, #1126, #1127 and #1128 land. Under an active tape or graph recording they
+/// defer to the CPU implementation, which records the backward (the convention of the engine's other parity
+/// overrides); so do non-float precisions, mismatched binary shapes and argument errors the CPU reports.
 /// </summary>
 public partial class DirectGpuTensorEngine
 {
@@ -34,7 +36,7 @@ public partial class DirectGpuTensorEngine
 
     private Tensor<T>? TryParityBinaryOnDevice<T>(Tensor<T> a, Tensor<T> b, TorchParityBinaryOp op)
     {
-        if (a.Length == 0 || !a._shape.AsSpan().SequenceEqual(b._shape) || IsTapeActive<T>(op.ToString())
+        if (a is null || b is null || a.Length == 0 || !a._shape.AsSpan().SequenceEqual(b._shape) || IsTapeActive<T>(op.ToString())
             || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
@@ -58,7 +60,7 @@ public partial class DirectGpuTensorEngine
     // small host-side tensor) and such a call stays on the CPU path so it throws the same exception.
     private Tensor<T>? TryPolynomialOnDevice<T>(Tensor<T> x, Tensor<T> degree, int kind, bool shifted, string opName)
     {
-        if (x.Length == 0 || !x._shape.AsSpan().SequenceEqual(degree._shape) || IsTapeActive<T>(opName)
+        if (x is null || degree is null || x.Length == 0 || !x._shape.AsSpan().SequenceEqual(degree._shape) || IsTapeActive<T>(opName)
             || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
@@ -116,6 +118,7 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryTriIndicesOnDevice<T>(string opName, int row, int col, int offset, bool lower)
     {
         if (row < 0 || col < 0) return null;   // the CPU rejects it
+        if (row > (1 << 24) || col > (1 << 24)) return null;   // indices must stay exact in the float device buffer
         long total = 0;
         for (int r = 0; r < row; r++)
         {

@@ -76,7 +76,8 @@ public partial class DirectGpuTensorEngine
     // randperm: one random key per position, sorted on the device; the permutation is the key order's indices.
     private Tensor<T>? TryRandpermOnDevice<T>(int n, int? seed)
     {
-        if (n <= 0 || typeof(T) != typeof(float) || !TryRandomBackend<T>("TensorRandperm", out var backend, out var kernels)) return null;
+        // Positions travel as float indices, exact only up to 2^24.
+        if (n <= 0 || n > (1 << 24) || typeof(T) != typeof(float) || !TryRandomBackend<T>("TensorRandperm", out var backend, out var kernels)) return null;
         try
         {
             ulong deviceSeed = DeviceSeed(seed);
@@ -173,7 +174,7 @@ public partial class DirectGpuTensorEngine
         {
             ulong deviceSeed = DeviceSeed(seed);
             using var w = GetOrAllocateBuffer(backend, probabilities.IsContiguous ? probabilities : probabilities.Contiguous());
-            using var scratch = AllocateOutputBuffer(backend, probabilities.Length);
+            using var scratch = AllocateOutputBuffer(backend, checked(2 * probabilities.Length));   // double prefix sums
             using var flag = AllocateOutputBuffer(backend, 2);
             kernels.TorchParityFlagReset(flag.Buffer);
             result = DispatchDeferredGpuOp<T>(backend, total, shape,
@@ -214,19 +215,32 @@ public partial class DirectGpuTensorEngine
             }
             else a = p == 1 ? 0 : 1 / (1 - p);
             ulong deviceSeed = DeviceSeed(seed);
-            var scaleBuffer = AllocateOutputBuffer(backend, n);
-            var offsetBuffer = AllocateOutputBuffer(backend, n);
-            kernels.TorchParityDropoutAffine(scaleBuffer.Buffer, offsetBuffer.Buffer, n, Math.Max(1, block), p, a, seluSaturation, b, alpha, deviceSeed);
-            var shape = (int[])tensor._shape.Clone();
-            var scale = new Tensor<T>(FinishGpuOp<T>(backend, scaleBuffer, n), shape);
-            var scaled = TensorMultiply(tensor, scale);
-            if (!alpha)
+            OwnedBuffer scaleBuffer = default, offsetBuffer = default;
+            bool ownsScale = false, ownsOffset = false;
+            try
             {
-                offsetBuffer.Dispose();
-                return scaled;
+                scaleBuffer = AllocateOutputBuffer(backend, n);
+                ownsScale = true;
+                offsetBuffer = AllocateOutputBuffer(backend, n);
+                ownsOffset = true;
+                kernels.TorchParityDropoutAffine(scaleBuffer.Buffer, offsetBuffer.Buffer, n, Math.Max(1, block), p, a, seluSaturation, b, alpha, deviceSeed);
+                var shape = (int[])tensor._shape.Clone();
+                var scale = new Tensor<T>(FinishGpuOp<T>(backend, scaleBuffer, n), shape);
+                ownsScale = false;
+                Tensor<T>? offset = null;
+                if (alpha)
+                {
+                    offset = new Tensor<T>(FinishGpuOp<T>(backend, offsetBuffer, n), (int[])shape.Clone());
+                    ownsOffset = false;
+                }
+                var scaled = TensorMultiply(tensor, scale);
+                return offset is null ? scaled : TensorAdd(scaled, offset);
             }
-            var offset = new Tensor<T>(FinishGpuOp<T>(backend, offsetBuffer, n), (int[])shape.Clone());
-            return TensorAdd(scaled, offset);
+            finally
+            {
+                if (ownsScale) scaleBuffer.Dispose();
+                if (ownsOffset) offsetBuffer.Dispose();
+            }
         }
         catch (Exception ex)
         {

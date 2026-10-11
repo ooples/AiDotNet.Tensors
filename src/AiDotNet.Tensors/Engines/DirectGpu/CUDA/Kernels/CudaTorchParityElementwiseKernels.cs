@@ -681,7 +681,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_sample(float* __restr
         case 0: v = a + (b - a) * parity_uniform(&r); break;
         case 1: v = a + b * tan(PARITY_PI * (parity_uniform(&r) - 0.5)); break;
         case 2: v = -log(1.0 - parity_uniform(&r)) / a; break;
-        case 3: v = a == 1.0 ? 1.0 : fmax(1.0, ceil(log(1.0 - parity_uniform(&r)) / log(1.0 - a))); break;
+        case 3: v = a == 1.0 ? 1.0 : fmax(1.0, ceil(log(1.0 - parity_uniform(&r)) / log1p(-a))); break;
         case 4: v = exp(a + b * parity_standard_normal(&r)); break;
         case 5: v = parity_standard_normal(&r); break;
         default: v = a + fmin(floor(parity_uniform(&r) * b), b - 1.0); break;
@@ -776,12 +776,15 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_binomial(const float*
     }
     else
     {
-        double logQ = log(1.0 - q);
+        // log1p: for q below ~1e-16, log(1 - q) rounds to 0. Each step is checked against the remaining trials
+        // before it is added, so an enormous (or infinite) step ends the walk instead of overflowing the position.
+        double logQ = log1p(-q);
         long long successes = 0, position = 0;
         while (true)
         {
-            position += (long long)floor(log(1.0 - parity_uniform(&r)) / logQ) + 1;
-            if (position > n) break;
+            double step = floor(log(1.0 - parity_uniform(&r)) / logQ) + 1.0;
+            if (!(step <= (double)(n - position))) break;
+            position += (long long)step;
             successes++;
         }
         draw = (double)successes;
@@ -798,14 +801,33 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_multinomial(const flo
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     const float* w = weights + (long long)row * categories;
-    float* s = scratch + (long long)row * categories;
     for (int c = 0; c < categories; c++)
     {
         double v = (double)w[c];
         if (!(v >= 0.0) || isinf(v)) { parity_flag(flag, (unsigned long long)row * categories + c, 1); return; }
-        s[c] = w[c];
     }
     ParityRng r = parity_rng(seed, (unsigned long long)row);
+    if (replacement)
+    {
+        // The weights never change, so the CPU's walk is a search of the double prefix sums (accumulated in the
+        // CPU's order): the first category whose running total exceeds u, which is always a positive-weight one.
+        // O(categories + numSamples log categories) instead of O(numSamples x categories). scratch holds doubles.
+        double* prefix = ((double*)scratch) + (long long)row * categories;
+        double total = 0.0;
+        int last = -1;
+        for (int c = 0; c < categories; c++) { total += (double)w[c]; prefix[c] = total; if (w[c] > 0.0f) last = c; }
+        if (!(total > 0.0)) { parity_flag(flag, (1ull << 58) | ((unsigned long long)row * categories), 2); return; }
+        for (int k = 0; k < numSamples; k++)
+        {
+            double u = parity_uniform(&r) * total;
+            int lo = 0, hi = categories;
+            while (lo < hi) { int mid = (lo + hi) >> 1; if (u < prefix[mid]) hi = mid; else lo = mid + 1; }
+            y[(long long)row * numSamples + k] = (float)(lo < categories ? lo : last);
+        }
+        return;
+    }
+    float* s = scratch + (long long)row * categories;
+    for (int c = 0; c < categories; c++) s[c] = w[c];
     for (int k = 0; k < numSamples; k++)
     {
         double total = 0.0;

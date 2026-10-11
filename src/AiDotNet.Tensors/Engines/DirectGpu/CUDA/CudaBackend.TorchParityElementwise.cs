@@ -57,6 +57,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         TorchParityUnaryOp op, IGpuBuffer input, IGpuBuffer output, int n, float p0, float p1)
     {
         if (n <= 0) return;
+        RequireCapacity(input, n, nameof(input), "n");
+        RequireCapacity(output, n, nameof(output), "n");
         string name = UnaryKernelName(op);
         if (!_kernelCache.TryGetValue(name, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {name}");
@@ -71,6 +73,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         int kind, bool shifted, IGpuBuffer x, IGpuBuffer degree, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
+        RequireCapacity(x, n, nameof(x), "n");
+        RequireCapacity(degree, n, nameof(degree), "n");
+        RequireCapacity(output, n, nameof(output), "n");
         if (!_kernelCache.TryGetValue("parity_polynomial", out var polynomialKernel))
             throw new InvalidOperationException("CUDA kernel not found: parity_polynomial");
         using var _ = PushContext();
@@ -89,6 +94,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityRange(IGpuBuffer output, int n, double start, double span, double denominator)
     {
         if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr rangeKernel = ParityKernel("parity_range");
         using var _ = PushContext();
         IntPtr py = output.Handle;
@@ -101,6 +107,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         IGpuBuffer output, int n, double start, double span, double denominator, double logBase, bool single)
     {
         if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr logspaceKernel = ParityKernel("parity_logspace");
         using var _ = PushContext();
         IntPtr py = output.Handle;
@@ -113,6 +120,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityWindow(IGpuBuffer output, int n, int kind, int m, double alpha, double beta)
     {
         if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr windowKernel = ParityKernel("parity_window");
         using var _ = PushContext();
         IntPtr py = output.Handle;
@@ -124,6 +132,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityTriIndices(IGpuBuffer output, int row, int col, int offset, bool lower, int total)
     {
         if (row <= 0 || total <= 0) return;
+        RequireCapacity(output, 2L * total, nameof(output), "2*total");
         IntPtr triKernel = ParityKernel("parity_tri_indices");
         using var _ = PushContext();
         IntPtr py = output.Handle;
@@ -135,8 +144,10 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
 
     unsafe void ITorchParityElementwiseBackend.TorchParityDiagflat(IGpuBuffer input, IGpuBuffer output, int n, int size, int offset)
     {
-        int total = size * size;
-        if (total <= 0) return;
+        if (size <= 0) return;
+        int total = checked(size * size);
+        RequireCapacity(output, total, nameof(output), "size*size");
+        RequireCapacity(input, n, nameof(input), "n");
         IntPtr diagflatKernel = ParityKernel("parity_diagflat");
         using var _ = PushContext();
         IntPtr px = input.Handle, py = output.Handle;
@@ -158,8 +169,18 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityDiagonalScatter(IGpuBuffer src, IGpuBuffer output, int count,
         int[] otherExtents, int[] otherStrides, int stride1, int stride2, int start1, int start2, int diagonal)
     {
+        if (otherExtents is null) throw new ArgumentNullException(nameof(otherExtents));
+        if (otherStrides is null) throw new ArgumentNullException(nameof(otherStrides));
+        if (otherStrides.Length != otherExtents.Length)
+            throw new ArgumentException("otherStrides must hold one stride per other axis.", nameof(otherStrides));
         if (count <= 0) return;
         if (otherExtents.Length > 8) throw new ArgumentOutOfRangeException(nameof(otherExtents), "at most 8 other axes.");
+        if (diagonal <= 0) throw new ArgumentOutOfRangeException(nameof(diagonal));
+        RequireCapacity(src, count, nameof(src), "count");
+        // The furthest element the scatter writes: every other axis and the diagonal at their last index.
+        long furthest = (long)(diagonal - 1 + start1) * stride1 + (long)(diagonal - 1 + start2) * stride2;
+        for (int k = 0; k < otherExtents.Length; k++) furthest += (long)(otherExtents[k] - 1) * otherStrides[k];
+        RequireCapacity(output, furthest + 1, nameof(output), "furthest diagonal offset + 1");
         IntPtr scatterKernel = ParityKernel("parity_diagonal_scatter");
         var geometry = new ParityDiagonalGeometry
         {
@@ -177,6 +198,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         double q, int mode, bool ignoreNan)
     {
         if (rows <= 0) return;
+        RequireCapacity(sorted, (long)rows * length, nameof(sorted), "rows*length");
+        RequireCapacity(output, rows, nameof(output), "rows");
         IntPtr quantileKernel = ParityKernel("parity_quantile_rows");
         using var _ = PushContext();
         IntPtr ps = sorted.Handle, py = output.Handle;
@@ -188,6 +211,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
 
     unsafe void ITorchParityElementwiseBackend.TorchParityFlagReset(IGpuBuffer flag)
     {
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr resetKernel = ParityKernel("parity_flag_reset");
         using var _ = PushContext();
         IntPtr pf = flag.Handle;
@@ -199,6 +223,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParitySample(IGpuBuffer output, int n, int kind, double a, double b, ulong seed)
     {
         if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr sampleKernel = ParityKernel("parity_sample");
         using var _ = PushContext();
         IntPtr py = output.Handle;
@@ -210,6 +235,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityBernoulli(IGpuBuffer probabilities, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
     {
         if (n <= 0) return;
+        RequireCapacity(probabilities, n, nameof(probabilities), "n");
+        RequireCapacity(output, n, nameof(output), "n");
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr bernoulliKernel = ParityKernel("parity_bernoulli");
         using var _ = PushContext();
         IntPtr pp = probabilities.Handle, py = output.Handle, pf = flag.Handle;
@@ -221,6 +249,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityPoisson(IGpuBuffer rates, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
     {
         if (n <= 0) return;
+        RequireCapacity(rates, n, nameof(rates), "n");
+        RequireCapacity(output, n, nameof(output), "n");
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr poissonKernel = ParityKernel("parity_poisson");
         using var _ = PushContext();
         IntPtr pr = rates.Handle, py = output.Handle, pf = flag.Handle;
@@ -233,6 +264,10 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         ulong seed, IGpuBuffer flag)
     {
         if (n <= 0) return;
+        RequireCapacity(counts, n, nameof(counts), "n");
+        RequireCapacity(probabilities, n, nameof(probabilities), "n");
+        RequireCapacity(output, n, nameof(output), "n");
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr binomialKernel = ParityKernel("parity_binomial");
         using var _ = PushContext();
         IntPtr pc = counts.Handle, pp = probabilities.Handle, py = output.Handle, pf = flag.Handle;
@@ -245,6 +280,10 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         int categories, int numSamples, bool replacement, ulong seed, IGpuBuffer flag)
     {
         if (rows <= 0) return;
+        RequireCapacity(weights, (long)rows * categories, nameof(weights), "rows*categories");
+        RequireCapacity(scratch, 2L * rows * categories, nameof(scratch), "2*rows*categories (double prefix sums)");
+        RequireCapacity(output, (long)rows * numSamples, nameof(output), "rows*numSamples");
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr multinomialKernel = ParityKernel("parity_multinomial");
         using var _ = PushContext();
         IntPtr pw = weights.Handle, ps = scratch.Handle, py = output.Handle, pf = flag.Handle;
@@ -259,6 +298,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         double a, double sat, double b, bool alpha, ulong seed)
     {
         if (n <= 0) return;
+        RequireCapacity(scale, n, nameof(scale), "n");
+        RequireCapacity(offset, n, nameof(offset), "n");
         IntPtr dropoutKernel = ParityKernel("parity_dropout_affine");
         using var _ = PushContext();
         IntPtr pscale = scale.Handle, poffset = offset.Handle;
@@ -273,6 +314,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         bool training, ulong seed)
     {
         if (n <= 0) return;
+        RequireCapacity(input, n, nameof(input), "n");
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr rreluKernel = ParityKernel("parity_rrelu");
         using var _ = PushContext();
         IntPtr px = input.Handle, py = output.Handle;
@@ -285,6 +328,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityRandomKeys(IGpuBuffer output, int n, ulong seed)
     {
         if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr keysKernel = ParityKernel("parity_random_keys");
         using var _ = PushContext();
         IntPtr py = output.Handle;
@@ -296,6 +340,10 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityIntBinary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, IGpuBuffer flag)
     {
         if (n <= 0) return;
+        RequireCapacity(a, n, nameof(a), "n");
+        RequireCapacity(b, n, nameof(b), "n");
+        RequireCapacity(output, n, nameof(output), "n");
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr intKernel = ParityKernel("parity_int_binary");
         using var _ = PushContext();
         IntPtr pa = a.Handle, pb = b.Handle, py = output.Handle, pf = flag.Handle;
@@ -307,6 +355,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityIntNot(IGpuBuffer input, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
+        RequireCapacity(input, n, nameof(input), "n");
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr notKernel = ParityKernel("parity_int_not");
         using var _ = PushContext();
         IntPtr pa = input.Handle, py = output.Handle;
@@ -318,6 +368,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityInclusiveScan(IGpuBuffer input, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
+        RequireCapacity(input, n, nameof(input), "n");
+        RequireCapacity(output, n, nameof(output), "n");
         IntPtr scanKernel = ParityKernel("parity_scan_block");
         int blocks = (n + 1023) / 1024;
         IGpuBuffer? sums = blocks > 1 ? AllocateBuffer(blocks) : null;
@@ -361,6 +413,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         int n, int size, int[] shape)
     {
         if (n <= 0) return;
+        RequireCapacity(input, n, nameof(input), "n");
+        RequireCapacity(positions, n, nameof(positions), "n");
+        RequireCapacity(output, (long)size * shape.Length, nameof(output), "size*rank");
         if (shape.Length > 8) throw new ArgumentOutOfRangeException(nameof(shape), "at most 8 axes.");
         IntPtr scatterKernel = ParityKernel("parity_nonzero_static_scatter");
         var packed = new ParityShape8 { Rank = shape.Length };
@@ -376,6 +431,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         long extent, bool validate, IGpuBuffer flag)
     {
         if (n <= 0) return;
+        RequireCapacity(indices, n, nameof(indices), "n");
+        RequireCapacity(output, n, nameof(output), "n");
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr unravelKernel = ParityKernel("parity_unravel_axis");
         using var _ = PushContext();
         IntPtr px = indices.Handle, py = output.Handle, pf = flag.Handle;
@@ -388,6 +446,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParitySliceBitonicStep(IGpuBuffer slices, IGpuBuffer order, int rowLen, int k, int j, int length)
     {
         if (rowLen <= 0) return;
+        RequireCapacity(order, rowLen, nameof(order), "rowLen");
         IntPtr stepKernel = ParityKernel("parity_slice_bitonic_step");
         using var _ = PushContext();
         IntPtr ps = slices.Handle, po = order.Handle;
@@ -399,6 +458,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParitySliceFirstFlags(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags, int n, int length)
     {
         if (n <= 0) return;
+        RequireCapacity(order, n, nameof(order), "n");
+        RequireCapacity(flags, n, nameof(flags), "n");
+        RequireCapacity(slices, (long)n * length, nameof(slices), "n*length");
         IntPtr flagsKernel = ParityKernel("parity_slice_first_flags");
         using var _ = PushContext();
         IntPtr ps = slices.Handle, po = order.Handle, pf = flags.Handle;
@@ -412,6 +474,10 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     {
         int total = n * length;
         if (total <= 0) return;
+        RequireCapacity(slices, (long)n * length, nameof(slices), "n*length");
+        RequireCapacity(order, n, nameof(order), "n");
+        RequireCapacity(flags, n, nameof(flags), "n");
+        RequireCapacity(positions, n, nameof(positions), "n");
         IntPtr gatherKernel = ParityKernel("parity_slice_gather_unique");
         using var _ = PushContext();
         IntPtr ps = slices.Handle, po = order.Handle, pf = flags.Handle, pp = positions.Handle, py = output.Handle;
@@ -425,6 +491,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     {
         int threads = batches * points;
         if (threads <= 0) return;
+        RequireCapacity(input, (long)batches * channels * depth * height * width, nameof(input), "N*C*D*H*W");
+        RequireCapacity(grid, 3L * batches * points, nameof(grid), "N*points*3");
+        RequireCapacity(output, (long)batches * channels * points, nameof(output), "N*C*points");
         IntPtr gridKernel = ParityKernel("parity_grid_sample_3d");
         using var _ = PushContext();
         IntPtr px = input.Handle, pg = grid.Handle, py = output.Handle;
@@ -441,6 +510,11 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     {
         int threads = batches * points;
         if (threads <= 0) return;
+        RequireCapacity(input, (long)batches * channels * depth * height * width, nameof(input), "N*C*D*H*W");
+        RequireCapacity(inputGrad, (long)batches * channels * depth * height * width, nameof(inputGrad), "N*C*D*H*W");
+        RequireCapacity(grid, 3L * batches * points, nameof(grid), "N*points*3");
+        RequireCapacity(gridGrad, 3L * batches * points, nameof(gridGrad), "N*points*3");
+        RequireCapacity(outputGrad, (long)batches * channels * points, nameof(outputGrad), "N*C*points");
         IntPtr backwardKernel = ParityKernel("parity_grid_sample_3d_backward");
         using var _ = PushContext();
         IntPtr px = input.Handle, pg = grid.Handle, pdy = outputGrad.Handle, pdx = inputGrad.Handle, pdg = gridGrad.Handle;
@@ -455,6 +529,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         TorchParityBinaryOp op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
+        RequireCapacity(a, n, nameof(a), "n");
+        RequireCapacity(b, n, nameof(b), "n");
+        RequireCapacity(output, n, nameof(output), "n");
         string name = BinaryKernelName(op);
         if (!_kernelCache.TryGetValue(name, out var kernel))
             throw new InvalidOperationException($"CUDA kernel not found: {name}");

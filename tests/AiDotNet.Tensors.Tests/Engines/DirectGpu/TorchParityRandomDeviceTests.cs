@@ -174,6 +174,26 @@ public class TorchParityRandomDeviceTests : IClassFixture<DirectGpuTensorEngineT
         AssertSeeded(s => gpu.TensorBinomial(counts, probs, s));
     }
 
+    // For p below ~1e-16, log(1 - p) rounds to 0: the binomial waiting-time walk then never advanced (the CPU looped
+    // forever) and geometric draws were infinite. Both engines now use log1p(-p) and a bounded walk.
+    [SkippableFact]
+    public void TinyProbabilities_GiveFiniteDraws_OnBothEngines()
+    {
+        var gpu = GpuOrSkip();
+        var counts = new Tensor<float>(new[] { 1000 });
+        var probs = new Tensor<float>(new[] { 1000 });
+        for (int i = 0; i < counts.Length; i++) { counts[i] = 5; probs[i] = 1e-30f; }
+        foreach (IEngine e in new IEngine[] { new CpuEngine(), gpu })
+        {
+            var b = Values(e.TensorBinomial(counts, probs, 3));
+            Assert.All(b, x => Assert.Equal(0.0, x));
+            var g = Values(e.TensorGeometric<float>(new[] { 1000 }, 1e-17, 3));
+            Assert.All(g, x => Assert.True(x >= 1 && !double.IsInfinity(x) && !double.IsNaN(x), $"geometric draw {x}"));
+            // Mean 1e17: a draw below 1e10 has probability 1e-7. log(1 - p) == 0 collapsed every draw to 1.
+            Assert.True(g.Count(x => x > 1e10) > 990, $"geometric(1e-17) draws too small: median {g.OrderBy(x => x).ElementAt(500)}");
+        }
+    }
+
     [SkippableFact]
     public void InvalidParameters_ThrowTheCpusExceptions()
     {
@@ -280,7 +300,7 @@ public class TorchParityRandomDeviceTests : IClassFixture<DirectGpuTensorEngineT
             {
                 int i = c * 100 + k;
                 Assert.Equal(first, channel[i] == 0);
-                if (!first) Assert.True(Math.Abs(channel[i] - x[i] / (1 - p)) <= 1e-5 * channel[i]);
+                if (!first) Assert.True(Math.Abs(channel[i] - x[i] / (1 - p)) <= 1e-5 * Math.Max(1.0, Math.Abs(channel[i])));
                 Assert.Equal(featureDropped, Math.Abs(feature[i] - (a * sat + b)) <= 1e-5);
             }
         }

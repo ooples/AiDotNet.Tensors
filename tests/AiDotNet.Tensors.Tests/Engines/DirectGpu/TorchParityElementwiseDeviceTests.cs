@@ -135,7 +135,8 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
             "airyAi" => e => e.TensorAiryAi(x),
             "mvlgamma" => e => e.TensorMvlgamma(x, 1),
             "mvlgamma4" => e => e.TensorMvlgamma(x, 4),
-            _ => e => e.TensorIsNegInf(x),
+            "isNegInf" => e => e.TensorIsNegInf(x),
+            _ => throw new ArgumentOutOfRangeException(nameof(op), op, "no case for this op"),
         };
         // CUDA's Bessel / erfcx / ndtri carry a few 1e-6 of error against the CPU's double-precision quadratures.
         double tolerance = op.Contains("essel") || op == "erfcx" || op == "ndtri" || op == "airyAi" || op.StartsWith("mvlgamma") ? 1e-5 : 2e-6;
@@ -178,6 +179,21 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
         };
         string probeName = "Tensor" + char.ToUpperInvariant(op[0]) + op.Substring(1);
         AssertMatches(op, f(cpu), OnDevice(probeName, () => f(gpu)), op.StartsWith("igamma") ? 1e-5 : 2e-6);
+    }
+
+    // The launchers check every buffer's capacity before a kernel can index past it (a sticky CUDA fault otherwise).
+    [SkippableFact]
+    public void Launchers_RejectUndersizedBuffers()
+    {
+        var gpu = GpuOrSkip();
+        var backend = gpu.GetBackend();
+        var kernels = (ITorchParityElementwiseBackend)backend!;
+        using var small = backend!.AllocateBuffer(8);
+        using var large = backend.AllocateBuffer(64);
+        Assert.Throws<ArgumentException>(() => kernels.TorchParityUnary(TorchParityUnaryOp.Erf, large, small, 64, 0f, 0f));
+        Assert.Throws<ArgumentException>(() => kernels.TorchParityBinary(TorchParityBinaryOp.Fmax, small, large, large, 64));
+        Assert.Throws<ArgumentException>(() => kernels.TorchParityDiagflat(large, small, 8, 8, 0));
+        Assert.Throws<ArgumentException>(() => kernels.TorchParitySample(small, 64, 0, 0, 1, 1));
     }
 
     public static TheoryData<string> PolynomialOps() => new()
