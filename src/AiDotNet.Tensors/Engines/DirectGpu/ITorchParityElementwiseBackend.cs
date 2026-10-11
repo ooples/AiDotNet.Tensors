@@ -17,9 +17,10 @@ internal enum TorchParityBinaryOp { Fmax, Fmin, Heaviside, GreaterEqual, LessEqu
 /// a backend without it keeps the recorded host fallback (<c>GpuLaunchProbe.OnFallback</c>).
 /// </summary>
 /// <remarks>
-/// Implemented by the CUDA backend. Not yet implemented, each tracked by its own follow-up issue: HIP (#1124),
-/// Metal (#1125), OpenCL (#1126), Vulkan (#1127) and WebGPU (#1128). Until then those backends compute these ops on
-/// the host.
+/// Implemented by the CUDA and Vulkan backends (Vulkan computes in double and int64, so a device without the
+/// shaderFloat64 / shaderInt64 features keeps the host fallback for the kernels that need them). Not yet implemented,
+/// each tracked by its own follow-up issue: HIP (#1124), Metal (#1125), OpenCL (#1126) and WebGPU (#1128). Until then
+/// those backends compute these ops on the host.
 /// </remarks>
 internal interface ITorchParityElementwiseBackend
 {
@@ -117,6 +118,15 @@ internal interface ITorchParityElementwiseBackend
 
     /// <summary>Bitwise not of a raw int32 buffer.</summary>
     void TorchParityIntNot(IGpuBuffer input, IGpuBuffer output, int n);
+
+    /// <summary>
+    /// The int32 ops on the raw int64 layout (2 words per element) of an element type t: 0 long, 1 ulong, 2 short,
+    /// 3 ushort, 4 sbyte, 5 byte, 6 uint. Flag codes 1 (zero divisor) and 2 (the CPU's OverflowException).
+    /// </summary>
+    void TorchParityInt64Binary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, int typeCode, IGpuBuffer flag);
+
+    /// <summary>Bitwise not on the raw int64 layout, narrowed to element type t.</summary>
+    void TorchParityInt64Not(IGpuBuffer input, IGpuBuffer output, int n, int typeCode);
 
     /// <summary>Inclusive prefix sum of n floats (exact for integer counts below 2^24).</summary>
     void TorchParityInclusiveScan(IGpuBuffer input, IGpuBuffer output, int n);

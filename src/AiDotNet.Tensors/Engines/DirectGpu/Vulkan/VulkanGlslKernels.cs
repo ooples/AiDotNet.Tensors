@@ -1301,13 +1301,13 @@ void main() {
 }";
 
     public static string Pad2DGlsl => Header + TwoBufferLayout + @"
-layout(push_constant) uniform Params { uint batch; uint channels; uint inH; uint inW; uint outH; uint outW; uint padTop; uint padLeft; };
+layout(push_constant) uniform Params { uint batch; uint channels; uint inH; uint inW; uint outH; uint outW; uint padTop; uint padLeft; float padValue; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= batch * channels * outH * outW) return;
     uint w = idx % outW; uint temp = idx / outW; uint h = temp % outH; temp /= outH; uint ch = temp % channels; uint ba = temp / channels;
     int srcH = int(h) - int(padTop); int srcW = int(w) - int(padLeft);
-    b[idx] = (srcH >= 0 && srcH < int(inH) && srcW >= 0 && srcW < int(inW)) ? a[((ba * channels + ch) * inH + uint(srcH)) * inW + uint(srcW)] : 0.0;
+    b[idx] = (srcH >= 0 && srcH < int(inH) && srcW >= 0 && srcW < int(inW)) ? a[((ba * channels + ch) * inH + uint(srcH)) * inW + uint(srcW)] : padValue;
 }";
 
     public static string TileLastAxisGlsl => Header + TwoBufferLayout + @"
