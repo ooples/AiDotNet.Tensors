@@ -337,6 +337,107 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_meshgrid2d(const float* s
     output1[i] = source1[xy ? r : c];
 }
 
+
+// ---- Generic FFT (#962): Bluestein for any length, and 16-bit storage packed two values per 32-bit word. ----
+// (a * b) mod m without 64-bit integers, which GLSL and WGSL lack; a, b < m <= 2^30.
+__device__ __forceinline__ unsigned int bx_mulmod(unsigned int a, unsigned int b, unsigned int m) {
+    unsigned int r = 0u;
+    while (b != 0u) { if (b & 1u) { r += a; if (r >= m) r -= m; } a += a; if (a >= m) a -= m; b >>= 1; }
+    return r;
+}
+
+// chirp[k] = exp(sign * i * pi * k^2 / n) for k < n (sign -1 forward, +1 inverse); filter is its conjugate laid out
+// circularly over m: filter[k] = conj(chirp[k]) for k < n, conj(chirp[m - k]) for k > m - n, else 0.
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_chirp(float* chirpRe, float* chirpIm, float* filterRe, float* filterIm,
+    int n, int m, int inverse) {
+    int k = bx_gid(); if (k >= m) return;
+    unsigned int twoN = 2u * (unsigned int)n;
+    float sign = inverse ? 1.0f : -1.0f;
+    if (k < n) {
+        float a = 3.14159265358979323846f * (float)bx_mulmod((unsigned int)k, (unsigned int)k, twoN) / (float)n;
+        chirpRe[k] = cosf(a); chirpIm[k] = sign * sinf(a);
+    }
+    int t = k < n ? k : (k > m - n ? m - k : -1);
+    if (t < 0) { filterRe[k] = 0.0f; filterIm[k] = 0.0f; return; }
+    float a = 3.14159265358979323846f * (float)bx_mulmod((unsigned int)t, (unsigned int)t, twoN) / (float)n;
+    filterRe[k] = cosf(a); filterIm[k] = -sign * sinf(a);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_bluestein_pre(const float* re, const float* im, const float* chirpRe,
+    const float* chirpIm, float* padRe, float* padIm, int batch, int n, int m) {
+    int i = bx_gid(); if (i >= batch * m) return;
+    int b = i / m; int k = i % m;
+    if (k >= n) { padRe[i] = 0.0f; padIm[i] = 0.0f; return; }
+    float xr = re[b * n + k]; float xi = im[b * n + k]; float cr = chirpRe[k]; float ci = chirpIm[k];
+    padRe[i] = xr * cr - xi * ci;
+    padIm[i] = xr * ci + xi * cr;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_cmul(float* aRe, float* aIm, const float* bRe, const float* bIm, int batch, int m) {
+    int i = bx_gid(); if (i >= batch * m) return;
+    int k = i % m;
+    float xr = aRe[i]; float xi = aIm[i]; float yr = bRe[k]; float yi = bIm[k];
+    aRe[i] = xr * yr - xi * yi;
+    aIm[i] = xr * yi + xi * yr;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_bluestein_post(const float* padRe, const float* padIm, const float* chirpRe,
+    const float* chirpIm, float* re, float* im, int batch, int n, int m, float scale) {
+    int i = bx_gid(); if (i >= batch * n) return;
+    int b = i / n; int k = i % n;
+    float xr = padRe[b * m + k]; float xi = padIm[b * m + k]; float cr = chirpRe[k]; float ci = chirpIm[k];
+    re[i] = (xr * cr - xi * ci) * scale;
+    im[i] = (xr * ci + xi * cr) * scale;
+}
+
+// mode 1: IEEE binary16, mode 2: bfloat16; both round to nearest even.
+__device__ __forceinline__ unsigned int bx_to_16(float x, int mode) {
+    unsigned int f = __float_as_uint(x);
+    if (mode == 2) {
+        if ((f & 0x7fffffffu) > 0x7f800000u) return (f >> 16) | 0x40u;
+        return (f + 0x7fffu + ((f >> 16) & 1u)) >> 16;
+    }
+    unsigned int sign = (f >> 16) & 0x8000u; int e = (int)((f >> 23) & 0xffu); unsigned int mant = f & 0x7fffffu;
+    if (e == 255) return sign | 0x7c00u | (mant != 0u ? 0x200u : 0u);
+    int ex = e - 112;
+    if (ex >= 31) return sign | 0x7c00u;
+    if (ex <= 0) {
+        if (ex < -10) return sign;
+        mant |= 0x800000u; unsigned int shift = (unsigned int)(14 - ex);
+        unsigned int h = mant >> shift; unsigned int rem = mant & ((1u << shift) - 1u); unsigned int half = 1u << (shift - 1u);
+        if (rem > half || (rem == half && (h & 1u) != 0u)) h++;
+        return sign | h;
+    }
+    unsigned int h = sign | ((unsigned int)ex << 10) | (mant >> 13); unsigned int rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h++;
+    return h;
+}
+
+__device__ __forceinline__ float bx_from_16(unsigned int h, int mode) {
+    if (mode == 2) return __uint_as_float(h << 16);
+    unsigned int sign = (h & 0x8000u) << 16; unsigned int e = (h >> 10) & 0x1fu; unsigned int mant = h & 0x3ffu;
+    if (e == 0u) {
+        if (mant == 0u) return __uint_as_float(sign);
+        int ex = 1; while ((mant & 0x400u) == 0u) { mant <<= 1; ex--; }
+        return __uint_as_float(sign | ((unsigned int)(ex + 112) << 23) | ((mant & 0x3ffu) << 13));
+    }
+    if (e == 31u) return __uint_as_float(sign | 0x7f800000u | (mant << 13));
+    return __uint_as_float(sign | ((e + 112u) << 23) | (mant << 13));
+}
+
+// One thread per 32-bit word: element 2w in the low half, 2w + 1 in the high half (zero past the end).
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_to_storage(const float* source, unsigned int* words, int count, int mode) {
+    int w = bx_gid(); if (w >= (count + 1) / 2) return;
+    unsigned int lo = bx_to_16(source[2 * w], mode);
+    unsigned int hi = 2 * w + 1 < count ? bx_to_16(source[2 * w + 1], mode) : 0u;
+    words[w] = lo | (hi << 16);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const unsigned int* words, float* destination, int count, int mode) {
+    int i = bx_gid(); if (i >= count) return;
+    unsigned int word = words[i / 2];
+    destination[i] = bx_from_16((i & 1) != 0 ? word >> 16 : word & 0xffffu, mode);
+}
 ";
 
     public static string[] GetKernelNames() => new[]
@@ -345,6 +446,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_meshgrid2d(const float* s
         "bx_broadcast_first", "bx_gated_backward", "bx_concat_axis", "bx_slice_last_axis", "bx_set_slice_last_axis",
         "bx_slice_axis", "bx_set_slice_axis", "bx_stack2", "bx_window_2d", "bx_tile_last_axis", "bx_repeat_elements",
         "bx_linspace", "bx_diag", "bx_extract_diag", "bx_triangular_mask", "bx_index_select", "bx_row_loss",
-        "bx_dropout_mask", "bx_gaussian_noise", "bx_gumbel_softmax", "bx_batch_outer_product", "bx_meshgrid2d"
+        "bx_dropout_mask", "bx_gaussian_noise", "bx_gumbel_softmax", "bx_batch_outer_product", "bx_meshgrid2d", "bx_fft_chirp", "bx_fft_bluestein_pre",
+        "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage"
     };
 }

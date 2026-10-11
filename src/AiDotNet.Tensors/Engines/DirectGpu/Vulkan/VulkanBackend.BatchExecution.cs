@@ -8,7 +8,7 @@ using S = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBatchExecutionKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed partial class VulkanBackend : IMeshgridBackend
+public sealed partial class VulkanBackend : IGenericFftBackend, IMeshgridBackend
 {
     private readonly List<VulkanComputePipeline> _batchRecordedPipelines = new List<VulkanComputePipeline>();
     private Action? _flushPendingBatchAction;
@@ -49,6 +49,35 @@ public sealed partial class VulkanBackend : IMeshgridBackend
         };
         VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
         _batchDispatchCount = 0;
+    }
+    private static readonly Dictionary<string, string> NamedShaders = new Dictionary<string, string>
+    {
+        ["bx_fft_chirp"] = S.FftChirp, ["bx_fft_bluestein_pre"] = S.FftBluesteinPre, ["bx_fft_cmul"] = S.FftCmul,
+        ["bx_fft_bluestein_post"] = S.FftBluesteinPost, ["bx_fft_to_storage"] = S.FftToStorage,
+        ["bx_fft_from_storage"] = S.FftFromStorage,
+    };
+
+    /// <summary>Shared-kernel launch by name: buffers bind in argument order, scalars push in argument order.</summary>
+    private void LaunchBatchByName(string name, int threads, params object[] args)
+    {
+        if (threads <= 0) return;
+        if (!NamedShaders.TryGetValue(name, out var source))
+            throw new InvalidOperationException($"Vulkan batch kernel not found: {name}");
+        var buffers = new List<IGpuBuffer>();
+        var push = new List<uint>();
+        foreach (var arg in args)
+        {
+            switch (arg)
+            {
+                case IGpuBuffer buffer: buffers.Add(buffer); break;
+                case int value: push.Add(Bits(value)); break;
+                case float value: push.Add(FloatBits(value)); break;
+                case ulong value: push.Add((uint)value); push.Add((uint)(value >> 32)); break;
+                default:
+                    throw new ArgumentException($"Unsupported argument type {arg?.GetType().Name ?? "null"} for {name}.");
+            }
+        }
+        GlslNaryOp(source, buffers.ToArray(), threads, push.ToArray());
     }
     private static uint Bits(int value) => unchecked((uint)value);
 
@@ -147,4 +176,15 @@ public sealed partial class VulkanBackend : IMeshgridBackend
         if (n1 <= 0) throw new ArgumentOutOfRangeException(nameof(n1));
         GlslNaryOp(S.Meshgrid2D, new[] { source0, source1, output0, output1 }, checked(n0 * n1), new[] { Bits(n0), Bits(n1), xy ? 1u : 0u });
     }
+
+    bool IGenericFftBackend.SupportsFftElementType(FftElementType type) => PortableGenericFft.Supports(type);
+
+    void IGenericFftBackend.ConvertFloatToFftStorage(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
+        => PortableGenericFft.ToStorage(this, LaunchBatchByName, source, destination, count, type);
+
+    void IGenericFftBackend.ConvertFftStorageToFloat(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
+        => PortableGenericFft.FromStorage(this, LaunchBatchByName, source, destination, count, type);
+
+    void IGenericFftBackend.LaunchFftGeneric(IGpuBuffer real, IGpuBuffer imaginary, int batch, int n, bool inverse, FftElementType type)
+        => PortableGenericFft.Launch(this, LaunchBatchByName, real, imaginary, batch, n, inverse, type);
 }

@@ -35,7 +35,9 @@ public sealed class WebGpuBatchExecutionKernelsTests
         foreach (string raw in signature.Groups[1].Value.Split(','))
         {
             string param = Regex.Replace(raw.Trim(), @"\s+", " ", RegexOptions.None, RegexTimeout);
-            if (param.StartsWith("const float* ", StringComparison.Ordinal)) expectedAccess.Add("read");
+            if (param.StartsWith("const float* ", StringComparison.Ordinal) || param.StartsWith("const unsigned int* ", StringComparison.Ordinal))
+                expectedAccess.Add("read");
+            else if (param.StartsWith("unsigned int* ", StringComparison.Ordinal)) expectedAccess.Add("read_write");
             else if (param.StartsWith("float* ", StringComparison.Ordinal)) expectedAccess.Add("read_write");
             else if (param.StartsWith("int ", StringComparison.Ordinal)) expectedFields.Add("i32");
             else if (param.StartsWith("float ", StringComparison.Ordinal)) expectedFields.Add("f32");

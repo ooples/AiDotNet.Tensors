@@ -5,7 +5,7 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
+public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
@@ -35,4 +35,15 @@ public sealed partial class MetalBackend : IMeshgridBackend, ISeededGumbelSoftma
         if (n1 <= 0) throw new ArgumentOutOfRangeException(nameof(n1));
         LaunchBatch("bx_meshgrid2d", checked(n0 * n1), source0, source1, output0, output1, n0, n1, xy ? 1 : 0);
     }
+
+    bool IGenericFftBackend.SupportsFftElementType(FftElementType type) => PortableGenericFft.Supports(type);
+
+    void IGenericFftBackend.ConvertFloatToFftStorage(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
+        => PortableGenericFft.ToStorage(this, LaunchBatch, source, destination, count, type);
+
+    void IGenericFftBackend.ConvertFftStorageToFloat(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
+        => PortableGenericFft.FromStorage(this, LaunchBatch, source, destination, count, type);
+
+    void IGenericFftBackend.LaunchFftGeneric(IGpuBuffer real, IGpuBuffer imaginary, int batch, int n, bool inverse, FftElementType type)
+        => PortableGenericFft.Launch(this, LaunchBatch, real, imaginary, batch, n, inverse, type);
 }

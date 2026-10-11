@@ -17,7 +17,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return k;
         }
 
-        private static IntPtr BatchHandle(IGpuBuffer buffer) => ((DirectOpenClGpuBuffer)buffer).Buffer.Handle;
+        // Float and byte buffers (16-bit FFT storage) both expose their cl_mem as Handle.
+        private static IntPtr BatchHandle(IGpuBuffer buffer) => buffer.Handle;
 
         private void LaunchBatch(string name, int globalSize, params object[] args)
         {

@@ -132,6 +132,102 @@ __kernel void bx_meshgrid2d(__global const float* source0, __global const float*
     output0[i] = source0[xy ? c : r];
     output1[i] = source1[xy ? r : c];
 }
+
+// ---- Generic FFT (#962): Bluestein for any length, 16-bit storage packed two values per 32-bit word. ----
+uint bx_mulmod(uint a, uint b, uint m) {
+    uint r = 0u;
+    while (b != 0u) { if (b & 1u) { r += a; if (r >= m) r -= m; } a += a; if (a >= m) a -= m; b >>= 1; }
+    return r;
+}
+
+__kernel void bx_fft_chirp(__global float* chirpRe, __global float* chirpIm, __global float* filterRe, __global float* filterIm,
+    int n, int m, int inverse) {
+    int k = get_global_id(0); if (k >= m) return;
+    uint twoN = 2u * (uint)n;
+    float sgn = inverse ? 1.0f : -1.0f;
+    if (k < n) {
+        float a = M_PI_F * (float)bx_mulmod((uint)k, (uint)k, twoN) / (float)n;
+        chirpRe[k] = cos(a); chirpIm[k] = sgn * sin(a);
+    }
+    int t = k < n ? k : (k > m - n ? m - k : -1);
+    if (t < 0) { filterRe[k] = 0.0f; filterIm[k] = 0.0f; return; }
+    float b = M_PI_F * (float)bx_mulmod((uint)t, (uint)t, twoN) / (float)n;
+    filterRe[k] = cos(b); filterIm[k] = -sgn * sin(b);
+}
+
+__kernel void bx_fft_bluestein_pre(__global const float* re, __global const float* im, __global const float* chirpRe,
+    __global const float* chirpIm, __global float* padRe, __global float* padIm, int batch, int n, int m) {
+    int i = get_global_id(0); if (i >= batch * m) return;
+    int b = i / m; int k = i % m;
+    if (k >= n) { padRe[i] = 0.0f; padIm[i] = 0.0f; return; }
+    float xr = re[b * n + k]; float xi = im[b * n + k]; float cr = chirpRe[k]; float ci = chirpIm[k];
+    padRe[i] = xr * cr - xi * ci;
+    padIm[i] = xr * ci + xi * cr;
+}
+
+__kernel void bx_fft_cmul(__global float* aRe, __global float* aIm, __global const float* bRe, __global const float* bIm, int batch, int m) {
+    int i = get_global_id(0); if (i >= batch * m) return;
+    int k = i % m;
+    float xr = aRe[i]; float xi = aIm[i]; float yr = bRe[k]; float yi = bIm[k];
+    aRe[i] = xr * yr - xi * yi;
+    aIm[i] = xr * yi + xi * yr;
+}
+
+__kernel void bx_fft_bluestein_post(__global const float* padRe, __global const float* padIm, __global const float* chirpRe,
+    __global const float* chirpIm, __global float* re, __global float* im, int batch, int n, int m, float scale) {
+    int i = get_global_id(0); if (i >= batch * n) return;
+    int b = i / n; int k = i % n;
+    float xr = padRe[b * m + k]; float xi = padIm[b * m + k]; float cr = chirpRe[k]; float ci = chirpIm[k];
+    re[i] = (xr * cr - xi * ci) * scale;
+    im[i] = (xr * ci + xi * cr) * scale;
+}
+
+uint bx_to_16(float x, int mode) {
+    uint f = as_uint(x);
+    if (mode == 2) {
+        if ((f & 0x7fffffffu) > 0x7f800000u) return (f >> 16) | 0x40u;
+        return (f + 0x7fffu + ((f >> 16) & 1u)) >> 16;
+    }
+    uint sgn = (f >> 16) & 0x8000u; int e = (int)((f >> 23) & 0xffu); uint mant = f & 0x7fffffu;
+    if (e == 255) return sgn | 0x7c00u | (mant != 0u ? 0x200u : 0u);
+    int ex = e - 112;
+    if (ex >= 31) return sgn | 0x7c00u;
+    if (ex <= 0) {
+        if (ex < -10) return sgn;
+        mant |= 0x800000u; uint shift = (uint)(14 - ex);
+        uint h = mant >> shift; uint rem = mant & ((1u << shift) - 1u); uint hw = 1u << (shift - 1u);
+        if (rem > hw || (rem == hw && (h & 1u) != 0u)) h++;
+        return sgn | h;
+    }
+    uint h = sgn | ((uint)ex << 10) | (mant >> 13); uint rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h++;
+    return h;
+}
+
+float bx_from_16(uint h, int mode) {
+    if (mode == 2) return as_float(h << 16);
+    uint sgn = (h & 0x8000u) << 16; uint e = (h >> 10) & 0x1fu; uint mant = h & 0x3ffu;
+    if (e == 0u) {
+        if (mant == 0u) return as_float(sgn);
+        int ex = 1; while ((mant & 0x400u) == 0u) { mant <<= 1; ex--; }
+        return as_float(sgn | ((uint)(ex + 112) << 23) | ((mant & 0x3ffu) << 13));
+    }
+    if (e == 31u) return as_float(sgn | 0x7f800000u | (mant << 13));
+    return as_float(sgn | ((e + 112u) << 23) | (mant << 13));
+}
+
+__kernel void bx_fft_to_storage(__global const float* source, __global uint* words, int count, int mode) {
+    int w = get_global_id(0); if (w >= (count + 1) / 2) return;
+    uint lo = bx_to_16(source[2 * w], mode);
+    uint hi = 2 * w + 1 < count ? bx_to_16(source[2 * w + 1], mode) : 0u;
+    words[w] = lo | (hi << 16);
+}
+
+__kernel void bx_fft_from_storage(__global const uint* words, __global float* destination, int count, int mode) {
+    int i = get_global_id(0); if (i >= count) return;
+    uint word = words[i / 2];
+    destination[i] = bx_from_16((i & 1) != 0 ? word >> 16 : word & 0xffffu, mode);
+}
 ";
     }
 
@@ -141,7 +237,8 @@ __kernel void bx_meshgrid2d(__global const float* source0, __global const float*
         {
             "bx_full_reduce", "bx_reduce_max_backward", "bx_reduce_variance_backward", "bx_reduce_log_variance",
             "bx_reduce_log_variance_backward", "bx_sincos", "bx_slice_axis", "bx_set_slice_axis",
-            "bx_crop_2d_backward", "bx_sparsemax", "bx_mse_loss_rows", "bx_meshgrid2d"
+            "bx_crop_2d_backward", "bx_sparsemax", "bx_mse_loss_rows", "bx_meshgrid2d",
+            "bx_fft_chirp", "bx_fft_bluestein_pre", "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage"
         };
     }
 }

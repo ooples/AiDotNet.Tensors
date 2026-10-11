@@ -28,6 +28,51 @@ fn bx_hash(counter: u32, key: u32) -> u32 {
 // Built at run time: an infinite constant expression is a shader-creation error.
 fn bx_inf() -> f32 { let bits = 0x7f800000u; return bitcast<f32>(bits); }
 fn bx_unit(h: u32) -> f32 { return f32(h >> 8u) * (1.0 / 16777216.0); }
+// (a * b) mod m in 32 bits; a, b < m <= 2^30.
+fn bx_mulmod(a0: u32, b0: u32, m: u32) -> u32 {
+    var a = a0; var b = b0; var r = 0u;
+    loop {
+        if (b == 0u) { break; }
+        if ((b & 1u) != 0u) { r = r + a; if (r >= m) { r = r - m; } }
+        a = a + a; if (a >= m) { a = a - m; }
+        b = b >> 1u;
+    }
+    return r;
+}
+// mode 1: IEEE binary16, mode 2: bfloat16; both round to nearest even.
+fn bx_to_16(x: f32, mode: i32) -> u32 {
+    let f = bitcast<u32>(x);
+    if (mode == 2) {
+        if ((f & 0x7fffffffu) > 0x7f800000u) { return (f >> 16u) | 0x40u; }
+        return (f + 0x7fffu + ((f >> 16u) & 1u)) >> 16u;
+    }
+    let sgn = (f >> 16u) & 0x8000u; let e = i32((f >> 23u) & 0xffu); var mant = f & 0x7fffffu;
+    if (e == 255) { return sgn | 0x7c00u | select(0u, 0x200u, mant != 0u); }
+    let ex = e - 112;
+    if (ex >= 31) { return sgn | 0x7c00u; }
+    if (ex <= 0) {
+        if (ex < -10) { return sgn; }
+        mant = mant | 0x800000u; let shift = u32(14 - ex);
+        var h = mant >> shift; let rem = mant & ((1u << shift) - 1u); let hw = 1u << (shift - 1u);
+        if (rem > hw || (rem == hw && (h & 1u) != 0u)) { h = h + 1u; }
+        return sgn | h;
+    }
+    var h = sgn | (u32(ex) << 10u) | (mant >> 13u); let rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) { h = h + 1u; }
+    return h;
+}
+fn bx_from_16(h: u32, mode: i32) -> f32 {
+    if (mode == 2) { return bitcast<f32>(h << 16u); }
+    let sgn = (h & 0x8000u) << 16u; let e = (h >> 10u) & 0x1fu; var mant = h & 0x3ffu;
+    if (e == 0u) {
+        if (mant == 0u) { return bitcast<f32>(sgn); }
+        var ex = 1;
+        loop { if ((mant & 0x400u) != 0u) { break; } mant = mant << 1u; ex = ex - 1; }
+        return bitcast<f32>(sgn | (u32(ex + 112) << 23u) | ((mant & 0x3ffu) << 13u));
+    }
+    if (e == 31u) { return bitcast<f32>(sgn | 0x7f800000u | (mant << 13u)); }
+    return bitcast<f32>(sgn | ((e + 112u) << 23u) | (mant << 13u));
+}
 ";
 
     private const string Main = "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n    let i = i32(id.x);\n";
@@ -40,7 +85,8 @@ fn bx_unit(h: u32) -> f32 { return f32(h >> 8u) * (1.0 / 16777216.0); }
         {
             string[] parts = buffers[b].Split(':');
             sb.Append("@group(0) @binding(").Append(b).Append(") var<storage, ")
-              .Append(parts[0] == "r" ? "read" : "read_write").Append("> ").Append(parts[1]).Append(" : array<f32>;\n");
+              .Append(parts[0] == "r" ? "read" : "read_write").Append("> ").Append(parts[1])
+              .Append(" : array<").Append(parts.Length > 2 ? parts[2] : "f32").Append(">;\n");
         }
         sb.Append("struct P { ").Append(fields).Append(" };\n");
         sb.Append("@group(0) @binding(").Append(buffers.Length).Append(") var<uniform> p : P;\n");
@@ -345,6 +391,61 @@ var<workgroup> scratch: array<f32, 256>;
     output1[i] = source1[select(c, r, p.xy != 0)];
 }");
 
+    public static readonly string FftChirp = Shader(new[] { "rw:chirpRe", "rw:chirpIm", "rw:filterRe", "rw:filterIm" }, "n: i32, m: i32, inverse: i32", Main + @"
+    if (i >= p.m) { return; }
+    let twoN = 2u * u32(p.n);
+    let sgn = select(-1.0, 1.0, p.inverse != 0);
+    if (i < p.n) {
+        let a = 3.14159265358979323846 * f32(bx_mulmod(u32(i), u32(i), twoN)) / f32(p.n);
+        chirpRe[i] = cos(a); chirpIm[i] = sgn * sin(a);
+    }
+    var t = -1;
+    if (i < p.n) { t = i; } else if (i > p.m - p.n) { t = p.m - i; }
+    if (t < 0) { filterRe[i] = 0.0; filterIm[i] = 0.0; return; }
+    let b = 3.14159265358979323846 * f32(bx_mulmod(u32(t), u32(t), twoN)) / f32(p.n);
+    filterRe[i] = cos(b); filterIm[i] = -sgn * sin(b);
+}");
+
+    public static readonly string FftBluesteinPre = Shader(new[] { "r:re", "r:im", "r:chirpRe", "r:chirpIm", "rw:padRe", "rw:padIm" }, "batch: i32, n: i32, m: i32", Main + @"
+    if (i >= p.batch * p.m) { return; }
+    let b = i / p.m; let k = i % p.m;
+    if (k >= p.n) { padRe[i] = 0.0; padIm[i] = 0.0; return; }
+    let xr = re[b * p.n + k]; let xi = im[b * p.n + k]; let cr = chirpRe[k]; let ci = chirpIm[k];
+    padRe[i] = xr * cr - xi * ci;
+    padIm[i] = xr * ci + xi * cr;
+}");
+
+    public static readonly string FftCmul = Shader(new[] { "rw:aRe", "rw:aIm", "r:bRe", "r:bIm" }, "batch: i32, m: i32", Main + @"
+    if (i >= p.batch * p.m) { return; }
+    let k = i % p.m;
+    let xr = aRe[i]; let xi = aIm[i]; let yr = bRe[k]; let yi = bIm[k];
+    aRe[i] = xr * yr - xi * yi;
+    aIm[i] = xr * yi + xi * yr;
+}");
+
+    public static readonly string FftBluesteinPost = Shader(new[] { "r:padRe", "r:padIm", "r:chirpRe", "r:chirpIm", "rw:re", "rw:im" },
+        "batch: i32, n: i32, m: i32, scale: f32", Main + @"
+    if (i >= p.batch * p.n) { return; }
+    let b = i / p.n; let k = i % p.n;
+    let xr = padRe[b * p.m + k]; let xi = padIm[b * p.m + k]; let cr = chirpRe[k]; let ci = chirpIm[k];
+    re[i] = (xr * cr - xi * ci) * p.scale;
+    im[i] = (xr * ci + xi * cr) * p.scale;
+}");
+
+    public static readonly string FftToStorage = Shader(new[] { "r:source", "rw:words:u32" }, "count: i32, mode: i32", Main + @"
+    if (i >= (p.count + 1) / 2) { return; }
+    let lo = bx_to_16(source[2 * i], p.mode);
+    var hi = 0u;
+    if (2 * i + 1 < p.count) { hi = bx_to_16(source[2 * i + 1], p.mode); }
+    words[i] = lo | (hi << 16u);
+}");
+
+    public static readonly string FftFromStorage = Shader(new[] { "r:words:u32", "rw:destination" }, "count: i32, mode: i32", Main + @"
+    if (i >= p.count) { return; }
+    let word = words[i / 2];
+    destination[i] = bx_from_16(select(word & 0xffffu, word >> 16u, (i & 1) != 0), p.mode);
+}");
+
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
@@ -360,6 +461,8 @@ var<workgroup> scratch: array<f32, 256>;
         ["bx_index_select"] = IndexSelect, ["bx_row_loss"] = RowLoss, ["bx_dropout_mask"] = DropoutMask,
         ["bx_gaussian_noise"] = GaussianNoise, ["bx_gumbel_softmax"] = GumbelSoftmax,
         ["bx_batch_outer_product"] = BatchOuterProduct, ["bx_meshgrid2d"] = Meshgrid2D,
+        ["bx_fft_chirp"] = FftChirp, ["bx_fft_bluestein_pre"] = FftBluesteinPre, ["bx_fft_cmul"] = FftCmul,
+        ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
     };
 }
 #endif

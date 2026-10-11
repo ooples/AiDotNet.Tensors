@@ -30,7 +30,9 @@ internal static class MetalBatchExecutionKernels
             .Replace("__syncthreads()", "threadgroup_barrier(mem_flags::mem_threadgroup)")
             .Replace("bx_gid()", "(int)bx_tid")
             .Replace("threadIdx.x", "(int)bx_lid")
-            .Replace("blockDim.x", "(int)bx_bdim");
+            .Replace("blockDim.x", "(int)bx_bdim")
+            .Replace("__float_as_uint(", "as_type<uint>(")
+            .Replace("__uint_as_float(", "as_type<float>(");
         body = Regex.Replace(body, @"(?<![\w*&])const float\* (\w+) =", "device const float* $1 =", RegexOptions.None, RegexTimeout);
         body = Regex.Replace(body, @"(?<!const )(?<![\w*&])float\* (\w+) =", "device float* $1 =", RegexOptions.None, RegexTimeout);
         body = Regex.Replace(body, @"\b(exp|log|sqrt|fmax|fmin|fabs|tanh|rsqrt|sin|cos)f\(", "$1(", RegexOptions.None, RegexTimeout);
@@ -46,6 +48,8 @@ internal static class MetalBatchExecutionKernels
             string p = Regex.Replace(parts[i].Trim(), @"\s+", " ", RegexOptions.None, RegexTimeout);
             string declaration =
                 p.StartsWith("const float* ", StringComparison.Ordinal) ? "device " + p
+                : p.StartsWith("const unsigned int* ", StringComparison.Ordinal) ? "device const uint* " + p.Substring("const unsigned int* ".Length)
+                : p.StartsWith("unsigned int* ", StringComparison.Ordinal) ? "device uint* " + p.Substring("unsigned int* ".Length)
                 : p.StartsWith("float* ", StringComparison.Ordinal) ? "device " + p
                 : p.StartsWith("unsigned long long ", StringComparison.Ordinal) ? "constant ulong& " + p.Substring("unsigned long long ".Length)
                 : p.StartsWith("int ", StringComparison.Ordinal) ? "constant int& " + p.Substring(4)

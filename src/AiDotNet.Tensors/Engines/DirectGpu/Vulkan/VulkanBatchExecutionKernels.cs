@@ -22,6 +22,43 @@ uint bx_hash(uint counter, uint key) {
 float bx_inf() { return uintBitsToFloat(0x7f800000u); }
 float bx_unit(uint h) { return float(h >> 8) * (1.0 / 16777216.0); }
 int bx_gid() { return int(gl_GlobalInvocationID.x); }
+uint bx_mulmod(uint a, uint b, uint m) {
+    uint r = 0u;
+    while (b != 0u) { if ((b & 1u) != 0u) { r += a; if (r >= m) r -= m; } a += a; if (a >= m) a -= m; b >>= 1; }
+    return r;
+}
+uint bx_to_16(float x, int mode) {
+    uint f = floatBitsToUint(x);
+    if (mode == 2) {
+        if ((f & 0x7fffffffu) > 0x7f800000u) return (f >> 16) | 0x40u;
+        return (f + 0x7fffu + ((f >> 16) & 1u)) >> 16;
+    }
+    uint sgn = (f >> 16) & 0x8000u; int e = int((f >> 23) & 0xffu); uint mant = f & 0x7fffffu;
+    if (e == 255) return sgn | 0x7c00u | (mant != 0u ? 0x200u : 0u);
+    int ex = e - 112;
+    if (ex >= 31) return sgn | 0x7c00u;
+    if (ex <= 0) {
+        if (ex < -10) return sgn;
+        mant |= 0x800000u; uint shift = uint(14 - ex);
+        uint h = mant >> shift; uint rem = mant & ((1u << shift) - 1u); uint hw = 1u << (shift - 1u);
+        if (rem > hw || (rem == hw && (h & 1u) != 0u)) h++;
+        return sgn | h;
+    }
+    uint h = sgn | (uint(ex) << 10) | (mant >> 13); uint rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h++;
+    return h;
+}
+float bx_from_16(uint h, int mode) {
+    if (mode == 2) return uintBitsToFloat(h << 16);
+    uint sgn = (h & 0x8000u) << 16; uint e = (h >> 10) & 0x1fu; uint mant = h & 0x3ffu;
+    if (e == 0u) {
+        if (mant == 0u) return uintBitsToFloat(sgn);
+        int ex = 1; while ((mant & 0x400u) == 0u) { mant <<= 1; ex--; }
+        return uintBitsToFloat(sgn | (uint(ex + 112) << 23) | ((mant & 0x3ffu) << 13));
+    }
+    if (e == 31u) return uintBitsToFloat(sgn | 0x7f800000u | (mant << 13));
+    return uintBitsToFloat(sgn | ((e + 112u) << 23) | (mant << 13));
+}
 ";
 
     /// <summary>Buffer specs are "r:name", "w:name" or "rw:name", bound to bindings 0..n-1 in order.</summary>
@@ -33,7 +70,8 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             string[] parts = buffers[i].Split(':');
             string access = parts[0] == "r" ? "readonly " : parts[0] == "w" ? "writeonly " : "";
             sb.Append("layout(set = 0, binding = ").Append(i).Append(") ").Append(access)
-              .Append("buffer Buf").Append(i).Append(" { float ").Append(parts[1]).Append("[]; };\n");
+              .Append("buffer Buf").Append(i).Append(" { ").Append(parts.Length > 2 ? parts[2] : "float").Append(" ")
+              .Append(parts[1]).Append("[]; };\n");
         }
         sb.Append("layout(push_constant) uniform Params { ").Append(push).Append(" };\n");
         sb.Append(Common).Append(body);
@@ -357,4 +395,63 @@ void main() {
     int cols = xy != 0 ? n0 : n1; int r = i / cols; int c = i % cols;
     output0[i] = source0[xy != 0 ? c : r];
     output1[i] = source1[xy != 0 ? r : c];
+}");
+
+    public static readonly string FftChirp = Shader(new[] { "w:chirpRe", "w:chirpIm", "w:filterRe", "w:filterIm" }, "int n; int m; int inverse;", @"
+void main() {
+    int k = bx_gid(); if (k >= m) return;
+    uint twoN = 2u * uint(n);
+    float sgn = inverse != 0 ? 1.0 : -1.0;
+    if (k < n) {
+        float a = 3.14159265358979323846 * float(bx_mulmod(uint(k), uint(k), twoN)) / float(n);
+        chirpRe[k] = cos(a); chirpIm[k] = sgn * sin(a);
+    }
+    int t = k < n ? k : (k > m - n ? m - k : -1);
+    if (t < 0) { filterRe[k] = 0.0; filterIm[k] = 0.0; return; }
+    float b = 3.14159265358979323846 * float(bx_mulmod(uint(t), uint(t), twoN)) / float(n);
+    filterRe[k] = cos(b); filterIm[k] = -sgn * sin(b);
+}");
+
+    public static readonly string FftBluesteinPre = Shader(new[] { "r:re", "r:im", "r:chirpRe", "r:chirpIm", "w:padRe", "w:padIm" }, "int batch; int n; int m;", @"
+void main() {
+    int i = bx_gid(); if (i >= batch * m) return;
+    int b = i / m; int k = i % m;
+    if (k >= n) { padRe[i] = 0.0; padIm[i] = 0.0; return; }
+    float xr = re[b * n + k]; float xi = im[b * n + k]; float cr = chirpRe[k]; float ci = chirpIm[k];
+    padRe[i] = xr * cr - xi * ci;
+    padIm[i] = xr * ci + xi * cr;
+}");
+
+    public static readonly string FftCmul = Shader(new[] { "rw:aRe", "rw:aIm", "r:bRe", "r:bIm" }, "int batch; int m;", @"
+void main() {
+    int i = bx_gid(); if (i >= batch * m) return;
+    int k = i % m;
+    float xr = aRe[i]; float xi = aIm[i]; float yr = bRe[k]; float yi = bIm[k];
+    aRe[i] = xr * yr - xi * yi;
+    aIm[i] = xr * yi + xi * yr;
+}");
+
+    public static readonly string FftBluesteinPost = Shader(new[] { "r:padRe", "r:padIm", "r:chirpRe", "r:chirpIm", "w:re", "w:im" },
+        "int batch; int n; int m; float scale;", @"
+void main() {
+    int i = bx_gid(); if (i >= batch * n) return;
+    int b = i / n; int k = i % n;
+    float xr = padRe[b * m + k]; float xi = padIm[b * m + k]; float cr = chirpRe[k]; float ci = chirpIm[k];
+    re[i] = (xr * cr - xi * ci) * scale;
+    im[i] = (xr * ci + xi * cr) * scale;
+}");
+
+    public static readonly string FftToStorage = Shader(new[] { "r:source", "w:words:uint" }, "int count; int mode;", @"
+void main() {
+    int w = bx_gid(); if (w >= (count + 1) / 2) return;
+    uint lo = bx_to_16(source[2 * w], mode);
+    uint hi = 2 * w + 1 < count ? bx_to_16(source[2 * w + 1], mode) : 0u;
+    words[w] = lo | (hi << 16);
+}");
+
+    public static readonly string FftFromStorage = Shader(new[] { "r:words:uint", "w:destination" }, "int count; int mode;", @"
+void main() {
+    int i = bx_gid(); if (i >= count) return;
+    uint word = words[i / 2];
+    destination[i] = bx_from_16((i & 1) != 0 ? word >> 16 : word & 0xffffu, mode);
 }");}

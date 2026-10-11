@@ -136,9 +136,3 @@ cast DirectGpuTensorEngine.WriteOutputToStableCapture CudaBackend #1154
 cast DirectGpuTensorEngine.ZeroLstmGradient CudaBackend #1154
 cast ExecutionStreamFactory.TryGetCudaStream CudaBackend #1154
 
-// Generic-precision arbitrary-length FFT, per-backend issues (#959 follow-ups).
-capability IGenericFftBackend HipBackend #961
-capability IGenericFftBackend OpenClBackend #962
-capability IGenericFftBackend MetalBackend #963
-capability IGenericFftBackend VulkanBackend #964
-capability IGenericFftBackend WebGpuBackend #965

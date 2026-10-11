@@ -13,9 +13,6 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class DirectGpuTensorEngine
 {
-    private const string GenericFftBackendRoadmap =
-        "HIP #961, OpenCL #962, Metal #963, Vulkan #964, and WebGPU #965";
-
     /// <inheritdoc/>
     public override bool SupportsFftElementType(FftElementType type)
     {
@@ -38,8 +35,7 @@ public partial class DirectGpuTensorEngine
         {
             string backendName = backend?.BackendName ?? "unavailable DirectGpu backend";
             throw new NotSupportedException(
-                $"{backendName} does not implement generic-precision arbitrary-length FFT. " +
-                $"Tracked backend work: {GenericFftBackendRoadmap}. No host fallback was performed.");
+                $"{backendName} does not implement generic-precision arbitrary-length FFT. No host fallback was performed.");
         }
 
         if (!fft.SupportsFftElementType(elementType))
@@ -228,7 +224,8 @@ public partial class DirectGpuTensorEngine
             }
             else
             {
-                int storageBytes = checked(complexCount * elementType.ByteSize());
+                // Whole 32-bit words: backends pack two 16-bit values per word.
+                int storageBytes = checked((complexCount * elementType.ByteSize() + 3) & ~3);
                 realStorage = cuda.AllocateByteBuffer(storageBytes);
                 imaginaryStorage = cuda.AllocateByteBuffer(storageBytes);
                 fft.ConvertFloatToFftStorage(realFloat, realStorage, complexCount, elementType);
