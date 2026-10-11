@@ -104,4 +104,31 @@ public class DepthwiseConvFloatPathTests
                 Assert.True(Math.Abs(sum - dw[o * inC + c]) <= 1e-4 * Math.Max(1.0, Math.Abs(sum)), $"dW[{o},{c}]: {dw[o * inC + c]} vs {sum}");
             }
     }
+
+    // #639: the pointwise input gradient at a tiny spatial size, dX[b, c, p] = sum over o of W[o, c] dY[b, o, p].
+    [Theory]
+    [InlineData(1, 960, 240, 1, 1)]
+    [InlineData(1, 112, 672, 2, 2)]
+    [InlineData(2, 70, 130, 4, 4)]    // two batch rows, channel counts not multiples of the 64-column block
+    [InlineData(1, 30, 50, 9, 9)]     // past the threshold: the im2col route
+    public void PointwiseInputGrad_MatchesDirectSum(int batch, int inC, int outC, int h, int w)
+    {
+        var rng = new Random(inC * 7 + outC);
+        var kernel = new float[outC * inC];
+        var dy = new float[batch * outC * h * w];
+        for (int i = 0; i < kernel.Length; i++) kernel[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < dy.Length; i++) dy[i] = (float)(rng.NextDouble() * 2 - 1);
+        var dx = new CpuEngine().Conv2DBackwardInput(new Tensor<float>(dy, new[] { batch, outC, h, w }),
+            new Tensor<float>(kernel, new[] { outC, inC, 1, 1 }), new[] { batch, inC, h, w }, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
+        int positions = h * w;
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < inC; c++)
+                for (int q = 0; q < positions; q++)
+                {
+                    double sum = 0;
+                    for (int o = 0; o < outC; o++) sum += (double)kernel[o * inC + c] * dy[(b * outC + o) * positions + q];
+                    float got = dx[(b * inC + c) * positions + q];
+                    Assert.True(Math.Abs(sum - got) <= 1e-4 * Math.Max(1.0, Math.Abs(sum)), $"dX[{b},{c},{q}]: {got} vs {sum}");
+                }
+    }
 }

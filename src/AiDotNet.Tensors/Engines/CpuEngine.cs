@@ -14914,6 +14914,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
 
+        if (typeof(T) == typeof(float) && kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+            && padH == 0 && padW == 0 && batch * height * width <= PointwiseDirectMaxPositions)
+        {
+            // #639: a pointwise conv's input gradient at a tiny spatial size, dX[b, c, p] = sum over o of W[o, c] dY[b, o, p],
+            // as one small GEMM per batch row instead of the im2col / col2im route.
+            var dYF = (float[])(object)gradOutput.GetFlattenedData();
+            var wF = (float[])(object)kernel.GetFlattenedData();
+            var dXF = new float[batch * inChannels * height * width];
+            PointwiseInputGradFloat(dYF, wF, dXF, batch, outChannels, inChannels, height * width);
+            return RentFloatResult<T>(inputShape, dXF);
+        }
+
         // im2col + GEMM fast path for float: kernel^T × gradOutput → col, then col2im
         if (typeof(T) == typeof(float))
         {
@@ -18084,6 +18096,42 @@ public partial class CpuEngine : ITensorLevelEngine
         });
     }
 
+    /// <summary>
+    /// dX_b^T[P, C] = dY_b^T[P, O] . W[O, C] per batch row (dY transposed once), written back as dX_b[C, P]; split over
+    /// 64-column blocks of the input channels, each an independent register-blocked GEMM, so the result does not
+    /// depend on the thread count.
+    /// </summary>
+    private static void PointwiseInputGradFloat(float[] dY, float[] w, float[] dX, int batch, int outChannels, int inChannels,
+        int positions)
+    {
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        var dYT = pool.Rent(positions * outChannels);
+        var dXT = pool.Rent(positions * inChannels);
+        try
+        {
+            for (int b = 0; b < batch; b++)
+            {
+                int yBase = b * outChannels * positions, xBase = b * inChannels * positions;
+                for (int o = 0; o < outChannels; o++)
+                    for (int q = 0; q < positions; q++) dYT[q * outChannels + o] = dY[yBase + o * positions + q];
+                const int colBlock = 64;
+                int blocks = (inChannels + colBlock - 1) / colBlock;
+                CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)positions * outChannels * inChannels, blk =>
+                {
+                    int c0 = blk * colBlock, n = Math.Min(colBlock, inChannels - c0);
+                    TileGemm(dYT, 0, outChannels, w, c0, inChannels, dXT, c0, inChannels, positions, n, outChannels, accumulate: false);
+                }, deterministicSafe: true);
+                for (int c = 0; c < inChannels; c++)
+                    for (int q = 0; q < positions; q++) dX[xBase + c * positions + q] = dXT[q * inChannels + c];
+            }
+        }
+        finally
+        {
+            pool.Return(dYT);
+            pool.Return(dXT);
+        }
+    }
+
     // Spatial positions (batch x height x width) up to which a pointwise conv's weight gradient skips im2col + GEMM.
     private const int PointwiseDirectMaxPositions = 64;
 
@@ -18105,17 +18153,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     int src = (b * inChannels + c) * positions;
                     for (int p = 0; p < positions; p++) xT[(b * positions + p) * inChannels + c] = x[src + p];
                 }
-            CpuParallelSettings.ParallelForOrSerial(0, outChannels, (long)outChannels * rows * inChannels, o =>
+            // dW[o0..o1, :] = sum over b of dY_b[o0..o1, P] . X_b^T[P, C]: a register-blocked small GEMM per batch row
+            // (thousands of channel-length axpys were call-bound at 8x8). Output-channel blocks are independent and
+            // each element's sum runs p- then b-ordered, so the result does not depend on the thread count.
+            const int rowBlock = 16;
+            int blocks = (outChannels + rowBlock - 1) / rowBlock;
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)outChannels * rows * inChannels, blk =>
             {
-                int dst = o * inChannels;
-                Array.Clear(dW, dst, inChannels);
+                int o0 = blk * rowBlock, m = Math.Min(rowBlock, outChannels - o0);
                 for (int b = 0; b < batch; b++)
-                    for (int p = 0; p < positions; p++)
-                    {
-                        float g = dY[(b * outChannels + o) * positions + p];
-                        if (g == 0f) continue;
-                        Axpy(g, xT, (b * positions + p) * inChannels, dW, dst, inChannels);
-                    }
+                    TileGemm(dY, (b * outChannels + o0) * positions, positions, xT, b * positions * inChannels, inChannels,
+                        dW, o0 * inChannels, inChannels, m, inChannels, positions, accumulate: b > 0);
             }, deterministicSafe: true);
         }
         finally
@@ -18140,6 +18188,15 @@ public partial class CpuEngine : ITensorLevelEngine
             int b = idx / outChannels, oc = idx % outChannels, ic = oc / multiplier;
             int xPlane = (b * inChannels + ic) * height * width, yPlane = idx * outH * outW, wBase = oc * kH * kW;
             int vw = System.Numerics.Vector<float>.Count;
+            // In-bounds output columns per kernel column (independent of the row): ow * strideW + kw - padW in [0, width).
+            // A negative reach (the tap is past the right edge for every column) must not truncate to column 0.
+            Span<int> owFrom = stackalloc int[kW], owTo = stackalloc int[kW];
+            for (int kw = 0; kw < kW; kw++)
+            {
+                int lastReach = width - 1 + padW - kw;
+                owFrom[kw] = Math.Max(0, (padW - kw + strideW - 1) / strideW);
+                owTo[kw] = lastReach < 0 ? 0 : Math.Min(outW, lastReach / strideW + 1);
+            }
             for (int oh = 0; oh < outH; oh++)
             {
                 int yRow = yPlane + oh * outW;
@@ -18152,13 +18209,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int kw = 0; kw < kW; kw++)
                     {
                         float wv = w[wBase + kh * kW + kw];
-                        // Output columns whose input column ow * strideW + kw - padW is in bounds.
-                        int lastReach = width - 1 + padW - kw;   // ow * strideW <= lastReach
-                        if (lastReach < 0) continue;              // (division would truncate a negative toward 0)
-                        int owStart = Math.Max(0, (padW - kw + strideW - 1) / strideW);
-                        int owEnd = Math.Min(outW, lastReach / strideW + 1);
+                        int owStart = owFrom[kw], owEnd = owTo[kw];
                         if (owStart >= owEnd) continue;
-                        if (strideW == 1)
+                        if (strideW == 1 && owEnd - owStart >= vw)
                         {
                             int src = xRow + owStart + kw - padW, dst = yRow + owStart, n = owEnd - owStart, i = 0;
                             var vwv = new System.Numerics.Vector<float>(wv);
@@ -18171,7 +18224,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                         else
                         {
-                            for (int ow = owStart; ow < owEnd; ow++) y[yRow + ow] += x[xRow + ow * strideW + kw - padW] * wv;
+                            int src = xRow + kw - padW;
+                            for (int ow = owStart; ow < owEnd; ow++) y[yRow + ow] += x[src + ow * strideW] * wv;
                         }
                     }
                 }
