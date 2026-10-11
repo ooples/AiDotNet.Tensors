@@ -2037,11 +2037,23 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_asyncAlloc)
             return AllocateBuffer(size);
         using var _ = PushContext();
-        if (TryRentAsyncBuffer(size) is { } reused)
-            return reused;
-        var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
-        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+        var buffer = TryRentAsyncBuffer(size)
+            ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
+                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+        if (PoisonUninitializedBuffers)
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(buffer.Handle, 0xFF, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async(poison)");
+        return buffer;
     }
+
+    /// <summary>
+    /// Debug switch (env <c>AIDOTNET_GPU_POISON_UNINITIALIZED=1</c>): fill every uninitialized buffer with 0xFF bytes,
+    /// a NaN in every float, so an op that allocates uninitialized but does not write every element surfaces as NaN in
+    /// GPU-vs-CPU tests instead of passing on whatever the reused memory happened to hold.
+    /// </summary>
+    internal static readonly bool PoisonUninitializedBuffers =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_POISON_UNINITIALIZED") == "1";
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
