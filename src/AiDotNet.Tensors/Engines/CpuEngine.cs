@@ -27450,39 +27450,10 @@ public partial class CpuEngine : ITensorLevelEngine
             float featureSizeF = fs;
             float invFeatureSizeF = 1f / featureSizeF;
 
-            // gradGamma / gradBeta: sum across batches. Left sequential to avoid
-            // cross-thread contention on the [featureSize] accumulators. For
-            // typical transformer LN (featureSize ≈ hidden dim ≈ 768–4096 and
-            // batchSize × seq ≈ 1k–4k), the sequential pass is memory-bound, not
-            // compute-bound, so threading doesn't help.
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
-                float m = fMean[b];
-                int f = 0;
-#if NET5_0_OR_GREATER
-                if (Vector256.IsHardwareAccelerated && fs >= 8)
-                {
-                    var vM = Vector256.Create(m);
-                    var vInvStd = Vector256.Create(invStd);
-                    for (; f + 8 <= fs; f += 8)
-                    {
-                        var go = Vector256.LoadUnsafe(ref fGradOut[off + f]);
-                        var norm = (Vector256.LoadUnsafe(ref fInput[off + f]) - vM) * vInvStd;
-                        (Vector256.LoadUnsafe(ref fGradGamma[f]) + go * norm).StoreUnsafe(ref fGradGamma[f]);
-                        (Vector256.LoadUnsafe(ref fGradBeta[f]) + go).StoreUnsafe(ref fGradBeta[f]);
-                    }
-                }
-#endif
-                for (; f < fs; f++)
-                {
-                    float go = fGradOut[off + f];
-                    float normalized = (fInput[off + f] - m) * invStd;
-                    fGradGamma[f] += go * normalized;
-                    fGradBeta[f] += go;
-                }
-            }
+            // gradGamma / gradBeta: sum across batches, split into feature-column ranges (each accumulated over the
+            // rows in order, so bit-identical to the whole-width loop at any thread count). One core cannot pull the
+            // memory bandwidth this pass needs; the serial loop left the rest of the machine idle.
+            LayerNormBackwardFloatAccumGammaBeta(fGradOut, fInput, fMean, fVar, fGradGamma, fGradBeta, batchSize, fs, fEps);
 
             // gradInput: per-batch two-pass (sum reductions, then per-element).
             // Safe to parallelize over batches since each batch writes to a
@@ -27801,10 +27772,98 @@ public partial class CpuEngine : ITensorLevelEngine
     /// structure at CpuEngine.cs:19580.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void LayerNormBackwardDoubleAccumGammaBeta(
+    // Feature-column ranges for a per-feature accumulation over rows: about four per thread, each at least
+    // ReductionMinParallelBlock columns (narrower ranges read a few bytes per row and page) and a multiple of 64, so
+    // every column's SIMD/scalar split -- and therefore its arithmetic -- matches the whole-width loop. Each column is
+    // still accumulated over the rows in order: the result is bit-identical at any thread count.
+    private static int NormColumnChunks(int rows, int cols, out int perChunk)
+    {
+        int chunks = (int)Math.Min(WorkChunks(cols, (long)rows * cols), cols / ReductionMinParallelBlock);
+        if (chunks <= 1) { perChunk = cols; return 1; }
+        perChunk = ((cols + chunks - 1) / chunks + 63) & ~63;
+        return (cols + perChunk - 1) / perChunk;
+    }
+
+    private static void LayerNormBackwardFloatAccumGammaBeta(
+        float[] gradOut, float[] input, float[] mean, float[] variance,
+        float[] gradGamma, float[] gradBeta,
+        int batchSize, int fs, float eps)
+    {
+        int chunks = NormColumnChunks(batchSize, fs, out int perChunk);
+        if (chunks <= 1)
+        {
+            LayerNormBackwardFloatAccumGammaBetaRange(gradOut, input, mean, variance, gradGamma, gradBeta, batchSize, fs, eps, 0, fs);
+            return;
+        }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)batchSize * fs, chunk =>
+        {
+            int f0 = chunk * perChunk;
+            LayerNormBackwardFloatAccumGammaBetaRange(gradOut, input, mean, variance, gradGamma, gradBeta,
+                batchSize, fs, eps, f0, Math.Min(fs, f0 + perChunk));
+        }, deterministicSafe: true);
+    }
+
+    [MethodImpl(Hot)]
+    private static void LayerNormBackwardFloatAccumGammaBetaRange(
+        float[] gradOut, float[] input, float[] mean, float[] variance,
+        float[] gradGamma, float[] gradBeta,
+        int batchSize, int fs, float eps, int f0, int f1)
+    {
+        for (int b = 0; b < batchSize; b++)
+        {
+            int off = b * fs;
+            float invStd = 1f / MathF.Sqrt(variance[b] + eps);
+            float m = mean[b];
+            int f = f0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= 8)
+            {
+                var vM = Vector256.Create(m);
+                var vInvStd = Vector256.Create(invStd);
+                for (; f + 8 <= f1; f += 8)
+                {
+                    var go = Vector256.LoadUnsafe(ref gradOut[off + f]);
+                    var norm = (Vector256.LoadUnsafe(ref input[off + f]) - vM) * vInvStd;
+                    (Vector256.LoadUnsafe(ref gradGamma[f]) + go * norm).StoreUnsafe(ref gradGamma[f]);
+                    (Vector256.LoadUnsafe(ref gradBeta[f]) + go).StoreUnsafe(ref gradBeta[f]);
+                }
+            }
+#endif
+            for (; f < f1; f++)
+            {
+                float go = gradOut[off + f];
+                float normalized = (input[off + f] - m) * invStd;
+                gradGamma[f] += go * normalized;
+                gradBeta[f] += go;
+            }
+        }
+    }
+
+    private static void LayerNormBackwardDoubleAccumGammaBeta(
         double[] gradOut, double[] input, double[] mean, double[] variance,
         double[] gradGamma, double[] gradBeta,
         int batchSize, int fs, double epsilon)
+    {
+        int chunks = NormColumnChunks(batchSize, fs, out int perChunk);
+        if (chunks <= 1)
+        {
+            LayerNormBackwardDoubleAccumGammaBetaRange(gradOut, input, mean, variance, gradGamma, gradBeta, batchSize, fs, epsilon, 0, fs);
+            return;
+        }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)batchSize * fs, chunk =>
+        {
+            int f0 = chunk * perChunk;
+            LayerNormBackwardDoubleAccumGammaBetaRange(gradOut, input, mean, variance, gradGamma, gradBeta,
+                batchSize, fs, epsilon, f0, Math.Min(fs, f0 + perChunk));
+        }, deterministicSafe: true);
+    }
+
+    // Columns [f0, f1) of the gamma/beta accumulation. f0 is a multiple of 64 (see NormColumnChunks), so the 16-wide
+    // FMA blocks cover the same columns as the whole-width loop and the scalar tail stays at its end.
+    private static unsafe void LayerNormBackwardDoubleAccumGammaBetaRange(
+        double[] gradOut, double[] input, double[] mean, double[] variance,
+        double[] gradGamma, double[] gradBeta,
+        int batchSize, int fs, double epsilon, int f0, int f1)
     {
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
@@ -27820,8 +27879,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     var vmean = System.Runtime.Intrinsics.Vector256.Create(m);
                     double* go = pGO + off;
                     double* ip = pI + off;
-                    int f = 0;
-                    int simdLen = fs & ~15;
+                    int f = f0;
+                    int simdLen = f0 + ((f1 - f0) & ~15);
                     for (; f < simdLen; f += 16)
                     {
                         // normalized = (x − m) · invStd, 4×Vector256 unrolled.
@@ -27867,7 +27926,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         System.Runtime.Intrinsics.X86.Avx.Store(pGB + f + 12,
                             System.Runtime.Intrinsics.X86.Avx.Add(g3, System.Runtime.Intrinsics.X86.Avx.LoadVector256(pGB + f + 12)));
                     }
-                    for (; f < fs; f++)
+                    for (; f < f1; f++)
                     {
                         double goS = go[f];
                         double normalized = (ip[f] - m) * invStd;
@@ -27884,7 +27943,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int off = b * fs;
             double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
             double m = mean[b];
-            for (int f = 0; f < fs; f++)
+            for (int f = f0; f < f1; f++)
             {
                 double go = gradOut[off + f];
                 double normalized = (input[off + f] - m) * invStd;
@@ -28285,13 +28344,12 @@ public partial class CpuEngine : ITensorLevelEngine
             float groupSizeF = groupSize;
             float invGroupSizeF = 1f / groupSizeF;
 
-            // gradGamma / gradBeta: sum across (batch, spatial). Sequential
-            // across batches to avoid per-channel accumulator contention, but
-            // spatial inner loop runs on direct floats. We pre-compute invStd
-            // once per (b, g) to avoid recomputing inside the spatial loop.
-            for (int b = 0; b < batch; b++)
+            // gradGamma / gradBeta: sum across (batch, spatial). One group's channels per work item, each channel
+            // accumulated over the batches in order -- the serial summation order, so bit-identical at any thread
+            // count. invStd is computed once per (b, g).
+            void GammaBetaGroup(int g)
             {
-                for (int g = 0; g < numGroups; g++)
+                for (int b = 0; b < batch; b++)
                 {
                     float groupMean = fMean[b * numGroups + g];
                     float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
@@ -28333,13 +28391,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             }
+            CpuParallelSettings.ParallelForOrSerial(0, numGroups, (long)batch * channels * spatialSize, GammaBetaGroup,
+                deterministicSafe: true);
 
-            // gradInput: parallel over batch. Each batch writes a disjoint
-            // [b*channels*spatialSize, (b+1)*channels*spatialSize) slice.
+            // gradInput: parallel over (batch, group). Each writes a disjoint slice of gradInput; at batch 1 (diffusion)
+            // a per-batch split ran on one core.
             [MethodImpl(Hot)]
-            void ProcessBatch(int b)
+            void ProcessGroup(int bg)
             {
-                for (int g = 0; g < numGroups; g++)
+                int b = bg / numGroups, g = bg % numGroups;
                 {
                     float groupMean = fMean[b * numGroups + g];
                     float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
@@ -28421,9 +28481,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            // Batch typically small (1–16) for diffusion training, but each
-            // batch's work is large (channels × spatialSize). Always parallel.
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatch);
+            CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, (long)batch * channels * spatialSize, ProcessGroup,
+                deterministicSafe: true);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -28438,9 +28497,10 @@ public partial class CpuEngine : ITensorLevelEngine
             double groupSizeD = groupSize;
             double invGroupSizeD = 1.0 / groupSizeD;
 
-            for (int b = 0; b < batch; b++)
+            // Per group, each channel accumulated over the batches in order (bit-identical to the serial loop).
+            void GammaBetaGroupD(int g)
             {
-                for (int g = 0; g < numGroups; g++)
+                for (int b = 0; b < batch; b++)
                 {
                     double groupMean = dMean[b * numGroups + g];
                     double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
@@ -28463,11 +28523,13 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             }
+            CpuParallelSettings.ParallelForOrSerial(0, numGroups, (long)batch * channels * spatialSize, GammaBetaGroupD,
+                deterministicSafe: true);
 
             [MethodImpl(Hot)]
-            void ProcessBatchD(int b)
+            void ProcessGroupD(int bg)
             {
-                for (int g = 0; g < numGroups; g++)
+                int b = bg / numGroups, g = bg % numGroups;
                 {
                     double groupMean = dMean[b * numGroups + g];
                     double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
@@ -28507,7 +28569,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatchD);
+            CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, (long)batch * channels * spatialSize, ProcessGroupD,
+                deterministicSafe: true);
         }
         else
         {
