@@ -49,7 +49,6 @@ internal static class DirectPtxSoftmaxCoverageManifest
     // source as an implemented IDirectGpuBackend operation.
     private const int HipSoftmaxVariantParityIssue = 914;
     private const int MetalSoftmaxVariantParityIssue = 915;
-    private const int OpenClSoftmaxVariantParityIssue = 916;
     private const int WebGpuSoftmaxVariantParityIssue = 917;
 
     internal static IReadOnlyList<DirectPtxSoftmaxCoverageCell> All { get; } =
@@ -107,7 +106,7 @@ internal static class DirectPtxSoftmaxCoverageManifest
     [
         Tracked("HIP", HipSoftmaxVariantParityIssue),
         Tracked("Metal", MetalSoftmaxVariantParityIssue),
-        Tracked("OpenCL", OpenClSoftmaxVariantParityIssue),
+        Native("OpenCL", $"OpenClBackend.{method}"),
         Native("Vulkan", $"VulkanBackend.{method}"),
         Tracked("WebGPU", WebGpuSoftmaxVariantParityIssue)
     ];

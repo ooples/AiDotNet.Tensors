@@ -133,7 +133,6 @@ public class DirectPtxSoftmaxTests
         {
             ["HIP"] = 914,
             ["Metal"] = 915,
-            ["OpenCL"] = 916,
             ["WebGPU"] = 917
         };
         Assert.All(variantApis, api =>
@@ -142,6 +141,9 @@ public class DirectPtxSoftmaxTests
             DirectPtxPeerBackendCoverage vulkan = Assert.Single(cell.PeerBackends,
                 peer => peer.Backend == "Vulkan");
             Assert.False(string.IsNullOrWhiteSpace(vulkan.NativeImplementation));
+            DirectPtxPeerBackendCoverage openCl = Assert.Single(cell.PeerBackends,
+                peer => peer.Backend == "OpenCL");
+            Assert.False(string.IsNullOrWhiteSpace(openCl.NativeImplementation));
             Assert.All(expectedIssues, expected =>
             {
                 DirectPtxPeerBackendCoverage peer = Assert.Single(cell.PeerBackends,
