@@ -178,7 +178,7 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
             const int Samples = 7;
             var gpuTimes = new double[Samples];
             var cpuTimes = new double[Samples];
-            Tensor<Half> cH = null!;
+            Matrix<Half> cH = null!;
             for (int s = 0; s < Samples; s++)
             {
                 var gpuSw = System.Diagnostics.Stopwatch.StartNew();
