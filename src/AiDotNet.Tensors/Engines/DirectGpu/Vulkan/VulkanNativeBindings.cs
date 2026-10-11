@@ -920,6 +920,9 @@ public static unsafe class VulkanNativeBindings
 
     public static void vkCmdDispatch(IntPtr commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ)
     {
+        // Every Vulkan compute dispatch passes here: count it as device work, as the CUDA launch and OpenCL enqueue
+        // choke points do, so residency probes see Vulkan kernels.
+        GpuLaunchProbe.OnLaunch();
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             vkCmdDispatch_Windows(commandBuffer, groupCountX, groupCountY, groupCountZ);
         else
