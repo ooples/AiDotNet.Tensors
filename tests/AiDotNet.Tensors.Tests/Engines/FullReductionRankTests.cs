@@ -77,11 +77,24 @@ public class FullReductionRankTests
         Assert.Equal(expected, r.Shape.ToArray());
     }
 
+    // ReduceMaxWithTensorIndices returns a second (index) tensor, which graph capture rejects by design, so the compiled
+    // cases leave it out rather than carrying a case that asserts nothing.
+    public static TheoryData<Reduction, int> CompiledCases()
+    {
+        var data = new TheoryData<Reduction, int>();
+        foreach (Reduction op in Enum.GetValues(typeof(Reduction)))
+        {
+            if (op == Reduction.MaxWithIndices) continue;
+            foreach (int rank in new[] { 1, 2, 3 })
+                data.Add(op, rank);
+        }
+        return data;
+    }
+
     [Theory]
-    [MemberData(nameof(Cases))]
+    [MemberData(nameof(CompiledCases))]
     public void AllAxes_NoKeepDims_CompiledMatchesEagerRank(Reduction op, int rank)
     {
-        if (op == Reduction.MaxWithIndices) return; // heterogeneous output: not graph-capturable by design
         var x = Input(rank);
         var allAxes = new int[rank];
         for (int i = 0; i < rank; i++) allAxes[i] = i;
