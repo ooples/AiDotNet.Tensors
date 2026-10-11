@@ -21175,7 +21175,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     // not the adjoint of the forward it serves.
                     double srcH = ((gy + 1) * height - 1) / 2.0;
                     double srcW = ((gx + 1) * width - 1) / 2.0;
-                    if (srcH <= -1 || srcH >= height || srcW <= -1 || srcW >= width) continue;
+                    // Written so a NaN coordinate fails it too (#1134): such a point sampled nothing forward.
+                    if (!(srcH > -1 && srcH < height && srcW > -1 && srcW < width)) continue;
 
                     int h0 = (int)Math.Floor(srcH), h1 = h0 + 1;
                     int w0 = (int)Math.Floor(srcW), w1 = w0 + 1;
@@ -21255,6 +21256,13 @@ public partial class CpuEngine : ITensorLevelEngine
                     // Convert to pixel coordinates — align_corners=false, matching the forward.
                     double srcH = ((gy + 1) * height - 1) / 2.0;
                     double srcW = ((gx + 1) * width - 1) / 2.0;
+                    if (!GridPointSamples(srcH) || !GridPointSamples(srcW))
+                    {
+                        // A point that sampled nothing forward (#1134) has no grid gradient.
+                        gradGridData[gridBaseIdx] = numOps.Zero;
+                        gradGridData[gridBaseIdx + 1] = numOps.Zero;
+                        continue;
+                    }
 
                     // Compute d(output)/d(gx) and d(output)/d(gy) by summing over all channels
                     T gradGx = numOps.Zero;
@@ -35378,6 +35386,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
                     double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
                     double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    if (!GridPointSamples(srcX) || !GridPointSamples(srcY))   // #1134: samples nothing
+                    {
+                        for (int c = 0; c < lCh; c++) outp[(b * lCh + c) * lOutH * lOutW + h * lOutW + w] = 0;
+                        continue;
+                    }
                     int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
                     int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     double wx1 = srcX - x0, wx0 = 1.0 - wx1, wy1 = srcY - y0, wy0 = 1.0 - wy1;
@@ -35414,6 +35427,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
                     double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
                     double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    if (!GridPointSamples(srcX) || !GridPointSamples(srcY))   // #1134: samples nothing
+                    {
+                        for (int c = 0; c < lCh; c++) outp[(b * lCh + c) * lOutH * lOutW + h * lOutW + w] = 0;
+                        continue;
+                    }
                     int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
                     int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     float fwx1 = (float)(srcX - x0), fwx0 = 1f - fwx1, fwy1 = (float)(srcY - y0), fwy0 = 1f - fwy1;
@@ -35445,6 +35463,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
                     double srcX = (numOps.ToDouble(gridData[gBase]) + 1.0) * widthScaleD - 0.5;
                     double srcY = (numOps.ToDouble(gridData[gBase + 1]) + 1.0) * heightScaleD - 0.5;
+                    if (!GridPointSamples(srcX) || !GridPointSamples(srcY))   // #1134: samples nothing
+                    {
+                        for (int c = 0; c < lCh; c++) outData[(b * lCh + c) * lOutH * lOutW + h * lOutW + w] = numOps.Zero;
+                        continue;
+                    }
                     int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
                     int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     T twx1 = numOps.FromDouble(srcX - x0), twx0 = numOps.Subtract(numOps.One, twx1);

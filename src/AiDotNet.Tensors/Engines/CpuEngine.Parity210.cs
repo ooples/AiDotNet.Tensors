@@ -2749,46 +2749,91 @@ public partial class CpuEngine
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
 
-        // Float32 inner-most-axis fast path: route through SortKernels' SIMD
-        // bitonic (short axes) or Array.Sort pair-sort (longer axes) without
-        // boxing into a (T,int) struct array.
-        if (typeof(T) == typeof(float) && innerSize == 1 && !descending)
-        {
-            float[] srcFloatArr = (float[])(object)input.GetDataArray();
-            float[] valFloatArr = (float[])(object)valuesOut.GetDataArray();
-            int[] idxArr = indicesOut.GetDataArray();
-            for (int outer = 0; outer < outerSize; outer++)
-            {
-                int baseIdx = outer * axisSize;
-                var vSlice = valFloatArr.AsSpan(baseIdx, axisSize);
-                var iSlice = idxArr.AsSpan(baseIdx, axisSize);
-                srcFloatArr.AsSpan(baseIdx, axisSize).CopyTo(vSlice);
-                for (int a = 0; a < axisSize; a++) iSlice[a] = a;
-                Simd.SortKernels.SortFloatWithIndicesAscending(vSlice, iSlice);
-            }
-            return (valuesOut, indicesOut);
-        }
-
-        var buffer = new (T value, int index)[axisSize];
+        // PyTorch's order (#1131): NaN after +inf ascending and first descending, -0 equal to +0, equal values in
+        // their original order (stable). The CUDA sort uses the same total order, so values and indices agree.
+        var order = new int[axisSize];
+        var keys = typeof(T) == typeof(float) || typeof(T) == typeof(double) ? new ulong[axisSize] : null;
+        var column = keys is null ? new T[axisSize] : null;
         for (int outer = 0; outer < outerSize; outer++)
             for (int inner = 0; inner < innerSize; inner++)
             {
                 int baseIdx = outer * axisSize * innerSize + inner;
-                for (int a = 0; a < axisSize; a++)
-                    buffer[a] = (src[baseIdx + a * innerSize], a);
-
-                Array.Sort(buffer, descending
-                    ? (x, y) => numOps.Compare(y.value, x.value)
-                    : (Comparison<(T value, int index)>)((x, y) => numOps.Compare(x.value, y.value)));
-
+                for (int a = 0; a < axisSize; a++) order[a] = a;
+                if (keys is not null)
+                {
+                    for (int a = 0; a < axisSize; a++) keys[a] = TorchSortKey(src[baseIdx + a * innerSize], descending);
+                    SortStableByKey(keys, order);
+                }
+                else
+                {
+                    for (int a = 0; a < axisSize; a++) column![a] = src[baseIdx + a * innerSize];
+                    var values = column!;
+                    Array.Sort(order, (x, y) => TorchSortCompare(numOps, values[x], values[y], x, y, descending));
+                }
                 for (int a = 0; a < axisSize; a++)
                 {
                     int pos = baseIdx + a * innerSize;
-                    valDst[pos] = buffer[a].value;
-                    idxDst[pos] = buffer[a].index;
+                    valDst[pos] = src[baseIdx + order[a] * innerSize];
+                    idxDst[pos] = order[a];
                 }
             }
         return (valuesOut, indicesOut);
+    }
+
+    /// <summary>
+    /// An unsigned key whose integer order is PyTorch's sort order for a float or double value: -0 is folded onto +0
+    /// and every NaN onto one quiet NaN above +inf; descending complements the key, so NaN comes first. Ties are broken
+    /// by original index in <see cref="SortStableByKey"/>.
+    /// </summary>
+    private static ulong TorchSortKey<T>(T value, bool descending)
+    {
+        ulong key;
+        if (typeof(T) == typeof(float))
+        {
+            float f = (float)(object)value!;
+            uint bits = float.IsNaN(f) ? 0x7FC00000u : f == 0f ? 0u : SingleToUInt32Bits(f);
+            key = (bits & 0x80000000u) != 0 ? ~bits : bits | 0x80000000u;   // sign-magnitude -> unsigned order
+        }
+        else
+        {
+            double d = (double)(object)value!;
+            ulong bits = double.IsNaN(d) ? 0x7FF8000000000000ul : d == 0.0 ? 0ul : (ulong)BitConverter.DoubleToInt64Bits(d);
+            key = (bits & 0x8000000000000000ul) != 0 ? ~bits : bits | 0x8000000000000000ul;
+        }
+        return descending ? ~key : key;
+    }
+
+    private static uint SingleToUInt32Bits(float value)
+    {
+#if NET5_0_OR_GREATER
+        return BitConverter.SingleToUInt32Bits(value);
+#else
+        return unchecked((uint)BitConverter.ToInt32(BitConverter.GetBytes(value), 0));
+#endif
+    }
+
+    // Sorts `order` (initially 0..n-1) by `keys`, keeping equal keys in increasing index order: Array.Sort on the
+    // primitive keys, then each run of equal keys (Array.Sort is not stable) re-sorted by index.
+    private static void SortStableByKey(ulong[] keys, int[] order)
+    {
+        Array.Sort(keys, order);
+        for (int start = 0; start < keys.Length;)
+        {
+            int end = start + 1;
+            while (end < keys.Length && keys[end] == keys[start]) end++;
+            if (end - start > 1) Array.Sort(order, start, end - start);
+            start = end;
+        }
+    }
+
+    // PyTorch's order for other element types: NaN (where the type has one) above every value, then the type's own
+    // comparison, then the original index.
+    private static int TorchSortCompare<T>(INumericOperations<T> ops, T x, T y, int ix, int iy, bool descending)
+    {
+        bool xNaN = ops.IsNaN(x), yNaN = ops.IsNaN(y);
+        int c = xNaN || yNaN ? xNaN.CompareTo(yNaN) : ops.Compare(x, y);
+        if (descending) c = -c;
+        return c != 0 ? c : ix.CompareTo(iy);
     }
 
     /// <inheritdoc/>
