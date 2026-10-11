@@ -10,3 +10,4 @@ TENS0002 | BackendParity | Error | BackendParityAnalyzer
 TENS0003 | BackendParity | Error | BackendParityAnalyzer
 TENS0004 | BackendParity | Error | BackendParityAnalyzer
 TENS0005 | BackendParity | Error | BackendParityAnalyzer
+TENS0006 | BackendParity | Error | BackendParityAnalyzer

@@ -27,12 +27,15 @@ namespace AiDotNet.Tensors.Analyzers;
 /// <c>NotSupportedException</c> or <c>NotImplementedException</c>, which compiles but is not an implementation.</item>
 /// <item><b>TENS0003</b> a baseline entry no longer matches a gap, so the baseline can only shrink.</item>
 /// <item><b>TENS0004</b> a baseline line is malformed or does not name a tracking issue.</item>
+/// <item><b>TENS0006</b> a backend implements an interface member by reading device memory back to the
+/// host (a direct <c>Download*</c> call), which hides a host round-trip behind a GPU capability.</item>
 /// <item><b>TENS0005</b> a <c>[BackendSpecificRoute]</c> exemption has no reason, or names a
 /// cross-backend operation that is not present on all six backends.</item>
 /// </list>
 /// <para>
 /// Existing gaps live in <c>BackendParityBaseline.txt</c> (an AdditionalFiles item), one per line:
-/// <c>capability &lt;Interface&gt; &lt;Backend&gt; #issue</c> or <c>stub &lt;Backend&gt;.&lt;Member&gt; #issue</c>.
+/// <c>capability &lt;Interface&gt; &lt;Backend&gt; #issue</c>, <c>stub &lt;Backend&gt;.&lt;Member&gt; #issue</c> or
+/// <c>host &lt;Backend&gt;.&lt;Member&gt; #issue</c>.
 /// </para>
 /// </remarks>
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
@@ -68,7 +71,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
 
     internal static readonly DiagnosticDescriptor MalformedBaselineEntry = new(
         "TENS0004", "Backend parity baseline entry is malformed",
-        "Baseline line '{0}' must be 'capability <Interface> <Backend> #issue' or 'stub <Backend>.<Member> #issue'",
+        "Baseline line '{0}' must be 'capability <Interface> <Backend> #issue', 'stub <Backend>.<Member> #issue' or 'host <Backend>.<Member> #issue'",
         Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
 
     internal static readonly DiagnosticDescriptor InvalidRouteExemption = new(
@@ -76,8 +79,14 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         "'{0}' is marked [BackendSpecificRoute] but {1}",
         Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
 
+    internal static readonly DiagnosticDescriptor HostRoundTrip = new(
+        "TENS0006", "Backend member reads device memory back to the host",
+        "'{0}.{1}' implements '{2}' by calling '{3}', a host round-trip; compute it on the device",
+        Category, DiagnosticSeverity.Error, isEnabledByDefault: true);
+
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get; } = ImmutableArray.Create(
-        CapabilityNotOnAllBackends, StubImplementation, StaleBaselineEntry, MalformedBaselineEntry, InvalidRouteExemption);
+        CapabilityNotOnAllBackends, StubImplementation, StaleBaselineEntry, MalformedBaselineEntry, InvalidRouteExemption,
+        HostRoundTrip);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -103,8 +112,10 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         if (backends.Count < 2) return;
 
         var stubs = new ConcurrentBag<StubCandidate>();
+        var hostReads = new ConcurrentBag<StubCandidate>();
         context.RegisterSymbolAction(c => CollectStub(c, backends, stubs), SymbolKind.Method);
-        context.RegisterCompilationEndAction(c => Finish(c, backends, stubs));
+        context.RegisterSyntaxNodeAction(c => CollectHostRead(c, backends, hostReads), SyntaxKind.InvocationExpression);
+        context.RegisterCompilationEndAction(c => Finish(c, backends, stubs, hostReads));
     }
 
     private static void CollectStub(SymbolAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs)
@@ -126,6 +137,43 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
                 thrown, declaration.GetLocation()));
         }
     }
+
+    private static void CollectHostRead(SyntaxNodeAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> hostReads)
+    {
+        var invocation = (InvocationExpressionSyntax)context.Node;
+        string calledName = invocation.Expression switch
+        {
+            MemberAccessExpressionSyntax member => member.Name.Identifier.ValueText,
+            IdentifierNameSyntax identifier => identifier.Identifier.ValueText,
+            _ => ""
+        };
+        if (!calledName.StartsWith("Download", StringComparison.Ordinal)) return;
+
+        // A host read inside a lambda or local function still belongs to the member that declares it.
+        var containing = context.ContainingSymbol;
+        while (containing is IMethodSymbol { MethodKind: MethodKind.AnonymousFunction or MethodKind.LocalFunction } inner)
+            containing = inner.ContainingSymbol;
+        if (containing is not IMethodSymbol method) return;
+        var owner = method.ContainingType;
+        if (owner is null || !backends.Any(b => SymbolEqualityComparer.Default.Equals(b, owner))) return;
+
+        var implemented = ImplementedInterfaceMember(owner, method);
+        if (implemented is null || IsTransferMember(implemented.Name)) return;
+        // A member whose contract returns a host value (a float loss, a norm) must read it back; only
+        // results meant to stay resident (void writes into buffers, or a returned buffer) are policed.
+        if (implemented is IMethodSymbol contract && !contract.ReturnsVoid
+            && !contract.ReturnType.AllInterfaces.Any(i => i.Name == "IGpuBuffer") && contract.ReturnType.Name != "IGpuBuffer")
+            return;
+
+        hostReads.Add(new StubCandidate(owner.Name, implemented.Name, implemented.ContainingType.Name + "." + implemented.Name,
+            calledName, invocation.GetLocation()));
+    }
+
+    /// <summary>The transfer API itself may move data to the host; that is its job.</summary>
+    private static bool IsTransferMember(string name) =>
+        name.StartsWith("Download", StringComparison.Ordinal) || name.StartsWith("Upload", StringComparison.Ordinal)
+        || name.StartsWith("Read", StringComparison.Ordinal) || name.StartsWith("Copy", StringComparison.Ordinal)
+        || name.StartsWith("Synchronize", StringComparison.Ordinal);
 
     private static string? OnlyThrownType(BaseMethodDeclarationSyntax declaration)
     {
@@ -157,7 +205,8 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         return null;
     }
 
-    private static void Finish(CompilationAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs)
+    private static void Finish(CompilationAnalysisContext context, List<INamedTypeSymbol> backends, ConcurrentBag<StubCandidate> stubs,
+        ConcurrentBag<StubCandidate> hostReads)
     {
         var baseline = Baseline.Load(context);
         var assembly = context.Compilation.Assembly;
@@ -193,6 +242,16 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
             if (baseline.Consume("stub " + stub.Backend + "." + stub.Member)) continue;
             context.ReportDiagnostic(Diagnostic.Create(StubImplementation, stub.Location,
                 stub.Backend, stub.Member, stub.Implements, stub.Thrown));
+        }
+
+        var reportedHost = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var read in hostReads.OrderBy(s => s.Backend, StringComparer.Ordinal).ThenBy(s => s.Member, StringComparer.Ordinal))
+        {
+            string key = "host " + read.Backend + "." + read.Member;
+            if (!reportedHost.Add(key + "|" + read.Location.SourceSpan.Start + read.Location.SourceTree?.FilePath)) continue;
+            if (baseline.Consume(key)) continue;
+            context.ReportDiagnostic(Diagnostic.Create(HostRoundTrip, read.Location,
+                read.Backend, read.Member, read.Implements, read.Thrown));
         }
 
         baseline.ReportProblems(context, new HashSet<string>(backends.Select(b => b.Name), StringComparer.Ordinal));
@@ -287,7 +346,8 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
             var parts = content.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
             bool valid = parts.Length >= 3 && parts[parts.Length - 1].Length > 1 && parts[parts.Length - 1][0] == '#'
                 && parts[parts.Length - 1].Skip(1).All(char.IsDigit)
-                && ((parts[0] == "capability" && parts.Length == 4) || (parts[0] == "stub" && parts.Length == 3 && parts[1].Contains('.')));
+                && ((parts[0] == "capability" && parts.Length == 4)
+                    || ((parts[0] == "stub" || parts[0] == "host") && parts.Length == 3 && parts[1].Contains('.')));
             if (!valid)
             {
                 _problems.Add(Diagnostic.Create(MalformedBaselineEntry, location, content));
