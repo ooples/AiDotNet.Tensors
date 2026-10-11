@@ -1000,7 +1000,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Plain float-encoded buffers only (not split-complex planes or raw int32).
     /// </summary>
     internal Engines.DirectGpu.IGpuBuffer? VectorDeviceBuffer
-        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 ? buffer : null;
+        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64 ? buffer : null;
 
     internal Engines.DirectGpu.IDirectGpuBackend? VectorDeviceBackend => _data?._deviceState?.Backend;
 
@@ -1024,6 +1024,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     private int _viewGpuBufferVersion = -1;
     private bool _viewGpuBufferIsSplitComplex;
     private bool _viewGpuBufferContainsRawInt32;
+    private bool _viewGpuBufferContainsRawInt64;
 
     /// <summary>
     /// True when this tensor covers its whole data vector in the vector's own layout (contiguous, offset 0, same
@@ -1060,6 +1061,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             if (CoversWholeVector) _data.DeviceState.ContainsRawInt32 = value;
             else _viewGpuBufferContainsRawInt32 = value;
+        }
+    }
+
+    /// <summary>The device buffer holds raw int64 words (two per element), not floats (#1135).</summary>
+    internal bool _gpuBufferContainsRawInt64
+    {
+        get => CoversWholeVector ? _data._deviceState?.ContainsRawInt64 ?? false : _viewGpuBufferContainsRawInt64;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.ContainsRawInt64 = value;
+            else _viewGpuBufferContainsRawInt64 = value;
         }
     }
 
@@ -1457,6 +1469,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // ordinary float-format one, and a marker that outlived its buffer would route those floats
         // to that consumer as though their bit patterns were indices.
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
     }
 
     /// <summary>
