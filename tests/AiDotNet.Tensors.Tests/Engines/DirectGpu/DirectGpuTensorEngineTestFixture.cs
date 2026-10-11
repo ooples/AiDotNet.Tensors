@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Owns one direct-GPU engine per test class so theory rows share the expensive native backend
 /// initialization while retaining isolation between unrelated test families.
 /// </summary>
-public sealed class DirectGpuTensorEngineTestFixture : IDisposable
+public sealed class DirectGpuTensorEngineTestFixture : IDirectGpuTensorEngineFixture, IDisposable
 {
     public DirectGpuTensorEngine? Engine { get; }
     public Exception? InitializationException { get; }
