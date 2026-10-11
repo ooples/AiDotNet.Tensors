@@ -2041,9 +2041,19 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
                 returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
         if (PoisonUninitializedBuffers)
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuMemsetD8Async(buffer.Handle, 0xFF, (ulong)size * sizeof(float), _stream),
-                "cuMemsetD8Async(poison)");
+        {
+            try
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemsetD8Async(buffer.Handle, 0xFF, (ulong)size * sizeof(float), _stream),
+                    "cuMemsetD8Async(poison)");
+            }
+            catch
+            {
+                buffer.Dispose();
+                throw;
+            }
+        }
         return buffer;
     }
 

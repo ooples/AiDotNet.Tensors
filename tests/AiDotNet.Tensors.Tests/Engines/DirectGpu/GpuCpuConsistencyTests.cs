@@ -335,8 +335,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             {
                 var scaled = cuda.DownloadBuffer(buffers[t]);
                 for (int i = 0; i < sizes[t]; i++)
-                    Assert.True(scaled[i] == host[t][i] * coefficient,
-                        $"tensor {t} (size {sizes[t]})[{i}]: {scaled[i]} vs {host[t][i] * coefficient}");
+                {
+                    float expected = host[t][i] * coefficient;
+                    if (scaled[i] != expected)   // build the message only on a mismatch (5M elements)
+                        Assert.Fail($"tensor {t} (size {sizes[t]})[{i}]: {scaled[i]} vs {expected}");
+                }
             }
         }
         finally
