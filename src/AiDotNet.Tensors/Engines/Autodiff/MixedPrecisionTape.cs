@@ -154,7 +154,8 @@ internal sealed class MixedPrecisionTape : IDisposable
         float invScale = 1f / scaler.Scale;
         foreach (var kv in fp16Params)
         {
-            var span = kv.Value.AsWritableSpan();
+            using var spanLease = kv.Value.LeaseWritable();
+            var span = spanLease.Span;
             for (int i = 0; i < span.Length; i++)
             {
                 span[i] *= invScale;
