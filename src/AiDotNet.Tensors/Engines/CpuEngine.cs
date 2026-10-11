@@ -8196,74 +8196,116 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     // #653: the 2-D ReduceSum fast paths ran one serial scalar loop at every size (an [8192, 1024] float row-sum took
-    // 6.6 ms at DOP 1 through 64). Rows / column blocks are now split across threads WITHOUT changing any element's
+    // 6.6 ms at DOP 1 through 64). Rows / column ranges are now split across threads WITHOUT changing any element's
     // summation order -- every output is accumulated by one thread in the same sequence as before -- so the result is
     // bit-identical to the serial loop at any thread count.
-    private const int ReduceColumnBlock = 64;
 
     private static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
     {
-        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum.
-        int chunks = WorkChunks(rows), perChunk = (rows + chunks - 1) / chunks;
-        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
-        {
-            int r1 = Math.Min(rows, (chunk + 1) * perChunk);
-            for (int r = chunk * perChunk; r < r1; r++)
-            {
-                float sum = 0; int offset = r * cols;
-                for (int c = 0; c < cols; c++) sum += src[offset + c];
-                dst[r] = sum;
-            }
-        }, deterministicSafe: true);
+        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
+        // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
+        int chunks = WorkChunks(rows);
+        if (chunks <= 1) { SumRows(src, dst, cols, 0, rows); return; }
+        int perChunk = (rows + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols,
+            chunk => SumRows(src, dst, cols, chunk * perChunk, Math.Min(rows, (chunk + 1) * perChunk)), deterministicSafe: true);
     }
 
-    private static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
+    private static void SumRows(float[] src, float[] dst, int cols, int r0, int r1)
     {
-        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum.
-        int chunks = WorkChunks(rows), perChunk = (rows + chunks - 1) / chunks;
-        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
+        for (int r = r0; r < r1; r++)
         {
-            int r1 = Math.Min(rows, (chunk + 1) * perChunk);
-            for (int r = chunk * perChunk; r < r1; r++)
-            {
-                double sum = 0; int offset = r * cols;
-                for (int c = 0; c < cols; c++) sum += src[offset + c];
-                dst[r] = sum;
-            }
-        }, deterministicSafe: true);
+            float sum = 0; int offset = r * cols;
+            for (int c = 0; c < cols; c++) sum += src[offset + c];
+            dst[r] = sum;
+        }
     }
 
     private static void ReduceSum2DColumns(float[] src, float[] dst, int rows, int cols)
     {
-        int block = ReductionInnerBlock(1, cols);   // a [8192, 256] column sum had four 64-wide units
-        int blocks = (cols + block - 1) / block;
-        CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * cols, blk =>
+        // Contiguous column ranges, about four per thread (the whole width on one thread), each accumulated row by row.
+        int chunks = (int)Math.Min(WorkChunks(cols), (cols + 15) / 16);
+        if (chunks <= 1) { AccumulateAxisRows(src, 0, cols, rows, dst, 0, cols); return; }
+        int perChunk = (cols + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
         {
-            int c0 = blk * block, c1 = Math.Min(cols, c0 + block);
-            Array.Clear(dst, c0, c1 - c0);
-            for (int r = 0; r < rows; r++)
-            {
-                int offset = r * cols;
-                for (int c = c0; c < c1; c++) dst[c] += src[offset + c];
-            }
+            int c0 = chunk * perChunk, c1 = Math.Min(cols, c0 + perChunk);
+            if (c1 > c0) AccumulateAxisRows(src, c0, cols, rows, dst, c0, c1 - c0);
         }, deterministicSafe: true);
+    }
+
+    /// <summary>
+    /// dst[dstBase + j] = sum over a in [0, count) of src[srcBase + a * stride + j], for j in [0, length), each sum
+    /// accumulated in increasing <c>a</c> (the serial order). Runs as row-sequential SIMD adds over column ranges of at
+    /// most <see cref="AxisAccumulateRange"/> elements: long contiguous reads instead of narrow strided ones (a
+    /// 64-column block walked a new page per row), with the accumulator range kept in L1.
+    /// </summary>
+    private static void AccumulateAxisRows(float[] src, int srcBase, int stride, int count, float[] dst, int dstBase, int length)
+    {
+        for (int j0 = 0; j0 < length; j0 += AxisAccumulateRange)
+        {
+            int len = Math.Min(AxisAccumulateRange, length - j0);
+            var acc = new Span<float>(dst, dstBase + j0, len);
+            acc.Clear();
+            for (int a = 0; a < count; a++)
+                Simd.SimdKernels.VectorAdd(acc, new ReadOnlySpan<float>(src, srcBase + a * stride + j0, len), acc);
+        }
+    }
+
+    private static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
+    {
+        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
+        // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
+        int chunks = WorkChunks(rows);
+        if (chunks <= 1) { SumRows(src, dst, cols, 0, rows); return; }
+        int perChunk = (rows + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols,
+            chunk => SumRows(src, dst, cols, chunk * perChunk, Math.Min(rows, (chunk + 1) * perChunk)), deterministicSafe: true);
+    }
+
+    private static void SumRows(double[] src, double[] dst, int cols, int r0, int r1)
+    {
+        for (int r = r0; r < r1; r++)
+        {
+            double sum = 0; int offset = r * cols;
+            for (int c = 0; c < cols; c++) sum += src[offset + c];
+            dst[r] = sum;
+        }
     }
 
     private static void ReduceSum2DColumns(double[] src, double[] dst, int rows, int cols)
     {
-        int block = ReductionInnerBlock(1, cols);   // a [8192, 256] column sum had four 64-wide units
-        int blocks = (cols + block - 1) / block;
-        CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * cols, blk =>
+        // Contiguous column ranges, about four per thread (the whole width on one thread), each accumulated row by row.
+        int chunks = (int)Math.Min(WorkChunks(cols), (cols + 15) / 16);
+        if (chunks <= 1) { AccumulateAxisRows(src, 0, cols, rows, dst, 0, cols); return; }
+        int perChunk = (cols + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
         {
-            int c0 = blk * block, c1 = Math.Min(cols, c0 + block);
-            Array.Clear(dst, c0, c1 - c0);
-            for (int r = 0; r < rows; r++)
-            {
-                int offset = r * cols;
-                for (int c = c0; c < c1; c++) dst[c] += src[offset + c];
-            }
+            int c0 = chunk * perChunk, c1 = Math.Min(cols, c0 + perChunk);
+            if (c1 > c0) AccumulateAxisRows(src, c0, cols, rows, dst, c0, c1 - c0);
         }, deterministicSafe: true);
     }
+
+    /// <summary>
+    /// dst[dstBase + j] = sum over a in [0, count) of src[srcBase + a * stride + j], for j in [0, length), each sum
+    /// accumulated in increasing <c>a</c> (the serial order). Runs as row-sequential SIMD adds over column ranges of at
+    /// most <see cref="AxisAccumulateRange"/> elements: long contiguous reads instead of narrow strided ones (a
+    /// 64-column block walked a new page per row), with the accumulator range kept in L1.
+    /// </summary>
+    private static void AccumulateAxisRows(double[] src, int srcBase, int stride, int count, double[] dst, int dstBase, int length)
+    {
+        for (int j0 = 0; j0 < length; j0 += AxisAccumulateRange)
+        {
+            int len = Math.Min(AxisAccumulateRange, length - j0);
+            var acc = new Span<double>(dst, dstBase + j0, len);
+            acc.Clear();
+            for (int a = 0; a < count; a++)
+                Simd.SimdKernels.VectorAdd(acc, new ReadOnlySpan<double>(src, srcBase + a * stride + j0, len), acc);
+        }
+    }
+
+    // Column range per accumulation pass in AccumulateAxisRows: 8-16 KB of accumulator.
+    private const int AxisAccumulateRange = 2048;
 
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
@@ -33687,51 +33729,56 @@ public partial class CpuEngine : ITensorLevelEngine
         long units = (long)outer * blocks;
         if (units > int.MaxValue) return false;
         long work = (long)outer * axisSize * inner;
-        // Chunks of (outer, block) units, about four per thread, so a serial run is one loop, not a delegate per unit.
+        // Chunks of (outer, block) units, about four per thread; a chunk's units under one outer index form one
+        // contiguous inner range, accumulated row by row (one serial chunk = the whole tensor in a single pass).
         int chunks = WorkChunks(units), perChunk = (int)((units + chunks - 1) / chunks);
         if (typeof(T) == typeof(double))
         {
             var src = (double[])(object)data; var dst = (double[])(object)outData;
-            double inv = 1.0 / axisSize;
+            if (chunks <= 1) { MeanUnits(src, dst, inner, axisSize, blocks, block, 0, units); return true; }
             CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
-            {
-                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
-                for (int u = chunk * perChunk; u < u1; u++)
-                {
-                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
-                    int ob = o * inner, ib = o * axisSize * inner;
-                    for (int j = j0; j < j1; j++) dst[ob + j] = 0;
-                    for (int a = 0; a < axisSize; a++)
-                    {
-                        int rb = ib + a * inner;
-                        for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
-                    }
-                    for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
-                }
-            }, deterministicSafe: true);
+                MeanUnits(src, dst, inner, axisSize, blocks, block, (long)chunk * perChunk, Math.Min(units, (long)(chunk + 1) * perChunk)),
+                deterministicSafe: true);
         }
         else
         {
             var src = (float[])(object)data; var dst = (float[])(object)outData;
-            float inv = 1.0f / axisSize;
+            if (chunks <= 1) { MeanUnits(src, dst, inner, axisSize, blocks, block, 0, units); return true; }
             CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
-            {
-                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
-                for (int u = chunk * perChunk; u < u1; u++)
-                {
-                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
-                    int ob = o * inner, ib = o * axisSize * inner;
-                    for (int j = j0; j < j1; j++) dst[ob + j] = 0;
-                    for (int a = 0; a < axisSize; a++)
-                    {
-                        int rb = ib + a * inner;
-                        for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
-                    }
-                    for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
-                }
-            }, deterministicSafe: true);
+                MeanUnits(src, dst, inner, axisSize, blocks, block, (long)chunk * perChunk, Math.Min(units, (long)(chunk + 1) * perChunk)),
+                deterministicSafe: true);
         }
         return true;
+    }
+
+    // Mean over the axis for the (outer, block) units [u0, u1): per outer index, one contiguous inner range summed in
+    // axis order and then scaled by 1 / axisSize, as the serial odometer does.
+    private static void MeanUnits(float[] src, float[] dst, int inner, int axisSize, int blocks, int block, long u0, long u1)
+    {
+        float inv = 1.0f / axisSize;
+        for (long u = u0; u < u1;)
+        {
+            int o = (int)(u / blocks);
+            long uEnd = Math.Min(u1, (long)(o + 1) * blocks);
+            int j0 = (int)(u - (long)o * blocks) * block, j1 = (int)Math.Min(inner, (uEnd - (long)o * blocks) * block);
+            AccumulateAxisRows(src, o * axisSize * inner + j0, inner, axisSize, dst, o * inner + j0, j1 - j0);
+            for (int j = o * inner + j0, end = o * inner + j1; j < end; j++) dst[j] *= inv;
+            u = uEnd;
+        }
+    }
+
+    private static void MeanUnits(double[] src, double[] dst, int inner, int axisSize, int blocks, int block, long u0, long u1)
+    {
+        double inv = 1.0 / axisSize;
+        for (long u = u0; u < u1;)
+        {
+            int o = (int)(u / blocks);
+            long uEnd = Math.Min(u1, (long)(o + 1) * blocks);
+            int j0 = (int)(u - (long)o * blocks) * block, j1 = (int)Math.Min(inner, (uEnd - (long)o * blocks) * block);
+            AccumulateAxisRows(src, o * axisSize * inner + j0, inner, axisSize, dst, o * inner + j0, j1 - j0);
+            for (int j = o * inner + j0, end = o * inner + j1; j < end; j++) dst[j] *= inv;
+            u = uEnd;
+        }
     }
 
     /// <inheritdoc/>

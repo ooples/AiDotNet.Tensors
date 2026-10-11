@@ -68,12 +68,12 @@ public class CoreSaturationFanOutTests
     }
 
     [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    public void ReduceSum2D_FansOut_BitIdenticalToSequentialOrder(int axis)
+    [InlineData(0, 3000, 300)]
+    [InlineData(1, 3000, 300)]
+    [InlineData(0, 40, 4500)]   // wider than one accumulation range (2048 columns), ragged
+    public void ReduceSum2D_FansOut_BitIdenticalToSequentialOrder(int axis, int rows, int cols)
     {
         var engine = new CpuEngine();
-        const int rows = 3000, cols = 300;
         var xd = Filled<double>(3, rows, cols); var xf = Filled<float>(3, rows, cols);
         AssertBitIdentical(AtDop(1, () => engine.ReduceSum(xd, new[] { axis })), AtDop(16, () => engine.ReduceSum(xd, new[] { axis })), "double sum");
         var pf = AtDop(16, () => engine.ReduceSum(xf, new[] { axis }));
@@ -94,6 +94,8 @@ public class CoreSaturationFanOutTests
     [InlineData(new[] { 2048, 128 }, 1)]
     [InlineData(new[] { 16, 64, 96 }, 1)]
     [InlineData(new[] { 16, 64, 96 }, 2)]
+    [InlineData(new[] { 40, 4500 }, 0)]       // one outer row wider than an accumulation range (2048), ragged
+    [InlineData(new[] { 3, 50, 2100 }, 1)]    // several outer rows, each just past one range
     public void ReduceMeanSingleAxis_FansOut_BitIdenticalToOdometerOrder(int[] shape, int axis)
     {
         var engine = new CpuEngine();
