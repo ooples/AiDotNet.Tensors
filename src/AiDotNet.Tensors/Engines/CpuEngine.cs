@@ -29593,10 +29593,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return resultGen;
     }
 
+    // Query rows per SDPA work item: the unit of the CPU attention fan-out. Fixed (not derived from the thread count),
+    // so the GEMM blocking -- and therefore every output bit -- is the same at any degree of parallelism.
+    private const int SdpaRowBlock = 64;
+
     /// <summary>
     /// BLAS-backed float-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
     /// Replaces the scalar virtual-dispatch triple-loop with two batched SGEMMs per head
-    /// (Q·K^T then P·V), parallelized across batch*heads. Expected to collapse the
+    /// (Q·K^T then P·V), parallelized across (head, query-row block). Expected to collapse the
     /// DiT-XL SDPA wall clock from tens of seconds to tens of milliseconds per forward
     /// pass (Issue #162).
     /// </summary>
@@ -29638,22 +29642,38 @@ public partial class CpuEngine : ITensorLevelEngine
         float capF = (float)softcap;
         float invCapF = useSoftcap ? 1f / capF : 0f;
 
-        // Process each batch-head slice in parallel. Each slice is two independent
-        // SGEMMs separated by a softmax pass. The individual SGEMMs are sized well
-        // above BLAS's 4096-FMA threshold for typical MHA (seqQ*seqK*d_k = 4.7M for
-        // DiT-XL per-head), so each head's GEMM hits either MKL or our blocked AVX2
-        // kernel — not the scalar fallback.
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
+        // Work items are (head, block of SdpaRowBlock query rows): scores for the block's rows (Q rows · K^T), their
+        // softmax, then the block's output rows (P rows · V). A batch-1 forward has few heads -- 8 heads left 56 of
+        // 64 cores idle when the split was per head -- but many row blocks. Every item runs the same single-threaded
+        // SIMD GEMM on the same fixed blocks whatever the thread count, so the output is bit-identical at any degree
+        // of parallelism (the old per-head split switched between a multi-threaded BLAS call and a sequential kernel
+        // depending on whether the head loop happened to run in parallel).
+        int qBlocks = (seqQ + SdpaRowBlock - 1) / SdpaRowBlock;
+        int ktLen = bhCount * d_k * seqK;
+        var ktAll = System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, ktLen));
+        try
         {
+        // K^T per head, once: [d_k, seqK] so each block's scores GEMM reads K^T row-major.
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)ktLen, bh =>
+        {
+            int kOff = bh * seqK * d_k, tOff = bh * d_k * seqK;
+            for (int i = 0; i < seqK; i++)
+                for (int j = 0; j < d_k; j++)
+                    ktAll[tOff + j * seqK + i] = kf[kOff + i * d_k + j];
+        }, deterministicSafe: true);
+
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount * qBlocks, (long)bhCount * seqQ * seqK * (d_k + d_v), [MethodImpl(Hot)] (item) =>
+        {
+            int bh = item / qBlocks;
+            int i0 = (item % qBlocks) * SdpaRowBlock;
+            int rows = Math.Min(SdpaRowBlock, seqQ - i0);
             int b = bh / heads;
             int h = bh % heads;
 
             // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
             // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
             // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
-            // of indexing past its bounds. The MHA fast paths already did this; these generic
-            // SDPA workers did not, which is why the GQA causal path had to materialize a full
-            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            // of indexing past its bounds.
             int mskB = mask is null ? 1 : mask.Shape[0];
             int mskH = mask is null ? 1 : mask.Shape[1];
             int mskQ = mask is null ? 1 : mask.Shape[2];
@@ -29661,56 +29681,21 @@ public partial class CpuEngine : ITensorLevelEngine
             int mskb = BroadcastMaskIndex(b, mskB);
             int mskh = BroadcastMaskIndex(h, mskH);
 
-            int qOff = bh * seqQ * d_k;
-            int kOff = bh * seqK * d_k;
-            int sOff = bh * seqQ * seqK;
+            int qOff = bh * seqQ * d_k + i0 * d_k;
+            int sOff = bh * seqQ * seqK + i0 * seqK;
 
-            // ──── Step 1: scores = Q @ K^T, via BLAS TryGemmEx with transB=true.
-            // If TryGemmEx is unavailable (deterministic mode, MKL absent), fall back
-            // to pre-transposing K and calling SimdGemm.Sgemm.
-            //
-            // Nested-threading guard: this body runs inside ParallelForOrSerial over
-            // batch·heads. TryGemmEx routes to a MULTI-THREADED GEMM (native OpenBLAS
-            // cblas_sgemm, or the managed machine kernel). Invoking that from each of N
-            // parallel head-workers oversubscribes the box (N × innerThreads) and the
-            // native BLAS pool blocks in native sync — a [1,8,1024,64] forward then
-            // crawls for minutes. So when this thread is already a parallel worker
-            // (IsInParallelRegion) we force the single-threaded AVX2 SgemmSequential
-            // path below — mirroring the double path, which always uses a sequential
-            // inner GEMM for exactly this reason. When the head loop ran serially (few
-            // heads / small work) we keep the fast multi-threaded GEMM for the lone head.
-            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: seqK, k: d_k,
-                a: qf, aOffset: qOff, lda: d_k, transA: false,
-                b: kf, bOffset: kOff, ldb: d_k, transB: true,
-                c: scoresData, cOffset: sOff, ldc: seqK);
-            if (!gemmed)
-            {
-                // Manual K^T for this head, then SimdGemm (AVX2 blocked).
-                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                try
-                {
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_k; j++)
-                            kt[j * seqK + i] = kf[kOff + i * d_k + j];
-                    // SgemmSequential: we're already inside Parallel.For(bhCount), so
-                    // forcing the inner SIMD kernel to run sequential avoids
-                    // bhCount × maxThreads workers on (maxThreads) cores.
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        qf.AsSpan(qOff, seqQ * d_k),
-                        kt.AsSpan(0, d_k * seqK),
-                        scoresData.AsSpan(sOff, seqQ * seqK),
-                        seqQ, d_k, seqK);
-                }
-                finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
-            }
+            // ──── Step 1: the block's scores = Q[i0 .. i0+rows) @ K^T.
+            Engines.Simd.SimdGemm.SgemmSequential(
+                qf.AsSpan(qOff, rows * d_k),
+                ktAll.AsSpan(bh * d_k * seqK, d_k * seqK),
+                scoresData.AsSpan(sOff, rows * seqK),
+                rows, d_k, seqK);
 
-            // ──── Step 2: fused scale + mask + numerically-stable softmax,
-            // row-wise over the [seqQ, seqK] scores matrix for this head.
-            for (int i = 0; i < seqQ; i++)
+            // ──── Step 2: fused scale + mask + numerically-stable softmax, row-wise.
+            for (int r = 0; r < rows; r++)
             {
-                int rowOff = sOff + i * seqK;
+                int i = i0 + r;
+                int rowOff = sOff + r * seqK;
                 // First pass: scale in-place, mask, and find row max.
                 float maxVal = negInfF;
                 for (int j = 0; j < seqK; j++)
@@ -29722,11 +29707,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (v > maxVal) maxVal = v;
                     scoresData[rowOff + j] = v;
                 }
-                // Second pass: exp(v - max), sum.
-                // Edge case: if the entire row was masked out, maxVal is still -Infinity.
-                // (scores - (-Inf)) == +Inf; MathF.Exp(+Inf) == +Inf; normalizing produces
-                // NaN. Detect that case up front and emit an all-zero softmax row, which
-                // is the sensible behavior (no attention anywhere → no value flows).
+                // A fully masked row has maxVal = -Infinity: exp(v - max) would be NaN. No attention anywhere -> an
+                // all-zero softmax row (no value flows).
                 if (float.IsNegativeInfinity(maxVal))
                 {
                     for (int j = 0; j < seqK; j++)
@@ -29737,9 +29719,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 float sumExp = 0f;
                 for (int j = 0; j < seqK; j++)
                 {
-                    float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
-                    weightsData[rowOff + j] = e;
-                    sumExp += e;
+                    float ex = MathF.Exp(scoresData[rowOff + j] - maxVal);
+                    weightsData[rowOff + j] = ex;
+                    sumExp += ex;
                 }
                 // Third pass: normalize. Use 1/sumExp to turn N divides into N muls.
                 float inv = sumExp != 0f ? 1f / sumExp : 0f;
@@ -29747,26 +29729,18 @@ public partial class CpuEngine : ITensorLevelEngine
                     weightsData[rowOff + j] *= inv;
             }
 
-            // ──── Step 3: output = weights @ V, via BLAS (no transpose).
-            // Same nested-threading guard as Step 1: serial inner GEMM when this is a
-            // parallel head-worker, multi-threaded GEMM only when the head loop is serial.
-            int wOff = bh * seqQ * seqK;
-            int vOff = bh * seqK * d_v;
-            int oOff = bh * seqQ * d_v;
-            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: d_v, k: seqK,
-                a: weightsData, aOffset: wOff, lda: seqK, transA: false,
-                b: vf, bOffset: vOff, ldb: d_v, transB: false,
-                c: outputData, cOffset: oOff, ldc: d_v);
-            if (!gemmed2)
-            {
-                Engines.Simd.SimdGemm.SgemmSequential(
-                    weightsData.AsSpan(wOff, seqQ * seqK),
-                    vf.AsSpan(vOff, seqK * d_v),
-                    outputData.AsSpan(oOff, seqQ * d_v),
-                    seqQ, seqK, d_v);
-            }
-        });
+            // ──── Step 3: the block's output rows = weights[i0 .. i0+rows) @ V.
+            Engines.Simd.SimdGemm.SgemmSequential(
+                weightsData.AsSpan(sOff, rows * seqK),
+                vf.AsSpan(bh * seqK * d_v, seqK * d_v),
+                outputData.AsSpan(bh * seqQ * d_v + i0 * d_v, rows * d_v),
+                rows, seqK, d_v);
+        }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(ktAll, clearArray: false);
+        }
 
         // Return strongly typed Tensor<float> (no generic cast). Caller bridges
         // to the outer Tensor<T> via a single (Tensor<T>)(object) cast at the

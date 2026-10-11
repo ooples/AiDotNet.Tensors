@@ -293,3 +293,85 @@ public class NormBackwardFanOutTests
         AssertClose(GroupNormBackwardReference<double>(batch, channels, side, groups), ToDouble(parallel), 1e-9);
     }
 }
+
+/// <summary>
+/// #653 phase 3: float CPU attention fans out over (head, 64-query-row block). Same output bits at one thread and
+/// many, and values matching a double-precision reference -- including a broadcast mask, a fully masked row (zero
+/// weights, zero output) and a query length that is not a multiple of the block.
+/// </summary>
+[Collection("EngineCurrentGlobalState")]
+public class AttentionFanOutTests
+{
+    private static Tensor<float> Random(int seed, params int[] shape)
+    {
+        var rng = new Random(seed);
+        var t = new Tensor<float>(shape);
+        var span = t.AsWritableSpan();
+        for (int i = 0; i < span.Length; i++) span[i] = (float)(rng.NextDouble() * 2 - 1);
+        return t;
+    }
+
+    private static (float[] Output, float[] Weights) Run(int dop, Tensor<float> q, Tensor<float> k, Tensor<float> v, Tensor<bool>? mask)
+    {
+        int prior = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = dop;
+            var o = new CpuEngine().ScaledDotProductAttention(q, k, v, mask, null, out var w);
+            return (o.ToArray(), w.ToArray());
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = prior; }
+    }
+
+    [Theory]
+    [InlineData(1, 3, 150, 40, 16, false)]
+    [InlineData(2, 2, 64, 200, 32, true)]
+    public void Sdpa_Float_SameAtAnyThreadCount_AndCorrect(int batch, int heads, int seqQ, int seqK, int d, bool masked)
+    {
+        var q = Random(1, batch, heads, seqQ, d);
+        var k = Random(2, batch, heads, seqK, d);
+        var v = Random(3, batch, heads, seqK, d);
+        Tensor<bool>? mask = null;
+        if (masked)
+        {
+            // [1, 1, seqQ, seqK]: banded, with query row 5 masked everywhere.
+            mask = new Tensor<bool>(new[] { 1, 1, seqQ, seqK });
+            for (int i = 0; i < seqQ; i++)
+                for (int j = 0; j < seqK; j++)
+                    mask[0, 0, i, j] = i != 5 && Math.Abs(i * seqK / seqQ - j) < 40;
+        }
+        var serial = Run(1, q, k, v, mask);
+        var parallel = Run(Math.Max(4, Environment.ProcessorCount), q, k, v, mask);
+        Assert.Equal(serial.Output, parallel.Output);
+        Assert.Equal(serial.Weights, parallel.Weights);
+
+        double scale = 1 / Math.Sqrt(d);
+        for (int b = 0; b < batch; b++)
+            for (int h = 0; h < heads; h++)
+                for (int i = 0; i < seqQ; i++)
+                {
+                    var s = new double[seqK];
+                    double max = double.NegativeInfinity;
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double dot = 0;
+                        for (int c = 0; c < d; c++) dot += q[b, h, i, c] * (double)k[b, h, j, c];
+                        s[j] = mask is null || mask[0, 0, i, j] ? dot * scale : double.NegativeInfinity;
+                        max = Math.Max(max, s[j]);
+                    }
+                    double sum = 0;
+                    for (int j = 0; j < seqK; j++) { s[j] = double.IsNegativeInfinity(max) ? 0 : Math.Exp(s[j] - max); sum += s[j]; }
+                    for (int j = 0; j < seqK; j++)
+                    {
+                        double w = sum > 0 ? s[j] / sum : 0;
+                        Assert.True(Math.Abs(w - parallel.Weights[((b * heads + h) * seqQ + i) * seqK + j]) < 1e-5, $"weight ({b},{h},{i},{j})");
+                    }
+                    for (int c = 0; c < d; c++)
+                    {
+                        double o = 0;
+                        for (int j = 0; j < seqK; j++) o += (sum > 0 ? s[j] / sum : 0) * v[b, h, j, c];
+                        Assert.True(Math.Abs(o - parallel.Output[((b * heads + h) * seqQ + i) * d + c]) < 1e-4, $"output ({b},{h},{i},{c})");
+                    }
+                }
+    }
+}
