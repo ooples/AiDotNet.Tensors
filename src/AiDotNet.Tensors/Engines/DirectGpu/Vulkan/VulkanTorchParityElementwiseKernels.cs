@@ -60,6 +60,8 @@ internal static class VulkanTorchParityElementwiseKernels
         yield return ("scan_add", ScanAdd);
         yield return ("int_binary", IntBinary);
         yield return ("int_not", IntNot);
+        yield return ("int64_binary", Int64Binary);
+        yield return ("int64_not", Int64Not);
         yield return ("grid_sample_3d", GridSample3D);
         yield return ("grid_sample_3d_backward", GridSample3DBackward);
     }
@@ -1011,6 +1013,95 @@ void main()
     o[i] = ~a[i];
 }
 "));
+
+    // #1135: the same ops on the raw int64 layout (two words per element) that long, ulong, short, ushort, sbyte, byte
+    // and uint tensors use on the device. Values are the element's int64 widening (ulong keeps its bits), computed as
+    // the CPU's IntegerBinary does -- in signed 64 bits -- and narrowed to the element type t (0 long, 1 ulong,
+    // 2 short, 3 ushort, 4 sbyte, 5 byte, 6 uint), as its FromLong. Flag codes: 1 a zero divisor
+    // (DivideByZeroException), 2 the CPU's OverflowException (Math.Abs of long.MinValue in gcd / lcm,
+    // long.MinValue / -1).
+    private const string Int64Narrow = @"
+int64_t parity_int_narrow(int64_t r, int t)
+{
+    if (t == 2) return (r << 48) >> 48;
+    if (t == 3) return r & 0xFFFFL;
+    if (t == 4) return (r << 56) >> 56;
+    if (t == 5) return r & 0xFFL;
+    if (t == 6) return r & 0xFFFFFFFFL;
+    return r;
+}
+";
+
+    public static string Int64Binary => Cached("int64Binary", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer A { int64_t a[]; };
+layout(set = 0, binding = 1) readonly buffer B { int64_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer O { int64_t o[]; };
+" + FlagSlots(3) + @"
+layout(push_constant) uniform P { uint n; int op; int t; };
+", Int64Narrow + @"
+// Both operands are non-negative here: the caller rejects long.MinValue before taking magnitudes.
+int64_t parity_gcd(int64_t x, int64_t y)
+{
+    x = x < 0L ? -x : x;
+    y = y < 0L ? -y : y;
+    while (y != 0L) { int64_t r = x % y; x = y; y = r; }
+    return x;
+}
+
+void main()
+{
+" + Index + @"
+    const int64_t minValue = -9223372036854775807L - 1L;
+    int64_t x = a[i], v = b[i], r;
+    if (op == 0) r = x & v;
+    else if (op == 1) r = x | v;
+    else if (op == 2) r = x ^ v;
+    else if (op == 3) r = v >= 64L ? 0L : int64_t(uint64_t(x) << int(v & 63L));
+    else if (op == 4) r = v >= 64L ? (x < 0L ? -1L : 0L) : x >> int(v & 63L);
+    else if (op == 5)
+    {
+        if (x == minValue || v == minValue) { parity_flag(0u, i, 2u); return; }
+        r = parity_gcd(x, v);
+    }
+    else if (op == 6)
+    {
+        if (x == minValue || v == minValue) { parity_flag(0u, i, 2u); return; }
+        int64_t g = parity_gcd(x, v);
+        // x / g from the magnitudes (g divides x exactly), then a wrapping multiply, as C#'s unchecked long.
+        int64_t ax = x < 0L ? -x : x;
+        int64_t xg = g == 0L ? 0L : ax / g;
+        if (x < 0L) xg = -xg;
+        int64_t m = g == 0L ? 0L : int64_t(uint64_t(xg) * uint64_t(v));
+        if (m == minValue) { parity_flag(0u, i, 2u); return; }
+        r = m < 0L ? -m : m;
+    }
+    else
+    {
+        if (v == 0L) { parity_flag(0u, i, 1u); return; }
+        if (x == minValue && v == -1L) { parity_flag(0u, i, 2u); return; }
+        // Floor division from unsigned magnitudes (GLSL leaves % of a negative operand undefined, and the magnitude
+        // of long.MinValue only fits unsigned).
+        uint64_t ax = x < 0L ? uint64_t(0) - uint64_t(x) : uint64_t(x);
+        uint64_t av = v < 0L ? uint64_t(0) - uint64_t(v) : uint64_t(v);
+        uint64_t q = ax / av;
+        if ((x < 0L) == (v < 0L)) r = int64_t(q);
+        else r = int64_t(uint64_t(0) - (q + (ax % av != uint64_t(0) ? uint64_t(1) : uint64_t(0))));
+    }
+    o[i] = parity_int_narrow(r, t);
+}
+", int64: true));
+
+    public static string Int64Not => Cached("int64Not", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer A { int64_t a[]; };
+layout(set = 0, binding = 1) writeonly buffer O { int64_t o[]; };
+layout(push_constant) uniform P { uint n; int t; };
+", Int64Narrow + @"
+void main()
+{
+" + Index + @"
+    o[i] = parity_int_narrow(~a[i], t);
+}
+", int64: true));
 
     // grid_sample 3-D, as the CPU's GridSampler3D: unnormalize, clip or reflect, then trilinear (8 taps) or nearest
     // (round half to even), skipping out-of-range voxels. mode 0 bilinear, 1 nearest; padding 0 zeros, 1 border,
