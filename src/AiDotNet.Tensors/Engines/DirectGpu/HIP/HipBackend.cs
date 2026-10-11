@@ -566,6 +566,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(HipNeuralNetKernels.GetSource(), "neural_net", ref _neuralNetModule,
                 HipNeuralNetKernels.GetKernelNames());
 
+            // IGpuBatchExecution (#1142): precise math, so min |x| can start at INFINITY.
+            CompileKernelModule(BatchExecutionCudaKernels.GetSource(), "batch_execution", ref _batchExecutionModule,
+                BatchExecutionCudaKernels.GetKernelNames(), useFastMath: false);
+
             // Categorical sampling: its own module, and NOT fast-math. Sharing the neural-net
             // module would make every kernel in it hostage to this one compiling, and fast math
             // permits reassociating the ordered double accumulation this kernel needs to reproduce
@@ -11412,6 +11416,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _categoricalModule = IntPtr.Zero;
         }
 
+        if (_batchExecutionModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_batchExecutionModule);
+            _batchExecutionModule = IntPtr.Zero;
+        }
         if (_neuralNetModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_neuralNetModule);
