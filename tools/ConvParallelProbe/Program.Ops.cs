@@ -58,8 +58,19 @@ internal static partial class Program
             int rows = shape[0], cols = shape[1];
             var x = R(rows, cols); var y = R(rows, cols); var bias = R(cols); var gamma = R(cols); var beta = R(cols);
             var x3 = eng.Reshape(x, new[] { rows / 2, 2, cols });
+            var gradOut = R(rows, cols);
+            eng.LayerNorm(x, gamma, beta, 1e-5, out var lnMean, out var lnVar);
+            eng.RMSNorm(x, gamma, 1e-6, out var rms);
+            // GroupNorm as a batch-1 diffusion feature map: [1, 32, rows*cols/512, 16], 8 groups.
+            var x4 = eng.Reshape(x, new[] { 1, 32, rows * cols / 512, 16 });
+            var g4 = eng.Reshape(gradOut, new[] { 1, 32, rows * cols / 512, 16 });
+            var gnGamma = R(32); var gnBeta = R(32);
+            eng.GroupNorm(x4, 8, gnGamma, gnBeta, 1e-5, out var gnMean, out var gnVar);
             var cases = new List<(string, Action)>
             {
+                ("layernorm_backward", () => eng.LayerNormBackward(gradOut, x, gamma, lnMean, lnVar, 1e-5, out _, out _)),
+                ("rmsnorm_backward", () => eng.RMSNormBackward(gradOut, x, gamma, rms, 1e-6, out _)),
+                ("groupnorm_backward_b1", () => eng.GroupNormBackward(g4, x4, 8, gnGamma, gnMean, gnVar, 1e-5, out _, out _)),
                 ("add", () => eng.TensorAdd(x, y)),
                 ("multiply", () => eng.TensorMultiply(x, y)),
                 ("add_rowbias_bcast", () => eng.TensorBroadcastAdd(x, bias)),
@@ -102,6 +113,35 @@ internal static partial class Program
                 double effMax = t1 / (dops[^1] * times[^1]);
                 Console.WriteLine($"{name,-26}{rows * cols,8}   " + string.Join("", Array.ConvertAll(times, t => $"{t,10:F1}")) + $"{eff8,8:P0}{effMax,9:P0}");
             }
+        }
+        // Attention [B, H, S, D]: few heads (a batch-1 forward), many heads, and one long single head.
+        foreach (var (bb, hh, ss, dd) in new[] { (1, 8, 1024, 64), (4, 16, 256, 72), (1, 1, 4096, 64) })
+        {
+            string name = $"sdpa_{bb}x{hh}x{ss}x{dd}";
+            if (filter.Length > 0 && !name.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
+            var q = R(bb, hh, ss, dd); var k = R(bb, hh, ss, dd); var v = R(bb, hh, ss, dd);
+            Action run = () => eng.ScaledDotProductAttention(q, k, v, null, null, out _);
+            var times = new double[dops.Length];
+            for (int di = 0; di < dops.Length; di++)
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = dops[di];
+                for (int w = 0; w < 3; w++) { using var ar = TensorArena.Create(); run(); }
+                var ts = new double[Math.Max(5, reps / 4)];
+                for (int r = 0; r < ts.Length; r++)
+                {
+                    using var ar = TensorArena.Create();
+                    long t0 = Stopwatch.GetTimestamp();
+                    run();
+                    ts[r] = (Stopwatch.GetTimestamp() - t0) * 1e6 / Stopwatch.Frequency;
+                }
+                Array.Sort(ts);
+                times[di] = ts[ts.Length / 2];
+            }
+            double t1 = times[Array.IndexOf(dops, 1)];
+            int i8 = Array.IndexOf(dops, 8);
+            double eff8 = i8 >= 0 ? t1 / (8 * times[i8]) : double.NaN;
+            double effMax = t1 / (dops[^1] * times[^1]);
+            Console.WriteLine($"{name,-26}{bb * hh * ss * dd,8}   " + string.Join("", Array.ConvertAll(times, t => $"{t,10:F1}")) + $"{eff8,8:P0}{effMax,9:P0}");
         }
         CpuParallelSettings.MaxDegreeOfParallelism = Environment.ProcessorCount;
         return 0;
