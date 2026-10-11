@@ -1331,6 +1331,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Compile softmax variant + GEMM extension kernels
         CompileKernelModule(device, CudaSoftmaxVariantKernels.GetSource(), "softmax_variant_kernels", CudaSoftmaxVariantKernels.GetKernelNames());
 
+        // IGpuBatchExecution kernels shared with HIP (#1142).
+        CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+
         // Self-contained FP16 kernels (#558 layer 7): manual IEEE-754 half<->float, NO cuda_fp16.h, so
         // they compile with the driver alone (the header-based CudaFp16Kernels below silently fails on
         // driver-only machines). This is the FP16 path that actually works without a CUDA Toolkit.
@@ -18281,21 +18284,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         => LaunchFusedUnaryReduce(
             GpuDeterminism.IsActive ? "reduce_mean_deterministic" : "reduce_mean",
             input, output, size, GpuDeterminism.IsActive);
-    public void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_product", input, output, size);
-    public unsafe void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size)
+    public void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullProduct, 0f);
+    public void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size)
     {
+        // The direct-PTX row kernel writes the sum of squares; the contract is the norm.
         if (size % PtxRowNormalizationD64Kernel.Dimension == 0 &&
             TryDirectPtxReduceNormL2D64(
                 input, output, size / PtxRowNormalizationD64Kernel.Dimension))
+        {
+            Sqrt(output, output, 1);
             return;
-        LaunchFusedUnaryReduce(
-            GpuDeterminism.IsActive ? "reduce_norm_l2_deterministic" : "reduce_norm_l2",
-            input, output, size, GpuDeterminism.IsActive);
+        }
+        BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullNormL2, 0f);
     }
-    public unsafe void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size)
-        => LaunchFusedUnaryReduce(
-            GpuDeterminism.IsActive ? "reduce_sum_of_squares_deterministic" : "reduce_sum_of_squares",
-            input, output, size, GpuDeterminism.IsActive);
+    public void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullSumOfSquares, 0f);
 
     /// <summary>
     /// Issue #382: variant of LaunchFusedUnary for scalar reductions that
@@ -18315,29 +18317,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         uint grid = deterministic ? 1u : (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
-    public void ReduceMaxMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_max_magnitude", input, output, size);
-    public void ReduceMinMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_min_magnitude", input, output, size);
+    public void ReduceMaxMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullMaxMagnitude, 0f);
+    public void ReduceMinMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullMinMagnitude, 0f);
 
-    public unsafe void ReduceLogSumExp(IGpuBuffer input, IGpuBuffer output, float maxVal, int size)
-    {
-        using var _ = PushContext();
-        IntPtr inPtr = input.Handle, outPtr = output.Handle;
-        void** args = stackalloc void*[4];
-        args[0] = &inPtr; args[1] = &outPtr; args[2] = &maxVal; args[3] = &size;
-
-        if (GpuDeterminism.IsActive)
-        {
-            if (!_kernelCache.TryGetValue("reduce_logsumexp_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp_deterministic");
-            Fill(output, 0f, 1);
-            LaunchKernel(kernelD, 1, DefaultBlockSize, args);
-            return;
-        }
-
-        if (!_kernelCache.TryGetValue("reduce_logsumexp", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp");
-        LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
-    }
+    public void ReduceLogSumExp(IGpuBuffer input, IGpuBuffer output, float maxVal, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullLogSumExp, maxVal);
 
     public void VarianceAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("variance_axis", input, output, outerSize, reduceSize);
     public void StdAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("std_axis", input, output, outerSize, reduceSize);
@@ -18719,24 +18702,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public unsafe void Crop2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW)
-    {
-        using var _ = PushContext();
-        IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
-        void** args = stackalloc void*[10];
-        args[0] = &goPtr; args[1] = &giPtr; args[2] = &batch; args[3] = &channels;
-        args[4] = &inH; args[5] = &inW; args[6] = &outH; args[7] = &outW; args[8] = &offsetH; args[9] = &offsetW;
-        uint total = (uint)(batch * channels * outH * outW);
-
-        // Issue #382: original uses atomicAdd defensively (mapping is one-to-one
-        // per launch). Deterministic variant uses direct +=.
-        string kernelName = GpuDeterminism.IsActive
-            ? "crop_2d_backward_deterministic"
-            : "crop_2d_backward";
-        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
-        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
-    }
+    public void Crop2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW)
+        // One thread per input-gradient cell, so cells outside the crop window are written as zero.
+        => LaunchBatchKernel("bx_window_2d", batch * channels * inH * inW, gradOutput, gradInput, batch, channels, inH, inW, outH, outW, offsetH, offsetW, 0f, 3);
 
     public unsafe void EyeKernel(IGpuBuffer output, int n)
     {
@@ -18834,7 +18802,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     }
 
     // --- Loss Forward ---
-    public void CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses) { LaunchLoss("cross_entropy_loss", predictions, targets, loss, batchSize, numClasses); }
+    // Two modules define a kernel named cross_entropy_loss (logits and probabilities); bx_row_loss is unambiguous.
+    public void CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
+        => LaunchBatchKernel("bx_row_loss", batchSize, predictions, targets, loss, batchSize, numClasses, 0);
     public void MseLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
 #if NET5_0_OR_GREATER
@@ -18916,7 +18886,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxSparsemax(input, output, outerSize, innerSize)) return;
-        LaunchFusedAxis("sparsemax", input, output, outerSize, innerSize);
+        LaunchBatchKernel("bx_row_map", outerSize, input, output, outerSize, innerSize, BatchExecutionCudaKernels.MapSparsemax);
     }
 
     public void TaylorSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
