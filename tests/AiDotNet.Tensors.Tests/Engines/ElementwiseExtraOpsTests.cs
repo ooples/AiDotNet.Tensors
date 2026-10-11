@@ -62,6 +62,17 @@ public class ElementwiseExtraOpsTests
         Rel(-3e-15, e[1]);
     }
 
+    [Fact]
+    public void Log1pAndExpm1_StayFiniteAtTheTopOfTheRange()
+    {
+        // expm1(709.7) = 1.65e308 and log1p(1e308) = 709.2 are finite; forming um1 * x (or log(u) * x) before the divide
+        // overflowed both to infinity.
+        var e = _engine.TensorExpm1(new Tensor<double>(new[] { 709.7 }, new[] { 1 })).ToArray()[0];
+        var l = _engine.TensorLog1p(new Tensor<double>(new[] { 1e308 }, new[] { 1 })).ToArray()[0];
+        Assert.True(Math.Abs(e - Math.Exp(709.7)) <= 1e-14 * Math.Exp(709.7), $"expm1(709.7) = {e:R}");
+        Assert.True(Math.Abs(l - Math.Log(1e308)) <= 1e-14 * Math.Log(1e308), $"log1p(1e308) = {l:R}");
+    }
+
     [Theory]
     [MemberData(nameof(Ops))]
     public void Gradient_MatchesACentralDifference(string op)

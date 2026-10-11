@@ -145,9 +145,10 @@ public partial class DirectGpuTensorEngine
         {
             var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) =>
             {
-                // The fused rsqrt kernel is on the batch-execution surface (Vulkan); every backend has sqrt and
-                // reciprocal, so the others stay on the device with two kernels instead of falling back to the host.
+                // The fused rsqrt kernel is on the batch-execution surface (Vulkan) and on CUDA; every backend has sqrt
+                // and reciprocal, so the others stay on the device with two kernels instead of falling back to the host.
                 if (backend is IGpuBatchExecution batch) batch.RsqrtKernel(input, output, size);
+                else if (backend is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.RsqrtKernel(input, output, size);
                 else
                 {
                     backend.Sqrt(input, output, size);

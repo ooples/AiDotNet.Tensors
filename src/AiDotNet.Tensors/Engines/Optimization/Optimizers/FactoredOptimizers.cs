@@ -131,6 +131,7 @@ public sealed class AdafactorOptimizer : ShapedOptimizerBase
                 {
                     if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
                     float[] p = HostParameter(gi, pi);
+                    if (p.Length == 0) continue;   // nothing to update, and the RMS / factoring would divide by zero
                     var slot = GetOrCreateState(gi, pi, p.Length);
                     int step = (slot["step"].IntValue ?? 0) + 1;
                     slot["step"].IntValue = step;
@@ -267,6 +268,7 @@ public sealed class MuonOptimizer : ShapedOptimizerBase
                 {
                     if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
                     float[] p = HostParameter(gi, pi);
+                    if (p.Length == 0) continue;   // nothing to update, and the RMS / factoring would divide by zero
                     var shape = ParameterShape(gi, pi, p.Length);
                     if (shape.Length != 2)
                         throw new InvalidOperationException(

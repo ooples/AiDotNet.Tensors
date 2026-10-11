@@ -35,6 +35,34 @@ public class GroupedScaledMatMulTests
 
 //@@TORCH_CASES@@
 
+    [Fact]
+    public void GroupedMatMul_ABiasOfTheWrongShape_IsRejectedAsTheBias()
+    {
+        // a [4, 3] jagged into 2 groups by rows; b [2, 3, 5]: the bias is [5] or [2, 5].
+        var a = Random(11, 4, 3); var b = Random(12, 2, 3, 5);
+        var offs = new Tensor<int>(new[] { 2, 4 }, new[] { 2 });
+        Assert.Equal("bias", Assert.Throws<ArgumentException>(() => _engine.TensorGroupedMatMul(a, b, offs, Random(13, 4))).ParamName);
+        Assert.Equal("bias", Assert.Throws<ArgumentException>(() => _engine.TensorGroupedMatMul(a, b, offs, Random(14, 3, 5))).ParamName);
+        Assert.Equal(new[] { 4, 5 }, _engine.TensorGroupedMatMul(a, b, offs, Random(15, 5)).Shape.ToArray());
+        Assert.Equal(new[] { 4, 5 }, _engine.TensorGroupedMatMul(a, b, offs, Random(16, 2, 5)).Shape.ToArray());
+    }
+
+    [Fact]
+    public void ScaledGroupedMatMul_JaggedK_RejectsBlockAndSwizzledScalesOnEitherOperand()
+    {
+        // a [4, 32] x b [32, 3] with the shared dimension jagged at 16: per-group row-wise scales are [2, 4] and [2, 3].
+        var a = Random(21, 4, 32); var b = Random(22, 32, 3);
+        var offs = new Tensor<int>(new[] { 16, 32 }, new[] { 2 });
+        var sa = Random(23, 2, 4); var sb = Random(24, 2, 3);
+        // A 1x16 block scale for b has ceil(32 / 16) * 3 = 6 values, the same count as the row-wise [2, 3]: it used to be
+        // decoded as row-wise.
+        Assert.Throws<NotSupportedException>(() => _engine.TensorScaledGroupedMatMul(a, b, sa, ScalingRecipe.RowWise, Random(25, 3, 2), ScalingRecipe.BlockWise1x16, offsets: offs));
+        Assert.Throws<NotSupportedException>(() => _engine.TensorScaledGroupedMatMul(a, b, sa, ScalingRecipe.RowWise, sb, ScalingRecipe.RowWise, ScaleSwizzle.Swizzle32x4x4, offsets: offs));
+        Assert.Throws<NotSupportedException>(() => _engine.TensorScaledGroupedMatMul(a, b, sa, ScalingRecipe.RowWise, sb, ScalingRecipe.RowWise, swizzleB: ScaleSwizzle.Swizzle32x4x4, offsets: offs));
+        Assert.Equal(new[] { 2, 4, 3 }, _engine.TensorScaledGroupedMatMul(a, b, sa, ScalingRecipe.RowWise, sb, ScalingRecipe.RowWise, offsets: offs).Shape.ToArray());
+    }
+
+
     [Theory]
     [InlineData(ScalingRecipe.BlockWise1x16, 16)]
     [InlineData(ScalingRecipe.BlockWise1x32, 32)]
