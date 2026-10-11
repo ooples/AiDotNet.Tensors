@@ -17674,7 +17674,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < inputRank; i++)
                 if (!reduceDimsSet.Contains(i))
                     outputShapeList.Add(inputShape[i]);
-            if (outputShapeList.Count == 0) outputShapeList.Add(1);
         }
         var outputShape = outputShapeList.ToArray();
 
@@ -19118,7 +19117,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (i != axis) outputShapeList.Add(inputShape[i]);
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -19155,7 +19153,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputShapeList = new List<int>();
         for (int i = 0; i < inputRank; i++)
             if (i != axis) outputShapeList.Add(inputShape[i]);
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -26558,7 +26555,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     outputShape.Add(input.Shape._dims[d]);
                 }
             }
-            if (outputShape.Count == 0) outputShape.Add(1);
 
             using var inputBuffer = GetOrAllocateBuffer(backend, reductionInput);
             using var valuesBuffer = AllocateOutputBuffer(backend, outerSize);

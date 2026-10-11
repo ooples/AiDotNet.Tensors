@@ -38270,7 +38270,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (d == capAxis) { if (keepDims) outShape.Add(1); }
                     else outShape.Add(tensor._shape[d]);
                 }
-                if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSumExp", tensor, outShape.ToArray(),
                     (eng, output) => { var r = eng.TensorLogSumExp(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.LogSumExpBackward, new object[] { capAxis });
@@ -38301,7 +38300,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var maxSqueezed = TensorSqueeze(maxVals, axis);
+            // Reshape, not TensorSqueeze: squeeze keeps a vector's last axis, which would broadcast a rank-0
+            // logSum back up to [1] (#1132).
+            var maxSqueezed = Reshape(maxVals, logSum._shape);
             return TensorAdd(logSum, maxSqueezed);
         }
     }
@@ -39217,7 +39218,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (d == capAxis) { if (keepDims) outShape.Add(1); }
                     else outShape.Add(tensor._shape[d]);
                 }
-                if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "Norm", tensor, outShape.ToArray(),
                     (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NormBackward, new object[] { capAxis });

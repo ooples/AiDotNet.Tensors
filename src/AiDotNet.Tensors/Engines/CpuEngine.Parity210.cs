@@ -718,7 +718,7 @@ public partial class CpuEngine
         var outShape = new int[rank - 1];
         int w = 0;
         for (int i = 0; i < rank; i++) if (i != dim) outShape[w++] = x1._shape[i];
-        var result = new Tensor<T>(outShape.Length == 0 ? new[] { 1 } : outShape);
+        var result = new Tensor<T>(outShape);
         // 0-rank result for e.g. 1-D input: treat specially — single scalar.
         var dst = result.AsWritableSpan();
 

@@ -128,6 +128,32 @@ public class FullReductionRankTests
         }
     }
 
+    /// <summary>
+    /// Single-axis reductions follow the same rule: reducing the only axis of a vector without keepDims
+    /// leaves a rank-0 result (torch.logsumexp(v, 0), torch.norm(v, dim=0), cosine_similarity(v, w, 0)).
+    /// </summary>
+    [Fact]
+    public void SingleAxisReductions_OfVector_AreRankZero()
+    {
+        var v = new Tensor<double>(new[] { 3.0, -1.0, 2.0 }, new[] { 3 });
+        var w = new Tensor<double>(new[] { 1.0, 2.0, 2.0 }, new[] { 3 });
+
+        var lse = Engine.TensorLogSumExp(v, 0);
+        Assert.Empty(lse.Shape.ToArray());
+        Assert.Equal(Math.Log(Math.Exp(3) + Math.Exp(-1) + Math.Exp(2)), lse[0], 12);
+
+        var norm = Engine.TensorNorm(v, 0);
+        Assert.Empty(norm.Shape.ToArray());
+        Assert.Equal(Math.Sqrt(14.0), norm[0], 12);
+
+        var cos = Engine.TensorCosineSimilarity(v, w, 0);
+        Assert.Empty(cos.Shape.ToArray());
+        Assert.Equal(5.0 / (Math.Sqrt(14.0) * 3.0), cos[0], 12);
+
+        Assert.Equal(new[] { 1 }, Engine.TensorLogSumExp(v, 0, keepDims: true).Shape.ToArray());
+        Assert.Equal(new[] { 1 }, Engine.TensorNorm(v, 0, keepDims: true).Shape.ToArray());
+    }
+
     [Fact]
     public void ReduceMaxWithTensorIndices_FullReduction_IndexIsRankZero()
     {
