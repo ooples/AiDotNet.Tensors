@@ -77,6 +77,29 @@ public partial class CpuEngine
         return tape is not null && tape.Options.RecordInPlace && !NoGradScope<U>.IsSuppressed;
     }
 
+    // A map callback has no derivative, so under a tape its result would be recorded with no history: the write would
+    // silently cut every gradient through the tensor and its operands. torch refuses apply_/map_ on a tensor that
+    // requires grad for the same reason; this refuses before anything is written.
+    private static void ThrowIfOpaqueMapRecorded<U>(string opName)
+    {
+        if (IsRecordingInPlace<U>())
+            throw new InvalidOperationException(
+                $"{opName}: the callback has no derivative, so it cannot be recorded on a gradient tape. Run it under " +
+                "a NoGradScope (torch: tensor.detach().map_()), or express the map with differentiable engine ops.");
+    }
+
+    // set_/resize_/as_strided_ swap the storage under the tensor object the tape keys gradients by: its producer's
+    // history would stay attached to different data, and nothing would connect it to the new storage (or to set_'s
+    // source). torch refuses resize_ on a tensor that requires grad; these refuse under a recording tape, before the
+    // tensor changes.
+    private static void ThrowIfStorageSwapRecorded<U>(string opName)
+    {
+        if (IsRecordingInPlace<U>())
+            throw new InvalidOperationException(
+                $"{opName}: replacing a tensor's storage cannot be recorded on a gradient tape. Run it under a " +
+                "NoGradScope (torch: inside torch.no_grad()), or use the out-of-place view ops, which are recorded.");
+    }
+
     private static bool ShapesEqual(int[] a, int[] b)
     {
         if (a.Length != b.Length) return false;
@@ -169,6 +192,10 @@ public partial class CpuEngine
         Tensor<U> layout;
         using (new NoGradScope<U>()) layout = viewOp(engine, tensor);
         tensor.AdoptFrom(layout);
+        // The temporary view holds its own storage reference, which AdoptFrom does not take over; left alive it keeps
+        // the storage looking shared (copy-on-write and the streaming-drop refcount check both read that count).
+        // Never the tensor itself: a view op may return its input unchanged, and AdoptFrom then did nothing.
+        if (!ReferenceEquals(layout, tensor)) layout.Dispose();
         if (recorded is not null) DifferentiableOps.RecordUnary(opName, tensor, recorded, BackwardFunctions<U>.InPlaceAssignBackward);
     }
 
@@ -251,6 +278,7 @@ public partial class CpuEngine
     public virtual void TensorApplyInPlace<T>(Tensor<T> tensor, Func<T, T> func)
     {
         if (func is null) throw new ArgumentNullException(nameof(func));
+        ThrowIfOpaqueMapRecorded<T>("TensorApplyInPlace");
         ApplyInPlace(tensor, "TensorApplyInPlace", (e, x) => e.TensorMap(x, func));
     }
 
@@ -259,6 +287,7 @@ public partial class CpuEngine
     {
         if (other is null) throw new ArgumentNullException(nameof(other));
         if (func is null) throw new ArgumentNullException(nameof(func));
+        ThrowIfOpaqueMapRecorded<T>("TensorMapInPlace");
         ApplyInPlace(tensor, "TensorMapInPlace", (e, x) =>
         {
             var b = ShapesEqual(other._shape, x._shape) ? other : e.TensorBroadcastTo(other, x._shape);
@@ -277,6 +306,7 @@ public partial class CpuEngine
         if (x is null) throw new ArgumentNullException(nameof(x));
         if (y is null) throw new ArgumentNullException(nameof(y));
         if (func is null) throw new ArgumentNullException(nameof(func));
+        ThrowIfOpaqueMapRecorded<T>("TensorMap2InPlace");
         ApplyInPlace(tensor, "TensorMap2InPlace", (e, self) =>
         {
             var a = ShapesEqual(x._shape, self._shape) ? x : e.TensorBroadcastTo(x, self._shape);
@@ -304,7 +334,8 @@ public partial class CpuEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         int rows = weight._shape[0], dim = weight._shape[1];
         var unique = new System.Collections.Generic.SortedSet<int>();
-        foreach (int row in indices.AsSpan().ToArray())
+        // ToArray, not AsSpan: it reads a strided index view in logical order (AsSpan throws on one).
+        foreach (int row in indices.ToArray())
         {
             if (row < 0 || row >= rows) throw new ArgumentOutOfRangeException(nameof(indices), $"Index {row} is outside [0, {rows}).");
             unique.Add(row);
@@ -419,8 +450,9 @@ public partial class CpuEngine
         if (size is null) throw new ArgumentNullException(nameof(size));
         if (stride is null) throw new ArgumentNullException(nameof(stride));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorAsStridedInPlace");
+        ThrowIfStorageSwapRecorded<T>("TensorAsStridedInPlace");
         // A view of the tensor's own storage; its constructor checks the layout stays inside the storage.
-        var view = new Tensor<T>(tensor.DataVector, size, stride, storageOffset ?? tensor._storageOffset, tensor._storage);
+        using var view = new Tensor<T>(tensor.DataVector, size, stride, storageOffset ?? tensor._storageOffset, tensor._storage);
         tensor.AdoptFrom(view);
     }
 
@@ -430,6 +462,7 @@ public partial class CpuEngine
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (source is null) throw new ArgumentNullException(nameof(source));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorSetInPlace");
+        ThrowIfStorageSwapRecorded<T>("TensorSetInPlace");
         tensor.AdoptFrom(source);
     }
 
@@ -439,7 +472,9 @@ public partial class CpuEngine
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (source is null) throw new ArgumentNullException(nameof(source));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorSetInPlace");
-        tensor.AdoptFrom(new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage));
+        ThrowIfStorageSwapRecorded<T>("TensorSetInPlace");
+        using var view = new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage);
+        tensor.AdoptFrom(view);
     }
 
     /// <inheritdoc/>
@@ -448,6 +483,7 @@ public partial class CpuEngine
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (shape is null) throw new ArgumentNullException(nameof(shape));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorResizeInPlace");
+        ThrowIfStorageSwapRecorded<T>("TensorResizeInPlace");
         long count = 1;
         foreach (int d in shape)
         {
@@ -461,10 +497,11 @@ public partial class CpuEngine
         for (int d = shape.Length - 1, s = 1; d >= 0; d--) { strides[d] = s; s *= Math.Max(shape[d], 1); }
         if (tensor.IsContiguous && tensor._storageOffset + count <= tensor.DataVector.Length)
         {
-            tensor.AdoptFrom(new Tensor<T>(tensor.DataVector, shape, strides, tensor._storageOffset, tensor._storage));
+            using var view = new Tensor<T>(tensor.DataVector, shape, strides, tensor._storageOffset, tensor._storage);
+            tensor.AdoptFrom(view);
             return;
         }
-        var grown = new Tensor<T>(shape);
+        using var grown = new Tensor<T>(shape);
         var from = tensor.IsContiguous ? tensor : tensor.Contiguous();
         int keep = (int)Math.Min(from.Length, count);
         from.AsSpan().Slice(0, keep).CopyTo(grown.AsWritableSpan());

@@ -18,8 +18,18 @@ public abstract class ShapedOptimizerBase : OptimizerBase
     public ParamGroup AddShapedParameter(int[] shape, float[] parameter, float[] gradient, IDictionary<string, double>? overrides = null)
     {
         if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (parameter is null) throw new ArgumentNullException(nameof(parameter));
+        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
+        if (gradient.Length != parameter.Length)
+            throw new ArgumentException($"The gradient has {gradient.Length} elements but the parameter has {parameter.Length}.", nameof(gradient));
         long count = 1;
-        foreach (int d in shape) count *= d;
+        // Positive only: a negative pair can multiply to the length, and a zero one leaves the factored row/column
+        // statistics an empty (divide-by-zero) average.
+        foreach (int d in shape)
+        {
+            if (d <= 0) throw new ArgumentException($"Every dimension must be positive; got [{string.Join(", ", shape)}].", nameof(shape));
+            count *= d;
+        }
         if (count != parameter.Length)
             throw new ArgumentException($"The shape holds {count} elements but the parameter has {parameter.Length}.", nameof(shape));
         var group = AddParamGroup(overrides);

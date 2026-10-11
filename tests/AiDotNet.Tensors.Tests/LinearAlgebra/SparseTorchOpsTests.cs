@@ -28,10 +28,11 @@ public class SparseTorchOpsTests
     [Fact]
     public void SparseMask_TakesTheSourceValuesAtTheMaskPattern()
     {
+        // torch keeps the (uncoalesced) mask's own order: indices [[0, 1, 2, 2], [1, 0, 2, 0]], values [1, 3, 8, 6].
         var m = SparseTensor<double>.SparseMask(Arange(3, 3), S());
         Assert.Equal(new[] { 0, 1, 2, 2 }, m.RowIndices);
-        Assert.Equal(new[] { 1, 0, 0, 2 }, m.ColumnIndices);
-        Assert.Equal(new double[] { 1, 3, 6, 8 }, m.Values);
+        Assert.Equal(new[] { 1, 0, 2, 0 }, m.ColumnIndices);
+        Assert.Equal(new double[] { 1, 3, 8, 6 }, m.Values);
     }
 
     [Fact]

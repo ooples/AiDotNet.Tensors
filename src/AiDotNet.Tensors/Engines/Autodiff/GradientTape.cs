@@ -2795,6 +2795,17 @@ public sealed class GradientTape<T> : IDisposable
         if (node is not null && ReferenceEquals(node.Output, target)) node.Output = old;
         target.GradFn = null;
         old._pinnedByTape = target._pinnedByTape;
+        // Every ACTIVE tape, innermost out: an outer tape still recording around this one can hold the old value's
+        // consumers (and its producer), and repointing only the current tape left those reading the overwritten tensor.
+        for (var tape = this; tape is not null; tape = tape._parent)
+            if (tape.RepointToSnapshot(target, old, node)) break;
+        return old;
+    }
+
+    // Repoints this tape's entries from target to its snapshot, newest first; true once it reached the producer (every
+    // consumer of the old value was recorded after it, here or in an inner tape).
+    private bool RepointToSnapshot(Tensor<T> target, Tensor<T> old, GradNode<T>? node)
+    {
         for (int i = _entries.Count - 1; i >= 0; i--)
         {
             ref var e = ref _entries[i];
@@ -2822,9 +2833,9 @@ public sealed class GradientTape<T> : IDisposable
                     for (int k = 0; k < nodeSaved.Length; k++)
                         if (ReferenceEquals(nodeSaved[k], target)) nodeSaved[k] = old;
             }
-            if (producer) break;
+            if (producer) return true;
         }
-        return old;
+        return false;
     }
 
     private static void RepointNodeInputs(GradNode<T> n, Tensor<T> from, Tensor<T> to)

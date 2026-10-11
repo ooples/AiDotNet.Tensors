@@ -113,13 +113,14 @@ public class InPlaceParityTests
             bool bitOp = ip.GetParameters()[0].ParameterType == typeof(Tensor<Bit>);
             if (bitOp) continue;   // Tensor<Bit> logical ops: checked in LogicalInPlace_MatchesOutOfPlace
 
+            bool handled = false;   // false only when every shape was outside the op's contract (each `continue`d)
             foreach (var shape in new[] { new[] { 3, 4 }, new[] { 4, 4 } })
             {
                 var args = ip.GetParameters().Select((p, i) => Argument(p, shape, i)).ToArray();
                 if (args.Select((a, i) => a is null && !ip.GetParameters()[i].ParameterType.IsGenericType
                         && Nullable.GetUnderlyingType(ip.GetParameters()[i].ParameterType) is null).Any(missing => missing))
                 {
-                    skipped.Add($"{inPlace.Name}: no argument for a parameter"); break;
+                    skipped.Add($"{inPlace.Name}: no argument for a parameter"); handled = true; break;
                 }
                 // Same arguments for the out-of-place op, in its own order, with the tensor as an untouched copy.
                 var self = (Tensor<double>)args[0];
@@ -133,19 +134,20 @@ public class InPlaceParityTests
                     used[k] = true;
                     opArgs[j] = k == 0 ? self.Clone() : args[k];
                 }
-                if (used.Any(x => !x)) { skipped.Add($"{inPlace.Name}: parameters do not pair with {baseName}"); break; }
+                if (used.Any(x => !x)) { skipped.Add($"{inPlace.Name}: parameters do not pair with {baseName}"); handled = true; break; }
                 Tensor<double> expected;
                 try { expected = (Tensor<double>)op.Invoke(_engine, opArgs)!; }
                 catch (TargetInvocationException) { continue; }   // this shape is outside the op's contract; try the next
-                if (!expected._shape.SequenceEqual(self._shape)) { skipped.Add($"{inPlace.Name}: shape changes"); break; }
+                if (!expected._shape.SequenceEqual(self._shape)) { skipped.Add($"{inPlace.Name}: shape changes"); handled = true; break; }
 
                 try { ip.Invoke(_engine, args); }
-                catch (TargetInvocationException ex) { failures.Add($"{inPlace.Name} threw where {baseName} succeeded: {ex.InnerException?.Message}"); break; }
+                catch (TargetInvocationException ex) { failures.Add($"{inPlace.Name} threw where {baseName} succeeded: {ex.InnerException?.Message}"); handled = true; break; }
                 if (!SameValues(self, expected))
                     failures.Add($"{inPlace.Name} on [{string.Join(",", shape)}]: in-place result differs from {baseName}");
                 checkedOps++;
-                break;
+                handled = true; break;
             }
+            if (!handled) skipped.Add($"{inPlace.Name}: {baseName} rejected every harness shape");
         }
         foreach (var s in skipped) _output.WriteLine("skipped " + s);
         _output.WriteLine($"{checkedOps} in-place ops checked against their out-of-place op");

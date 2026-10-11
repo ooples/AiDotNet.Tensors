@@ -31,12 +31,15 @@ public partial interface IEngine
     void TensorFillDiagonalInPlace<T>(Tensor<T> tensor, T value, bool wrap = false);
 
     /// <summary>Replaces every element x with <paramref name="func"/>(x) (torch <c>apply_</c>).</summary>
+    /// <remarks>Evaluated on the host by every engine, for the reason given on <see cref="TensorMapInPlace{T}"/>.</remarks>
     void TensorApplyInPlace<T>(Tensor<T> tensor, Func<T, T> func);
 
     /// <summary>Replaces every element x with <paramref name="func"/>(x, y), y from <paramref name="other"/> broadcast to the tensor (torch <c>map_</c>).</summary>
+    /// <remarks>The function is a managed delegate, so every engine (a GPU engine included) evaluates it on the host, as torch's <c>map_</c> is CPU-only; there is no device kernel to dispatch to.</remarks>
     void TensorMapInPlace<T>(Tensor<T> tensor, Tensor<T> other, Func<T, T, T> func);
 
     /// <summary>Replaces every element s with <paramref name="func"/>(s, x, y), from <paramref name="x"/> and <paramref name="y"/> broadcast to the tensor (torch <c>map2_</c>).</summary>
+    /// <remarks>Evaluated on the host by every engine, for the reason given on <see cref="TensorMapInPlace{T}"/>.</remarks>
     void TensorMap2InPlace<T>(Tensor<T> tensor, Tensor<T> x, Tensor<T> y, Func<T, T, T, T> func);
 
     /// <summary>

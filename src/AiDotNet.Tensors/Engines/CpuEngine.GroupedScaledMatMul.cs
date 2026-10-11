@@ -67,7 +67,7 @@ public partial class CpuEngine
             if (a._shape[0] != b._shape[0] || a._shape[2] != b._shape[1])
                 throw new ArgumentException($"Batched groups need [G, M, K] x [G, K, N]; got [{string.Join(", ", a._shape)}] x [{string.Join(", ", b._shape)}].");
             result = e.TensorBatchMatMul(a, b);
-            if (bias is not null) result = AddGroupBias(e, result, bias, groupAxis: 0);
+            if (bias is not null) result = AddGroupBias(e, result, bias);
             return result;
         }
 
@@ -89,7 +89,7 @@ public partial class CpuEngine
                 if (rows > 0)
                 {
                     var part = e.TensorMatMul(e.TensorNarrow(a, 0, start, rows), e.Reshape(e.TensorNarrow(b, 0, g, 1), new[] { k, n }));
-                    if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, GroupBias(e, bias, g, n));
+                    if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, GroupBias(e, bias, g, groups, n));
                     parts.Add(part);
                 }
                 start = ends[g];
@@ -112,7 +112,7 @@ public partial class CpuEngine
                 var part = len > 0
                     ? e.TensorMatMul(e.TensorNarrow(a, 1, start, len), e.TensorNarrow(b, 0, start, len))
                     : new Tensor<T>(new[] { m, n });
-                if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, GroupBias(e, bias, g, n));
+                if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, GroupBias(e, bias, g, groups, n));
                 parts[g] = e.Reshape(part, new[] { 1, m, n });
                 start = ends[g];
             }
@@ -132,7 +132,7 @@ public partial class CpuEngine
                 if (cols > 0)
                 {
                     var part = e.TensorMatMul(e.Reshape(e.TensorNarrow(a, 0, g, 1), new[] { m, k }), e.TensorNarrow(b, 1, start, cols));
-                    if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, e.TensorNarrow(GroupBias(e, bias, g, -1), 0, 0, cols));
+                    if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, e.TensorNarrow(GroupBias(e, bias, g, groups, -1), 0, 0, cols));
                     parts.Add(part);
                 }
                 start = ends[g];
@@ -153,17 +153,34 @@ public partial class CpuEngine
         }
     }
 
-    // The bias row for group g: bias is [N] (shared) or [G, N] (per group).
-    private static Tensor<T> GroupBias<T>(IEngine e, Tensor<T> bias, int g, int n)
+    // A grouped bias is [N] (shared by every group) or [G, N] (one row per group). Checked up front so a mismatch
+    // names the expected shape instead of failing later inside a narrow or a broadcast. n < 0 means the caller's
+    // per-group output width varies (jagged columns) and is enforced by the caller's own narrow.
+    private static void ValidateGroupBias<T>(Tensor<T> bias, int groups, int n)
     {
-        if (bias.Rank == 1) return bias;
-        if (bias.Rank == 2) return e.Reshape(e.TensorNarrow(bias, 0, g, 1), new[] { bias._shape[1] });
-        throw new ArgumentException("A grouped bias is [N] or [G, N].", nameof(bias));
+        bool ok = bias.Rank switch
+        {
+            1 => n < 0 || bias._shape[0] == n,
+            2 => bias._shape[0] == groups && (n < 0 || bias._shape[1] == n),
+            _ => false,
+        };
+        if (!ok)
+            throw new ArgumentException(
+                $"A grouped bias is [{(n < 0 ? "N" : n.ToString())}] or [{groups}, {(n < 0 ? "N" : n.ToString())}]; got [{string.Join(", ", bias._shape)}].",
+                nameof(bias));
     }
 
-    private static Tensor<T> AddGroupBias<T>(IEngine e, Tensor<T> result, Tensor<T> bias, int groupAxis)
+    // The bias row for group g.
+    private static Tensor<T> GroupBias<T>(IEngine e, Tensor<T> bias, int g, int groups, int n)
+    {
+        ValidateGroupBias(bias, groups, n);
+        return bias.Rank == 1 ? bias : e.Reshape(e.TensorNarrow(bias, 0, g, 1), new[] { bias._shape[1] });
+    }
+
+    private static Tensor<T> AddGroupBias<T>(IEngine e, Tensor<T> result, Tensor<T> bias)
     {
         // result [G, M, N]; bias [N] broadcasts directly, [G, N] becomes [G, 1, N].
+        ValidateGroupBias(bias, result._shape[0], result._shape[2]);
         var b = bias.Rank == 2 ? e.Reshape(bias, new[] { bias._shape[0], 1, bias._shape[1] }) : bias;
         return ((CpuEngine)e).TensorBroadcastAdd(result, b);
     }
@@ -201,8 +218,17 @@ public partial class CpuEngine
         using (new Autodiff.NoGradScope<T>())
         {
             bool jaggedK = a.Rank == 2 && b.Rank == 2;
-            if (jaggedK && recipeA != ScalingRecipe.TensorWise && recipeA != ScalingRecipe.RowWise)
-                throw new NotSupportedException("A jagged contraction dimension takes tensor-wise or per-group row-wise scales; block scales would straddle group boundaries.");
+            if (jaggedK)
+            {
+                // Both operands: DequantizeGrouped decodes every non-tensor-wise jagged-K operand as per-group row-wise
+                // and ignores its swizzle, so a block-wise recipeB whose length happened to equal G * N, or any
+                // swizzle, would be applied silently wrong rather than rejected.
+                foreach (var recipe in new[] { recipeA, recipeB })
+                    if (recipe != ScalingRecipe.TensorWise && recipe != ScalingRecipe.RowWise)
+                        throw new NotSupportedException("A jagged contraction dimension takes tensor-wise or per-group row-wise scales; block scales would straddle group boundaries.");
+                if (swizzleA != ScaleSwizzle.None || swizzleB != ScaleSwizzle.None)
+                    throw new NotSupportedException("Swizzled scales apply to block-scaled recipes only, which a jagged contraction dimension does not take.");
+            }
             var left = DequantizeGrouped(e, a, scaleA, recipeA, swizzleA, rightOperand: false, jaggedK ? offsets : null);
             var right = DequantizeGrouped(e, b, scaleB, recipeB, swizzleB, rightOperand: true, jaggedK ? offsets : null);
             return e.TensorGroupedMatMul(left, right, offsets, bias);

@@ -110,7 +110,8 @@ public partial class CpuEngine
         double u = 1.0 + x;
         if (u == 1.0) return x;
         if (double.IsInfinity(u)) return u;
-        return Math.Log(u) * x / (u - 1.0);
+        // The ratio first: Math.Log(u) * x overflows for x near double.MaxValue although the result is finite.
+        return Math.Log(u) * (x / (u - 1.0));
     }
 
     /// <summary>exp(x) - 1 without cancellation near 0 (Kahan's correction, as in <see cref="Log1pScalar"/>).</summary>
@@ -121,7 +122,8 @@ public partial class CpuEngine
         double um1 = u - 1.0;
         if (um1 == -1.0) return -1.0;
         if (double.IsInfinity(u)) return u;
-        return um1 * x / Math.Log(u);
+        // The ratio first: for x just under ln(double.MaxValue), um1 * x overflows although the result is finite.
+        return um1 * (x / Math.Log(u));
     }
 
     private static double Log2Scalar(double x)

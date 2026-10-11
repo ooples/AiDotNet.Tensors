@@ -1578,7 +1578,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         else
         {
-            for (int i = 0; i < Length; i++) this[i] = value;
+            FillStridedElements(value);   // one ownership check (above) and one version bump (below), not one per element
         }
         IncrementVersion();
         UniformFillValue = _numOps.ToDouble(value);

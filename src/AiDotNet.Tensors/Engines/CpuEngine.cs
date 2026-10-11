@@ -4213,7 +4213,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
         // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
-        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorBroadcastAddInPlace", (e, x) => ((CpuEngine)e).TensorBroadcastAdd(x, b)); return; }
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorBroadcastAddInPlace", (e, x) => ((CpuEngine)e).TensorBroadcastAdd(x, ReferenceEquals(b, a) ? x : b)); return; }
 
         // A non-contiguous target (a transpose, a strided slice) used to be swapped for a contiguous
         // COPY here, so every kernel below added into the copy and the caller's tensor came back

@@ -1383,10 +1383,30 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (IsSparse || source.IsSparse)
             throw new NotSupportedException("A sparse tensor cannot adopt or donate a dense layout.");
 
-        // Reading the data runs any pending device download into the host array.
+        // Deferred, lazy or paged-out storage first (the raw vector would be empty), then any pending device download
+        // into the host array.
+        EnsureMaterialized();
+        source.EnsureMaterialized();
         _ = _data.AsSpan();
         _ = source._data.AsSpan();
 
+        // Under the source's copy-on-write family lock (when it has one), so a first-write detach cannot swap its
+        // storage between the snapshot below and this tensor joining the family that detach moves together.
+        var family = source._cowFamily;
+        if (family is null)
+        {
+            bool sameStorage = ReferenceEquals(_storage, source._storage);
+            AdoptStorageAndLayout(source);
+            // Left the old family only when it left that storage: a layout change over its own (still COW-shared)
+            // storage must keep the pending detach.
+            if (!sameStorage) _cowFamily = null;
+        }
+        else family.Adopt(source, this, () => AdoptStorageAndLayout(source));
+        IncrementVersion();
+    }
+
+    private void AdoptStorageAndLayout(TensorBase<T> source)
+    {
         bool sameStorage = ReferenceEquals(_storage, source._storage);
         if (!sameStorage)
         {
@@ -1406,9 +1426,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         IsContiguous = source.IsContiguous;
         // Sharing another tensor's storage makes this a view of it; a layout change over its own storage does not.
         IsView = sameStorage ? IsView || source.IsView : true;
-        InvalidateGpuBindingAfterStorageReplacement();
+        // Only this tensor's OWN binding goes. With the source's vector adopted, the whole-vector binding properties
+        // (_gpuBuffer, _gpuBackend, ...) address the vector's shared device state, which describes the same bytes in the
+        // same layout and belongs to the source too: clearing through them stripped the source's buffer.
+        _viewGpuBuffer = null;
+        _viewGpuBackend = null;
         _viewGpuBufferVersion = -1;
-        IncrementVersion();
+        _viewGpuBufferIsSplitComplex = false;
+        _viewGpuBufferContainsRawInt32 = false;
+        _ownsGpuBuffer = false;          // never the owner of a buffer it adopted
+        _device = TensorDevice.CPU;      // the host data was made current above
     }
 
     private void InvalidateGpuBindingAfterStorageReplacement()
@@ -2331,6 +2358,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Sets the value at a flat (logical) index. Handles views correctly.
     /// </summary>
+    /// <summary>
+    /// Writes <paramref name="value"/> to every element of this (strided) view through the storage, with no per-element
+    /// ownership check or version bump: the caller has already run <see cref="EnsureOwnedForWrite"/> and bumps the
+    /// version once for the whole write.
+    /// </summary>
+    private protected void FillStridedElements(T value)
+    {
+        var writable = _storage.AsWritableSpan();   // a read-only mmap alias throws here, as in SetFlat
+        for (int i = 0; i < Length; i++) writable[FlatIndexToStorageIndex(i)] = value;
+    }
+
     public void SetFlat(int flatIndex, T value)
     {
         EnsureMaterialized();
@@ -3326,6 +3364,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     return view;
                 }
                 return view;
+            }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="adopt"/> (which gives <paramref name="target"/> the source's storage) under the family
+        /// lock, then makes the target a member while a detach is pending, as <see cref="CreateView"/> does for a view.
+        /// </summary>
+        internal void Adopt(TensorBase<T> source, TensorBase<T> target, Action adopt)
+        {
+            lock (_sync)
+            {
+                adopt();
+                if (_requiresDetach != 0 && ReferenceEquals(source._cowFamily, this))
+                {
+                    target._cowFamily = this;
+                    _members.Add(new WeakReference<TensorBase<T>>(target));
+                }
+                else target._cowFamily = null;
             }
         }
 

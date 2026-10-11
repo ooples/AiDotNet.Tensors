@@ -111,4 +111,62 @@ public class InPlaceAutogradChainTests
         AssertClose(
             Expected(v => (v > 0 ? 1 : -1) * (1 - System.Math.Tanh(System.Math.Abs(v)) * System.Math.Tanh(System.Math.Abs(v)))),
             TapeGradient((e, y) => { e.TensorAbsInPlace(y); e.TanhInPlace(y); }));
+
+    [Fact]
+    public void OpaqueMapsUnderATape_RefuseBeforeWriting()
+    {
+        // A callback has no derivative: recorded, the write would cut the gradient silently (torch refuses map_ on a
+        // tensor requiring grad). The refusal comes before the write, so the tensor keeps its value.
+        IEngine engine = new CpuEngine();
+        var other = new Tensor<double>(new[] { 1.0, 1.0, 1.0, 1.0 }, new[] { 4 });
+        using (new GradientTape<double>())
+        {
+            var y = engine.TensorMultiplyScalar(X(), 2.0);
+            Assert.Throws<InvalidOperationException>(() => engine.TensorApplyInPlace(y, v => v + 1.0));
+            Assert.Throws<InvalidOperationException>(() => engine.TensorMapInPlace(y, other, (a, b) => a + b));
+            Assert.Throws<InvalidOperationException>(() => engine.TensorMap2InPlace(y, other, other, (s, a, b) => s + a + b));
+            for (int i = 0; i < Xs.Length; i++) Assert.Equal(2.0 * Xs[i], y[i], 12);
+
+            using (new NoGradScope<double>())
+                engine.TensorMapInPlace(y, other, (a, b) => a + b);
+            for (int i = 0; i < Xs.Length; i++) Assert.Equal(2.0 * Xs[i] + 1.0, y[i], 12);
+        }
+    }
+
+    [Fact]
+    public void StorageSwapsUnderATape_RefuseBeforeChangingTheTensor()
+    {
+        IEngine engine = new CpuEngine();
+        var source = new Tensor<double>(new[] { 9.0, 8.0 }, new[] { 2 });
+        using (new GradientTape<double>())
+        {
+            var y = engine.TensorMultiplyScalar(X(), 2.0);
+            Assert.Throws<InvalidOperationException>(() => engine.TensorSetInPlace(y, source));
+            Assert.Throws<InvalidOperationException>(() => engine.TensorSetInPlace(y, source, 0, new[] { 2 }, new[] { 1 }));
+            Assert.Throws<InvalidOperationException>(() => engine.TensorResizeInPlace(y, new[] { 2 }));
+            Assert.Throws<InvalidOperationException>(() => engine.TensorAsStridedInPlace(y, new[] { 2 }, new[] { 2 }));
+            Assert.Equal(new[] { 4 }, y.Shape.ToArray());
+            for (int i = 0; i < Xs.Length; i++) Assert.Equal(2.0 * Xs[i], y[i], 12);
+
+            using (new NoGradScope<double>())
+                engine.TensorResizeInPlace(y, new[] { 2 });
+            Assert.Equal(new[] { 2 }, y.Shape.ToArray());
+        }
+    }
+
+    [Fact]
+    public void InPlaceInsideAnInnerTape_RebasesTheOuterTapesConsumers()
+    {
+        // The outer tape records z = y * y; an inner tape then overwrites y in place. z must still differentiate
+        // through the OLD y: dz/dx = d(4x^2)/dx = 8x, not a gradient read from the overwritten value.
+        IEngine engine = new CpuEngine();
+        var x = X();
+        using var outer = new GradientTape<double>();
+        var y = engine.TensorMultiplyScalar(x, 2.0);
+        var z = engine.TensorMultiply(y, y);
+        using (new GradientTape<double>())
+            engine.TensorAddInPlace(y, y);
+        var g = outer.ComputeGradients(engine.ReduceSum(z, null), new[] { x })[x].ToArray();
+        for (int i = 0; i < Xs.Length; i++) Assert.Equal(8.0 * Xs[i], g[i], 12);
+    }
 }

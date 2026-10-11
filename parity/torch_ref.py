@@ -17,6 +17,7 @@ out = {
   "adafactor_matrix": traj(torch.optim.Adafactor, (4, 6), lr=1e-2),
   "adafactor_vector": traj(torch.optim.Adafactor, (7,), lr=1e-2),
   "adafactor_wd": traj(torch.optim.Adafactor, (3, 5), lr=5e-2, weight_decay=0.1),
+  "adafactor_batched": traj(torch.optim.Adafactor, (2, 3, 4), lr=1e-2),
   "muon_tall": traj(torch.optim.Muon, (6, 4), lr=2e-2),
   "muon_wide_moonshot": traj(torch.optim.Muon, (3, 5), lr=2e-2, adjust_lr_fn="match_rms_adamw", nesterov=False),
 }
