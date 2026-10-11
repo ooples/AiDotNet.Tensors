@@ -331,10 +331,10 @@ internal static class SpecialFunctions
             else p += ((k / 2) % 2 == 0 ? 1 : -1) * term;
             if (Math.Abs(term) < 1e-17) break;
         }
-        // cos/sin(x - φ) through cos x and sin x, which reduce x exactly; forming x - φ first rounds it to x's ulp
+        // cos/sin(x - φ) through cos x and sin x, reduced exactly (ExactTrig); forming x - φ first rounds it to x's ulp
         // (1.2e-10 at x = 1e6), an error the cosine then carries in full near its zeros.
         double phi = (n / 2.0 + 0.25) * Math.PI, s = Math.Sqrt(2 / (Math.PI * x));
-        double cx = Math.Cos(x), sx = Math.Sin(x), cp = Math.Cos(phi), sp = Math.Sin(phi);
+        double cx = ExactTrig.Cos(x), sx = ExactTrig.Sin(x), cp = Math.Cos(phi), sp = Math.Sin(phi);
         double cosChi = cx * cp + sx * sp, sinChi = sx * cp - cx * sp;
         return (s * (p * cosChi - q * sinChi), s * (p * sinChi + q * cosChi));
     }
@@ -428,7 +428,7 @@ internal static class SpecialFunctions
         if (double.IsNaN(x)) return double.NaN;
         if (double.IsInfinity(x)) return 0;
         if (Math.Abs(x) < 1e-4) return 1 - x * x / 6;
-        return Math.Sin(x) / x;
+        return ExactTrig.Sin(x) / x;
     }
 
     // ∫₀^∞ f for a smooth, decaying f: unit-width panels of 32-node Gauss–Legendre up to where 'beyond' holds.
@@ -548,9 +548,9 @@ internal static class SpecialFunctions
             if (term < 1e-17) break;
         }
         // The phase ζ + π/4 for large z: ζ = (2/3)z^{3/2} reaches 6.7e20 at z = 1e14, where one ulp is 131072, so ζ
-        // is carried as a double-double hi + lo and sin/cos(ζ + π/4) expanded so Math.Sin/Cos reduce hi exactly.
+        // is carried as a double-double hi + lo and sin/cos(ζ + π/4) expanded so ExactTrig reduces hi exactly.
         ZetaDoubleDouble(z, out double hi, out double lo);
-        double sh = Math.Sin(hi), ch = Math.Cos(hi), sl = Math.Sin(lo + Math.PI / 4), cl = Math.Cos(lo + Math.PI / 4);
+        double sh = ExactTrig.Sin(hi), ch = ExactTrig.Cos(hi), sl = Math.Sin(lo + Math.PI / 4), cl = Math.Cos(lo + Math.PI / 4);
         double sinPhase = sh * cl + ch * sl, cosPhase = ch * cl - sh * sl;
         return (sinPhase * even - cosPhase * odd) / (Math.Sqrt(Math.PI) * Math.Pow(z, 0.25));
     }
