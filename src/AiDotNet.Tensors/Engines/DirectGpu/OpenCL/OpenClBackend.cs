@@ -6732,6 +6732,22 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW,
             int dilationH, int dilationW)
         {
+            // Registry dispatch (#1114): the established generic dispatch, the explicit tiled / direct kernels, or
+            // im2col + GEMM, chosen per shape class.
+            var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)) return;
+            Conv2DGenericCore(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        }
+
+        private void Conv2DGenericCore(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+            int batch, int inChannels, int inHeight, int inWidth,
+            int outChannels, int outHeight, int outWidth,
+            int kernelH, int kernelW,
+            int strideH, int strideW, int padH, int padW,
+            int dilationH, int dilationW)
+        {
             // Route: Winograd (3x3 stride-1 dilation-1) → Tiled (shared mem) → Direct fallback
             bool useWinograd = kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1
                                && dilationH == 1 && dilationW == 1;

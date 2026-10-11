@@ -7,14 +7,14 @@
       "shape": "f32:4096x64",
       "deterministic": true,
       "candidate": "generated.softmax.lanes16",
-      "speedup": 1.447
+      "speedup": 1.366
     },
     {
       "op": "Softmax",
       "shape": "f32:1024x128",
       "deterministic": true,
-      "candidate": "generated.softmax.lanes32",
-      "speedup": 1.228
+      "candidate": "opencl.softmax.group",
+      "speedup": 1
     },
     {
       "op": "Softmax",
@@ -27,8 +27,8 @@
       "op": "Softmax",
       "shape": "f32:2048x64",
       "deterministic": true,
-      "candidate": "generated.softmax.lanes16",
-      "speedup": 1.207
+      "candidate": "opencl.softmax.group",
+      "speedup": 1
     },
     {
       "op": "SoftmaxBackward",
@@ -62,8 +62,8 @@
       "op": "LayerNorm",
       "shape": "f32:4096x64",
       "deterministic": true,
-      "candidate": "generated.layernorm_forward.lanes16",
-      "speedup": 1.362
+      "candidate": "opencl.layernorm_forward.group",
+      "speedup": 1
     },
     {
       "op": "LayerNorm",
@@ -83,15 +83,15 @@
       "op": "LayerNorm",
       "shape": "f32:2048x64",
       "deterministic": true,
-      "candidate": "opencl.layernorm_forward.group",
-      "speedup": 1
+      "candidate": "generated.layernorm_forward.lanes8",
+      "speedup": 1.206
     },
     {
       "op": "LayerNormBackward",
       "shape": "f32:4096x64",
       "deterministic": true,
-      "candidate": "generated.layernorm_backward.lanes32",
-      "speedup": 1.182
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
     },
     {
       "op": "LayerNormBackward",
@@ -119,28 +119,56 @@
       "shape": "f32:4096x64",
       "deterministic": true,
       "candidate": "generated.layernorm_grad_params.rows32",
-      "speedup": 12.966
+      "speedup": 10.628
     },
     {
       "op": "LayerNormGradParameters",
       "shape": "f32:1024x128",
       "deterministic": true,
       "candidate": "generated.layernorm_grad_params.rows32",
-      "speedup": 5.307
+      "speedup": 4.599
     },
     {
       "op": "LayerNormGradParameters",
       "shape": "f32:8192x32",
       "deterministic": true,
-      "candidate": "generated.layernorm_grad_params.rows32",
-      "speedup": 18.465
+      "candidate": "generated.layernorm_grad_params.rows8",
+      "speedup": 6.26
     },
     {
       "op": "LayerNormGradParameters",
       "shape": "f32:2048x64",
       "deterministic": true,
       "candidate": "generated.layernorm_grad_params.rows32",
-      "speedup": 8.373
+      "speedup": 6.773
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:32x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:128x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x1x28x28x16x3x3x1x1x1x1x1x1x28x28",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
     }
   ]
 }

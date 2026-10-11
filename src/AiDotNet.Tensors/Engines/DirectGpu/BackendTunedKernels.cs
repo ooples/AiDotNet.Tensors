@@ -149,3 +149,56 @@ internal readonly struct TunedNormBackwardArgs
     internal int Rows { get; }
     internal int N { get; }
 }
+/// <summary>2-D convolution arguments (any backend): NCHW input, [Cout, Cin, kH, kW] filter.</summary>
+internal readonly struct TunedConv2DArgs
+{
+    internal TunedConv2DArgs(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        Input = input; Kernel = kernel; Output = output;
+        Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
+        OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
+        KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW;
+        PadH = padH; PadW = padW; DilationH = dilationH; DilationW = dilationW;
+    }
+
+    internal IGpuBuffer Input { get; }
+    internal IGpuBuffer Kernel { get; }
+    internal IGpuBuffer Output { get; }
+    internal int Batch { get; }
+    internal int InChannels { get; }
+    internal int InHeight { get; }
+    internal int InWidth { get; }
+    internal int OutChannels { get; }
+    internal int OutHeight { get; }
+    internal int OutWidth { get; }
+    internal int KernelH { get; }
+    internal int KernelW { get; }
+    internal int StrideH { get; }
+    internal int StrideW { get; }
+    internal int PadH { get; }
+    internal int PadW { get; }
+    internal int DilationH { get; }
+    internal int DilationW { get; }
+
+    internal int OutputCount => Batch * OutChannels * OutHeight * OutWidth;
+
+    /// <summary>Shape class: every geometric parameter, in CudaConv2DArgs' order (so profiles share keys).</summary>
+    internal TunedShape Shape()
+    {
+        var d = new[]
+        {
+            Batch, InChannels, InHeight, InWidth, OutChannels, KernelH, KernelW, StrideH, StrideW, PadH, PadW,
+            DilationH, DilationW, OutHeight, OutWidth,
+        };
+        return TunedShape.Create(TunedKernelDType.Float32, d);
+    }
+
+    /// <summary>The im2col scratch (batch * Cin*kH*kW * outH*outW floats) stays under 256 MiB.</summary>
+    internal static bool GemmScratchFits(TunedShape s)
+    {
+        long floats = (long)s[0] * s[1] * s[5] * s[6] * s[13] * s[14];
+        return floats > 0 && floats <= 64L * 1024 * 1024;
+    }
+}

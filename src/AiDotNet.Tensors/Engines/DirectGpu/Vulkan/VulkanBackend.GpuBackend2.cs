@@ -39,6 +39,10 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         try
         {
+            // Registry dispatch (#1115): the direct shader or im2col + GEMM, chosen per shape class.
+            var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)) return;
             int total = batch * outChannels * outHeight * outWidth;
             var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
                 (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,

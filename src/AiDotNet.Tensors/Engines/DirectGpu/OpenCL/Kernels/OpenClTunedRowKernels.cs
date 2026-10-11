@@ -186,6 +186,26 @@ void tk_column_grad_body(__global const float* gradOutput, __global const float*
     }
 }
 ");
+            sb.Append(@"
+// im2col to [P, B * L] (P = Cin*kH*kW, L = outH*outW) for the registry's im2col + GEMM convolution candidate: the batch
+// sits inside each row, so ONE GEMM covers every batch item. One work item per (batch, output pixel).
+__kernel void " + Im2ColName + @"(__global const float* input, __global float* col, int batch, int channels, int height, int width,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outH, int outW)
+{
+    int idx = (int)get_global_id(0);
+    int l = outH * outW;
+    if (idx >= batch * l) return;
+    int b = idx / l, s = idx % l, oh = s / outW, ow = s % outW;
+    for (int c = 0; c < channels; c++)
+        for (int kh = 0; kh < kernelH; kh++)
+            for (int kw = 0; kw < kernelW; kw++)
+            {
+                int ih = oh * strideH - padH + kh * dilationH, iw = ow * strideW - padW + kw * dilationW;
+                float v = (ih >= 0 && ih < height && iw >= 0 && iw < width) ? input[((b * channels + c) * height + ih) * width + iw] : 0.0f;
+                col[(long)((c * kernelH + kh) * kernelW + kw) * (batch * l) + b * l + s] = v;
+            }
+}
+");
             foreach (int l in RowLanes)
             {
                 string ls = l.ToString(CultureInfo.InvariantCulture);
@@ -213,9 +233,12 @@ __kernel __attribute__((reqd_work_group_size(32, {rs}, 1))) void {RmsNormGradGam
             return sb.ToString();
         }
 
+        /// <summary>The im2col variant writing [P, B * L] for the single-GEMM convolution candidate.</summary>
+        internal const string Im2ColName = "tk_im2col_pbl";
+
         public static string[] GetKernelNames()
         {
-            var names = new List<string>();
+            var names = new List<string> { Im2ColName };
             foreach (int l in RowLanes)
             {
                 names.Add(SoftmaxName(l));

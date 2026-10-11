@@ -322,4 +322,52 @@ public sealed class VulkanTunedKernelTests
         }
     }
 
+
+    // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.
+    private static readonly (int B, int C, int H, int W, int O, int K, int S, int P, int D)[] ConvShapes =
+    {
+        (1, 3, 8, 8, 4, 3, 1, 1, 1), (2, 4, 9, 7, 5, 3, 1, 0, 1), (1, 8, 6, 6, 3, 1, 1, 0, 1),
+        (2, 3, 11, 10, 2, 5, 2, 2, 1), (1, 2, 12, 12, 3, 3, 1, 2, 2), (3, 5, 7, 9, 6, 3, 2, 1, 1),
+    };
+
+    [SkippableFact]
+    public void Conv2DForward_EveryCandidate_MatchesCpu()
+    {
+        var backend = RequireBackend();
+        foreach (var (bt, c, h, w, o, k, s, p, d) in ConvShapes)
+        {
+            int oh = (h + 2 * p - d * (k - 1) - 1) / s + 1, ow = (w + 2 * p - d * (k - 1) - 1) / s + 1;
+            float[] x = Values(bt * c * h * w, bt * 13 + k, 2f), wt = Values(o * c * k * k, o * 7 + s, 1f);
+            var expected = new float[bt * o * oh * ow];
+            for (int b = 0; b < bt; b++)
+                for (int co = 0; co < o; co++)
+                    for (int y = 0; y < oh; y++)
+                        for (int z = 0; z < ow; z++)
+                        {
+                            double acc = 0;
+                            for (int ci = 0; ci < c; ci++)
+                                for (int kh = 0; kh < k; kh++)
+                                    for (int kw = 0; kw < k; kw++)
+                                    {
+                                        int ih = y * s - p + kh * d, iw = z * s - p + kw * d;
+                                        if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                        acc += (double)x[((b * c + ci) * h + ih) * w + iw] * wt[((co * c + ci) * k + kh) * k + kw];
+                                    }
+                            expected[((b * o + co) * oh + y) * ow + z] = (float)acc;
+                        }
+            using var xb = backend.AllocateBuffer(x);
+            using var wb = backend.AllocateBuffer(wt);
+            using var yb = backend.AllocateBuffer(expected.Length);
+            var args = new TunedConv2DArgs(xb, wb, yb, bt, c, h, w, o, oh, ow, k, k, s, s, p, p, d, d);
+            foreach (var cand in Applicable(backend.Conv2DForwardSlot, args.Shape()))
+            {
+                cand.Execute(args);
+                backend.Synchronize();
+                AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
+            }
+            // Every candidate applies to these small shapes, so a variant that silently dropped out fails here.
+            Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
+                + (k > 7 ? 1 : 0));
+        }
+    }
 }
