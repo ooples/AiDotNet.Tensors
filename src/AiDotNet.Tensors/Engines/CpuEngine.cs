@@ -3138,38 +3138,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 float* pB = (float*)pinB.Pointer;
                 float* pR = (float*)pinR.Pointer;
 
-            // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-            {
-                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
-            }
-            else
-            {
-                // Fallback: SimdKernels with parallel chunking for large arrays, at the shared
-                // elementwise grain (see CpuParallelSettings.ElementwiseGrainSize).
-                int addChunks = CpuParallelSettings.ElementwiseChunkCount(length);
-                if (addChunks >= 2)
-                {
-                    int chunkSize = (length + addChunks - 1) / addChunks;
-                    chunkSize = (chunkSize + 31) & ~31;
-                    var pACap = pA; var pBCap = pB; var pRCap = pR;
-                    int lenCap = length;
-
-                    PersistentParallelExecutor.Instance.Execute(addChunks, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, lenCap - start);
-                        if (count > 0)
-                        {
-                            SimdKernels.VectorAddUnsafe(pACap + start, pBCap + start, pRCap + start, count);
-                        }
-                    });
-                }
-                else
-                {
-                    SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
-                }
-            }
+            // SimdKernels through the elementwise dispatcher: one pass below the grain, split across threads above it
+            JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
             }
         }
         else if (typeof(T) == typeof(double))
@@ -3297,35 +3267,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 #endif
 
-            // Strategy 2: JIT-compiled kernel (size-specialized, 4x unrolled, parallel for large)
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-            {
-                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
-                if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
-                return;
-            }
-
-            // Fallback: SimdKernels with parallel chunking for large arrays
-            int numChunks = ElementwiseChunks(length);
-            if (numChunks >= 2)
-            {
-                int chunkSize = (length + numChunks - 1) / numChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorAddUnsafe(pB + start, pA + start, pA + start, count);
-                    }
-                });
-            }
-            else
-            {
-                SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
-            }
+            // Strategy 2: SimdKernels, split across threads above the elementwise grain
+            JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
             if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
             return;
         }
@@ -3401,10 +3344,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pB = (float*)pinB.Pointer;
             float* pR = (float*)pinR.Pointer;
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
-            else
-                Simd.SimdKernels.VectorAddUnsafe(pA, pB, pR, length);
+            JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Add);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -5790,30 +5730,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 float* pA = (float*)pinA.Pointer;
                 float* pB = (float*)pinB.Pointer;
                 float* pR = (float*)pinR.Pointer;
-                if (CpuJitSelfTest.IsVerified && length >= 64)
-                {
-                    JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Subtract);
-                }
-                else
-                {
-                    int subChunks = ElementwiseChunks(length);
-                    if (subChunks >= 2)
-                    {
-                        int chunkSize = (length + subChunks - 1) / subChunks;
-                        chunkSize = (chunkSize + 31) & ~31;
-                        CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
-                        {
-                            int start = chunk * chunkSize;
-                            int count = Math.Min(chunkSize, length - start);
-                            if (count > 0)
-                                SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pR + start, count);
-                        });
-                    }
-                    else
-                    {
-                        SimdKernels.VectorSubtractUnsafe(pA, pB, pR, length);
-                    }
-                }
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Subtract);
             }
         }
         else if (typeof(T) == typeof(double))
@@ -5949,30 +5866,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 float* pA = (float*)pinA.Pointer;
                 float* pB = (float*)pinB.Pointer;
                 float* pR = (float*)pinR.Pointer;
-                if (CpuJitSelfTest.IsVerified && length >= 64)
-                {
-                    JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Multiply);
-                }
-                else
-                {
-                    int mulChunks = ElementwiseChunks(length);
-                    if (mulChunks >= 2)
-                    {
-                        int chunkSize = (length + mulChunks - 1) / mulChunks;
-                        chunkSize = (chunkSize + 31) & ~31;
-                        CpuParallelSettings.ParallelForOrSerial(0, mulChunks, length, chunk =>
-                        {
-                            int start = chunk * chunkSize;
-                            int count = Math.Min(chunkSize, length - start);
-                            if (count > 0)
-                                SimdKernels.VectorMultiplyUnsafe(pA + start, pB + start, pR + start, count);
-                        });
-                    }
-                    else
-                    {
-                        SimdKernels.VectorMultiplyUnsafe(pA, pB, pR, length);
-                    }
-                }
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Multiply);
             }
         }
         else if (typeof(T) == typeof(double))
@@ -6089,33 +5983,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 #endif
 
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-            {
-                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
-                if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
-                return;
-            }
-
-            int numChunks = ElementwiseChunks(length);
-            if (numChunks >= 2)
-            {
-                int chunkSize = (length + numChunks - 1) / numChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorMultiplyUnsafe(pB + start, pA + start, pA + start, count);
-                    }
-                });
-            }
-            else
-            {
-                SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
-            }
+            JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
             if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
             return;
         }
@@ -6257,34 +6125,8 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pB = (float*)pinB.Pointer;
 
-            // No oneDNN subtract primitive — go straight to JIT/SIMD
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-            {
-                JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
-                if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
-                return;
-            }
-
-            int numChunks = ElementwiseChunks(length);
-            if (numChunks >= 2)
-            {
-                int chunkSize = (length + numChunks - 1) / numChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.VectorSubtractUnsafe(pA + start, pB + start, pA + start, count);
-                    }
-                });
-            }
-            else
-            {
-                SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
-            }
+            // No oneDNN subtract primitive — go straight to SIMD
+            JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
             if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
             return;
         }
@@ -6683,30 +6525,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 float* pA = (float*)pinA.Pointer;
                 float* pB = (float*)pinB.Pointer;
                 float* pR = (float*)pinR.Pointer;
-                if (CpuJitSelfTest.IsVerified && length >= 64)
-                {
-                    JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
-                }
-                else
-                {
-                    int subChunks = ElementwiseChunks(length);
-                    if (subChunks >= 2)
-                    {
-                        int chunkSize = (length + subChunks - 1) / subChunks;
-                        chunkSize = (chunkSize + 31) & ~31;
-                        CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
-                        {
-                            int start = chunk * chunkSize;
-                            int count = Math.Min(chunkSize, length - start);
-                            if (count > 0)
-                                SimdKernels.VectorDivideUnsafe(pA + start, pB + start, pR + start, count);
-                        });
-                    }
-                    else
-                    {
-                        SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
-                    }
-                }
+                JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
             }
         }
         else if (typeof(T) == typeof(double))
@@ -11772,10 +11591,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     float* pSrc = pSrcFix + sOff;
                     float* pDst = pDstFix + dOff;
-                    if (CpuJitSelfTest.IsVerified && length >= 64)
-                        JitUnaryDispatch(pSrc, pDst, length);
-                    else
-                        SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+                    JitUnaryDispatch(pSrc, pDst, length);
                 }
             }
         }
@@ -11952,10 +11768,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-                JitUnaryDispatch(pSrc, pDst, length);
-            else
-                ParallelComputeBound(pSrc, pDst, length, Simd.SimdKernels.ReLUUnsafe);
+            JitUnaryDispatch(pSrc, pDst, length);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -46333,6 +46146,14 @@ public partial class CpuEngine : ITensorLevelEngine
     #region JIT Dispatch Helpers
 
     /// <summary>
+    /// Chunks the last float JIT elementwise dispatch on this thread fanned out to (0 = ran serially). A test hook:
+    /// these dispatchers once returned through the SERIAL path whenever the array was large enough to split,
+    /// leaving every large float add/subtract/multiply/divide/min/max/relu on one core -- correct values, so only
+    /// a dispatch assertion catches it (ElementwiseDispatchParallelismTests).
+    /// </summary>
+    [ThreadStatic] internal static int t_lastElementwiseDispatchChunks;
+
+    /// <summary>
     /// Runs a float binary elementwise op (Add / Subtract / Multiply / Divide) on SimdKernels, split across threads
     /// at the shared <see cref="ElementwiseGrain"/> (one chunk per grain, at most the pool width).
     /// </summary>
@@ -46344,11 +46165,14 @@ public partial class CpuEngine : ITensorLevelEngine
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
         int numChunks = ElementwiseChunks(length);
-        if (numChunks >= 2)
+        if (numChunks < 2)
         {
+            // Below the elementwise grain: one serial pass.
+            t_lastElementwiseDispatchChunks = 0;
             RunBinary(pA, pB, pR, length, op);
             return;
         }
+        t_lastElementwiseDispatchChunks = numChunks;
 
         int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
         CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
@@ -46376,11 +46200,14 @@ public partial class CpuEngine : ITensorLevelEngine
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
         int numChunks = ElementwiseChunks(length);
-        if (numChunks >= 2)
+        if (numChunks < 2)
         {
+            // Below the elementwise grain: one serial pass.
+            t_lastElementwiseDispatchChunks = 0;
             SimdKernels.ReLUUnsafe(pSrc, pDst, length);
             return;
         }
+        t_lastElementwiseDispatchChunks = numChunks;
 
         int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
         CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
