@@ -29817,17 +29817,43 @@ public partial class CpuEngine : ITensorLevelEngine
 
         float scaleF = (float)scaleValue;
         float negInfF = float.NegativeInfinity;
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
+
+        // Work items are (head, block of SdpaRowBlock query rows), as in ScaledDotProductAttentionFloat: few heads no
+        // longer leave most cores idle, and every item runs the same single-threaded SIMD GEMM on the same fixed
+        // blocks, so the output is bit-identical at any degree of parallelism. K^T (and V, when its rows are strided)
+        // is packed once per head; a strided Q block is packed per item.
+        int qBlocks = (seqQ + SdpaRowBlock - 1) / SdpaRowBlock;
+        int ktLen = bhCount * d_k * seqK;
+        bool packV = vRowStride != d_v;
+        var ktAll = System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, ktLen));
+        var vPacked = packV ? System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, bhCount * seqK * d_v)) : null;
+        try
         {
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqK * (d_k + d_v), bh =>
+        {
+            int b = bh / heads, h = bh % heads;
+            int kOff = kBase + b * kBatchStride + h * kHeadStride, tOff = bh * d_k * seqK;
+            for (int i = 0; i < seqK; i++)
+                for (int j = 0; j < d_k; j++)
+                    ktAll[tOff + j * seqK + i] = kf[kOff + i * kRowStride + j];
+            if (vPacked != null)
+            {
+                int vOff = vBase + b * vBatchStride + h * vHeadStride, pOff = bh * seqK * d_v;
+                for (int i = 0; i < seqK; i++)
+                    Array.Copy(vf, vOff + i * vRowStride, vPacked, pOff + i * d_v, d_v);
+            }
+        }, deterministicSafe: true);
+
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount * qBlocks, (long)bhCount * seqQ * seqK * (d_k + d_v), [MethodImpl(Hot)] (item) =>
+        {
+            int bh = item / qBlocks;
+            int i0 = (item % qBlocks) * SdpaRowBlock;
+            int rows = Math.Min(SdpaRowBlock, seqQ - i0);
             int b = bh / heads;
             int h = bh % heads;
 
             // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
-            // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
-            // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
-            // of indexing past its bounds. The MHA fast paths already did this; these generic
-            // SDPA workers did not, which is why the GQA causal path had to materialize a full
-            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            // [batch, heads, seq_q, seq_k]); a size-1 axis maps every index to 0.
             int mskB = mask is null ? 1 : mask.Shape[0];
             int mskH = mask is null ? 1 : mask.Shape[1];
             int mskQ = mask is null ? 1 : mask.Shape[2];
@@ -29835,67 +29861,42 @@ public partial class CpuEngine : ITensorLevelEngine
             int mskb = BroadcastMaskIndex(b, mskB);
             int mskh = BroadcastMaskIndex(h, mskH);
             // Per-head storage offsets via the operands' (possibly permuted) strides.
-            int qOff = qBase + b * qBatchStride + h * qHeadStride;
-            int kOff = kBase + b * kBatchStride + h * kHeadStride;
-            int vOff = vBase + b * vBatchStride + h * vHeadStride;
-            int sOff = bh * seqQ * seqK;
-            int oOff = bh * seqQ * d_v;
+            int qOff = qBase + b * qBatchStride + h * qHeadStride + i0 * qRowStride;
+            int sOff = bh * seqQ * seqK + i0 * seqK;
+            int oOff = bh * seqQ * d_v + i0 * d_v;
 
-            // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
-            // force the single-threaded inner GEMM when this body is itself a parallel worker.
-            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-
-            // Step 1: scores = Q @ K^T → scratch. Q is [seqQ,d_k] with leading dim qRowStride,
-            // K is [seqK,d_k] (used transposed) with leading dim kRowStride; the resolver
-            // guarantees the d_k dimension is unit-stride, which is all BLAS lda/ldb require.
-            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: seqK, k: d_k,
-                a: qf, aOffset: qOff, lda: qRowStride, transA: false,
-                b: kf, bOffset: kOff, ldb: kRowStride, transB: true,
-                c: scratch, cOffset: sOff, ldc: seqK);
-            if (!gemmed)
+            // Step 1: the block's scores = Q[i0 .. i0+rows) @ K^T -> scratch. The d_k dimension is unit-stride (the
+            // resolver guarantees it); rows with a wider stride are packed first.
+            float[]? qPackRented = qRowStride != d_k ? System.Buffers.ArrayPool<float>.Shared.Rent(rows * d_k) : null;
+            try
             {
-                // SgemmSequential needs packed (row-major, leading dim == cols) inputs, so
-                // gather strided Q/K per-head slices into small reused buffers. kt holds K^T.
-                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                float[]? qPackRented = qRowStride != d_k
-                    ? System.Buffers.ArrayPool<float>.Shared.Rent(seqQ * d_k) : null;
-                try
+                ReadOnlySpan<float> qSpan;
+                if (qPackRented != null)
                 {
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_k; j++)
-                            kt[j * seqK + i] = kf[kOff + i * kRowStride + j];
-
-                    ReadOnlySpan<float> qSpan;
-                    if (qPackRented != null)
-                    {
-                        for (int i = 0; i < seqQ; i++)
-                            for (int j = 0; j < d_k; j++)
-                                qPackRented[i * d_k + j] = qf[qOff + i * qRowStride + j];
-                        qSpan = qPackRented.AsSpan(0, seqQ * d_k);
-                    }
-                    else
-                    {
-                        qSpan = qf.AsSpan(qOff, seqQ * d_k);
-                    }
-
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        qSpan,
-                        kt.AsSpan(0, d_k * seqK),
-                        scratch.AsSpan(sOff, seqQ * seqK),
-                        seqQ, d_k, seqK);
+                    for (int r = 0; r < rows; r++)
+                        Array.Copy(qf, qOff + r * qRowStride, qPackRented, r * d_k, d_k);
+                    qSpan = qPackRented.AsSpan(0, rows * d_k);
                 }
-                finally
+                else
                 {
-                    System.Buffers.ArrayPool<float>.Shared.Return(kt);
-                    if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
+                    qSpan = qf.AsSpan(qOff, rows * d_k);
                 }
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    qSpan,
+                    ktAll.AsSpan(bh * d_k * seqK, d_k * seqK),
+                    scratch.AsSpan(sOff, rows * seqK),
+                    rows, d_k, seqK);
+            }
+            finally
+            {
+                if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
             }
 
             // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
-            for (int i = 0; i < seqQ; i++)
+            for (int r = 0; r < rows; r++)
             {
-                int rowOff = sOff + i * seqK;
+                int i = i0 + r;
+                int rowOff = sOff + r * seqK;
                 float maxVal = negInfF;
                 for (int j = 0; j < seqK; j++)
                 {
@@ -29920,44 +29921,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
             }
 
-            // Step 3: output = probs @ V → outBuf. V is [seqK,d_v] with leading dim vRowStride
-            // (resolver guarantees d_v unit-stride). TryGemmEx beta=0 SET / SgemmSequential
-            // self-clears, so outBuf needs no pre-zero.
-            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: d_v, k: seqK,
-                a: scratch, aOffset: sOff, lda: seqK, transA: false,
-                b: vf, bOffset: vOff, ldb: vRowStride, transB: false,
-                c: outBuf, cOffset: oOff, ldc: d_v);
-            if (!gemmed2)
-            {
-                ReadOnlySpan<float> vSpan;
-                float[]? vPackRented = null;
-                if (vRowStride != d_v)
-                {
-                    vPackRented = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * d_v);
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_v; j++)
-                            vPackRented[i * d_v + j] = vf[vOff + i * vRowStride + j];
-                    vSpan = vPackRented.AsSpan(0, seqK * d_v);
-                }
-                else
-                {
-                    vSpan = vf.AsSpan(vOff, seqK * d_v);
-                }
-                try
-                {
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        scratch.AsSpan(sOff, seqQ * seqK),
-                        vSpan,
-                        outBuf.AsSpan(oOff, seqQ * d_v),
-                        seqQ, seqK, d_v);
-                }
-                finally
-                {
-                    if (vPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(vPackRented);
-                }
-            }
-        });
+            // Step 3: the block's output rows = probs @ V -> outBuf (SgemmSequential overwrites, no pre-zero).
+            ReadOnlySpan<float> vSpan = vPacked != null
+                ? vPacked.AsSpan(bh * seqK * d_v, seqK * d_v)
+                : vf.AsSpan(vBase + b * vBatchStride + h * vHeadStride, seqK * d_v);
+            Engines.Simd.SimdGemm.SgemmSequential(
+                scratch.AsSpan(sOff, rows * seqK),
+                vSpan,
+                outBuf.AsSpan(oOff, rows * d_v),
+                rows, seqK, d_v);
+        }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(ktAll, clearArray: false);
+            if (vPacked != null) System.Buffers.ArrayPool<float>.Shared.Return(vPacked, clearArray: false);
+        }
     }
 
     /// <summary>

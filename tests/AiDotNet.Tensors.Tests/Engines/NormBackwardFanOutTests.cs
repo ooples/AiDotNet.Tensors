@@ -374,4 +374,32 @@ public class AttentionFanOutTests
                     }
                 }
     }
+
+    [Theory]
+    [InlineData(1, 3, 150, 40, 16)]
+    [InlineData(2, 2, 64, 200, 32)]
+    public void SdpaInto_StridedOperands_SameAtAnyThreadCount_AndMatchesSdpa(int batch, int heads, int seqQ, int seqK, int d)
+    {
+        // [B, T, H, D] permuted to [B, H, T, D]: row stride H * D, the layout the fused MHA path passes without a copy.
+        var q = Random(4, batch, seqQ, heads, d).Transpose(new[] { 0, 2, 1, 3 });
+        var k = Random(5, batch, seqK, heads, d).Transpose(new[] { 0, 2, 1, 3 });
+        var v = Random(6, batch, seqK, heads, d).Transpose(new[] { 0, 2, 1, 3 });
+        float[] Into(int dop)
+        {
+            int prior = CpuParallelSettings.MaxDegreeOfParallelism;
+            try
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = dop;
+                var dst = new Tensor<float>(new[] { batch, heads, seqQ, d });
+                new CpuEngine().ScaledDotProductAttentionInto(dst, q, k, v, null);
+                return dst.ToArray();
+            }
+            finally { CpuParallelSettings.MaxDegreeOfParallelism = prior; }
+        }
+        var serial = Into(1);
+        var parallel = Into(Math.Max(4, Environment.ProcessorCount));
+        Assert.Equal(serial, parallel);
+        var reference = Run(1, q.Contiguous(), k.Contiguous(), v.Contiguous(), null).Output;
+        Assert.Equal(reference, parallel);   // same blocks, same kernel: the same bits as the materializing SDPA
+    }
 }
