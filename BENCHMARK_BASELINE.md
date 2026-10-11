@@ -1,5 +1,9 @@
 # Benchmark Baseline (CPU + GPU)
 
+> **Historical.** This is the March 2026 baseline on a Ryzen 9 3950X, kept as the starting point the P0 gaps below were
+> measured from; it is not current. The current comparison tables and their raw reports are in the README's
+> [CPU Benchmarks](README.md#cpu-benchmarks) section.
+
 Date: 2026-03-09
 Hardware: AMD Ryzen 9 3950X, DDR4, Windows 11 Pro
 Runtime: .NET 10.0, BenchmarkDotNet 0.15.8

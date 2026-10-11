@@ -1,6 +1,5 @@
 using System;
 using AiDotNet.Tensors.Engines;
-using AiDotNet.Tensors.Engines.CpuJit;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -16,8 +15,16 @@ namespace AiDotNet.Tensors.Tests.Engines;
 public class ElementwiseDispatchParallelismTests
 {
     // ReLUInto is the compiled plan's ReLU; it reaches the unary dispatcher at every size (eager ReLU splits large
-    // arrays itself and only calls the dispatcher below its own threshold).
-    public static TheoryData<string> Ops() => new() { "add", "subtract", "multiply", "divide", "reluInto" };
+    // arrays itself and only calls the dispatcher below its own threshold). AddInto is the zero-allocation add, which
+    // ran single-threaded wherever the CPU JIT was unavailable (Linux, macOS, .NET Framework).
+    public static TheoryData<string> Ops() => new() { "add", "addInto", "subtract", "multiply", "divide", "reluInto" };
+
+    private static Tensor<float> AddInto(CpuEngine engine, Tensor<float> a, Tensor<float> b)
+    {
+        var dst = new Tensor<float>(a._shape);
+        engine.TensorAddInto(dst, a, b);
+        return dst;
+    }
 
     private static Tensor<float> ReluInto(CpuEngine engine, Tensor<float> a)
     {
@@ -26,14 +33,11 @@ public class ElementwiseDispatchParallelismTests
         return dst;
     }
 
-    [SkippableTheory]
+    // No JIT precondition: the dispatchers run SimdKernels, so every platform must fan out the same way.
+    [Theory]
     [MemberData(nameof(Ops))]
     public void LargeFloatElementwise_FansOut_SmallStaysSerial(string op)
     {
-        // The JIT dispatchers only run once the self-test verifies them. Unsupported hardware (no AVX2/FMA, not
-        // Windows x64, or .NET Framework) skips; a supported machine whose self-test fails is a real failure.
-        Skip.IfNot(CpuJitKernels.IsSupported, "The CPU JIT is not supported on this machine.");
-        Assert.True(CpuJitSelfTest.IsVerified, "The CPU JIT is supported here but its self-test failed.");
         int previousDop = CpuParallelSettings.MaxDegreeOfParallelism;
         CpuParallelSettings.MaxDegreeOfParallelism = 8;
         try
@@ -47,6 +51,7 @@ public class ElementwiseDispatchParallelismTests
                 var r = op switch
                 {
                     "add" => engine.TensorAdd(a, b),
+                    "addInto" => AddInto(engine, a, b),
                     "subtract" => engine.TensorSubtract(a, b),
                     "multiply" => engine.TensorMultiply(a, b),
                     "divide" => engine.TensorDivide(a, b),
@@ -58,7 +63,7 @@ public class ElementwiseDispatchParallelismTests
                 foreach (int i in new[] { 0, 1, n / 2, n - 1 })
                 {
                     float x = a[i], y = b[i];
-                    float expected = op switch { "add" => x + y, "subtract" => x - y, "multiply" => x * y, "divide" => x / y, _ => Math.Max(x, 0f) };
+                    float expected = op switch { "add" or "addInto" => x + y, "subtract" => x - y, "multiply" => x * y, "divide" => x / y, _ => Math.Max(x, 0f) };
                     Assert.Equal(expected, r[i]);
                 }
             }

@@ -1238,6 +1238,7 @@ class Program
             BenchmarkRunner.Run<LinearAlgebraBenchmarks>(BenchConfig);
             BenchmarkRunner.Run<SmallMatrixBenchmarks>(BenchConfig);
             BenchmarkRunner.Run<ElementWiseBenchmarks>(BenchConfig);
+            RunManifest.Write("linalg", "NumSharp", "MathNet.Numerics");
             return;
         }
 
@@ -1675,6 +1676,7 @@ class Program
             BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>(BenchConfig);
             BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>(BenchConfig);
             BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>(BenchConfig);
+            RunManifest.Write("vs-all", "TorchSharp", "Microsoft.ML", "TensorFlow.NET");
             return;
         }
 
