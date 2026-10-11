@@ -137,6 +137,31 @@ public abstract class TorchParityIndexDeviceTestsBase
         return t;
     }
 
+    // #1131: the CPU sort now uses the same total order as the device sort, so values and indices agree exactly
+    // (NaN, +-inf, +-0 and ties included), on the innermost axis and on a middle axis.
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sort_CpuAndGpuAgree(bool descending)
+    {
+        var gpu = GpuOrSkip();
+        var cpu = new CpuEngine();
+        foreach (var shape in new[] { new[] { 5, 19 }, new[] { 3, 17, 4 } })
+        {
+            var x = new Tensor<float>(shape);
+            var rng = new Random(23 + shape.Length);
+            float[] pool = { float.NaN, float.PositiveInfinity, float.NegativeInfinity, 2f, 2f, -1f, 0f, -0f, 0.5f };
+            for (int i = 0; i < x.Length; i++) x[i] = pool[rng.Next(pool.Length)];
+            var (gv, gi) = gpu.TensorSort(x, 1, descending);
+            var (cv, ci) = cpu.TensorSort(x, 1, descending);
+            for (int i = 0; i < x.Length; i++)
+            {
+                Assert.True(ci[i] == gi[i], $"shape [{string.Join(",", shape)}] {(descending ? "desc" : "asc")} element {i}: cpu index {ci[i]}, gpu index {gi[i]}");
+                Assert.Equal(BitConverter.ToInt32(BitConverter.GetBytes(cv[i]), 0), BitConverter.ToInt32(BitConverter.GetBytes(gv[i]), 0));
+            }
+        }
+    }
+
     // torch.sort order on rows of non-power-of-two length: NaN after +inf ascending, first descending; equal values in
     // original order; every index a real position (padding never leaks into the output).
     [SkippableTheory]
