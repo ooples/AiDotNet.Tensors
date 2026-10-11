@@ -1539,8 +1539,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var reciprocal = default(OwnedBuffer);
         try
         {
-            squared = AllocateOutputBuffer(backend, count);
-            reciprocal = AllocateOutputBuffer(backend, count);
+            squared = AllocateFullyWrittenOutputBuffer(backend, count);
+            reciprocal = AllocateFullyWrittenOutputBuffer(backend, count);
             backend.Multiply(
                 inverseStandardDeviationAndVariance,
                 inverseStandardDeviationAndVariance,
@@ -1703,7 +1703,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var permutation = new int[rank];
         for (int k = 0; k < rank; k++) permutation[order[k]] = k;   // output axis j reads base axis permutation[j]
 
-        var output = AllocateOutputBuffer(backend, view.Length);
+        var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
         try
         {
             backend.Permute(baseBuffer, output.Buffer, baseShape, permutation);
@@ -3071,10 +3071,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var eng = s_residentScratchEngine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
-        return new OwnedBuffer(AllocateReclaiming(backend, b => b is IUninitializedGpuAllocation uninitialized
-            ? uninitialized.AllocateBufferUninitialized(size)
-            : b.AllocateBuffer(size)), ownsBuffer: true);
+        return new OwnedBuffer(AllocateReclaiming(backend, b => AllocateDeviceBufferUninitialized(b, size)), ownsBuffer: true);
     }
+
+    /// <summary>
+    /// A raw device buffer the caller's next kernel writes in full: not zero-filled where the backend supports it
+    /// (see <see cref="IUninitializedGpuAllocation"/> for what must never use this).
+    /// </summary>
+    private static IGpuBuffer AllocateDeviceBufferUninitialized(IDirectGpuBackend backend, int size) =>
+        backend is IUninitializedGpuAllocation uninitialized
+            ? uninitialized.AllocateBufferUninitialized(size)
+            : backend.AllocateBuffer(size);
 
     /// <summary>
     /// Runs <paramref name="allocate"/>, and if it fails, reclaims memory held only by unreachable objects and tries
@@ -5180,7 +5187,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // so SAME-tensor consumers resolve it via t._gpuBuffer; the (action,local) key gives determinism.
         if (ScratchPoolingActive)
             return RentActionScratch(backend, length, fullyWritten);
-        var buf = backend.AllocateBuffer(length);
+        var buf = fullyWritten ? AllocateDeviceBufferUninitialized(backend, length) : backend.AllocateBuffer(length);
         if (arr is not null) CacheActivation(arr, buf, t._shape, backend, hostVersion: t.GpuCacheVersion);
         return buf;
     }
@@ -8096,7 +8103,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int n = preActivation.Length;
                 using var preBuffer = GetOrAllocateBuffer(backend, preActivation);
                 var result = DispatchDeferredGpuOp<T>(backend, n, (int[])preActivation._shape.Clone(), output =>
-                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation));
+                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation), fullyWritten: true);
                 return (result, preActivation);
             }
         }
@@ -15368,12 +15375,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // while the forward + matmul/softmax/embedding backward were all correct (see Phase_GPU_Grad_Check).
             // Convert variance → invVar here so the kernels get the inverse-std they actually consume.
             using var trueVarianceBuffer = GetOrAllocateBuffer(backend, variance);
-            using var saveVarBuffer = AllocateOutputBuffer(backend, batchSize);
+            using var saveVarBuffer = AllocateFullyWrittenOutputBuffer(backend, batchSize);
             backend.AddScalar(trueVarianceBuffer.Buffer, saveVarBuffer.Buffer, (float)epsilon, batchSize);
             backend.Sqrt(saveVarBuffer.Buffer, saveVarBuffer.Buffer, batchSize);
             backend.Reciprocal(saveVarBuffer.Buffer, saveVarBuffer.Buffer, batchSize);
 
-            var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
+            // gradGamma / gradBeta stay zero-filled: they reduce across rows, and a tuned candidate may accumulate.
+            var gradInputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
             var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
             var gradBetaBuffer = AllocateOutputBuffer(backend, normalizedSize);
             bool handedOff = false;
@@ -17790,7 +17798,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     backend.OuterProduct(gradient.Buffer, ones, output, outerSize, reduceCount);
                     backend.Scale(output, output, 1f / reduceCount, inputSize);
-                });
+                }, fullyWritten: true);
             }
             catch (Exception ex)
             {
@@ -20309,7 +20317,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         IGpuBuffer? output = null;
         try
         {
-            output = backend.AllocateBuffer(a.Length);
+            output = AllocateDeviceBufferUninitialized(backend, a.Length);   // an elementwise map writes every element
             kernel(backend, residentA, residentB, output, a.Length);
             var result = DeferTensorResult<T>(backend, output, a.Length, a.Shape.ToArray());
             output = null; // ownership transferred to the deferred tensor
@@ -22353,7 +22361,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
             using var bufIn = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);
             var transposed = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, new[] { cols, rows });
             Autodiff.DifferentiableOps.RecordUnary("TensorTranspose", transposed, tensor, Autodiff.BackwardFunctions<T>.TransposeBackward);
@@ -22725,9 +22733,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
-            bufOut = AllocateOutputBuffer(backend, input.Length);
-            bufMean = AllocateOutputBuffer(backend, outerSize);
-            bufVar = AllocateOutputBuffer(backend, outerSize);
+            bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            bufMean = AllocateFullyWrittenOutputBuffer(backend, outerSize);
+            bufVar = AllocateFullyWrittenOutputBuffer(backend, outerSize);
             backend.LayerNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, outerSize, normSize, (float)epsilon);
             ConvertInverseStandardDeviationToVariance(
@@ -24561,7 +24569,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Length / b.Length;
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                var bufOut = AllocateOutputBuffer(backend, a.Length);
+                var bufOut = AllocateFullyWrittenOutputBuffer(backend, a.Length);
                 backend.BroadcastAddLast(bufA.Buffer, bufB.Buffer, bufOut.Buffer, outerSize, b.Length);
                 var output = DeferTensorResult<T>(backend, bufOut.Buffer, a.Length, a.Shape.ToArray());
                 return RecordGpuResult(output);
@@ -26284,7 +26292,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var input = UploadTensorRaw(backend, tensor);
-            output = backend.AllocateBuffer(total);
+            output = AllocateDeviceBufferUninitialized(backend, total);   // every route below writes all of it
             int segment = length[tensor.Rank - 1];
             int rows = total / segment;
             if (TryLastAxisOnlySlice(backend, input, output, tensor, start, length, rows, segment))
@@ -26341,7 +26349,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Fast path of <see cref="TryDeviceRectSlice{T}"/> for the common case where only the LAST axis is narrowed
     /// (every leading axis taken in full): the source is a [rows, D] matrix and the result is columns
     /// [start, start + width). Uses O(width) single-launch kernels instead of one device copy per row:
-    /// width 1 is one strided gather; start 0 is one row-prefix copy; otherwise each column is gathered
+    /// width 1 is one strided gather; start 0 is one row-prefix copy, as is any start on a backend with buffer views
+    /// (a row copy from a view offset by the start); otherwise each column is gathered
     /// (width launches) into a [width, rows] buffer and transposed once into [rows, width]. All of these are
     /// IDirectGpuBackend kernels, so the fast path stays recordable.
     /// </summary>
@@ -26363,6 +26372,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (first == 0)
         {
             backend.CopyRows(input, output, full, width, rows, width);
+            return true;
+        }
+
+        // #1106: a window starting at column `first` is a row copy from a view offset by `first` -- one launch. (The
+        // column gather below issued 2 * width + 1 launches: splitting a fused [rows, 3 * D] QKV projection with
+        // D = 64 cost 128 kernel launches + device copies per transformer step.) Reads stay in bounds: the last is
+        // (rows - 1) * full + first + width - 1 < rows * full.
+        if (backend is IGpuBufferViews views && views.TryCreateView(input, first, input.Size - first) is { } window)
+        {
+            backend.CopyRows(window, output, full, width, rows, width);
             return true;
         }
 
