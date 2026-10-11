@@ -105,6 +105,26 @@ internal static class PortableGenericFft
         launch("bx_fft_bluestein_post", count, padRe, padIm, chirpRe, chirpIm, re, im, batch, n, m, inverse ? 1f / n : 1f);
     }
 
+    /// <summary>
+    /// <see cref="IFftBackend.LaunchFft"/> over the generic transform: deinterleave the re/im pairs, transform, and
+    /// interleave back into the same buffer, all with device copies.
+    /// </summary>
+    public static void LaunchInterleaved(IDirectGpuBackend backend, IGenericFftBackend fft, IGpuBuffer buffer,
+        int batchCount, int n, bool inverse)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (batchCount < 1) throw new ArgumentOutOfRangeException(nameof(batchCount));
+        if (n < 1 || (n & (n - 1)) != 0) throw new ArgumentOutOfRangeException(nameof(n), "IFftBackend transforms power-of-two lengths.");
+        int count = checked(batchCount * n);
+        using var re = backend.AllocateBuffer(count);
+        using var im = backend.AllocateBuffer(count);
+        backend.StridedGather(buffer, re, 0, 2, count);
+        backend.StridedGather(buffer, im, 1, 2, count);
+        fft.LaunchFftGeneric(re, im, batchCount, n, inverse, FftElementType.Float32);
+        backend.StridedScatter(re, buffer, 0, 2, count);
+        backend.StridedScatter(im, buffer, 1, 2, count);
+    }
+
     private static void ValidateCount(int count)
     {
         if (count < 1) throw new ArgumentOutOfRangeException(nameof(count));

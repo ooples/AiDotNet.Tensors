@@ -5,7 +5,7 @@ using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMeshgridBackend, IGpuBatchExecution
+public sealed partial class CudaBackend : IFftBackend, IMeshgridBackend, IGpuBatchExecution
 {
     private int _batchDepth;
     private int _secondaryStreamOwnerThreadId;
@@ -103,4 +103,7 @@ public sealed partial class CudaBackend : IMeshgridBackend, IGpuBatchExecution
         if (n1 <= 0) throw new ArgumentOutOfRangeException(nameof(n1));
         LaunchBatchKernel("bx_meshgrid2d", checked(n0 * n1), source0, source1, output0, output1, n0, n1, xy ? 1 : 0);
     }
+
+    public void LaunchFft(IGpuBuffer buffer, int batchCount, int n, bool inverse)
+        => PortableGenericFft.LaunchInterleaved(this, this, buffer, batchCount, n, inverse);
 }

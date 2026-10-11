@@ -6,7 +6,7 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
-public sealed partial class OpenClBackend : IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
+public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
@@ -47,6 +47,9 @@ public sealed partial class OpenClBackend : IGenericFftBackend, IMeshgridBackend
 
     void IGenericFftBackend.LaunchFftGeneric(IGpuBuffer real, IGpuBuffer imaginary, int batch, int n, bool inverse, FftElementType type)
         => PortableGenericFft.Launch(this, LaunchBatch, real, imaginary, batch, n, inverse, type);
+
+    public void LaunchFft(IGpuBuffer buffer, int batchCount, int n, bool inverse)
+        => PortableGenericFft.LaunchInterleaved(this, this, buffer, batchCount, n, inverse);
 }
 #endif
 

@@ -5,7 +5,7 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend : IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
+public sealed partial class HipBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -41,4 +41,7 @@ public sealed partial class HipBackend : IGenericFftBackend, IMeshgridBackend, I
 
     void IGenericFftBackend.LaunchFftGeneric(IGpuBuffer real, IGpuBuffer imaginary, int batch, int n, bool inverse, FftElementType type)
         => PortableGenericFft.Launch(this, LaunchBatch, real, imaginary, batch, n, inverse, type);
+
+    public void LaunchFft(IGpuBuffer buffer, int batchCount, int n, bool inverse)
+        => PortableGenericFft.LaunchInterleaved(this, this, buffer, batchCount, n, inverse);
 }

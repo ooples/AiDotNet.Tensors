@@ -10,10 +10,6 @@ capability IExtendedLinalgBackend MetalBackend #1142
 capability IExtendedLinalgBackend OpenClBackend #1142
 capability IExtendedLinalgBackend VulkanBackend #1142
 capability IExtendedLinalgBackend WebGpuBackend #1142
-capability IFftBackend CudaBackend #1142
-capability IFftBackend HipBackend #1142
-capability IFftBackend OpenClBackend #1142
-capability IFftBackend WebGpuBackend #1142
 capability IFusedLstmSequenceTraining MetalBackend #1107
 capability IFusedLstmSequenceTraining WebGpuBackend #1108
 capability IGpuBufferViews HipBackend #1142

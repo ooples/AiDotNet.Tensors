@@ -102,10 +102,32 @@ public sealed class GenericFftBackendParityTests
         }
     }
 
+    private static void CheckInterleaved(IDirectGpuBackend backend)
+    {
+        var fft = Assert.IsAssignableFrom<IFftBackend>(backend);
+        foreach (int n in new[] { 2, 8, 64 })
+            foreach (bool inverse in new[] { false, true })
+            {
+                var re = Values(Batch * n, n + 3);
+                var im = Values(Batch * n, n + 11);
+                Dft(re, im, n, inverse, out var eRe, out var eIm);
+                var interleaved = new float[2 * Batch * n];
+                for (int i = 0; i < Batch * n; i++) { interleaved[2 * i] = re[i]; interleaved[2 * i + 1] = im[i]; }
+                using var buffer = backend.AllocateBuffer(interleaved);
+                fft.LaunchFft(buffer, Batch, n, inverse);
+                var actual = backend.DownloadBuffer(buffer);
+                double tol = 2e-5 * n * (inverse ? 1.0 / n : 1.0) * 2 + 1e-5;
+                for (int i = 0; i < Batch * n; i++)
+                    Assert.True(Math.Abs(actual[2 * i] - eRe[i]) <= tol && Math.Abs(actual[2 * i + 1] - eIm[i]) <= tol,
+                        $"LaunchFft n={n} {(inverse ? "inverse" : "forward")} [{i}]: got ({actual[2 * i]}, {actual[2 * i + 1]}), expected ({eRe[i]}, {eIm[i]})");
+            }
+    }
+
     private static void CheckAll(IDirectGpuBackend backend)
     {
         CheckTransforms(backend);
         CheckStorage(backend);
+        CheckInterleaved(backend);
     }
 
     [SkippableFact]
