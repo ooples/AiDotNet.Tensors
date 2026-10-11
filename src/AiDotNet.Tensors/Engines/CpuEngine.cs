@@ -33660,15 +33660,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     }
 
-    /// <summary>
-    /// Mean over ONE axis of a dense row-major float/double array: work units are (outer index, 64-wide inner block),
-    /// split across threads, so it parallelizes whether the reduced axis is the last one (many outer rows) or the first
-    /// (one outer row, many inner columns). Each output accumulates over the reduced axis in increasing order and is
-    /// then scaled by 1/axisSize -- exactly the odometer's sequence -- so the result is bit-identical to it at any
-    /// thread count (#653: the odometer ran serially; an [8192, 1024] float mean over axis 0 took 17 ms at DOP 1 through
-    /// 64). Returns false for other element types.
-    /// </summary>
-    // Single-axis max over a dense row-major input (#653), fanned out over (outer, 64-wide inner block) units. Matches
+    // Single-axis max over a dense row-major input (#653), fanned out over (outer, inner column block) units. Matches
     // the serial odometer exactly: each cell starts at the type's MinValue with index -1, the axis is scanned in
     // increasing order and only a strictly greater value (never NaN) replaces it, recording the absolute flat index.
     private static bool TryReduceMaxSingleAxisDense<T>(T[] data, T[] outData, int[] maxIndices, int[] shape, int axis, T minValue)
@@ -33725,6 +33717,15 @@ public partial class CpuEngine : ITensorLevelEngine
         return true;
     }
 
+    /// <summary>
+    /// Mean over ONE axis of a dense row-major float/double array: work units are (outer index, inner column block),
+    /// split across threads, so it parallelizes whether the reduced axis is the last one (many outer rows) or the first
+    /// (one outer row, many inner columns); a chunk's units under one outer index are accumulated as one contiguous
+    /// column range, row by row. Each output accumulates over the reduced axis in increasing order and is then scaled
+    /// by 1/axisSize -- exactly the odometer's sequence -- so the result is bit-identical to it at any thread count
+    /// (#653: the odometer ran serially; an [8192, 1024] float mean over axis 0 took 17 ms at DOP 1 through 64).
+    /// Returns false for other element types.
+    /// </summary>
     private static bool TryReduceMeanSingleAxisDense<T>(T[] data, T[] outData, int[] shape, int axis)
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return false;

@@ -7,8 +7,10 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 /// <summary>
 /// #653 phase 2 baseline: parallel efficiency of the everyday non-GEMM ops (elementwise, broadcast, activations,
-/// norms, reductions, layout) across a DOP sweep. Each op runs eagerly inside a TensorArena (as model code does), so
-/// the numbers measure the kernel and its fan-out, not fresh-allocation page faults.
+/// norms, reductions, layout) across a DOP sweep. Each call runs eagerly inside its own create-and-dispose TensorArena
+/// -- the per-step pattern eager model code uses -- after five warm-up calls, so outputs come from the arena's
+/// persistent pool rather than fresh allocations and the numbers measure the kernel and its fan-out. The sweep must
+/// include DOP 1, the efficiency baseline.
 /// usage: --ops [--dtype float|double] [--dops 1,2,4,8,16,32,64] [--reps 60] [--filter name]
 /// </summary>
 internal static partial class Program
@@ -18,8 +20,21 @@ internal static partial class Program
         string dtype = ArgS(a, "--dtype", "float");
         int reps = ArgI(a, "--reps", 60);
         string filter = ArgS(a, "--filter", "");
-        var dops = Array.ConvertAll(ArgS(a, "--dops", "1,2,4,8,16,32,64").Split(','), int.Parse);
+        if (dtype != "float" && dtype != "double") return OpsUsageError($"--dtype must be float or double, not '{dtype}'.");
+        if (reps <= 0) return OpsUsageError($"--reps must be positive, not {reps}.");
+        var dopText = ArgS(a, "--dops", "1,2,4,8,16,32,64").Split(',');
+        var dops = new int[dopText.Length];
+        for (int i = 0; i < dopText.Length; i++)
+            if (!int.TryParse(dopText[i], out dops[i]) || dops[i] <= 0)
+                return OpsUsageError($"--dops entries must be positive integers, not '{dopText[i]}'.");
+        if (Array.IndexOf(dops, 1) < 0) return OpsUsageError("--dops must include 1: it is the efficiency baseline.");
         return dtype == "double" ? RunOpsT<double>(eng, dops, reps, filter) : RunOpsT<float>(eng, dops, reps, filter);
+    }
+
+    private static int OpsUsageError(string message)
+    {
+        Console.Error.WriteLine("--ops: " + message);
+        return 2;
     }
 
     private static int RunOpsT<T>(CpuEngine eng, int[] dops, int reps, string filter)
@@ -81,9 +96,10 @@ internal static partial class Program
                     Array.Sort(ts);
                     times[di] = ts[reps / 2];
                 }
+                double t1 = times[Array.IndexOf(dops, 1)];
                 int i8 = Array.IndexOf(dops, 8);
-                double eff8 = i8 > 0 ? times[0] / (8 * times[i8]) : double.NaN;
-                double effMax = times[0] / (dops[^1] * times[^1]);
+                double eff8 = i8 >= 0 ? t1 / (8 * times[i8]) : double.NaN;
+                double effMax = t1 / (dops[^1] * times[^1]);
                 Console.WriteLine($"{name,-26}{rows * cols,8}   " + string.Join("", Array.ConvertAll(times, t => $"{t,10:F1}")) + $"{eff8,8:P0}{effMax,9:P0}");
             }
         }
