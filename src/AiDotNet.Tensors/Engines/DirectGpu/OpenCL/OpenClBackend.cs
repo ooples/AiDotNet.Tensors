@@ -877,6 +877,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in SoftmaxVariantKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, softmaxVarProgram, name);
 
+                // IGpuBatchExecution kernels no other program provides (#1142). Safe math: min |x| starts at
+                // INFINITY and the comparisons must keep IEEE semantics.
+                var batchExecutionProgram = CompileOrLoadCached(BatchExecutionKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Batch execution kernels");
+                _programs.Add(batchExecutionProgram);
+                foreach (var name in BatchExecutionKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, batchExecutionProgram, name);
                 // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
                 var complexProgram = CompileOrLoadCached(ComplexKernels.GetSource(), optimizationFlags, "Complex kernels");
                 _programs.Add(complexProgram);
