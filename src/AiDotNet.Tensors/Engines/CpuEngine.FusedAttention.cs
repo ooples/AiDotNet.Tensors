@@ -215,6 +215,7 @@ public partial class CpuEngine
     /// out[b, h, i, :] = softmax_j(f(scale * q_i . k_j)) v_j over the allowed keys, f the optional soft-cap, with an
     /// online softmax over key tiles so no [seqQ, seqK] matrix exists; tiles every row of which is masked are skipped.
     /// Writes lse[(b*heads+h)*seqQ + i] for the backward; a row with no allowed key outputs zeros (lse = -inf).
+    /// One task per (batch, head, query block): rows are independent, so the result does not depend on the split.
     /// </summary>
     internal static void FusedAttentionForwardFloat(
         Tensor<float> query, Tensor<float> key, Tensor<float> value, Tensor<float> output, float[] lse, FusedAttentionPlan p)
@@ -224,10 +225,12 @@ public partial class CpuEngine
         var v = new AttentionOperand(value);
         var oArr = output.GetCpuBackingForContiguousWrite(out int oOff)
             ?? throw new InvalidOperationException("ScaledDotProductAttention needs a host output buffer.");
-        int tasks = p.Batch * p.Heads;
-        long work = (long)tasks * p.SeqQ * p.SeqK * (p.HeadDim + p.ValueDim);
+        int br = Math.Min(AttentionCoreQueryBlock, p.SeqQ), queryBlocks = (p.SeqQ + br - 1) / br;
+        int tasks = p.Batch * p.Heads * queryBlocks;
+        long work = (long)p.Batch * p.Heads * p.SeqQ * p.SeqK * (p.HeadDim + p.ValueDim);
         CpuParallelSettings.ParallelForOrSerial(0, tasks, work,
-            bh => FusedAttentionForwardHead(q, k, v, oArr, oOff, lse, p, bh), deterministicSafe: true);
+            unit => FusedAttentionForwardBlock(q, k, v, oArr, oOff, lse, p, unit / queryBlocks, (unit % queryBlocks) * br),
+            deterministicSafe: true);
     }
 
     // Applies the soft-cap and the mask to one score row in place: masked entries become -inf. Returns the row's max.
@@ -257,9 +260,9 @@ public partial class CpuEngine
         return false;
     }
 
-    private static void FusedAttentionForwardHead(
+    private static void FusedAttentionForwardBlock(
         AttentionOperand q, AttentionOperand k, AttentionOperand v, float[] o, int oOff, float[] lse,
-        FusedAttentionPlan p, int bh)
+        FusedAttentionPlan p, int bh, int i0)
     {
         int b = bh / p.Heads, h = bh % p.Heads;
         int hd = p.HeadDim, vd = p.ValueDim;
@@ -268,63 +271,62 @@ public partial class CpuEngine
         var ws = AttentionScratch.ForThread();
         float[] qs = ws.Get(0, br * hd), kt = ws.Get(1, hd * bc), sc = ws.Get(2, br * bc);
         float[] acc = ws.Get(3, br * vd), rowMax = ws.Get(4, br), rowSum = ws.Get(5, br);
-        for (int i0 = 0; i0 < p.SeqQ; i0 += br)
+        int rows = Math.Min(br, p.SeqQ - i0);
+        for (int r = 0; r < rows; r++)
         {
-            int rows = Math.Min(br, p.SeqQ - i0);
+            ScaleCopy(q.Data, qBase + (i0 + r) * q.RowStride, qs, r * hd, hd, p.ScaleF);
+            rowMax[r] = float.NegativeInfinity;
+            rowSum[r] = 0f;
+        }
+        Array.Clear(acc, 0, rows * vd);
+        int keyEnd = p.KeyLimit(i0 + rows - 1);
+        for (int j0 = 0; j0 < keyEnd; j0 += bc)
+        {
+            int cols = Math.Min(bc, keyEnd - j0);
+            if (!TileHasAllowed(p, b, h, i0, rows, j0, cols)) continue;   // a fully masked tile adds nothing
+            TransposeKeyBlock(k.Data, kBase + j0 * k.RowStride, k.RowStride, kt, hd, cols, bc);
+            TileGemm(qs, 0, hd, kt, 0, bc, sc, 0, bc, rows, cols, hd, accumulate: false);
             for (int r = 0; r < rows; r++)
             {
-                ScaleCopy(q.Data, qBase + (i0 + r) * q.RowStride, qs, r * hd, hd, p.ScaleF);
-                rowMax[r] = float.NegativeInfinity;
-                rowSum[r] = 0f;
+                int srow = r * bc;
+                float blockMax = PrepareScoreRow(sc, srow, cols, p, b, h, i0 + r, j0);
+                if (float.IsNegativeInfinity(blockMax)) { Array.Clear(sc, srow, cols); continue; }
+                float newMax = Math.Max(rowMax[r], blockMax);
+                float rescale = float.IsNegativeInfinity(rowMax[r]) ? 0f : (float)Math.Exp(rowMax[r] - newMax);
+                ExpShifted(sc, srow, cols, newMax);   // masked (-inf) entries become 0
+                float blockSum = 0f;
+                for (int c = 0; c < cols; c++) blockSum += sc[srow + c];
+                rowSum[r] = rowSum[r] * rescale + blockSum;
+                rowMax[r] = newMax;
+                if (rescale != 1f) Scale(acc, r * vd, vd, rescale);
             }
-            Array.Clear(acc, 0, rows * vd);
-            int keyEnd = p.KeyLimit(i0 + rows - 1);
-            for (int j0 = 0; j0 < keyEnd; j0 += bc)
+            TileGemm(sc, 0, bc, v.Data, vBase + j0 * v.RowStride, v.RowStride, acc, 0, vd, rows, vd, cols, accumulate: true);
+        }
+        int lseRow = bh * p.SeqQ + i0;
+        for (int r = 0; r < rows; r++)
+        {
+            float sum = rowSum[r];
+            int orow = oBase + (i0 + r) * vd;
+            if (sum > 0f)
             {
-                int cols = Math.Min(bc, keyEnd - j0);
-                if (!TileHasAllowed(p, b, h, i0, rows, j0, cols)) continue;   // a fully masked tile adds nothing
-                TransposeKeyBlock(k.Data, kBase + j0 * k.RowStride, k.RowStride, kt, hd, cols, bc);
-                TileGemm(qs, 0, hd, kt, 0, bc, sc, 0, bc, rows, cols, hd, accumulate: false);
-                for (int r = 0; r < rows; r++)
-                {
-                    int srow = r * bc;
-                    float blockMax = PrepareScoreRow(sc, srow, cols, p, b, h, i0 + r, j0);
-                    if (float.IsNegativeInfinity(blockMax)) { Array.Clear(sc, srow, cols); continue; }
-                    float newMax = Math.Max(rowMax[r], blockMax);
-                    float rescale = float.IsNegativeInfinity(rowMax[r]) ? 0f : (float)Math.Exp(rowMax[r] - newMax);
-                    ExpShifted(sc, srow, cols, newMax);   // masked (-inf) entries become 0
-                    float blockSum = 0f;
-                    for (int c = 0; c < cols; c++) blockSum += sc[srow + c];
-                    rowSum[r] = rowSum[r] * rescale + blockSum;
-                    rowMax[r] = newMax;
-                    if (rescale != 1f) Scale(acc, r * vd, vd, rescale);
-                }
-                TileGemm(sc, 0, bc, v.Data, vBase + j0 * v.RowStride, v.RowStride, acc, 0, vd, rows, vd, cols, accumulate: true);
+                ScaleCopy(acc, r * vd, o, orow, vd, 1f / sum);
+                lse[lseRow + r] = rowMax[r] + (float)Math.Log(sum);
             }
-            int lseRow = bh * p.SeqQ + i0;
-            for (int r = 0; r < rows; r++)
+            else
             {
-                float sum = rowSum[r];
-                int orow = oBase + (i0 + r) * vd;
-                if (sum > 0f)
-                {
-                    ScaleCopy(acc, r * vd, o, orow, vd, 1f / sum);
-                    lse[lseRow + r] = rowMax[r] + (float)Math.Log(sum);
-                }
-                else
-                {
-                    Array.Clear(o, orow, vd);
-                    lse[lseRow + r] = float.NegativeInfinity;
-                }
+                Array.Clear(o, orow, vd);
+                lse[lseRow + r] = float.NegativeInfinity;
             }
         }
     }
 
     /// <summary>
-    /// Backward of the fused attention (FlashAttention-2 form): each probability tile is rebuilt from the saved
-    /// log-sum-exp; with s = f(raw) the soft-capped score, dS_raw = P * (dO V^T - rowsum(dO * O)) * f'(raw) where
-    /// f'(raw) = 1 - tanh^2(raw / cap); then dV += P^T dO, dK += dS_raw^T (scale Q), dQ = scale dS_raw K. One task per
-    /// (batch, head) owns that head's gradient rows, so the result does not depend on the thread count.
+    /// Backward of the fused attention (FlashAttention-2 form). Each probability tile is rebuilt from the saved
+    /// log-sum-exp; with s = f(raw) the soft-capped score, dS_raw = P * (dO V^T - delta) * f'(raw) where
+    /// delta = rowsum(dO * O) and f'(raw) = 1 - tanh^2(raw / cap). Two passes, each split finely and race-free: one
+    /// task per (batch, head, key block) owns that block's dK += dS_raw^T (scale Q) and dV += P^T dO, and one task per
+    /// (batch, head, query block) owns its dQ = scale dS_raw K -- the tiles are recomputed rather than accumulated
+    /// through atomics, so the result does not depend on the thread count.
     /// </summary>
     private static void FusedAttentionBackwardFloat(
         Tensor<float> gradOutput, Tensor<float>[] inputs, Tensor<float> output, object[] savedState, IEngine engine,
@@ -353,100 +355,143 @@ public partial class CpuEngine
         if (distinct && dK.Array is not null && Overlap(dK, dV))
             dK = GradTarget(needK, key, grads, engine, distinct: false);
 
-        int tasks = p.Batch * p.Heads;
-        long work = 3L * tasks * p.SeqQ * p.SeqK * (p.HeadDim + p.ValueDim);
-        CpuParallelSettings.ParallelForOrSerial(0, tasks, work,
-            bh => FusedAttentionBackwardHead(q, k, v, oArr, oOff, dOArr, dOOff, lse, p, bh, dQ, dK, dV),
-            deterministicSafe: true);
+        int vd = p.ValueDim, heads = p.Batch * p.Heads;
+        int br = Math.Min(AttentionCoreQueryBlock, p.SeqQ), bc = Math.Min(AttentionCoreKeyBlock, p.SeqK);
+        int queryBlocks = (p.SeqQ + br - 1) / br, keyBlocks = (p.SeqK + bc - 1) / bc;
+        long rowWork = (long)p.SeqK * (p.HeadDim + p.ValueDim);
+
+        // delta[bh, i] = dO_i . O_i, read by both passes.
+        var delta = new float[heads * p.SeqQ];
+        CpuParallelSettings.ParallelForOrSerial(0, heads, (long)heads * p.SeqQ * vd, bh =>
+        {
+            for (int i = 0; i < p.SeqQ; i++)
+                delta[bh * p.SeqQ + i] = Dot(dOArr, dOOff + (bh * p.SeqQ + i) * vd, oArr, oOff + (bh * p.SeqQ + i) * vd, vd);
+        }, deterministicSafe: true);
+
+        if (dK.Array is not null || dV.Array is not null)
+            CpuParallelSettings.ParallelForOrSerial(0, heads * keyBlocks, 2L * heads * p.SeqQ * rowWork,
+                unit => FusedAttentionBackwardKeyBlock(q, k, v, dOArr, dOOff, lse, delta, p, unit / keyBlocks,
+                    (unit % keyBlocks) * bc, dK, dV),
+                deterministicSafe: true);
+        if (dQ.Array is not null)
+            CpuParallelSettings.ParallelForOrSerial(0, heads * queryBlocks, 2L * heads * p.SeqQ * rowWork,
+                unit => FusedAttentionBackwardQueryBlock(q, k, v, dOArr, dOOff, lse, delta, p, unit / queryBlocks,
+                    (unit % queryBlocks) * br, dQ),
+                deterministicSafe: true);
 
         dQ.Commit(grads, query, engine);
         dK.Commit(grads, key, engine);
         dV.Commit(grads, value, engine);
     }
 
-    private static void FusedAttentionBackwardHead(
-        AttentionOperand q, AttentionOperand k, AttentionOperand v, float[] o, int oOff, float[] dO, int dOOff,
-        float[] lse, FusedAttentionPlan p, int bh, FusedGradTarget dQ, FusedGradTarget dK, FusedGradTarget dV)
+    // Rebuilds the [rows, cols] tile at (i0, j0): pr = P and ds = dS_raw (zero where masked). qs holds scale * Q rows,
+    // kt / vt the transposed key / value block.
+    private static void FusedAttentionGradientTile(
+        float[] qs, float[] kt, float[] vt, float[] dO, int dOBase, float[] lse, float[] delta, FusedAttentionPlan p,
+        int b, int h, int bh, int i0, int rows, int j0, int cols, float[] pr, float[] ds)
+    {
+        int hd = p.HeadDim, vd = p.ValueDim, bc = Math.Min(AttentionCoreKeyBlock, p.SeqK);
+        float cap = p.SoftcapF;
+        TileGemm(qs, 0, hd, kt, 0, bc, pr, 0, bc, rows, cols, hd, accumulate: false);              // raw scores
+        TileGemm(dO, dOBase + i0 * vd, vd, vt, 0, bc, ds, 0, bc, rows, cols, vd, accumulate: false); // dP
+        for (int r = 0; r < rows; r++)
+        {
+            int i = i0 + r, row = r * bc;
+            float rowLse = lse[bh * p.SeqQ + i];
+            int limit = Math.Min(cols, p.KeyLimit(i) - j0);
+            if (float.IsNegativeInfinity(rowLse) || limit <= 0)
+            {
+                Array.Clear(pr, row, cols);
+                Array.Clear(ds, row, cols);
+                continue;
+            }
+            float d = delta[bh * p.SeqQ + i];
+            for (int c = 0; c < cols; c++)
+            {
+                if (c >= limit || (p.Mask is { } m && !m.Allowed(b, h, i, j0 + c)))
+                {
+                    pr[row + c] = 0f;
+                    ds[row + c] = 0f;
+                    continue;
+                }
+                float raw = pr[row + c], s = raw, slope = 1f;
+                if (cap > 0f)
+                {
+                    float t = (float)Math.Tanh(raw / cap);
+                    s = cap * t;
+                    slope = 1f - t * t;
+                }
+                float prob = (float)Math.Exp(s - rowLse);
+                pr[row + c] = prob;
+                ds[row + c] = prob * (ds[row + c] - d) * slope;
+            }
+        }
+    }
+
+    private static void FusedAttentionBackwardKeyBlock(
+        AttentionOperand q, AttentionOperand k, AttentionOperand v, float[] dO, int dOOff, float[] lse, float[] delta,
+        FusedAttentionPlan p, int bh, int j0, FusedGradTarget dK, FusedGradTarget dV)
     {
         int b = bh / p.Heads, h = bh % p.Heads;
         int hd = p.HeadDim, vd = p.ValueDim;
-        int qBase = q.Base(b, h), kBase = k.Base(b, h), vBase = v.Base(b, h);
-        int oBase = oOff + bh * p.SeqQ * vd, dOBase = dOOff + bh * p.SeqQ * vd;
+        int qBase = q.Base(b, h), kBase = k.Base(b, h), vBase = v.Base(b, h), dOBase = dOOff + bh * p.SeqQ * vd;
         int br = Math.Min(AttentionCoreQueryBlock, p.SeqQ), bc = Math.Min(AttentionCoreKeyBlock, p.SeqK);
-        float cap = p.SoftcapF;
-
+        int cols = Math.Min(bc, p.SeqK - j0);
         var ws = AttentionScratch.ForThread();
         float[] qs = ws.Get(0, br * hd), kt = ws.Get(1, hd * bc), vt = ws.Get(2, vd * bc);
-        float[] pr = ws.Get(3, br * bc), ds = ws.Get(4, br * bc), dq = ws.Get(5, br * hd), delta = ws.Get(6, br);
-        float[] dk = ws.Get(7, p.SeqK * hd), dv = ws.Get(8, p.SeqK * vd);
+        float[] pr = ws.Get(3, br * bc), ds = ws.Get(4, br * bc);
+        float[] dk = ws.Get(7, bc * hd), dv = ws.Get(8, bc * vd);
         float[] pt = ws.Get(9, bc * br), dst = ws.Get(10, bc * br);
-        Array.Clear(dk, 0, p.SeqK * hd);
-        Array.Clear(dv, 0, p.SeqK * vd);
-        for (int i0 = 0; i0 < p.SeqQ; i0 += br)
+        Array.Clear(dk, 0, cols * hd);
+        Array.Clear(dv, 0, cols * vd);
+        TransposeKeyBlock(k.Data, kBase + j0 * k.RowStride, k.RowStride, kt, hd, cols, bc);
+        TransposeKeyBlock(v.Data, vBase + j0 * v.RowStride, v.RowStride, vt, vd, cols, bc);
+        // Causal: query rows before j0 see none of this block's keys.
+        int iStart = p.Causal ? j0 / br * br : 0;
+        for (int i0 = iStart; i0 < p.SeqQ; i0 += br)
         {
             int rows = Math.Min(br, p.SeqQ - i0);
-            for (int r = 0; r < rows; r++)
-            {
-                ScaleCopy(q.Data, qBase + (i0 + r) * q.RowStride, qs, r * hd, hd, p.ScaleF);
-                delta[r] = Dot(dO, dOBase + (i0 + r) * vd, o, oBase + (i0 + r) * vd, vd);
-            }
-            Array.Clear(dq, 0, rows * hd);
-            int keyEnd = p.KeyLimit(i0 + rows - 1);
-            for (int j0 = 0; j0 < keyEnd; j0 += bc)
-            {
-                int cols = Math.Min(bc, keyEnd - j0);
-                if (!TileHasAllowed(p, b, h, i0, rows, j0, cols)) continue;
-                TransposeKeyBlock(k.Data, kBase + j0 * k.RowStride, k.RowStride, kt, hd, cols, bc);
-                TransposeKeyBlock(v.Data, vBase + j0 * v.RowStride, v.RowStride, vt, vd, cols, bc);
-                TileGemm(qs, 0, hd, kt, 0, bc, pr, 0, bc, rows, cols, hd, accumulate: false);          // raw scores
-                TileGemm(dO, dOBase + i0 * vd, vd, vt, 0, bc, ds, 0, bc, rows, cols, vd, accumulate: false); // dP
-                for (int r = 0; r < rows; r++)
-                {
-                    int i = i0 + r, row = r * bc;
-                    float rowLse = lse[bh * p.SeqQ + i];
-                    int limit = Math.Min(cols, p.KeyLimit(i) - j0);
-                    if (float.IsNegativeInfinity(rowLse) || limit <= 0)
-                    {
-                        Array.Clear(pr, row, cols);
-                        Array.Clear(ds, row, cols);
-                        continue;
-                    }
-                    float d = delta[r];
-                    for (int c = 0; c < cols; c++)
-                    {
-                        if (c >= limit || (p.Mask is { } m && !m.Allowed(b, h, i, j0 + c)))
-                        {
-                            pr[row + c] = 0f;
-                            ds[row + c] = 0f;
-                            continue;
-                        }
-                        float raw = pr[row + c], s = raw, slope = 1f;
-                        if (cap > 0f)
-                        {
-                            float t = (float)Math.Tanh(raw / cap);
-                            s = cap * t;
-                            slope = 1f - t * t;
-                        }
-                        float prob = (float)Math.Exp(s - rowLse);
-                        pr[row + c] = prob;
-                        ds[row + c] = prob * (ds[row + c] - d) * slope;
-                    }
-                }
-                TransposeTile(pr, bc, pt, rows, rows, cols);
-                TransposeTile(ds, bc, dst, rows, rows, cols);
-                TileGemm(pt, 0, rows, dO, dOBase + i0 * vd, vd, dv, j0 * vd, vd, cols, vd, rows, accumulate: true);
-                TileGemm(dst, 0, rows, qs, 0, hd, dk, j0 * hd, hd, cols, hd, rows, accumulate: true);
-                TileGemm(ds, 0, bc, k.Data, kBase + j0 * k.RowStride, k.RowStride, dq, 0, hd, rows, hd, cols, accumulate: true);
-            }
-            if (dQ.Array is not null)
-                for (int r = 0; r < rows; r++)
-                    StoreRow(dq, r * hd, dQ.Array, dQ.Offset + (bh * p.SeqQ + i0 + r) * hd, hd, p.ScaleF, dQ.Overwrite);
+            if (!TileHasAllowed(p, b, h, i0, rows, j0, cols)) continue;
+            for (int r = 0; r < rows; r++) ScaleCopy(q.Data, qBase + (i0 + r) * q.RowStride, qs, r * hd, hd, p.ScaleF);
+            FusedAttentionGradientTile(qs, kt, vt, dO, dOBase, lse, delta, p, b, h, bh, i0, rows, j0, cols, pr, ds);
+            TransposeTile(pr, bc, pt, rows, rows, cols);
+            TransposeTile(ds, bc, dst, rows, rows, cols);
+            TileGemm(pt, 0, rows, dO, dOBase + i0 * vd, vd, dv, 0, vd, cols, vd, rows, accumulate: true);
+            TileGemm(dst, 0, rows, qs, 0, hd, dk, 0, hd, cols, hd, rows, accumulate: true);
         }
         if (dK.Array is not null)
-            for (int j = 0; j < p.SeqK; j++)
-                StoreRow(dk, j * hd, dK.Array, dK.Offset + (bh * p.SeqK + j) * hd, hd, 1f, dK.Overwrite);
+            for (int c = 0; c < cols; c++)
+                StoreRow(dk, c * hd, dK.Array, dK.Offset + (bh * p.SeqK + j0 + c) * hd, hd, 1f, dK.Overwrite);
         if (dV.Array is not null)
-            for (int j = 0; j < p.SeqK; j++)
-                StoreRow(dv, j * vd, dV.Array, dV.Offset + (bh * p.SeqK + j) * vd, vd, 1f, dV.Overwrite);
+            for (int c = 0; c < cols; c++)
+                StoreRow(dv, c * vd, dV.Array, dV.Offset + (bh * p.SeqK + j0 + c) * vd, vd, 1f, dV.Overwrite);
+    }
+
+    private static void FusedAttentionBackwardQueryBlock(
+        AttentionOperand q, AttentionOperand k, AttentionOperand v, float[] dO, int dOOff, float[] lse, float[] delta,
+        FusedAttentionPlan p, int bh, int i0, FusedGradTarget dQ)
+    {
+        int b = bh / p.Heads, h = bh % p.Heads;
+        int hd = p.HeadDim, vd = p.ValueDim;
+        int qBase = q.Base(b, h), kBase = k.Base(b, h), vBase = v.Base(b, h), dOBase = dOOff + bh * p.SeqQ * vd;
+        int br = Math.Min(AttentionCoreQueryBlock, p.SeqQ), bc = Math.Min(AttentionCoreKeyBlock, p.SeqK);
+        int rows = Math.Min(br, p.SeqQ - i0);
+        var ws = AttentionScratch.ForThread();
+        float[] qs = ws.Get(0, br * hd), kt = ws.Get(1, hd * bc), vt = ws.Get(2, vd * bc);
+        float[] pr = ws.Get(3, br * bc), ds = ws.Get(4, br * bc), dq = ws.Get(5, br * hd);
+        for (int r = 0; r < rows; r++) ScaleCopy(q.Data, qBase + (i0 + r) * q.RowStride, qs, r * hd, hd, p.ScaleF);
+        Array.Clear(dq, 0, rows * hd);
+        int keyEnd = p.KeyLimit(i0 + rows - 1);
+        for (int j0 = 0; j0 < keyEnd; j0 += bc)
+        {
+            int cols = Math.Min(bc, keyEnd - j0);
+            if (!TileHasAllowed(p, b, h, i0, rows, j0, cols)) continue;
+            TransposeKeyBlock(k.Data, kBase + j0 * k.RowStride, k.RowStride, kt, hd, cols, bc);
+            TransposeKeyBlock(v.Data, vBase + j0 * v.RowStride, v.RowStride, vt, vd, cols, bc);
+            FusedAttentionGradientTile(qs, kt, vt, dO, dOBase, lse, delta, p, b, h, bh, i0, rows, j0, cols, pr, ds);
+            TileGemm(ds, 0, bc, k.Data, kBase + j0 * k.RowStride, k.RowStride, dq, 0, hd, rows, hd, cols, accumulate: true);
+        }
+        for (int r = 0; r < rows; r++)
+            StoreRow(dq, r * hd, dQ.Array!, dQ.Offset + (bh * p.SeqQ + i0 + r) * hd, hd, p.ScaleF, dQ.Overwrite);
     }
 }
