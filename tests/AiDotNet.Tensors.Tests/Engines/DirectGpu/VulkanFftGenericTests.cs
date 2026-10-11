@@ -355,6 +355,33 @@ public class VulkanFftGenericTests
         Assert.True(RelErr(y, DftBatched(x, 2, 6, inverse: false)) < 2e-5);
     }
 
+    // No device needed: libshaderc compiles on the CPU, so this runs wherever the native library loads (CI included).
+    [SkippableTheory]
+    [InlineData(FftElementType.Float32, 9)]
+    [InlineData(FftElementType.Float16, 14)]
+    [InlineData(FftElementType.BFloat16, 14)]
+    public void EveryKernel_CompilesToSpirv(FftElementType type, int expectedKernels)
+    {
+        VulkanGlslCompiler compiler;
+        try { compiler = new VulkanGlslCompiler(); }
+        catch (Exception ex) when (ex is DllNotFoundException or TypeInitializationException or BadImageFormatException) { compiler = null!; }
+        Skip.If(compiler is null || !compiler.IsAvailable, "libshaderc is not available.");
+        using (compiler)
+        {
+            VulkanFftGenericKernel[] kernels = VulkanFftGenericKernels.All(type);
+            Assert.Equal(expectedKernels, kernels.Length);
+            Assert.Equal(kernels.Length, kernels.Select(k => k.Name).Distinct().Count());
+            foreach (var kernel in kernels)
+            {
+                uint[]? spirv = compiler!.CompileToSpirv(kernel.Source);
+                Assert.True(spirv is { Length: > 5 }, $"{kernel.Name} did not compile: {compiler.LastError}");
+                Assert.True(kernel.Bindings is >= 2 and <= 6 && kernel.PushWords is >= 1 and <= 4, kernel.Name);
+            }
+        }
+        Assert.Equal(type == FftElementType.Float32 ? 1 : 2, VulkanFftGenericKernels.ElementsPerWord(type));
+        Assert.Equal(type == FftElementType.Float32 ? 7 : 4, VulkanFftGenericKernels.WordsFor(7, type));
+    }
+
     [SkippableFact]
     public void FftGeneric_RecordsAutograd()
     {
