@@ -437,7 +437,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     {
         if (_gpuFp16 is not null) { _gpuFp16.CompressActivationFp16(t); PageOutCount++; return; }
         if (_halfStore!.ContainsKey(t)) return;
-        var span = t.AsSpan();
+        using var spanLease = t.Lease();
+        var span = spanLease.Span;
         var h = new Half[span.Length];
         for (int i = 0; i < span.Length; i++) h[i] = (Half)span[i];
         if (TryDropPlanOwnedStorage(t)) { _halfStore[t] = h; _droppedThisStep!.Add(t); PageOutCount++; }
@@ -526,7 +527,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             var p = parameters[i];
             Tensor<float>? g = grads.Fp32.TryGetValue(p, out var gf) ? gf : null;
             if (g is null) continue; // param not on the path this step
-            var span = g.AsWritableSpan();
+            using var spanLease = g.LeaseWritable();
+            var span = spanLease.Span;
             for (int k = 0; k < span.Length; k++)
             {
                 span[k] *= invScale;
@@ -543,7 +545,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
                 var g = pgrads[i];
                 if (g is null) continue;
                 var w = parameters[i].AsWritableSpan();
-                var gs = g.AsSpan();
+                using var gsLease = g.Lease();
+                var gs = gsLease.Span;
                 for (int k = 0; k < w.Length; k++) w[k] -= learningRate * gs[k];
                 parameters[i].IncrementVersion();
             }
@@ -584,7 +587,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         for (int i = 0; i < parameters.Count; i++)
         {
             if (!grads.Fp32.TryGetValue(parameters[i], out var g)) continue;
-            var span = g.AsWritableSpan();
+            using var spanLease = g.LeaseWritable();
+            var span = spanLease.Span;
             for (int k = 0; k < span.Length; k++)
             {
                 span[k] *= invScale;
@@ -612,8 +616,10 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
                     st = (new float[p.Length], new float[p.Length]);
                     _adamState[p] = st;
                 }
-                var w = p.AsWritableSpan();
-                var gs = g.AsSpan();
+                using var wLease = p.LeaseWritable();
+                var w = wLease.Span;
+                using var gsLease = g.Lease();
+                var gs = gsLease.Span;
                 var m = st.M; var v = st.V;
                 for (int k = 0; k < w.Length; k++)
                 {
@@ -672,7 +678,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         for (int i = 0; i < parameters.Count; i++)
         {
             if (!grads.Fp32.TryGetValue(parameters[i], out var g)) continue;
-            var span = g.AsWritableSpan();
+            using var spanLease = g.LeaseWritable();
+            var span = spanLease.Span;
             for (int k = 0; k < span.Length; k++)
             {
                 span[k] *= invScale;
@@ -732,7 +739,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         for (int i = 0; i < fp32Parameters.Count; i++)
         {
             if (!grads.Fp32.TryGetValue(fp32Parameters[i], out var g)) continue;
-            var span = g.AsWritableSpan();
+            using var spanLease = g.LeaseWritable();
+            var span = spanLease.Span;
             for (int k = 0; k < span.Length; k++)
             {
                 span[k] *= invScale;
@@ -748,9 +756,11 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         for (int i = 0; i < fp16Parameters.Count; i++)
         {
             if (!grads.Fp16.TryGetValue(fp16Parameters[i], out var gh)) continue;
-            var hs = gh.AsSpan();
+            using var hsLease = gh.Lease();
+            var hs = hsLease.Span;
             var f = new Tensor<float>(gh._shape);
-            var fsp = f.AsWritableSpan();
+            using var fspLease = f.LeaseWritable();
+            var fsp = fspLease.Span;
             for (int k = 0; k < fsp.Length; k++)
             {
                 float v = (float)hs[k] * invScale;
@@ -792,7 +802,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             var g = res.Fp32Gradients[i];
             if (g is null) continue;
             var w = fp32Parameters[i].AsWritableSpan();
-            var gs = g.AsSpan();
+            using var gsLease = g.Lease();
+            var gs = gsLease.Span;
             for (int k = 0; k < w.Length; k++) w[k] -= learningRate * gs[k];
             fp32Parameters[i].IncrementVersion();
         }
@@ -821,7 +832,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
                 },
                 master =>
                 {
-                    var w = param.AsWritableSpan();
+                    using var wLease = param.LeaseWritable();
+                    var w = wLease.Span;
                     if (w.Length != master.Length)
                         throw new InvalidOperationException(
                             $"Mixed-precision Step: fp16 storage length {w.Length} != fp32 master length {master.Length} (param index {idx}).");

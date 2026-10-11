@@ -155,8 +155,10 @@ public partial class CpuEngine
     {
         int rank = input.Rank;
         int N = input._shape[0], C = input._shape[1];
-        var src = input.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         int spatial = rank - 2;
 
         // Pre-compute per-axis floor-scale factors (input / output). We
@@ -215,8 +217,10 @@ public partial class CpuEngine
     {
         int spatial = input.Rank - 2;
         int N = input._shape[0], C = input._shape[1];
-        var src = input.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
 
         var srcDims = new int[spatial]; var dstDims = new int[spatial];
         for (int i = 0; i < spatial; i++) { srcDims[i] = input._shape[2 + i]; dstDims[i] = output._shape[2 + i]; }
@@ -291,8 +295,10 @@ public partial class CpuEngine
         int N = input._shape[0], C = input._shape[1];
         int H = input._shape[2], W = input._shape[3];
         int outH = output._shape[2], outW = output._shape[3];
-        var src = input.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
 
         for (int n = 0; n < N; n++)
         for (int c = 0; c < C; c++)
@@ -362,8 +368,10 @@ public partial class CpuEngine
     {
         int spatial = input.Rank - 2;
         int N = input._shape[0], C = input._shape[1];
-        var src = input.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
 
         var srcDims = new int[spatial]; var dstDims = new int[spatial];
         for (int i = 0; i < spatial; i++) { srcDims[i] = input._shape[2 + i]; dstDims[i] = output._shape[2 + i]; }
@@ -484,8 +492,10 @@ public partial class CpuEngine
         var output = new Tensor<T>(outShape);
         if (output.Length == 0) return output;
 
-        var src = input.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         var ops = MathHelper.GetNumericOperations<T>();
         T fill = mode == PadMode.Constant ? value : ops.Zero;
 
@@ -579,9 +589,12 @@ public partial class CpuEngine
         if (output.Length == 0) return output;
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var src = input.AsSpan();
-        var g = grid.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var gLease = grid.Lease();
+        var g = gLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
 
         for (int n = 0; n < N; n++)
         for (int oy = 0; oy < outH; oy++)
@@ -745,7 +758,8 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var scaled = (Tensor<T>)grid.Clone();
-        var span = scaled.AsWritableSpan();
+        using var spanLease = scaled.LeaseWritable();
+        var span = spanLease.Span;
         T fx = ops.FromDouble(width <= 0 ? 0.0 : (width - 1) / (double)width);
         T fy = ops.FromDouble(height <= 0 ? 0.0 : (height - 1) / (double)height);
         for (int i = 0; i + 1 < span.Length; i += 2)
@@ -799,8 +813,10 @@ public partial class CpuEngine
         if (grid.Length == 0) return grid;
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var t = theta.AsSpan();
-        var g = grid.AsWritableSpan();
+        using var tLease = theta.Lease();
+        var t = tLease.Span;
+        using var gLease = grid.LeaseWritable();
+        var g = gLease.Span;
 
         for (int n = 0; n < N; n++)
         {

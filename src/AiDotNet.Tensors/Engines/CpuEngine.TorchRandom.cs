@@ -415,7 +415,8 @@ public partial class CpuEngine
         var others = Enumerable.Range(0, tensor.Rank).Where(k => k != d).ToArray();
         var norm = others.Length == 0 ? TensorAbs(tensor) : PNorm(tensor, p, others, keepDims: true);
         // Slices over maxNorm are scaled by maxNorm / (norm + 1e-7) (PyTorch's epsilon), the rest by 1.
-        var normValues = norm.AsSpan().ToArray();
+        using var normKeep1 = new KeepAliveScope(norm);
+        var normValues = norm.AsSpanUnmarked().ToArray();
         var over = FromDoubles<T>((int[])norm._shape.Clone(), i => ops.ToDouble(normValues[i]) > maxNorm ? 1 : 0);
         var limited = TensorDivide(TensorFullLike(norm, ops.FromDouble(maxNorm)), TensorAddScalar(norm, ops.FromDouble(1e-7)));
         var factor = TensorWhere(over, limited, TensorOnesLike(norm));
@@ -520,7 +521,8 @@ public partial class CpuEngine
         int d = NormalizeDim(dim, tensor.Rank);
         if (index.Length != source._shape[d]) throw new ArgumentException("index must have one entry per slice of source along dim.", nameof(index));
         // index_reduce's 1-D index, expanded to source's shape, is scatter_reduce's index.
-        var idx = index.AsSpan().ToArray();
+        using var indexKeep1 = new KeepAliveScope(index);
+        var idx = index.AsSpanUnmarked().ToArray();
         int inner = source._shape.Skip(d + 1).Aggregate(1, (a, b) => a * b), extent = source._shape[d];
         var expanded = new int[source.Length];
         for (int i = 0; i < expanded.Length; i++) expanded[i] = idx[i / inner % extent];

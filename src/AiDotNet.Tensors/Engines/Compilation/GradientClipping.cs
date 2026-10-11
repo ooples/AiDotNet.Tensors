@@ -79,7 +79,8 @@ public static class GradientClipping
                     // AsWritableSpan is the single write-intent gate: it applies COW,
                     // respects a view's offset, excludes ArrayPool padding, and works
                     // for managed and native CPU storage.
-                    Scale(grad.AsWritableSpan(), scale);
+                    using var gradKeep1 = new KeepAliveScope(grad);
+                    Scale(grad.AsWritableSpanUnmarked(), scale);
                     grad.IncrementVersion();
                 }
                 else
@@ -117,7 +118,8 @@ public static class GradientClipping
                 continue;
             }
 
-            var data = grad.AsWritableSpan();
+            using var dataLease = grad.LeaseWritable();
+            var data = dataLease.Span;
             int len = data.Length;
             int i = 0;
 

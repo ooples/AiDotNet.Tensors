@@ -570,7 +570,8 @@ public sealed class ParameterBuffer<T>
                 $"Source vector length ({source.Length}) must match buffer size ({_totalSize}).",
                 nameof(source));
 
-        source.AsSpan().CopyTo(_data.AsWritableSpan());
+        using var sourceKeep1 = new KeepAliveScope(source);
+        source.AsSpanUnmarked().CopyTo(_data.AsWritableSpan());
     }
 
     /// <summary>
@@ -591,7 +592,8 @@ public sealed class ParameterBuffer<T>
     public Vector<T> FlattenGradients(IReadOnlyList<Tensor<T>> parameters, Dictionary<Tensor<T>, Tensor<T>> gradients)
     {
         var flatGrad = new Vector<T>(_totalSize);
-        var gradSpan = flatGrad.AsWritableSpan();
+        using var gradSpanLease = flatGrad.LeaseWritable();
+        var gradSpan = gradSpanLease.Span;
 
         for (int i = 0; i < parameters.Count; i++)
         {

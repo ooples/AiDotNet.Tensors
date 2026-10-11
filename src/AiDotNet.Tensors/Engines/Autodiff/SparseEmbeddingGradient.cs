@@ -199,7 +199,8 @@ public readonly struct SparseEmbeddingGradient<T>
         }
         else
         {
-            var src = indices.GetDataArray();
+            using var srcLease = indices.LeaseArray();
+            var src = srcLease.Array;
             var dst = new long[totalIndices];
             for (int i = 0; i < totalIndices; i++) dst[i] = Convert.ToInt64(src[i]);
             longIndices = new Tensor<long>(dst, new[] { totalIndices });

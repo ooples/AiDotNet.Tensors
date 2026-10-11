@@ -259,7 +259,8 @@ public partial class CpuEngine
                     // (We're inside the typeof(T)==float branch, so the (object) casts are
                     // exact reference casts, not boxing.)
                     var inputF = (Tensor<float>)(object)input;
-                    ReadOnlySpan<float> srcSpan = inputF.AsSpan();
+                    using var srcSpanLease = inputF.Lease();
+                    ReadOnlySpan<float> srcSpan = srcSpanLease.Span;
                     int curK = k0;
                     int pingToggle = 0;
                     for (int i = 0; i < weights.Count; i++)
@@ -285,7 +286,8 @@ public partial class CpuEngine
                         // needs the STABLE backing float[] (GetFlattenedData) for its
                         // identity-keyed pre-pack. AsSpan also materializes lazy data once.
                         var wT = (Tensor<float>)(object)w;
-                        ReadOnlySpan<float> wSpan = wT.AsSpan();
+                        using var wSpanLease = wT.Lease();
+                        ReadOnlySpan<float> wSpan = wSpanLease.Span;
 
                         bool gemmDone = false;
 #if !NET471

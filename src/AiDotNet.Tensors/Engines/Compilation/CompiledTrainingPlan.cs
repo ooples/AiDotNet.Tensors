@@ -490,7 +490,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (fresh is null) return;
         var key = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
         if (key is not null) Helpers.HostSync.Remove(key);
-        var dst = _lossOutput.AsWritableSpan();
+        using var dstLease = _lossOutput.LeaseWritable();
+        var dst = dstLease.Span;
         int n = Math.Min(dst.Length, fresh.Length);
         for (int i = 0; i < n; i++) dst[i] = (T)(object)fresh[i];
     }
@@ -1148,7 +1149,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             throw new InvalidOperationException(
                 "Internal invariant violated: _compiledInputTensor is null but expected==1.");
         ValidateShapesMatch(dst, src, "inputs[0]");
-        src.AsSpan().CopyTo(dst.AsWritableSpan());
+        using var srcKeep1 = new KeepAliveScope(src);
+        using var dstKeep1 = new KeepAliveScope(dst);
+        src.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
     }
 
     internal void SetInput(Tensor<T> input)
@@ -1163,7 +1166,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 $"{nameof(SetInput)} requires exactly one.");
 
         ValidateShapesMatch(dst, input, nameof(input));
-        input.AsSpan().CopyTo(dst.AsWritableSpan());
+        using var inputKeep1 = new KeepAliveScope(input);
+        using var dstKeep2 = new KeepAliveScope(dst);
+        input.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
@@ -1994,8 +1999,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 backend.AddScaled(gradBuffer, paramBuffer, gradBuffer, 1f, _l2Regularization, grad.Length);
                 continue;
             }
-            var g = grad.AsWritableSpan();   // materializes a pending device result first
-            var w = param.AsSpan();
+            using var gLease = grad.LeaseWritable();
+            var g = gLease.Span;   // materializes a pending device result first
+            using var wLease = param.Lease();
+            var w = wLease.Span;
             for (int i = 0; i < g.Length; i++) g[i] = numOps.Add(g[i], numOps.Multiply(strength, w[i]));
             // AsWritableSpan does not bump the GPU-cache version. A device copy of this gradient would otherwise stay
             // "current" and the optimizer would read it - without the term just added on the host.
@@ -2243,7 +2250,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
         var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
-        var span = buffer.AsWritableSpan();
+        using var spanLease = buffer.LeaseWritable();
+        var span = spanLease.Span;
         for (int i = 0; i < span.Length; i++) span[i] = sentinel;
     }
 
@@ -2252,7 +2260,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return 0;
         var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
-        var span = buffer.AsSpan();
+        using var spanLease = buffer.Lease();
+        var span = spanLease.Span;
         int leaked = 0;
         for (int i = 0; i < span.Length; i++)
         {
@@ -2661,7 +2670,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
                 if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
                 if (leafBuffer is null) continue;
-                var leafData = leaf.GetDataArray();
+                using var leafDataLease = leaf.LeaseArray();
+                var leafData = leafDataLease.Array;
                 if (leafBuffer.Size < leaf.Length) continue;
                 cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
                 leaf._gpuBufferVersion = leaf.GpuCacheVersion;
@@ -2686,7 +2696,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (bound.Handle == IntPtr.Zero) return false;
             buf = bound;
         }
-        var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
+        using var dataLease = inT.LeaseArray();
+        var data = dataLease.Array;                 // host backing (T==float on the graph path)
         if (buf.Size < inT.Length) return allLive;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         inT._gpuBufferVersion = inT.GpuCacheVersion;
@@ -2755,8 +2766,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         for (int p = 0; p < _gradients.Length; p++)
         {
             var gradient = _gradients[p];
+            using var gradientKeep1 = new KeepAliveScope(gradient);
             if (gradient is not null && gradient.HasPendingGpuData && _parameters[p].TryGetGpuBuffer() is null)
-                _ = gradient.AsSpan();
+                _ = gradient.AsSpanUnmarked();
         }
     }
 
@@ -3340,8 +3352,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             for (int p = 0; p < _gradients.Length; p++)
             {
                 var gradient = _gradients[p];
+                using var gradientKeep2 = new KeepAliveScope(gradient);
                 if (gradient is not null && gradient.LazySource is not null)
-                    _ = gradient.AsSpan();
+                    _ = gradient.AsSpanUnmarked();
             }
         }
 
@@ -6826,8 +6839,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     throw new InvalidOperationException(
                         $"FP16 backward produced gradient length {g.Length} for parameter {p}, " +
                         $"but the compiled parameter gradient buffer length is {destF.Length}.");
+                using var gKeep1 = new KeepAliveScope(g);
+                using var destFKeep1 = new KeepAliveScope(destF);
                 if (!(residentEng is not null && residentEng.TryRouteGradResident(g, destF, ref _residentGradBuffers![p])))
-                    g.AsSpan().CopyTo(destF.AsWritableSpan());
+                    g.AsSpanUnmarked().CopyTo(destF.AsWritableSpanUnmarked());
             }
         }
     }
@@ -7467,7 +7482,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     : new Tensor<T>(new int[] { 1 });
         }
         var lossGradSeed = TensorAllocator.RentUninitialized<T>(lossOutput._shape);
-        lossGradSeed.AsWritableSpan().Fill(numOps.One);
+        using var lossGradSeedKeep1 = new KeepAliveScope(lossGradSeed);
+        lossGradSeed.AsWritableSpanUnmarked().Fill(numOps.One);
 
         // Gradients array for parameters
         var gradients = new Tensor<T>[parameters.Length];
@@ -8422,7 +8438,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng =>
             {
-                MathHelper.GetNumericOperations<T>().Negate(inp.AsSpan(), o.AsWritableSpan());
+                using var inpKeep1 = new KeepAliveScope(inp);
+                using var oKeep1 = new KeepAliveScope(o);
+                MathHelper.GetNumericOperations<T>().Negate(inp.AsSpanUnmarked(), o.AsWritableSpanUnmarked());
             };
         }
 
@@ -8842,7 +8860,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     else
                     {
                         var result = eng.Conv2D(inp, kernel, capStride, capPadding, capDilation);
-                        result.AsSpan().CopyTo(o.AsWritableSpan());
+                        using var resultKeep1 = new KeepAliveScope(result);
+                        using var oKeep2 = new KeepAliveScope(o);
+                        result.AsSpanUnmarked().CopyTo(o.AsWritableSpanUnmarked());
                     }
                 };
             }
@@ -8859,7 +8879,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else
                 {
                     var result = eng.Conv2D(inp, kernel, defStride, defPadding, defDilation);
-                    result.AsSpan().CopyTo(o.AsWritableSpan());
+                    using var resultKeep2 = new KeepAliveScope(result);
+                    using var oKeep3 = new KeepAliveScope(o);
+                    result.AsSpanUnmarked().CopyTo(o.AsWritableSpanUnmarked());
                 }
             };
         }
@@ -8903,7 +8925,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else
                 {
                     var result = eng.ConvTranspose2D(inp, kernel, capStride, capPadding, capOutPad);
-                    result.AsSpan().CopyTo(o.AsWritableSpan());
+                    using var resultKeep3 = new KeepAliveScope(result);
+                    using var oKeep4 = new KeepAliveScope(o);
+                    result.AsSpanUnmarked().CopyTo(o.AsWritableSpanUnmarked());
                 }
             };
         }
@@ -8954,7 +8978,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else
                 {
                     var result = eng.GroupNorm(inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
-                    result.AsSpan().CopyTo(o.AsWritableSpan());
+                    using var resultKeep4 = new KeepAliveScope(result);
+                    using var oKeep5 = new KeepAliveScope(o);
+                    result.AsSpanUnmarked().CopyTo(o.AsWritableSpanUnmarked());
                 }
                 // Refresh the saved statistics the backward reads (see note above).
                 // In a compiled plan the trace-time and replay-time shapes are fixed, so
@@ -8966,8 +8992,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         $"GroupNorm forward produced mean/variance of length ({freshMean.Length}, {freshVar.Length}) " +
                         $"but the compiled savedState buffers are ({savedMeanGN.Length}, {savedVarGN.Length}); " +
                         "refusing to silently skip the statistics refresh (this is the same stale-statistics class of bug being fixed here).");
-                freshMean.AsSpan().CopyTo(savedMeanGN.AsWritableSpan());
-                freshVar.AsSpan().CopyTo(savedVarGN.AsWritableSpan());
+                using var freshMeanKeep1 = new KeepAliveScope(freshMean);
+                using var savedMeanGNKeep1 = new KeepAliveScope(savedMeanGN);
+                freshMean.AsSpanUnmarked().CopyTo(savedMeanGN.AsWritableSpanUnmarked());
+                using var freshVarKeep1 = new KeepAliveScope(freshVar);
+                using var savedVarGNKeep1 = new KeepAliveScope(savedVarGN);
+                freshVar.AsSpanUnmarked().CopyTo(savedVarGN.AsWritableSpanUnmarked());
 
                 // Return the freshly-rented stat temporaries to the pool. Both GroupNormInto
                 // and GroupNorm Rent freshMean/freshVar from TensorAllocator; this replay path
@@ -9703,11 +9733,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             //    Every element is written, so nothing downstream can read a stale slot.
             if (leftSpansOutput)
             {
-                left.AsSpan().CopyTo(output.AsWritableSpan());
+                using var leftKeep1 = new KeepAliveScope(left);
+                using var outputKeep1 = new KeepAliveScope(output);
+                left.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
             }
             else
             {
-                output.AsWritableSpan().Clear();
+                using var outputKeep2 = new KeepAliveScope(output);
+                output.AsWritableSpanUnmarked().Clear();
                 cpu.TensorBroadcastAddInPlace(output, left);
             }
 
@@ -9743,7 +9776,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // logical shape; AsSpan() would then copy only that backing and leave the rest of output
         // untouched.
         if (!result.IsContiguous) result = result.Contiguous();
-        result.AsSpan().CopyTo(output.AsWritableSpan());
+        using var resultKeep5 = new KeepAliveScope(result);
+        using var outputKeep3 = new KeepAliveScope(output);
+        result.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -10032,13 +10067,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (!BlasProvider.TryGemmEx(Md, Kd, Nd, cdDC, 0, Nd, false, cdB, 0, Nd, true, cdDestA, 0, Kd))
                 {
                     var dA = eng.TensorMatMul(gradOutD, inputBd.Transpose());
-                    dA.AsSpan().CopyTo(gradAd.AsWritableSpan());
+                    using var dAKeep1 = new KeepAliveScope(dA);
+                    using var gradAdKeep1 = new KeepAliveScope(gradAd);
+                    dA.AsSpanUnmarked().CopyTo(gradAd.AsWritableSpanUnmarked());
                 }
                 // dB = A^T @ dC — double-precision BLAS with engine fallback
                 if (!BlasProvider.TryGemmEx(Kd, Nd, Md, cdA, 0, Kd, true, cdDC, 0, Nd, false, cdDestB, 0, Nd))
                 {
                     var dB = eng.TensorMatMul(inputAd.Transpose(), gradOutD);
-                    dB.AsSpan().CopyTo(gradBd.AsWritableSpan());
+                    using var dBKeep1 = new KeepAliveScope(dB);
+                    using var gradBdKeep1 = new KeepAliveScope(gradBd);
+                    dB.AsSpanUnmarked().CopyTo(gradBd.AsWritableSpanUnmarked());
                 }
 
                 inputAd.Grad = gradAd;
@@ -10246,7 +10285,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (!dAJit && !BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
                 {
                     var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
-                    dA.AsSpan().CopyTo(gradA.AsWritableSpan());
+                    using var dAKeep2 = new KeepAliveScope(dA);
+                    using var gradAKeep1 = new KeepAliveScope(gradA);
+                    dA.AsSpanUnmarked().CopyTo(gradA.AsWritableSpanUnmarked());
                 }
                 // dB = A^T @ dC — when dW peeling is active for this
                 // step (Phase G.12), skip this GEMM entirely; the dW
@@ -10257,7 +10298,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
                     {
                         var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
-                        dB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                        using var dBKeep2 = new KeepAliveScope(dB);
+                        using var gradBKeep1 = new KeepAliveScope(gradB);
+                        dB.AsSpanUnmarked().CopyTo(gradB.AsWritableSpanUnmarked());
                     }
                 }
 
@@ -10626,7 +10669,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var computed = eng.ReluBackward(gradOut, input);
-                computed.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var computedKeep1 = new KeepAliveScope(computed);
+                using var gradInKeep1 = new KeepAliveScope(gradIn);
+                computed.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11176,7 +11221,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else
                 {
                     // Another engine at replay: its own backward, accumulated into a cleared buffer unless shared.
-                    if (!accum) gradIn.AsWritableSpan().Clear();
+                    using var gradInKeep2 = new KeepAliveScope(gradIn);
+                    if (!accum) gradIn.AsWritableSpanUnmarked().Clear();
                     genericBackward(gradOut, step.Inputs, output, savedState, eng, gradMap);
                 }
                 input.Grad = gradIn;
@@ -11257,7 +11303,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 // ReduceSum backward: each input element gets the same scalar gradient
-                gradIn.AsWritableSpan().Fill(gradOut.AsSpan()[0]);
+                using var gradInKeep3 = new KeepAliveScope(gradIn);
+                using var gradOutKeep1 = new KeepAliveScope(gradOut);
+                gradIn.AsWritableSpanUnmarked().Fill(gradOut.AsSpanUnmarked()[0]);
                 input.Grad = gradIn;
             };
         }
@@ -11273,7 +11321,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.SigmoidBackward(gradOut, output);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep1 = new KeepAliveScope(grad);
+                using var gradInKeep4 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11289,7 +11339,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.TanhBackward(gradOut, output);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep2 = new KeepAliveScope(grad);
+                using var gradInKeep5 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11304,7 +11356,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var gradIn = gradMap[input];
             return eng =>
             {
-                MathHelper.GetNumericOperations<T>().Negate(gradOut.AsSpan(), gradIn.AsWritableSpan());
+                using var gradOutKeep2 = new KeepAliveScope(gradOut);
+                using var gradInKeep6 = new KeepAliveScope(gradIn);
+                MathHelper.GetNumericOperations<T>().Negate(gradOut.AsSpanUnmarked(), gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11320,7 +11374,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.TensorTranspose(gradOut);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep3 = new KeepAliveScope(grad);
+                using var gradInKeep7 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11340,11 +11396,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var gA = eng.TensorDivide(gradOut, inputB);
-                gA.AsSpan().CopyTo(gradA.AsWritableSpan());
+                using var gAKeep1 = new KeepAliveScope(gA);
+                using var gradAKeep2 = new KeepAliveScope(gradA);
+                gA.AsSpanUnmarked().CopyTo(gradA.AsWritableSpanUnmarked());
                 var negGradTimesA = eng.TensorNegate(eng.TensorMultiply(gradOut, inputA));
                 var bSquared = eng.TensorMultiply(inputB, inputB);
                 var gB = eng.TensorDivide(negGradTimesA, bSquared);
-                gB.AsSpan().CopyTo(gradB.AsWritableSpan());
+                using var gBKeep1 = new KeepAliveScope(gB);
+                using var gradBKeep2 = new KeepAliveScope(gradB);
+                gB.AsSpanUnmarked().CopyTo(gradB.AsWritableSpanUnmarked());
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
@@ -11362,7 +11422,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.SoftmaxBackward(gradOut, output, axis);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep4 = new KeepAliveScope(grad);
+                using var gradInKeep8 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11376,7 +11438,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.GeluBackward(gradOut, input);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep5 = new KeepAliveScope(grad);
+                using var gradInKeep9 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11391,7 +11455,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.LeakyReluBackward(gradOut, input, negSlope);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep6 = new KeepAliveScope(grad);
+                using var gradInKeep10 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11405,7 +11471,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.SwishBackward(gradOut, input);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep7 = new KeepAliveScope(grad);
+                using var gradInKeep11 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -11420,7 +11488,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 var grad = eng.EluBackward(gradOut, input, output, alpha);
-                grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                using var gradKeep8 = new KeepAliveScope(grad);
+                using var gradInKeep12 = new KeepAliveScope(gradIn);
+                grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
                 input.Grad = gradIn;
             };
         }
@@ -12299,7 +12369,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else
                 {
                     var z = eng.TensorChannelBiasAdd(eng.Conv2D(x, kernel, capStride, capPadding, capDilation), bias);
-                    (relu ? eng.ReLU(z) : z).AsSpan().CopyTo(y.AsWritableSpan());
+                    using var yKeep1 = new KeepAliveScope(y);
+                    (relu ? eng.ReLU(z) : z).AsSpan().CopyTo(y.AsWritableSpanUnmarked());
                 }
             };
             backwardSpecs[poolIdx >= 0 ? poolIdx : last] = eng =>
