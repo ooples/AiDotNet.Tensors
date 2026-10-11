@@ -155,7 +155,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityCapacity(output, n, nameof(output), "n");
         RequireParityDoubles("range");
         ParityDispatch("range", VulkanTorchParityElementwiseKernels.Range, n,
-            new[] { (uint)n, Low(start), High(start), Low(span), High(span), Low(denominator), High(denominator) }, output);
+            new[] { (uint)n, 0u, Low(start), High(start), Low(span), High(span), Low(denominator), High(denominator) }, output);
     }
 
     void ITorchParityElementwiseBackend.TorchParityLogspace(IGpuBuffer output, int n, double start, double span, double denominator,
@@ -167,7 +167,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         ParityDispatch("logspace", VulkanTorchParityElementwiseKernels.Logspace, n,
             new[]
             {
-                (uint)n, Low(start), High(start), Low(span), High(span), Low(denominator), High(denominator), Low(logBase), High(logBase),
+                (uint)n, 0u, Low(start), High(start), Low(span), High(span), Low(denominator), High(denominator), Low(logBase), High(logBase),
                 single ? 1u : 0u,
             }, output);
     }
@@ -178,7 +178,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityCapacity(output, n, nameof(output), "n");
         RequireParityDoubles("window");
         ParityDispatch("window", VulkanTorchParityElementwiseKernels.Window, n,
-            new[] { (uint)n, Word(kind), Word(m), Low(alpha), High(alpha), Low(beta), High(beta) }, output);
+            new[] { (uint)n, Word(kind), Word(m), 0u, Low(alpha), High(alpha), Low(beta), High(beta) }, output);
     }
 
     void ITorchParityElementwiseBackend.TorchParityTriIndices(IGpuBuffer output, int row, int col, int offset, bool lower, int total)
@@ -263,7 +263,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityCapacity(output, n, nameof(output), "n");
         RequireParityDoubles("bernoulli");
         ParityDispatchValidating("bernoulli", VulkanTorchParityElementwiseKernels.Bernoulli, n,
-            new[] { (uint)n, (uint)seed, (uint)(seed >> 32) }, flag, probabilities, output);
+            new[] { (uint)n, 0u, (uint)seed, (uint)(seed >> 32) }, flag, probabilities, output);
     }
 
     void ITorchParityElementwiseBackend.TorchParityPoisson(IGpuBuffer rates, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
@@ -273,7 +273,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityCapacity(output, n, nameof(output), "n");
         RequireParityDoubles("poisson");
         ParityDispatchValidating("poisson", VulkanTorchParityElementwiseKernels.Poisson, n,
-            new[] { (uint)n, (uint)seed, (uint)(seed >> 32) }, flag, rates, output);
+            new[] { (uint)n, 0u, (uint)seed, (uint)(seed >> 32) }, flag, rates, output);
     }
 
     void ITorchParityElementwiseBackend.TorchParityBinomial(IGpuBuffer counts, IGpuBuffer probabilities, IGpuBuffer output, int n,
@@ -286,7 +286,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityDoubles("binomial");
         RequireParityInt64("binomial");
         ParityDispatchValidating("binomial", VulkanTorchParityElementwiseKernels.Binomial, n,
-            new[] { (uint)n, (uint)seed, (uint)(seed >> 32) }, flag, counts, probabilities, output);
+            new[] { (uint)n, 0u, (uint)seed, (uint)(seed >> 32) }, flag, counts, probabilities, output);
     }
 
     void ITorchParityElementwiseBackend.TorchParityMultinomial(IGpuBuffer weights, IGpuBuffer scratch, IGpuBuffer output, int rows,
@@ -298,7 +298,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityCapacity(output, (long)rows * numSamples, nameof(output), "rows*numSamples");
         RequireParityDoubles("multinomial");
         ParityDispatchValidating("multinomial", VulkanTorchParityElementwiseKernels.Multinomial(replacement), rows,
-            new[] { (uint)rows, Word(categories), Word(numSamples), (uint)seed, (uint)(seed >> 32) }, flag, weights, scratch, output);
+            new[] { (uint)rows, Word(categories), Word(numSamples), 0u, (uint)seed, (uint)(seed >> 32) }, flag, weights, scratch, output);
     }
 
     void ITorchParityElementwiseBackend.TorchParityDropoutAffine(IGpuBuffer scale, IGpuBuffer offset, int n, int block, double p, double a,
@@ -325,7 +325,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityCapacity(output, n, nameof(output), "n");
         RequireParityDoubles("rrelu");
         ParityDispatch("rrelu", VulkanTorchParityElementwiseKernels.Rrelu, n,
-            new[] { (uint)n, Low(lower), High(lower), Low(upper), High(upper), training ? 1u : 0u, (uint)seed, (uint)(seed >> 32) },
+            new[] { (uint)n, 0u, Low(lower), High(lower), Low(upper), High(upper), training ? 1u : 0u, 0u, (uint)seed, (uint)(seed >> 32) },
             input, output);
     }
 
@@ -335,7 +335,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityCapacity(output, n, nameof(output), "n");
         RequireParityDoubles("random_keys");
         ParityDispatch("random_keys", VulkanTorchParityElementwiseKernels.RandomKeys, n,
-            new[] { (uint)n, (uint)seed, (uint)(seed >> 32) }, output);
+            new[] { (uint)n, 0u, (uint)seed, (uint)(seed >> 32) }, output);
     }
 
     void ITorchParityElementwiseBackend.TorchParityIntBinary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, IGpuBuffer flag)
@@ -420,7 +420,7 @@ public sealed unsafe partial class VulkanBackend : ITorchParityElementwiseBacken
         RequireParityDoubles("unravel_axis");
         RequireParityInt64("unravel_axis");
         ParityDispatchValidating("unravel_axis", VulkanTorchParityElementwiseKernels.UnravelAxis, n,
-            new[] { (uint)n, Low(total), High(total), Low(stride), High(stride), Low(extent), High(extent), validate ? 1u : 0u },
+            new[] { (uint)n, 0u, Low(total), High(total), Low(stride), High(stride), Low(extent), High(extent), validate ? 1u : 0u },
             flag, indices, output);
     }
 
