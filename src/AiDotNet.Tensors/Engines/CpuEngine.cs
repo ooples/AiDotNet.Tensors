@@ -27839,6 +27839,56 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    private static void RmsNormBackwardAccumGamma(float[] gradOut, float[] input, float[] rms, float[] gradGamma, int rows, int fs)
+    {
+        int chunks = NormColumnChunks(rows, fs, out int perChunk);
+        if (chunks <= 1) { RmsNormBackwardAccumGammaRange(gradOut, input, rms, gradGamma, rows, fs, 0, fs); return; }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * fs, chunk =>
+        {
+            int f0 = chunk * perChunk;
+            RmsNormBackwardAccumGammaRange(gradOut, input, rms, gradGamma, rows, fs, f0, Math.Min(fs, f0 + perChunk));
+        }, deterministicSafe: true);
+    }
+
+    private static void RmsNormBackwardAccumGammaRange(float[] gradOut, float[] input, float[] rms, float[] gradGamma, int rows, int fs, int f0, int f1)
+    {
+        for (int b = 0; b < rows; b++)
+        {
+            int off = b * fs;
+            float invRms = 1f / rms[b];
+            for (int f = f0; f < f1; f++)
+            {
+                float normalized = input[off + f] * invRms;
+                gradGamma[f] += gradOut[off + f] * normalized;
+            }
+        }
+    }
+
+    private static void RmsNormBackwardAccumGamma(double[] gradOut, double[] input, double[] rms, double[] gradGamma, int rows, int fs)
+    {
+        int chunks = NormColumnChunks(rows, fs, out int perChunk);
+        if (chunks <= 1) { RmsNormBackwardAccumGammaRange(gradOut, input, rms, gradGamma, rows, fs, 0, fs); return; }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * fs, chunk =>
+        {
+            int f0 = chunk * perChunk;
+            RmsNormBackwardAccumGammaRange(gradOut, input, rms, gradGamma, rows, fs, f0, Math.Min(fs, f0 + perChunk));
+        }, deterministicSafe: true);
+    }
+
+    private static void RmsNormBackwardAccumGammaRange(double[] gradOut, double[] input, double[] rms, double[] gradGamma, int rows, int fs, int f0, int f1)
+    {
+        for (int b = 0; b < rows; b++)
+        {
+            int off = b * fs;
+            double invRms = 1.0 / rms[b];
+            for (int f = f0; f < f1; f++)
+            {
+                double normalized = input[off + f] * invRms;
+                gradGamma[f] += gradOut[off + f] * normalized;
+            }
+        }
+    }
+
     private static void LayerNormBackwardDoubleAccumGammaBeta(
         double[] gradOut, double[] input, double[] mean, double[] variance,
         double[] gradGamma, double[] gradBeta,
@@ -28995,16 +29045,8 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             float invFeatureSizeF = 1f / fs;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                float invRms = 1f / fRms[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    float normalized = fInput[off + f] * invRms;
-                    fGradGamma[f] += fGradOut[off + f] * normalized;
-                }
-            }
+            // gradGamma over feature-column ranges, each accumulated over the rows in order (bit-identical).
+            RmsNormBackwardAccumGamma(fGradOut, fInput, fRms, fGradGamma, batchSize, fs);
 
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {
@@ -29037,16 +29079,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             double invFeatureSizeD = 1.0 / fs;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                double invRms = 1.0 / dRms[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    double normalized = dInput[off + f] * invRms;
-                    dGradGamma[f] += dGradOut[off + f] * normalized;
-                }
-            }
+            RmsNormBackwardAccumGamma(dGradOut, dInput, dRms, dGradGamma, batchSize, fs);
 
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {

@@ -148,6 +148,73 @@ public class NormBackwardFanOutTests
         AssertClose(LayerNormBackwardReference<double>(rows, features), ToDouble(parallel), 1e-9);
     }
 
+    // ---------------------------------------------------------------- RMSNorm
+
+    private static T[] RmsNormBackward<T>(int rows, int features)
+    {
+        var engine = new CpuEngine();
+        var x = Random<T>(9, rows, features);
+        var gamma = Random<T>(10, features);
+        var gradOut = Random<T>(11, rows, features);
+        engine.RMSNorm(x, gamma, 1e-6, out var rms);
+        var gradInput = engine.RMSNormBackward(gradOut, x, gamma, rms, 1e-6, out var gradGamma);
+        return Concat(gradInput, gradGamma);
+    }
+
+    // gradGamma[f] = sum_b go * x / rms; gradInput = (gamma * go - xhat * mean_f(gamma * go * xhat)) / rms.
+    private static double[] RmsNormBackwardReference<T>(int rows, int features)
+    {
+        var x = ToDouble(Random<T>(9, rows, features).ToArray());
+        var gamma = ToDouble(Random<T>(10, features).ToArray());
+        var go = ToDouble(Random<T>(11, rows, features).ToArray());
+        var gi = new double[rows * features];
+        var gg = new double[features];
+        for (int r = 0; r < rows; r++)
+        {
+            double ms = 0;
+            for (int f = 0; f < features; f++) ms += x[r * features + f] * x[r * features + f];
+            double rms = Math.Sqrt(ms / features + 1e-6);
+            double corr = 0;
+            for (int f = 0; f < features; f++)
+            {
+                int i = r * features + f;
+                gg[f] += go[i] * x[i] / rms;
+                corr += gamma[f] * go[i] * x[i] / rms;
+            }
+            corr /= features;
+            for (int f = 0; f < features; f++)
+            {
+                int i = r * features + f;
+                gi[i] = (gamma[f] * go[i] - x[i] / rms * corr) / rms;
+            }
+        }
+        var all = new double[gi.Length + features];
+        gi.CopyTo(all, 0); gg.CopyTo(all, gi.Length);
+        return all;
+    }
+
+    [Theory]
+    [InlineData(600, 1000)]
+    [InlineData(64, 4096)]
+    public void RmsNormBackward_Float_SameAtAnyThreadCount_AndCorrect(int rows, int features)
+    {
+        var serial = Run(1, () => RmsNormBackward<float>(rows, features));
+        var parallel = Run(Math.Max(4, Environment.ProcessorCount), () => RmsNormBackward<float>(rows, features));
+        AssertBitEqual(serial, parallel);
+        AssertClose(RmsNormBackwardReference<float>(rows, features), ToDouble(parallel), 2e-3);
+    }
+
+    [Theory]
+    [InlineData(600, 1000)]
+    [InlineData(64, 4096)]
+    public void RmsNormBackward_Double_SameAtAnyThreadCount_AndCorrect(int rows, int features)
+    {
+        var serial = Run(1, () => RmsNormBackward<double>(rows, features));
+        var parallel = Run(Math.Max(4, Environment.ProcessorCount), () => RmsNormBackward<double>(rows, features));
+        AssertBitEqual(serial, parallel);
+        AssertClose(RmsNormBackwardReference<double>(rows, features), ToDouble(parallel), 1e-9);
+    }
+
     // ---------------------------------------------------------------- GroupNorm
 
     private static T[] GroupNormBackward<T>(int batch, int channels, int side, int groups)
