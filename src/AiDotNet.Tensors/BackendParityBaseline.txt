@@ -9,10 +9,7 @@ capability IExtendedLinalgBackend VulkanBackend #1142
 capability IExtendedLinalgBackend WebGpuBackend #1142
 capability IFusedLstmSequenceTraining MetalBackend #1107
 capability IFusedLstmSequenceTraining WebGpuBackend #1108
-capability IGpuBufferViews HipBackend #1142
 capability IGpuBufferViews MetalBackend #1142
-capability IGpuBufferViews OpenClBackend #1142
-capability IGpuBufferViews VulkanBackend #1142
 capability IGpuBufferViews WebGpuBackend #1142
 capability IGpuMixedPrecisionConvBackend HipBackend #1142
 capability IGpuMixedPrecisionConvBackend MetalBackend #1142

@@ -14,6 +14,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     internal readonly VulkanBuffer Storage;
     internal readonly VulkanBuffer Staging;
     private int _disposed;
+    private readonly VulkanGpuBuffer? _viewParent;
 
     /// <summary>Frees of Vulkan buffers collected without Dispose, run by the next allocation.</summary>
     internal static readonly DeviceFreeQueue PendingFrees = new();
@@ -41,6 +42,13 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
         Size = size;
+    }
+
+    /// <summary>A view wrapper: holds <paramref name="parent"/> so its finalizer cannot free memory the view still uses.</summary>
+    internal VulkanGpuBuffer(VulkanBuffer storage, VulkanBuffer staging, int size, VulkanGpuBuffer parent)
+        : this(storage, staging, size)
+    {
+        _viewParent = parent;
     }
 
     /// <summary>

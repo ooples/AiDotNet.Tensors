@@ -72,7 +72,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private readonly int _length;
 
         /// <summary>Bytes this buffer holds on the device, for residency accounting.</summary>
-        private long ByteSize => (long)_length * sizeof(float);
+        private long ByteSize => _isView ? 0 : (long)_length * sizeof(float);
+        // A sub-buffer view shares its parent's memory, so it adds and removes nothing from residency accounting.
+        private readonly bool _isView;
         private bool _disposed;
 
         public IntPtr Handle => _buffer;
@@ -115,6 +117,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <summary>
         /// Creates an empty buffer of specified size.
         /// </summary>
+        private DirectOpenClBuffer(DirectOpenClContext context, IntPtr subBuffer, int length)
+        {
+            _context = context;
+            _length = length;
+            _buffer = subBuffer;
+            _isView = true;
+            _context.RegisterMemoryObject(this);
+        }
+
+        /// <summary>
+        /// A sub-buffer over <paramref name="elementCount"/> floats of <paramref name="parent"/> starting at
+        /// <paramref name="elementOffset"/>, or null when the device refuses the region (an offset off its base
+        /// address alignment). The sub-buffer retains the parent's memory until it is released.
+        /// </summary>
+        internal static DirectOpenClBuffer? TryCreateView(DirectOpenClBuffer parent, int elementOffset, int elementCount)
+        {
+            IntPtr view = OpenClNativeBindings.CreateSubBuffer(parent.Handle, checked(elementOffset * sizeof(float)),
+                checked(elementCount * sizeof(float)));
+            return view == IntPtr.Zero ? null : new DirectOpenClBuffer(parent._context, view, elementCount);
+        }
+
         public DirectOpenClBuffer(DirectOpenClContext context, int size)
         {
             _context = context;
