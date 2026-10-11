@@ -248,6 +248,8 @@ __device__ void fa_backward_kv(const float* __restrict__ q, const float* __restr
             Ds[e] = delta[(long long)bh * p.Sq + i0 + e];
         }
         __syncthreads();
+        // Unrolled so neighbouring rows' independent dot products overlap (the pass runs at low occupancy).
+        #pragma unroll 4
         for (int ii = 0; ii < rows; ii++)
         {
             int i = i0 + ii;
@@ -328,6 +330,7 @@ __device__ void fa_backward_q(const float* __restrict__ q, const float* __restri
             Vs[jj][d] = vbase[(long long)(j0 + jj) * p.vr + d];
         }
         __syncthreads();
+        #pragma unroll 4
         for (int jj = 0; jj < cols; jj++)
         {
             int j = j0 + jj;
