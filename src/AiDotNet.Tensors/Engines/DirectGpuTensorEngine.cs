@@ -1640,7 +1640,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the vector's current values.
         return view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
             && shared.Handle != IntPtr.Zero && ReferenceEquals(state.Backend, backend)
-            && !state.IsSplitComplex && !state.ContainsRawInt32
+            && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64
             ? shared
             : null;
     }
@@ -1812,6 +1812,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -1953,6 +1954,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // held index bits rather than one float per element, and GetOrAllocateInt32IndexBuffer
         // forwards such a buffer to its consumer UNCONVERTED.
         tensor._gpuBufferContainsRawInt32 = false;
+        tensor._gpuBufferContainsRawInt64 = false;
         // ...and say so. Device and buffer are set together by Tensor.Gpu() and cleared together by
         // Tensor.Cpu(); leaving _device on a GPU after dropping the buffer produces a tensor that claims
         // GPU residency while nothing holds its data. That state is host-authoritative by this method's
@@ -2192,6 +2194,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Check caches without triggering CPU materialization
@@ -17534,8 +17537,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Every axis of a contiguous tensor: one mean over all elements. Shape [1] whatever keepDims says,
-            // exactly as CpuEngine's full-reduction fast path returns it.
+            // Every axis of a contiguous tensor: one mean over all elements, shaped as CpuEngine's full reduction
+            // (rank 0, or every axis kept as 1 with keepDims).
             if (normalizedAxes.Length == input.Rank && input.IsContiguous && input.Length > 0)
             {
                 using var source = GetOrAllocateBuffer(backend, input);
@@ -17544,7 +17547,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     backend.MeanAxis(source.Buffer, output.Buffer, outerSize: 1, reduceSize: input.Length);
-                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, new[] { 1 });
+                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, FullReductionShape(input.Rank, keepDims));
                     handedOff = true;
                     Autodiff.DifferentiableOps.RecordUnary("ReduceMean", result, input,
                         Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { normalizedAxes, keepDims });
@@ -17688,7 +17691,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < inputRank; i++)
                 if (!reduceDimsSet.Contains(i))
                     outputShapeList.Add(inputShape[i]);
-            if (outputShapeList.Count == 0) outputShapeList.Add(1);
         }
         var outputShape = outputShapeList.ToArray();
 
@@ -17864,17 +17866,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     try
                     {
                         backend.SumAxis(input.Buffer, output.Buffer, outerSize: 1, reduceSize: tensor.Length);
-                        int[] outputShape;
-                        if (keepDims)
-                        {
-                            outputShape = new int[tensor.Rank];
-                            for (int i = 0; i < outputShape.Length; i++) outputShape[i] = 1;
-                        }
-                        else
-                        {
-                            outputShape = new[] { 1 };
-                        }
-
+                        var outputShape = FullReductionShape(tensor.Rank, keepDims);
                         var result = DeferTensorResult<T>(backend, output.Buffer, 1, outputShape);
                         handedOff = true;
                         var allAxes = new int[tensor.Rank];
@@ -18080,7 +18072,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             || inputShape is null || !TryGetBackend(out var backend))
             return null;
 
-        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor yields [1]): the
+        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor is rank 0): the
         // gradient is the incoming one, reshaped and scaled.
         int inputLength = 1;
         foreach (int d in inputShape) inputLength = checked(inputLength * d);
@@ -19132,7 +19124,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (i != axis) outputShapeList.Add(inputShape[i]);
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -19169,7 +19160,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputShapeList = new List<int>();
         for (int i = 0; i < inputRank; i++)
             if (i != axis) outputShapeList.Add(inputShape[i]);
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -26587,7 +26577,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     outputShape.Add(input.Shape._dims[d]);
                 }
             }
-            if (outputShape.Count == 0) outputShape.Add(1);
 
             using var inputBuffer = GetOrAllocateBuffer(backend, reductionInput);
             using var valuesBuffer = AllocateOutputBuffer(backend, outerSize);

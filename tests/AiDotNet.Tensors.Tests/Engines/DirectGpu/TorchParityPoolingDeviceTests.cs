@@ -14,11 +14,10 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// inputs include negatives and a NaN, and Lp runs at an integer and a fractional power. Each case must match the CPU
 /// element by element (NaN only where the CPU is NaN), launch device work, and record no host fallback.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class TorchParityPoolingDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public abstract class TorchParityPoolingDeviceTestsBase
 {
-    private readonly DirectGpuTensorEngineTestFixture _fixture;
-    public TorchParityPoolingDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+    private readonly IDirectGpuTensorEngineFixture _fixture;
+    protected TorchParityPoolingDeviceTestsBase(IDirectGpuTensorEngineFixture fixture) => _fixture = fixture;
 
     private static Tensor<float> Input(int salt, bool withNaN, params int[] shape)
     {
@@ -78,4 +77,18 @@ public class TorchParityPoolingDeviceTests : IClassFixture<DirectGpuTensorEngine
         Assert.Equal(fallbacks, TorchParityElementwiseDeviceTests.FallbackCount(probe));
         AssertMatches(op, expected, actual);
     }
+}
+
+/// <summary>The cases above on the machine's default DirectGpu backend.</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityPoolingDeviceTests : TorchParityPoolingDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    public TorchParityPoolingDeviceTests(DirectGpuTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+/// <summary>The cases above on the Vulkan backend (#1127).</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityPoolingVulkanDeviceTests : TorchParityPoolingDeviceTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
+{
+    public TorchParityPoolingVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }

@@ -272,6 +272,84 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    // #1135: integer ops on long, ulong, short, ushort, sbyte, byte and uint tensors run on the raw int64 device layout
+    // (two words per element, the element's int64 widening). A result stays resident in that layout, so a chain of
+    // integer ops never leaves the device; the host sees it narrowed back to the element type.
+    private Tensor<T>? TryInt64OnDevice<T>(string opName, Tensor<T> a, Tensor<T>? b, int op)
+    {
+        int typeCode = Int64TypeCode<T>();
+        if (typeCode < 0 || a is null || a.Length == 0 || (b is not null && !a._shape.AsSpan().SequenceEqual(b._shape))
+            || (op >= 0 && b is null) || IsTapeActive<T>(opName) || !TryGetBackend(out var backend)
+            || backend is not ITorchParityElementwiseBackend kernels)
+            return null;
+        IGpuBuffer? output = null;
+        ulong flagValue = NoParityError;
+        try
+        {
+            int n = a.Length;
+            if (n > int.MaxValue / 2) return null;
+            using var x = GetOrUploadRawInt64(backend, a);
+            output = backend.AllocateIntBuffer(2 * n);
+            if (op < 0) kernels.TorchParityInt64Not(x.Buffer, output, n, typeCode);
+            else
+            {
+                using var y = GetOrUploadRawInt64(backend, b!);
+                using var flag = AllocateOutputBuffer(backend, 2);
+                kernels.TorchParityFlagReset(flag.Buffer);
+                kernels.TorchParityInt64Binary(op, x.Buffer, y.Buffer, output, n, typeCode, flag.Buffer);
+                if (op >= 5) flagValue = ReadParityFlag(backend, flag.Buffer);   // gcd, lcm, floor divide can throw
+            }
+            if (flagValue != NoParityError)
+            {
+                if ((flagValue & 7) == 1) throw new DivideByZeroException($"{opName}: integer division by zero.");
+                throw new OverflowException($"{opName}: the result overflows Int64 (as Math.Abs / division on the CPU).");
+            }
+            var result = Tensor<T>.FromGpuBuffer(backend, output, (int[])a._shape.Clone(), Gpu.GpuTensorRole.Intermediate,
+                ownsBuffer: true, bufferContainsRawInt64: true);
+            output = null;
+            return result;
+        }
+        catch (Exception ex) when (ex is DivideByZeroException || ex is OverflowException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback(opName, ex);
+            return null;
+        }
+        finally
+        {
+            output?.Dispose();
+        }
+    }
+
+    private static int Int64TypeCode<T>()
+    {
+        if (typeof(T) == typeof(long)) return 0;
+        if (typeof(T) == typeof(ulong)) return 1;
+        if (typeof(T) == typeof(short)) return 2;
+        if (typeof(T) == typeof(ushort)) return 3;
+        if (typeof(T) == typeof(sbyte)) return 4;
+        if (typeof(T) == typeof(byte)) return 5;
+        if (typeof(T) == typeof(uint)) return 6;
+        return -1;
+    }
+
+    // The tensor's raw int64 device buffer: its own when a previous integer op left it resident in that layout,
+    // otherwise its host values widened and uploaded.
+    private OwnedBuffer GetOrUploadRawInt64<T>(IDirectGpuBackend backend, Tensor<T> tensor)
+    {
+        if (tensor._gpuBufferContainsRawInt64 && tensor.IsContiguous && tensor._gpuBuffer is { } resident
+            && ReferenceEquals(tensor._gpuBackend, backend) && resident.Size >= 2 * tensor.Length)
+            return new OwnedBuffer(resident, ownsBuffer: false);
+        var contiguous = tensor.IsContiguous ? tensor : tensor.Contiguous();
+        var longs = Tensor<T>.ToRawInt64(contiguous.GetDataArray());
+        var words = new int[2 * longs.Length];
+        Buffer.BlockCopy(longs, 0, words, 0, longs.Length * sizeof(long));
+        return new OwnedBuffer(backend.AllocateIntBuffer(words), ownsBuffer: true);
+    }
+
     // Integer ops on int32 tensors run on raw int32 device storage (the same storage resident argsort indices use);
     // other integer widths keep the CPU path. op as in ITorchParityElementwiseBackend.TorchParityIntBinary; -1 is not.
     private Tensor<T>? TryInt32OnDevice<T>(string opName, Tensor<T> a, Tensor<T>? b, int op)

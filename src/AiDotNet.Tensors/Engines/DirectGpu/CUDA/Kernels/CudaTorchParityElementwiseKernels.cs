@@ -1116,6 +1116,67 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_int_not(const int* __
     y[i] = ~a[i];
 }
 
+// #1135: the same ops on the raw int64 layout (two words per element) that long, ulong, short, ushort, sbyte, byte and
+// uint tensors use on the device. Values are the element's int64 widening (ulong keeps its bits), computed as the
+// CPU's IntegerBinary does -- in signed 64 bits -- and narrowed to the element type t (0 long, 1 ulong, 2 short,
+// 3 ushort, 4 sbyte, 5 byte, 6 uint), as its FromLong. Flag codes: 1 a zero divisor (DivideByZeroException), 2 the
+// CPU's OverflowException (Math.Abs of long.MinValue in gcd / lcm, long.MinValue / -1).
+__device__ __forceinline__ long long parity_int_narrow(long long r, int t)
+{
+    switch (t)
+    {
+        case 2: return (long long)(short)r;
+        case 3: return r & 0xFFFFLL;
+        case 4: return (long long)(signed char)r;
+        case 5: return r & 0xFFLL;
+        case 6: return r & 0xFFFFFFFFLL;
+        default: return r;
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_int64_binary(const long long* __restrict__ a,
+    const long long* __restrict__ b, long long* __restrict__ y, int n, int op, int t, unsigned long long* flag)
+{
+    PARITY_INDEX
+    const long long minValue = (long long)0x8000000000000000ULL;
+    long long x = a[i], v = b[i], r;
+    switch (op)
+    {
+        case 0: r = x & v; break;
+        case 1: r = x | v; break;
+        case 2: r = x ^ v; break;
+        case 3: r = v >= 64 ? 0 : (long long)((unsigned long long)x << (v & 63)); break;
+        case 4: r = v >= 64 ? (x < 0 ? -1 : 0) : x >> (v & 63); break;
+        case 5:
+            if (x == minValue || v == minValue) { parity_flag(flag, (unsigned long long)i, 2); return; }
+            r = parity_gcd(x, v);
+            break;
+        case 6:
+        {
+            if (x == minValue || v == minValue) { parity_flag(flag, (unsigned long long)i, 2); return; }
+            long long g = parity_gcd(x, v);
+            long long m = g == 0 ? 0 : (long long)((unsigned long long)(x / g) * (unsigned long long)v);   // wraps, as C#
+            if (m == minValue) { parity_flag(flag, (unsigned long long)i, 2); return; }
+            r = m < 0 ? -m : m;
+            break;
+        }
+        default:
+            if (v == 0) { parity_flag(flag, (unsigned long long)i, 1); return; }
+            if (x == minValue && v == -1) { parity_flag(flag, (unsigned long long)i, 2); return; }
+            r = x / v;
+            if (x % v != 0 && ((x < 0) != (v < 0))) r -= 1;
+            break;
+    }
+    y[i] = parity_int_narrow(r, t);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_int64_not(const long long* __restrict__ a,
+    long long* __restrict__ y, int n, int t)
+{
+    PARITY_INDEX
+    y[i] = parity_int_narrow(~a[i], t);
+}
+
 // grid_sample 3-D adjoints, as the CPU's GridSample3DBackward: per (batch, point) the taps, their weights and each
 // weight's derivative with respect to the normalized coordinates (d voxel / d normalized: (size - 1) / 2 aligned,
 // size / 2 otherwise; 0 where border / reflection clipping holds the coordinate; sign-flipped by each reflection).
@@ -1237,7 +1298,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_grid_sample_3d_backwa
             "parity_flag_reset", "parity_sample", "parity_bernoulli", "parity_poisson", "parity_binomial", "parity_multinomial",
             "parity_dropout_affine", "parity_rrelu", "parity_random_keys",
             "parity_nonzero_static_scatter", "parity_unravel_axis", "parity_slice_bitonic_step", "parity_slice_first_flags",
-            "parity_slice_gather_unique", "parity_grid_sample_3d", "parity_scan_block", "parity_scan_add", "parity_int_binary", "parity_int_not", "parity_grid_sample_3d_backward",
+            "parity_slice_gather_unique", "parity_grid_sample_3d", "parity_scan_block", "parity_scan_add", "parity_int_binary", "parity_int_not", "parity_int64_binary", "parity_int64_not", "parity_grid_sample_3d_backward",
         };
     }
 }
