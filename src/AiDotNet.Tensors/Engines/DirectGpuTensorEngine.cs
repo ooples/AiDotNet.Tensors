@@ -8103,7 +8103,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int n = preActivation.Length;
                 using var preBuffer = GetOrAllocateBuffer(backend, preActivation);
                 var result = DispatchDeferredGpuOp<T>(backend, n, (int[])preActivation._shape.Clone(), output =>
-                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation));
+                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation), fullyWritten: true);
                 return (result, preActivation);
             }
         }
@@ -17798,7 +17798,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     backend.OuterProduct(gradient.Buffer, ones, output, outerSize, reduceCount);
                     backend.Scale(output, output, 1f / reduceCount, inputSize);
-                });
+                }, fullyWritten: true);
             }
             catch (Exception ex)
             {
