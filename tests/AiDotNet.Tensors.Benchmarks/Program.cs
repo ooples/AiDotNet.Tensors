@@ -1397,6 +1397,36 @@ class Program
             return;
         }
 
+        // Per-call cost of the Vulkan ops with an optional operand when it is left out (max pooling without indices)
+        if (args[0] == "--vulkan-optional-binding")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            foreach (var (b, c, hw) in new[] { (1, 16, 32), (8, 64, 56), (32, 64, 112) })
+            {
+                int o = hw / 2, total = b * c * o * o;
+                using var x = vb.AllocateBuffer(new float[b * c * hw * hw]);
+                using var y = vb.AllocateBuffer(total);
+                using var idx = vb.AllocateIntBuffer(total);
+                double Time(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer? indices)
+                {
+                    for (int i = 0; i < 200; i++) vb.MaxPool2D(x, y, indices, b, c, hw, hw, o, o, 2, 2, 2, 2, 0, 0);
+                    var samples = new double[9];
+                    for (int s = 0; s < samples.Length; s++)
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < 300; i++) vb.MaxPool2D(x, y, indices, b, c, hw, hw, o, o, 2, 2, 2, 2, 0, 0);
+                        samples[s] = sw.Elapsed.TotalMilliseconds * 1000 / 300;
+                    }
+                    Array.Sort(samples);
+                    return samples[samples.Length / 2];
+                }
+                double without = Time(null), with = Time(idx), without2 = Time(null);
+                Console.WriteLine($"MAXPOOL2D [{b},{c},{hw},{hw}] out={total} no-indices={without:F1}us with-indices={with:F1}us no-indices(again)={without2:F1}us");
+            }
+            return;
+        }
+
         // Run Vulkan backend diagnostics and bottleneck analysis
         if (args[0] == "--vulkan")
         {
