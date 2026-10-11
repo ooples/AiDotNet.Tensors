@@ -32,6 +32,7 @@ internal static class CudaFusedAttentionKernels
 #define FA_BR 32        // query rows per forward block (4 threads each: 128 threads)
 #define FA_BC 64        // keys per shared-memory tile (backward-q pass)
 #define FA_FBC 64       // keys per shared-memory tile (forward)
+#define FA_FWD_TILED 1  // forward as register-tiled GEMMs (S = Q K^T and O += P V per 4x4 thread tile)
 #define FA_SPLIT 4      // threads per query row in the forward
 #define FA_KB 128       // key rows per backward-kv block (2 threads each: 256 threads)
 #define FA_QB 128       // query rows per backward-q block (2 threads each: 256 threads)
@@ -185,6 +186,177 @@ __device__ void fa_forward(const float* __restrict__ q, const float* __restrict_
         lse[(long long)bh * p.Sq + i] = l > 0.0f ? m + __logf(l) : -INFINITY;
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Forward, register-tiled: grid (ceil(Sq / FA_BR), B * H), block 128 threads as 8 row groups (ty) x 16 lanes (tx).
+// Per 64-key tile, thread (ty, tx) computes the 4 x 4 scores S[ty*4 .. +4][tx*4 .. +4] as outer products over the head
+// dimension from Q^T (pre-scaled) and K^T in shared memory -- 16 FMAs per two float4 reads -- then updates the online
+// softmax of its 4 rows (row max / sum over the 16 lanes of the row group by xor butterflies, identical in every lane)
+// and accumulates O[ty*4 .. +4][tx*(D/16) .. +D/16] += P V with P staged in shared memory. K^T and V share one
+// buffer in turn.
+// ---------------------------------------------------------------------------------------------------------------
+#define FA_KT(d, j) KV[(d) * (FA_FBC + 4) + (j)]
+#define FA_VS(j, d) KV[(j) * (D + 4) + (d)]
+template <int D>
+__device__ void fa_forward_tiled(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ o, float* __restrict__ lse, const int* __restrict__ mask, FaParams p)
+{
+    constexpr int OC = D / 16;   // output columns per thread
+    constexpr int KVN = (D * (FA_FBC + 4) > FA_FBC * (D + 4)) ? D * (FA_FBC + 4) : FA_FBC * (D + 4);
+    __shared__ __align__(16) float Qt[D][FA_BR + 4];
+    __shared__ __align__(16) float KV[KVN];
+    __shared__ __align__(16) float Ps[FA_BR][FA_FBC + 4];
+    int bh = blockIdx.y, b = bh / p.H, h = bh % p.H;
+    int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    // Causal: the last query blocks see the most keys, so they are launched first (shorter tail).
+    int qBlock = p.causal ? (int)(gridDim.x - 1 - blockIdx.x) : (int)blockIdx.x;
+    int row0 = qBlock * FA_BR;
+
+    const float* qbase = q + b * p.qb + h * p.qh;
+    for (int e = threadIdx.x; e < FA_BR * (D / 4); e += blockDim.x)
+    {
+        int r = e % FA_BR, d4 = e / FA_BR;
+        float4 qv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (row0 + r < p.Sq) qv = *reinterpret_cast<const float4*>(qbase + (long long)(row0 + r) * p.qr + 4 * d4);
+        Qt[4 * d4][r] = qv.x * p.scale; Qt[4 * d4 + 1][r] = qv.y * p.scale;
+        Qt[4 * d4 + 2][r] = qv.z * p.scale; Qt[4 * d4 + 3][r] = qv.w * p.scale;
+    }
+
+    float acc[4][OC], m[4], l[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+        m[i] = -INFINITY; l[i] = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < OC; u++) acc[i][u] = 0.0f;
+    }
+
+    int lastRow = min(p.Sq - 1, row0 + FA_BR - 1);
+    int keyEnd = p.causal ? min(p.Sk, lastRow + p.causalOffset + 1) : p.Sk;
+    const float* kbase = k + b * p.kb + h * p.kh;
+    const float* vbase = v + b * p.vb + h * p.vh;
+    for (int j0 = 0; j0 < keyEnd; j0 += FA_FBC)
+    {
+        int cols = min(FA_FBC, keyEnd - j0);
+        // K^T: consecutive threads take consecutive keys of one 4-wide chunk (conflict-free transposed stores).
+        for (int e = threadIdx.x; e < FA_FBC * (D / 4); e += blockDim.x)
+        {
+            int jj = e % FA_FBC, d4 = e / FA_FBC;
+            float4 kv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (jj < cols) kv = *reinterpret_cast<const float4*>(kbase + (long long)(j0 + jj) * p.kr + 4 * d4);
+            FA_KT(4 * d4, jj) = kv.x; FA_KT(4 * d4 + 1, jj) = kv.y;
+            FA_KT(4 * d4 + 2, jj) = kv.z; FA_KT(4 * d4 + 3, jj) = kv.w;
+        }
+        __syncthreads();
+
+        float s[4][4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+            #pragma unroll
+            for (int jx = 0; jx < 4; jx++) s[i][jx] = 0.0f;
+        #pragma unroll 8
+        for (int d = 0; d < D; d++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&Qt[d][ty * 4]);
+            float4 kk = *reinterpret_cast<const float4*>(&FA_KT(d, tx * 4));
+            float av[4] = { a.x, a.y, a.z, a.w }, kvv[4] = { kk.x, kk.y, kk.z, kk.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int jx = 0; jx < 4; jx++) s[i][jx] += av[i] * kvv[jx];
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int row = row0 + ty * 4 + i;
+            bool rowActive = row < p.Sq;
+            float rmax = -INFINITY;
+            #pragma unroll
+            for (int jx = 0; jx < 4; jx++)
+            {
+                int jj = tx * 4 + jx;
+                float sv = -INFINITY;
+                if (rowActive && jj < cols && fa_allowed(p, mask, b, h, row, j0 + jj))
+                {
+                    float slope;
+                    sv = fa_cap(s[i][jx], p.softcap, &slope);
+                }
+                s[i][jx] = sv;
+                rmax = fmaxf(rmax, sv);
+            }
+            #pragma unroll
+            for (int off = 1; off < 16; off <<= 1) rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, off));
+            float mNew = fmaxf(m[i], rmax);
+            float pr[4], rsum = 0.0f;
+            #pragma unroll
+            for (int jx = 0; jx < 4; jx++)
+            {
+                pr[jx] = s[i][jx] == -INFINITY ? 0.0f : __expf(s[i][jx] - mNew);
+                rsum += pr[jx];
+            }
+            #pragma unroll
+            for (int off = 1; off < 16; off <<= 1) rsum += __shfl_xor_sync(0xffffffffu, rsum, off);
+            if (rmax != -INFINITY)
+            {
+                float alpha = m[i] == -INFINITY ? 0.0f : __expf(m[i] - mNew);
+                l[i] = l[i] * alpha + rsum;
+                #pragma unroll
+                for (int u = 0; u < OC; u++) acc[i][u] *= alpha;
+                m[i] = mNew;
+            }
+            *reinterpret_cast<float4*>(&Ps[ty * 4 + i][tx * 4]) = make_float4(pr[0], pr[1], pr[2], pr[3]);
+        }
+        __syncthreads();   // P staged; every thread is done with K^T
+
+        for (int e = threadIdx.x; e < FA_FBC * (D / 4); e += blockDim.x)
+        {
+            int jj = e / (D / 4), d4 = e % (D / 4);
+            float4 vv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);   // zero past the tile: 0 * garbage could be NaN
+            if (jj < cols) vv = *reinterpret_cast<const float4*>(vbase + (long long)(j0 + jj) * p.vr + 4 * d4);
+            *reinterpret_cast<float4*>(&FA_VS(jj, 4 * d4)) = vv;
+        }
+        __syncthreads();
+
+        int cEnd = (cols + 3) & ~3;
+        for (int c4 = 0; c4 < cEnd; c4 += 4)
+        {
+            float pv[4][4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                float4 t = *reinterpret_cast<const float4*>(&Ps[ty * 4 + i][c4]);
+                pv[i][0] = t.x; pv[i][1] = t.y; pv[i][2] = t.z; pv[i][3] = t.w;
+            }
+            #pragma unroll
+            for (int cc = 0; cc < 4; cc++)
+            {
+                float vr[OC];
+                #pragma unroll
+                for (int u = 0; u < OC; u++) vr[u] = FA_VS(c4 + cc, tx * OC + u);
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    #pragma unroll
+                    for (int u = 0; u < OC; u++) acc[i][u] += pv[i][cc] * vr[u];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+        int row = row0 + ty * 4 + i;
+        if (row >= p.Sq) continue;
+        float* orow = o + b * p.ob + h * p.oh + (long long)row * p.orow;
+        float inv = l[i] > 0.0f ? 1.0f / l[i] : 0.0f;
+        #pragma unroll
+        for (int u = 0; u < OC; u++) orow[tx * OC + u] = acc[i][u] * inv;
+        if (tx == 0) lse[(long long)bh * p.Sq + row] = l[i] > 0.0f ? m[i] + __logf(l[i]) : -INFINITY;
+    }
+}
+#undef FA_KT
+#undef FA_VS
 
 // ---------------------------------------------------------------------------------------------------------------
 // delta[bh, i] = sum_d dO[i, d] * O[i, d]   (one thread per query row)
@@ -368,10 +540,15 @@ __device__ void fa_backward_q(const float* __restrict__ q, const float* __restri
     }
 }
 
+#if FA_FWD_TILED
+#define FA_FORWARD_IMPL fa_forward_tiled
+#else
+#define FA_FORWARD_IMPL fa_forward
+#endif
 #define FA_INSTANTIATE(D) \
 extern ""C"" __global__ __launch_bounds__(FA_BR * FA_SPLIT) void fa_forward_d##D(const float* __restrict__ q, \
     const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ o, float* __restrict__ lse, \
-    const int* __restrict__ mask, FaParams p) { fa_forward<D>(q, k, v, o, lse, mask, p); } \
+    const int* __restrict__ mask, FaParams p) { FA_FORWARD_IMPL<D>(q, k, v, o, lse, mask, p); } \
 extern ""C"" __global__ __launch_bounds__(FA_KB * 2) void fa_backward_kv_d##D(const float* __restrict__ q, \
     const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ dO, \
     const float* __restrict__ lse, const float* __restrict__ delta, float* __restrict__ dK, float* __restrict__ dV, \
