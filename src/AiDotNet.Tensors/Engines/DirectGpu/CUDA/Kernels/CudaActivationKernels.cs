@@ -1072,6 +1072,45 @@ extern ""C"" __global__ __launch_bounds__(256) void sum_axis_rows(const float* _
     }
 }
 
+// #1150: one long row split across blocks. Block (chunk, row) sums elements [chunk * chunkLen, (chunk + 1) * chunkLen) of
+// its row (clipped to reduceSize) into partial[row * chunks + chunk], with sum_axis_rows' coalesced stride and fixed
+// shuffle tree; a second SumAxis over the partials finishes. The partition and both orders are fixed, so the result is
+// deterministic. Launched with grid (chunks, outerSize) and 256 threads.
+extern ""C"" __global__ __launch_bounds__(256) void sum_axis_rows_split(const float* __restrict__ input, float* __restrict__ partial,
+    int reduceSize, int chunks, int chunkLen)
+{
+    __shared__ float warpSums[8];
+    unsigned int chunk = blockIdx.x, row = blockIdx.y;
+    size_t start = (size_t)chunk * (unsigned int)chunkLen;
+    size_t end = start + (unsigned int)chunkLen;
+    if (end > (size_t)(unsigned int)reduceSize) end = (size_t)(unsigned int)reduceSize;
+    const float* rowPtr = input + (size_t)row * (unsigned int)reduceSize;
+    float sum = 0.0f;
+    for (size_t i = start + threadIdx.x; i < end; i += blockDim.x)
+        sum += __ldg(&rowPtr[i]);
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    unsigned int lane = threadIdx.x & 31;
+    unsigned int warpId = threadIdx.x >> 5;
+    if (lane == 0)
+        warpSums[warpId] = sum;
+    __syncthreads();
+
+    if (warpId == 0)
+    {
+        unsigned int numWarps = (blockDim.x + 31) >> 5;
+        sum = lane < numWarps ? warpSums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0)
+            partial[(size_t)row * (unsigned int)chunks + chunk] = sum;
+    }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
 {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1494,6 +1533,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "squared_deviation_from_mean",
                 "sum_axis",
                 "sum_axis_rows",
+                "sum_axis_rows_split",
                 "bias_add",
                 "bias_add_out",
                 "conv2d_bias_add",

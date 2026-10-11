@@ -352,6 +352,35 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         LaunchKernel(intKernel, ParityGrid(n), DefaultBlockSize, args);
     }
 
+    unsafe void ITorchParityElementwiseBackend.TorchParityInt64Binary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n,
+        int typeCode, IGpuBuffer flag)
+    {
+        if (n <= 0) return;
+        RequireCapacity(a, 2 * n, nameof(a), "2n (int64 words)");
+        RequireCapacity(b, 2 * n, nameof(b), "2n (int64 words)");
+        RequireCapacity(output, 2 * n, nameof(output), "2n (int64 words)");
+        RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
+        IntPtr int64Kernel = ParityKernel("parity_int64_binary");
+        using var _ = PushContext();
+        IntPtr pa = a.Handle, pb = b.Handle, py = output.Handle, pf = flag.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &pa; args[1] = &pb; args[2] = &py; args[3] = &n; args[4] = &op; args[5] = &typeCode; args[6] = &pf;
+        LaunchKernel(int64Kernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityInt64Not(IGpuBuffer input, IGpuBuffer output, int n, int typeCode)
+    {
+        if (n <= 0) return;
+        RequireCapacity(input, 2 * n, nameof(input), "2n (int64 words)");
+        RequireCapacity(output, 2 * n, nameof(output), "2n (int64 words)");
+        IntPtr int64NotKernel = ParityKernel("parity_int64_not");
+        using var _ = PushContext();
+        IntPtr pa = input.Handle, py = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &pa; args[1] = &py; args[2] = &n; args[3] = &typeCode;
+        LaunchKernel(int64NotKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
     unsafe void ITorchParityElementwiseBackend.TorchParityIntNot(IGpuBuffer input, IGpuBuffer output, int n)
     {
         if (n <= 0) return;
