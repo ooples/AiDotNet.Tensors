@@ -143,6 +143,9 @@ internal static class GpuLaunchProbe
     public static void OnSynchronize(GpuBackendType backend)
         => RecordScoped(Diagnostics.GpuTransferKind.Synchronize, 0, backend);
 
+    /// <summary>Residency scopes open anywhere in the process; with none, every transfer hook is one volatile read.</summary>
+    internal static int ActiveScopes => Volatile.Read(ref _activeScopes);
+
     private static void RecordScoped(Diagnostics.GpuTransferKind kind, long bytes, GpuBackendType backend)
     {
         if (Volatile.Read(ref _activeScopes) == 0) return;

@@ -163,6 +163,118 @@ public sealed class GpuResidencyTests
     }
 
     /// <summary>
+    /// #1058: with no residency scope open, the counters must cost under 1% of a training step. Times the real
+    /// no-scope transfer hook and the two interlocked updates a readback and a kernel launch add, charges every transfer
+    /// and launch of a measured MLP step at that cost, and compares the total with the step's median time.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void TransferCounters_CostUnderOnePercentOfAStep_WithNoScopeOpen()
+    {
+        using var gpu = RequireGpu();
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var step = BuildMlpStep(gpu);
+            var backend = gpu.GetBackend() ?? throw new InvalidOperationException("The GPU engine has no backend.");
+            for (int i = 0; i < 5; i++) step();
+            backend.Synchronize();
+
+            int transfers, readbacks;
+            using (var scope = GpuResidencyScope.Begin())
+            {
+                step();
+                backend.Synchronize();
+                transfers = scope.Uploads + scope.Downloads + scope.Synchronizations;
+                readbacks = scope.Downloads;
+            }
+            long launchesBefore = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            step();
+            backend.Synchronize();
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count - launchesBefore; // concurrent launches can only inflate this
+
+            var stepMs = new List<double>();
+            for (int i = 0; i < 21; i++)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                step();
+                backend.Synchronize();
+                stepMs.Add(sw.Elapsed.TotalMilliseconds);
+            }
+            stepMs.Sort();
+            double medianStepNs = stepMs[stepMs.Count / 2] * 1e6;
+
+            // The hook's no-scope path is one volatile read; it is only representative while no scope is open anywhere.
+            Skip.If(AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.ActiveScopes != 0, "Another test holds a residency scope open, so the no-scope path cannot be timed.");
+            const int Calls = 2_000_000;
+            var probeTimer = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < Calls; i++) AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
+            double hookNs = probeTimer.Elapsed.TotalMilliseconds * 1e6 / Calls;
+            long counter = 0, total = 0;
+            var atomicTimer = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < Calls; i++) { System.Threading.Interlocked.Increment(ref counter); System.Threading.Interlocked.Add(ref total, i); }
+            double atomicNs = atomicTimer.Elapsed.TotalMilliseconds * 1e6 / Calls;
+
+            double overheadNs = transfers * hookNs + (readbacks + launches) * atomicNs;
+            double fraction = overheadNs / medianStepNs;
+            _output.WriteLine($"step {medianStepNs / 1e6:F3} ms; {transfers} transfer hooks at {hookNs:F2} ns, " +
+                $"{readbacks + launches} interlocked pairs (readbacks + {launches} launches) at {atomicNs:F2} ns; " +
+                $"overhead {overheadNs / 1e3:F2} us = {fraction:P4} of the step");
+            Assert.True(fraction < 0.01, $"The counters cost {fraction:P3} of a training step with no scope open.");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
+    /// <summary>A three-layer MLP training step (forward, backward, device-side SGD) with device-resident data.</summary>
+    private static Action BuildMlpStep(DirectGpuTensorEngine gpu)
+    {
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(1058);
+        Tensor<float> Rand(params int[] shape)
+        {
+            int n = shape.Aggregate(1, (a, b) => a * b);
+            var data = new float[n];
+            for (int i = 0; i < n; i++) data[i] = (float)(rng.NextDouble() * 0.2 - 0.1);
+            return new Tensor<float>(data, shape);
+        }
+
+        var weights = new[] { Rand(784, 512), Rand(512, 256), Rand(256, 10) };
+        var biases = new[] { Rand(512), Rand(256), Rand(10) };
+        var x = gpu.UploadToGpu(Rand(128, 784), GpuTensorRole.General);
+        var y = gpu.UploadToGpu(Rand(128, 10), GpuTensorRole.General);
+        for (int i = 0; i < 3; i++)
+        {
+            weights[i] = gpu.UploadToGpu(weights[i], GpuTensorRole.General);
+            biases[i] = gpu.UploadToGpu(biases[i], GpuTensorRole.General);
+        }
+
+        var sources = weights.Concat(biases).ToArray();
+        IEngine engine = gpu;
+        void Step()
+        {
+            using var tape = new GradientTape<float>();
+            var h = x;
+            for (int i = 0; i < 3; i++)
+                h = engine.FusedLinear(h, weights[i], biases[i], i < 2 ? FusedActivationType.ReLU : FusedActivationType.None);
+            var loss = engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(h, y)), new[] { 0, 1 }, keepDims: false);
+            var grads = tape.ComputeGradients(loss, sources);
+            Assert.Equal(sources.Length, grads.Count);
+            // A training step includes the update: the device-side SGD kernel, so the measured crossings cover
+            // forward, backward and optimizer exactly as the head-to-head CUDA step runs them.
+            foreach (var parameter in sources)
+                Assert.True(GpuOptimizer.TrySgdStep(parameter, grads[parameter], 0.01f),
+                    $"The device-side SGD step was refused for a [{string.Join(", ", parameter.Shape.ToArray())}] parameter " +
+                    $"(parameter on device: {parameter.TryGetGpuBuffer() is not null}, gradient on device: " +
+                    $"{grads[parameter].TryGetGpuBuffer() is not null}).");
+        }
+
+        return Step;
+    }
+
+    /// <summary>
     /// Runs warmed-up MLP training steps on the GPU engine and records one step's crossings, grouped by the engine
     /// operation that caused each.
     /// </summary>
@@ -173,45 +285,7 @@ public sealed class GpuResidencyTests
         AiDotNetEngine.Current = gpu;
         try
         {
-            var rng = new Random(1058);
-            Tensor<float> Rand(params int[] shape)
-            {
-                int n = shape.Aggregate(1, (a, b) => a * b);
-                var data = new float[n];
-                for (int i = 0; i < n; i++) data[i] = (float)(rng.NextDouble() * 0.2 - 0.1);
-                return new Tensor<float>(data, shape);
-            }
-
-            var weights = new[] { Rand(784, 512), Rand(512, 256), Rand(256, 10) };
-            var biases = new[] { Rand(512), Rand(256), Rand(10) };
-            var x = gpu.UploadToGpu(Rand(128, 784), GpuTensorRole.General);
-            var y = gpu.UploadToGpu(Rand(128, 10), GpuTensorRole.General);
-            for (int i = 0; i < 3; i++)
-            {
-                weights[i] = gpu.UploadToGpu(weights[i], GpuTensorRole.General);
-                biases[i] = gpu.UploadToGpu(biases[i], GpuTensorRole.General);
-            }
-
-            var sources = weights.Concat(biases).ToArray();
-            IEngine engine = gpu;
-            void Step()
-            {
-                using var tape = new GradientTape<float>();
-                var h = x;
-                for (int i = 0; i < 3; i++)
-                    h = engine.FusedLinear(h, weights[i], biases[i], i < 2 ? FusedActivationType.ReLU : FusedActivationType.None);
-                var loss = engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(h, y)), new[] { 0, 1 }, keepDims: false);
-                var grads = tape.ComputeGradients(loss, sources);
-                Assert.Equal(sources.Length, grads.Count);
-                // A training step includes the update: the device-side SGD kernel, so the measured crossings cover
-                // forward, backward and optimizer exactly as the head-to-head CUDA step runs them.
-                foreach (var parameter in sources)
-                    Assert.True(GpuOptimizer.TrySgdStep(parameter, grads[parameter], 0.01f),
-                        $"The device-side SGD step was refused for a [{string.Join(", ", parameter.Shape.ToArray())}] parameter " +
-                        $"(parameter on device: {parameter.TryGetGpuBuffer() is not null}, gradient on device: " +
-                        $"{grads[parameter].TryGetGpuBuffer() is not null}).");
-            }
-
+            var Step = BuildMlpStep(gpu);
             for (int i = 0; i < 5; i++) Step();
 
             // Name the backend from one deliberate upload rather than from the step's first event: a step that stays
