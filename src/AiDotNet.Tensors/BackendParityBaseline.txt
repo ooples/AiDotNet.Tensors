@@ -117,3 +117,4 @@ cast DirectGpuTensorEngine.WriteOutputToStableCapture CudaBackend #1154
 cast DirectGpuTensorEngine.ZeroLstmGradient CudaBackend #1154
 cast ExecutionStreamFactory.TryGetCudaStream CudaBackend #1154
 
+cast DirectGpuTensorEngine.TryBackendFft CudaBackend #1154

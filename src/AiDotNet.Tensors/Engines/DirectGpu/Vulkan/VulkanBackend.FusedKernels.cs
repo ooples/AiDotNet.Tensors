@@ -37,7 +37,10 @@ public sealed partial class VulkanBackend
     public void ReduceSumBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ReduceSumBackwardGlsl, go, gi, os * rs, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
     public void ReduceMeanBackward(IGpuBuffer go, IGpuBuffer gi, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.ReduceMeanBackwardGlsl, go, gi, os * rs, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
 
+
+
     public void ReduceLogVariance(IGpuBuffer i, IGpuBuffer o, int os, int rs) => GlslUnaryOp(VulkanGlslKernels.LogVarianceAxis, i, o, os, new uint[] { (uint)os, (uint)rs }, 2 * sizeof(uint));
+
 
     #endregion
 
@@ -315,10 +318,10 @@ public sealed partial class VulkanBackend
         GlslUnaryOp(VulkanGlslKernels.SetSliceAxisGlsl, v, o, os * stride, new uint[] { (uint)os, (uint)axSz, (uint)stride, (uint)idx }, 4 * sizeof(uint));
     }
     public void Stack2(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) => GlslBinaryOp(VulkanGlslKernels.Stack2Glsl, a, b, o, sz * 2, sizeof(uint));
-    public void PixelShuffle(IGpuBuffer i, IGpuBuffer o, int ba, int ch, int ih, int iw, int sc) => GlslUnaryOp(VulkanGlslKernels.PixelShuffleGlsl, i, o, ba * ch * ih * sc * iw * sc, 5 * sizeof(uint));
-    public void PixelShuffleBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int sc) => GlslUnaryOp(VulkanGlslKernels.PixelShuffleBackwardGlsl, go, gi, ba * ch * sc * sc * ih * iw, 5 * sizeof(uint));
+    public void PixelShuffle(IGpuBuffer i, IGpuBuffer o, int ba, int ch, int ih, int iw, int sc) => GlslUnaryOp(VulkanGlslKernels.PixelShuffleGlsl, i, o, ba * ch * ih * sc * iw * sc, new uint[] { (uint)ba, (uint)ch, (uint)ih, (uint)iw, (uint)sc }, 5 * sizeof(uint));
+    public void PixelShuffleBackward(IGpuBuffer go, IGpuBuffer gi, int ba, int ch, int ih, int iw, int sc) => GlslUnaryOp(VulkanGlslKernels.PixelShuffleBackwardGlsl, go, gi, ba * ch * sc * sc * ih * iw, new uint[] { (uint)ba, (uint)ch, (uint)ih, (uint)iw, (uint)sc }, 5 * sizeof(uint));
     public void EyeKernel(IGpuBuffer o, int n) => GlslGenerateOp(VulkanGlslKernels.EyeKernelGlsl, o, n * n, sizeof(uint));
-    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) => GlslUnaryOp(VulkanGlslKernels.OneHotKernel, idx, o, bs * nc, 2 * sizeof(uint));
+    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) => GlslUnaryOp(VulkanGlslKernels.OneHotKernel, idx, o, bs * nc, new uint[] { (uint)bs, (uint)nc }, 2 * sizeof(uint));
     public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) => GlslBinaryOp(VulkanGlslKernels.MaskedFillKernel, i, m, o, sz, new uint[] { FloatBits(fv), (uint)sz }, sizeof(float) + sizeof(uint));
     public void IndexSelect(IGpuBuffer i, IGpuBuffer idx, IGpuBuffer o, int ni, int isz) => GlslBinaryOp(VulkanGlslKernels.IndexSelectGlsl, i, idx, o, ni * isz, new uint[] { (uint)ni, (uint)isz }, 2 * sizeof(uint));
 
@@ -334,7 +337,7 @@ public sealed partial class VulkanBackend
     #region Fused Softmax Variants + Distance
 
     public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => GlslBinaryOp(VulkanGlslKernels.BatchDotProductGlsl, a, b, o, bs, new uint[] { (uint)bs, (uint)dim }, 2 * sizeof(uint));
-    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) => GlslBinaryOp(VulkanGlslKernels.OuterProduct, a, b, o, M * N, 2 * sizeof(uint));
+    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) => GlslBinaryOp(VulkanGlslKernels.OuterProduct, a, b, o, M * N, new uint[] { (uint)M, (uint)N }, 2 * sizeof(uint));
     public void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim)
     {
         var dispatch = CreateCosineSimilarityDispatch(bs, dim);

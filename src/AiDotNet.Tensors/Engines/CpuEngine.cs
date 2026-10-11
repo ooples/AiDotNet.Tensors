@@ -8325,8 +8325,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int[] outShape;
                 if (axes == null || axes.Length == 0)
                 {
-                    outShape = keepDims ? new int[tensor.Rank] : new[] { 1 };
-                    if (keepDims) for (int i = 0; i < tensor.Rank; i++) outShape[i] = 1;
+                    outShape = FullReductionShape(tensor.Rank, keepDims);
                 }
                 else
                 {
@@ -8341,7 +8340,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                         else shapeList.Add(tensor._shape[i]);
                     }
-                    outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                    outShape = shapeList.ToArray();
                 }
 
                 var captured = tensor;
@@ -8414,7 +8413,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                fullResult = TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
+                fullResult = TensorAllocator.Rent<T>(Array.Empty<int>(), new Vector<T>([sum]));
             }
             DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                 new object[] { allAxes, keepDims });
@@ -21175,7 +21174,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     // not the adjoint of the forward it serves.
                     double srcH = ((gy + 1) * height - 1) / 2.0;
                     double srcW = ((gx + 1) * width - 1) / 2.0;
-                    if (srcH <= -1 || srcH >= height || srcW <= -1 || srcW >= width) continue;
+                    // Written so a NaN coordinate fails it too (#1134): such a point sampled nothing forward.
+                    if (!(srcH >= -1 && srcH < height && srcW >= -1 && srcW < width)) continue;
 
                     int h0 = (int)Math.Floor(srcH), h1 = h0 + 1;
                     int w0 = (int)Math.Floor(srcW), w1 = w0 + 1;
@@ -21255,6 +21255,13 @@ public partial class CpuEngine : ITensorLevelEngine
                     // Convert to pixel coordinates — align_corners=false, matching the forward.
                     double srcH = ((gy + 1) * height - 1) / 2.0;
                     double srcW = ((gx + 1) * width - 1) / 2.0;
+                    if (!GridPointSamples(srcH) || !GridPointSamples(srcW))
+                    {
+                        // A point that sampled nothing forward (#1134) has no grid gradient.
+                        gradGridData[gridBaseIdx] = numOps.Zero;
+                        gradGridData[gridBaseIdx + 1] = numOps.Zero;
+                        continue;
+                    }
 
                     // Compute d(output)/d(gx) and d(output)/d(gy) by summing over all channels
                     T gradGx = numOps.Zero;
@@ -33467,7 +33474,19 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return outputShape.Count == 0 ? new[] { 1 } : outputShape.ToArray();
+        return outputShape.ToArray();
+    }
+
+    /// <summary>
+    /// Output shape of a reduction over every axis: rank 0 without keepDims (as torch and the GPU engine
+    /// return), otherwise every axis kept as size 1 (#1132).
+    /// </summary>
+    internal static int[] FullReductionShape(int rank, bool keepDims)
+    {
+        if (!keepDims) return Array.Empty<int>();
+        var shape = new int[rank];
+        for (int i = 0; i < rank; i++) shape[i] = 1;
+        return shape;
     }
 
     /// <inheritdoc/>
@@ -33588,7 +33607,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
                 maxIndices = new[] { maxIdx };
                 float fMax = maxVal;
-                return TensorAllocator.Rent<T>(keepDims ? new[] { 1 } : new[] { 1 },
+                return TensorAllocator.Rent<T>(FullReductionShape(1, keepDims),
                     new Vector<T>(new[] { Unsafe.As<float, T>(ref fMax) }));
             }
         }
@@ -33984,7 +34003,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (axisSet.Contains(i)) { if (keepDims) shapeList.Add(1); }
                     else shapeList.Add(input._shape[i]);
                 }
-                var outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                var outShape = shapeList.ToArray();
                 if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine && !GraphMode.IsInferenceTrace)
                 {
                     var compiledMean = TryRecordReduceMeanFloat(scope, (Tensor<float>)(object)input, axes, keepDims, outShape);
@@ -34039,7 +34058,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var dSpan = AsDoubleMemory(input.Data).Span;
                 double dSum = SimdKernels.Sum(dSpan);
                 double dMean = dSum / input.Length;
-                var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                var scalarResult = AutoTensorCache.RentOrAllocate<T>(FullReductionShape(input.Rank, keepDims));
                 ((double[])(object)scalarResult.GetDataArray())[0] = dMean;
                 DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                     BackwardFunctions<T>.ReduceMeanBackward,
@@ -34050,7 +34069,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // poisons compiled graphs with a stale value when the same op
                 // pattern is run on a different input tensor of identical shape.
                 { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
-                  AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
+                  var ck = keepDims; AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, ck)); }
                 return scalarResult;
             }
             if (typeof(T) == typeof(float))
@@ -34061,7 +34080,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     using var pin = mem.Pin();
                     float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, input.Length);
                     float fMean = fSum / input.Length;
-                    var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                    var scalarResult = AutoTensorCache.RentOrAllocate<T>(FullReductionShape(input.Rank, keepDims));
                     ((float[])(object)scalarResult.GetDataArray())[0] = fMean;
                     DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                         BackwardFunctions<T>.ReduceMeanBackward,
@@ -34070,7 +34089,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // this branch as a stale scalar constant — same fix as the
                     // double branch above.
                     { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
-                      AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
+                      var ck = keepDims; AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, ck)); }
                     return scalarResult;
                 }
             }
@@ -34096,7 +34115,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputShapeList.Add(inputShape[i]);
             }
         }
-        var outputShape = outputShapeList.Count > 0 ? outputShapeList.ToArray() : [1];
+        var outputShape = outputShapeList.ToArray();
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
@@ -34238,6 +34257,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        // Null or empty means every axis, as for ReduceSum and ReduceMean (and torch var(dim=None)).
+        if (axes is null || axes.Length == 0) axes = Enumerable.Range(0, input.Rank).ToArray();
+
         // Tape-aware AND lazy-graph (GraphMode) path: take the slow path
         // that explicitly allocates a `mean` Tensor<T> we can save in
         // savedState for backward. The fast paths below inline the mean
@@ -34402,7 +34425,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputShapeList.Add(inputShape[d]);
             }
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
         var outputShape = outputShapeList.ToArray();
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
@@ -34482,7 +34504,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     { if (capturedKeepDims) outShapeList.Add(1); }
                     else outShapeList.Add(inShape[d]);
                 }
-                if (outShapeList.Count == 0) outShapeList.Add(1);
                 var outShape = outShapeList.ToArray();
 
                 // For backward we need the `mean` tensor — compute once here
@@ -34527,7 +34548,6 @@ public partial class CpuEngine : ITensorLevelEngine
             if (normalizedAxes.Contains(d)) { if (keepDims) outputShapeList.Add(1); }
             else outputShapeList.Add(inputShape[d]);
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
         var outputShape = outputShapeList.ToArray();
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
@@ -35378,6 +35398,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
                     double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
                     double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    if (!GridPointSamples(srcX) || !GridPointSamples(srcY))   // #1134: samples nothing
+                    {
+                        for (int c = 0; c < lCh; c++) outp[(b * lCh + c) * lOutH * lOutW + h * lOutW + w] = 0;
+                        continue;
+                    }
                     int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
                     int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     double wx1 = srcX - x0, wx0 = 1.0 - wx1, wy1 = srcY - y0, wy0 = 1.0 - wy1;
@@ -35414,6 +35439,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
                     double srcX = (gr[gBase] + 1.0) * widthScaleD - 0.5;
                     double srcY = (gr[gBase + 1] + 1.0) * heightScaleD - 0.5;
+                    if (!GridPointSamples(srcX) || !GridPointSamples(srcY))   // #1134: samples nothing
+                    {
+                        for (int c = 0; c < lCh; c++) outp[(b * lCh + c) * lOutH * lOutW + h * lOutW + w] = 0;
+                        continue;
+                    }
                     int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
                     int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     float fwx1 = (float)(srcX - x0), fwx0 = 1f - fwx1, fwy1 = (float)(srcY - y0), fwy0 = 1f - fwy1;
@@ -35445,6 +35475,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gBase = ((b * lOutH + h) * lOutW + w) * 2;
                     double srcX = (numOps.ToDouble(gridData[gBase]) + 1.0) * widthScaleD - 0.5;
                     double srcY = (numOps.ToDouble(gridData[gBase + 1]) + 1.0) * heightScaleD - 0.5;
+                    if (!GridPointSamples(srcX) || !GridPointSamples(srcY))   // #1134: samples nothing
+                    {
+                        for (int c = 0; c < lCh; c++) outData[(b * lCh + c) * lOutH * lOutW + h * lOutW + w] = numOps.Zero;
+                        continue;
+                    }
                     int x0 = (int)Math.Floor(srcX), x1 = x0 + 1;
                     int y0 = (int)Math.Floor(srcY), y1 = y0 + 1;
                     T twx1 = numOps.FromDouble(srcX - x0), twx0 = numOps.Subtract(numOps.One, twx1);
@@ -38258,7 +38293,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (d == capAxis) { if (keepDims) outShape.Add(1); }
                     else outShape.Add(tensor._shape[d]);
                 }
-                if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSumExp", tensor, outShape.ToArray(),
                     (eng, output) => { var r = eng.TensorLogSumExp(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.LogSumExpBackward, new object[] { capAxis });
@@ -38289,7 +38323,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var maxSqueezed = TensorSqueeze(maxVals, axis);
+            // Reshape, not TensorSqueeze: squeeze keeps a vector's last axis, which would broadcast a rank-0
+            // logSum back up to [1] (#1132).
+            var maxSqueezed = Reshape(maxVals, logSum._shape);
             return TensorAdd(logSum, maxSqueezed);
         }
     }
@@ -39205,7 +39241,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (d == capAxis) { if (keepDims) outShape.Add(1); }
                     else outShape.Add(tensor._shape[d]);
                 }
-                if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "Norm", tensor, outShape.ToArray(),
                     (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NormBackward, new object[] { capAxis });

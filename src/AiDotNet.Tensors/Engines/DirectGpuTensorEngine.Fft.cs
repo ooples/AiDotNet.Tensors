@@ -1,8 +1,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// DirectGpuTensorEngine entry point for the public Fft module. CUDA exposes
-// generic-precision radix-2 and Bluestein transforms through IEngine. Legacy
-// power-of-two backends remain available to the public Fft module, but an
-// explicit IEngine.FftGeneric request never performs a hidden host fallback.
+// DirectGpuTensorEngine entry point for the public Fft module. Backends that
+// implement IGenericFftBackend (CUDA, Vulkan) expose generic-precision radix-2
+// and Bluestein transforms through IEngine. Legacy power-of-two backends remain
+// available to the public Fft module, but an explicit IEngine.FftGeneric
+// request never performs a hidden host fallback.
 
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -18,8 +19,8 @@ public partial class DirectGpuTensorEngine
     {
         _ = type.ByteSize();
         return TryGetBackend(out var backend)
-            && backend is IGenericFftBackend fft
-            && fft.SupportsFftElementType(type);
+            && backend is IGenericFftBackend generic
+            && generic.SupportsFftElementType(type);
     }
 
     /// <inheritdoc/>
@@ -31,21 +32,21 @@ public partial class DirectGpuTensorEngine
         ValidateGenericFftInput(input);
         _ = elementType.ByteSize();
 
-        if (!TryGetBackend(out var backend) || backend is not IGenericFftBackend fft)
+        if (!TryGetBackend(out var backend) || backend is not IGenericFftBackend generic)
         {
             string backendName = backend?.BackendName ?? "unavailable DirectGpu backend";
             throw new NotSupportedException(
                 $"{backendName} does not implement generic-precision arbitrary-length FFT. No host fallback was performed.");
         }
 
-        if (!fft.SupportsFftElementType(elementType))
+        if (!generic.SupportsFftElementType(elementType))
         {
             throw new NotSupportedException(
                 $"{backend.BackendName} cannot execute {elementType} FFT storage on this device/toolkit. " +
                 "The capability result is authoritative; no host fallback was performed.");
         }
 
-        Tensor<float> result = ExecuteGenericFft(backend, fft, input, inverse, elementType);
+        Tensor<float> result = ExecuteGenericFft(backend, generic, input, inverse, elementType);
         int n = input._shape[^1] / 2;
         if (inverse)
             FftAutograd.RecordIFft1(result, input, n, FftNorm.Backward);
@@ -72,25 +73,29 @@ public partial class DirectGpuTensorEngine
         int n = last / 2;
         int batch = interleaved.Length / last;
 
-        // Preferred CUDA path: arbitrary length, batched, and fully device-resident.
+        // Preferred generic path: arbitrary length, batched, and fully device-resident. CUDA takes it for every
+        // length. A backend that also has an established power-of-two kernel (Vulkan) keeps that kernel for
+        // power-of-two lengths and takes this path for the lengths that otherwise had no device route at all.
         // The public Fft module records the backward operation after this method returns.
-        if (backend is IGenericFftBackend fft && fft.SupportsFftElementType(FftElementType.Float32))
+        bool powerOfTwo = (n & (n - 1)) == 0;
+        if (backend is IGenericFftBackend generic && (backend is CudaBackend || !powerOfTwo) &&
+            generic.SupportsFftElementType(FftElementType.Float32))
         {
             try
             {
-                return ExecuteGenericFft(backend, fft, interleaved, inverse, FftElementType.Float32);
+                return ExecuteGenericFft(backend, generic, interleaved, inverse, FftElementType.Float32);
             }
             catch (Exception ex) when (
-                ex is not CudaGenericFftRecoveryException &&
+                ex is not GenericFftRecoveryException &&
                 (ex is InvalidOperationException or NotSupportedException or ArgumentException))
             {
                 if (ThrowOnGpuKernelFallback) throw;
                 System.Diagnostics.Trace.TraceWarning(
-                    $"CUDA generic FFT fallback: {ex.GetType().Name}: {ex.Message}");
+                    $"{backend.BackendName} generic FFT fallback: {ex.GetType().Name}: {ex.Message}");
             }
         }
 
-        if ((n & (n - 1)) != 0) return null; // legacy backends remain radix-2-only
+        if (!powerOfTwo) return null; // legacy backends remain radix-2-only
 
         // Path A: IFftBackend (Metal / Vulkan — interleaved layout, single buffer).
         if (backend is IFftBackend fftBackend)
@@ -189,8 +194,8 @@ public partial class DirectGpuTensorEngine
     }
 
     private Tensor<float> ExecuteGenericFft(
-        IDirectGpuBackend cuda,
-        IGenericFftBackend fft,
+        IDirectGpuBackend device,
+        IGenericFftBackend generic,
         Tensor<float> interleaved,
         bool inverse,
         FftElementType elementType)
@@ -206,16 +211,16 @@ public partial class DirectGpuTensorEngine
         IGpuBuffer? imaginaryStorage = null;
         IGpuBuffer? interleavedOutput = null;
         bool outputHandedOff = false;
-        bool cudaWorkMayBePending = false;
+        bool deviceWorkMayBePending = false;
         Exception? dispatchFailure = null;
         try
         {
-            using var input = GetOrAllocateBuffer(cuda, interleaved);
-            realFloat = cuda.AllocateBuffer(complexCount);
-            imaginaryFloat = cuda.AllocateBuffer(complexCount);
-            cudaWorkMayBePending = true;
-            cuda.StridedGather(input.Buffer, realFloat, 0, 2, complexCount);
-            cuda.StridedGather(input.Buffer, imaginaryFloat, 1, 2, complexCount);
+            using var input = GetOrAllocateBuffer(device, interleaved);
+            realFloat = device.AllocateBuffer(complexCount);
+            imaginaryFloat = device.AllocateBuffer(complexCount);
+            deviceWorkMayBePending = true;
+            device.StridedGather(input.Buffer, realFloat, 0, 2, complexCount);
+            device.StridedGather(input.Buffer, imaginaryFloat, 1, 2, complexCount);
 
             if (elementType == FftElementType.Float32)
             {
@@ -224,28 +229,28 @@ public partial class DirectGpuTensorEngine
             }
             else
             {
-                // Whole 32-bit words: backends pack two 16-bit values per word.
+                // Whole 32-bit words: several backends pack two 16-bit values per word.
                 int storageBytes = checked((complexCount * elementType.ByteSize() + 3) & ~3);
-                realStorage = cuda.AllocateByteBuffer(storageBytes);
-                imaginaryStorage = cuda.AllocateByteBuffer(storageBytes);
-                fft.ConvertFloatToFftStorage(realFloat, realStorage, complexCount, elementType);
-                fft.ConvertFloatToFftStorage(imaginaryFloat, imaginaryStorage, complexCount, elementType);
+                realStorage = device.AllocateByteBuffer(storageBytes);
+                imaginaryStorage = device.AllocateByteBuffer(storageBytes);
+                generic.ConvertFloatToFftStorage(realFloat, realStorage, complexCount, elementType);
+                generic.ConvertFloatToFftStorage(imaginaryFloat, imaginaryStorage, complexCount, elementType);
             }
 
-            fft.LaunchFftGeneric(realStorage, imaginaryStorage, batch, n, inverse, elementType);
+            generic.LaunchFftGeneric(realStorage, imaginaryStorage, batch, n, inverse, elementType);
 
             if (elementType != FftElementType.Float32)
             {
-                fft.ConvertFftStorageToFloat(realStorage, realFloat, complexCount, elementType);
-                fft.ConvertFftStorageToFloat(imaginaryStorage, imaginaryFloat, complexCount, elementType);
+                generic.ConvertFftStorageToFloat(realStorage, realFloat, complexCount, elementType);
+                generic.ConvertFftStorageToFloat(imaginaryStorage, imaginaryFloat, complexCount, elementType);
             }
 
-            interleavedOutput = cuda.AllocateBuffer(interleaved.Length);
-            cuda.StridedScatter(realFloat, interleavedOutput, 0, 2, complexCount);
-            cuda.StridedScatter(imaginaryFloat, interleavedOutput, 1, 2, complexCount);
-            cuda.Synchronize();
+            interleavedOutput = device.AllocateBuffer(interleaved.Length);
+            device.StridedScatter(realFloat, interleavedOutput, 0, 2, complexCount);
+            device.StridedScatter(imaginaryFloat, interleavedOutput, 1, 2, complexCount);
+            device.Synchronize();
 
-            var result = DeferTensorResult<float>(cuda, interleavedOutput,
+            var result = DeferTensorResult<float>(device, interleavedOutput,
                 interleaved.Length, (int[])interleaved._shape.Clone());
             outputHandedOff = true;
             return result;
@@ -258,19 +263,19 @@ public partial class DirectGpuTensorEngine
         finally
         {
             // A generic FFT error may occur after one or more asynchronous launches. Do not
-            // release or reuse any device buffer, or enter a legacy CUDA fallback, until the
+            // release or reuse any device buffer, or enter a legacy GPU fallback, until the
             // stream proves those launches completed. If synchronization itself reports a
             // device fault, surface a non-fallback exception and leave cleanup to backend
-            // teardown rather than risk a use-after-free on a poisoned context.
-            if (!outputHandedOff && cudaWorkMayBePending && dispatchFailure is not null)
+            // teardown rather than risk a use-after-free on a faulted device.
+            if (!outputHandedOff && deviceWorkMayBePending && dispatchFailure is not null)
             {
                 try
                 {
-                    cuda.Synchronize();
+                    device.Synchronize();
                 }
                 catch (Exception synchronizationFailure)
                 {
-                    throw new CudaGenericFftRecoveryException(dispatchFailure, synchronizationFailure);
+                    throw new GenericFftRecoveryException(device.BackendName, dispatchFailure, synchronizationFailure);
                 }
             }
 
@@ -282,11 +287,11 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    private sealed class CudaGenericFftRecoveryException : InvalidOperationException
+    private sealed class GenericFftRecoveryException : InvalidOperationException
     {
-        internal CudaGenericFftRecoveryException(Exception dispatchFailure, Exception synchronizationFailure)
+        internal GenericFftRecoveryException(string backendName, Exception dispatchFailure, Exception synchronizationFailure)
             : base(
-                "CUDA generic FFT failed and the stream could not be synchronized safely; " +
+                backendName + " generic FFT failed and the device could not be synchronized safely; " +
                 "legacy GPU fallback was blocked to preserve the original device fault.",
                 new AggregateException(dispatchFailure, synchronizationFailure))
         {
