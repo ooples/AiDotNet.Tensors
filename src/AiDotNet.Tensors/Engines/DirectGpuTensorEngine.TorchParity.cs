@@ -783,6 +783,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorFloorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorFloorDivide", a, b, 7) is { } onInt32) return onInt32;
+        if (TryInt64OnDevice("TensorFloorDivide", a, b, 7) is { } onInt64) return onInt64;
         if (TryParityBinaryOnDevice(a, b, TorchParityBinaryOp.FloorDivide) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorFloorDivide: no device kernel", null);
         return base.TensorFloorDivide<T>(a, b);
@@ -792,6 +793,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorGcd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorGcd", a, b, 5) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorGcd", a, b, 5) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorGcd: no device kernel", null);
         return base.TensorGcd<T>(a, b);
     }
@@ -800,6 +802,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorLcm<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorLcm", a, b, 6) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorLcm", a, b, 6) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorLcm: no device kernel", null);
         return base.TensorLcm<T>(a, b);
     }
@@ -808,6 +811,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorBitwiseAnd<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorBitwiseAnd", a, b, 0) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorBitwiseAnd", a, b, 0) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorBitwiseAnd: no device kernel", null);
         return base.TensorBitwiseAnd<T>(a, b);
     }
@@ -816,6 +820,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorBitwiseOr<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorBitwiseOr", a, b, 1) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorBitwiseOr", a, b, 1) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorBitwiseOr: no device kernel", null);
         return base.TensorBitwiseOr<T>(a, b);
     }
@@ -824,6 +829,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorBitwiseXor<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorBitwiseXor", a, b, 2) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorBitwiseXor", a, b, 2) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorBitwiseXor: no device kernel", null);
         return base.TensorBitwiseXor<T>(a, b);
     }
@@ -832,6 +838,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorBitwiseNot<T>(Tensor<T> tensor)
     {
         if (TryInt32OnDevice("TensorBitwiseNot", tensor, null, -1) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorBitwiseNot", tensor, null, -1) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorBitwiseNot: no device kernel", null);
         return base.TensorBitwiseNot<T>(tensor);
     }
@@ -840,6 +847,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorBitwiseLeftShift<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorBitwiseLeftShift", a, b, 3) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorBitwiseLeftShift", a, b, 3) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorBitwiseLeftShift: no device kernel", null);
         return base.TensorBitwiseLeftShift<T>(a, b);
     }
@@ -848,6 +856,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorBitwiseRightShift<T>(Tensor<T> a, Tensor<T> b)
     {
         if (TryInt32OnDevice("TensorBitwiseRightShift", a, b, 4) is { } onDevice) return onDevice;
+        if (TryInt64OnDevice("TensorBitwiseRightShift", a, b, 4) is { } onInt64) return onInt64;
         GpuLaunchProbe.OnFallback("TensorBitwiseRightShift: no device kernel", null);
         return base.TensorBitwiseRightShift<T>(a, b);
     }
