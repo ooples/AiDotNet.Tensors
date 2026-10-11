@@ -6526,9 +6526,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MatrixAdd(a, b);
 
         var matrix = new Matrix<T>(a.Rows, a.Columns);
-        using var resultKeep1 = new KeepAliveScope(result);
-        using var matrixKeep1 = new KeepAliveScope(matrix);
-        result.AsSpanUnmarked().CopyTo(matrix.AsWritableSpanUnmarked());
+        result.AsSpan().CopyTo(matrix.AsWritableSpan());
         return matrix;
     }
 
@@ -6543,9 +6541,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MatrixSubtract(a, b);
 
         var matrix = new Matrix<T>(a.Rows, a.Columns);
-        using var resultKeep2 = new KeepAliveScope(result);
-        using var matrixKeep2 = new KeepAliveScope(matrix);
-        result.AsSpanUnmarked().CopyTo(matrix.AsWritableSpanUnmarked());
+        result.AsSpan().CopyTo(matrix.AsWritableSpan());
         return matrix;
     }
 
@@ -6557,9 +6553,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MatrixMultiplyScalar(matrix, scalar);
 
         var output = new Matrix<T>(matrix.Rows, matrix.Columns);
-        using var resultKeep3 = new KeepAliveScope(result);
-        using var outputKeep1 = new KeepAliveScope(output);
-        result.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
+        result.AsSpan().CopyTo(output.AsWritableSpan());
         return output;
     }
 

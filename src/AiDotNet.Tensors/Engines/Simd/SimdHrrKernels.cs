@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -128,9 +129,7 @@ public static class SimdHrrKernels
 
         if (n < ParallelThresholdElements)
         {
-            using var inputKeep1 = new KeepAliveScope(input);
-            using var outputKeep1 = new KeepAliveScope(output);
-            GatherDouble(input.AsSpanUnmarked(), indices.AsSpan(), output.AsSpanUnmarked());
+            GatherDouble(input.AsSpan(), indices.AsSpan(), output.AsSpan());
             return;
         }
 
@@ -489,8 +488,8 @@ public static class SimdHrrKernels
             scores[v] = PhaseCoherenceRow(
                 new ReadOnlySpan<double>(codesR, rowOff, D),
                 new ReadOnlySpan<double>(codesI, rowOff, D),
-                queryR.AsSpanUnmarked(),
-                queryI.AsSpanUnmarked());
+                queryR.AsSpan(),
+                queryI.AsSpan());
         });
     }
 

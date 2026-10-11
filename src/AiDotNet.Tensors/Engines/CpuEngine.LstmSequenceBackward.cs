@@ -1384,17 +1384,13 @@ public partial class CpuEngine
             if (idxBIh >= 0)
             {
                 var gb = new Tensor<double>(new[] { G });
-                using var gradBKeep1 = new KeepAliveScope(gradB);
-                using var gbKeep3 = new KeepAliveScope(gb);
-                gradB.AsSpanUnmarked().CopyTo(gb.AsWritableSpanUnmarked());
+                gradB.AsSpan().CopyTo(gb.AsWritableSpan());
                 DifferentiableOps.AccumulateGrad(grads, inp[idxBIh], gb, engine);
             }
             if (idxBHh >= 0)
             {
                 var gb = new Tensor<double>(new[] { G });
-                using var gradBKeep2 = new KeepAliveScope(gradB);
-                using var gbKeep4 = new KeepAliveScope(gb);
-                gradB.AsSpanUnmarked().CopyTo(gb.AsWritableSpanUnmarked());
+                gradB.AsSpan().CopyTo(gb.AsWritableSpan());
                 DifferentiableOps.AccumulateGrad(grads, inp[idxBHh], gb, engine);
             }
         }

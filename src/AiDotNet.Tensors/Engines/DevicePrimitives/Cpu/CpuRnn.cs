@@ -361,8 +361,7 @@ public sealed class CpuRnn : IDeviceRnn
                         h0, c0, reverseTime: d == 1, saveCache);
 
                 dirOutputs[d] = output;
-                using var hLastKeep1 = new KeepAliveScope(hLast);
-                hLast.AsSpanUnmarked().CopyTo(hNSpan.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
+                hLast.AsSpan().CopyTo(hNSpan.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
                 if (layout.Cell == RnnCellType.Lstm)
                     cLast!.AsSpan().CopyTo(cNSpan.Slice(ld * layout.Batch * layout.Hidden, layout.Batch * layout.Hidden));
 
@@ -425,8 +424,7 @@ public sealed class CpuRnn : IDeviceRnn
 
     private static void SplitDirections<T>(T[] flat, T[][] perDir, int seqLen, int batch, int featOut, int numDirections)
     {
-        using var flatKeep1 = new KeepAliveScope(flat);
-        if (numDirections == 1) { flat.AsSpanUnmarked().CopyTo(perDir[0]); return; }
+        if (numDirections == 1) { flat.AsSpan().CopyTo(perDir[0]); return; }
         for (int t = 0; t < seqLen; t++)
             for (int b = 0; b < batch; b++)
             {
@@ -481,8 +479,7 @@ public sealed class CpuRnn : IDeviceRnn
 
         var output = new T[T_ * B * F];
         var hPrev = new T[B * F];
-        using var h0Keep1 = new KeepAliveScope(h0);
-        h0.AsSpanUnmarked().CopyTo(hPrev);
+        h0.AsSpan().CopyTo(hPrev);
         var cPrev = c0 is null ? null : new T[B * H];
         c0?.AsSpan().CopyTo(cPrev);
 
@@ -493,13 +490,11 @@ public sealed class CpuRnn : IDeviceRnn
 
         if (saveCache)
         {
-            using var hPrevKeep1 = new KeepAliveScope(hPrev);
-            hPrev.AsSpanUnmarked().CopyTo(allH.AsSpan(0, B * F));
+            hPrev.AsSpan().CopyTo(allH.AsSpan(0, B * F));
             if (cell == RnnCellType.Lstm) cPrev!.AsSpan().CopyTo(allC.AsSpan(0, B * H));
         }
 
-        using var inSpanLease = layerInput.Lease();
-        var inSpan = inSpanLease.Span;
+        var inSpan = layerInput.AsSpan();
 
         for (int step = 0; step < T_; step++)
         {
@@ -530,15 +525,13 @@ public sealed class CpuRnn : IDeviceRnn
 
             if (saveCache)
             {
-                using var hPrevKeep2 = new KeepAliveScope(hPrev);
-                hPrev.AsSpanUnmarked().CopyTo(allH.AsSpan((step + 1) * B * F, B * F));
+                hPrev.AsSpan().CopyTo(allH.AsSpan((step + 1) * B * F, B * F));
                 if (cell == RnnCellType.Lstm) cPrev!.AsSpan().CopyTo(allC.AsSpan((step + 1) * B * H, B * H));
             }
         }
 
         var hLast = new T[B * F];
-        using var hPrevKeep3 = new KeepAliveScope(hPrev);
-        hPrev.AsSpanUnmarked().CopyTo(hLast);
+        hPrev.AsSpan().CopyTo(hLast);
         T[]? cLast = cell == RnnCellType.Lstm ? new T[B * H] : null;
         cPrev?.AsSpan().CopyTo(cLast);
 
@@ -679,8 +672,7 @@ public sealed class CpuRnn : IDeviceRnn
                 }
             }
         }
-        using var hNewKeep1 = new KeepAliveScope(hNew);
-        hNew.AsSpanUnmarked().CopyTo(hPrev);
+        hNew.AsSpan().CopyTo(hPrev);
     }
 
     private static void StepPlain<T>(
@@ -710,8 +702,7 @@ public sealed class CpuRnn : IDeviceRnn
                 output[(t * B + b) * H + j] = hNew[b * H + j];
             }
         }
-        using var hNewKeep2 = new KeepAliveScope(hNew);
-        hNew.AsSpanUnmarked().CopyTo(hPrev);
+        hNew.AsSpan().CopyTo(hPrev);
     }
 
     private static double Sigmoid(double x) => 1.0 / (1.0 + Math.Exp(-x));
@@ -800,8 +791,7 @@ public sealed class CpuRnn : IDeviceRnn
                     dInput, gradWeightsArr,
                     out var dH0Out, out var dC0Out);
 
-                using var dH0OutKeep1 = new KeepAliveScope(dH0Out);
-                dH0Out.AsSpanUnmarked().CopyTo(gradH0Span.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
+                dH0Out.AsSpan().CopyTo(gradH0Span.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
                 if (cell == RnnCellType.Lstm)
                     dC0Out!.AsSpan().CopyTo(gradC0Span.Slice(ld * layout.Batch * layout.Hidden, layout.Batch * layout.Hidden));
             }
@@ -810,9 +800,7 @@ public sealed class CpuRnn : IDeviceRnn
         }
 
         var gradInput = new Tensor<T>(new[] { layout.SeqLen, layout.Batch, layout.InputSize });
-        using var dYKeep1 = new KeepAliveScope(dY);
-        using var gradInputKeep1 = new KeepAliveScope(gradInput);
-        dY.AsSpanUnmarked().CopyTo(gradInput.AsWritableSpanUnmarked());
+        dY.AsSpan().CopyTo(gradInput.AsWritableSpan());
         var gradWeights = new Tensor<T>(new[] { ctx.Weights.Length });
         gradWeightsArr.AsSpan().CopyTo(gradWeights.AsWritableSpan());
 
@@ -854,11 +842,9 @@ public sealed class CpuRnn : IDeviceRnn
         var dWHr = slice.WHrLen > 0 ? new Span<T>(gradWeights, slice.Off + slice.WIhLen + slice.WHhLen + 2 * slice.BLen, slice.WHrLen) : default;
 
         var dH = new T[B * F];
-        using var dHNSliceKeep1 = new KeepAliveScope(dHNSlice);
-        if (dHNSlice is not null) dHNSlice.AsSpanUnmarked().CopyTo(dH);
+        if (dHNSlice is not null) dHNSlice.AsSpan().CopyTo(dH);
         var dC = cell == RnnCellType.Lstm ? new T[B * H] : null;
-        using var dCNSliceKeep1 = new KeepAliveScope(dCNSlice);
-        if (dCNSlice is not null) dCNSlice.AsSpanUnmarked().CopyTo(dC);
+        if (dCNSlice is not null) dCNSlice.AsSpan().CopyTo(dC);
 
         for (int step = T_ - 1; step >= 0; step--)
         {

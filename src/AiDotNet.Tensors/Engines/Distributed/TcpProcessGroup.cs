@@ -314,9 +314,7 @@ public sealed class TcpProcessGroup : IProcessGroup
                     contributions[r] = ReadTensorArray<T>(_clientStreams![r], tensor.Length);
                 }
                 var result = ReduceArrays(contributions, op);
-                using var resultKeep1 = new KeepAliveScope(result);
-                using var tensorKeep3 = new KeepAliveScope(tensor);
-                result.AsSpanUnmarked().CopyTo(tensor.AsWritableSpanUnmarked());
+                result.AsSpan().CopyTo(tensor.AsWritableSpan());
                 for (int r = 1; r < WorldSize; r++)
                 {
                     WriteOpcode(_clientStreams![r], OP_ALL_REDUCE);

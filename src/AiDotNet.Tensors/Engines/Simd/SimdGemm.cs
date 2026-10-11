@@ -689,8 +689,7 @@ internal static partial class SimdGemm
         if (n > Nc || Avx512Sgemm.CanUse)
         {
             c.Clear();
-            using var bKeep1 = new KeepAliveScope(b);
-            SgemmAddInternal(a, k, false, b.AsSpanUnmarked(), n, false, c, m, k, n,
+            SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
                 allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
@@ -717,8 +716,7 @@ internal static partial class SimdGemm
             // SgemmAddInternal accumulates into c. We need overwrite semantics
             // for SgemmWithCachedB, so zero c before passing clearedOutput:true.
             c.Clear();
-            using var bKeep2 = new KeepAliveScope(b);
-            SgemmAddInternal(a, k, false, b.AsSpanUnmarked(), n, false, c, m, k, n,
+            SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
                 allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
@@ -996,8 +994,7 @@ internal static partial class SimdGemm
 
         if (n > Nc || Avx512Sgemm.CanUse)
         {
-            using var bKeep3 = new KeepAliveScope(b);
-            SgemmAddInternal(a, k, false, b.AsSpanUnmarked(), n, false, c, m, k, n,
+            SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
                 allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
@@ -1378,8 +1375,7 @@ internal static partial class SimdGemm
         }
 
 #pragma warning disable CS0618 // Self-call to the [Obsolete] no-trans shim — SgemmWithCachedB is a net471 wrapper that legitimately delegates here.
-        using var bKeep4 = new KeepAliveScope(b);
-        Sgemm(a, b.AsSpanUnmarked(), c, m, k, n);
+        Sgemm(a, b.AsSpan(), c, m, k, n);
 #pragma warning restore CS0618
     }
 #endif

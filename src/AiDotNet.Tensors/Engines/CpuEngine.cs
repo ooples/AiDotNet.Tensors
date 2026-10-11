@@ -894,8 +894,8 @@ public partial class CpuEngine : ITensorLevelEngine
             using var floatInputKeep1 = new KeepAliveScope(floatInput);
             using var floatOutputKeep1 = new KeepAliveScope(floatOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<SinOperatorFloat>(
-                floatInput.AsSpanUnmarked(),
-                floatOutput.AsSpanUnmarked());
+                floatInput.AsSpan(),
+                floatOutput.AsSpan());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -917,8 +917,8 @@ public partial class CpuEngine : ITensorLevelEngine
             using var doubleInputKeep1 = new KeepAliveScope(doubleInput);
             using var doubleOutputKeep1 = new KeepAliveScope(doubleOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<SinOperatorDouble>(
-                doubleInput.AsSpanUnmarked(),
-                doubleOutput.AsSpanUnmarked());
+                doubleInput.AsSpan(),
+                doubleOutput.AsSpan());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -960,8 +960,8 @@ public partial class CpuEngine : ITensorLevelEngine
             using var floatInputKeep2 = new KeepAliveScope(floatInput);
             using var floatOutputKeep2 = new KeepAliveScope(floatOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<CosOperatorFloat>(
-                floatInput.AsSpanUnmarked(),
-                floatOutput.AsSpanUnmarked());
+                floatInput.AsSpan(),
+                floatOutput.AsSpan());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -983,8 +983,8 @@ public partial class CpuEngine : ITensorLevelEngine
             using var doubleInputKeep2 = new KeepAliveScope(doubleInput);
             using var doubleOutputKeep2 = new KeepAliveScope(doubleOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<CosOperatorDouble>(
-                doubleInput.AsSpanUnmarked(),
-                doubleOutput.AsSpanUnmarked());
+                doubleInput.AsSpan(),
+                doubleOutput.AsSpan());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -1879,8 +1879,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var rowSpan = rowData.AsSpan(0, bFloat.Length);
                 for (int i = 0; i < aFloat.Length; i++)
                 {
-                    using var bFloatKeep1 = new KeepAliveScope(bFloat);
-                    SimdKernels.MultiplyScalar(bFloat.AsSpanUnmarked(), aFloat[i], rowSpan);
+                    SimdKernels.MultiplyScalar(bFloat.AsSpan(), aFloat[i], rowSpan);
                     for (int j = 0; j < bFloat.Length; j++)
                         result[i, j] = (T)(object)rowData[j];
                 }
@@ -1897,8 +1896,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var rowSpan = rowData.AsSpan(0, bDouble.Length);
                 for (int i = 0; i < aDouble.Length; i++)
                 {
-                    using var bDoubleKeep1 = new KeepAliveScope(bDouble);
-                    SimdKernels.MultiplyScalar(bDouble.AsSpanUnmarked(), aDouble[i], rowSpan);
+                    SimdKernels.MultiplyScalar(bDouble.AsSpan(), aDouble[i], rowSpan);
                     for (int j = 0; j < bDouble.Length; j++)
                         result[i, j] = (T)(object)rowData[j];
                 }
@@ -25469,7 +25467,6 @@ public partial class CpuEngine : ITensorLevelEngine
         LazyTensorScope scope, Tensor<T> batchNormOutput, Tensor<T> refreshedStatistic, string opName)
     {
         using var refreshedStatisticKeep1 = new KeepAliveScope(refreshedStatistic);
-        using var outputKeep5 = new KeepAliveScope(output);
         var statistic = scope.RecordUnary(LazyNodeType.Custom, opName, batchNormOutput, refreshedStatistic._shape,
             (eng, output) => refreshedStatistic.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked()));
         using var refreshedStatisticKeep2 = new KeepAliveScope(refreshedStatistic);
@@ -31394,10 +31391,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // Local accumulators per query position
             var rowMax = new T[seqQ];
             var rowSum = new T[seqQ];
-            using var rowMaxKeep1 = new KeepAliveScope(rowMax);
-            numOps.Fill(rowMax.AsSpanUnmarked(), negInf);
-            using var rowSumKeep1 = new KeepAliveScope(rowSum);
-            numOps.Fill(rowSum.AsSpanUnmarked(), numOps.Zero);
+            numOps.Fill(rowMax.AsSpan(), negInf);
+            numOps.Fill(rowSum.AsSpan(), numOps.Zero);
 
             // Process KV blocks
             for (int kvBlockStart = 0; kvBlockStart < seqK; kvBlockStart += BLOCK_KV)
@@ -36475,8 +36470,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                using var outArrDKeep1 = new KeepAliveScope(outArrD);
-                outArrD.AsSpanUnmarked().Fill(padD);
+                outArrD.AsSpan().Fill(padD);
             }
             int h = height, w = width, nH = newHeight, nW = newWidth;
             int pt = padTop, pl = padLeft;
@@ -53887,8 +53881,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Radix-2 only below — see NativeFFTBluestein.
             var arbitrary = data.ToArray();
             NativeFFTBluestein<double>(arbitrary, n, inverse, MathHelper.GetNumericOperations<double>());
-            using var arbitraryKeep1 = new KeepAliveScope(arbitrary);
-            arbitrary.AsSpanUnmarked().CopyTo(data);
+            arbitrary.AsSpan().CopyTo(data);
             return;
         }
 
@@ -53981,8 +53974,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Radix-2 only below — see NativeFFTBluestein.
             var arbitrary = data.ToArray();
             NativeFFTBluestein<float>(arbitrary, n, inverse, MathHelper.GetNumericOperations<float>());
-            using var arbitraryKeep2 = new KeepAliveScope(arbitrary);
-            arbitrary.AsSpanUnmarked().CopyTo(data);
+            arbitrary.AsSpan().CopyTo(data);
             return;
         }
 

@@ -116,8 +116,7 @@ internal static partial class SimdGemm
         float[] input = a.ToArray();
         var output = new float[c.Length];
         SgemmWithInt8RowScaledCachedB(input, bInt8, rowScales, output, m, k, n);
-        using var outputKeep1 = new KeepAliveScope(output);
-        output.AsSpanUnmarked().CopyTo(c);
+        output.AsSpan().CopyTo(c);
     }
 
     /// <summary>

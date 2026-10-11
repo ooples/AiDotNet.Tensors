@@ -252,7 +252,7 @@ internal static class SvdDecomposition
         {
             using var tempKeep1 = new KeepAliveScope(temp);
             SimdGemm.Sgemm(x.AsSpan(0, xRows * xCols), factors.LeftFactor.AsSpan(0, xCols * r),
-                temp.AsSpanUnmarked(), xRows, xCols, r);
+                temp.AsSpan(), xRows, xCols, r);
         }
 
         // Step 2: output = temp[xRows, r] @ rightFactor[r, N] → [xRows, N]

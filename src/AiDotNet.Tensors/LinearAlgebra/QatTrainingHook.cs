@@ -58,8 +58,7 @@ public sealed class QatTrainingHook
         var contig = floatWeight.IsContiguous ? floatWeight : floatWeight.Contiguous();
         var master = new FloatMaster
         {
-            using var contigKeep1 = new KeepAliveScope(contig);
-            Buffer = contig.AsSpanUnmarked().ToArray(),
+            Buffer = contig.AsSpan().ToArray(),
             Shape = (int[])contig._shape.Clone(),
         };
         _masters[key] = master;

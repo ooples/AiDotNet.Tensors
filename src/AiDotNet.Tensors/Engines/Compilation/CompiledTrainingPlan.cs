@@ -1121,9 +1121,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // at the old buffer. Under CUDA graph capture the copy becomes a
         // device memcpy node and replays deterministically.
         Step();
-        using var lossOutputKeep1 = new KeepAliveScope(_lossOutput);
-        using var lossOutputKeep1 = new KeepAliveScope(lossOutput);
-        _lossOutput.AsSpanUnmarked().CopyTo(lossOutput.AsWritableSpanUnmarked());
+        _lossOutput.AsSpan().CopyTo(lossOutput.AsWritableSpan());
     }
 
     /// <inheritdoc/>

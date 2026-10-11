@@ -238,8 +238,7 @@ public sealed class NcclProcessGroup : IProcessGroup
                     CheckCuda(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(ch.AddrOfPinnedObject(), src, sendBytes), "cuMemcpyDtoH(AllGather rank chunk)");
                 }
                 finally { ch.Free(); }
-                using var chunkKeep1 = new KeepAliveScope(chunk);
-                chunk.AsSpanUnmarked().CopyTo(output[r].AsWritableSpan());
+                chunk.AsSpan().CopyTo(output[r].AsWritableSpan());
             }
         }
         finally

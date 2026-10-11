@@ -183,9 +183,7 @@ public sealed class MpiProcessGroup : IProcessGroup
                 var div = ops.FromDouble(1.0 / WorldSize);
                 for (int i = 0; i < result.Length; i++) result[i] = ops.Multiply(result[i], div);
             }
-            using var resultKeep1 = new KeepAliveScope(result);
-            using var tensorKeep2 = new KeepAliveScope(tensor);
-            result.AsSpanUnmarked().CopyTo(tensor.AsWritableSpanUnmarked());
+            result.AsSpan().CopyTo(tensor.AsWritableSpan());
         }
         finally { send.Free(); recv.Free(); }
     }
@@ -229,9 +227,7 @@ public sealed class MpiProcessGroup : IProcessGroup
                     var div = ops.FromDouble(1.0 / WorldSize);
                     for (int i = 0; i < result.Length; i++) result[i] = ops.Multiply(result[i], div);
                 }
-                using var resultKeep2 = new KeepAliveScope(result);
-                using var tensorKeep6 = new KeepAliveScope(tensor);
-                result.AsSpanUnmarked().CopyTo(tensor.AsWritableSpanUnmarked());
+                result.AsSpan().CopyTo(tensor.AsWritableSpan());
             }
         }
         finally { send.Free(); recv.Free(); }
@@ -279,9 +275,7 @@ public sealed class MpiProcessGroup : IProcessGroup
                 var div = ops.FromDouble(1.0 / WorldSize);
                 for (int i = 0; i < recv.Length; i++) recv[i] = ops.Multiply(recv[i], div);
             }
-            using var recvKeep1 = new KeepAliveScope(recv);
-            using var outputKeep1 = new KeepAliveScope(output);
-            recv.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
+            recv.AsSpan().CopyTo(output.AsWritableSpan());
         }
         finally { sh.Free(); rh.Free(); }
     }

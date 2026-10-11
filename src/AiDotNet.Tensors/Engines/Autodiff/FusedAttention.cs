@@ -751,13 +751,13 @@ public static class FusedAttention<T>
             var dsTile = new Tensor<T>(dsData, new[] { BH, Sq, bk });
 
             // dV_j = Σ_i P_ij · dO_i  -> [BH, bk, Dv]; keys are disjoint per tile, so write.
-            using var dVtileKeep1 = new KeepAliveScope(dVtile);
             var dVtile = engine.TensorBatchMatMul(pTile.TransposeLast2D(), dof);            // [BH, bk, Dv]
+            using var dVtileKeep1 = new KeepAliveScope(dVtile);
             CopyTileIntoAxis1(dVfull, dVtile.AsSpanUnmarked(), BH, Sk, Dv, j0, bk);
             // dK_j = scale · Σ_i dS_ij · q_i -> [BH, bk, Dh]
-            using var dKtileKeep1 = new KeepAliveScope(dKtile);
             var dKtile = engine.TensorMultiplyScalar(
                 engine.TensorBatchMatMul(dsTile.TransposeLast2D(), qf), scaleT);            // [BH, bk, Dh]
+            using var dKtileKeep1 = new KeepAliveScope(dKtile);
             CopyTileIntoAxis1(dKfull, dKtile.AsSpanUnmarked(), BH, Sk, headDim, j0, bk);
             // dQ_i += scale · Σ_j dS_ij · k_j -> [BH, Sq, Dh] (accumulate across tiles)
             var dQtile = engine.TensorMultiplyScalar(

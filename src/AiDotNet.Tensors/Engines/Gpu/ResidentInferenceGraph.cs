@@ -277,8 +277,7 @@ public sealed class ResidentInferenceGraph : System.IDisposable
                         if (i == 0) c0 = ci;
                         mutd = System.Math.Max(mutd, System.Math.Abs(System.Convert.ToDouble(a[i]) - ci));
                     }
-                    using var origKeep1 = new KeepAliveScope(orig);
-                    orig.AsSpanUnmarked().CopyTo(s[0].AsWritableSpan()); // restore
+                    orig.AsSpan().CopyTo(s[0].AsWritableSpan()); // restore
                     _engine.RefreshResidentInputInPlace(s[0]);
                     _engine.LaunchGpuGraph(exec);
                     out1 = DownloadOutput<T>();
