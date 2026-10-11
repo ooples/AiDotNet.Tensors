@@ -712,12 +712,19 @@ public sealed class BatchExecutionBackendParityTests
             var input = run.Up(x);
             var mid = run.Out(n);
             var o = run.Out(n);
+            var last = run.Out(n);
+            // The same kernel twice on different buffers: a batch must not let the later binding leak into the
+            // earlier recorded dispatch.
             if (b.SupportsBatchExecution) b.BeginBatch();
             b.ScalarMinusTensor(input, mid, 1f, n);
             b.InsertBarrier(mid);
             b.DivScalar(mid, o, 2f, n);
+            b.InsertBarrier(o);
+            b.ScalarMinusTensor(o, last, 5f, n);
             if (b.SupportsBatchExecution) b.EndBatch();
+            run.Check("BeginBatch/EndBatch.mid", mid, x.Select(v => 1.0 - v).ToArray());
             run.Check("BeginBatch/EndBatch", o, x.Select(v => (1.0 - v) / 2.0).ToArray());
+            run.Check("BeginBatch/EndBatch.last", last, x.Select(v => 5.0 - (1.0 - v) / 2.0).ToArray());
         });
         run.Op("BeginSecondaryStream/EndSecondaryStream", () =>
         {
@@ -766,6 +773,7 @@ public sealed class BatchExecutionBackendParityTests
     [SkippableFact]
     public void Metal_BatchExecution_MatchesCpu()
     {
+        Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal is only available on macOS/iOS.");
         using var backend = new MetalBackend();
         Skip.IfNot(backend.IsAvailable, "Metal is not available.");
         CheckAll(backend);

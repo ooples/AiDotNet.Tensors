@@ -779,6 +779,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
             var batchCmd = _batchThreadRes.CommandBuffer;
+            TrackBatchPipeline(pipeline);
             if (_batchDispatchCount > 0)
                 RecordComputeMemoryBarrier(batchCmd);
             VulkanNativeBindings.vkCmdBindPipeline(batchCmd, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle);
@@ -839,6 +840,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
             var batchCmd = _batchThreadRes.CommandBuffer;
+            TrackBatchPipeline(pipeline);
 
             // Insert barrier between dispatches to ensure data dependencies
             if (_batchDispatchCount > 0)
@@ -1024,6 +1026,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         var threadRes = _device.AcquireThreadResources();
         _batchThreadRes = threadRes;
         _batchDispatchCount = 0;
+        ClearBatchMarks();
 
         var cmdBuffer = threadRes.CommandBuffer;
         VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
@@ -1054,6 +1057,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
         _device.SubmitAndWait(cmdBuffer, _batchThreadRes.Fence);
+        ClearBatchMarks();
 
         _batchMode = false;
         _batchDispatchCount = 0;
