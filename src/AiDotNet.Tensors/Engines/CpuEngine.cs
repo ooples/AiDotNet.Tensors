@@ -8159,21 +8159,33 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
     {
-        CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * cols, r =>
+        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum.
+        int chunks = WorkChunks(rows), perChunk = (rows + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
         {
-            float sum = 0; int offset = r * cols;
-            for (int c = 0; c < cols; c++) sum += src[offset + c];
-            dst[r] = sum;
+            int r1 = Math.Min(rows, (chunk + 1) * perChunk);
+            for (int r = chunk * perChunk; r < r1; r++)
+            {
+                float sum = 0; int offset = r * cols;
+                for (int c = 0; c < cols; c++) sum += src[offset + c];
+                dst[r] = sum;
+            }
         }, deterministicSafe: true);
     }
 
     private static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
     {
-        CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * cols, r =>
+        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum.
+        int chunks = WorkChunks(rows), perChunk = (rows + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
         {
-            double sum = 0; int offset = r * cols;
-            for (int c = 0; c < cols; c++) sum += src[offset + c];
-            dst[r] = sum;
+            int r1 = Math.Min(rows, (chunk + 1) * perChunk);
+            for (int r = chunk * perChunk; r < r1; r++)
+            {
+                double sum = 0; int offset = r * cols;
+                for (int c = 0; c < cols; c++) sum += src[offset + c];
+                dst[r] = sum;
+            }
         }, deterministicSafe: true);
     }
 
@@ -33538,6 +33550,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return block;
     }
 
+    // Work chunks for a loop of `units` independent items: about four per thread, one on a single thread.
+    private static int WorkChunks(long units)
+    {
+        int dop = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (dop <= 1 || units <= 1) return 1;
+        return (int)Math.Min(units, 4L * dop);
+    }
+
     private static TItem[] UninitializedArray<TItem>(int length)
     {
 #if NET5_0_OR_GREATER
@@ -33569,33 +33589,43 @@ public partial class CpuEngine : ITensorLevelEngine
         long units = (long)outer * blocks;
         if (units > int.MaxValue) return false;
         long work = (long)outer * axisSize * inner;
+        // Chunks of (outer, block) units, about four per thread, so a serial run is one loop, not a delegate per unit.
+        int chunks = WorkChunks(units), perChunk = (int)((units + chunks - 1) / chunks);
         if (typeof(T) == typeof(double))
         {
             var src = (double[])(object)data; var dst = (double[])(object)outData; double init = (double)(object)minValue!;
-            CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
             {
-                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
-                int ob = o * inner, ib = o * axisSize * inner;
-                for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
-                for (int a = 0; a < axisSize; a++)
+                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
+                for (int u = chunk * perChunk; u < u1; u++)
                 {
-                    int rb = ib + a * inner;
-                    for (int j = j0; j < j1; j++) { double v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
+                    int ob = o * inner, ib = o * axisSize * inner;
+                    for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
+                    for (int a = 0; a < axisSize; a++)
+                    {
+                        int rb = ib + a * inner;
+                        for (int j = j0; j < j1; j++) { double v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                    }
                 }
             }, deterministicSafe: true);
         }
         else
         {
             var src = (float[])(object)data; var dst = (float[])(object)outData; float init = (float)(object)minValue!;
-            CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
             {
-                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
-                int ob = o * inner, ib = o * axisSize * inner;
-                for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
-                for (int a = 0; a < axisSize; a++)
+                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
+                for (int u = chunk * perChunk; u < u1; u++)
                 {
-                    int rb = ib + a * inner;
-                    for (int j = j0; j < j1; j++) { float v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
+                    int ob = o * inner, ib = o * axisSize * inner;
+                    for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
+                    for (int a = 0; a < axisSize; a++)
+                    {
+                        int rb = ib + a * inner;
+                        for (int j = j0; j < j1; j++) { float v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                    }
                 }
             }, deterministicSafe: true);
         }
@@ -33613,38 +33643,48 @@ public partial class CpuEngine : ITensorLevelEngine
         long units = (long)outer * blocks;
         if (units > int.MaxValue) return false;
         long work = (long)outer * axisSize * inner;
+        // Chunks of (outer, block) units, about four per thread, so a serial run is one loop, not a delegate per unit.
+        int chunks = WorkChunks(units), perChunk = (int)((units + chunks - 1) / chunks);
         if (typeof(T) == typeof(double))
         {
             var src = (double[])(object)data; var dst = (double[])(object)outData;
             double inv = 1.0 / axisSize;
-            CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
             {
-                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
-                int ob = o * inner, ib = o * axisSize * inner;
-                for (int j = j0; j < j1; j++) dst[ob + j] = 0;
-                for (int a = 0; a < axisSize; a++)
+                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
+                for (int u = chunk * perChunk; u < u1; u++)
                 {
-                    int rb = ib + a * inner;
-                    for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
+                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
+                    int ob = o * inner, ib = o * axisSize * inner;
+                    for (int j = j0; j < j1; j++) dst[ob + j] = 0;
+                    for (int a = 0; a < axisSize; a++)
+                    {
+                        int rb = ib + a * inner;
+                        for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
+                    }
+                    for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
                 }
-                for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
             }, deterministicSafe: true);
         }
         else
         {
             var src = (float[])(object)data; var dst = (float[])(object)outData;
             float inv = 1.0f / axisSize;
-            CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
             {
-                int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
-                int ob = o * inner, ib = o * axisSize * inner;
-                for (int j = j0; j < j1; j++) dst[ob + j] = 0;
-                for (int a = 0; a < axisSize; a++)
+                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
+                for (int u = chunk * perChunk; u < u1; u++)
                 {
-                    int rb = ib + a * inner;
-                    for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
+                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
+                    int ob = o * inner, ib = o * axisSize * inner;
+                    for (int j = j0; j < j1; j++) dst[ob + j] = 0;
+                    for (int a = 0; a < axisSize; a++)
+                    {
+                        int rb = ib + a * inner;
+                        for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
+                    }
+                    for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
                 }
-                for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
             }, deterministicSafe: true);
         }
         return true;

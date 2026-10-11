@@ -501,7 +501,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // all on the hot path.
         if (Rank == 0 || Length == 0) return FinalizeContiguousCopy(result);
         // Large views: tiled / row-chunked copy across threads straight between the backing arrays (#653).
-        if (Length >= ParallelStridedCopyMinElements
+        // (On one thread the span walk below is faster than the tiled copy.)
+        if (Length >= ParallelStridedCopyMinElements && Helpers.CpuParallelSettings.MaxDegreeOfParallelism > 1
             && GetCpuBackingForStridedRead(out int srcBase) is { } srcArr
             && result.GetCpuBackingForContiguousWrite(out int dstBase) is { } dstArr)
         {
