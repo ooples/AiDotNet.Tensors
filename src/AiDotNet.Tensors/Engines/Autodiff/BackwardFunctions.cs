@@ -1975,12 +1975,46 @@ internal static class BackwardFunctions<T>
         // inputs[0]=Q, inputs[1]=K, inputs[2]=V; mask + scale + attn weights in savedState.
         var attentionWeights = (Tensor<T>)savedState[0];
         var scale = (double)savedState[1];
+        double softcap = savedState.Length > 2 ? (double)savedState[2] : 0.0;
+        if (softcap > 0.0)
+        {
+            SoftcappedAttentionBackward(gradOutput, inputs, attentionWeights, scale, softcap, engine, grads);
+            return;
+        }
         engine.ScaledDotProductAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], attentionWeights, scale,
             out var gradQ, out var gradK, out var gradV);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradQ, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradK, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradV, engine);
+    }
+
+    /// <summary>
+    /// ScaledDotProductAttention backward with an attention-logit soft-cap s = cap * tanh(raw / cap), raw = scale * Q K^T.
+    /// The softmax gradient with respect to the capped scores, dS = P * (dP - rowsum(dP * P)), is carried through the
+    /// cap's derivative 1 - tanh^2(raw / cap) before dQ = scale * dS_raw K and dK = scale * dS_raw^T Q. The fast engine
+    /// backward has no soft-cap input and omitted that factor (its gradients were those of the uncapped scores).
+    /// Masked positions have P = 0 and so receive no gradient. Built from engine primitives, so it runs on any engine.
+    /// </summary>
+    private static void SoftcappedAttentionBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> weights, double scale, double softcap, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        Tensor<T> query = inputs[0], key = inputs[1], value = inputs[2];
+        var keyT = engine.TensorPermute(key, new[] { 0, 1, 3, 2 });
+        var gradValue = engine.TensorMatMul(engine.TensorPermute(weights, new[] { 0, 1, 3, 2 }), gradOutput);
+        var dP = engine.TensorMatMul(gradOutput, engine.TensorPermute(value, new[] { 0, 1, 3, 2 }));
+        var rowDot = engine.ReduceSum(engine.TensorMultiply(dP, weights), new[] { 3 }, keepDims: true);
+        var dCapped = engine.TensorMultiply(weights, engine.TensorSubtract(dP, engine.TensorBroadcastTo(rowDot, dP._shape)));
+        var t = engine.Tanh(engine.TensorMultiplyScalar(engine.TensorMatMul(query, keyT), ops.FromDouble(scale / softcap)));
+        var slope = engine.TensorSubtract(engine.TensorOnesLike(t), engine.TensorMultiply(t, t));
+        var dRaw = engine.TensorMultiplyScalar(engine.TensorMultiply(dCapped, slope), ops.FromDouble(scale));
+        var gradQuery = engine.TensorMatMul(dRaw, key);
+        var gradKey = engine.TensorMatMul(engine.TensorPermute(dRaw, new[] { 0, 1, 3, 2 }), query);
+        DifferentiableOps.AccumulateGrad(grads, query, gradQuery, engine);
+        DifferentiableOps.AccumulateGrad(grads, key, gradKey, engine);
+        DifferentiableOps.AccumulateGrad(grads, value, gradValue, engine);
     }
 
     /// <summary>Backward for the bounded local correlation volume.</summary>

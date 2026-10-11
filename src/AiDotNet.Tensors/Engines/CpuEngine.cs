@@ -29164,7 +29164,7 @@ public partial class CpuEngine : ITensorLevelEngine
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultFCast,
                 new[] { queryOrig, keyOrig, valueOrig },
                 BackwardFunctions<T>.ScaledDotProductAttentionBackward,
-                new object[] { attentionWeights, scaleVal });
+                new object[] { attentionWeights, scaleVal, softcap });
             return resultFCast;
         }
 
@@ -29190,7 +29190,7 @@ public partial class CpuEngine : ITensorLevelEngine
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultDCast,
                 new[] { queryOrig, keyOrig, valueOrig },
                 BackwardFunctions<T>.ScaledDotProductAttentionBackward,
-                new object[] { attentionWeights, scaleVal });
+                new object[] { attentionWeights, scaleVal, softcap });
             return resultDCast;
         }
 
@@ -29316,7 +29316,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultGen,
             new[] { queryOrig, keyOrig, valueOrig },
             BackwardFunctions<T>.ScaledDotProductAttentionBackward,
-            new object[] { attentionWeights, scaleVal });
+            new object[] { attentionWeights, scaleVal, softcap });
         return resultGen;
     }
 

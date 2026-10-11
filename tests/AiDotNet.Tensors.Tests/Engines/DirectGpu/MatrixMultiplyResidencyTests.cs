@@ -172,20 +172,31 @@ AssertCloseFloat(c.AsSpan().ToArray(), cRef.AsSpan().ToArray(), absTol: 5e-3f, r
             var cpuEngine = new CpuEngine();
             _ = cpuEngine.MatrixMultiply(aH, bH);
 
-            // Time the GPU engine — first read forces materialization.
-            var gpuSw = System.Diagnostics.Stopwatch.StartNew();
-            var cH = ((IEngine)engine).MatrixMultiply(aH, bH);
-            _ = cH.AsSpan()[0];
-            gpuSw.Stop();
+            // Time both engines, interleaved, and compare MEDIANS: a single sample of each lost the race under a
+            // loaded full-suite run (GPU 80 ms for an N = 256 multiply that takes ~1 ms in isolation) although the
+            // GPU path ran. The first read of each result forces materialization.
+            const int Samples = 7;
+            var gpuTimes = new double[Samples];
+            var cpuTimes = new double[Samples];
+            Matrix<Half> cH = null!;
+            for (int s = 0; s < Samples; s++)
+            {
+                var gpuSw = System.Diagnostics.Stopwatch.StartNew();
+                cH = ((IEngine)engine).MatrixMultiply(aH, bH);
+                _ = cH.AsSpan()[0];
+                gpuSw.Stop();
+                gpuTimes[s] = gpuSw.Elapsed.TotalMilliseconds;
 
-            // Time the CPU engine on the same inputs as the oracle baseline.
-            var cpuSw = System.Diagnostics.Stopwatch.StartNew();
-            var cCpu = cpuEngine.MatrixMultiply(aH, bH);
-            _ = cCpu.AsSpan()[0];
-            cpuSw.Stop();
-
-            double gpuMs = gpuSw.Elapsed.TotalMilliseconds;
-            double cpuMs = cpuSw.Elapsed.TotalMilliseconds;
+                var cpuSw = System.Diagnostics.Stopwatch.StartNew();
+                var cCpu = cpuEngine.MatrixMultiply(aH, bH);
+                _ = cCpu.AsSpan()[0];
+                cpuSw.Stop();
+                cpuTimes[s] = cpuSw.Elapsed.TotalMilliseconds;
+            }
+            Array.Sort(gpuTimes);
+            Array.Sort(cpuTimes);
+            double gpuMs = gpuTimes[Samples / 2];
+            double cpuMs = cpuTimes[Samples / 2];
             _output.WriteLine($"#560 N={N}: GPU-engine FP16={gpuMs:F2}ms, CPU-engine FP16={cpuMs:F2}ms, speedup={cpuMs / Math.Max(gpuMs, 0.001):F2}×");
 
             // Pre-fix the IEngine GPU MatMul<Half> caught its FP16 path's
