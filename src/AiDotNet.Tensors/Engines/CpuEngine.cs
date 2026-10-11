@@ -33525,13 +33525,16 @@ public partial class CpuEngine : ITensorLevelEngine
     // Inner-axis block a ReduceMean work unit covers (see TryReduceMeanSingleAxisDense).
     private const int ReduceMeanInnerBlock = 64;
 
-    // Inner columns per work unit: 64 (vector-friendly, a cache line per row read), halved down to 8 until there are
-    // about four units per thread -- a [8192, 256] axis-0 reduction otherwise had four units. Each column is still
-    // summed / scanned in axis order, so the result does not depend on the block.
+    // Inner columns per work unit: 64 (vector-friendly, a cache line per row read), halved down to 16 until there are
+    // about four units per thread -- a [8192, 256] axis-0 reduction otherwise had four units. Not below 16 columns
+    // (every unit re-walks the whole axis, so narrower blocks multiply the strided passes), and not at all on one
+    // thread. Each column is still summed / scanned in axis order, so the result does not depend on the block.
     private static int ReductionInnerBlock(int outer, int inner)
     {
-        int block = ReduceMeanInnerBlock, wanted = 4 * Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
-        while (block > 8 && (long)outer * ((inner + block - 1) / block) < wanted) block >>= 1;
+        int dop = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (dop <= 1) return ReduceMeanInnerBlock;
+        int block = ReduceMeanInnerBlock, wanted = 4 * dop;
+        while (block > 16 && (long)outer * ((inner + block - 1) / block) < wanted) block >>= 1;
         return block;
     }
 
