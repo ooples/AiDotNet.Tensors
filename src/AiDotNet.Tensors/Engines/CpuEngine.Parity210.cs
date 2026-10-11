@@ -2741,9 +2741,6 @@ public partial class CpuEngine
         var indicesOut = new Tensor<int>(input._shape);
 
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
-        var valDst = valuesOut.AsWritableSpan();
-        var idxDst = indicesOut.AsWritableSpan();
 
         int axisSize = input._shape[axis];
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
@@ -2751,32 +2748,52 @@ public partial class CpuEngine
 
         // PyTorch's order (#1131): NaN after +inf ascending and first descending, -0 equal to +0, equal values in
         // their original order (stable). The CUDA sort uses the same total order, so values and indices agree.
-        var order = new int[axisSize];
-        var keys = typeof(T) == typeof(float) || typeof(T) == typeof(double) ? new ulong[axisSize] : null;
-        var column = keys is null ? new T[axisSize] : null;
-        for (int outer = 0; outer < outerSize; outer++)
-            for (int inner = 0; inner < innerSize; inner++)
+        // Rows are independent, so they are sorted in chunks across threads (each chunk with its own scratch); every
+        // row's result is the same at any thread count.
+        int rows = outerSize * innerSize;
+        // Backing arrays with their offsets (a contiguous view can start inside its array); a non-addressable source
+        // is copied once.
+        var srcArr = input.GetCpuBackingForStridedRead(out int srcOff);
+        if (srcArr is null) { srcArr = input.ToArray(); srcOff = 0; }
+        var valArr = valuesOut.GetCpuBackingForContiguousWrite(out int valOff)
+            ?? throw new InvalidOperationException("TensorSort needs a host values buffer.");
+        var idxArr = indicesOut.GetCpuBackingForContiguousWrite(out int idxOff)
+            ?? throw new InvalidOperationException("TensorSort needs a host indices buffer.");
+        int dop = CpuParallelSettings.MaxDegreeOfParallelism;
+        long work = (long)rows * axisSize;
+        int chunks = dop <= 1 || work < 64 * 1024 ? 1 : (int)Math.Min(rows, 4L * dop);
+        int perChunk = (rows + chunks - 1) / chunks;
+        bool keyed = typeof(T) == typeof(float) || typeof(T) == typeof(double);
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, work * 16, chunk =>
+        {
+            var order = new int[axisSize];
+            var keys = keyed ? new ulong[axisSize] : null;
+            var column = keyed ? null : new T[axisSize];
+            int r1 = Math.Min(rows, (chunk + 1) * perChunk);
+            for (int row = chunk * perChunk; row < r1; row++)
             {
+                int outer = row / innerSize, inner = row % innerSize;
                 int baseIdx = outer * axisSize * innerSize + inner;
                 for (int a = 0; a < axisSize; a++) order[a] = a;
                 if (keys is not null)
                 {
-                    for (int a = 0; a < axisSize; a++) keys[a] = TorchSortKey(src[baseIdx + a * innerSize], descending);
+                    for (int a = 0; a < axisSize; a++) keys[a] = TorchSortKey(srcArr[srcOff + baseIdx + a * innerSize], descending);
                     SortStableByKey(keys, order);
                 }
                 else
                 {
-                    for (int a = 0; a < axisSize; a++) column![a] = src[baseIdx + a * innerSize];
+                    for (int a = 0; a < axisSize; a++) column![a] = srcArr[srcOff + baseIdx + a * innerSize];
                     var values = column!;
                     Array.Sort(order, (x, y) => TorchSortCompare(numOps, values[x], values[y], x, y, descending));
                 }
                 for (int a = 0; a < axisSize; a++)
                 {
                     int pos = baseIdx + a * innerSize;
-                    valDst[pos] = src[baseIdx + order[a] * innerSize];
-                    idxDst[pos] = order[a];
+                    valArr[valOff + pos] = srcArr[srcOff + baseIdx + order[a] * innerSize];
+                    idxArr[idxOff + pos] = order[a];
                 }
             }
+        }, deterministicSafe: true);
         return (valuesOut, indicesOut);
     }
 

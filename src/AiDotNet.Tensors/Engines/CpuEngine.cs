@@ -21176,7 +21176,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     double srcH = ((gy + 1) * height - 1) / 2.0;
                     double srcW = ((gx + 1) * width - 1) / 2.0;
                     // Written so a NaN coordinate fails it too (#1134): such a point sampled nothing forward.
-                    if (!(srcH > -1 && srcH < height && srcW > -1 && srcW < width)) continue;
+                    if (!(srcH >= -1 && srcH < height && srcW >= -1 && srcW < width)) continue;
 
                     int h0 = (int)Math.Floor(srcH), h1 = h0 + 1;
                     int w0 = (int)Math.Floor(srcW), w1 = w0 + 1;

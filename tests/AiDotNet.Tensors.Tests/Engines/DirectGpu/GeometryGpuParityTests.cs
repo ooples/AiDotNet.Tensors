@@ -144,15 +144,26 @@ public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFix
     {
         SkipIfUnavailable();
         var input = new Tensor<float>(Enumerable.Range(1, 24).Select(v => (float)v).ToArray(), new[] { 1, 2, 3, 4 });
-        var (grid, _) = NonFiniteSortAndGridSampleTests.MixedGrid();
+        var (grid, bad) = NonFiniteSortAndGridSampleTests.MixedGrid();
         var (go, gdx, gdg) = NonFiniteSortAndGridSampleTests.BilinearWithGradients(Gpu, input, grid);
         var (co, cdx, cdg) = NonFiniteSortAndGridSampleTests.BilinearWithGradients(_cpu, input, grid);
         foreach (var (name, gv, cv) in new[] { ("output", go, co), ("dInput", gdx, cdx), ("dGrid", gdg, cdg) })
         {
             Assert.Equal(cv.Length, gv.Length);
             for (int i = 0; i < cv.Length; i++)
+            {
+                // A NaN on either side fails here (a bare tolerance test would pass it: NaN > x is false).
+                Assert.False(float.IsNaN(gv[i]) || float.IsInfinity(gv[i]), $"{name}[{i}]: gpu {gv[i]} is not finite");
+                Assert.False(float.IsNaN(cv[i]) || float.IsInfinity(cv[i]), $"{name}[{i}]: cpu {cv[i]} is not finite");
                 Assert.True(Math.Abs(gv[i] - cv[i]) <= Tolerance * (1 + Math.Abs(cv[i])), $"{name}[{i}]: gpu {gv[i]} cpu {cv[i]}");
+            }
         }
+        for (int i = 0; i < bad.Length; i++)
+            if (bad[i])
+            {
+                Assert.Equal(0f, gdg[2 * i]);
+                Assert.Equal(0f, gdg[2 * i + 1]);
+            }
     }
 
     [SkippableFact]

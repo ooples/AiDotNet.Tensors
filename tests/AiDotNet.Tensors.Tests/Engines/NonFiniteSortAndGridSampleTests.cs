@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -79,6 +80,51 @@ public class NonFiniteSortAndGridSampleTests
     {
         CheckSort(v => (double)v, v => (float)v, 5, 23, 1, descending);
         CheckSort(v => (double)v, v => (float)v, 2, 11, 3, descending);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sort_RowsSplitAcrossThreads_SameAtAnyDop(bool descending)
+    {
+        // Rows are sorted in chunks across threads above 64K elements: every DOP gives the serial result, and rows still
+        // follow torch's order (inner axis, and a middle axis whose rows are strided).
+        foreach (var shape in new[] { new[] { 64, 4096 }, new[] { 3, 4096, 6 } })
+        {
+            var x = new Tensor<float>(RandomRows(shape.Length * 13 + (descending ? 1 : 0), shape.Aggregate(1, (p, q) => p * q)), shape);
+            int previous = CpuParallelSettings.MaxDegreeOfParallelism;
+            (Tensor<float> V, Tensor<int> I) serial, parallel;
+            try
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = 1;
+                serial = _cpu.TensorSort(x, 1, descending);
+                CpuParallelSettings.MaxDegreeOfParallelism = 16;
+                parallel = _cpu.TensorSort(x, 1, descending);
+            }
+            finally { CpuParallelSettings.MaxDegreeOfParallelism = previous; }
+            Assert.Equal(serial.I.ToArray(), parallel.I.ToArray());
+            int inner = shape.Length == 3 ? shape[2] : 1, axis = shape[1];
+            foreach (int row in new[] { 0, shape[0] - 1 })
+            {
+                var values = new float[axis];
+                for (int a = 0; a < axis; a++) values[a] = x[(row * axis + a) * inner];
+                var expected = TorchOrder(values, descending);
+                for (int a = 0; a < axis; a++) Assert.Equal(expected[a], parallel.I[(row * axis + a) * inner]);
+            }
+        }
+    }
+
+    [Fact]
+    public void Sort_OfAnOffsetView_ReadsTheViewNotTheStorageStart()
+    {
+        // Rows 3..6 of a larger tensor: a contiguous view that starts inside its backing array.
+        var whole = new Tensor<float>(RandomRows(77, 10 * 50), new[] { 10, 50 });
+        var view = _cpu.TensorNarrow(whole, 0, 3, 4);
+        var copy = new Tensor<float>(view.ToArray(), new[] { 4, 50 });
+        var (vv, vi) = _cpu.TensorSort(view, -1, false);
+        var (cv, ci) = _cpu.TensorSort(copy, -1, false);
+        Assert.Equal(ci.ToArray(), vi.ToArray());
+        Assert.Equal(cv.ToArray().Select(v => BitConverter.DoubleToInt64Bits(v)), vv.ToArray().Select(v => BitConverter.DoubleToInt64Bits(v)));
     }
 
     [Theory]
