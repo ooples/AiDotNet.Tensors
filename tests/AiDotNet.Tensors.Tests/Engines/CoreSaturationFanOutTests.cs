@@ -113,6 +113,8 @@ public class CoreSaturationFanOutTests
 
     [Theory]
     [InlineData("transpose2d")]
+    [InlineData("transposeThin")]     // [6144, 32] -> [32, 6144]: one row of 32 x 32 tiles, split over inner tiles
+    [InlineData("transposeRagged")]   // neither extent a multiple of the tile
     [InlineData("permute021")]
     [InlineData("permute102")]
     [InlineData("narrowed")]
@@ -124,6 +126,8 @@ public class CoreSaturationFanOutTests
             return kind switch
             {
                 "transpose2d" => engine.TensorPermute(Filled<float>(7, 520, 300), new[] { 1, 0 }),
+                "transposeThin" => engine.TensorPermute(Filled<float>(7, 6144, 32), new[] { 1, 0 }),
+                "transposeRagged" => engine.TensorPermute(Filled<float>(7, 70, 3001), new[] { 1, 0 }),
                 "permute021" => engine.TensorPermute(Filled<float>(7, 8, 120, 90), new[] { 0, 2, 1 }),
                 "permute102" => engine.TensorPermute(Filled<float>(7, 120, 8, 90), new[] { 1, 0, 2 }),
                 _ => engine.TensorNarrow(Filled<float>(7, 8, 140, 96), 1, 10, 100),

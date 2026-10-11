@@ -2737,10 +2737,18 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // both the strided reads and the contiguous writes stay within a few cache lines per tile.
             int outer = dims[1], outerStep = steps[1];
             int oTiles = (outer + TransposeTile - 1) / TransposeTile, iTiles = (inner + TransposeTile - 1) / TransposeTile;
-            CpuParallelSettings.ParallelForOrSerial(0, oTiles, total, ot =>
+            // Work units are (outer tile row, group of inner tiles), about four per thread: splitting over the outer
+            // tiles alone left a [32, 6144] view one unit and a [256, 8192] view eight.
+            int wanted = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism * 4);
+            int iGroups = Math.Max(1, Math.Min(iTiles, (wanted + oTiles - 1) / oTiles));
+            int tilesPerGroup = (iTiles + iGroups - 1) / iGroups;
+            iGroups = (iTiles + tilesPerGroup - 1) / tilesPerGroup;
+            CpuParallelSettings.ParallelForOrSerial(0, oTiles * iGroups, total, unit =>
             {
+                int ot = unit / iGroups, ig = unit % iGroups;
                 int o0 = ot * TransposeTile, o1 = Math.Min(outer, o0 + TransposeTile);
-                for (int it = 0; it < iTiles; it++)
+                int itEnd = Math.Min(iTiles, (ig + 1) * tilesPerGroup);
+                for (int it = ig * tilesPerGroup; it < itEnd; it++)
                 {
                     int i0 = it * TransposeTile, i1 = Math.Min(inner, i0 + TransposeTile);
                     for (int o = o0; o < o1; o++)
