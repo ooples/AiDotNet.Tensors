@@ -315,6 +315,30 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             ParityLaunch(k, n);
         }
 
+        void ITorchParityElementwiseBackend.TorchParityInt64Binary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, int typeCode,
+            IGpuBuffer flag)
+        {
+            if (n <= 0) return;
+            ParityRequire(a, 2L * n, nameof(a), "2n (int64 words)");
+            ParityRequire(b, 2L * n, nameof(b), "2n (int64 words)");
+            ParityRequire(output, 2L * n, nameof(output), "2n (int64 words)");
+            ParityRequire(flag, 2, nameof(flag), "2 (64-bit flag)");
+            var k = ParityKernel("parity_int64_binary");
+            k.SetArg(0, BufHandle(a)); k.SetArg(1, BufHandle(b)); k.SetArg(2, BufHandle(output)); k.SetArg(3, n); k.SetArg(4, op);
+            k.SetArg(5, typeCode); k.SetArg(6, BufHandle(flag));
+            ParityLaunch(k, n);
+        }
+
+        void ITorchParityElementwiseBackend.TorchParityInt64Not(IGpuBuffer input, IGpuBuffer output, int n, int typeCode)
+        {
+            if (n <= 0) return;
+            ParityRequire(input, 2L * n, nameof(input), "2n (int64 words)");
+            ParityRequire(output, 2L * n, nameof(output), "2n (int64 words)");
+            var k = ParityKernel("parity_int64_not");
+            k.SetArg(0, BufHandle(input)); k.SetArg(1, BufHandle(output)); k.SetArg(2, n); k.SetArg(3, typeCode);
+            ParityLaunch(k, n);
+        }
+
         void ITorchParityElementwiseBackend.TorchParityInclusiveScan(IGpuBuffer input, IGpuBuffer output, int n)
         {
             if (n <= 0) return;

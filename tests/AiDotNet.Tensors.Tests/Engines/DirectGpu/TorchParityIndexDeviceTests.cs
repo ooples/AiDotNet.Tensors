@@ -15,17 +15,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// torch's: NaN after +inf ascending and first descending, ties by original index, and padding never leaking into a
 /// row whose length is not a power of two.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class TorchParityIndexDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public abstract class TorchParityIndexDeviceTestsBase
 {
-    private readonly DirectGpuTensorEngineTestFixture _fixture;
-    public TorchParityIndexDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+    private readonly IDirectGpuTensorEngineFixture _fixture;
+    protected TorchParityIndexDeviceTestsBase(IDirectGpuTensorEngineFixture fixture) => _fixture = fixture;
 
     private DirectGpuTensorEngine GpuOrSkip()
     {
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels (CUDA, OpenCL and Vulkan do).");
+        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels.");
         return gpu;
     }
 
@@ -138,6 +137,31 @@ public class TorchParityIndexDeviceTests : IClassFixture<DirectGpuTensorEngineTe
         return t;
     }
 
+    // #1131: the CPU sort now uses the same total order as the device sort, so values and indices agree exactly
+    // (NaN, +-inf, +-0 and ties included), on the innermost axis and on a middle axis.
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Sort_CpuAndGpuAgree(bool descending)
+    {
+        var gpu = GpuOrSkip();
+        var cpu = new CpuEngine();
+        foreach (var shape in new[] { new[] { 5, 19 }, new[] { 3, 17, 4 } })
+        {
+            var x = new Tensor<float>(shape);
+            var rng = new Random(23 + shape.Length);
+            float[] pool = { float.NaN, float.PositiveInfinity, float.NegativeInfinity, 2f, 2f, -1f, 0f, -0f, 0.5f };
+            for (int i = 0; i < x.Length; i++) x[i] = pool[rng.Next(pool.Length)];
+            var (gv, gi) = gpu.TensorSort(x, 1, descending);
+            var (cv, ci) = cpu.TensorSort(x, 1, descending);
+            for (int i = 0; i < x.Length; i++)
+            {
+                Assert.True(ci[i] == gi[i], $"shape [{string.Join(",", shape)}] {(descending ? "desc" : "asc")} element {i}: cpu index {ci[i]}, gpu index {gi[i]}");
+                Assert.Equal(BitConverter.ToInt32(BitConverter.GetBytes(cv[i]), 0), BitConverter.ToInt32(BitConverter.GetBytes(gv[i]), 0));
+            }
+        }
+    }
+
     // torch.sort order on rows of non-power-of-two length: NaN after +inf ascending, first descending; equal values in
     // original order; every index a real position (padding never leaks into the output).
     [SkippableTheory]
@@ -169,4 +193,18 @@ public class TorchParityIndexDeviceTests : IClassFixture<DirectGpuTensorEngineTe
             }
         }
     }
+}
+
+/// <summary>The cases above on the machine's default DirectGpu backend.</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityIndexDeviceTests : TorchParityIndexDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    public TorchParityIndexDeviceTests(DirectGpuTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+/// <summary>The cases above on the Vulkan backend (#1127).</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityIndexVulkanDeviceTests : TorchParityIndexDeviceTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
+{
+    public TorchParityIndexVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }

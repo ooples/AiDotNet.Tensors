@@ -1,1225 +1,865 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// GLSL (Vulkan) port of the PyTorch-parity elementwise kernels (#1127), kernel for kernel with
-// CUDA/Kernels/CudaTorchParityElementwiseKernels and OpenCL/OpenClTorchParityElementwiseKernels.
+// Vulkan device kernels for the PyTorch-parity elementwise ops (#1127), the peers of
+// CUDA/Kernels/CudaTorchParityElementwiseKernels.
 //
-// GLSL has double arithmetic, sqrt, fma, floor and frexp / ldexp, but no double exp, log or trigonometry, and its float
-// transcendentals carry loose error bounds (sin only to an absolute 2^-11 under SPIR-V's precision rules). The prelude
-// below therefore implements those functions in double -- range reduction plus series that converge to double
-// precision on the reduced interval -- and the special functions are ports of SpecialFunctions on top of them, so the
-// results agree with the CPU's double reference to float rounding. Needs shaderFloat64 and shaderInt64; the kernels
-// that report invalid arguments also need 64-bit buffer atomics. A device without a feature fails that pipeline and
-// the op keeps its recorded host fallback.
-using System.Text.RegularExpressions;
+// Each kernel mirrors the CPU reference lambda (CpuEngine.TorchMisc / TorchSpecial): the same branches, evaluated in
+// double through VulkanTorchParityMath and rounded once to float. NaN is tested by bit pattern, and Math.Max / Math.Min
+// clamps propagate a NaN from the input or either bound, while fmax / fmin ignore it.
+//
+// The bodies below are written with bare floating-point literals and passed through VulkanTorchParityMath.Doubles,
+// which marks them all as doubles: do not mix float arithmetic into a double kernel.
+using System;
+using System.Collections.Concurrent;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-/// <summary>GLSL compute shaders for the PyTorch-parity elementwise ops (one shader per kernel).</summary>
+/// <summary>GLSL compute shaders for the Vulkan PyTorch-parity elementwise kernels.</summary>
 internal static class VulkanTorchParityElementwiseKernels
 {
-    /// <summary>Work-group size of every kernel, including the block scan.</summary>
-    internal const int LocalSize = 256;
+    /// <summary>Elements per work group of every kernel here except the scan.</summary>
+    public const int LocalSize = 256;
 
-    private static readonly System.TimeSpan RegexTimeout = System.TimeSpan.FromSeconds(1);
+    /// <summary>Elements per work group (and per shared-memory block) of the inclusive scan.</summary>
+    public const int ScanBlock = 256;
 
-    // An unsuffixed floating literal in GLSL is a float; every one in the prelude and kernel bodies below is meant as
-    // a double, so they are suffixed lf when a shader is assembled (a literal already carrying f or lf is left alone).
-    private static readonly Regex FloatingLiteral = new Regex(
-        @"(?<![\w.])(\d+\.\d*(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)(?![\w.])", RegexOptions.CultureInvariant, RegexTimeout);
+    private static readonly ConcurrentDictionary<string, string> Sources = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
-    private static string AsDoubleLiterals(string source) => FloatingLiteral.Replace(source, m => m.Value + "lf");
+    private static string Cached(string key, Func<string> build) => Sources.GetOrAdd(key, _ => build());
 
-    private const string Header = @"#version 450
-#extension GL_ARB_gpu_shader_int64 : require
+    /// <summary>Every shader of this kernel set, by name: what a test compiles to prove the sources are valid GLSL.</summary>
+    public static System.Collections.Generic.IEnumerable<(string Name, string Source)> All()
+    {
+        foreach (TorchParityUnaryOp op in Enum.GetValues(typeof(TorchParityUnaryOp))) yield return ("unary." + op, Unary(op));
+        foreach (TorchParityBinaryOp op in Enum.GetValues(typeof(TorchParityBinaryOp))) yield return ("binary." + op, Binary(op));
+        yield return ("polynomial", Polynomial);
+        yield return ("range", Range);
+        yield return ("logspace", Logspace);
+        yield return ("window", Window);
+        yield return ("tri_indices", TriIndices);
+        yield return ("diagflat", Diagflat);
+        yield return ("diagonal_scatter", DiagonalScatter);
+        yield return ("quantile_rows", QuantileRows);
+        yield return ("flag_reset", FlagReset);
+        yield return ("flag_merge", FlagMerge);
+        yield return ("sample", Sample);
+        yield return ("bernoulli", Bernoulli);
+        yield return ("poisson", Poisson);
+        yield return ("binomial", Binomial);
+        yield return ("multinomial.replacement", Multinomial(true));
+        yield return ("multinomial", Multinomial(false));
+        yield return ("dropout_affine.alpha", DropoutAffine(true));
+        yield return ("dropout_affine", DropoutAffine(false));
+        yield return ("rrelu", Rrelu);
+        yield return ("random_keys", RandomKeys);
+        yield return ("nonzero_static_scatter", NonzeroStaticScatter);
+        yield return ("unravel_axis", UnravelAxis);
+        yield return ("slice_bitonic_step", SliceBitonicStep);
+        yield return ("slice_first_flags", SliceFirstFlags);
+        yield return ("slice_gather_unique", SliceGatherUnique);
+        yield return ("scan_block", ScanBlockSource);
+        yield return ("scan_add", ScanAdd);
+        yield return ("int_binary", IntBinary);
+        yield return ("int_not", IntNot);
+        yield return ("grid_sample_3d", GridSample3D);
+        yield return ("grid_sample_3d_backward", GridSample3DBackward);
+    }
+
+    private const string Int64Extension = "#extension GL_ARB_gpu_shader_int64 : require\n";
+
+    private static string Head(bool int64, int localSize = LocalSize)
+        => "#version 450\n" + (int64 ? Int64Extension : "") + "layout(local_size_x = " + localSize + ") in;\n";
+
+    // A kernel that computes in double: header, declarations, the double library, then the body.
+    private static string DoubleShader(string declarations, string body, bool special, bool int64 = false)
+        => Head(int64) + declarations + VulkanTorchParityMath.Tables + VulkanTorchParityMath.ElementaryFunctions
+            + Conversions + (special ? VulkanTorchParityMath.SpecialFunctionsSource : "") + VulkanTorchParityMath.Doubles(body);
+
+    // Buffer values cross between float and double by bit pattern: D widens exactly and F rounds to nearest even,
+    // both including the subnormal floats a GPU's own conversions flush to zero (logit of 6e-39 must not be -inf).
+    private const string Conversions = @"
+double D(float f) { return d_from_float_bits(floatBitsToUint(f)); }
+float F(double d) { return uintBitsToFloat(d_to_float_bits(d)); }
+float F(int v) { return float(v); }
+// A positive weight, subnormal included (NaN and infinity are rejected before this is asked).
+bool f_positive(float f) { uint u = floatBitsToUint(f); return u != 0u && u <= 0x7F800000u; }
 ";
 
-    private const string AtomicsHeader = @"#extension GL_EXT_shader_atomic_int64 : require
+    // A kernel in float / integer arithmetic only: runs on devices without shaderFloat64.
+    private static string FloatShader(string declarations, string body, bool int64 = false, int localSize = LocalSize)
+        => Head(int64, localSize) + declarations + FloatHelpers + body;
+
+    private const string FloatHelpers = @"
+bool f_isnan(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) > 0x7F800000u; }
+bool f_isinf(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) == 0x7F800000u; }
+float f_nan() { return uintBitsToFloat(0x7FC00000u); }
 ";
 
     /// <summary>
-    /// Assembles one kernel: header, buffer bindings, the push-constant block (instance <c>pc</c>), the double prelude
-    /// and the body (which defines <c>main</c>).
+    /// y = <paramref name="expression"/> of the double x, over doubles stored as two words each: how the tests measure
+    /// the double library against .NET, one function at a time.
     /// </summary>
-    private static string Kernel(string bindings, string pushConstants, string body, bool atomics = false)
-        => Header + (atomics ? AtomicsHeader : string.Empty)
-           + "layout(local_size_x = " + LocalSize.ToString(System.Globalization.CultureInfo.InvariantCulture) + ") in;\n"
-           + bindings
-           + "layout(push_constant) uniform P { " + pushConstants + " } pc;\n"
-           + Prelude.Value + AsDoubleLiterals(body);
+    public static string DoubleProbe(string expression, bool special) => Cached("probe:" + special + ":" + expression, () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) writeonly buffer O { uint o[]; };
+layout(push_constant) uniform P { uint n; };
+", @"
+void main()
+{
+" + Index + @"
+    double x = packDouble2x32(uvec2(a[2u * i], a[2u * i + 1u]));
+    double y = " + expression + @";
+    uvec2 bits = unpackDouble2x32(y);
+    o[2u * i] = bits.x;
+    o[2u * i + 1u] = bits.y;
+}
+", special));
 
-    private static readonly System.Lazy<string> Prelude = new System.Lazy<string>(() => AsDoubleLiterals(GaussLegendreTables() + LibmSource + SpecialSource));
+    private const string UnaryBuffers = @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; float p0; float p1; };
+";
 
-    // The CPU quadratures' Gauss-Legendre rules (96 nodes on [0, pi], 32 per unit tail panel) as const arrays, written
-    // at round-trip precision (AsDoubleLiterals makes them doubles).
-    private static string GaussLegendreTables()
+    private const string BinaryBuffers = @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; };
+";
+
+    private const string Index = "    uint i = gl_GlobalInvocationID.x;\n    if (i >= n) return;\n";
+
+    // ------------------------------------------------------------------------------------------------------------
+    // Unary and binary elementwise ops
+    // ------------------------------------------------------------------------------------------------------------
+
+    /// <summary>True when <paramref name="op"/>'s kernel computes in double (and so needs shaderFloat64).</summary>
+    public static bool NeedsDoubles(TorchParityUnaryOp op) => op switch
     {
-        var sb = new System.Text.StringBuilder();
-        foreach (int n in new[] { 96, 32 })
+        TorchParityUnaryOp.Hardtanh or TorchParityUnaryOp.Softsign or TorchParityUnaryOp.Signbit or TorchParityUnaryOp.IsPosInf
+            or TorchParityUnaryOp.IsNegInf or TorchParityUnaryOp.Angle or TorchParityUnaryOp.NonZero => false,
+        _ => true,
+    };
+
+    /// <summary>True when <paramref name="op"/>'s kernel computes in double (and so needs shaderFloat64).</summary>
+    public static bool NeedsDoubles(TorchParityBinaryOp op)
+        => op is TorchParityBinaryOp.Igamma or TorchParityBinaryOp.Igammac or TorchParityBinaryOp.FloorDivide;
+
+    public static string Unary(TorchParityUnaryOp op) => Cached("unary:" + op, () =>
+    {
+        if (!NeedsDoubles(op))
         {
-            var (x, w) = AiDotNet.Tensors.Helpers.SpecialFunctions.GaussLegendreRule(n);
-            string count = n.ToString(System.Globalization.CultureInfo.InvariantCulture);
-            sb.Append("const double PARITY_GL").Append(count).Append("_X[").Append(count).Append("] = double[").Append(count).Append("](").Append(Join(x)).Append(");\n");
-            sb.Append("const double PARITY_GL").Append(count).Append("_W[").Append(count).Append("] = double[").Append(count).Append("](").Append(Join(w)).Append(");\n");
+            string f = op switch
+            {
+                // Math.Min(Math.Max(x, lo), hi), a NaN from x or either bound propagating.
+                TorchParityUnaryOp.Hardtanh => "(f_isnan(v) || f_isnan(p0) || f_isnan(p1)) ? f_nan() : ((v < p0 ? p0 : v) > p1 ? p1 : (v < p0 ? p0 : v))",
+                TorchParityUnaryOp.Softsign => "v / (1.0 + abs(v))",
+                TorchParityUnaryOp.Signbit => "(floatBitsToUint(v) >> 31) != 0u ? 1.0 : 0.0",
+                TorchParityUnaryOp.IsPosInf => "floatBitsToUint(v) == 0x7F800000u ? 1.0 : 0.0",
+                TorchParityUnaryOp.IsNegInf => "floatBitsToUint(v) == 0xFF800000u ? 1.0 : 0.0",
+                // angle of a real: NaN stays NaN, negatives (including -inf) give pi, everything else (including -0) 0.
+                TorchParityUnaryOp.Angle => "f_isnan(v) ? v : (v < 0.0 ? 3.14159274101257324 : 0.0)",
+                // all / any indicator: 1 where non-zero (NaN counts), else 0.
+                _ => "(floatBitsToUint(v) & 0x7FFFFFFFu) != 0u ? 1.0 : 0.0",
+            };
+            return FloatShader(UnaryBuffers, "void main()\n{\n" + Index + "    float v = a[i];\n    o[i] = " + f + ";\n}\n");
         }
-        return sb.ToString();
-    }
 
-    // "R" can print an exponent-only form (1E-05); give every value a decimal point so AsDoubleLiterals sees it.
-    private static string Join(double[] values)
-        => string.Join(", ", System.Linq.Enumerable.Select(values, v =>
+        string d = op switch
         {
-            string s = v.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-            if (s.IndexOf('E') >= 0 && s.IndexOf('.') < 0) s = s.Replace("E", ".0E");
-            else if (s.IndexOf('.') < 0) s += ".0";
-            return s;
-        }));
-
-    private const string LibmSource = @"
-// ---- double libm ----
-#define PARITY_PI 3.141592653589793
-#define PARITY_SQRT_PI 1.7724538509055160273
-#define PARITY_SQRT2 1.4142135623730950488
-#define PARITY_EXP_UNDERFLOW 745.0
-#define PARITY_LARGE_ARGUMENT 50.0
-
-double d_nan() { return packDouble2x32(uvec2(0u, 0x7FF80000u)); }
-double d_inf() { return packDouble2x32(uvec2(0u, 0x7FF00000u)); }
-float f_nan() { return uintBitsToFloat(0x7FC00000u); }
-bool d_signbit(double x) { return (unpackDouble2x32(x).y >> 31) != 0u; }
-
-// Float bits to double, keeping subnormals: a plain float load may flush them to zero (AMD does), which turned
-// logit / ndtri of a tiny input into -inf.
-double f_in(uint bits)
+            TorchParityUnaryOp.Celu => "v > 0.0 ? v : D(p0) * (d_exp(v / D(p0)) - 1.0)",
+            // min(x, 0) - log(1 + exp(-|x|)), as the CPU writes it.
+            TorchParityUnaryOp.LogSigmoid => "d_isnan(v) ? v : (v < 0.0 ? v : 0.0) - d_log(1.0 + d_exp(-abs(v)))",
+            TorchParityUnaryOp.Logit => "parity_logit(v, D(p0), D(p1))",
+            TorchParityUnaryOp.Sinc => "v == 0.0 ? 1.0 : (d_isinf(v) ? 0.0 : sf_sin_pi(v) / (SF_PI * v))",
+            TorchParityUnaryOp.Erf => "sf_erf(v)",
+            TorchParityUnaryOp.BesselJ0 => "sf_bessel_j(0, v)",
+            TorchParityUnaryOp.BesselJ1 => "sf_bessel_j(1, v)",
+            TorchParityUnaryOp.BesselY0 => "sf_bessel_y(0, v)",
+            TorchParityUnaryOp.BesselY1 => "sf_bessel_y(1, v)",
+            TorchParityUnaryOp.ModifiedBesselI0 => "sf_bessel_i(0, v)",
+            TorchParityUnaryOp.ModifiedBesselI1 => "sf_bessel_i(1, v)",
+            TorchParityUnaryOp.Erfcx => "sf_erfcx(v)",
+            TorchParityUnaryOp.Ndtr => "sf_ndtr(v)",
+            TorchParityUnaryOp.Ndtri => "sf_ndtri(v)",
+            TorchParityUnaryOp.Entr => "d_isnan(v) ? v : (v > 0.0 ? -v * d_log(v) : (v == 0.0 ? 0.0 : -d_inf()))",
+            TorchParityUnaryOp.LogNdtr => "sf_log_ndtr(v)",
+            TorchParityUnaryOp.ModifiedBesselK0 => "sf_bessel_k(0.0, v)",
+            TorchParityUnaryOp.ModifiedBesselK1 => "sf_bessel_k(1.0, v)",
+            TorchParityUnaryOp.ScaledModifiedBesselK0 => "sf_bessel_k_scaled(0.0, v)",
+            TorchParityUnaryOp.ScaledModifiedBesselK1 => "sf_bessel_k_scaled(1.0, v)",
+            TorchParityUnaryOp.SphericalBesselJ0 => "sf_spherical_bessel_j0(v)",
+            TorchParityUnaryOp.AiryAi => "sf_airy_ai(v)",
+            TorchParityUnaryOp.Mvlgamma => "parity_mvlgamma(v, int(p0))",
+            _ => throw new ArgumentOutOfRangeException(nameof(op)),
+        };
+        const string helpers = @"
+// c = Math.Min(Math.Max(x, lo), hi) (lo / hi are -inf / +inf without eps), a NaN from x or a bound propagating;
+// then log(c / (1 - c)).
+double parity_logit(double v, double lo, double hi)
 {
-    if (((bits >> 23) & 0xFFu) != 0u) return double(uintBitsToFloat(bits));
-    double magnitude = double(bits & 0x7FFFFFu) * 1.401298464324817e-45;   // m * 2^-149, exact
-    return (bits >> 31) != 0u ? -magnitude : magnitude;
+    if (d_isnan(v) || d_isnan(lo) || d_isnan(hi)) return d_nan();
+    double c = v < lo ? lo : v;
+    c = c > hi ? hi : c;
+    return d_log(c / (1.0 - c));
 }
 
-// Double to float bits, rounding to nearest even into the subnormal range instead of flushing it to zero.
-uint f_out(double v)
+// mvlgamma (p >= 1): NaN at or below (p - 1) / 2, else p (p - 1) / 4 log(pi) + sum_j lgamma(x - j / 2).
+double parity_mvlgamma(double v, int p)
 {
-    if (isnan(v)) return 0x7FC00000u;
-    uint sign = d_signbit(v) ? 0x80000000u : 0u;
-    double a = abs(v);
-    // Below the smallest normal float: the mantissa is a * 2^149 rounded (2^23 is exactly the smallest normal's bits).
-    if (a < 1.1754943508222875e-38) return sign | uint(roundEven(a * 7.1362384635297994e44));
-    return floatBitsToUint(float(v));
-}
-
-// e^x: x = k ln2 + r, |r| <= ln2 / 2, Taylor to r^16 (error below 1e-17 relative), then ldexp.
-double d_exp(double x)
-{
-    if (isnan(x)) return x;
-    if (x > 709.782712893384) return d_inf();
-    if (x < -745.1332191019412) return 0.0;
-    double k = roundEven(x * 1.4426950408889634);
-    double r = (x - k * 0.6931471803691238) - k * 1.9082149292705877e-10;
-    double term = 1.0, sum = 1.0;
-    for (int i = 1; i <= 16; i++) { term *= r / double(i); sum += term; }
-    int ki = int(k);
-    // ldexp in two steps keeps the scale finite near the subnormal end.
-    if (ki < -1000) return ldexp(ldexp(sum, ki + 1000), -1000);
-    return ldexp(sum, ki);
-}
-
-// log x: x = m 2^e with m in [sqrt(1/2), sqrt(2)), log m = 2 atanh((m - 1) / (m + 1)) by its series.
-double d_log(double x)
-{
-    if (isnan(x) || x < 0.0) return d_nan();
-    if (x == 0.0) return -d_inf();
-    if (isinf(x)) return x;
-    int e;
-    double m = frexp(x, e);
-    if (m < 0.7071067811865476) { m *= 2.0; e -= 1; }
-    double f = (m - 1.0) / (m + 1.0), s = f * f, term = f, sum = f;
-    for (int i = 1; i <= 12; i++) { term *= s; sum += term / double(2 * i + 1); }
-    return double(e) * 0.6931471803691238 + (2.0 * sum + double(e) * 1.9082149292705877e-10);
-}
-
-// log(1 + y), accurate for small y (Goldberg's correction, as SpecialFunctions.Log1p).
-double d_log1p(double y) { double u = 1.0 + y; return u == 1.0 ? y : d_log(u) * y / (u - 1.0); }
-
-// sin / cos: x = n pi/2 + r (three-part Cody-Waite pi/2), Taylor on |r| <= pi/4. Past |x| ~ 1e9 the reduction loses
-// digits, but every caller then scales the result by a factor at most 1/|x|, so only boundedness matters there.
-void d_reduce(double x, out double r, out int quadrant)
-{
-    double n = roundEven(x * 0.6366197723675814);
-    r = ((x - n * 1.57079632673412561417) - n * 6.07710050630396597660e-11) - n * 2.02226624871116645580e-21;
-    // Past |x| ~ 1e15 no double reduction means anything; return a bounded value (callers scale it by at most 1/|x|).
-    // A reduced r a rounding step outside [-pi/4, pi/4] keeps its quadrant: the series are still exact there.
-    if (abs(n) > 1e15) { r = 0.0; n = 0.0; }
-    quadrant = int(mod(n, 4.0));
-}
-
-double d_sin_poly(double r)
-{
-    double r2 = r * r, term = r, sum = r;
-    for (int i = 1; i <= 9; i++) { term *= -r2 / double((2 * i) * (2 * i + 1)); sum += term; }
-    return sum;
-}
-
-double d_cos_poly(double r)
-{
-    double r2 = r * r, term = 1.0, sum = 1.0;
-    for (int i = 1; i <= 9; i++) { term *= -r2 / double((2 * i - 1) * (2 * i)); sum += term; }
-    return sum;
-}
-
-double d_sin(double x)
-{
-    if (isnan(x) || isinf(x)) return d_nan();
-    double r; int q;
-    d_reduce(x, r, q);
-    if (q == 0) return d_sin_poly(r);
-    if (q == 1) return d_cos_poly(r);
-    if (q == 2) return -d_sin_poly(r);
-    return -d_cos_poly(r);
-}
-
-double d_cos(double x)
-{
-    if (isnan(x) || isinf(x)) return d_nan();
-    double r; int q;
-    d_reduce(x, r, q);
-    if (q == 0) return d_cos_poly(r);
-    if (q == 1) return -d_sin_poly(r);
-    if (q == 2) return -d_cos_poly(r);
-    return d_sin_poly(r);
-}
-
-double d_tan(double x) { return d_sin(x) / d_cos(x); }
-double d_sinh(double x) { double e = d_exp(x); return 0.5 * (e - 1.0 / e); }
-double d_cosh(double x) { double e = d_exp(x); return 0.5 * (e + 1.0 / e); }
-
-// x^y for the generators (logspace): exp(y log |x|), with the sign of a negative base raised to an integer power.
-double d_pow(double x, double y)
-{
-    if (y == 0.0) return 1.0;
-    if (isnan(x) || isnan(y)) return d_nan();
-    if (x == 0.0) return y > 0.0 ? 0.0 : d_inf();
-    if (x < 0.0)
-    {
-        if (y != floor(y)) return d_nan();
-        double v = d_exp(y * d_log(-x));
-        return mod(abs(y), 2.0) == 1.0 ? -v : v;
-    }
-    return d_exp(y * d_log(x));
-}
-
-double d_fmod(double x, double y) { return x - y * trunc(x / y); }
-
-// log|Gamma(x)| (SpecialFunctions.LogGamma: Lanczos g = 7, reflection below 1/2, unrolled since GLSL forbids recursion).
-double d_lanczos_lgamma(double x)
-{
-    x -= 1.0;
-    double a = 0.99999999999980993, t = x + 7.5;
-    a += 676.5203681218851 / (x + 1.0);
-    a += -1259.1392167224028 / (x + 2.0);
-    a += 771.32342877765313 / (x + 3.0);
-    a += -176.61502916214059 / (x + 4.0);
-    a += 12.507343278686905 / (x + 5.0);
-    a += -0.13857109526572012 / (x + 6.0);
-    a += 9.9843695780195716e-6 / (x + 7.0);
-    a += 1.5056327351493116e-7 / (x + 8.0);
-    return 0.5 * d_log(2.0 * PARITY_PI) + (x + 0.5) * d_log(t) - t + d_log(a);
-}
-
-double d_lgamma(double x)
-{
-    if (isnan(x)) return x;
-    if (isinf(x)) return d_inf();
-    if (x <= 0.0 && floor(x) == x) return d_inf();
-    if (x < 0.5) return d_log(PARITY_PI / abs(d_sin(PARITY_PI * x))) - d_lanczos_lgamma(1.0 - x);
-    return d_lanczos_lgamma(x);
+    if (v <= double(p - 1) / 2.0) return d_nan();
+    return sf_mvlgamma(v, p);
 }
 ";
-    private const string SpecialSource = @"
-// ---- special functions: ports of Helpers/SpecialFunctions ----
+        return DoubleShader(UnaryBuffers, helpers + "void main()\n{\n" + Index + "    double v = D(a[i]);\n    o[i] = F(" + d + ");\n}\n",
+            special: true);
+    });
 
-double sf_erf_series(double x)
-{
-    double x2 = x * x, term = x, sum = x;
-    for (int k = 1; k < 200; k++)
+    public static string Binary(TorchParityBinaryOp op) => Cached("binary:" + op, () =>
     {
-        term *= -x2 / double(k);
-        double add = term / double(2 * k + 1);
-        sum += add;
-        if (abs(add) < 1e-17 * abs(sum)) break;
-    }
-    return 2.0 / PARITY_SQRT_PI * sum;
-}
+        if (!NeedsDoubles(op))
+        {
+            string f = op switch
+            {
+                // NaN-ignoring max / min.
+                TorchParityBinaryOp.Fmax => "f_isnan(x) ? y : (f_isnan(y) ? x : max(x, y))",
+                TorchParityBinaryOp.Fmin => "f_isnan(x) ? y : (f_isnan(y) ? x : min(x, y))",
+                TorchParityBinaryOp.Heaviside => "f_isnan(x) ? x : (x < 0.0 ? 0.0 : (x > 0.0 ? 1.0 : y))",
+                // A comparison with NaN is false, as in .NET.
+                TorchParityBinaryOp.GreaterEqual => "(!f_isnan(x) && !f_isnan(y) && x >= y) ? 1.0 : 0.0",
+                _ => "(!f_isnan(x) && !f_isnan(y) && x <= y) ? 1.0 : 0.0",
+            };
+            return FloatShader(BinaryBuffers, "void main()\n{\n" + Index + "    float x = a[i], y = b[i];\n    o[i] = " + f + ";\n}\n");
+        }
 
-double sf_erfc_continued_fraction(double x)
+        string d = op switch
+        {
+            TorchParityBinaryOp.Igamma => "sf_igamma(x, y)",
+            TorchParityBinaryOp.Igammac => "sf_igammac(x, y)",
+            // floor(a / b) in double, as the CPU's Math.Floor(x / y).
+            _ => "floor(x / y)",
+        };
+        return DoubleShader(BinaryBuffers,
+            "void main()\n{\n" + Index + "    double x = D(a[i]), y = D(b[i]);\n    o[i] = F(" + d + ");\n}\n",
+            special: op != TorchParityBinaryOp.FloorDivide);
+    });
+
+    /// <summary>
+    /// Orthogonal polynomials: the CPU recurrence in double. Degree: NaN gives NaN; truncated toward zero; negative gives
+    /// 0 (checked before a NaN x, as on the CPU). The host keeps infinite / &gt; 2^20 degrees on the CPU path.
+    /// </summary>
+    public static string Polynomial => Cached("polynomial", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Deg { float degree[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; int kind; int shifted; };
+", @"
+void main()
 {
-    const double tiny = 1e-300;
-    double f = x, c = x, d = 0.0;
-    for (int k = 1; k < 500; k++)
-    {
-        double a = double(k) / 2.0;
-        d = x + a * d;
-        d = abs(d) < tiny ? tiny : d;
-        c = x + a / c;
-        c = abs(c) < tiny ? tiny : c;
-        d = 1.0 / d;
-        double delta = c * d;
-        f *= delta;
-        if (abs(delta - 1.0) < 1e-16) break;
-    }
-    return 1.0 / f;
+" + Index + @"
+    double d = D(degree[i]);
+    if (d_isnan(d)) { o[i] = F(d_nan()); return; }
+    double t = d_trunc(d);
+    if (t < 0.0) { o[i] = 0.0f; return; }
+    if (t > 1048576.0) { o[i] = F(d_nan()); return; }
+    double v = D(x[i]);
+    if (d_isnan(v)) { o[i] = F(d_nan()); return; }
+    if (shifted != 0) v = 2.0 * v - 1.0;
+    o[i] = F(sf_polynomial(kind, v, int(t)));
 }
+", special: true));
 
-double sf_erfc_large(double x) { return d_exp(-x * x) * sf_erfc_continued_fraction(x) / PARITY_SQRT_PI; }
+    // ------------------------------------------------------------------------------------------------------------
+    // Generators: the CPU's FromDoubles lambdas in double, same operation order, rounded once to float.
+    // A double parameter arrives as two push-constant words (low, high).
+    // ------------------------------------------------------------------------------------------------------------
 
-double sf_erfc_mid(double x)
+    private const string Unpack = "double U(uint lo, uint hi) { return packDouble2x32(uvec2(lo, hi)); }\n";
+
+    /// <summary>arange / range / linspace-style points: start + i * span / denominator.</summary>
+    public static string Range => Cached("range", () => DoubleShader(@"
+layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; };
+", Unpack + @"
+void main()
 {
-    double mid = 0.5 * (x + 2.5), halfWidth = 0.5 * (2.5 - x), sum = 0.0;
-    for (int k = 0; k < 32; k++) { double t = mid + halfWidth * PARITY_GL32_X[k]; sum += PARITY_GL32_W[k] * d_exp(-t * t); }
-    return sf_erfc_large(2.5) + 2.0 / PARITY_SQRT_PI * sum * halfWidth;
+" + Index + @"
+    precise double scaled = double(i) * U(spanLo, spanHi);
+    precise double v = U(startLo, startHi) + scaled / U(denLo, denHi);
+    o[i] = F(v);
 }
+", special: false));
 
-double sf_erfc(double x)
+    /// <summary>logspace: base ^ (single ? start : start + i * span / denominator).</summary>
+    public static string Logspace => Cached("logspace", () => DoubleShader(@"
+layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; uint baseLo; uint baseHi; uint single; };
+", Unpack + @"
+void main()
 {
-    if (isnan(x)) return x;
-    if (isinf(x)) return x > 0.0 ? 0.0 : 2.0;
-    if (x >= 2.5) return sf_erfc_large(x);
-    if (x >= 0.5) return sf_erfc_mid(x);
-    if (x <= -0.5) { double ax = -x; return 2.0 - (ax >= 2.5 ? sf_erfc_large(ax) : sf_erfc_mid(ax)); }
-    return 1.0 - sf_erf_series(x);
+" + Index + @"
+    precise double scaled = double(i) * U(spanLo, spanHi);
+    precise double e = single != 0u ? U(startLo, startHi) : U(startLo, startHi) + scaled / U(denLo, denHi);
+    o[i] = F(d_pow(U(baseLo, baseHi), e));
 }
+", special: false));
 
-double sf_erf(double x)
+    /// <summary>Windows over t = i / (m - 1): 0 Hann, 1 Hamming(alpha, beta), 2 Blackman, 3 Bartlett, 4 Kaiser(beta = alpha).</summary>
+    public static string Window => Cached("window", () => DoubleShader(@"
+layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; int kind; int m; uint alphaLo; uint alphaHi; uint betaLo; uint betaHi; };
+", Unpack + @"
+void main()
 {
-    if (isnan(x)) return x;
-    if (isinf(x)) return x > 0.0 ? 1.0 : -1.0;
-    if (abs(x) < 0.5) return sf_erf_series(x);
-    double tail = sf_erfc(abs(x));
-    return x > 0.0 ? 1.0 - tail : tail - 1.0;
-}
-
-double sf_erfcx(double x)
-{
-    if (isnan(x)) return x;
-    if (isinf(x) && x > 0.0) return 0.0;
-    if (x >= 2.5) return sf_erfc_continued_fraction(x) / PARITY_SQRT_PI;
-    if (x >= 0.5) return d_exp(x * x) * sf_erfc_mid(x);
-    if (x > -0.5) return d_exp(x * x) * (1.0 - sf_erf_series(x));
-    if (x < -26.7) return d_inf();
-    double ax = -x, positive = ax >= 2.5 ? sf_erfc_continued_fraction(ax) / PARITY_SQRT_PI : d_exp(ax * ax) * sf_erfc_mid(ax);
-    return 2.0 * d_exp(x * x) - positive;
-}
-
-double sf_ndtr(double x) { return 0.5 * sf_erfc(-x / PARITY_SQRT2); }
-
-double sf_log_ndtr(double x)
-{
-    if (isnan(x)) return x;
-    if (isinf(x) && x < 0.0) return -d_inf();
-    if (x > 0.0) return d_log1p(-sf_ndtr(-x));
-    if (x > -1.0) return d_log(sf_ndtr(x));
-    return d_log(0.5 * sf_erfcx(-x / PARITY_SQRT2)) - 0.5 * x * x;
-}
-
-double sf_ndtri(double p)
-{
-    if (isnan(p) || p < 0.0 || p > 1.0) return d_nan();
-    if (p == 0.0) return -d_inf();
-    if (p == 1.0) return d_inf();
-    const double a0 = -3.969683028665376e+01, a1 = 2.209460984245205e+02, a2 = -2.759285104469687e+02,
-        a3 = 1.383577518672690e+02, a4 = -3.066479806614716e+01, a5 = 2.506628277459239e+00;
-    const double b0 = -5.447609879822406e+01, b1 = 1.615858368580409e+02, b2 = -1.556989798598866e+02,
-        b3 = 6.680131188771972e+01, b4 = -1.328068155288572e+01;
-    const double c0 = -7.784894002430293e-03, c1 = -3.223964580411365e-01, c2 = -2.400758277161838e+00,
-        c3 = -2.549732539343734e+00, c4 = 4.374664141464968e+00, c5 = 2.938163982698783e+00;
-    const double d0 = 7.784695709041462e-03, d1 = 3.224671290700398e-01, d2 = 2.445134137142996e+00, d3 = 3.754408661907416e+00;
-    double x;
-    if (p < 0.02425)
-    {
-        double q = sqrt(-2.0 * d_log(p));
-        x = (((((c0 * q + c1) * q + c2) * q + c3) * q + c4) * q + c5) / ((((d0 * q + d1) * q + d2) * q + d3) * q + 1.0);
-    }
-    else if (p > 1.0 - 0.02425)
-    {
-        double q = sqrt(-2.0 * d_log(1.0 - p));
-        x = -(((((c0 * q + c1) * q + c2) * q + c3) * q + c4) * q + c5) / ((((d0 * q + d1) * q + d2) * q + d3) * q + 1.0);
-    }
+" + Index + @"
+    if (n == 1u) { o[i] = 1.0f; return; }
+    double alpha = U(alphaLo, alphaHi), beta = U(betaLo, betaHi);
+    double t = double(i) / double(m - 1), v;
+    if (kind == 0) v = 0.5 - 0.5 * d_cos(2.0 * SF_PI * t);
+    else if (kind == 1) v = alpha - beta * d_cos(2.0 * SF_PI * t);
+    else if (kind == 2) v = 0.42 - 0.5 * d_cos(2.0 * SF_PI * t) + 0.08 * d_cos(4.0 * SF_PI * t);
+    else if (kind == 3) v = 1.0 - abs(2.0 * t - 1.0);
     else
     {
-        double q = p - 0.5, r = q * q;
-        x = (((((a0 * r + a1) * r + a2) * r + a3) * r + a4) * r + a5) * q / (((((b0 * r + b1) * r + b2) * r + b3) * r + b4) * r + 1.0);
+        double r = 2.0 * t - 1.0;
+        v = sf_bessel_i(0, alpha * sqrt(max(0.0, 1.0 - r * r))) / sf_bessel_i(0, alpha);
     }
-    for (int k = 0; k < 2; k++)
-    {
-        double e = sf_ndtr(x) - p;
-        double u = e * sqrt(2.0 * PARITY_PI) * d_exp(x * x / 2.0);
-        x -= u / (1.0 + x * u / 2.0);
-    }
-    return x;
+    o[i] = F(v);
 }
+", special: true));
 
-double sf_bessel_series(int order, double x, bool alternating)
-{
-    double halfX = x / 2.0, term = 1.0;
-    for (int k = 1; k <= order; k++) term *= halfX / double(k);
-    double sum = term, q = halfX * halfX * (alternating ? -1.0 : 1.0);
-    for (int k = 1; k < 60; k++)
-    {
-        term *= q / (double(k) * double(k + order));
-        sum += term;
-        if (abs(term) <= 1e-17 * abs(sum)) break;
-    }
-    return sum;
-}
-
-double sf_modified_bessel_asymptotic(double mu, double x, bool alternating)
-{
-    double term = 1.0, sum = 1.0, last = 1.7976931348623157e308;
-    for (int k = 1; k < 200; k++)
-    {
-        term *= (mu - (2.0 * double(k) - 1.0) * (2.0 * double(k) - 1.0)) / (8.0 * double(k) * x) * (alternating ? -1.0 : 1.0);
-        if (abs(term) > last) break;
-        last = abs(term);
-        sum += term;
-        if (abs(term) < 1e-17 * abs(sum)) break;
-    }
-    return sum;
-}
-
-// Hankel's asymptotic expansion: J (which = 0) or Y (which = 1) for x > 25.
-double sf_hankel_asymptotic(int order, double x, int which)
-{
-    double mu = 4.0 * double(order * order), p = 1.0, q = 0.0, term = 1.0, lastP = 1.7976931348623157e308;
-    for (int k = 1; k < 60; k++)
-    {
-        term *= (mu - double((2 * k - 1) * (2 * k - 1))) / (double(k) * 8.0 * x);
-        if (abs(term) > lastP) break;
-        lastP = abs(term);
-        if (k % 2 == 1) q += ((k / 2) % 2 == 0 ? 1.0 : -1.0) * term;
-        else p += ((k / 2) % 2 == 0 ? 1.0 : -1.0) * term;
-        if (abs(term) < 1e-17) break;
-    }
-    double phi = (double(order) / 2.0 + 0.25) * PARITY_PI, s = sqrt(2.0 / (PARITY_PI * x));
-    double cx = d_cos(x), sx = d_sin(x), cp = d_cos(phi), sp = d_sin(phi);
-    double cosChi = cx * cp + sx * sp, sinChi = sx * cp - cx * sp;
-    return which == 0 ? s * (p * cosChi - q * sinChi) : s * (p * sinChi + q * cosChi);
-}
-
-double sf_bessel_j(int order, double x)
-{
-    if (isnan(x)) return x;
-    double ax = abs(x);
-    if (isinf(ax)) return 0.0;
-    if (ax < 2.0) return sf_bessel_series(order, x, true);
-    if (ax > 25.0) return (order % 2 == 1 && x < 0.0 ? -1.0 : 1.0) * sf_hankel_asymptotic(order, ax, 0);
-    int points = 2 * int(ceil(ax)) + 48;
-    double sum = 0.0;
-    for (int k = 0; k < points; k++)
-    {
-        double tau = 2.0 * PARITY_PI * double(k) / double(points);
-        sum += d_cos(double(order) * tau - x * d_sin(tau));
-    }
-    return sum / double(points);
-}
-
-double sf_bessel_y(int order, double x)
-{
-    if (isnan(x) || x < 0.0) return d_nan();
-    if (x == 0.0) return -d_inf();
-    if (isinf(x)) return 0.0;
-    if (x > 25.0) return sf_hankel_asymptotic(order, x, 1);
-    double first = 0.0;
-    for (int k = 0; k < 96; k++)
-    {
-        double tau = 0.5 * PARITY_PI + 0.5 * PARITY_PI * PARITY_GL96_X[k];
-        first += PARITY_GL96_W[k] * d_sin(x * d_sin(tau) - double(order) * tau);
-    }
-    first *= 0.5 * PARITY_PI;
-    double sign = order % 2 == 0 ? 1.0 : -1.0, second = 0.0;
-    for (int panel = 0; panel < 2000; panel++)
-    {
-        if (x * d_sinh(double(panel)) - double(order * panel) > PARITY_EXP_UNDERFLOW) break;
-        double part = 0.0;
-        for (int k = 0; k < 32; k++)
-        {
-            double t = double(panel) + 0.5 + 0.5 * PARITY_GL32_X[k];
-            part += PARITY_GL32_W[k] * (d_exp(double(order) * t) + sign * d_exp(-double(order) * t)) * d_exp(-x * d_sinh(t));
-        }
-        second += 0.5 * part;
-    }
-    return (first - second) / PARITY_PI;
-}
-
-double sf_bessel_i_scaled(int order, double x)
-{
-    if (isnan(x)) return x;
-    double ax = abs(x), sign = order % 2 == 1 && x < 0.0 ? -1.0 : 1.0;
-    if (ax < 2.0) return sign * d_exp(-ax) * sf_bessel_series(order, ax, false);
-    if (ax > PARITY_LARGE_ARGUMENT) return sign * sf_modified_bessel_asymptotic(4.0 * double(order * order), ax, true) / sqrt(2.0 * PARITY_PI * ax);
-    int points = 40 + int(ceil(sqrt(80.0 * ax)));
-    double sum = 0.0;
-    for (int k = 0; k < points; k++)
-    {
-        double tau = 2.0 * PARITY_PI * double(k) / double(points);
-        sum += d_exp(ax * (d_cos(tau) - 1.0)) * d_cos(double(order) * tau);
-    }
-    return sign * sum / double(points);
-}
-
-double sf_bessel_i(int order, double x)
-{
-    if (isinf(x)) return order % 2 == 1 && x < 0.0 ? -d_inf() : d_inf();
-    return sf_bessel_i_scaled(order, x) * d_exp(abs(x));
-}
-
-double sf_bessel_k_scaled(double nu, double x)
-{
-    if (isnan(x) || x < 0.0) return d_nan();
-    if (x == 0.0) return d_inf();
-    if (x > PARITY_LARGE_ARGUMENT) return sqrt(PARITY_PI / (2.0 * x)) * sf_modified_bessel_asymptotic(4.0 * nu * nu, x, false);
-    const double h = 0.02;
-    double sum = 0.5;
-    for (int k = 1; k < 100000; k++)
-    {
-        double t = double(k) * h;
-        double ct = d_cosh(t) - 1.0;
-        if (x * ct - abs(nu) * t > PARITY_EXP_UNDERFLOW) break;
-        sum += d_exp(-x * ct) * d_cosh(nu * t);
-    }
-    return sum * h;
-}
-
-double sf_bessel_k(double nu, double x) { return (isinf(x) && x > 0.0) ? 0.0 : sf_bessel_k_scaled(nu, x) * d_exp(-x); }
-
-double sf_bessel_j_fractional(double nu, double x)
-{
-    double first = 0.0;
-    for (int k = 0; k < 96; k++)
-    {
-        double tau = 0.5 * PARITY_PI + 0.5 * PARITY_PI * PARITY_GL96_X[k];
-        first += PARITY_GL96_W[k] * d_cos(nu * tau - x * d_sin(tau));
-    }
-    first *= 0.5 * PARITY_PI;
-    double second = 0.0;
-    for (int panel = 0; panel < 2000; panel++)
-    {
-        if (x * d_sinh(double(panel)) + nu * double(panel) > PARITY_EXP_UNDERFLOW) break;
-        double part = 0.0;
-        for (int k = 0; k < 32; k++)
-        {
-            double t = double(panel) + 0.5 + 0.5 * PARITY_GL32_X[k];
-            part += PARITY_GL32_W[k] * d_exp(-x * d_sinh(t) - nu * t);
-        }
-        second += 0.5 * part;
-    }
-    return (first - d_sin(nu * PARITY_PI) * second) / PARITY_PI;
-}
-
-void sf_two_product(double a, double b, out double p, out double e) { p = a * b; e = fma(a, b, -p); }
-
-void sf_zeta_double_double(double z, out double hi, out double lo)
-{
-    double root = sqrt(z), sq, sqErr;
-    sf_two_product(root, root, sq, sqErr);
-    double rootLo = ((z - sq) - sqErr) / (2.0 * root);
-    double m, mErr;
-    sf_two_product(z, root, m, mErr);
-    double mLo = mErr + z * rootLo;
-    const double twoThirds = 2.0 / 3.0;
-    double three, threeErr;
-    sf_two_product(3.0, twoThirds, three, threeErr);
-    double twoThirdsLo = ((2.0 - three) - threeErr) / 3.0;
-    double p, pErr;
-    sf_two_product(m, twoThirds, p, pErr);
-    double pLo = pErr + m * twoThirdsLo + mLo * twoThirds;
-    hi = p + pLo;
-    lo = pLo - (hi - p);
-}
-
-double sf_airy_ai(double x)
-{
-    if (isnan(x)) return x;
-    if (isinf(x)) return 0.0;
-    if (x >= -5.0 && x <= 1.0)
-    {
-        double x3 = x * x * x, f = 1.0, g = x, tf = 1.0, tg = x;
-        for (int k = 1; k < 200; k++)
-        {
-            double kk = double(k);
-            tf *= x3 / ((3.0 * kk - 1.0) * (3.0 * kk));
-            tg *= x3 / ((3.0 * kk) * (3.0 * kk + 1.0));
-            f += tf;
-            g += tg;
-            if (abs(tf) + abs(tg) < 1e-18 * (abs(f) + abs(g))) break;
-        }
-        return 0.355028053887817239 * f - 0.258819403792806798 * g;
-    }
-    double z = abs(x), zeta = 2.0 / 3.0 * z * sqrt(z);
-    if (x > 0.0) return sqrt(x / 3.0) / PARITY_PI * sf_bessel_k(1.0 / 3.0, zeta);
-    if (z <= 15.0) return sqrt(z) / 3.0 * (sf_bessel_j_fractional(1.0 / 3.0, zeta) + sf_bessel_j_fractional(-1.0 / 3.0, zeta));
-    double u = 1.0, even = 1.0, odd = 0.0, power = 1.0, last = 1.7976931348623157e308;
-    for (int k = 1; k < 60; k++)
-    {
-        double kk = double(k);
-        u *= (6.0 * kk - 5.0) * (6.0 * kk - 3.0) * (6.0 * kk - 1.0) / ((2.0 * kk - 1.0) * 216.0 * kk);
-        power /= zeta;
-        double term = u * power;
-        if (term > last) break;
-        last = term;
-        int pair = k / 2;
-        double s = (pair % 2 == 0 ? 1.0 : -1.0) * term;
-        if (k % 2 == 0) even += s; else odd += s;
-        if (term < 1e-17) break;
-    }
-    double hi, lo;
-    sf_zeta_double_double(z, hi, lo);
-    double sh = d_sin(hi), ch = d_cos(hi), sl = d_sin(lo + PARITY_PI / 4.0), cl = d_cos(lo + PARITY_PI / 4.0);
-    double sinPhase = sh * cl + ch * sl, cosPhase = ch * cl - sh * sl;
-    return (sinPhase * even - cosPhase * odd) / (sqrt(PARITY_PI) * sqrt(sqrt(z)));
-}
-
-double sf_igamma_series(double a, double x)
-{
-    double ap = a, sum = 1.0 / a, inc = sum;
-    for (int k = 0; k < 1000; k++)
-    {
-        ap += 1.0;
-        inc *= x / ap;
-        sum += inc;
-        if (abs(inc) < abs(sum) * 1e-16) break;
-    }
-    return sum * d_exp(-x + a * d_log(x) - d_lgamma(a));
-}
-
-double sf_igamma_continued_fraction(double a, double x)
-{
-    const double tiny = 1e-300;
-    double b = x + 1.0 - a, c = 1.0 / tiny, d = 1.0 / b, h = d;
-    for (int k = 1; k < 1000; k++)
-    {
-        double an = -double(k) * (double(k) - a);
-        b += 2.0;
-        d = an * d + b;
-        if (abs(d) < tiny) d = tiny;
-        c = b + an / c;
-        if (abs(c) < tiny) c = tiny;
-        d = 1.0 / d;
-        double ratio = d * c;
-        h *= ratio;
-        if (abs(ratio - 1.0) < 1e-16) break;
-    }
-    return d_exp(-x + a * d_log(x) - d_lgamma(a)) * h;
-}
-
-double sf_sinpi(double x)
-{
-    if (isnan(x) || isinf(x)) return d_nan();
-    double r = x - 2.0 * roundEven(x * 0.5);
-    double a = abs(r);
-    if (a == 0.0 || a == 1.0) return 0.0;
-    if (a > 0.5) a = 1.0 - a;
-    return (r < 0.0 ? -1.0 : 1.0) * d_sin(PARITY_PI * a);
-}
-
-double sf_clamp_nan(double v, double lo, double hi) { return (isnan(v) || isnan(lo) || isnan(hi)) ? d_nan() : (v < lo ? lo : (v > hi ? hi : v)); }
-
-// unpackDouble2x32 order: the low word first.
-double pc_double(uvec2 bits) { return packDouble2x32(bits); }
-";
-    private const string UnaryBindings = @"
-layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
-layout(std430, set = 0, binding = 1) writeonly buffer Y { float y[]; };
-";
-
-    // The special functions read and write raw float bits so subnormal inputs and results survive (see f_in / f_out).
-    private const string UnaryBitsBindings = @"
-layout(std430, set = 0, binding = 0) readonly buffer X { uint xbits[]; };
-layout(std430, set = 0, binding = 1) writeonly buffer Y { uint ybits[]; };
-";
-
-    private const string BinaryBindings = @"
-layout(std430, set = 0, binding = 0) readonly buffer A { float a[]; };
-layout(std430, set = 0, binding = 1) readonly buffer B { float b[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer Y { float y[]; };
-";
-
-    private const string OutputBinding = @"
-layout(std430, set = 0, binding = 0) writeonly buffer Y { float y[]; };
-";
-
-    private const string Index = "int i = int(gl_GlobalInvocationID.x); if (i >= pc.n) return;\n";
-
-    // The unary kernels: y[i] = (expr)(v = x[i], a0 = p0, a1 = p1), evaluated in double.
-    private static readonly System.Collections.Generic.Dictionary<string, string> UnaryExpressions =
-        new System.Collections.Generic.Dictionary<string, string>
-        {
-            ["parity_celu"] = "v > 0.0 ? v : a0 * (d_exp(v / a0) - 1.0)",
-            ["parity_hardtanh"] = "sf_clamp_nan(v, a0, a1)",
-            ["parity_logsigmoid"] = "isnan(v) ? v : (v < 0.0 ? v : 0.0) - d_log1p(d_exp(-abs(v)))",
-            ["parity_softsign"] = "v / (1.0 + abs(v))",
-            ["parity_logit"] = "d_log(sf_clamp_nan(v, a0, a1) / (1.0 - sf_clamp_nan(v, a0, a1)))",
-            ["parity_sinc"] = "v == 0.0 ? 1.0 : (isinf(v) ? 0.0 : sf_sinpi(v) / (PARITY_PI * v))",
-            ["parity_erf"] = "sf_erf(v)",
-            ["parity_bessel_j0"] = "sf_bessel_j(0, v)",
-            ["parity_bessel_j1"] = "sf_bessel_j(1, v)",
-            ["parity_bessel_y0"] = "sf_bessel_y(0, v)",
-            ["parity_bessel_y1"] = "sf_bessel_y(1, v)",
-            ["parity_bessel_i0"] = "sf_bessel_i(0, v)",
-            ["parity_bessel_i1"] = "sf_bessel_i(1, v)",
-            ["parity_erfcx"] = "sf_erfcx(v)",
-            ["parity_ndtr"] = "sf_ndtr(v)",
-            ["parity_ndtri"] = "sf_ndtri(v)",
-            ["parity_entr"] = "isnan(v) ? v : (v > 0.0 ? -v * d_log(v) : (v == 0.0 ? 0.0 : -d_inf()))",
-            ["parity_signbit"] = "d_signbit(v) ? 1.0 : 0.0",
-            ["parity_isposinf"] = "(isinf(v) && v > 0.0) ? 1.0 : 0.0",
-            ["parity_isneginf"] = "(isinf(v) && v < 0.0) ? 1.0 : 0.0",
-            ["parity_log_ndtr"] = "sf_log_ndtr(v)",
-            ["parity_bessel_k0"] = "sf_bessel_k(0.0, v)",
-            ["parity_bessel_k1"] = "sf_bessel_k(1.0, v)",
-            ["parity_bessel_k0e"] = "sf_bessel_k_scaled(0.0, v)",
-            ["parity_bessel_k1e"] = "sf_bessel_k_scaled(1.0, v)",
-            ["parity_spherical_bessel_j0"] = "isnan(v) ? v : isinf(v) ? 0.0 : abs(v) < 1e-4 ? 1.0 - v * v / 6.0 : d_sin(v) / v",
-            ["parity_airy_ai"] = "sf_airy_ai(v)",
-            ["parity_angle"] = "isnan(v) ? v : (v < 0.0 ? PARITY_PI : 0.0)",
-            ["parity_nonzero"] = "v != 0.0 ? 1.0 : 0.0",
-        };
-
-    private static string UnaryKernel(string expression) => Kernel(UnaryBitsBindings, "int n; float p0; float p1;",
-        "void main() { " + Index + "double v = f_in(xbits[i]); double a0 = double(pc.p0); double a1 = double(pc.p1); ybits[i] = f_out(" + expression + "); }\n");
-
-    private static readonly string Mvlgamma = Kernel(UnaryBitsBindings, "int n; float p0; float p1;", @"
-void main()
-{
-    " + Index + @"
-    double v = f_in(xbits[i]);
-    int p = int(pc.p0);
-    if (v <= double(p - 1) / 2.0) { ybits[i] = 0x7FC00000u; return; }
-    double sum = double(p) * (double(p) - 1.0) / 4.0 * d_log(PARITY_PI);
-    for (int j = 0; j < p; j++) sum += d_lgamma(v - double(j) / 2.0);
-    ybits[i] = f_out(sum);
-}
-");
-
-    private static string BinaryKernel(string body) => Kernel(BinaryBindings, "int n;", "void main() { " + Index + body + " }\n");
-
-    // fmax / fmin ignore a NaN operand; GLSL's max / min leave that undefined, so the choice is explicit.
-    private static readonly System.Collections.Generic.Dictionary<string, string> BinaryBodies =
-        new System.Collections.Generic.Dictionary<string, string>
-        {
-            ["parity_fmax"] = "float p = a[i], q = b[i]; y[i] = isnan(p) ? q : (isnan(q) ? p : max(p, q));",
-            ["parity_fmin"] = "float p = a[i], q = b[i]; y[i] = isnan(p) ? q : (isnan(q) ? p : min(p, q));",
-            ["parity_heaviside"] = "float t = a[i]; y[i] = isnan(t) ? t : (t < 0.0f ? 0.0f : (t > 0.0f ? 1.0f : b[i]));",
-            ["parity_greater_equal"] = "y[i] = a[i] >= b[i] ? 1.0f : 0.0f;",
-            ["parity_less_equal"] = "y[i] = a[i] <= b[i] ? 1.0f : 0.0f;",
-            ["parity_floor_divide"] = "y[i] = float(floor(double(a[i]) / double(b[i])));",
-            ["parity_igamma"] = @"double av = double(a[i]), v = double(b[i]), r;
-                if (isnan(av) || isnan(v) || av <= 0.0 || v < 0.0) r = d_nan();
-                else if (v == 0.0) r = 0.0;
-                else if (isinf(v)) r = 1.0;
-                else r = v < av + 1.0 ? sf_igamma_series(av, v) : 1.0 - sf_igamma_continued_fraction(av, v);
-                y[i] = float(r);",
-            ["parity_igammac"] = @"double av = double(a[i]), v = double(b[i]), r;
-                if (isnan(av) || isnan(v) || av <= 0.0 || v < 0.0) r = d_nan();
-                else if (v == 0.0) r = 1.0;
-                else if (isinf(v)) r = 0.0;
-                else r = v < av + 1.0 ? 1.0 - sf_igamma_series(av, v) : sf_igamma_continued_fraction(av, v);
-                y[i] = float(r);",
-        };
-
-    private static readonly string Polynomial = Kernel(BinaryBindings, "int n; int kind; int shifted;", @"
-void main()
-{
-    " + Index + @"
-    double d = double(b[i]);
-    if (isnan(d)) { y[i] = f_nan(); return; }
-    double t = trunc(d);
-    if (t < 0.0) { y[i] = 0.0f; return; }
-    if (t > 1048576.0) { y[i] = f_nan(); return; }
-    int deg = int(t);
-    double v = double(a[i]);
-    if (isnan(v)) { y[i] = f_nan(); return; }
-    if (pc.shifted != 0) v = 2.0 * v - 1.0;
-    double previous = 1.0, current;
-    switch (pc.kind)
-    {
-        case 0: current = v; break;
-        case 1: current = 2.0 * v; break;
-        case 2: current = 2.0 * v - 1.0; break;
-        case 3: current = 2.0 * v + 1.0; break;
-        case 4: current = 2.0 * v; break;
-        case 5: current = v; break;
-        case 6: current = 1.0 - v; break;
-        default: current = v; break;
-    }
-    if (deg == 0) { y[i] = 1.0f; return; }
-    for (int k = 1; k < deg; k++)
-    {
-        double kk = double(k), next;
-        switch (pc.kind)
-        {
-            case 4: next = 2.0 * v * current - 2.0 * kk * previous; break;
-            case 5: next = v * current - kk * previous; break;
-            case 6: next = ((2.0 * kk + 1.0 - v) * current - kk * previous) / (kk + 1.0); break;
-            case 7: next = ((2.0 * kk + 1.0) * v * current - kk * previous) / (kk + 1.0); break;
-            default: next = 2.0 * v * current - previous; break;
-        }
-        previous = current;
-        current = next;
-    }
-    y[i] = float(current);
-}
-");
-    // ---- generators. Doubles and 64-bit values travel as lo / hi uint pairs, and every pair sits FIRST in its push block,
-    // at an 8-byte-aligned offset: AMD's compiler merges a pair into one aligned 64-bit load, so a pair at an odd word
-    // offset read the 8 bytes starting one word early. ----
-
-    private static readonly string Range = Kernel(OutputBinding, "uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; int n;", @"
-void main()
-{
-    " + Index + @"
-    double start = pc_double(uvec2(pc.startLo, pc.startHi)), span = pc_double(uvec2(pc.spanLo, pc.spanHi)), den = pc_double(uvec2(pc.denLo, pc.denHi));
-    y[i] = float(start + double(i) * span / den);
-}
-");
-
-    private static readonly string Logspace = Kernel(OutputBinding,
-        "uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; uint baseLo; uint baseHi; int n; int single;", @"
-void main()
-{
-    " + Index + @"
-    double start = pc_double(uvec2(pc.startLo, pc.startHi)), span = pc_double(uvec2(pc.spanLo, pc.spanHi)), den = pc_double(uvec2(pc.denLo, pc.denHi));
-    double base = pc_double(uvec2(pc.baseLo, pc.baseHi));
-    y[i] = float(d_pow(base, pc.single != 0 ? start : start + double(i) * span / den));
-}
-");
-
-    private static readonly string Window = Kernel(OutputBinding, "uint alphaLo; uint alphaHi; uint betaLo; uint betaHi; int n; int kind; int m;", @"
-void main()
-{
-    " + Index + @"
-    if (pc.n == 1) { y[i] = 1.0f; return; }
-    double alpha = pc_double(uvec2(pc.alphaLo, pc.alphaHi)), beta = pc_double(uvec2(pc.betaLo, pc.betaHi));
-    double t = double(i) / double(pc.m - 1), v;
-    switch (pc.kind)
-    {
-        case 0: v = 0.5 - 0.5 * d_cos(2.0 * PARITY_PI * t); break;
-        case 1: v = alpha - beta * d_cos(2.0 * PARITY_PI * t); break;
-        case 2: v = 0.42 - 0.5 * d_cos(2.0 * PARITY_PI * t) + 0.08 * d_cos(4.0 * PARITY_PI * t); break;
-        case 3: v = 1.0 - abs(2.0 * t - 1.0); break;
-        default:
-        {
-            double r = 2.0 * t - 1.0;
-            v = sf_bessel_i(0, alpha * sqrt(max(0.0, 1.0 - r * r))) / sf_bessel_i(0, alpha);
-            break;
-        }
-    }
-    y[i] = float(v);
-}
-");
-
-    private static readonly string TriIndices = Kernel(OutputBinding, "int row; int col; int offset; int lower; int total;", @"
+    /// <summary>
+    /// tril / triu indices as a [2, total] tensor (row indices, then column indices), one thread per row; each row's
+    /// output offset is the kept-count of the rows before it.
+    /// </summary>
+    public static string TriIndices => Cached("triIndices", () => FloatShader(@"
+layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { int row; int col; int offset; int lower; int total; };
+", @"
+// Columns kept in row r: lower keeps j - r <= offset, upper keeps j - r >= offset.
 void tri_columns(int r, out int lo, out int hi)
 {
-    int edge = r + pc.offset;
-    if (pc.lower != 0) { lo = 0; hi = min(edge, pc.col - 1); }
-    else { lo = max(edge, 0); hi = pc.col - 1; }
+    int edge = r + offset;
+    if (lower != 0) { lo = 0; hi = min(edge, col - 1); }
+    else { lo = max(edge, 0); hi = col - 1; }
 }
+
 void main()
 {
     int i = int(gl_GlobalInvocationID.x);
-    if (i >= pc.row) return;
+    if (i >= row) return;
     int lo, hi, at = 0;
-    for (int r = 0; r < i; r++) { tri_columns(r, lo, hi); if (hi >= lo) at += hi - lo + 1; }
+    for (int r = 0; r < i; r++)
+    {
+        tri_columns(r, lo, hi);
+        if (hi >= lo) at += hi - lo + 1;
+    }
     tri_columns(i, lo, hi);
-    for (int j = lo; j <= hi; j++, at++) { y[at] = float(i); y[pc.total + at] = float(j); }
+    for (int j = lo; j <= hi; j++, at++)
+    {
+        o[at] = float(i);
+        o[total + at] = float(j);
+    }
 }
-");
+"));
 
-    private static readonly string Diagflat = Kernel(UnaryBindings, "int total; int size; int offset; int n;", @"
+    // ------------------------------------------------------------------------------------------------------------
+    // Index, reduction-feeding and order-statistic ops
+    // ------------------------------------------------------------------------------------------------------------
+
+    /// <summary>diagflat: a size x size matrix with the n input values on diagonal `offset`, zeros elsewhere.</summary>
+    public static string Diagflat => Cached("diagflat", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { int total; int size; int offset; int n; };
+", @"
 void main()
 {
     int idx = int(gl_GlobalInvocationID.x);
-    if (idx >= pc.total) return;
-    int r = idx / pc.size, c = idx % pc.size;
-    int k = pc.offset >= 0 ? (c - r == pc.offset ? r : -1) : (r - c == -pc.offset ? c : -1);
-    y[idx] = (k >= 0 && k < pc.n) ? x[k] : 0.0f;
+    if (idx >= total) return;
+    int r = idx / size, c = idx % size;
+    int k = offset >= 0 ? (c - r == offset ? r : -1) : (r - c == -offset ? c : -1);
+    o[idx] = (k >= 0 && k < n) ? a[k] : 0.0;
 }
-");
+"));
 
-    // geometry: [0] other rank, [1..8] extents, [9..16] strides, [17..21] stride1, stride2, start1, start2, diagonal.
-    private static readonly string DiagonalScatter = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer S { float src[]; };
-layout(std430, set = 0, binding = 1) buffer Y { float y[]; };
-layout(std430, set = 0, binding = 2) readonly buffer G { int g[]; };
-", "int count;", @"
+    /// <summary>
+    /// diagonal_scatter: writes src (torch.diagonal's layout: the other axes in order, then the diagonal) into the copy of
+    /// the input already in the output.
+    /// </summary>
+    public static string DiagonalScatter => Cached("diagonalScatter", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer S { float src[]; };
+layout(set = 0, binding = 1) buffer O { float o[]; };
+layout(push_constant) uniform P { int count; int otherRank; int otherExtent[8]; int otherStride[8]; int stride1; int stride2; int start1; int start2; int diagonal; };
+", @"
 void main()
 {
     int idx = int(gl_GlobalInvocationID.x);
-    if (idx >= pc.count) return;
-    int diagonal = g[21];
-    int o = idx / diagonal, t = idx % diagonal;
-    int base = 0, rest = o;
-    for (int j = g[0] - 1; j >= 0; j--) { base += rest % g[1 + j] * g[9 + j]; rest /= g[1 + j]; }
-    y[base + (t + g[19]) * g[17] + (t + g[20]) * g[18]] = src[idx];
+    if (idx >= count) return;
+    int outer = idx / diagonal, t = idx % diagonal;
+    int base = 0, rest = outer;
+    for (int j = otherRank - 1; j >= 0; j--) { base += rest % otherExtent[j] * otherStride[j]; rest /= otherExtent[j]; }
+    o[base + (t + start1) * stride1 + (t + start2) * stride2] = src[idx];
 }
-");
+"));
 
-    private static readonly string QuantileRows = Kernel(UnaryBindings, "uint qLo; uint qHi; int rows; int rowLength; int mode; int ignoreNan;", @"
+    /// <summary>
+    /// quantile over sorted rows (ascending, NaN last). mode: 0 linear, 1 lower, 2 higher, 3 nearest (ties to even),
+    /// 4 midpoint. Without ignoreNan a row holding a NaN gives NaN; a row with no values gives NaN.
+    /// </summary>
+    public static string QuantileRows => Cached("quantileRows", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer S { float sorted[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { int rows; int length; uint qLo; uint qHi; int mode; int ignoreNan; };
+", Unpack + @"
+bool f_isnan(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) > 0x7F800000u; }
+
 void main()
 {
     int r = int(gl_GlobalInvocationID.x);
-    if (r >= pc.rows) return;
-    int baseIndex = r * pc.rowLength;
-    int lo = 0, hi = pc.rowLength;
-    while (lo < hi) { int mid = (lo + hi) >> 1; if (isnan(x[baseIndex + mid])) hi = mid; else lo = mid + 1; }
+    if (r >= rows) return;
+    int start = r * length;
+    int lo = 0, hi = length;   // the first NaN (NaN sorts last)
+    while (lo < hi) { int mid = (lo + hi) >> 1; if (f_isnan(sorted[start + mid])) hi = mid; else lo = mid + 1; }
     int count = lo;
-    if (count == 0 || (count < pc.rowLength && pc.ignoreNan == 0)) { y[r] = f_nan(); return; }
-    double position = pc_double(uvec2(pc.qLo, pc.qHi)) * double(count - 1);
+    if (count == 0 || (count < length && ignoreNan == 0)) { o[r] = F(d_nan()); return; }
+    double position = U(qLo, qHi) * double(count - 1);
     int below = int(floor(position)), above = int(ceil(position));
     double w = position - double(below);
-    switch (pc.mode)
-    {
-        case 1: above = below; w = 0.0; break;
-        case 2: below = above; w = 0.0; break;
-        case 3: below = int(roundEven(position)); above = below; w = 0.0; break;
-        case 4: w = below == above ? 0.0 : 0.5; break;
-        default: break;
-    }
-    y[r] = float((1.0 - w) * double(x[baseIndex + below]) + w * double(x[baseIndex + above]));
+    if (mode == 1) { above = below; w = 0.0; }
+    else if (mode == 2) { below = above; w = 0.0; }
+    else if (mode == 3) { below = int(d_rint(position)); above = below; w = 0.0; }
+    else if (mode == 4) { w = below == above ? 0.0 : 0.5; }
+    precise double v = (1.0 - w) * D(sorted[start + below]) + w * D(sorted[start + above]);
+    o[r] = F(v);
 }
-");
-    // ---- random sampling: counter-based Philox4x32-10, bit-identical to the CUDA and OpenCL streams ----
+", special: false));
 
-    private const string RandomSource = @"
-uint rng_key0, rng_key1, rng_draw;
-uint rng_element_lo, rng_element_hi;
+    // ------------------------------------------------------------------------------------------------------------
+    // Random sampling: the counter-based Philox4x32-10 generator of the CUDA kernels (same streams). Element i draws
+    // its k-th uniform from counter (i, k), so a seed gives the same tensor on every run and launch shape.
+    //
+    // Invalid per-element parameters do not produce values. CUDA lowers a 64-bit flag with a 64-bit atomicMin; GLSL has
+    // 32-bit atomics only, so a kernel lowers the offending element's index into a slot per (rank, code) of a small
+    // scratch buffer, and FlagMerge then folds the slots into the 64-bit flag ((rank << 58 | index) << 3 | code).
+    // ------------------------------------------------------------------------------------------------------------
 
-void rng_init(uint seedLo, uint seedHi, uint element) { rng_key0 = seedLo; rng_key1 = seedHi; rng_element_lo = element; rng_element_hi = 0u; rng_draw = 0u; }
+    private static string FlagSlots(int binding) => @"
+layout(set = 0, binding = " + binding + @") buffer FlagSlots { uint flagSlots[]; };
+void parity_flag(uint rank, uint element, uint code) { atomicMin(flagSlots[rank * 4u + code], element); }
+";
 
-double rng_uniform()
+    private const string Rng = @"
+struct ParityRng { uint key0; uint key1; uint element; uint draw; };
+
+ParityRng parity_rng(uint seedLo, uint seedHi, uint element)
 {
-    uint c0 = rng_element_lo, c1 = rng_element_hi, c2 = rng_draw, c3 = 0x5EEDu;
-    rng_draw += 1u;
-    uint k0 = rng_key0, k1 = rng_key1;
+    ParityRng r;
+    r.key0 = seedLo; r.key1 = seedHi; r.element = element; r.draw = 0u;
+    return r;
+}
+
+// A uniform double in [0, 1) with 53 random bits.
+double parity_uniform(inout ParityRng r)
+{
+    uvec4 c = uvec4(r.element, 0u, r.draw, 0x5EEDu);
+    r.draw += 1u;
+    uint k0 = r.key0, k1 = r.key1;
     for (int round = 0; round < 10; round++)
     {
-        uint hi0, lo0, hi1, lo1;
-        umulExtended(0xD2511F53u, c0, hi0, lo0);
-        umulExtended(0xCD9E8D57u, c2, hi1, lo1);
-        uint n0 = hi1 ^ c1 ^ k0, n2 = hi0 ^ c3 ^ k1;
-        c0 = n0; c1 = lo1; c2 = n2; c3 = lo0;
+        uint lo0, hi0, lo1, hi1;
+        umulExtended(0xD2511F53u, c.x, hi0, lo0);
+        umulExtended(0xCD9E8D57u, c.z, hi1, lo1);
+        c = uvec4(hi1 ^ c.y ^ k0, lo1, hi0 ^ c.w ^ k1, lo0);
         k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
     }
-    return (double(c0 >> 5) * 67108864.0 + double(c1 >> 6)) * (1.0 / 9007199254740992.0);
+    return (double(c.x >> 5) * 67108864.0 + double(c.y >> 6)) * (1.0 / 9007199254740992.0);
 }
 
-double rng_standard_normal()
+// Box-Muller, as the CPU's StandardNormal: sqrt(-2 log(1 - U1)) cos(2 pi U2).
+double parity_standard_normal(inout ParityRng r)
 {
-    double u1 = rng_uniform(), u2 = rng_uniform();
-    return sqrt(-2.0 * d_log(1.0 - u1)) * d_cos(2.0 * PARITY_PI * u2);
+    double u1 = parity_uniform(r), u2 = parity_uniform(r);
+    return sqrt(-2.0 * d_log(1.0 - u1)) * d_cos(2.0 * 3.141592653589793 * u2);
 }
 ";
 
-    // The 64-bit validation flag, lowered to (index << 3 | code) with atomicMin.
-    private const string FlagBinding = "layout(std430, set = 0, binding = {0}) buffer F {{ uint64_t flag; }};\n";
-
-    private static string Flag(int binding) => string.Format(System.Globalization.CultureInfo.InvariantCulture, FlagBinding, binding);
-
-    private const string FlagSource = @"
-void raise_flag(uint64_t element, int code) { atomicMin(flag, (element << 3) | uint64_t(code)); }
-";
-
-    private static string RandomKernel(string bindings, string pushConstants, string body, bool atomics = false)
-        => Kernel(bindings, pushConstants, RandomSource + (atomics ? FlagSource : string.Empty) + body, atomics);
-
-    private static readonly string FlagReset = Kernel(Flag(0), "int n;", "void main() { if (gl_GlobalInvocationID.x == 0u) flag = 0xFFFFFFFFFFFFFFFFul; }\n", atomics: true);
-
-    private static readonly string Sample = RandomKernel(OutputBinding,
-        "uint aLo; uint aHi; uint bLo; uint bHi; uint seedLo; uint seedHi; int n; int kind;", @"
+    /// <summary>Sets a 64-bit validation flag to "no error".</summary>
+    public static string FlagReset => Cached("flagReset", () => FloatShader(@"
+layout(set = 0, binding = 0) writeonly buffer F { uint flag[]; };
+layout(push_constant) uniform P { uint unused; };
+", @"
 void main()
 {
-    " + Index + @"
-    double a = pc_double(uvec2(pc.aLo, pc.aHi)), b = pc_double(uvec2(pc.bLo, pc.bHi));
-    rng_init(pc.seedLo, pc.seedHi, uint(i));
+    if (gl_GlobalInvocationID.x != 0u) return;
+    flag[0] = 0xFFFFFFFFu;
+    flag[1] = 0xFFFFFFFFu;
+}
+"));
+
+    /// <summary>Folds the scratch slots into the 64-bit flag (kept at its minimum) and clears them.</summary>
+    public static string FlagMerge => Cached("flagMerge", () => FloatShader(@"
+layout(set = 0, binding = 0) buffer S { uint slots[]; };
+layout(set = 0, binding = 1) buffer F { uint flag[]; };
+layout(push_constant) uniform P { uint unused; };
+", @"
+void main()
+{
+    if (gl_GlobalInvocationID.x != 0u) return;
+    uint bestLo = flag[0], bestHi = flag[1];
+    for (uint rank = 0u; rank < 2u; rank++)
+        for (uint code = 1u; code < 4u; code++)
+        {
+            uint element = slots[rank * 4u + code];
+            if (element == 0xFFFFFFFFu) continue;
+            slots[rank * 4u + code] = 0xFFFFFFFFu;
+            uint lo = (element << 3) | code, hi = (element >> 29) | (rank << 29);
+            if (hi < bestHi || (hi == bestHi && lo < bestLo)) { bestHi = hi; bestLo = lo; }
+        }
+    flag[0] = bestLo;
+    flag[1] = bestHi;
+}
+"));
+
+    /// <summary>
+    /// Shape-only distributions: 0 uniform(a = low, b = high), 1 cauchy(a = median, b = sigma), 2 exponential(a = rate),
+    /// 3 geometric(a = p), 4 log-normal(a = mean, b = std), 5 standard normal, 6 randint(a = low, b = span).
+    /// </summary>
+    public static string Sample => Cached("sample", () => DoubleShader(@"
+layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; int kind; uint aLo; uint aHi; uint bLo; uint bHi; uint seedLo; uint seedHi; };
+", Unpack + Rng + @"
+void main()
+{
+" + Index + @"
+    double a = U(aLo, aHi), b = U(bLo, bHi);
+    ParityRng r = parity_rng(seedLo, seedHi, i);
     double v;
-    switch (pc.kind)
-    {
-        case 0: v = a + (b - a) * rng_uniform(); break;
-        case 1: v = a + b * d_tan(PARITY_PI * (rng_uniform() - 0.5)); break;
-        case 2: v = -d_log(1.0 - rng_uniform()) / a; break;
-        case 3: v = a == 1.0 ? 1.0 : max(1.0, ceil(d_log(1.0 - rng_uniform()) / d_log1p(-a))); break;
-        case 4: v = d_exp(a + b * rng_standard_normal()); break;
-        case 5: v = rng_standard_normal(); break;
-        default: v = a + min(floor(rng_uniform() * b), b - 1.0); break;
-    }
-    y[i] = float(v);
+    if (kind == 0) v = a + (b - a) * parity_uniform(r);
+    else if (kind == 1) v = a + b * d_tan(3.141592653589793 * (parity_uniform(r) - 0.5));
+    else if (kind == 2) v = -d_log(1.0 - parity_uniform(r)) / a;
+    else if (kind == 3) v = a == 1.0 ? 1.0 : max(1.0, ceil(d_log(1.0 - parity_uniform(r)) / d_log1p(-a)));
+    else if (kind == 4) v = d_exp(a + b * parity_standard_normal(r));
+    else if (kind == 5) v = parity_standard_normal(r);
+    else v = a + min(floor(parity_uniform(r) * b), b - 1.0);
+    o[i] = F(v);
 }
-");
+", special: false));
 
-    private static readonly string Bernoulli = RandomKernel(UnaryBindings + Flag(2), "uint seedLo; uint seedHi; int n;", @"
+    /// <summary>Bernoulli: 1 with probability p; code 1 for p outside [0, 1] or NaN.</summary>
+    public static string Bernoulli => Cached("bernoulli", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer Pr { float p[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+" + FlagSlots(2) + @"
+layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+", Rng + @"
 void main()
 {
-    " + Index + @"
-    double q = double(x[i]);
-    if (!(q >= 0.0 && q <= 1.0)) { raise_flag(uint64_t(i), 1); return; }
-    rng_init(pc.seedLo, pc.seedHi, uint(i));
-    y[i] = rng_uniform() < q ? 1.0f : 0.0f;
+" + Index + @"
+    double q = D(p[i]);
+    if (d_isnan(q) || q < 0.0 || q > 1.0) { parity_flag(0u, i, 1u); return; }
+    ParityRng r = parity_rng(seedLo, seedHi, i);
+    o[i] = parity_uniform(r) < q ? 1.0f : 0.0f;
 }
-", atomics: true);
+", special: false));
 
-    private static readonly string Poisson = RandomKernel(UnaryBindings + Flag(2), "uint seedLo; uint seedHi; int n;", @"
+    /// <summary>Poisson: Knuth's product method below rate 10, Hormann's PTRS above; code 1 for a negative or NaN rate.</summary>
+    public static string Poisson => Cached("poisson", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer R { float rates[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+" + FlagSlots(2) + @"
+layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+", Rng + @"
 void main()
 {
-    " + Index + @"
-    double rate = double(x[i]);
-    if (!(rate >= 0.0)) { raise_flag(uint64_t(i), 1); return; }
-    if (rate == 0.0) { y[i] = 0.0f; return; }
-    rng_init(pc.seedLo, pc.seedHi, uint(i));
+" + Index + @"
+    double rate = D(rates[i]);
+    if (d_isnan(rate) || rate < 0.0) { parity_flag(0u, i, 1u); return; }
+    if (rate == 0.0) { o[i] = 0.0f; return; }
+    ParityRng r = parity_rng(seedLo, seedHi, i);
     if (rate < 10.0)
     {
-        double limit = d_exp(-rate), product = rng_uniform();
+        double limit = d_exp(-rate), product = parity_uniform(r);
         int k = 0;
-        while (product > limit) { k++; product *= rng_uniform(); }
-        y[i] = float(k);
+        while (product > limit) { k++; product *= parity_uniform(r); }
+        o[i] = F(k);
         return;
     }
     double slam = sqrt(rate), logLam = d_log(rate);
     double bb = 0.931 + 2.53 * slam, aa = -0.059 + 0.02483 * bb, invAlpha = 1.1239 + 1.1328 / (bb - 3.4), vr = 0.9277 - 3.6224 / (bb - 2.0);
     while (true)
     {
-        double u = rng_uniform() - 0.5, v = rng_uniform(), us = 0.5 - abs(u);
+        double u = parity_uniform(r) - 0.5, v = parity_uniform(r), us = 0.5 - abs(u);
         double k = floor((2.0 * aa / us + bb) * u + rate + 0.43);
-        if (us >= 0.07 && v <= vr) { y[i] = float(k); return; }
+        if (us >= 0.07 && v <= vr) { o[i] = F(k); return; }
         if (k < 0.0 || (us < 0.013 && v > us)) continue;
-        if (d_log(v) + d_log(invAlpha) - d_log(aa / (us * us) + bb) <= -rate + k * logLam - d_lgamma(k + 1.0)) { y[i] = float(k); return; }
+        if (d_log(v) + d_log(invAlpha) - d_log(aa / (us * us) + bb) <= -rate + k * logLam - sf_lgamma(k + 1.0)) { o[i] = F(k); return; }
     }
 }
-", atomics: true);
+", special: true));
 
-    private static readonly string Binomial = RandomKernel(BinaryBindings + Flag(3), "uint seedLo; uint seedHi; int n;", @"
-double stirling_tail(double k)
+    /// <summary>
+    /// Binomial: geometric waiting times while n min(p, 1-p) &lt; 10, Hormann's BTRS above (as the CPU and PyTorch).
+    /// Code 1: count not a whole number of trials within the long range; code 2: count &lt; 0, or p outside [0, 1] / NaN.
+    /// </summary>
+    public static string Binomial => Cached("binomial", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer C { float counts[]; };
+layout(set = 0, binding = 1) readonly buffer Pr { float probs[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
+" + FlagSlots(3) + @"
+layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+", Rng + @"
+double parity_stirling_tail(double k)
 {
-    const double table[10] = double[10](0.08106146679532726, 0.04134069595540929, 0.02767792568499834, 0.02079067210376509,
-        0.01664469118982119, 0.01387612882307075, 0.01189670994589177, 0.01041126526197209, 0.009255462182712733, 0.008330563433362871);
+    const double table[10] = double[10](
+        0.08106146679532726, 0.04134069595540929, 0.02767792568499834, 0.02079067210376509, 0.01664469118982119,
+        0.01387612882307075, 0.01189670994589177, 0.01041126526197209, 0.009255462182712733, 0.008330563433362871);
     if (k <= 9.0) return table[int(k)];
     double kp1sq = (k + 1.0) * (k + 1.0);
     return (1.0 / 12.0 - (1.0 / 360.0 - 1.0 / 1260.0 / kp1sq) / kp1sq) / (k + 1.0);
 }
+
 void main()
 {
-    " + Index + @"
-    double count = double(a[i]), p = double(b[i]);
-    if (isnan(count) || isinf(count) || count != floor(count) || count >= 9.2233720368547758E18) { raise_flag(uint64_t(i), 1); return; }
-    int64_t n = int64_t(count);
-    if (n < 0l || !(p >= 0.0 && p <= 1.0)) { raise_flag(uint64_t(i), 2); return; }
-    if (n == 0l || p == 0.0) { y[i] = 0.0f; return; }
-    if (p == 1.0) { y[i] = float(n); return; }
-    rng_init(pc.seedLo, pc.seedHi, uint(i));
+" + Index + @"
+    double count = D(counts[i]), p = D(probs[i]);
+    if (d_isnan(count) || d_isinf(count) || count != floor(count) || count >= 9.2233720368547758E18) { parity_flag(0u, i, 1u); return; }
+    if (count < 0.0 || d_isnan(p) || p < 0.0 || p > 1.0) { parity_flag(0u, i, 2u); return; }
+    if (count == 0.0 || p == 0.0) { o[i] = 0.0f; return; }
+    if (p == 1.0) { o[i] = F(count); return; }
+    int64_t trials = int64_t(count);
+    ParityRng r = parity_rng(seedLo, seedHi, i);
     bool flip = p > 0.5;
-    double q = flip ? 1.0 - p : p, draw, dn = double(n);
-    if (dn * q >= 10.0)
+    double q = flip ? 1.0 - p : p, draw;
+    if (count * q >= 10.0)
     {
-        double stddev = sqrt(dn * q * (1.0 - q)), bb = 1.15 + 2.53 * stddev, aa = -0.0873 + 0.0248 * bb + 0.01 * q;
-        double c = dn * q + 0.5, vR = 0.92 - 4.2 / bb, ratio = q / (1.0 - q), alpha = (2.83 + 5.1 / bb) * stddev;
-        double m = floor((dn + 1.0) * q);
+        double stddev = sqrt(count * q * (1.0 - q)), bb = 1.15 + 2.53 * stddev, aa = -0.0873 + 0.0248 * bb + 0.01 * q;
+        double c = count * q + 0.5, vR = 0.92 - 4.2 / bb, ratio = q / (1.0 - q), alpha = (2.83 + 5.1 / bb) * stddev;
+        double m = floor(double(trials + 1L) * q);
         while (true)
         {
-            double u = rng_uniform() - 0.5, v = rng_uniform(), us = 0.5 - abs(u);
+            double u = parity_uniform(r) - 0.5, v = parity_uniform(r), us = 0.5 - abs(u);
             double k = floor((2.0 * aa / us + bb) * u + c);
-            if (k < 0.0 || k > dn) continue;
+            if (k < 0.0 || k > count) continue;
             if (us >= 0.07 && v <= vR) { draw = k; break; }
             v = d_log(v * alpha / (aa / (us * us) + bb));
-            double upper = (m + 0.5) * d_log((m + 1.0) / (ratio * (dn - m + 1.0)))
-                + (dn + 1.0) * d_log((dn - m + 1.0) / (dn - k + 1.0))
-                + (k + 0.5) * d_log(ratio * (dn - k + 1.0) / (k + 1.0))
-                + stirling_tail(m) + stirling_tail(dn - m) - stirling_tail(k) - stirling_tail(dn - k);
+            double upper = (m + 0.5) * d_log((m + 1.0) / (ratio * (count - m + 1.0)))
+                + (count + 1.0) * d_log((count - m + 1.0) / (count - k + 1.0))
+                + (k + 0.5) * d_log(ratio * (count - k + 1.0) / (k + 1.0))
+                + parity_stirling_tail(m) + parity_stirling_tail(count - m) - parity_stirling_tail(k) - parity_stirling_tail(count - k);
             if (v <= upper) { draw = k; break; }
         }
     }
     else
     {
+        // Each step is checked against the remaining trials before it is added, so an enormous (or infinite) step ends
+        // the walk instead of overflowing the position.
         double logQ = d_log1p(-q);
-        int64_t successes = 0l, position = 0l;
+        int64_t successes = 0L, position = 0L;
         while (true)
         {
-            double step = floor(d_log(1.0 - rng_uniform()) / logQ) + 1.0;
-            if (!(step <= double(n - position))) break;
-            position += int64_t(step);
+            double advance = floor(d_log(1.0 - parity_uniform(r)) / logQ) + 1.0;
+            if (d_isnan(advance) || !(advance <= double(trials - position))) break;
+            position += int64_t(advance);
             successes++;
         }
         draw = double(successes);
     }
-    y[i] = float(flip ? dn - draw : draw);
+    o[i] = F(flip ? count - draw : draw);
 }
-", atomics: true);
-    // scratch is raw 32-bit words: floats without replacement, double prefix sums (two words each) with it.
-    private static readonly string Multinomial = RandomKernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer W { float w[]; };
-layout(std430, set = 0, binding = 1) buffer S { uint scratch[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer Y { float y[]; };
-" + Flag(3), "uint seedLo; uint seedHi; int rows; int categories; int numSamples; int replacement;", @"
+", special: false, int64: true));
+
+    /// <summary>
+    /// Multinomial: one thread per row walks numSamples draws over its categories, as the CPU. Code 1: a negative, NaN
+    /// or infinite weight (flagged at its element); code 2: a row with no positive weight left (flagged at the row,
+    /// ranked after every weight error). With replacement the scratch holds double prefix sums (2 words per category).
+    /// </summary>
+    public static string Multinomial(bool replacement) => Cached("multinomial:" + replacement, () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer W { float w[]; };
+layout(set = 0, binding = 1) buffer S { " + (replacement ? "double prefix[];" : "float s[];") + @" };
+layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
+" + FlagSlots(3) + @"
+layout(push_constant) uniform P { uint rows; int categories; int numSamples; uint seedLo; uint seedHi; };
+", Rng + @"
 void main()
 {
-    int row = int(gl_GlobalInvocationID.x);
-    if (row >= pc.rows) return;
-    int baseIndex = row * pc.categories;
-    for (int c = 0; c < pc.categories; c++)
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= rows) return;
+    int first = int(row) * categories;
+    for (int c = 0; c < categories; c++)
     {
-        double v = double(w[baseIndex + c]);
-        if (!(v >= 0.0) || isinf(v)) { raise_flag(uint64_t(baseIndex + c), 1); return; }
+        double v = D(w[first + c]);
+        if (d_isnan(v) || v < 0.0 || d_isinf(v)) { parity_flag(0u, uint(first + c), 1u); return; }
     }
-    rng_init(pc.seedLo, pc.seedHi, uint(row));
-    if (pc.replacement != 0)
+    ParityRng r = parity_rng(seedLo, seedHi, row);
+    int outFirst = int(row) * numSamples;
+" + (replacement ? @"
+    // The weights never change, so the CPU's walk is a search of the double prefix sums (accumulated in the CPU's
+    // order): the first category whose running total exceeds u, which is always a positive-weight one.
+    double total = 0.0;
+    int last = -1;
+    for (int c = 0; c < categories; c++) { total += D(w[first + c]); prefix[first + c] = total; if (f_positive(w[first + c])) last = c; }
+    if (!(total > 0.0)) { parity_flag(1u, uint(first), 2u); return; }
+    for (int k = 0; k < numSamples; k++)
+    {
+        double u = parity_uniform(r) * total;
+        int lo = 0, hi = categories;
+        while (lo < hi) { int mid = (lo + hi) >> 1; if (u < prefix[first + mid]) hi = mid; else lo = mid + 1; }
+        o[outFirst + k] = F(lo < categories ? lo : last);
+    }
+" : @"
+    for (int c = 0; c < categories; c++) s[first + c] = w[first + c];
+    for (int k = 0; k < numSamples; k++)
     {
         double total = 0.0;
-        int last = -1;
-        for (int c = 0; c < pc.categories; c++)
-        {
-            total += double(w[baseIndex + c]);
-            uvec2 bits = unpackDouble2x32(total);
-            scratch[2 * (baseIndex + c)] = bits.x; scratch[2 * (baseIndex + c) + 1] = bits.y;
-            if (w[baseIndex + c] > 0.0f) last = c;
-        }
-        if (!(total > 0.0)) { raise_flag((1ul << 58) | uint64_t(baseIndex), 2); return; }
-        for (int k = 0; k < pc.numSamples; k++)
-        {
-            double u = rng_uniform() * total;
-            int lo = 0, hi = pc.categories;
-            while (lo < hi)
-            {
-                int mid = (lo + hi) >> 1;
-                double prefix = packDouble2x32(uvec2(scratch[2 * (baseIndex + mid)], scratch[2 * (baseIndex + mid) + 1]));
-                if (u < prefix) hi = mid; else lo = mid + 1;
-            }
-            y[row * pc.numSamples + k] = float(lo < pc.categories ? lo : last);
-        }
-        return;
-    }
-    for (int c = 0; c < pc.categories; c++) scratch[baseIndex + c] = floatBitsToUint(w[baseIndex + c]);
-    for (int k = 0; k < pc.numSamples; k++)
-    {
-        double total = 0.0;
-        for (int c = 0; c < pc.categories; c++) total += double(uintBitsToFloat(scratch[baseIndex + c]));
-        if (!(total > 0.0)) { raise_flag((1ul << 58) | uint64_t(baseIndex), 2); return; }
-        double u = rng_uniform() * total, running = 0.0;
+        for (int c = 0; c < categories; c++) total += D(s[first + c]);
+        if (!(total > 0.0)) { parity_flag(1u, uint(first), 2u); return; }
+        double u = parity_uniform(r) * total, running = 0.0;
         int chosen = -1;
-        for (int c = pc.categories - 1; c >= 0; c--) if (uintBitsToFloat(scratch[baseIndex + c]) > 0.0f) { chosen = c; break; }
-        for (int c = 0; c < pc.categories; c++)
+        for (int c = categories - 1; c >= 0; c--) if (f_positive(s[first + c])) { chosen = c; break; }
+        for (int c = 0; c < categories; c++)
         {
-            float s = uintBitsToFloat(scratch[baseIndex + c]);
-            running += double(s);
-            if (u < running && s > 0.0f) { chosen = c; break; }
+            running += D(s[first + c]);
+            if (u < running && f_positive(s[first + c])) { chosen = c; break; }
         }
-        y[row * pc.numSamples + k] = float(chosen);
-        scratch[baseIndex + chosen] = floatBitsToUint(0.0f);
+        o[outFirst + k] = F(chosen);
+        s[first + chosen] = 0.0f;
     }
+") + @"
 }
-", atomics: true);
+", special: false));
 
-    // Channel dropout (alpha = 0) writes scale only; the engine may pass the scale buffer as offset too.
-    private static readonly string DropoutAffine = RandomKernel(@"
-layout(std430, set = 0, binding = 0) buffer Sc { float scale[]; };
-layout(std430, set = 0, binding = 1) buffer Of { float offsetOut[]; };
-", "uint pLo; uint pHi; uint aLo; uint aHi; uint satLo; uint satHi; uint bLo; uint bHi; uint seedLo; uint seedHi; int n; int block; int alpha;", @"
+    /// <summary>
+    /// Dropout keep mask, one draw per block of `block` elements: keep = (U &gt;= p). Alpha dropout writes the per-element
+    /// scale and offset (a * keep, a * sat * (1 - keep) + b); channel dropout writes the scale only (keep * a).
+    /// </summary>
+    public static string DropoutAffine(bool alpha) => Cached("dropoutAffine:" + alpha, () => DoubleShader(@"
+layout(set = 0, binding = 0) writeonly buffer Sc { float scale[]; };
+" + (alpha ? "layout(set = 0, binding = 1) writeonly buffer Of { float offset[]; };\n" : "") + @"
+layout(push_constant) uniform P { uint n; uint block; uint pLo; uint pHi; uint aLo; uint aHi; uint satLo; uint satHi; uint bLo; uint bHi; uint seedLo; uint seedHi; };
+", Unpack + Rng + @"
 void main()
 {
-    " + Index + @"
-    rng_init(pc.seedLo, pc.seedHi, uint(i / pc.block));
-    double p = pc_double(uvec2(pc.pLo, pc.pHi)), a = pc_double(uvec2(pc.aLo, pc.aHi));
-    double sat = pc_double(uvec2(pc.satLo, pc.satHi)), b = pc_double(uvec2(pc.bLo, pc.bHi));
-    double keep = rng_uniform() >= p ? 1.0 : 0.0;
-    if (pc.alpha != 0) { scale[i] = float(a * keep); offsetOut[i] = float(a * sat * (1.0 - keep) + b); }
-    else scale[i] = float(keep * a);
+" + Index + @"
+    ParityRng r = parity_rng(seedLo, seedHi, i / block);
+    double keep = parity_uniform(r) >= U(pLo, pHi) ? 1.0 : 0.0;
+    double a = U(aLo, aHi);
+" + (alpha
+    ? "    scale[i] = F(a * keep);\n    offset[i] = F(a * U(satLo, satHi) * (1.0 - keep) + U(bLo, bHi));\n"
+    : "    scale[i] = F(keep * a);\n") + @"
 }
-");
+", special: false));
 
-    private static readonly string Rrelu = RandomKernel(UnaryBindings, "uint lowerLo; uint lowerHi; uint upperLo; uint upperHi; uint seedLo; uint seedHi; int n; int training;", @"
+    /// <summary>rrelu: slope 1 above zero; below, the eval slope (training = 0) or a uniform draw in [lower, upper].</summary>
+    public static string Rrelu => Cached("rrelu", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; uint lowerLo; uint lowerHi; uint upperLo; uint upperHi; int training; uint seedLo; uint seedHi; };
+", Unpack + Rng + @"
 void main()
 {
-    " + Index + @"
-    double v = double(x[i]);
-    double lower = pc_double(uvec2(pc.lowerLo, pc.lowerHi)), upper = pc_double(uvec2(pc.upperLo, pc.upperHi));
-    double slope;
+" + Index + @"
+    double v = D(a[i]), lower = U(lowerLo, lowerHi), upper = U(upperLo, upperHi), slope;
     if (v > 0.0) slope = 1.0;
-    else if (pc.training == 0) slope = (lower + upper) / 2.0;
-    else { rng_init(pc.seedLo, pc.seedHi, uint(i)); slope = lower + (upper - lower) * rng_uniform(); }
-    y[i] = float(slope * v);
+    else if (training == 0) slope = (lower + upper) / 2.0;
+    else { ParityRng r = parity_rng(seedLo, seedHi, i); slope = lower + (upper - lower) * parity_uniform(r); }
+    o[i] = F(slope * v);
 }
-");
+", special: false));
 
-    private static readonly string RandomKeys = RandomKernel(OutputBinding, "uint seedLo; uint seedHi; int n;", @"
+    /// <summary>randperm keys: one uniform per position.</summary>
+    public static string RandomKeys => Cached("randomKeys", () => DoubleShader(@"
+layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+", Rng + @"
 void main()
 {
-    " + Index + @"
-    rng_init(pc.seedLo, pc.seedHi, uint(i));
-    y[i] = float(rng_uniform());
+" + Index + @"
+    ParityRng r = parity_rng(seedLo, seedHi, i);
+    o[i] = F(parity_uniform(r));
 }
-");
+", special: false));
 
-    // ---- nonzero_static / unravel_index / unique_dim / grid_sample 3-D / scan / integer ops ----
+    // ------------------------------------------------------------------------------------------------------------
+    // nonzero_static / unravel_index / unique_dim / scan / integer ops / grid_sample 3-D
+    // ------------------------------------------------------------------------------------------------------------
 
-    // shape: [0] rank, [1..8] extents.
-    private static readonly string NonzeroStaticScatter = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
-layout(std430, set = 0, binding = 1) readonly buffer Pos { float positions[]; };
-layout(std430, set = 0, binding = 2) buffer Y { float y[]; };
-layout(std430, set = 0, binding = 3) readonly buffer Shp { int shape[]; };
-", "int n; int size;", @"
+    /// <summary>
+    /// nonzero_static: an element that is non-zero (NaN counts; -0 does not) and whose inclusive-scan position is within
+    /// `size` writes its coordinates to row (position - 1) of the [size, rank] output.
+    /// </summary>
+    public static string NonzeroStaticScatter => Cached("nonzeroStaticScatter", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer Ps { float positions[]; };
+layout(set = 0, binding = 2) buffer O { float o[]; };
+layout(push_constant) uniform P { uint n; int size; int rank; int extent[8]; };
+", @"
 void main()
 {
-    " + Index + @"
-    if (x[i] == 0.0f) return;
+" + Index + @"
+    if ((floatBitsToUint(a[i]) & 0x7FFFFFFFu) == 0u) return;
     int row = int(positions[i]) - 1;
-    if (row >= pc.size) return;
-    int rank = shape[0], rest = i;
-    for (int k = rank - 1; k >= 0; k--) { y[row * rank + k] = float(rest % shape[1 + k]); rest /= shape[1 + k]; }
+    if (row >= size) return;
+    int rest = int(i);
+    for (int k = rank - 1; k >= 0; k--) { o[row * rank + k] = float(rest % extent[k]); rest /= extent[k]; }
 }
-");
+"));
 
-    private static readonly string UnravelAxis = Kernel(UnaryBindings + Flag(2),
-        "uint totalLo; uint totalHi; uint strideLo; uint strideHi; uint extentLo; uint extentHi; int n; int validate;", FlagSource + @"
+    /// <summary>
+    /// unravel_index, one launch per output axis: ((flat + total) % total) / stride % extent. A validating launch flags
+    /// (code 1) an index whose truncation lies outside [-total, total), or a NaN.
+    /// </summary>
+    public static string UnravelAxis => Cached("unravelAxis", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer A { float indices[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+" + FlagSlots(2) + @"
+layout(push_constant) uniform P { uint n; uint totalLo; uint totalHi; uint strideLo; uint strideHi; uint extentLo; uint extentHi; int validate; };
+", @"
+int64_t L(uint lo, uint hi) { return int64_t((uint64_t(hi) << 32) | uint64_t(lo)); }
+
 void main()
 {
-    " + Index + @"
-    int64_t total = int64_t(packUint2x32(uvec2(pc.totalLo, pc.totalHi)));
-    int64_t stride = int64_t(packUint2x32(uvec2(pc.strideLo, pc.strideHi)));
-    int64_t extent = int64_t(packUint2x32(uvec2(pc.extentLo, pc.extentHi)));
-    double t = trunc(double(x[i]));
-    if (isnan(t) || t < -double(total) || t >= double(total))
+" + Index + @"
+    int64_t total = L(totalLo, totalHi), stride = L(strideLo, strideHi), extent = L(extentLo, extentHi);
+    double t = d_trunc(D(indices[i]));
+    if (d_isnan(t) || t < -double(total) || t >= double(total))
     {
-        if (pc.validate != 0) raise_flag(uint64_t(i), 1);
+        if (validate != 0) parity_flag(0u, i, 1u);
         return;
     }
-    // f + total is non-negative here, so the integer division and remainder below see no negative operand.
-    int64_t f = int64_t(t) + total;
-    int64_t wrapped = f - (f / total) * total;
-    int64_t q = wrapped / stride;
-    y[i] = float(q - (q / extent) * extent);
+    int64_t f = int64_t(t);
+    o[i] = F(double(((f + total) % total) / stride % extent));
 }
-", atomics: true);
+", special: false, int64: true));
+
+    // unique_dim's slice order, as the CPU's comparer: element by element, NaN below every number and equal to NaN,
+    // -0 equal to 0.
     private const string SliceCompare = @"
-// unique_dim's slice order: element by element with double.CompareTo (NaN below every number, equal to NaN).
-int slice_compare(int a, int b, int width)
+int slice_compare(int a, int b, int length)
 {
-    for (int k = 0; k < width; k++)
+    for (int k = 0; k < length; k++)
     {
-        float p = data[a * width + k], q = data[b * width + k];
-        bool np = isnan(p), nq = isnan(q);
-        if (np || nq) { if (np && nq) continue; return np ? -1 : 1; }
-        if (p < q) return -1;
-        if (p > q) return 1;
+        float x = data[a * length + k], y = data[b * length + k];
+        bool nx = f_isnan(x), ny = f_isnan(y);
+        if (nx || ny) { if (nx && ny) continue; return nx ? -1 : 1; }
+        if (x < y) return -1;
+        if (x > y) return 1;
     }
     return 0;
 }
 ";
 
-    private static readonly string SliceBitonicStep = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer D { float data[]; };
-layout(std430, set = 0, binding = 1) buffer O { float order[]; };
-", "int rowLen; int k; int j; int rowLength;", SliceCompare + @"
+    /// <summary>One bitonic step over slice indices (padding = -1 sorts last; equal slices keep index order).</summary>
+    public static string SliceBitonicStep => Cached("sliceBitonicStep", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer D { float data[]; };
+layout(set = 0, binding = 1) buffer Or { float order[]; };
+layout(push_constant) uniform P { int rowLen; int k; int j; int length; };
+", SliceCompare + @"
 void main()
 {
     int i = int(gl_GlobalInvocationID.x);
-    if (i >= pc.rowLen) return;
-    int ixj = i ^ pc.j;
+    if (i >= rowLen) return;
+    int ixj = i ^ j;
     if (ixj <= i) return;
     float fa = order[i], fb = order[ixj];
     int a = int(fa), b = int(fb);
@@ -1227,65 +867,173 @@ void main()
     if (a < 0 || b < 0) { bBeforeA = a < 0 && b >= 0; aBeforeB = b < 0 && a >= 0; }
     else
     {
-        int c = slice_compare(a, b, pc.rowLength);
+        int c = slice_compare(a, b, length);
         bBeforeA = c > 0 || (c == 0 && b < a);
         aBeforeB = c < 0 || (c == 0 && a < b);
     }
-    bool up = (i & pc.k) == 0;
+    bool up = (i & k) == 0;
     if (up ? bBeforeA : aBeforeB) { order[i] = fb; order[ixj] = fa; }
 }
-");
+"));
 
-    private static readonly string SliceFirstFlags = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer D { float data[]; };
-layout(std430, set = 0, binding = 1) readonly buffer O { float order[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer F { float flags[]; };
-", "int n; int rowLength;", SliceCompare + @"
+    /// <summary>1 where a sorted slice differs from the one before it (the first slice always), else 0.</summary>
+    public static string SliceFirstFlags => Cached("sliceFirstFlags", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer D { float data[]; };
+layout(set = 0, binding = 1) readonly buffer Or { float order[]; };
+layout(set = 0, binding = 2) writeonly buffer Fl { float flags[]; };
+layout(push_constant) uniform P { uint n; int length; };
+", SliceCompare + @"
 void main()
 {
-    " + Index + @"
-    flags[i] = (i == 0 || slice_compare(int(order[i]), int(order[i - 1]), pc.rowLength) != 0) ? 1.0f : 0.0f;
+" + Index + @"
+    flags[i] = (i == 0u || slice_compare(int(order[i]), int(order[i - 1u]), length) != 0) ? 1.0 : 0.0;
 }
-");
+"));
 
-    private static readonly string SliceGatherUnique = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer D { float data[]; };
-layout(std430, set = 0, binding = 1) readonly buffer O { float order[]; };
-layout(std430, set = 0, binding = 2) readonly buffer F { float flags[]; };
-layout(std430, set = 0, binding = 3) readonly buffer Pos { float positions[]; };
-layout(std430, set = 0, binding = 4) buffer Y { float y[]; };
-", "int total; int rowLength;", @"
+    /// <summary>Copies each first-of-a-run slice (in sorted order) to row (position - 1) of the [unique, length] output.</summary>
+    public static string SliceGatherUnique => Cached("sliceGatherUnique", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer D { float data[]; };
+layout(set = 0, binding = 1) readonly buffer Or { float order[]; };
+layout(set = 0, binding = 2) readonly buffer Fl { float flags[]; };
+layout(set = 0, binding = 3) readonly buffer Ps { float positions[]; };
+layout(set = 0, binding = 4) buffer O { float o[]; };
+layout(push_constant) uniform P { int total; int length; };
+", @"
 void main()
 {
     int idx = int(gl_GlobalInvocationID.x);
-    if (idx >= pc.total) return;
-    int s = idx / pc.rowLength, k = idx % pc.rowLength;
-    if (flags[s] == 0.0f) return;
+    if (idx >= total) return;
+    int s = idx / length, k = idx % length;
+    if (flags[s] == 0.0) return;
     int row = int(positions[s]) - 1;
-    y[row * pc.rowLength + k] = data[int(order[s]) * pc.rowLength + k];
+    o[row * length + k] = data[int(order[s]) * length + k];
 }
-");
+"));
 
-    private const string GridSource = @"
-double grid_reflect_slope(double coord, int twiceLow, int twiceHigh, inout double slope)
+    /// <summary>
+    /// Inclusive prefix sum of one block per work group (Hillis-Steele in shared memory); each block's total goes to
+    /// `sums`, which the host scans the same way and adds back with <see cref="ScanAdd"/>.
+    /// </summary>
+    public static string ScanBlockSource => Cached("scanBlock", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
+layout(set = 0, binding = 2) writeonly buffer Sm { float sums[]; };
+layout(push_constant) uniform P { uint n; };
+shared float s[" + ScanBlock + @"];
+", @"
+void main()
+{
+    uint t = gl_LocalInvocationID.x, i = gl_GlobalInvocationID.x;
+    s[t] = i < n ? a[i] : 0.0;
+    barrier();
+    for (uint offset = 1u; offset < " + ScanBlock + @"u; offset <<= 1)
+    {
+        float v = t >= offset ? s[t - offset] : 0.0;
+        barrier();
+        s[t] += v;
+        barrier();
+    }
+    if (i < n) o[i] = s[t];
+    if (t == " + (ScanBlock - 1) + @"u) sums[gl_WorkGroupID.x] = s[t];
+}
+", localSize: ScanBlock));
+
+    public static string ScanAdd => Cached("scanAdd", () => FloatShader(@"
+layout(set = 0, binding = 0) buffer O { float o[]; };
+layout(set = 0, binding = 1) readonly buffer C { float carries[]; };
+layout(push_constant) uniform P { uint n; };
+", @"
+void main()
+{
+" + Index + @"
+    uint block = i / " + ScanBlock + @"u;
+    if (block > 0u) o[i] += carries[block - 1u];
+}
+"));
+
+    /// <summary>
+    /// Integer ops on raw int32 storage, as the CPU's IntegerBinary: 64-bit arithmetic on the sign-extended operands,
+    /// wrapped to int32. op: 0 and, 1 or, 2 xor, 3 left shift, 4 right shift, 5 gcd, 6 lcm, 7 floor divide (code 1 for
+    /// a zero divisor). Shifts follow C#'s long shifts: a count of 64 or more gives 0 (left) or the sign fill (right);
+    /// otherwise the count is masked to its low 6 bits.
+    /// </summary>
+    public static string IntBinary => Cached("intBinary", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer A { int a[]; };
+layout(set = 0, binding = 1) readonly buffer B { int b[]; };
+layout(set = 0, binding = 2) writeonly buffer O { int o[]; };
+" + FlagSlots(3) + @"
+layout(push_constant) uniform P { uint n; int op; };
+", @"
+int64_t parity_gcd(int64_t x, int64_t y)
+{
+    x = x < 0L ? -x : x;
+    y = y < 0L ? -y : y;
+    while (y != 0L) { int64_t t = x % y; x = y; y = t; }
+    return x;
+}
+
+void main()
+{
+" + Index + @"
+    int64_t x = int64_t(a[i]), v = int64_t(b[i]), r;
+    if (op == 0) r = x & v;
+    else if (op == 1) r = x | v;
+    else if (op == 2) r = x ^ v;
+    else if (op == 3) r = v >= 64L ? 0L : int64_t(uint64_t(x) << int(v & 63L));
+    else if (op == 4) r = v >= 64L ? (x < 0L ? -1L : 0L) : x >> int(v & 63L);
+    else if (op == 5) r = parity_gcd(x, v);
+    else if (op == 6)
+    {
+        int64_t g = parity_gcd(x, v);
+        int64_t m = g == 0L ? 0L : x / g * v;
+        r = m < 0L ? -m : m;
+    }
+    else
+    {
+        if (v == 0L) { parity_flag(0u, i, 1u); return; }
+        // Floor division from the magnitudes (GLSL leaves % of a negative operand undefined).
+        int64_t ax = x < 0L ? -x : x, av = v < 0L ? -v : v;
+        int64_t q = ax / av;
+        r = ((x < 0L) == (v < 0L)) ? q : -(q + (ax % av != 0L ? 1L : 0L));
+    }
+    o[i] = int(r);
+}
+", int64: true));
+
+    public static string IntNot => Cached("intNot", () => FloatShader(@"
+layout(set = 0, binding = 0) readonly buffer A { int a[]; };
+layout(set = 0, binding = 1) writeonly buffer O { int o[]; };
+layout(push_constant) uniform P { uint n; };
+", @"
+void main()
+{
+" + Index + @"
+    o[i] = ~a[i];
+}
+"));
+
+    // grid_sample 3-D, as the CPU's GridSampler3D: unnormalize, clip or reflect, then trilinear (8 taps) or nearest
+    // (round half to even), skipping out-of-range voxels. mode 0 bilinear, 1 nearest; padding 0 zeros, 1 border,
+    // 2 reflection. `slope` is d voxel / d normalized: (size - 1) / 2 aligned, size / 2 otherwise; 0 where border or
+    // reflection clipping holds the coordinate; sign-flipped by each reflection.
+    private const string GridHelpers = @"
+double grid_reflect(double coord, int twiceLow, int twiceHigh, inout double slope)
 {
     if (twiceLow == twiceHigh) { slope = 0.0; return 0.0; }
-    double mn = double(twiceLow) / 2.0, span = double(twiceHigh - twiceLow) / 2.0, sign = 1.0;
+    double mn = double(twiceLow) / 2.0, span = double(twiceHigh - twiceLow) / 2.0, sgn = 1.0;
     coord -= mn;
-    if (coord < 0.0) { sign = -1.0; coord = -coord; }
+    if (coord < 0.0) { sgn = -1.0; coord = -coord; }
     double extra = d_fmod(coord, span), flips = floor(coord / span);
-    if (d_fmod(flips, 2.0) == 0.0) { slope *= sign; return extra + mn; }
-    slope *= -sign;
+    if (d_fmod(flips, 2.0) == 0.0) { slope *= sgn; return extra + mn; }
+    slope *= -sgn;
     return span - extra + mn;
 }
 
-// The unnormalized, clipped or reflected source coordinate, and d coordinate / d normalized in slope.
-double grid_source(double normalized, int size, int padding, bool align, out double slope)
+double grid_source(double normalized, int size, int padding, int align, out double slope)
 {
-    double coord = align ? (normalized + 1.0) / 2.0 * double(size - 1) : ((normalized + 1.0) * double(size) - 1.0) / 2.0;
-    slope = align ? double(size - 1) / 2.0 : double(size) / 2.0;
-    if (padding == 2)
-        coord = align ? grid_reflect_slope(coord, 0, 2 * (size - 1), slope) : grid_reflect_slope(coord, -1, 2 * size - 1, slope);
+    double coord = align != 0 ? (normalized + 1.0) / 2.0 * double(size - 1) : ((normalized + 1.0) * double(size) - 1.0) / 2.0;
+    slope = align != 0 ? double(size - 1) / 2.0 : double(size) / 2.0;
+    if (padding == 2) coord = align != 0 ? grid_reflect(coord, 0, 2 * (size - 1), slope) : grid_reflect(coord, -1, 2 * size - 1, slope);
     if (padding >= 1)
     {
         if (coord <= 0.0) { slope = 0.0; return 0.0; }
@@ -1294,255 +1042,128 @@ double grid_source(double normalized, int size, int padding, bool align, out dou
     return coord;
 }
 
-// A voxel index as the CPU's VoxelIndex: NaN and out-of-int-range coordinates land far outside the volume.
-int64_t grid_index(double v) { return (isnan(v) || v < -2147483648.0 || v >= 2147483648.0) ? -4l : int64_t(v); }
+// A voxel index from a coordinate as the CPU's (int) cast, where NaN and out-of-range values become int.MinValue: here
+// a sentinel far enough below zero that neither it nor its +1 neighbour lands inside the volume.
+int grid_index(double v) { return (d_isnan(v) || v < -2147483648.0 || v >= 2147483647.0) ? -4 : int(v); }
 
-int taps;
-int tapOffset[8];
-double tapWeight[8], tapGradX[8], tapGradY[8], tapGradZ[8];
-
-void grid_taps(double cx, double cy, double cz, double sx, double sy, double sz)
+// The taps of point (cx, cy, cz): offsets into a [depth, height, width] plane, weights, and each weight's derivative
+// with respect to the three voxel coordinates.
+int grid_taps(double cx, double cy, double cz, int depth, int height, int width, int mode,
+    out int offsets[8], out double weights[8], out double gx[8], out double gy[8], out double gz[8])
 {
-    taps = 0;
-    if (pc.mode == 1)
+    int taps = 0;
+    if (mode == 1)
     {
-        int64_t ix = grid_index(roundEven(cx)), iy = grid_index(roundEven(cy)), iz = grid_index(roundEven(cz));
-        if (ix >= 0l && ix < int64_t(pc.width) && iy >= 0l && iy < int64_t(pc.height) && iz >= 0l && iz < int64_t(pc.depth))
+        int ix = grid_index(d_rint(cx)), iy = grid_index(d_rint(cy)), iz = grid_index(d_rint(cz));
+        if (ix >= 0 && ix < width && iy >= 0 && iy < height && iz >= 0 && iz < depth)
         {
-            tapOffset[0] = int((iz * int64_t(pc.height) + iy) * int64_t(pc.width) + ix); tapWeight[0] = 1.0;
-            tapGradX[0] = 0.0; tapGradY[0] = 0.0; tapGradZ[0] = 0.0; taps = 1;
+            offsets[0] = (iz * height + iy) * width + ix;
+            weights[0] = 1.0; gx[0] = 0.0; gy[0] = 0.0; gz[0] = 0.0;
+            taps = 1;
         }
-        return;
+        return taps;
     }
     double fx0 = floor(cx), fy0 = floor(cy), fz0 = floor(cz);
-    int64_t x0 = grid_index(fx0), y0 = grid_index(fy0), z0 = grid_index(fz0);
+    int x0 = grid_index(fx0), y0 = grid_index(fy0), z0 = grid_index(fz0);
     double fx = cx - fx0, fy = cy - fy0, fz = cz - fz0;
     for (int oz = 0; oz < 2; oz++)
         for (int oy = 0; oy < 2; oy++)
             for (int ox = 0; ox < 2; ox++)
             {
-                int64_t ix = x0 + int64_t(ox), iy = y0 + int64_t(oy), iz = z0 + int64_t(oz);
-                if (ix < 0l || ix >= int64_t(pc.width) || iy < 0l || iy >= int64_t(pc.height) || iz < 0l || iz >= int64_t(pc.depth)) continue;
+                int ix = x0 + ox, iy = y0 + oy, iz = z0 + oz;
+                if (ix < 0 || ix >= width || iy < 0 || iy >= height || iz < 0 || iz >= depth) continue;
                 double wx = ox == 1 ? fx : 1.0 - fx, wy = oy == 1 ? fy : 1.0 - fy, wz = oz == 1 ? fz : 1.0 - fz;
-                tapOffset[taps] = int((iz * int64_t(pc.height) + iy) * int64_t(pc.width) + ix);
-                tapWeight[taps] = wx * wy * wz;
-                tapGradX[taps] = (ox == 1 ? 1.0 : -1.0) * wy * wz * sx;
-                tapGradY[taps] = (oy == 1 ? 1.0 : -1.0) * wx * wz * sy;
-                tapGradZ[taps] = (oz == 1 ? 1.0 : -1.0) * wx * wy * sz;
+                offsets[taps] = (iz * height + iy) * width + ix;
+                weights[taps] = wx * wy * wz;
+                gx[taps] = (ox == 1 ? 1.0 : -1.0) * wy * wz;
+                gy[taps] = (oy == 1 ? 1.0 : -1.0) * wx * wz;
+                gz[taps] = (oz == 1 ? 1.0 : -1.0) * wx * wy;
                 taps++;
             }
+    return taps;
 }
 ";
 
-    private const string GridPush = "int batches; int channels; int depth; int height; int width; int points; int mode; int padding; int align;";
+    private const string GridPush =
+        "layout(push_constant) uniform P { int batches; int channels; int depth; int height; int width; int points; int mode; int padding; int align; };\n";
 
-    private static readonly string GridSample3D = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
-layout(std430, set = 0, binding = 1) readonly buffer G { float grid[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer Y { float y[]; };
-", GridPush, GridSource + @"
+    /// <summary>grid_sample 3-D forward: one thread per (batch, point) locates its taps once and sums every channel.</summary>
+    public static string GridSample3D => Cached("gridSample3D", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer G { float grid[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
+" + GridPush, GridHelpers + @"
 void main()
 {
     int idx = int(gl_GlobalInvocationID.x);
-    if (idx >= pc.batches * pc.points) return;
-    int b = idx / pc.points, q = idx % pc.points;
-    bool align = pc.align != 0;
+    if (idx >= batches * points) return;
+    int b = idx / points, q = idx % points;
     double sx, sy, sz;
-    double cx = grid_source(double(grid[idx * 3]), pc.width, pc.padding, align, sx);
-    double cy = grid_source(double(grid[idx * 3 + 1]), pc.height, pc.padding, align, sy);
-    double cz = grid_source(double(grid[idx * 3 + 2]), pc.depth, pc.padding, align, sz);
-    grid_taps(cx, cy, cz, sx, sy, sz);
-    int volume = pc.depth * pc.height * pc.width;
-    for (int ch = 0; ch < pc.channels; ch++)
+    double cx = grid_source(D(grid[idx * 3]), width, padding, align, sx);
+    double cy = grid_source(D(grid[idx * 3 + 1]), height, padding, align, sy);
+    double cz = grid_source(D(grid[idx * 3 + 2]), depth, padding, align, sz);
+    int volume = depth * height * width;
+    int offsets[8]; double weights[8], gx[8], gy[8], gz[8];
+    int taps = grid_taps(cx, cy, cz, depth, height, width, mode, offsets, weights, gx, gy, gz);
+    for (int ch = 0; ch < channels; ch++)
     {
-        int plane = (b * pc.channels + ch) * volume;
+        int plane = (b * channels + ch) * volume;
         double acc = 0.0;
-        for (int t = 0; t < taps; t++) acc += tapWeight[t] * double(x[plane + tapOffset[t]]);
-        y[(b * pc.channels + ch) * pc.points + q] = float(acc);
+        for (int t = 0; t < taps; t++) acc += weights[t] * D(x[plane + offsets[t]]);
+        o[(b * channels + ch) * points + q] = F(acc);
     }
 }
-");
+", special: false));
 
-    // dx gathers w * dy from every point through a compare-and-swap float add (points share voxels).
-    private static readonly string GridSample3DBackward = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
-layout(std430, set = 0, binding = 1) readonly buffer G { float grid[]; };
-layout(std430, set = 0, binding = 2) readonly buffer Dy { float dy[]; };
-layout(std430, set = 0, binding = 3) buffer Dx { uint dx[]; };
-layout(std430, set = 0, binding = 4) writeonly buffer Dg { float dgrid[]; };
-", GridPush, GridSource + @"
-void add_dx(int index, float value)
+    /// <summary>
+    /// grid_sample 3-D adjoints: dx gathers w * dy from every point (compare-and-swap adds: points share voxels, and
+    /// float atomics are not portable); dgrid is owned by its point's thread.
+    /// </summary>
+    public static string GridSample3DBackward => Cached("gridSample3DBackward", () => DoubleShader(@"
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer G { float grid[]; };
+layout(set = 0, binding = 2) readonly buffer Dy { float dy[]; };
+layout(set = 0, binding = 3) buffer Dx { uint dx[]; };
+layout(set = 0, binding = 4) writeonly buffer Dg { float dgrid[]; };
+" + GridPush, GridHelpers + @"
+void atomic_add(int index, float value)
 {
     uint expected = dx[index];
     while (true)
     {
-        uint desired = floatBitsToUint(uintBitsToFloat(expected) + value);
-        uint seen = atomicCompSwap(dx[index], expected, desired);
-        if (seen == expected) break;
-        expected = seen;
+        uint actual = atomicCompSwap(dx[index], expected, floatBitsToUint(uintBitsToFloat(expected) + value));
+        if (actual == expected) break;
+        expected = actual;
     }
 }
+
 void main()
 {
     int idx = int(gl_GlobalInvocationID.x);
-    if (idx >= pc.batches * pc.points) return;
-    int b = idx / pc.points, q = idx % pc.points;
-    bool align = pc.align != 0;
+    if (idx >= batches * points) return;
+    int b = idx / points, q = idx % points;
     double sx, sy, sz;
-    double cx = grid_source(double(grid[idx * 3]), pc.width, pc.padding, align, sx);
-    double cy = grid_source(double(grid[idx * 3 + 1]), pc.height, pc.padding, align, sy);
-    double cz = grid_source(double(grid[idx * 3 + 2]), pc.depth, pc.padding, align, sz);
-    grid_taps(cx, cy, cz, sx, sy, sz);
-    int volume = pc.depth * pc.height * pc.width;
+    double cx = grid_source(D(grid[idx * 3]), width, padding, align, sx);
+    double cy = grid_source(D(grid[idx * 3 + 1]), height, padding, align, sy);
+    double cz = grid_source(D(grid[idx * 3 + 2]), depth, padding, align, sz);
+    int volume = depth * height * width;
+    int offsets[8]; double weights[8], gx[8], gy[8], gz[8];
+    int taps = grid_taps(cx, cy, cz, depth, height, width, mode, offsets, weights, gx, gy, gz);
     double dgx = 0.0, dgy = 0.0, dgz = 0.0;
-    for (int ch = 0; ch < pc.channels; ch++)
+    for (int ch = 0; ch < channels; ch++)
     {
-        int plane = (b * pc.channels + ch) * volume;
-        double up = double(dy[(b * pc.channels + ch) * pc.points + q]);
+        int plane = (b * channels + ch) * volume;
+        double up = D(dy[(b * channels + ch) * points + q]);
         for (int t = 0; t < taps; t++)
         {
-            add_dx(plane + tapOffset[t], float(tapWeight[t] * up));
-            double v = double(x[plane + tapOffset[t]]) * up;
-            dgx += v * tapGradX[t]; dgy += v * tapGradY[t]; dgz += v * tapGradZ[t];
+            atomic_add(plane + offsets[t], F(weights[t] * up));
+            double v = D(x[plane + offsets[t]]) * up;
+            dgx += v * (gx[t] * sx); dgy += v * (gy[t] * sy); dgz += v * (gz[t] * sz);
         }
     }
-    dgrid[idx * 3] = float(dgx);
-    dgrid[idx * 3 + 1] = float(dgy);
-    dgrid[idx * 3 + 2] = float(dgz);
+    dgrid[idx * 3] = F(dgx);
+    dgrid[idx * 3 + 1] = F(dgy);
+    dgrid[idx * 3 + 2] = F(dgz);
 }
-");
-    // Inclusive prefix sum: a LocalSize-wide Hillis-Steele scan per work group, the group totals scanned the same way
-    // (recursively, on the host side), then each group's carry added. Exact in float for counts below 2^24.
-    private static readonly string ScanBlock = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
-layout(std430, set = 0, binding = 1) buffer Y { float y[]; };
-layout(std430, set = 0, binding = 2) buffer Sums { float sums[]; };
-", "int n; int writeSums;", @"
-shared float s[gl_WorkGroupSize.x];
-void main()
-{
-    int t = int(gl_LocalInvocationID.x), i = int(gl_WorkGroupID.x * gl_WorkGroupSize.x) + t;
-    s[t] = i < pc.n ? x[i] : 0.0f;
-    barrier();
-    for (int offset = 1; offset < int(gl_WorkGroupSize.x); offset <<= 1)
-    {
-        float v = t >= offset ? s[t - offset] : 0.0f;
-        barrier();
-        s[t] += v;
-        barrier();
-    }
-    if (i < pc.n) y[i] = s[t];
-    if (pc.writeSums != 0 && t == int(gl_WorkGroupSize.x) - 1) sums[gl_WorkGroupID.x] = s[t];
-}
-");
-
-    private static readonly string ScanAdd = Kernel(@"
-layout(std430, set = 0, binding = 0) buffer Y { float y[]; };
-layout(std430, set = 0, binding = 1) readonly buffer C { float carries[]; };
-", "int n;", @"
-void main()
-{
-    " + Index + @"
-    int block = i / int(gl_WorkGroupSize.x);
-    if (block > 0) y[i] += carries[block - 1];
-}
-");
-
-    // Integer ops on raw int32 storage, as the CPU's IntegerBinary: 64-bit arithmetic on the sign-extended operands,
-    // wrapped to int32. op: 0 and, 1 or, 2 xor, 3 left shift, 4 right shift, 5 gcd, 6 lcm, 7 floor divide (code 1 for a
-    // zero divisor). GLSL leaves / and % undefined for negative operands, so quotients are formed on magnitudes.
-    private static readonly string IntBinary = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer A { int a[]; };
-layout(std430, set = 0, binding = 1) readonly buffer B { int b[]; };
-layout(std430, set = 0, binding = 2) writeonly buffer Y { int y[]; };
-" + Flag(3), "int n; int op;", FlagSource + @"
-int64_t magnitude(int64_t v) { return v < 0l ? -v : v; }
-// Quotient truncated toward zero, as C#.
-int64_t truncated_divide(int64_t x, int64_t v)
-{
-    int64_t q = int64_t(uint64_t(magnitude(x)) / uint64_t(magnitude(v)));
-    return (x < 0l) != (v < 0l) ? -q : q;
-}
-int64_t gcd64(int64_t x, int64_t y)
-{
-    uint64_t p = uint64_t(magnitude(x)), q = uint64_t(magnitude(y));
-    while (q != 0ul) { uint64_t t = p % q; p = q; q = t; }
-    return int64_t(p);
-}
-void main()
-{
-    " + Index + @"
-    int64_t x = int64_t(a[i]), v = int64_t(b[i]), r;
-    switch (pc.op)
-    {
-        case 0: r = x & v; break;
-        case 1: r = x | v; break;
-        case 2: r = x ^ v; break;
-        case 3: r = v >= 64l ? 0l : int64_t(uint64_t(x) << uint64_t(v & 63l)); break;
-        case 4: r = v >= 64l ? (x < 0l ? -1l : 0l) : x >> (v & 63l); break;
-        case 5: r = gcd64(x, v); break;
-        case 6: { int64_t g = gcd64(x, v); int64_t m = g == 0l ? 0l : truncated_divide(x, g) * v; r = magnitude(m); break; }
-        default:
-            if (v == 0l) { raise_flag(uint64_t(i), 1); return; }
-            r = truncated_divide(x, v);
-            if (x - r * v != 0l && ((x < 0l) != (v < 0l))) r -= 1l;
-            break;
-    }
-    y[i] = int(r);
-}
-", atomics: true);
-
-    private static readonly string IntNot = Kernel(@"
-layout(std430, set = 0, binding = 0) readonly buffer A { int a[]; };
-layout(std430, set = 0, binding = 1) writeonly buffer Y { int y[]; };
-", "int n;", "void main() { " + Index + "y[i] = ~a[i]; }\n");
-
-    private static readonly System.Lazy<System.Collections.Generic.Dictionary<string, string>> Sources =
-        new System.Lazy<System.Collections.Generic.Dictionary<string, string>>(BuildSources);
-
-    private static System.Collections.Generic.Dictionary<string, string> BuildSources()
-    {
-        var map = new System.Collections.Generic.Dictionary<string, string>(System.StringComparer.Ordinal);
-        foreach (var pair in UnaryExpressions) map[pair.Key] = UnaryKernel(pair.Value);
-        foreach (var pair in BinaryBodies) map[pair.Key] = BinaryKernel(pair.Value);
-        map["parity_mvlgamma"] = Mvlgamma;
-        map["parity_polynomial"] = Polynomial;
-        map["parity_range"] = Range;
-        map["parity_logspace"] = Logspace;
-        map["parity_window"] = Window;
-        map["parity_tri_indices"] = TriIndices;
-        map["parity_diagflat"] = Diagflat;
-        map["parity_diagonal_scatter"] = DiagonalScatter;
-        map["parity_quantile_rows"] = QuantileRows;
-        map["parity_flag_reset"] = FlagReset;
-        map["parity_sample"] = Sample;
-        map["parity_bernoulli"] = Bernoulli;
-        map["parity_poisson"] = Poisson;
-        map["parity_binomial"] = Binomial;
-        map["parity_multinomial"] = Multinomial;
-        map["parity_dropout_affine"] = DropoutAffine;
-        map["parity_rrelu"] = Rrelu;
-        map["parity_random_keys"] = RandomKeys;
-        map["parity_nonzero_static_scatter"] = NonzeroStaticScatter;
-        map["parity_unravel_axis"] = UnravelAxis;
-        map["parity_slice_bitonic_step"] = SliceBitonicStep;
-        map["parity_slice_first_flags"] = SliceFirstFlags;
-        map["parity_slice_gather_unique"] = SliceGatherUnique;
-        map["parity_grid_sample_3d"] = GridSample3D;
-        map["parity_grid_sample_3d_backward"] = GridSample3DBackward;
-        map["parity_scan_block"] = ScanBlock;
-        map["parity_scan_add"] = ScanAdd;
-        map["parity_int_binary"] = IntBinary;
-        map["parity_int_not"] = IntNot;
-        return map;
-    }
-
-    /// <summary>The GLSL source of the kernel with the CUDA / OpenCL name <paramref name="name"/>.</summary>
-    internal static string Source(string name)
-        => Sources.Value.TryGetValue(name, out var source)
-            ? source
-            : throw new System.ArgumentOutOfRangeException(nameof(name), "No Vulkan torch-parity kernel named " + name + ".");
-
-    /// <summary>Every kernel name (the same set as the CUDA and OpenCL modules).</summary>
-    internal static System.Collections.Generic.IEnumerable<string> KernelNames => Sources.Value.Keys;
+", special: false));
 }

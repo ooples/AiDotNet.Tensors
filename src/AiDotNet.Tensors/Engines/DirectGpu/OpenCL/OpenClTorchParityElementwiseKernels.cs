@@ -1140,6 +1140,84 @@ __kernel void parity_int_binary(__global const int* restrict a, __global const i
 __kernel void parity_int_not(__global const int* restrict a, __global int* restrict y, int n)
 { PARITY_INDEX y[i] = ~a[i]; }
 
+// #1135: the same ops on the raw int64 layout (two words per element) that long, ulong, short, ushort, sbyte, byte and
+// uint tensors use on the device, as the CUDA kernels: signed 64-bit math, narrowed to the element type t (0 long,
+// 1 ulong, 2 short, 3 ushort, 4 sbyte, 5 byte, 6 uint). Flag codes: 1 a zero divisor, 2 the CPU's OverflowException
+// (Math.Abs of long.MinValue in gcd / lcm, long.MinValue / -1). gcd is binary (shifts and subtraction) on the magnitudes,
+// as on Vulkan, whose driver's 64-bit % proved unreliable.
+long parity_int_narrow(long r, int t)
+{
+    switch (t)
+    {
+        case 2: return (long)(short)r;
+        case 3: return r & 0xFFFFL;
+        case 4: return (long)(char)r;
+        case 5: return r & 0xFFL;
+        case 6: return r & 0xFFFFFFFFL;
+        default: return r;
+    }
+}
+
+ulong parity_magnitude(long x) { return x < 0 ? (ulong)(-x) : (ulong)x; }
+
+ulong parity_gcd_u(ulong a, ulong b)
+{
+    if (a == 0) return b;
+    if (b == 0) return a;
+    int shift = 0;
+    while (((a | b) & 1UL) == 0) { a >>= 1; b >>= 1; shift++; }
+    while ((a & 1UL) == 0) a >>= 1;
+    while (b != 0)
+    {
+        while ((b & 1UL) == 0) b >>= 1;
+        if (a > b) { ulong s = a; a = b; b = s; }
+        b -= a;
+    }
+    return a << shift;
+}
+
+__kernel void parity_int64_binary(__global const long* restrict a, __global const long* restrict b, __global long* restrict y, int n,
+    int op, int t, __global ulong* flag)
+{
+    PARITY_INDEX
+    const long minValue = (long)0x8000000000000000UL;
+    long x = a[i], v = b[i], r;
+    switch (op)
+    {
+        case 0: r = x & v; break;
+        case 1: r = x | v; break;
+        case 2: r = x ^ v; break;
+        case 3: r = v >= 64 ? 0 : (long)((ulong)x << (v & 63)); break;
+        case 4: r = v >= 64 ? (x < 0 ? -1 : 0) : x >> (v & 63); break;
+        case 5:
+            if (x == minValue || v == minValue) { parity_flag(flag, (ulong)i, 2); return; }
+            r = (long)parity_gcd_u(parity_magnitude(x), parity_magnitude(v));
+            break;
+        case 6:
+        {
+            if (x == minValue || v == minValue) { parity_flag(flag, (ulong)i, 2); return; }
+            ulong g = parity_gcd_u(parity_magnitude(x), parity_magnitude(v));
+            ulong q = g == 0 ? 0 : parity_magnitude(x) / g;
+            long m = (long)((x < 0 ? (ulong)(-(long)q) : q) * (ulong)v);   // wraps, as C#
+            if (m == minValue) { parity_flag(flag, (ulong)i, 2); return; }
+            r = m < 0 ? -m : m;
+            break;
+        }
+        default:
+        {
+            if (v == 0) { parity_flag(flag, (ulong)i, 1); return; }
+            if (x == minValue && v == -1) { parity_flag(flag, (ulong)i, 2); return; }
+            ulong ax = parity_magnitude(x), av = parity_magnitude(v), q = ax / av;
+            r = ((x < 0) == (v < 0)) ? (long)q : -((long)q + (ax % av != 0 ? 1 : 0));
+            break;
+        }
+    }
+    y[i] = parity_int_narrow(r, t);
+}
+
+__kernel void parity_int64_not(__global const long* restrict a, __global long* restrict y, int n, int t)
+{ PARITY_INDEX y[i] = parity_int_narrow(~a[i], t); }
+
 // grid_sample 3-D adjoints, as the CPU's GridSample3DBackward; dx gathers w * dy from every point through a float
 // compare-and-swap add (points share voxels), dgrid is owned by its point's work item.
 double parity_grid_reflect_slope(double coord, int twiceLow, int twiceHigh, double* slope)
@@ -1272,7 +1350,7 @@ __kernel void parity_grid_sample_3d_backward(__global const float* restrict x, _
         "parity_dropout_affine", "parity_rrelu", "parity_random_keys",
         "parity_nonzero_static_scatter", "parity_unravel_axis", "parity_slice_bitonic_step", "parity_slice_first_flags",
         "parity_slice_gather_unique", "parity_grid_sample_3d", "parity_scan_block", "parity_scan_add", "parity_int_binary",
-        "parity_int_not", "parity_grid_sample_3d_backward",
+        "parity_int_not", "parity_grid_sample_3d_backward", "parity_int64_binary", "parity_int64_not",
     };
 }
 #endif

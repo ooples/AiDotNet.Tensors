@@ -14,18 +14,17 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// the same tensor for the same seed (and a different one for another seed), its structural invariants (support,
 /// permutations, masks), the CPU's exceptions for invalid parameters, device launches, and no host fallback.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class TorchParityRandomDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public abstract class TorchParityRandomDeviceTestsBase
 {
     private const int N = 200_000;
-    private readonly DirectGpuTensorEngineTestFixture _fixture;
-    public TorchParityRandomDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+    private readonly IDirectGpuTensorEngineFixture _fixture;
+    protected TorchParityRandomDeviceTestsBase(IDirectGpuTensorEngineFixture fixture) => _fixture = fixture;
 
     private DirectGpuTensorEngine GpuOrSkip()
     {
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels (CUDA, OpenCL and Vulkan do).");
+        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels.");
         return gpu;
     }
 
@@ -307,4 +306,18 @@ public class TorchParityRandomDeviceTests : IClassFixture<DirectGpuTensorEngineT
         Assert.InRange(channelsDropped / 2000.0, 0.25, 0.35);
         AssertSeeded(s => gpu.TensorChannelDropout(x, p, training: true, spatialDims: 2, seed: s));
     }
+}
+
+/// <summary>The cases above on the machine's default DirectGpu backend.</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityRandomDeviceTests : TorchParityRandomDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    public TorchParityRandomDeviceTests(DirectGpuTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+/// <summary>The cases above on the Vulkan backend (#1127).</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityRandomVulkanDeviceTests : TorchParityRandomDeviceTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
+{
+    public TorchParityRandomVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }

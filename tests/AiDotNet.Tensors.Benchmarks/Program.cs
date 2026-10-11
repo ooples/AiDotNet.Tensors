@@ -1390,6 +1390,13 @@ class Program
             return;
         }
 
+        // Vulkan fused Meshgrid2D against the composed route (#923)
+        if (args[0] == "--vulkan-meshgrid2d")
+        {
+            Environment.ExitCode = VulkanMeshgrid2DExperiment.Run();
+            return;
+        }
+
         // Run Vulkan backend diagnostics and bottleneck analysis
         if (args[0] == "--vulkan")
         {
@@ -1819,6 +1826,7 @@ class Program
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
+        Console.WriteLine("  --vulkan-meshgrid2d : Time the Vulkan fused Meshgrid2D route against the composed route");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");
         Console.WriteLine("  --webgpu   : Run WebGPU backend diagnostics (browser GPU compute)");
         Console.WriteLine("  --memory   : Run GPU memory transfer diagnostics");

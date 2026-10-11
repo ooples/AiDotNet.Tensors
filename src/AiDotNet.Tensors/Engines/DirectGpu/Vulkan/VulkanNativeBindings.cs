@@ -357,20 +357,6 @@ public static unsafe class VulkanNativeBindings
             ? vkEnumerateInstanceVersion_Windows(pApiVersion)
             : vkEnumerateInstanceVersion_Linux(pApiVersion);
 
-    [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceFeatures")]
-    private static extern void vkGetPhysicalDeviceFeatures_Windows(IntPtr physicalDevice, VkPhysicalDeviceFeatures* pFeatures);
-
-    [DllImport(VulkanLinux, EntryPoint = "vkGetPhysicalDeviceFeatures")]
-    private static extern void vkGetPhysicalDeviceFeatures_Linux(IntPtr physicalDevice, VkPhysicalDeviceFeatures* pFeatures);
-
-    public static void vkGetPhysicalDeviceFeatures(IntPtr physicalDevice, VkPhysicalDeviceFeatures* pFeatures)
-    {
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            vkGetPhysicalDeviceFeatures_Windows(physicalDevice, pFeatures);
-        else
-            vkGetPhysicalDeviceFeatures_Linux(physicalDevice, pFeatures);
-    }
-
     [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceFeatures2")]
     private static extern void vkGetPhysicalDeviceFeatures2_Windows(IntPtr physicalDevice, VkPhysicalDeviceFeatures2* pFeatures);
 
@@ -413,6 +399,33 @@ public static unsafe class VulkanNativeBindings
             vkGetPhysicalDeviceProperties_Windows(physicalDevice, pProperties);
         else
             vkGetPhysicalDeviceProperties_Linux(physicalDevice, pProperties);
+    }
+
+    [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceFeatures")]
+    private static extern void vkGetPhysicalDeviceFeatures_Windows(IntPtr physicalDevice, uint* pFeatures);
+
+    [DllImport(VulkanLinux, EntryPoint = "vkGetPhysicalDeviceFeatures")]
+    private static extern void vkGetPhysicalDeviceFeatures_Linux(IntPtr physicalDevice, uint* pFeatures);
+
+    /// <summary>Number of VkBool32 members in VkPhysicalDeviceFeatures.</summary>
+    public const int PhysicalDeviceFeatureCount = 55;
+
+    /// <summary>Index of VkPhysicalDeviceFeatures.shaderFloat64.</summary>
+    public const int FeatureShaderFloat64 = 39;
+
+    /// <summary>Index of VkPhysicalDeviceFeatures.shaderInt64.</summary>
+    public const int FeatureShaderInt64 = 40;
+
+    /// <summary>
+    /// Fills <paramref name="pFeatures"/> (<see cref="PhysicalDeviceFeatureCount"/> VkBool32 values, the layout of
+    /// VkPhysicalDeviceFeatures) with the features the physical device supports.
+    /// </summary>
+    public static void vkGetPhysicalDeviceFeatures(IntPtr physicalDevice, uint* pFeatures)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            vkGetPhysicalDeviceFeatures_Windows(physicalDevice, pFeatures);
+        else
+            vkGetPhysicalDeviceFeatures_Linux(physicalDevice, pFeatures);
     }
 
     [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceMemoryProperties")]
@@ -980,8 +993,8 @@ public static unsafe class VulkanNativeBindings
 
     public static void vkCmdDispatch(IntPtr commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ)
     {
-        // Every Vulkan compute dispatch passes here: count it as device work, as the CUDA launch and OpenCL enqueue
-        // choke points do, so residency probes see Vulkan kernels.
+        // The one place every Vulkan compute dispatch passes through: counted for the GPU-residency diagnostics, as
+        // the CUDA and OpenCL launch choke points are.
         GpuLaunchProbe.OnLaunch();
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             vkCmdDispatch_Windows(commandBuffer, groupCountX, groupCountY, groupCountZ);

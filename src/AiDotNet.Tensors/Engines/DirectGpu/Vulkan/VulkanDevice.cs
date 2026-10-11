@@ -51,6 +51,8 @@ public sealed unsafe class VulkanDevice : IDisposable
     private string _deviceName = string.Empty;
     private string _vendorName = string.Empty;
     private VkPhysicalDeviceLimits _limits;
+    private bool _shaderFloat64;
+    private bool _shaderInt64;
     private VkPhysicalDeviceMemoryProperties _memoryProperties;
 
     /// <summary>
@@ -151,6 +153,16 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// Gets the maximum storage buffer range.
     /// </summary>
     public uint MaxStorageBufferRange => _limits.maxStorageBufferRange;
+
+    /// <summary>
+    /// True when the device supports 64-bit floats in shaders (shaderFloat64) and the feature is enabled.
+    /// </summary>
+    public bool SupportsShaderFloat64 => _shaderFloat64;
+
+    /// <summary>
+    /// True when the device supports 64-bit integers in shaders (shaderInt64) and the feature is enabled.
+    /// </summary>
+    public bool SupportsShaderInt64 => _shaderInt64;
 
     /// <summary>
     /// Gets the total device-local memory in bytes by summing all device-local heaps.
@@ -630,7 +642,8 @@ public sealed unsafe class VulkanDevice : IDisposable
         // arithmetic, 64-bit buffer atomics and float atomic add. Using one in a shader without enabling it is invalid
         // usage that only lenient drivers tolerate. A shader needing an absent feature fails to build and its op falls back.
         VkPhysicalDeviceFeatures supported;
-        VulkanNativeBindings.vkGetPhysicalDeviceFeatures(_physicalDevice, &supported);
+        // VkPhysicalDeviceFeatures is the 55 VkBool32 words the binding fills.
+        VulkanNativeBindings.vkGetPhysicalDeviceFeatures(_physicalDevice, (uint*)&supported);
         VkPhysicalDeviceFeatures enabled = default;
         foreach (int feature in new[] { VkPhysicalDeviceFeatures.ShaderFloat64, VkPhysicalDeviceFeatures.ShaderInt64, VkPhysicalDeviceFeatures.ShaderInt16 })
             enabled.Bits[feature] = supported.Bits[feature];
@@ -638,6 +651,8 @@ public sealed unsafe class VulkanDevice : IDisposable
         Int64Supported = supported.Bits[VkPhysicalDeviceFeatures.ShaderInt64] != 0;
         Float64Enabled = enabled.Bits[VkPhysicalDeviceFeatures.ShaderFloat64] != 0;
         Int64Enabled = enabled.Bits[VkPhysicalDeviceFeatures.ShaderInt64] != 0;
+        _shaderFloat64 = Float64Enabled;
+        _shaderInt64 = Int64Enabled;
 
         const string AtomicInt64Extension = "VK_KHR_shader_atomic_int64";
         const string AtomicFloatExtension = "VK_EXT_shader_atomic_float";
