@@ -523,6 +523,39 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         }
     }
     [SkippableFact]
+    public void LastAxisWindows_MatchCpuExactly()
+    {
+        // Windows over the last axis only (the fused-QKV split): starts 0, inside and at the end, a ragged 3-D
+        // window and a single column. A non-zero start takes the one-launch row copy from a buffer view (#1106).
+        SkipIfNoDirectGpu();
+        var cases = new (int[] Shape, int[] Start, int[] Length)[]
+        {
+            (new[] { 33, 60 }, new[] { 0, 0 }, new[] { 33, 20 }),
+            (new[] { 33, 60 }, new[] { 0, 20 }, new[] { 33, 20 }),
+            (new[] { 33, 60 }, new[] { 0, 40 }, new[] { 33, 20 }),
+            (new[] { 2, 17, 60 }, new[] { 0, 0, 7 }, new[] { 2, 17, 13 }),
+            (new[] { 33, 60 }, new[] { 0, 59 }, new[] { 33, 1 }),
+        };
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            foreach (var (shape, start, length) in cases)
+            {
+                int n = 1; foreach (int s in shape) n *= s;
+                var x = new Tensor<float>(Enumerable.Range(0, n).Select(i => DeterministicValue(5 + i)).ToArray(), shape);
+                var cpu = new CpuEngine().TensorSlice(x, start, length).ToArray();
+                var gpu = Gpu.TensorSlice(x, start, length).ToArray();
+                Assert.Equal(cpu, gpu);
+            }
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+    }
+
+    [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
         SkipIfNoDirectGpu();

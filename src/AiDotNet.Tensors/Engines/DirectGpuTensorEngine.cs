@@ -26341,7 +26341,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Fast path of <see cref="TryDeviceRectSlice{T}"/> for the common case where only the LAST axis is narrowed
     /// (every leading axis taken in full): the source is a [rows, D] matrix and the result is columns
     /// [start, start + width). Uses O(width) single-launch kernels instead of one device copy per row:
-    /// width 1 is one strided gather; start 0 is one row-prefix copy; otherwise each column is gathered
+    /// width 1 is one strided gather; start 0 is one row-prefix copy, as is any start on a backend with buffer views
+    /// (a row copy from a view offset by the start); otherwise each column is gathered
     /// (width launches) into a [width, rows] buffer and transposed once into [rows, width]. All of these are
     /// IDirectGpuBackend kernels, so the fast path stays recordable.
     /// </summary>
@@ -26363,6 +26364,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (first == 0)
         {
             backend.CopyRows(input, output, full, width, rows, width);
+            return true;
+        }
+
+        // #1106: a window starting at column `first` is a row copy from a view offset by `first` -- one launch. (The
+        // column gather below issued 2 * width + 1 launches: splitting a fused [rows, 3 * D] QKV projection with
+        // D = 64 cost 128 kernel launches + device copies per transformer step.) Reads stay in bounds: the last is
+        // (rows - 1) * full + first + width - 1 < rows * full.
+        if (backend is IGpuBufferViews views && views.TryCreateView(input, first, input.Size - first) is { } window)
+        {
+            backend.CopyRows(window, output, full, width, rows, width);
             return true;
         }
 
