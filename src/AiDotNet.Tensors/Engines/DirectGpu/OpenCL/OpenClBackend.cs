@@ -900,9 +900,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 // PyTorch-parity elementwise kernels (#1126), built with strict IEEE math: they reproduce the CPU reference
                 // on NaN, infinity and -0 inputs, which the relaxed flags let the compiler assume away. Optional: they need
-                // cl_khr_fp64 and 64-bit atomics; on a
-                // device without them the module fails to build, the kernels stay absent, each launch throws and the
-                // engine records its host fallback. Program and kernels are committed together.
+                // cl_khr_fp64 and 64-bit atomics; on a device without them the module fails to build, the kernels stay
+                // absent, each launch throws and the engine records its host fallback. Program and kernels are committed
+                // together.
                 try
                 {
                     var torchParityProgram = CompileOrLoadCached(OpenClTorchParityElementwiseKernels.GetSource(), OpenClBuildOptions.StrictMathFlags, "Torch parity elementwise kernels");

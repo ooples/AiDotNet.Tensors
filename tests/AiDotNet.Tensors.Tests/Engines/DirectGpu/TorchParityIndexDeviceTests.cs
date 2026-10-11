@@ -25,7 +25,7 @@ public class TorchParityIndexDeviceTests : IClassFixture<DirectGpuTensorEngineTe
     {
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "These device kernels are CUDA-only.");
+        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels (CUDA, OpenCL and Vulkan do).");
         return gpu;
     }
 

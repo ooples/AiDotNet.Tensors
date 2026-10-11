@@ -17,9 +17,9 @@ internal enum TorchParityBinaryOp { Fmax, Fmin, Heaviside, GreaterEqual, LessEqu
 /// a backend without it keeps the recorded host fallback (<c>GpuLaunchProbe.OnFallback</c>).
 /// </summary>
 /// <remarks>
-/// Implemented by the CUDA backend. Not yet implemented, each tracked by its own follow-up issue: HIP (#1124),
-/// Metal (#1125), OpenCL (#1126), Vulkan (#1127) and WebGPU (#1128). Until then those backends compute these ops on
-/// the host.
+/// Implemented by the CUDA, OpenCL (#1126) and Vulkan (#1127) backends. Not yet implemented, each tracked by its own
+/// follow-up issue: HIP (#1124), Metal (#1125) and WebGPU (#1128). Until then those backends compute these ops on the
+/// host.
 /// </remarks>
 internal interface ITorchParityElementwiseBackend
 {
