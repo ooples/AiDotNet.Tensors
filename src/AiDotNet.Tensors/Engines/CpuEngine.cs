@@ -3235,8 +3235,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // FMA on net8+). Beats TensorPrimitives by 1.0-1.04× on every
             // tracked DiT-XL shape — same kernel family that beat MKL on
             // the iter18c sweep.
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep1 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep1 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep1 = new KeepAliveScope(result);
             var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -3254,8 +3256,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house: pin logical memory and call SimdKernels.VectorAddUnsafe(double*).
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep2 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep2 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep2 = new KeepAliveScope(result);
             var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -3361,8 +3365,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep3 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep3 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -3390,8 +3396,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // VectorAddUnsafe pattern, dgemm-equivalent throughput on AVX2.
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep4 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep4 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -3450,8 +3458,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep5 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep5 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep1 = new KeepAliveScope(destination);
             var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -3464,8 +3474,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep6 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep6 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep2 = new KeepAliveScope(destination);
             var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -3542,8 +3554,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numeric = MathHelper.GetNumericOperations<T>();
-            var inputSpan = input.ReadOnlyData.Span;
-            var biasSpan = bias.ReadOnlyData.Span;
+            using var inputDataKeep1 = new KeepAliveScope(input);
+            var inputSpan = input.ReadOnlyDataUnmarked.Span;
+            using var biasDataKeep1 = new KeepAliveScope(bias);
+            var biasSpan = bias.ReadOnlyDataUnmarked.Span;
             using var resultDataKeep3 = new KeepAliveScope(result);
             var resultSpan = result.DataUnmarked.Span;
             for (int batch = 0; batch < batchCount; batch++)
@@ -4295,7 +4309,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         using var aDataKeep1 = new KeepAliveScope(a);
         var aSpan = a.DataUnmarked.Span;
-        var bSpan = b.ReadOnlyData.Span;
+        using var bDataKeep7 = new KeepAliveScope(b);
+        var bSpan = b.ReadOnlyDataUnmarked.Span;
 
         // Fast path: same shape — no broadcasting needed
         if (ShapesMatch(a._shape, b._shape))
@@ -4477,11 +4492,14 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Input and affine parameters are read-only. Pinning through Data would
             // privatize every COW peer during compiled GroupNorm replay.
-            using var pinIn = input.ReadOnlyData.Pin();
+            using var inputDataKeep2 = new KeepAliveScope(input);
+            using var pinIn = input.ReadOnlyDataUnmarked.Pin();
             using var outputDataKeep1 = new KeepAliveScope(output);
             using var pinOut = output.DataUnmarked.Pin();
-            using var pinGamma = gamma.ReadOnlyData.Pin();
-            using var pinBeta = beta.ReadOnlyData.Pin();
+            using var gammaDataKeep1 = new KeepAliveScope(gamma);
+            using var pinGamma = gamma.ReadOnlyDataUnmarked.Pin();
+            using var betaDataKeep1 = new KeepAliveScope(beta);
+            using var pinBeta = beta.ReadOnlyDataUnmarked.Pin();
             unsafe
             {
                 float epsF = (float)epsilon;
@@ -5559,8 +5577,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep7 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep8 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep21 = new KeepAliveScope(destination);
             var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -5570,8 +5590,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep8 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep9 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep22 = new KeepAliveScope(destination);
             var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -5601,8 +5623,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep9 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep10 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep23 = new KeepAliveScope(destination);
             var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -5612,8 +5636,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep10 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep11 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep24 = new KeepAliveScope(destination);
             var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -5976,8 +6002,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house SIMD: pin logical memory, then use JIT or
             // VectorSubtractUnsafe (4× unrolled AVX2/AVX-512 with FMA).
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep11 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep12 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep11 = new KeepAliveScope(result);
             var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -5993,8 +6021,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house: pin logical memory and call VectorSubtractUnsafe(double*).
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep12 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep13 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep12 = new KeepAliveScope(result);
             var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -6117,8 +6147,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep13 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep14 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep13 = new KeepAliveScope(result);
             var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -6133,8 +6165,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep14 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep15 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep14 = new KeepAliveScope(result);
             var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -6230,8 +6264,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep15 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep16 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -6256,8 +6292,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep16 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep17 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -6316,8 +6354,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep17 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep18 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep37 = new KeepAliveScope(destination);
             var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -6327,8 +6367,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep18 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep19 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var destinationDataKeep38 = new KeepAliveScope(destination);
             var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -6811,8 +6853,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep19 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep20 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep15 = new KeepAliveScope(result);
             var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -6827,8 +6871,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep20 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep21 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var resultDataKeep16 = new KeepAliveScope(result);
             var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
@@ -9504,7 +9550,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Float fast path: direct array access with specialized inner loops
-        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
+        // The arrays feed only the synchronous kernels below; the scopes keep input and result alive while they do.
+        using var maxPoolInputKeep = new KeepAliveScope(input);
+        using var maxPoolResultKeep = new KeepAliveScope(result);
+        if (typeof(T) == typeof(float) && input.GetDataArrayUnmarked() is float[] inArr && result.GetDataArrayUnmarked() is float[] outArr)
         {
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
@@ -9538,7 +9587,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // 3x3 maxpool over 1×64×112×112 hits this op once per train iter
         // backward + forward; the generic numOps path was paying ~9
         // GreaterThan + 9 ToDouble / output cell.
-        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && result.GetDataArray() is double[] outArrD)
+        if (typeof(T) == typeof(double) && input.GetDataArrayUnmarked() is double[] inArrD && result.GetDataArrayUnmarked() is double[] outArrD)
         {
             int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
             int psD = poolSize, stD = stride, pdD = padding;
@@ -9655,7 +9704,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Float fast paths
-        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        using var inputArrayKeep9706 = new KeepAliveScope(input);
+        using var outputArrayKeep9706 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(float) && input.GetDataArrayUnmarked() is float[] inArr && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int bc = batch * channels;
             int ps = poolSize, st = stride, pd = padding;
@@ -9669,7 +9720,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path: direct double arithmetic with batch×channel parallelism,
         // bypassing the per-element numOps virtual dispatch. Mirrors the allocating
         // MaxPool2D's double path that VGG / ResNet / DenseNet hit on every pool layer.
-        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        using var inputArrayKeep9720 = new KeepAliveScope(input);
+        using var outputArrayKeep9720 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(double) && input.GetDataArrayUnmarked() is double[] inArrD && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
             int psD = poolSize, stD = stride, pdD = padding;
@@ -9775,7 +9828,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Float fast path
-        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        using var inputArrayKeep9826 = new KeepAliveScope(input);
+        using var outputArrayKeep9826 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(float) && input.GetDataArrayUnmarked() is float[] inArr && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
@@ -9824,7 +9879,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // parallel partition, but without the per-element numOps virtual dispatch.
         // Used by ResNet's global-average-pool final step and by GAP blocks in
         // various CV architectures running fp64.
-        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        using var inputArrayKeep9875 = new KeepAliveScope(input);
+        using var outputArrayKeep9875 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(double) && input.GetDataArrayUnmarked() is double[] inArrD && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
@@ -10837,8 +10894,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int inputImage = inChannels * height * width;
         int outputImage = outChannels * colW;
-        using var pinIn = input.ReadOnlyData.Pin();
-        using var pinK = kernel.ReadOnlyData.Pin();
+        using var inputDataKeep3 = new KeepAliveScope(input);
+        using var pinIn = input.ReadOnlyDataUnmarked.Pin();
+        using var kernelDataKeep1 = new KeepAliveScope(kernel);
+        using var pinK = kernel.ReadOnlyDataUnmarked.Pin();
         using var resultDataKeep39 = new KeepAliveScope(result);
         using var pinOut = result.DataUnmarked.Pin();
         nint pIn = (nint)pinIn.Pointer, pK = (nint)pinK.Pointer, pOut = (nint)pinOut.Pointer;
@@ -13326,10 +13385,32 @@ public partial class CpuEngine : ITensorLevelEngine
         // Return a contiguous transposed copy for API compatibility.
         // The lazy graph path uses a more efficient execute delegate.
         Tensor<T> result;
-        using (DifferentiableOps.SuppressTensorViewRecording())
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
         {
-            var view = tensor.Transpose();
-            result = view.Contiguous();
+            // Tiled SIMD transpose into a pooled result. Contiguous() of the strided view copied element by element
+            // (5.9 ms for 1024x1024 float) and read the source through a raw accessor, which kept large results from
+            // being recycled.
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            result = TensorAllocator.RentUninitialized<T>(new[] { cols, rows });
+            using var sourceKeep = new KeepAliveScope(source);
+            using var resultKeep = new KeepAliveScope(result);
+            if (typeof(T) == typeof(float))
+                SimdTranspose.Transpose(
+                    ((Tensor<float>)(object)source).AsSpanUnmarked(), ((Tensor<float>)(object)result).AsWritableSpanUnmarked(), rows, cols);
+            else
+                SimdTranspose.Transpose(
+                    ((Tensor<double>)(object)source).AsSpanUnmarked(), ((Tensor<double>)(object)result).AsWritableSpanUnmarked(), rows, cols);
+        }
+        else
+#endif
+        {
+            using (DifferentiableOps.SuppressTensorViewRecording())
+            {
+                var view = tensor.Transpose();
+                result = view.Contiguous();
+            }
         }
         DifferentiableOps.RecordUnary("TensorTranspose", result, tensor, BackwardFunctions<T>.TransposeBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorTranspose", result, eng => eng.TensorTranspose(c)); }
@@ -28478,11 +28559,14 @@ public partial class CpuEngine : ITensorLevelEngine
             // Pin all memory to get float* pointers (works with both managed and NativeMemory).
             // COW Stage 2 (#624): input/gamma/beta are read-only — pin via the non-privatizing
             // ReadOnlyData so a cloned model's shared norm weights stay O(1); only pinOut writes.
-            using var pinIn = input.ReadOnlyData.Pin();
+            using var inputDataKeep4 = new KeepAliveScope(input);
+            using var pinIn = input.ReadOnlyDataUnmarked.Pin();
             using var resultDataKeep60 = new KeepAliveScope(result);
             using var pinOut = result.DataUnmarked.Pin();
-            using var pinGamma = gamma.ReadOnlyData.Pin();
-            using var pinBeta = beta.ReadOnlyData.Pin();
+            using var gammaDataKeep2 = new KeepAliveScope(gamma);
+            using var pinGamma = gamma.ReadOnlyDataUnmarked.Pin();
+            using var betaDataKeep2 = new KeepAliveScope(beta);
+            using var pinBeta = beta.ReadOnlyDataUnmarked.Pin();
             unsafe
             {
                 GroupNormFloatPtr(
@@ -35084,9 +35168,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int newHeight = height * scaleH;
         int newWidth = width * scaleW;
 
+        using var inputArrayKeep35163 = new KeepAliveScope(input);
+        using var outputArrayKeep35164 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int h = height, w = width, sH = scaleH, sW = scaleW, nH = newHeight, nW = newWidth;
             Action<int> kernel = [MethodImpl(Hot)] (fb) =>
@@ -35334,9 +35420,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int newHeight = height * r;
         int newWidth = width * r;
 
+        using var inputArrayKeep35413 = new KeepAliveScope(input);
+        using var outputArrayKeep35414 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int totalBOC = batch * newChannels;
             int hh = height, ww = width, oH = newHeight, oW = newWidth, rr = r, ch = channels;
@@ -36073,9 +36161,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (top < 0 || left < 0 || top + height > inputHeight || left + width > inputWidth)
             throw new ArgumentException("Crop region is out of bounds");
 
+        using var inputArrayKeep36152 = new KeepAliveScope(input);
+        using var outputArrayKeep36153 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int totalBC = batch * channels;
             int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
@@ -36094,9 +36184,11 @@ public partial class CpuEngine : ITensorLevelEngine
             CpuParallelSettings.ParallelForOrSerial(0, totalBC, (long)totalBC * oH * oW, kernel);
             return;
         }
+        using var inputArrayKeep36173 = new KeepAliveScope(input);
+        using var outputArrayKeep36174 = new KeepAliveScope(output);
         if (typeof(T) == typeof(double)
-            && input.GetDataArray() is double[] inArrD
-            && output.GetDataArray() is double[] outArrD)
+            && input.GetDataArrayUnmarked() is double[] inArrD
+            && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int totalBC = batch * channels;
             int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
@@ -36242,9 +36334,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int batchSize = 1;
         for (int i = 0; i < rank - 2; i++) batchSize *= shape[i];
 
+        using var inputArrayKeep36321 = new KeepAliveScope(input);
+        using var outputArrayKeep36322 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             float padF = padValue is float fv ? fv : 0f;
             // Fast fill: Array.Clear if zero pad, scalar fill otherwise.
@@ -36272,9 +36366,11 @@ public partial class CpuEngine : ITensorLevelEngine
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * h * w, kernel);
             return;
         }
+        using var inputArrayKeep36351 = new KeepAliveScope(input);
+        using var outputArrayKeep36352 = new KeepAliveScope(output);
         if (typeof(T) == typeof(double)
-            && input.GetDataArray() is double[] inArrD
-            && output.GetDataArray() is double[] outArrD)
+            && input.GetDataArrayUnmarked() is double[] inArrD
+            && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             double padD = padValue is double dv ? dv : 0.0;
             if (padD == 0.0)
@@ -45435,8 +45531,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<float>(a._shape);
-        using var pinA = a.ReadOnlyData.Pin();
-        using var pinB = b.ReadOnlyData.Pin();
+        using var aDataKeep21 = new KeepAliveScope(a);
+        using var pinA = a.ReadOnlyDataUnmarked.Pin();
+        using var bDataKeep22 = new KeepAliveScope(b);
+        using var pinB = b.ReadOnlyDataUnmarked.Pin();
         using var resultDataKeep65 = new KeepAliveScope(result);
         using var pinR = result.DataUnmarked.Pin();
         nint pa = (nint)pinA.Pointer, pb = (nint)pinB.Pointer, pr = (nint)pinR.Pointer;
@@ -47071,9 +47169,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
+            using var inputArrayKeep47152 = new KeepAliveScope(input);
+            using var outputArrayKeep47153 = new KeepAliveScope(output);
             if (typeof(T) == typeof(float)
-                && input.GetDataArray() is float[] inArrG
-                && output.GetDataArray() is float[] outArrG)
+                && input.GetDataArrayUnmarked() is float[] inArrG
+                && output.GetDataArrayUnmarked() is float[] outArrG)
             {
                 int totalChannelsG = batch * channels;
                 int spatialG = inHeight * inWidth;
@@ -48964,9 +49064,11 @@ public partial class CpuEngine : ITensorLevelEngine
             fwArr[ow] = Math.Max(0.0, srcW - w0); // clamp to >= 0 (see fhArr above): PyTorch align_corners=False.
         }
 
+        using var inputArrayKeep49045 = new KeepAliveScope(input);
+        using var outputArrayKeep49046 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int total = n * c;
             int hh = h, ww = w, oH = outH, oW = outW;
@@ -49004,9 +49106,11 @@ public partial class CpuEngine : ITensorLevelEngine
             CpuParallelSettings.LightweightParallel(total, bilinearWork, kernel);
             return;
         }
+        using var inputArrayKeep49085 = new KeepAliveScope(input);
+        using var outputArrayKeep49086 = new KeepAliveScope(output);
         if (typeof(T) == typeof(double)
-            && input.GetDataArray() is double[] inArrD
-            && output.GetDataArray() is double[] outArrD)
+            && input.GetDataArrayUnmarked() is double[] inArrD
+            && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int total = n * c;
             int hh = h, ww = w, oH = outH, oW = outW;

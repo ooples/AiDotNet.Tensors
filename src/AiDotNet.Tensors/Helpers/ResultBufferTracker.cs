@@ -79,20 +79,27 @@ internal static class ResultBufferTracker
     private static readonly object s_lock = new();
     private static readonly Dictionary<Array, Entry> s_byArray = new(ArrayIdentity.Instance);
     private static readonly Dictionary<(Type, int), List<Entry>> s_bySize = new();
+    // When each size group was last asked for (TakeFreeOnce), for TrimFree. Keyed by the group list itself.
+    private static readonly Dictionary<List<Entry>, long> s_groupAsked = new();
+    private static long s_askTick;
     private static int s_count;
     private static long s_trackedBytes;
 
-    // Collection pacing: fresh large bytes allocated (misses with nothing free) since the last gen-0 collection, natural
-    // or induced. Once they pass CollectBudgetBytes, the next miss collects and looks again, so fresh allocation between
-    // collections stays bounded. (Pacing on TOTAL tracked bytes let the mark run away: tracked arrays reached the cap
+    // Collection pacing: large bytes handed to results (reused and fresh) since the last gen-0 collection, natural or
+    // induced. Once they pass CollectBudgetBytes, the next miss collects and looks again, so fresh allocation between
+    // collections stays bounded. Counting reused bytes too is what lets a steady loop run on reuse alone: counting only
+    // fresh bytes restarted every cycle with a full budget of fresh arrays after the freed ones ran out, which held a
+    // maxpool loop at 48% reuse. (Pacing on TOTAL tracked bytes let the mark run away: tracked arrays reached the cap
     // with no collection, and 46% of results were fresh.) The generation escalates while a collection frees nothing of
     // the size asked for (owners promoted past gen 0 need a deeper one) and resets once one does.
-    private static long s_freshSinceCollect;
+    private static long s_issuedSinceCollect;
     private static int s_lastGen0 = -1;
-    private static int s_collectGeneration;
-    // Backoff: a collection that freed nothing usable doubles the budget for the next one (up to 32x), so a workload
-    // whose large results all escape, or that holds them, does not pay a collection every few calls. Reset on success.
-    private static int s_budgetShift;
+    // Backoff, per (element type, length): a collection that freed nothing of that size doubles that size's budget for
+    // the next one (up to 32x) and takes it to gen 1, so a workload that holds or escapes its results of one size does
+    // not pay a collection every few calls. Reset once that size is reused. Per size, because one process-wide shift let
+    // one op family that held its results (conv2d) push the budget to 32x for every other size: maxpool then reused 3%.
+    private static readonly Dictionary<(Type, int), int> s_backoff = new();
+    private static int s_backoffCount;
 
     /// <summary>Whether result recycling is active (off on .NET Framework, where large results are not pooled).</summary>
     internal static readonly bool Enabled =
@@ -257,40 +264,60 @@ internal static class ResultBufferTracker
             return TakeFreeOnce<T>(length);
         }
 
+        long bytes = (long)length * Unsafe.SizeOf<T>();
+        var key = (typeof(T), length);
         var array = TakeFreeOnce<T>(length);
-        if (array is not null) return array;
+        if (array is not null)
+        {
+            IssuedSinceCollect(bytes);
+            if (Volatile.Read(ref s_backoffCount) != 0) SetBackoff(key, 0);
+            return array;
+        }
+        int shift = GetBackoff(key);
+        if (IssuedSinceCollect(bytes) < (CollectBudgetBytes << shift)) return null;
 
-        // A collection since the last look (natural or induced) restarts the fresh-bytes count.
+        // Freed nothing of this size last time: the dead owners may be older than gen 0, so this one includes gen 1.
+        // Never gen 2: a full collection costs too much in a large heap (an inference loop whose results all escaped
+        // paid 0.35 ms per call that way) and the GC runs gen 2 on its own schedule anyway.
+        GC.Collect(shift > 0 ? 1 : 0, GCCollectionMode.Forced, blocking: true);
+        Interlocked.Increment(ref InducedCollections);
+        Volatile.Write(ref s_lastGen0, GC.CollectionCount(0));
+        Interlocked.Exchange(ref s_issuedSinceCollect, 0);
+        array = TakeFreeOnce<T>(length);
+        SetBackoff(key, array is not null ? 0 : Math.Min(5, shift + 1));
+        TrimFree();
+        return array;
+    }
+
+    private static int GetBackoff((Type, int) key)
+    {
+        if (Volatile.Read(ref s_backoffCount) == 0) return 0;
+        lock (s_lock) return s_backoff.TryGetValue(key, out int shift) ? shift : 0;
+    }
+
+    private static void SetBackoff((Type, int) key, int shift)
+    {
+        lock (s_lock)
+        {
+            if (shift == 0) s_backoff.Remove(key);
+            else s_backoff[key] = shift;
+            Volatile.Write(ref s_backoffCount, s_backoff.Count);
+        }
+    }
+
+    /// <summary>
+    /// Adds <paramref name="bytes"/> handed to a large result, reused or fresh, to the count since the last gen-0
+    /// collection (natural or induced, either restarts it) and returns the new count.
+    /// </summary>
+    private static long IssuedSinceCollect(long bytes)
+    {
         int gen0 = GC.CollectionCount(0);
         if (gen0 != Volatile.Read(ref s_lastGen0))
         {
             Volatile.Write(ref s_lastGen0, gen0);
-            Interlocked.Exchange(ref s_freshSinceCollect, 0);
+            Interlocked.Exchange(ref s_issuedSinceCollect, 0);
         }
-        long bytes = (long)length * Unsafe.SizeOf<T>();
-        if (Interlocked.Add(ref s_freshSinceCollect, bytes) < (CollectBudgetBytes << Volatile.Read(ref s_budgetShift))) return null;
-
-        int generation = Volatile.Read(ref s_collectGeneration);
-        GC.Collect(generation, GCCollectionMode.Forced, blocking: true);
-        Interlocked.Increment(ref InducedCollections);
-        Volatile.Write(ref s_lastGen0, GC.CollectionCount(0));
-        Interlocked.Exchange(ref s_freshSinceCollect, 0);
-        array = TakeFreeOnce<T>(length);
-        // Freed nothing of this size: the dead owners may be older than gen 0, so the next collection includes gen 1, and
-        // waits twice as long. Never gen 2: a full collection costs too much in a large heap (an inference loop whose
-        // results all escaped paid 0.35 ms per call that way) and the GC runs gen 2 on its own schedule anyway.
-        if (array is not null)
-        {
-            Volatile.Write(ref s_collectGeneration, 0);
-            Volatile.Write(ref s_budgetShift, 0);
-        }
-        else
-        {
-            Volatile.Write(ref s_collectGeneration, 1);
-            Volatile.Write(ref s_budgetShift, Math.Min(5, Volatile.Read(ref s_budgetShift) + 1));
-        }
-        TrimFree();
-        return array;
+        return Interlocked.Add(ref s_issuedSinceCollect, bytes);
     }
 
     private static T[]? TakeFreeOnce<T>(int length)
@@ -299,6 +326,7 @@ internal static class ResultBufferTracker
         lock (s_lock)
         {
             if (!s_bySize.TryGetValue((typeof(T), length), out var group)) return null;
+            s_groupAsked[group] = ++s_askTick;
             for (int i = group.Count - 1; i >= 0; i--)
             {
                 var candidate = group[i];
@@ -336,7 +364,14 @@ internal static class ResultBufferTracker
                 (candidates ??= new List<Entry>()).Add(entry);
             }
             if (free <= FreeCapBytes || candidates is null) return;
-            candidates.Sort((x, y) => y.Bytes.CompareTo(x.Bytes));
+            // Sizes asked for least recently go first (never asked: first of all), largest first among equals. Largest
+            // first alone dropped the arrays of the biggest size still in use (a 1024x1024 transpose reused 19% of its
+            // results) while sizes no op asks for any more kept their free arrays.
+            candidates.Sort((x, y) =>
+            {
+                long ax = s_groupAsked.TryGetValue(x.Group, out var tx) ? tx : 0, ay = s_groupAsked.TryGetValue(y.Group, out var ty) ? ty : 0;
+                return ax != ay ? ax.CompareTo(ay) : y.Bytes.CompareTo(x.Bytes);
+            });
             foreach (var entry in candidates)
             {
                 if (free <= FreeCapBytes) break;
@@ -350,6 +385,12 @@ internal static class ResultBufferTracker
     {
         entry.Owner.Free();
         entry.Group.Remove(entry);
+        if (entry.Group.Count == 0)
+        {
+            // Drop the empty group, so a run through many shapes does not keep a group per shape it ever saw.
+            s_bySize.Remove((entry.Array.GetType().GetElementType()!, entry.Array.Length));
+            s_groupAsked.Remove(entry.Group);
+        }
         s_byArray.Remove(entry.Array);
         s_trackedBytes -= entry.Bytes;
         s_count--;

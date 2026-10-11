@@ -1751,6 +1751,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
     }
 
+    /// <summary>
+    /// <see cref="ReadOnlyData"/> without the escape mark, under the same rule as <see cref="DataUnmarked"/>: the caller
+    /// keeps this tensor alive while it uses the memory and does not let the memory outlive that scope.
+    /// </summary>
+    internal ReadOnlyMemory<T> ReadOnlyDataUnmarked
+    {
+        get
+        {
+            EnsureMaterialized();
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            if (_storageOffset == 0 && _storage.Length == Length)
+                return _storage.AsReadOnlyMemoryUnmarked();
+            return _storage.AsReadOnlyMemoryUnmarked().Slice(_storageOffset, Length);
+        }
+    }
+
     // ================================================================
     // Constructors
     // ================================================================

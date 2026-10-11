@@ -334,6 +334,9 @@ internal sealed class TensorStorage<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal ReadOnlyMemory<T> AsReadOnlyMemory() => _data.AsMemory();
 
+    /// <summary><see cref="AsReadOnlyMemory"/> without the escape mark; see <see cref="VectorBase{T}.AsWritableMemoryUnmarked"/>.</summary>
+    internal ReadOnlyMemory<T> AsReadOnlyMemoryUnmarked() => _data.AsMemoryUnmarked();
+
     /// <summary>
     /// Gets the underlying data as a writable span.
     /// </summary>

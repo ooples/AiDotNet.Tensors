@@ -664,6 +664,13 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
         return _memory;
     }
 
+    /// <summary><see cref="AsMemory"/> without the escape mark; see <see cref="AsWritableMemoryUnmarked"/>.</summary>
+    internal ReadOnlyMemory<T> AsMemoryUnmarked()
+    {
+        EnsureMaterialized();
+        return _memory;
+    }
+
     /// <summary>
     /// Gets a writable memory view of the vector's data without copying.
     /// </summary>

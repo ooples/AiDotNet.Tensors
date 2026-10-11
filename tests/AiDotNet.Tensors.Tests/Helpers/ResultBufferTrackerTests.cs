@@ -183,6 +183,100 @@ public sealed class ResultBufferTrackerTests
     }
 }
 
+/// <summary>
+/// Collection pacing of <see cref="ResultBufferTracker"/> in loops that discard their results: after warm-up a steady
+/// loop runs on reuse, a size whose results are held does not slow reuse of other sizes, and trimming the free arrays
+/// keeps the sizes still being asked for. Each test uses sizes no other test uses, since the backoff is kept per size.
+/// </summary>
+[Collection(ResultBufferTrackerCollection.Name)]
+public sealed class ResultBufferTrackerPacingTests
+{
+    private static Matrix<double> Square(int n)
+    {
+        var m = new Matrix<double>(n, n);
+        var span = m.AsWritableSpanUnmarked();
+        for (int i = 0; i < span.Length; i++) span[i] = i;
+        return m;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Discard(Matrix<double> source) => GC.KeepAlive(source.Multiply(2.0));
+
+    // Fraction of `measured` discarded results that reused an array, after `warm` unmeasured ones.
+    private static double ReusedFraction(Matrix<double> source, int warm, int measured)
+    {
+        for (int i = 0; i < warm; i++) Discard(source);
+        long before = ResultBufferTracker.ReusedArrays;
+        for (int i = 0; i < measured; i++) Discard(source);
+        return (ResultBufferTracker.ReusedArrays - before) / (double)measured;
+    }
+
+    private static void WithSettings(long collectBudget, long freeCap, Action body)
+    {
+        long savedBudget = ResultBufferTracker.CollectBudgetBytes, savedCap = ResultBufferTracker.FreeCapBytes;
+        bool savedStress = ResultBufferTracker.Stress;
+        ResultBufferTracker.CollectBudgetBytes = collectBudget;
+        ResultBufferTracker.FreeCapBytes = freeCap;
+        ResultBufferTracker.Stress = false;   // stress collects on every miss, which is not the pacing under test
+        try { body(); }
+        finally
+        {
+            ResultBufferTracker.CollectBudgetBytes = savedBudget;
+            ResultBufferTracker.FreeCapBytes = savedCap;
+            ResultBufferTracker.Stress = savedStress;
+        }
+    }
+
+    [Fact]
+    public void SteadyLoop_RunsOnReuse_AfterWarmUp()
+    {
+        // Pacing on fresh bytes alone gave each cycle a full budget of fresh arrays once the freed ones ran out: about
+        // half the results of a steady loop were fresh, however long it ran.
+        WithSettings(8L << 20, 64L << 20, () =>
+        {
+            var source = Square(410);                       // 1.3 MB results
+            double reused = ReusedFraction(source, warm: 40, measured: 200);
+            Assert.True(reused > 0.9, $"a steady loop reused {reused:P0} of its results after warm-up");
+        });
+    }
+
+    [Fact]
+    public void HeldResultsOfOneSize_DoNotSlowReuseOfAnother()
+    {
+        // One process-wide backoff let a size whose results were held (every collection for it freed nothing) push the
+        // collection budget to 32x for every size: a maxpool loop after a conv2d loop reused 3% of its results.
+        WithSettings(4L << 20, 64L << 20, () =>
+        {
+            // 100 held results of 1.4 MB: the collections asked for this size free nothing at 4, 12, 28, 60 and 124 MB,
+            // which takes its backoff to the 32x cap.
+            var held = new List<Matrix<double>>();
+            var heldSource = Square(420);
+            for (int i = 0; i < 100; i++) held.Add(heldSource.Multiply(2.0));
+
+            var source = Square(430);                       // 1.5 MB results, discarded
+            double reused = ReusedFraction(source, warm: 10, measured: 200);
+            GC.KeepAlive(held);
+            Assert.True(reused > 0.9, $"after another size's results were held, this size reused {reused:P0} of its results");
+        });
+    }
+
+    [Fact]
+    public void Trim_KeepsTheSizeStillInUse_OverSizesNoLongerAskedFor()
+    {
+        // Trimming largest-first dropped the arrays of the biggest size still in use (a 1024x1024 transpose reused 19%)
+        // while free arrays of sizes nobody asked for any more stayed.
+        WithSettings(8L << 20, 12L << 20, () =>
+        {
+            var stale = Square(400);                        // 1.25 MB results, discarded once and never asked for again
+            for (int i = 0; i < 12; i++) Discard(stale);
+
+            var source = Square(700);                       // 3.9 MB results, the largest size, in steady use
+            double reused = ReusedFraction(source, warm: 30, measured: 120);
+            Assert.True(reused > 0.8, $"the largest size in use reused {reused:P0} of its results with stale sizes free");
+        });
+    }
+}
+
 internal static class ResultBufferTrackerTestExtensions
 {
     // The backing array of a matrix or vector, read without marking it escaped (test-only identity checks).

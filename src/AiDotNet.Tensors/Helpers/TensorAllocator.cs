@@ -486,12 +486,13 @@ public static class TensorAllocator
             return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
         }
 
-        // Tier 3: pooled sizes get an exact-size array marked as pooled, so Return can recycle it.
+        // Tier 3: pooled sizes get an exact-size array marked as pooled, so Return can recycle it. A large miss
+        // takes the array of a collected result first (ResultBufferTracker), cleared for Rent's zero-init contract.
         if (UsesArrayPool<T>(totalSize))
         {
             MemoryProfiler.RecordAllocation(
                 "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
-            T[] pooled = new T[totalSize];
+            T[] pooled = RentExactArray<T>(totalSize, zeroed: true);
             return Tensor<T>.FromPooledMemory(new Memory<T>(pooled), shape, pooled);
         }
 
