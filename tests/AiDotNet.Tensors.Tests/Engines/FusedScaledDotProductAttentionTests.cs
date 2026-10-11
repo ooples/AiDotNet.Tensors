@@ -31,7 +31,7 @@ public class FusedScaledDotProductAttentionTests
     {
         var rng = new Random(salt);
         var m = new Tensor<bool>(shape);
-        int keys = shape[^1];
+        int keys = shape[shape.Length - 1];
         for (int i = 0; i < m.Length; i++) m[i] = rng.NextDouble() < 0.6 || i % keys == (i / keys) % keys;
         return m;
     }
