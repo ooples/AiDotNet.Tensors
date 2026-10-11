@@ -3721,9 +3721,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var aSpan = a.AsSpan();
-        var bSpan = b.AsSpan();
-        var rSpan = r.AsWritableSpan();
+        using var aSpanLease = a.Lease();
+        var aSpan = aSpanLease.Span;
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
+        using var rSpanLease = r.LeaseWritable();
+        var rSpan = rSpanLease.Span;
         for (int t = 0; t < numTiles; t++)
         {
             int off = t * tile;
