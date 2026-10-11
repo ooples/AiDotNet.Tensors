@@ -40,6 +40,9 @@ internal interface IFusedAttentionBackend
 public sealed partial class CudaBackend : IFusedAttentionBackend
 {
     private IntPtr _fusedAttentionModule;
+
+    // Query rows per forward block: FA_BR in CudaFusedAttentionKernels (4 threads each).
+    private const int FaForwardRows = 32;
     private string? _fusedAttentionCompileError;
 
     // Compiled with the rest of the backend; a failure leaves the capability off rather than failing startup.
@@ -91,7 +94,7 @@ public sealed partial class CudaBackend : IFusedAttentionBackend
         var args0 = p;
         void** args = stackalloc void*[7];
         args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &po; args[4] = &pl; args[5] = &pm; args[6] = &args0;
-        LaunchKernel2D(kernel, (uint)((p.Sq + 63) / 64), (uint)(p.B * p.H), 256, 1, args);   // FA_BR = 64 rows x 4 threads
+        LaunchKernel2D(kernel, (uint)((p.Sq + FaForwardRows - 1) / FaForwardRows), (uint)(p.B * p.H), (uint)(FaForwardRows * 4), 1, args);
     }
 
     unsafe void IFusedAttentionBackend.FusedAttentionBackward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o,

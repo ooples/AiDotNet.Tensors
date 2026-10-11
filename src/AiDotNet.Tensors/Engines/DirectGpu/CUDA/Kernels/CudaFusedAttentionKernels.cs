@@ -29,8 +29,9 @@ internal static class CudaFusedAttentionKernels
     };
 
     public static string GetSource() => @"
-#define FA_BR 64        // query rows per forward block (4 threads each: 256 threads)
-#define FA_BC 64        // keys per shared-memory tile
+#define FA_BR 32        // query rows per forward block (4 threads each: 128 threads)
+#define FA_BC 64        // keys per shared-memory tile (backward-q pass)
+#define FA_FBC 64       // keys per shared-memory tile (forward)
 #define FA_SPLIT 4      // threads per query row in the forward
 #define FA_KB 128       // key rows per backward-kv block (2 threads each: 256 threads)
 #define FA_QB 128       // query rows per backward-q block (2 threads each: 256 threads)
@@ -73,8 +74,8 @@ template <int D>
 __device__ void fa_forward(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
     float* __restrict__ o, float* __restrict__ lse, const int* __restrict__ mask, FaParams p)
 {
-    __shared__ __align__(16) float Ks[FA_BC][D + 4];
-    __shared__ __align__(16) float Vs[FA_BC][D + 4];
+    __shared__ __align__(16) float Ks[FA_FBC][D + 4];
+    __shared__ __align__(16) float Vs[FA_FBC][D + 4];
     int bh = blockIdx.y, b = bh / p.H, h = bh % p.H;
     int r = threadIdx.x / FA_SPLIT, c = threadIdx.x % FA_SPLIT;
     // Causal: the last query blocks see the most keys, so they are launched first (shorter tail).
@@ -93,9 +94,9 @@ __device__ void fa_forward(const float* __restrict__ q, const float* __restrict_
     int keyEnd = p.causal ? min(p.Sk, lastRow + p.causalOffset + 1) : p.Sk;
     const float* kbase = k + b * p.kb + h * p.kh;
     const float* vbase = v + b * p.vb + h * p.vh;
-    for (int j0 = 0; j0 < keyEnd; j0 += FA_BC)
+    for (int j0 = 0; j0 < keyEnd; j0 += FA_FBC)
     {
-        int cols = min(FA_BC, keyEnd - j0);
+        int cols = min(FA_FBC, keyEnd - j0);
         for (int e = threadIdx.x; e < cols * (D / 4); e += blockDim.x)
         {
             int jj = e / (D / 4), d4 = e % (D / 4);
@@ -105,10 +106,10 @@ __device__ void fa_forward(const float* __restrict__ q, const float* __restrict_
         __syncthreads();
         if (active)
         {
-            float s[FA_BC / FA_SPLIT];
+            float s[FA_FBC / FA_SPLIT];
             float tileMax = -INFINITY;
             #pragma unroll
-            for (int t = 0; t < FA_BC / FA_SPLIT; t++)
+            for (int t = 0; t < FA_FBC / FA_SPLIT; t++)
             {
                 int jj = c + t * FA_SPLIT, j = j0 + jj;
                 float sv = -INFINITY;
@@ -136,7 +137,7 @@ __device__ void fa_forward(const float* __restrict__ q, const float* __restrict_
                 #pragma unroll
                 for (int d = 0; d < D; d++) acc[d] *= rescale;
                 #pragma unroll
-                for (int t = 0; t < FA_BC / FA_SPLIT; t++)
+                for (int t = 0; t < FA_FBC / FA_SPLIT; t++)
                 {
                     if (s[t] == -INFINITY) continue;
                     float pr = __expf(s[t] - mNew);
