@@ -1390,6 +1390,13 @@ class Program
             return;
         }
 
+        // #1115: run the tuned-kernel registry gate on the Vulkan device and export a shippable profile
+        if (args[0] == "--vulkan-tuned-profile")
+        {
+            VulkanTunedProfileExperiment.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         // Run Vulkan backend diagnostics and bottleneck analysis
         if (args[0] == "--vulkan")
         {
@@ -1819,6 +1826,7 @@ class Program
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
+        Console.WriteLine("  --vulkan-tuned-profile [out.json] [rounds] : Tune the Vulkan kernel registry and export a profile");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");
         Console.WriteLine("  --webgpu   : Run WebGPU backend diagnostics (browser GPU compute)");
         Console.WriteLine("  --memory   : Run GPU memory transfer diagnostics");

@@ -955,8 +955,13 @@ void main() {
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
         if (batchSize <= 0 || features <= 0) return;
-        GlslUnaryOp(VulkanGlslKernels.SoftmaxRows, A, B, batchSize,
-            new uint[] { (uint)batchSize, (uint)features }, 2 * sizeof(uint));
+        EnsureInitialized();
+        // Tuned-kernel registry seam (#1115): the established invocation-per-row kernel is the reference; the
+        // generated lanes-per-row variants are chosen per shape class only after the correctness and paired
+        // timing gate (TunedKernelSlot).
+        var args = new VulkanSoftmaxArgs(A, B, batchSize, features);
+        if (SoftmaxSlot.TryExecute(RowShape(batchSize, features), args)) return;
+        LaunchSoftmaxReference(args);
     }
 
     #endregion

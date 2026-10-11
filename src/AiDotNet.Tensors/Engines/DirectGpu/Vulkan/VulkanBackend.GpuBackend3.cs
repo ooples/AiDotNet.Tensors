@@ -240,8 +240,11 @@ public sealed unsafe partial class VulkanBackend
 
     public void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
-        GlslBinaryOp(VulkanGlslKernels.SoftmaxBackward, gradOutput, output, gradInput,
-            batchSize, new uint[] { (uint)batchSize, (uint)features }, 2 * sizeof(uint));
+        if (batchSize <= 0) return;
+        EnsureInitialized();
+        var args = new VulkanSoftmaxBackwardArgs(gradOutput, output, gradInput, batchSize, features);
+        if (features > 0 && SoftmaxBackwardSlot.TryExecute(RowShape(batchSize, features), args)) return;
+        LaunchSoftmaxBackwardReference(args);
     }
 
     public void SiluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)

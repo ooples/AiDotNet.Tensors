@@ -1136,6 +1136,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         // Wait for device to finish
         _device.WaitIdle();
 
+        DisposeTunedKernelResources();
+        _unusedBindingBuffer?.Dispose();
+        _unusedBindingBuffer = null;
+
         // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()
 
         // Dispose pipelines

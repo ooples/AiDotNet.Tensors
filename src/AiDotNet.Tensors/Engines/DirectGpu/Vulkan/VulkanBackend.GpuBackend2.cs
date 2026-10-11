@@ -37,15 +37,13 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
-        try
-        {
-            int total = batch * outChannels * outHeight * outWidth;
-            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
-            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output)) return;
-        }
-        catch { throw; }
+        var convArgs = new VulkanConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (convArgs.OutputCount <= 0) return;
+        // Tuned-kernel registry seam (#1115): the invocation-per-output kernel is the reference; the generated
+        // channel-tile variants are chosen per shape class only after the correctness and paired timing gate.
+        if (Conv2DForwardSlot.TryExecute(convArgs.Shape(), convArgs)) return;
+        LaunchConv2DReference(convArgs);
     }
 
     public void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -745,6 +743,21 @@ void main() {
 
     #region Normalization Operations
 
+    // One float that no kernel reads or writes. The normalization kernels declare every binding any of their modes
+    // uses, so a mode that leaves some untouched (the running statistics outside batch norm, RMSNorm's beta, saved
+    // mean and gradBeta) still needs a buffer bound there. Allocating one per call cost about a millisecond each.
+    private IGpuBuffer? _unusedBindingBuffer;
+    private readonly object _unusedBindingLock = new();
+
+    private IGpuBuffer UnusedBinding
+    {
+        get
+        {
+            if (_unusedBindingBuffer is { } b) return b;
+            lock (_unusedBindingLock) return _unusedBindingBuffer ??= AllocateBuffer(1);
+        }
+    }
+
     private bool DispatchNormalizationForward(IGpuBuffer[] buffers, int threads, uint[] pushConstants)
     {
         GlslNaryOp(VulkanGlslKernels.NormalizationForward, buffers, threads, pushConstants);
@@ -788,12 +801,12 @@ void main() {
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        using var layerRunningMeanDummy = AllocateBuffer(1);
-        using var layerRunningVarianceDummy = AllocateBuffer(1);
-        if (DispatchNormalizationForward(
-            new[] { input, output, gamma, beta, layerRunningMeanDummy, layerRunningVarianceDummy, saveMean, saveInvVar }, batchSize,
-            new[] { 1u, (uint)batchSize, (uint)normalizedSize, 1u, 1u, FloatBits(epsilon), 0u, 1u }))
+        if (batchSize <= 0) return;
+        var lnArgs = new VulkanLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar,
+            batchSize, normalizedSize, epsilon);
+        if (normalizedSize > 0 && LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), lnArgs))
             return;
+        LaunchLayerNormReference(lnArgs);
     }
 
     public void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -801,22 +814,29 @@ void main() {
         int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        var layerBuffers = new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta };
-        GlslNaryOp(VulkanGlslKernels.NormalizationBackward, layerBuffers, batchSize,
-            new[] { 1u, 0u, (uint)batchSize, (uint)normalizedSize, 1u });
-        if (DispatchNormalizationBackward(layerBuffers, normalizedSize,
-            new[] { 1u, 1u, (uint)batchSize, (uint)normalizedSize, 1u }))
-            return;
+        bool rowsValid = batchSize > 0 && normalizedSize > 0;
+        var inputGradArgs = new VulkanNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar,
+            gradInput, null, batchSize, normalizedSize);
+        if (!(rowsValid && LayerNormBackwardSlot.TryExecute(RowShape(batchSize, normalizedSize), inputGradArgs)) &&
+            batchSize > 0)
+            LaunchLayerNormBackwardReference(inputGradArgs);
+
+        // gradGamma/gradBeta are a reduction ACROSS the rows. The established kernel gives each column one
+        // invocation looping over every row; the registry may select a generated column-tile reduction instead.
+        var paramArgs = new VulkanNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar,
+            gradGamma, gradBeta, batchSize, normalizedSize);
+        if (!(rowsValid && LayerNormGradParametersSlot.TryExecute(RowShape(batchSize, normalizedSize), paramArgs)) &&
+            normalizedSize > 0)
+            LaunchColumnGradReference(rms: false, paramArgs);
     }
 
     public void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
         EnsureInitialized();
-        using var groupRunningMeanDummy = AllocateBuffer(1);
-        using var groupRunningVarianceDummy = AllocateBuffer(1);
+        var unused = UnusedBinding;
         if (DispatchNormalizationForward(
-            new[] { input, output, gamma, beta, groupRunningMeanDummy, groupRunningVarianceDummy, saveMean, saveInvVar }, batch * numGroups,
+            new[] { input, output, gamma, beta, unused, unused, saveMean, saveInvVar }, batch * numGroups,
             new[] { 2u, (uint)batch, (uint)channels, (uint)spatialSize, (uint)numGroups, FloatBits(epsilon), 0u, 1u }))
             return;
     }
@@ -843,12 +863,9 @@ void main() {
         int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        using var rmsBetaDummy = AllocateBuffer(1);
-        using var rmsRunningMeanDummy = AllocateBuffer(1);
-        using var rmsRunningVarianceDummy = AllocateBuffer(1);
-        using var rmsSavedMeanDummy = AllocateBuffer(Math.Max(1, batchSize));
+        var unused = UnusedBinding;
         if (DispatchNormalizationForward(
-            new[] { input, output, gamma, rmsBetaDummy, rmsRunningMeanDummy, rmsRunningVarianceDummy, rmsSavedMeanDummy, saveRms }, batchSize,
+            new[] { input, output, gamma, unused, unused, unused, unused, saveRms }, batchSize,
             new[] { 3u, (uint)batchSize, (uint)normalizedSize, 1u, 1u, FloatBits(epsilon), 0u, 1u }))
             return;
     }
@@ -857,14 +874,17 @@ void main() {
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        using var rmsSavedMeanDummy = AllocateBuffer(Math.Max(1, batchSize));
-        using var rmsGradBetaDummy = AllocateBuffer(Math.Max(1, normalizedSize));
-        var rmsBuffers = new[] { gradOutput, input, gamma, rmsSavedMeanDummy, saveRms, gradInput, gradGamma, rmsGradBetaDummy };
+        var unused = UnusedBinding;
+        var rmsBuffers = new[] { gradOutput, input, gamma, unused, saveRms, gradInput, gradGamma, unused };
         GlslNaryOp(VulkanGlslKernels.NormalizationBackward, rmsBuffers, batchSize,
             new[] { 3u, 0u, (uint)batchSize, (uint)normalizedSize, 1u });
-        if (DispatchNormalizationBackward(rmsBuffers, normalizedSize,
-            new[] { 3u, 1u, (uint)batchSize, (uint)normalizedSize, 1u }))
-            return;
+
+        // gradGamma (a column reduction over rows) goes through the tuned-kernel registry.
+        var gammaArgs = new VulkanNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null,
+            batchSize, normalizedSize);
+        if (!(batchSize > 0 && normalizedSize > 0 &&
+              RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)) && normalizedSize > 0)
+            LaunchColumnGradReference(rms: true, gammaArgs);
     }
 
     #endregion
