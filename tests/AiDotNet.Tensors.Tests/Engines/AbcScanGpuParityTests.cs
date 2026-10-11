@@ -130,6 +130,11 @@ public class AbcScanGpuParityTests
         {
             DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
             GpuLaunchProbe.CaptureReadbackSites = true;
+            // Warm up once: the first sight of a shape lets the tuned-kernel registry measure its candidates, which
+            // downloads their outputs to verify them (a one-time cost, persisted with the tuning). The assertion below
+            // is about the composition's steady state, which must not read back at all.
+            using (DirectGpuTensorEngine.AbcScanComposed(
+                gpu, q, k, v, fg, sk, batch, seqLen, modelDim, numHeads, headDim, numSlots, InitScale)) { }
             GpuLaunchProbe.Reset();
             // Invoke the composition directly: the public wrapper must not be able to hide a
             // primitive failure by returning the CPU reference result.
@@ -179,6 +184,8 @@ public class AbcScanGpuParityTests
         try
         {
             GpuLaunchProbe.CaptureReadbackSites = true;
+            // Warm up once, as above: a shape's first run may measure tuned-kernel candidates (one-time downloads).
+            using (gpu.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale)) { }
             GpuLaunchProbe.Reset();
             using var result = gpu.AbcScanForward(q, k, v, fg, sk, numHeads, InitScale);
 
