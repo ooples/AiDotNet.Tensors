@@ -187,6 +187,40 @@ public class VulkanTorchParityMathTests
         }
     }
 
+    // No device needed: libshaderc compiles on the CPU, so this runs wherever the native library loads (CI included)
+    // and proves every kernel source is valid GLSL for Vulkan.
+    [SkippableFact]
+    public void EveryParityShader_CompilesToSpirv()
+    {
+        VulkanGlslCompiler compiler;
+        try { compiler = new VulkanGlslCompiler(); }
+        catch (Exception ex) when (ex is DllNotFoundException or TypeInitializationException or BadImageFormatException) { compiler = null!; }
+        Skip.If(compiler is null || !compiler.IsAvailable, "libshaderc is not available.");
+        using (compiler)
+        {
+            int count = 0;
+            foreach (var (name, source) in VulkanTorchParityElementwiseKernels.All())
+            {
+                uint[]? spirv = compiler!.CompileToSpirv(source);
+                Assert.True(spirv is { Length: > 5 }, $"{name} did not compile: {compiler.LastError}");
+                Assert.Equal(0x07230203u, spirv![0]);   // SPIR-V magic number
+                count++;
+            }
+            // One per unary and binary op, plus the 31 other kernels.
+            Assert.Equal(Enum.GetValues(typeof(TorchParityUnaryOp)).Length + Enum.GetValues(typeof(TorchParityBinaryOp)).Length + 31, count);
+            Assert.NotNull(compiler.CompileToSpirv(VulkanTorchParityElementwiseKernels.DoubleProbe("d_exp(x)", special: false)));
+        }
+    }
+
+    [Fact]
+    public void KernelsThatNeedDoubles_AreExactlyThoseThatComputeInDouble()
+    {
+        foreach (TorchParityUnaryOp op in Enum.GetValues(typeof(TorchParityUnaryOp)))
+            Assert.Equal(VulkanTorchParityElementwiseKernels.NeedsDoubles(op), VulkanTorchParityElementwiseKernels.Unary(op).Contains("double "));
+        foreach (TorchParityBinaryOp op in Enum.GetValues(typeof(TorchParityBinaryOp)))
+            Assert.Equal(VulkanTorchParityElementwiseKernels.NeedsDoubles(op), VulkanTorchParityElementwiseKernels.Binary(op).Contains("double "));
+    }
+
     [Fact]
     public void TwoOverPi_HasTheKnownLeadingWords()
     {

@@ -26,6 +26,44 @@ internal static class VulkanTorchParityElementwiseKernels
 
     private static string Cached(string key, Func<string> build) => Sources.GetOrAdd(key, _ => build());
 
+    /// <summary>Every shader of this kernel set, by name: what a test compiles to prove the sources are valid GLSL.</summary>
+    public static System.Collections.Generic.IEnumerable<(string Name, string Source)> All()
+    {
+        foreach (TorchParityUnaryOp op in Enum.GetValues(typeof(TorchParityUnaryOp))) yield return ("unary." + op, Unary(op));
+        foreach (TorchParityBinaryOp op in Enum.GetValues(typeof(TorchParityBinaryOp))) yield return ("binary." + op, Binary(op));
+        yield return ("polynomial", Polynomial);
+        yield return ("range", Range);
+        yield return ("logspace", Logspace);
+        yield return ("window", Window);
+        yield return ("tri_indices", TriIndices);
+        yield return ("diagflat", Diagflat);
+        yield return ("diagonal_scatter", DiagonalScatter);
+        yield return ("quantile_rows", QuantileRows);
+        yield return ("flag_reset", FlagReset);
+        yield return ("flag_merge", FlagMerge);
+        yield return ("sample", Sample);
+        yield return ("bernoulli", Bernoulli);
+        yield return ("poisson", Poisson);
+        yield return ("binomial", Binomial);
+        yield return ("multinomial.replacement", Multinomial(true));
+        yield return ("multinomial", Multinomial(false));
+        yield return ("dropout_affine.alpha", DropoutAffine(true));
+        yield return ("dropout_affine", DropoutAffine(false));
+        yield return ("rrelu", Rrelu);
+        yield return ("random_keys", RandomKeys);
+        yield return ("nonzero_static_scatter", NonzeroStaticScatter);
+        yield return ("unravel_axis", UnravelAxis);
+        yield return ("slice_bitonic_step", SliceBitonicStep);
+        yield return ("slice_first_flags", SliceFirstFlags);
+        yield return ("slice_gather_unique", SliceGatherUnique);
+        yield return ("scan_block", ScanBlockSource);
+        yield return ("scan_add", ScanAdd);
+        yield return ("int_binary", IntBinary);
+        yield return ("int_not", IntNot);
+        yield return ("grid_sample_3d", GridSample3D);
+        yield return ("grid_sample_3d_backward", GridSample3DBackward);
+    }
+
     private const string Int64Extension = "#extension GL_ARB_gpu_shader_int64 : require\n";
 
     private static string Head(bool int64, int localSize = LocalSize)
