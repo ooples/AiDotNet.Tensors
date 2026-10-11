@@ -20,7 +20,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     // for the next allocation of the same size (as the CUDA, HIP and OpenCL backends do). Only an exact size match is
     // reused: a Vulkan buffer's logical size is its allocation size everywhere a transfer or a kernel reads it.
     // Every dispatch is submitted and waited for, so a released buffer has no work in flight.
-    // As many per size bucket as OpenCL keeps: a loop that never disposes its results gets them all back at once,
+    // As many per size as OpenCL keeps per bucket: a loop that never disposes its results gets them all back at once,
     // when a collection finalizes them. The memory budget below is the real bound.
     private const int MaxPooledBuffersPerBucket = 4096;
     private const int PooledMemoryDivisor = 4;
@@ -28,7 +28,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     /// <summary>Released buffers kept for reuse. AIDOTNET_VULKAN_BUFFER_POOL=0 disables pooling.</summary>
     internal static readonly GpuBufferPool<VulkanGpuBuffer> Pool =
-        new GpuBufferPool<VulkanGpuBuffer>(MaxPooledBuffersPerBucket, int.MaxValue);
+        new GpuBufferPool<VulkanGpuBuffer>(MaxPooledBuffersPerBucket, int.MaxValue, exactSizes: true);
 
     internal static bool PoolingEnabled { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_VULKAN_BUFFER_POOL") != "0";
@@ -105,7 +105,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // is, so small results have to come back from the collector by count; charged by their bytes alone, sixteen
         // thousand 16 KB results would be created before the first collection returned any.
         DeviceMemoryReclaim.OnDeviceAllocation(Math.Max((long)size * sizeof(float), MinimumReclaimCharge));
-        if (PoolingEnabled && Pool.TryRent(size, GpuBufferPoolAffinity.Global, exactCapacity: true, out var pooled) &&
+        if (PoolingEnabled && Pool.TryRent(size, out var pooled) &&
             pooled is not null)
             return pooled;
         // Out of memory: the parked buffers are the first thing to give back.

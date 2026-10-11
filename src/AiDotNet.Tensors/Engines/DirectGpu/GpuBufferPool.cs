@@ -73,11 +73,25 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         }
     }
 
-    public GpuBufferPool(int maxPerSize, int maxSize)
+    // With exact sizes a bucket holds one capacity only, so a rent never passes over a candidate.
+    private readonly bool _exactSizes;
+
+    public GpuBufferPool(int maxPerSize, int maxSize) : this(maxPerSize, maxSize, exactSizes: false)
+    {
+    }
+
+    /// <summary>
+    /// Creates a pool. With <paramref name="exactSizes"/> a buffer is reused only for a request of exactly its
+    /// capacity, for a backend whose buffers cannot carry a logical size smaller than their allocation.
+    /// </summary>
+    public GpuBufferPool(int maxPerSize, int maxSize, bool exactSizes)
     {
         _maxPerSize = maxPerSize > 0 ? maxPerSize : 1;
         _maxSize = maxSize > 0 ? maxSize : int.MaxValue;
+        _exactSizes = exactSizes;
     }
+
+    private int BucketKey(int size) => _exactSizes ? size : NextPowerOfTwo(size);
 
     /// <summary>
     /// Rounds up to the next power of two for bucket key.
@@ -100,14 +114,6 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         => TryRent(size, GpuBufferPoolAffinity.Global, out buffer);
 
     public bool TryRent(int size, GpuBufferPoolAffinity affinity, out TBuffer? buffer)
-        => TryRent(size, affinity, exactCapacity: false, out buffer);
-
-    /// <summary>
-    /// Rents a pooled buffer. With <paramref name="exactCapacity"/> only a buffer of exactly
-    /// <paramref name="size"/> elements is taken, for a backend whose buffers cannot carry a logical size smaller
-    /// than their allocation.
-    /// </summary>
-    public bool TryRent(int size, GpuBufferPoolAffinity affinity, bool exactCapacity, out TBuffer? buffer)
     {
         buffer = null;
         if (Volatile.Read(ref _disposed) != 0 || size <= 0 || size > _maxSize)
@@ -116,7 +122,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         }
 
         // Use power-of-two bucket key for higher cache hit rate
-        int bucketKey = NextPowerOfTwo(size);
+        int bucketKey = BucketKey(size);
         if (_buckets.TryGetValue(bucketKey, out var bucket)
             && bucket.Buffers.TryGetValue(affinity, out var affinityBuffers))
         {
@@ -131,7 +137,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 // Power-of-two bucketing can contain different physical capacities (for example,
                 // both 6272 and 8192 elements in bucket 8192). Keep searching instead of turning
                 // an undersized top entry into a false miss when a sufficient entry is also pooled.
-                if (candidate.Capacity < size || (exactCapacity && candidate.Capacity != size))
+                if (candidate.Capacity < size)
                 {
                     (undersized ??= new List<TBuffer>()).Add(candidate);
                     continue;
@@ -185,7 +191,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             // Keep bucket creation, capacity accounting, and insertion atomic with Dispose's drain.
             // Otherwise Dispose can clear the dictionary between GetOrAdd and Add, orphaning a live
             // device buffer in a bucket that is no longer reachable.
-            int bucketKey = NextPowerOfTwo(buffer.Capacity);
+            int bucketKey = BucketKey(buffer.Capacity);
             var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
             int count = Interlocked.Increment(ref bucket.Count);
             if (count > _maxPerSize || Interlocked.Add(ref _pooledElements, buffer.Capacity) > MaxPooledElements)
