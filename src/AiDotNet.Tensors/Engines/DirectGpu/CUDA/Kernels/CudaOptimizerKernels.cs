@@ -1036,6 +1036,9 @@ __device__ __forceinline__ void mt_atomic_add_double(double* address, double val
 #endif
 }
 
+// Elements per multi-tensor gradient-table chunk (CudaBackend.GradientTableChunk must match).
+#define MT_CHUNK 4096
+
 // Sum of squares of every element of every tensor, accumulated in double. A float squared cannot overflow a double,
 // so the result is finite exactly when every element is finite: one reduction serves both the global-norm clip and
 // the non-finite-gradient check. *out must be zeroed before the launch.
@@ -1050,14 +1053,31 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_sum_squares(
     __shared__ double warpSums[8];
     // A bounded grid strides over the chunks and accumulates locally, so the result takes one atomic per block
     // rather than one per chunk: ~10k chunk-atomics on one address serialized to ~300 us per call.
+    // Each chunk is up to MT_CHUNK (4096) elements; the block strides over it in float4s when the tensor's base
+    // pointer is 16-byte aligned (chunk starts are multiples of 4096, so every chunk then is), scalar otherwise and
+    // for the tail (#1106: one 256-element chunk per block-iteration and scalar loads left the kernel launch-bound).
     double v = 0.0;
     for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
     {
         int t = chunkTensor[c];
-        int i = chunkStart[c] + threadIdx.x;
-        if (i < sizes[t])
+        int start = chunkStart[c];
+        int end = min(start + MT_CHUNK, sizes[t]);
+        const float* p = (const float*)ptrs[t];
+        int i = start;
+        if ((ptrs[t] & 15ULL) == 0)
         {
-            double x = (double)((const float*)ptrs[t])[i];
+            int nvec = (end - start) >> 2;
+            const float4* p4 = (const float4*)(p + start);
+            for (int k = threadIdx.x; k < nvec; k += blockDim.x)
+            {
+                float4 x = p4[k];
+                v += (double)x.x * (double)x.x + (double)x.y * (double)x.y + (double)x.z * (double)x.z + (double)x.w * (double)x.w;
+            }
+            i = start + (nvec << 2);
+        }
+        for (i += threadIdx.x; i < end; i += blockDim.x)
+        {
+            double x = (double)p[i];
             v += x * x;
         }
     }
@@ -1092,18 +1112,39 @@ extern ""C"" __global__ void clip_scale_from_sum_squares(
     *scale = (float)(c < 1.0 ? c : 1.0);
 }
 
-// Every element of every tensor multiplied by the device scalar *scale.
+// Every element of every tensor multiplied by the device scalar *scale: a bounded grid strides over the MT_CHUNK
+// chunks, in float4s when the tensor's base pointer is 16-byte aligned (scalar otherwise and for the tail).
 extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device_scalar(
     const unsigned long long* __restrict__ ptrs,
     const int* __restrict__ sizes,
     const int* __restrict__ chunkTensor,
     const int* __restrict__ chunkStart,
-    const float* __restrict__ scale)
+    const float* __restrict__ scale,
+    int totalChunks)
 {
-    int t = chunkTensor[blockIdx.x];
-    int i = chunkStart[blockIdx.x] + threadIdx.x;
-    if (i < sizes[t])
-        ((float*)ptrs[t])[i] *= *scale;
+    float s = *scale;
+    for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
+    {
+        int t = chunkTensor[c];
+        int start = chunkStart[c];
+        int end = min(start + MT_CHUNK, sizes[t]);
+        float* p = (float*)ptrs[t];
+        int i = start;
+        if ((ptrs[t] & 15ULL) == 0)
+        {
+            int nvec = (end - start) >> 2;
+            float4* p4 = (float4*)(p + start);
+            for (int k = threadIdx.x; k < nvec; k += blockDim.x)
+            {
+                float4 x = p4[k];
+                x.x *= s; x.y *= s; x.z *= s; x.w *= s;
+                p4[k] = x;
+            }
+            i = start + (nvec << 2);
+        }
+        for (i += threadIdx.x; i < end; i += blockDim.x)
+            p[i] *= s;
+    }
 }
 ";
     }

@@ -3670,19 +3670,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            var numOps = MathHelper.GetNumericOperations<T>();
-            using var aSpanLease = a.Lease();
-            var aSpan = aSpanLease.Span;
-            using var bSpanLease = b.Lease();
-            var bSpan = bSpanLease.Span;
-            using var rSpanLease = res.LeaseWritable();
-            var rSpan = rSpanLease.Span;
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, res, bTileSize, multiply: false);
             DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
             // #319: gate closure allocation on AutoTracer.ShouldRecord.
             // The replay-delegate closure costs ~30 ns/op and was being
@@ -3706,6 +3694,94 @@ public partial class CpuEngine : ITensorLevelEngine
             AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorAdd(ca, cb));
         }
         return result;
+    }
+
+    /// <summary>
+    /// <c>r = a op b</c> where <paramref name="b"/> repeats along the leading axes of <paramref name="a"/> in tiles of
+    /// <paramref name="tile"/> elements (the [N, M] op [M] bias pattern). Float and double call the SIMD kernels
+    /// directly per tile (no per-tile interface call), split across threads from <see cref="TrailingRepeatParallelMin"/>
+    /// elements (#653: the former single loop ran every row-bias add and scale on one core at every size -- 4.9 ms for
+    /// an 8M-element float tensor at DOP 1 through 64). Each element is one IEEE add or multiply, so the result is the
+    /// same as the serial INumericOperations loop, which other element types (and non-addressable backings) keep.
+    /// </summary>
+    private static void TrailingRepeatBinary<T>(Tensor<T> a, Tensor<T> b, Tensor<T> r, int tile, bool multiply)
+    {
+        int length = a.Length, numTiles = length / tile;
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && a.GetCpuBackingForStridedRead(out int aOff) is { } aArr
+            && b.GetCpuBackingForStridedRead(out int bOff) is { } bArr
+            && r.GetCpuBackingForContiguousWrite(out int rOff) is { } rArr)
+        {
+            int chunks = length >= TrailingRepeatParallelMin ? Math.Min(CpuParallelSettings.ElementwiseChunkCount(length), numTiles) : 1;
+            if (typeof(T) == typeof(float))
+                TrailingRepeatFloat((float[])(object)aArr, aOff, (float[])(object)bArr, bOff, (float[])(object)rArr, rOff, tile, numTiles, multiply, chunks);
+            else
+                TrailingRepeatDouble((double[])(object)aArr, aOff, (double[])(object)bArr, bOff, (double[])(object)rArr, rOff, tile, numTiles, multiply, chunks);
+            return;
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var aSpan = a.AsSpan();
+        var bSpan = b.AsSpan();
+        var rSpan = r.AsWritableSpan();
+        for (int t = 0; t < numTiles; t++)
+        {
+            int off = t * tile;
+            if (multiply) numOps.Multiply(aSpan.Slice(off, tile), bSpan, rSpan.Slice(off, tile));
+            else numOps.Add(aSpan.Slice(off, tile), bSpan, rSpan.Slice(off, tile));
+        }
+    }
+
+    // Below this many elements a trailing-repeat broadcast stays one serial pass: a [6144, 32] row-bias add (~45 us)
+    // only lost time to the fan-out.
+    private const int TrailingRepeatParallelMin = 1 << 20;
+
+    private static void TrailingRepeatFloat(float[] a, int aOff, float[] b, int bOff, float[] r, int rOff, int tile, int numTiles,
+        bool multiply, int chunks)
+    {
+        if (chunks < 2) { TrailingRepeatFloatTiles(a, aOff, b, bOff, r, rOff, tile, 0, numTiles, multiply); return; }
+        int perChunk = (numTiles + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)numTiles * tile, c =>
+            TrailingRepeatFloatTiles(a, aOff, b, bOff, r, rOff, tile, c * perChunk, Math.Min(numTiles, (c + 1) * perChunk), multiply),
+            deterministicSafe: true);
+    }
+
+    private static void TrailingRepeatFloatTiles(float[] a, int aOff, float[] b, int bOff, float[] r, int rOff, int tile, int t0, int t1,
+        bool multiply)
+    {
+        // The same SIMD kernels the INumericOperations span overloads reach, without the per-tile interface dispatch.
+        var bias = new ReadOnlySpan<float>(b, bOff, tile);
+        for (int t = t0; t < t1; t++)
+        {
+            var src = new ReadOnlySpan<float>(a, aOff + t * tile, tile);
+            var dst = new Span<float>(r, rOff + t * tile, tile);
+            if (multiply) Simd.SimdKernels.VectorMultiply(src, bias, dst);
+            else Simd.SimdKernels.VectorAdd(src, bias, dst);
+        }
+    }
+
+    private static void TrailingRepeatDouble(double[] a, int aOff, double[] b, int bOff, double[] r, int rOff, int tile, int numTiles,
+        bool multiply, int chunks)
+    {
+        if (chunks < 2) { TrailingRepeatDoubleTiles(a, aOff, b, bOff, r, rOff, tile, 0, numTiles, multiply); return; }
+        int perChunk = (numTiles + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)numTiles * tile, c =>
+            TrailingRepeatDoubleTiles(a, aOff, b, bOff, r, rOff, tile, c * perChunk, Math.Min(numTiles, (c + 1) * perChunk), multiply),
+            deterministicSafe: true);
+    }
+
+    private static void TrailingRepeatDoubleTiles(double[] a, int aOff, double[] b, int bOff, double[] r, int rOff, int tile, int t0, int t1,
+        bool multiply)
+    {
+        // The same SIMD kernels the INumericOperations span overloads reach, without the per-tile interface dispatch.
+        var bias = new ReadOnlySpan<double>(b, bOff, tile);
+        for (int t = t0; t < t1; t++)
+        {
+            var src = new ReadOnlySpan<double>(a, aOff + t * tile, tile);
+            var dst = new Span<double>(r, rOff + t * tile, tile);
+            if (multiply) Simd.SimdKernels.VectorMultiply(src, bias, dst);
+            else Simd.SimdKernels.VectorAdd(src, bias, dst);
+        }
     }
 
     /// <inheritdoc/>
@@ -3961,19 +4037,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            var numOps = MathHelper.GetNumericOperations<T>();
-            using var aSpanLease = a.Lease();
-            var aSpan = aSpanLease.Span;
-            using var bSpanLease = b.Lease();
-            var bSpan = bSpanLease.Span;
-            using var rSpanLease = res.LeaseWritable();
-            var rSpan = rSpanLease.Span;
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, res, bTileSize, multiply: true);
             DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
             { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb)); }
             return res;
@@ -5437,19 +5501,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
-            var numOps = MathHelper.GetNumericOperations<T>();
-            using var aSpanLease = a.Lease();
-            var aSpan = aSpanLease.Span;
-            using var bSpanLease = b.Lease();
-            var bSpan = bSpanLease.Span;
-            using var rSpanLease = destination.LeaseWritable();
-            var rSpan = rSpanLease.Span;
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, destination, bTileSize, multiply: true);
             return;
         }
 
@@ -5483,19 +5535,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
-            var numOps = MathHelper.GetNumericOperations<T>();
-            using var aSpanLease = a.Lease();
-            var aSpan = aSpanLease.Span;
-            using var bSpanLease = b.Lease();
-            var bSpan = bSpanLease.Span;
-            using var rSpanLease = destination.LeaseWritable();
-            var rSpan = rSpanLease.Span;
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, destination, bTileSize, multiply: false);
             return;
         }
 
@@ -8608,6 +8648,118 @@ public partial class CpuEngine : ITensorLevelEngine
         return numOps.Sum(tensor.AsSpan());
     }
 
+    // #653: the 2-D ReduceSum fast paths ran one serial scalar loop at every size (an [8192, 1024] float row-sum took
+    // 6.6 ms at DOP 1 through 64). Rows / column ranges are now split across threads WITHOUT changing any element's
+    // summation order -- every output is accumulated by one thread in the same sequence as before -- so the result is
+    // bit-identical to the serial loop at any thread count.
+
+    private static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
+    {
+        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
+        // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
+        int chunks = WorkChunks(rows, (long)rows * cols);
+        if (chunks <= 1) { SumRows(src, dst, cols, 0, rows); return; }
+        int perChunk = (rows + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols,
+            chunk => SumRows(src, dst, cols, chunk * perChunk, Math.Min(rows, (chunk + 1) * perChunk)), deterministicSafe: true);
+    }
+
+    private static void SumRows(float[] src, float[] dst, int cols, int r0, int r1)
+    {
+        for (int r = r0; r < r1; r++)
+        {
+            float sum = 0; int offset = r * cols;
+            for (int c = 0; c < cols; c++) sum += src[offset + c];
+            dst[r] = sum;
+        }
+    }
+
+    private static void ReduceSum2DColumns(float[] src, float[] dst, int rows, int cols)
+    {
+        // Contiguous column ranges, about four per thread (the whole width on one thread), each accumulated row by row.
+        int chunks = (int)Math.Min(WorkChunks(cols, (long)rows * cols), (cols + ReductionMinParallelBlock - 1) / ReductionMinParallelBlock);
+        if (chunks <= 1) { AccumulateAxisRows(src, 0, cols, rows, dst, 0, cols); return; }
+        int perChunk = (cols + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
+        {
+            int c0 = chunk * perChunk, c1 = Math.Min(cols, c0 + perChunk);
+            if (c1 > c0) AccumulateAxisRows(src, c0, cols, rows, dst, c0, c1 - c0);
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>
+    /// dst[dstBase + j] = sum over a in [0, count) of src[srcBase + a * stride + j], for j in [0, length), each sum
+    /// accumulated in increasing <c>a</c> (the serial order). Runs as row-sequential SIMD adds over column ranges of at
+    /// most <see cref="AxisAccumulateRange"/> elements: long contiguous reads instead of narrow strided ones (a
+    /// 64-column block walked a new page per row), with the accumulator range kept in L1.
+    /// </summary>
+    private static void AccumulateAxisRows(float[] src, int srcBase, int stride, int count, float[] dst, int dstBase, int length)
+    {
+        for (int j0 = 0; j0 < length; j0 += AxisAccumulateRange)
+        {
+            int len = Math.Min(AxisAccumulateRange, length - j0);
+            var acc = new Span<float>(dst, dstBase + j0, len);
+            acc.Clear();
+            for (int a = 0; a < count; a++)
+                Simd.SimdKernels.VectorAdd(acc, new ReadOnlySpan<float>(src, srcBase + a * stride + j0, len), acc);
+        }
+    }
+
+    private static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
+    {
+        // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
+        // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
+        int chunks = WorkChunks(rows, (long)rows * cols);
+        if (chunks <= 1) { SumRows(src, dst, cols, 0, rows); return; }
+        int perChunk = (rows + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols,
+            chunk => SumRows(src, dst, cols, chunk * perChunk, Math.Min(rows, (chunk + 1) * perChunk)), deterministicSafe: true);
+    }
+
+    private static void SumRows(double[] src, double[] dst, int cols, int r0, int r1)
+    {
+        for (int r = r0; r < r1; r++)
+        {
+            double sum = 0; int offset = r * cols;
+            for (int c = 0; c < cols; c++) sum += src[offset + c];
+            dst[r] = sum;
+        }
+    }
+
+    private static void ReduceSum2DColumns(double[] src, double[] dst, int rows, int cols)
+    {
+        // Contiguous column ranges, about four per thread (the whole width on one thread), each accumulated row by row.
+        int chunks = (int)Math.Min(WorkChunks(cols, (long)rows * cols), (cols + ReductionMinParallelBlock - 1) / ReductionMinParallelBlock);
+        if (chunks <= 1) { AccumulateAxisRows(src, 0, cols, rows, dst, 0, cols); return; }
+        int perChunk = (cols + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, chunk =>
+        {
+            int c0 = chunk * perChunk, c1 = Math.Min(cols, c0 + perChunk);
+            if (c1 > c0) AccumulateAxisRows(src, c0, cols, rows, dst, c0, c1 - c0);
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>
+    /// dst[dstBase + j] = sum over a in [0, count) of src[srcBase + a * stride + j], for j in [0, length), each sum
+    /// accumulated in increasing <c>a</c> (the serial order). Runs as row-sequential SIMD adds over column ranges of at
+    /// most <see cref="AxisAccumulateRange"/> elements: long contiguous reads instead of narrow strided ones (a
+    /// 64-column block walked a new page per row), with the accumulator range kept in L1.
+    /// </summary>
+    private static void AccumulateAxisRows(double[] src, int srcBase, int stride, int count, double[] dst, int dstBase, int length)
+    {
+        for (int j0 = 0; j0 < length; j0 += AxisAccumulateRange)
+        {
+            int len = Math.Min(AxisAccumulateRange, length - j0);
+            var acc = new Span<double>(dst, dstBase + j0, len);
+            acc.Clear();
+            for (int a = 0; a < count; a++)
+                Simd.SimdKernels.VectorAdd(acc, new ReadOnlySpan<double>(src, srcBase + a * stride + j0, len), acc);
+        }
+    }
+
+    // Column range per accumulation pass in AccumulateAxisRows: 8-16 KB of accumulator.
+    private const int AxisAccumulateRange = 2048;
+
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
@@ -8741,13 +8893,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 using var rArrLease = fastResult.LeaseArray();
                 var rArr = (float[])(object)rArrLease.Array;
-                Array.Clear(rArr, 0, cols);
-                for (int r = 0; r < rows; r++)
-                {
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        rArr[c] += srcArr[offset + c];
-                }
+                ReduceSum2DColumns(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -8759,14 +8905,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 using var rArrLease = fastResult.LeaseArray();
                 var rArr = (float[])(object)rArrLease.Array;
-                for (int r = 0; r < rows; r++)
-                {
-                    float sum = 0;
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        sum += srcArr[offset + c];
-                    rArr[r] = sum;
-                }
+                ReduceSum2DRows(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -8789,13 +8928,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 using var rArrLease = fastResult.LeaseArray();
                 var rArr = (double[])(object)rArrLease.Array;
-                Array.Clear(rArr, 0, cols);
-                for (int r = 0; r < rows; r++)
-                {
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        rArr[c] += srcArr[offset + c];
-                }
+                ReduceSum2DColumns(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -8806,14 +8939,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 using var rArrLease = fastResult.LeaseArray();
                 var rArr = (double[])(object)rArrLease.Array;
-                for (int r = 0; r < rows; r++)
-                {
-                    double sum = 0;
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        sum += srcArr[offset + c];
-                    rArr[r] = sum;
-                }
+                ReduceSum2DRows(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -12685,17 +12811,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
-                SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)alpha);
+                ELUDispatch((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)alpha);
             }
         }
         else if (typeof(T) == typeof(double))
         {
-            // SIMD double ELU via the Span overload (no double unsafe-ptr variant in SimdKernels).
-            using var tensorDataKeep33 = new KeepAliveScope(tensor);
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(tensor.DataUnmarked)).Span;
-            using var resultDataKeep54 = new KeepAliveScope(result);
-            var dstSpan = AsDoubleMemory(result.DataUnmarked).Span;
-            SimdKernels.ELU(srcSpan, alpha, dstSpan);
+            // SIMD double ELU via the Span overload (no double unsafe-ptr variant in SimdKernels), chunked as the float path.
+            // The memory feeds only the synchronous loop below; the scopes keep both tensors alive while it runs.
+            using var eluTensorKeep = new KeepAliveScope(tensor);
+            using var eluResultKeep = new KeepAliveScope(result);
+            var srcMem = (ReadOnlyMemory<double>)AsDoubleMemory(tensor.DataUnmarked);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
+            int length = tensor.Length, numChunks = ElementwiseChunks(length);
+            if (numChunks < 2) SimdKernels.ELU(srcMem.Span, alpha, dstMem.Span);
+            else
+            {
+                // Chunks are whole multiples of 8 doubles, so every chunk but the last has no scalar tail and the result
+                // equals one whole-array pass.
+                int chunkSize = ((length + numChunks - 1) / numChunks + 7) & ~7;
+                CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+                {
+                    int start = chunk * chunkSize, count = Math.Min(chunkSize, length - start);
+                    if (count > 0) SimdKernels.ELU(srcMem.Span.Slice(start, count), alpha, dstMem.Span.Slice(start, count));
+                }, deterministicSafe: true);
+            }
         }
         else
         {
@@ -15544,6 +15683,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
 
+        if (typeof(T) == typeof(float) && kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+            && padH == 0 && padW == 0 && batch * height * width <= PointwiseDirectMaxPositions)
+        {
+            // #639: a pointwise conv's input gradient at a tiny spatial size, dX[b, c, p] = sum over o of W[o, c] dY[b, o, p],
+            // as one small GEMM per batch row instead of the im2col / col2im route.
+            var dYF = (float[])(object)gradOutput.GetFlattenedData();
+            var wF = (float[])(object)kernel.GetFlattenedData();
+            var dXF = new float[batch * inChannels * height * width];
+            PointwiseInputGradFloat(dYF, wF, dXF, batch, outChannels, inChannels, height * width);
+            return RentFloatResult<T>(inputShape, dXF);
+        }
+
         // im2col + GEMM fast path for float: kernel^T × gradOutput → col, then col2im
         if (typeof(T) == typeof(float))
         {
@@ -16789,6 +16940,19 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         // im2col + GEMM fast path for float: gradKernel += gradOutput × im2col^T
+        if (typeof(T) == typeof(float) && kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
+            && padH == 0 && padW == 0 && batch * height * width <= PointwiseDirectMaxPositions)
+        {
+            // #639: a pointwise conv's weight gradient at a tiny spatial size (MobileNet / SE blocks at 1x1-4x4) is a
+            // sum of a few outer products, dW[o, c] = sum over (b, p) of dY[b, o, p] * X[b, c, p]. The im2col + GEMM
+            // route spent its time staging and transposing for a K = 1..16 product.
+            var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
+            var inputF = (float[])(object)input.GetFlattenedData();
+            var gradKernelF = new float[outChannels * inChannels];
+            PointwiseWeightGradFloat(gradOutputF, inputF, gradKernelF, batch, outChannels, inChannels, height * width);
+            return RentFloatResult<T>(kernelShape, gradKernelF);
+        }
+
         if (typeof(T) == typeof(float))
         {
             int colH = inChannels * kernelHeight * kernelWidth;
@@ -18669,6 +18833,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var kernelData = kernel.GetFlattenedData();
 
+        if (typeof(T) == typeof(float))
+        {
+            DepthwiseConv2DFloat((float[])(object)inputData, (float[])(object)kernelData, (float[])(object)outputData,
+                batch, inChannels, height, width, multiplier, kernelHeight, kernelWidth, strideH, strideW, padH, padW,
+                outputHeight, outputWidth);
+            return;
+        }
+
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
             (long)batch * outChannels * outputHeight * outputWidth, idx =>
         {
@@ -18704,6 +18876,143 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// dX_b^T[P, C] = dY_b^T[P, O] . W[O, C] per batch row (dY transposed once), written back as dX_b[C, P]; split over
+    /// 64-column blocks of the input channels, each an independent register-blocked GEMM, so the result does not
+    /// depend on the thread count.
+    /// </summary>
+    private static void PointwiseInputGradFloat(float[] dY, float[] w, float[] dX, int batch, int outChannels, int inChannels,
+        int positions)
+    {
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        var dYT = pool.Rent(positions * outChannels);
+        var dXT = pool.Rent(positions * inChannels);
+        try
+        {
+            for (int b = 0; b < batch; b++)
+            {
+                int yBase = b * outChannels * positions, xBase = b * inChannels * positions;
+                for (int o = 0; o < outChannels; o++)
+                    for (int q = 0; q < positions; q++) dYT[q * outChannels + o] = dY[yBase + o * positions + q];
+                const int colBlock = 64;
+                int blocks = (inChannels + colBlock - 1) / colBlock;
+                CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)positions * outChannels * inChannels, blk =>
+                {
+                    int c0 = blk * colBlock, n = Math.Min(colBlock, inChannels - c0);
+                    TileGemm(dYT, 0, outChannels, w, c0, inChannels, dXT, c0, inChannels, positions, n, outChannels, accumulate: false);
+                }, deterministicSafe: true);
+                for (int c = 0; c < inChannels; c++)
+                    for (int q = 0; q < positions; q++) dX[xBase + c * positions + q] = dXT[q * inChannels + c];
+            }
+        }
+        finally
+        {
+            pool.Return(dYT);
+            pool.Return(dXT);
+        }
+    }
+
+    // Spatial positions (batch x height x width) up to which a pointwise conv's weight gradient skips im2col + GEMM.
+    private const int PointwiseDirectMaxPositions = 64;
+
+    /// <summary>
+    /// dW[o, c] = sum over b, p of dY[b, o, p] * X[b, c, p] for a 1x1 stride-1 conv, with the positions transposed once
+    /// to [b, p, c] rows so each term is a contiguous axpy over the input channels; parallel over output channels
+    /// (each task owns its dW row, so the sum order does not depend on the thread count).
+    /// </summary>
+    private static void PointwiseWeightGradFloat(float[] dY, float[] x, float[] dW, int batch, int outChannels, int inChannels,
+        int positions)
+    {
+        int rows = batch * positions;
+        var xT = System.Buffers.ArrayPool<float>.Shared.Rent(rows * inChannels);
+        try
+        {
+            for (int b = 0; b < batch; b++)
+                for (int c = 0; c < inChannels; c++)
+                {
+                    int src = (b * inChannels + c) * positions;
+                    for (int p = 0; p < positions; p++) xT[(b * positions + p) * inChannels + c] = x[src + p];
+                }
+            // dW[o0..o1, :] = sum over b of dY_b[o0..o1, P] . X_b^T[P, C]: a register-blocked small GEMM per batch row
+            // (thousands of channel-length axpys were call-bound at 8x8). Output-channel blocks are independent and
+            // each element's sum runs p- then b-ordered, so the result does not depend on the thread count.
+            const int rowBlock = 16;
+            int blocks = (outChannels + rowBlock - 1) / rowBlock;
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)outChannels * rows * inChannels, blk =>
+            {
+                int o0 = blk * rowBlock, m = Math.Min(rowBlock, outChannels - o0);
+                for (int b = 0; b < batch; b++)
+                    TileGemm(dY, (b * outChannels + o0) * positions, positions, xT, b * positions * inChannels, inChannels,
+                        dW, o0 * inChannels, inChannels, m, inChannels, positions, accumulate: b > 0);
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(xT);
+        }
+    }
+
+    /// <summary>
+    /// Float depthwise convolution (#639): one task per (batch, output channel) plane, typed arrays instead of the
+    /// generic per-element numeric interface, and for stride 1 each tap added across a whole output row as a vector
+    /// multiply then add. Every output sums its in-bounds taps in (kh, kw) order with separate multiply and add, as the
+    /// generic loop does, so the result is identical to it. The parallel grain counts the kernel taps.
+    /// </summary>
+    private static void DepthwiseConv2DFloat(float[] x, float[] w, float[] y, int batch, int inChannels, int height,
+        int width, int multiplier, int kH, int kW, int strideH, int strideW, int padH, int padW, int outH, int outW)
+    {
+        int outChannels = inChannels * multiplier;
+        int planes = batch * outChannels;
+        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * outH * outW * kH * kW, idx =>
+        {
+            int b = idx / outChannels, oc = idx % outChannels, ic = oc / multiplier;
+            int xPlane = (b * inChannels + ic) * height * width, yPlane = idx * outH * outW, wBase = oc * kH * kW;
+            int vw = System.Numerics.Vector<float>.Count;
+            // In-bounds output columns per kernel column (independent of the row): ow * strideW + kw - padW in [0, width).
+            // A negative reach (the tap is past the right edge for every column) must not truncate to column 0.
+            Span<int> owFrom = stackalloc int[kW], owTo = stackalloc int[kW];
+            for (int kw = 0; kw < kW; kw++)
+            {
+                int lastReach = width - 1 + padW - kw;
+                owFrom[kw] = Math.Max(0, (padW - kw + strideW - 1) / strideW);
+                owTo[kw] = lastReach < 0 ? 0 : Math.Min(outW, lastReach / strideW + 1);
+            }
+            for (int oh = 0; oh < outH; oh++)
+            {
+                int yRow = yPlane + oh * outW;
+                Array.Clear(y, yRow, outW);
+                for (int kh = 0; kh < kH; kh++)
+                {
+                    int ih = oh * strideH + kh - padH;
+                    if (ih < 0 || ih >= height) continue;
+                    int xRow = xPlane + ih * width;
+                    for (int kw = 0; kw < kW; kw++)
+                    {
+                        float wv = w[wBase + kh * kW + kw];
+                        int owStart = owFrom[kw], owEnd = owTo[kw];
+                        if (owStart >= owEnd) continue;
+                        if (strideW == 1 && owEnd - owStart >= vw)
+                        {
+                            int src = xRow + owStart + kw - padW, dst = yRow + owStart, n = owEnd - owStart, i = 0;
+                            var vwv = new System.Numerics.Vector<float>(wv);
+                            for (; i <= n - vw; i += vw)
+                            {
+                                var prod = new System.Numerics.Vector<float>(x, src + i) * vwv;
+                                (new System.Numerics.Vector<float>(y, dst + i) + prod).CopyTo(y, dst + i);
+                            }
+                            for (; i < n; i++) y[dst + i] += x[src + i] * wv;
+                        }
+                        else
+                        {
+                            int src = xRow + kw - padW;
+                            for (int ow = owStart; ow < owEnd; ow++) y[yRow + ow] += x[src + ow * strideW] * wv;
+                        }
+                    }
+                }
+            }
+        }, deterministicSafe: true);
     }
 
     /// <inheritdoc/>
@@ -29787,7 +30096,7 @@ public partial class CpuEngine : ITensorLevelEngine
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultFCast,
                 new[] { queryOrig, keyOrig, valueOrig },
                 BackwardFunctions<T>.ScaledDotProductAttentionBackward,
-                new object[] { attentionWeights, scaleVal });
+                new object[] { attentionWeights, scaleVal, softcap });
             return resultFCast;
         }
 
@@ -29813,7 +30122,7 @@ public partial class CpuEngine : ITensorLevelEngine
             DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultDCast,
                 new[] { queryOrig, keyOrig, valueOrig },
                 BackwardFunctions<T>.ScaledDotProductAttentionBackward,
-                new object[] { attentionWeights, scaleVal });
+                new object[] { attentionWeights, scaleVal, softcap });
             return resultDCast;
         }
 
@@ -29940,7 +30249,7 @@ public partial class CpuEngine : ITensorLevelEngine
         DifferentiableOps.RecordIfActive("ScaledDotProductAttention", resultGen,
             new[] { queryOrig, keyOrig, valueOrig },
             BackwardFunctions<T>.ScaledDotProductAttentionBackward,
-            new object[] { attentionWeights, scaleVal });
+            new object[] { attentionWeights, scaleVal, softcap });
         return resultGen;
     }
 
@@ -34104,11 +34413,15 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputShape = GetReductionOutputShape(inputShape, normalizedAxes, keepDims);
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
-        var outputData = new T[outputSize];
-        maxIndices = new int[outputSize];
+        T minVal = numOps.MinValue;
+        // The dense single-axis path initializes every cell itself, in parallel: skip the zeroing and the serial init.
+        bool denseMax = normalizedAxes.Length == 1 && input.IsContiguous && (typeof(T) == typeof(float) || typeof(T) == typeof(double));
+        var outputData = denseMax ? UninitializedArray<T>(outputSize) : new T[outputSize];
+        maxIndices = denseMax ? UninitializedArray<int>(outputSize) : new int[outputSize];
+        if (denseMax && TryReduceMaxSingleAxisDense(inputData, outputData, maxIndices, inputShape, normalizedAxes[0], minVal))
+            goto maxRecord;
 
         // Initialize with minimum values
-        T minVal = numOps.MinValue;
         for (int i = 0; i < outputSize; i++)
         {
             outputData[i] = minVal;
@@ -34118,6 +34431,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Allocation-free odometer (replaces per-element FlatToMultiIndex +
         // new List<int> + MultiToFlatIndex + Contains). inputData is logical
         // row-major; advance the output flat index incrementally as we walk it.
+
         int maxRank = inputShape.Length;
         var maxOutStrideForDim = BuildReducedOutStrideForDim(inputShape, outputShape, normalizedAxes);
         var maxCoord = new int[maxRank];
@@ -34138,6 +34452,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        maxRecord:
         var reduceMaxResult = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ReduceMax", reduceMaxResult, input, BackwardFunctions<T>.ReduceMaxBackward, new object[] { maxIndices });
         { var ci = input; var ca = axes; var ck = keepDims; AutoTracer.RecordOp("ReduceMax", reduceMaxResult, eng => { eng.ReduceMax(ci, ca, ck, out _); return reduceMaxResult; }); }
@@ -34287,6 +34602,175 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(inputShape, gradInput);
     }
 
+    // Inner-axis block a ReduceMean work unit covers (see TryReduceMeanSingleAxisDense).
+    private const int ReduceMeanInnerBlock = 64;
+
+    // Inner columns per work unit on several threads: enough blocks per outer index for about four units per thread,
+    // but never narrower than ReductionMinParallelBlock columns. Every unit re-walks the whole axis, one row segment per
+    // page of input, so narrow blocks (16 columns: 64 bytes per page touched) ran SLOWER on 64 threads than one thread's
+    // single pass. On one thread: 64. Each column is still summed / scanned in axis order, so the result does not
+    // depend on the block.
+    private static int ReductionInnerBlock(int outer, int inner)
+    {
+        int dop = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (dop <= 1) return ReduceMeanInnerBlock;
+        long perOuter = Math.Max(1, (4L * dop + outer - 1) / outer);
+        long block = Math.Max(ReductionMinParallelBlock, (inner + perOuter - 1) / perOuter);
+        return (int)Math.Max(1, Math.Min(block, inner));
+    }
+
+    private const int ReductionMinParallelBlock = 256;
+
+    // Work chunks for a loop of `units` independent items costing `work` elements in all: about four per thread, but
+    // none smaller than ReductionMinChunkWork elements (a [6144, 32] row sum split 256 ways took 182 us against 107 us
+    // serially), and one on a single thread.
+    private static int WorkChunks(long units, long work)
+    {
+        int dop = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (dop <= 1 || units <= 1) return 1;
+        return (int)Math.Max(1, Math.Min(Math.Min(units, 4L * dop), work / ReductionMinChunkWork));
+    }
+
+    private const int ReductionMinChunkWork = 64 * 1024;
+
+    private static TItem[] UninitializedArray<TItem>(int length)
+    {
+#if NET5_0_OR_GREATER
+        return GC.AllocateUninitializedArray<TItem>(length);
+#else
+        return new TItem[length];
+#endif
+    }
+
+    // Single-axis max over a dense row-major input (#653), fanned out over (outer, inner column block) units. Matches
+    // the serial odometer exactly: each cell starts at the type's MinValue with index -1, the axis is scanned in
+    // increasing order and only a strictly greater value (never NaN) replaces it, recording the absolute flat index.
+    private static bool TryReduceMaxSingleAxisDense<T>(T[] data, T[] outData, int[] maxIndices, int[] shape, int axis, T minValue)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return false;
+        int outer = 1, inner = 1, axisSize = shape[axis];
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        int block = ReductionInnerBlock(outer, inner);
+        int blocks = (inner + block - 1) / block;
+        long units = (long)outer * blocks;
+        if (units > int.MaxValue) return false;
+        long work = (long)outer * axisSize * inner;
+        // Chunks of (outer, block) units, about four per thread, so a serial run is one loop, not a delegate per unit.
+        int chunks = WorkChunks(units, work), perChunk = (int)((units + chunks - 1) / chunks);
+        if (typeof(T) == typeof(double))
+        {
+            var src = (double[])(object)data; var dst = (double[])(object)outData; double init = (double)(object)minValue!;
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
+            {
+                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
+                for (int u = chunk * perChunk; u < u1; u++)
+                {
+                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
+                    int ob = o * inner, ib = o * axisSize * inner;
+                    for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
+                    for (int a = 0; a < axisSize; a++)
+                    {
+                        int rb = ib + a * inner;
+                        for (int j = j0; j < j1; j++) { double v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                    }
+                }
+            }, deterministicSafe: true);
+        }
+        else
+        {
+            var src = (float[])(object)data; var dst = (float[])(object)outData; float init = (float)(object)minValue!;
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
+            {
+                int u1 = (int)Math.Min(units, (long)(chunk + 1) * perChunk);
+                for (int u = chunk * perChunk; u < u1; u++)
+                {
+                    int o = u / blocks, j0 = (u % blocks) * block, j1 = Math.Min(inner, j0 + block);
+                    int ob = o * inner, ib = o * axisSize * inner;
+                    for (int j = j0; j < j1; j++) { dst[ob + j] = init; maxIndices[ob + j] = -1; }
+                    for (int a = 0; a < axisSize; a++)
+                    {
+                        int rb = ib + a * inner;
+                        for (int j = j0; j < j1; j++) { float v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                    }
+                }
+            }, deterministicSafe: true);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Mean over ONE axis of a dense row-major float/double array: work units are (outer index, inner column block),
+    /// split across threads, so it parallelizes whether the reduced axis is the last one (many outer rows) or the first
+    /// (one outer row, many inner columns); a chunk's units under one outer index are accumulated as one contiguous
+    /// column range, row by row. Each output accumulates over the reduced axis in increasing order and is then scaled
+    /// by 1/axisSize -- exactly the odometer's sequence -- so the result is bit-identical to it at any thread count
+    /// (#653: the odometer ran serially; an [8192, 1024] float mean over axis 0 took 17 ms at DOP 1 through 64).
+    /// Returns false for other element types.
+    /// </summary>
+    private static bool TryReduceMeanSingleAxisDense<T>(T[] data, T[] outData, int[] shape, int axis)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return false;
+        int outer = 1, inner = 1, axisSize = shape[axis];
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        int block = ReductionInnerBlock(outer, inner);
+        int blocks = (inner + block - 1) / block;
+        long units = (long)outer * blocks;
+        if (units > int.MaxValue) return false;
+        long work = (long)outer * axisSize * inner;
+        // Chunks of (outer, block) units, about four per thread; a chunk's units under one outer index form one
+        // contiguous inner range, accumulated row by row (one serial chunk = the whole tensor in a single pass).
+        int chunks = WorkChunks(units, work), perChunk = (int)((units + chunks - 1) / chunks);
+        if (typeof(T) == typeof(double))
+        {
+            var src = (double[])(object)data; var dst = (double[])(object)outData;
+            if (chunks <= 1) { MeanUnits(src, dst, inner, axisSize, blocks, block, 0, units); return true; }
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
+                MeanUnits(src, dst, inner, axisSize, blocks, block, (long)chunk * perChunk, Math.Min(units, (long)(chunk + 1) * perChunk)),
+                deterministicSafe: true);
+        }
+        else
+        {
+            var src = (float[])(object)data; var dst = (float[])(object)outData;
+            if (chunks <= 1) { MeanUnits(src, dst, inner, axisSize, blocks, block, 0, units); return true; }
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunk =>
+                MeanUnits(src, dst, inner, axisSize, blocks, block, (long)chunk * perChunk, Math.Min(units, (long)(chunk + 1) * perChunk)),
+                deterministicSafe: true);
+        }
+        return true;
+    }
+
+    // Mean over the axis for the (outer, block) units [u0, u1): per outer index, one contiguous inner range summed in
+    // axis order and then scaled by 1 / axisSize, as the serial odometer does.
+    private static void MeanUnits(float[] src, float[] dst, int inner, int axisSize, int blocks, int block, long u0, long u1)
+    {
+        float inv = 1.0f / axisSize;
+        for (long u = u0; u < u1;)
+        {
+            int o = (int)(u / blocks);
+            long uEnd = Math.Min(u1, (long)(o + 1) * blocks);
+            int j0 = (int)(u - (long)o * blocks) * block, j1 = (int)Math.Min(inner, (uEnd - (long)o * blocks) * block);
+            AccumulateAxisRows(src, o * axisSize * inner + j0, inner, axisSize, dst, o * inner + j0, j1 - j0);
+            for (int j = o * inner + j0, end = o * inner + j1; j < end; j++) dst[j] *= inv;
+            u = uEnd;
+        }
+    }
+
+    private static void MeanUnits(double[] src, double[] dst, int inner, int axisSize, int blocks, int block, long u0, long u1)
+    {
+        double inv = 1.0 / axisSize;
+        for (long u = u0; u < u1;)
+        {
+            int o = (int)(u / blocks);
+            long uEnd = Math.Min(u1, (long)(o + 1) * blocks);
+            int j0 = (int)(u - (long)o * blocks) * block, j1 = (int)Math.Min(inner, (uEnd - (long)o * blocks) * block);
+            AccumulateAxisRows(src, o * axisSize * inner + j0, inner, axisSize, dst, o * inner + j0, j1 - j0);
+            for (int j = o * inner + j0, end = o * inner + j1; j < end; j++) dst[j] *= inv;
+            u = uEnd;
+        }
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
@@ -34431,6 +34915,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
 
+        // #653: dense single-axis float/double mean, parallel and bit-identical to the odometer below.
+        if (normalizedAxes.Length == 1 && TryReduceMeanSingleAxisDense(inputData, outputData, inputShape, normalizedAxes[0]))
+            goto meanRecord;
+
         // Allocation-free odometer reduction (mirrors the Tensor<T>.Sum fast
         // path). The previous implementation allocated a FlatToMultiIndex int[]
         // + a List<int> + a MultiToFlatIndex int[] PER ELEMENT plus a
@@ -34508,6 +34996,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Divide(outputData[i], divisor);
         }
 
+    meanRecord:
         var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ReduceMean", result, input,
             BackwardFunctions<T>.ReduceMeanBackward,
@@ -36557,7 +37046,8 @@ public partial class CpuEngine : ITensorLevelEngine
         outputShape[axis] = totalAxisSize;
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
-        var outputData = new T[outputSize];
+        // Every path below writes every element, so skip the (serial) zeroing of a fresh array.
+        var outputData = UninitializedArray<T>(outputSize);
 
         // NCHWc8 fast path: channel-axis concat where every input is
         // NCHWc8 and each C is divisible by the cBlock. Physical layout is
@@ -36598,6 +37088,41 @@ public partial class CpuEngine : ITensorLevelEngine
             return packedResult;
         }
 
+        // Row-major inputs contribute one contiguous block per outer index (#653): copy blocks, fanned out over the outer
+        // rows when the result is large. A pure copy, so identical at any DOP.
+        if (tensors.All(t => t.IsContiguous))
+        {
+            int outer = 1, innerUnit = 1;
+            for (int d = 0; d < axis; d++) outer *= firstShape[d];
+            for (int d = axis + 1; d < rank; d++) innerUnit *= firstShape[d];
+            int outRow = totalAxisSize * innerUnit;
+            var sources = new T[tensors.Count][];
+            var widths = new int[tensors.Count];
+            var offsets = new int[tensors.Count];
+            for (int k = 0, at = 0; k < tensors.Count; k++)
+            {
+                sources[k] = tensors[k].GetDataArray();
+                widths[k] = tensors[k]._shape[axis] * innerUnit;
+                offsets[k] = at;
+                at += widths[k];
+            }
+            void CopyRows(int o0, int o1)
+            {
+                for (int o = o0; o < o1; o++)
+                    for (int k = 0; k < sources.Length; k++)
+                        if (widths[k] > 0) Array.Copy(sources[k], o * widths[k], outputData, o * outRow + offsets[k], widths[k]);
+            }
+            int chunks = outer < 2 ? 1 : Math.Min(outer, ElementwiseChunks(outputSize));
+            if (chunks < 2) CopyRows(0, outer);
+            else
+            {
+                int rowsPerChunk = (outer + chunks - 1) / chunks;
+                CpuParallelSettings.ParallelForOrSerial(0, chunks, outputSize, c => CopyRows(c * rowsPerChunk, Math.Min(outer, (c + 1) * rowsPerChunk)),
+                    deterministicSafe: true);
+            }
+            goto concatRecord;
+        }
+
         var outputStrides = ComputeStrides(outputShape);
 
         int axisOffset = 0;
@@ -36630,6 +37155,7 @@ public partial class CpuEngine : ITensorLevelEngine
             axisOffset += tensor._shape[axis];
         }
 
+        concatRecord:
         var result = TensorAllocator.Rent<T>(outputShape, outputData);
         if (GradientTape<T>.Current is not null)
         {
@@ -47368,6 +47894,25 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Runs float ReLU split across threads in <see cref="CpuParallelSettings.ElementwiseGrainSize"/>
     /// chunks, with <see cref="SimdKernels.ReLUUnsafe"/> (see <see cref="JitBinaryDispatch"/>).
     /// </summary>
+    // Float ELU split across threads in elementwise-grain chunks (#653), as JitUnaryDispatch does for ReLU.
+    private static unsafe void ELUDispatch(float* pSrc, float* pDst, int length, float alpha)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            SimdKernels.ELUUnsafe(pSrc, pDst, length, alpha);
+            return;
+        }
+        int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.ELUUnsafe(pSrc + start, pDst + start, count, alpha);
+        }, deterministicSafe: true);
+    }
+
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
         int numChunks = ElementwiseChunks(length);

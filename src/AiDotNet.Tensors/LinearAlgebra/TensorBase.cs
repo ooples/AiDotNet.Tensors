@@ -2864,6 +2864,95 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// was ~13% of a CPU Transformer training step, mostly transposed and permuted gradient views. Pure copies,
     /// so the result is identical to any element-order walk.
     /// </summary>
+    // #653: below this many elements a strided materialization stays the single-threaded span walk.
+    internal const int ParallelStridedCopyMinElements = 64 * 1024;
+    private const int TransposeTile = 32;
+
+    /// <summary>
+    /// Array form of <see cref="CopyStridedToRowMajor(ReadOnlySpan{T}, int, int[], int[], Span{T})"/> for large views:
+    /// the same axis coalescing, then either a cache-blocked tile copy (two coalesced axes -- a transpose or any 2-D
+    /// permutation) or contiguous row chunks, split across threads. A pure copy, so the result is identical at any
+    /// thread count. (#653: the span walk ran on one thread and, for a transpose, gathered one cache line per element;
+    /// an [8192, 1024] float transpose + Contiguous took ~60 ms at DOP 1 through 64.)
+    /// </summary>
+    internal static void CopyStridedToRowMajorParallel(T[] source, int offset, int[] shape, int[] strides, T[] destination, int destOffset)
+    {
+        int rank = shape.Length;
+        long totalL = 1;
+        for (int d = 0; d < rank; d++) totalL *= shape[d];
+        int total = (int)totalL;
+        if (total == 0) return;
+        var dims = new int[Math.Max(rank, 1)];
+        var steps = new int[Math.Max(rank, 1)];
+        int n = 0;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            int extent = shape[d];
+            if (extent == 1) continue;
+            if (n > 0 && strides[d] == steps[n - 1] * dims[n - 1]) { dims[n - 1] *= extent; continue; }
+            dims[n] = extent; steps[n] = strides[d]; n++;
+        }
+        if (n == 0) { destination[destOffset] = source[offset]; return; }
+
+        int inner = dims[0], innerStep = steps[0];
+        if (n == 2 && innerStep != 1)
+        {
+            // Two coalesced axes: dst[o * inner + i] = src[offset + o * steps[1] + i * innerStep]. Walk 32 x 32 tiles so
+            // both the strided reads and the contiguous writes stay within a few cache lines per tile.
+            int outer = dims[1], outerStep = steps[1];
+            int oTiles = (outer + TransposeTile - 1) / TransposeTile, iTiles = (inner + TransposeTile - 1) / TransposeTile;
+            // Work units are (outer tile row, group of inner tiles), about four per thread: splitting over the outer
+            // tiles alone left a [32, 6144] view one unit and a [256, 8192] view eight.
+            int wanted = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism * 4);
+            int iGroups = Math.Max(1, Math.Min(iTiles, (wanted + oTiles - 1) / oTiles));
+            int tilesPerGroup = (iTiles + iGroups - 1) / iGroups;
+            iGroups = (iTiles + tilesPerGroup - 1) / tilesPerGroup;
+            CpuParallelSettings.ParallelForOrSerial(0, oTiles * iGroups, total, unit =>
+            {
+                int ot = unit / iGroups, ig = unit % iGroups;
+                int o0 = ot * TransposeTile, o1 = Math.Min(outer, o0 + TransposeTile);
+                int itEnd = Math.Min(iTiles, (ig + 1) * tilesPerGroup);
+                for (int it = ig * tilesPerGroup; it < itEnd; it++)
+                {
+                    int i0 = it * TransposeTile, i1 = Math.Min(inner, i0 + TransposeTile);
+                    for (int o = o0; o < o1; o++)
+                    {
+                        int s = offset + o * outerStep + i0 * innerStep, dRow = destOffset + o * inner;
+                        for (int i = i0; i < i1; i++, s += innerStep) destination[dRow + i] = source[s];
+                    }
+                }
+            }, deterministicSafe: true);
+            return;
+        }
+
+        int rows = total / inner;
+        int chunks = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism * 4, rows));
+        int rowsPerChunk = (rows + chunks - 1) / chunks;
+        chunks = (rows + rowsPerChunk - 1) / rowsPerChunk;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, total, c =>
+        {
+            int r0 = c * rowsPerChunk, r1 = Math.Min(rows, r0 + rowsPerChunk);
+            // Decode r0 into the outer odometer (axes 1..n-1, axis 1 fastest) and its source offset.
+            var counter = new int[n];
+            int src = offset, rem = r0;
+            for (int d = 1; d < n; d++) { counter[d] = rem % dims[d]; rem /= dims[d]; src += counter[d] * steps[d]; }
+            int dst = destOffset + r0 * inner;
+            for (int row = r0; row < r1; row++)
+            {
+                if (innerStep == 1) Array.Copy(source, src, destination, dst, inner);
+                else { int s = src; for (int i = 0; i < inner; i++, s += innerStep) destination[dst + i] = source[s]; }
+                dst += inner;
+                for (int d = 1; d < n; d++)
+                {
+                    src += steps[d];
+                    if (++counter[d] < dims[d]) break;
+                    counter[d] = 0;
+                    src -= steps[d] * dims[d];
+                }
+            }
+        }, deterministicSafe: true);
+    }
+
     internal static void CopyStridedToRowMajor(ReadOnlySpan<T> source, int offset, int[] shape, int[] strides, Span<T> destination)
     {
         int rank = shape.Length;

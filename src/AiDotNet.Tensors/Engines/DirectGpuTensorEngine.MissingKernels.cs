@@ -991,17 +991,19 @@ public partial class DirectGpuTensorEngine
         return engine.TensorStack(channels, 1);
     }
 
+    // fullyWritten: `dispatch` writes every element of the output, so it need not start zero-filled (#1106).
     private Tensor<T> DispatchDeferredGpuOp<T>(
         IDirectGpuBackend backend,
         int elementCount,
         int[] shape,
-        Action<IGpuBuffer> dispatch)
+        Action<IGpuBuffer> dispatch,
+        bool fullyWritten = false)
     {
         IGpuBuffer? output = null;
         bool handedOff = false;
         try
         {
-            output = backend.AllocateBuffer(elementCount);
+            output = fullyWritten ? AllocateDeviceBufferUninitialized(backend, elementCount) : backend.AllocateBuffer(elementCount);
             dispatch(output);
             var result = DeferTensorResult<T>(backend, output, elementCount, shape);
             handedOff = true;
@@ -5051,6 +5053,7 @@ public partial class DirectGpuTensorEngine
             var sourceShape = (int[])source._shape.Clone();
             using var sourceBuffer = GetOrAllocateBuffer(backend, source);
             var rect = rank <= RectSliceLimits.MaxRank ? backend as IRectSliceKernels : null;
+            // The explicit zero Fill below covers the whole output, so the allocation need not zero it as well.
             return DispatchDeferredGpuOp<T>(backend, total, (int[])inputShape.Clone(), output =>
             {
                 backend.Fill(output, 0f, total);
@@ -5074,7 +5077,7 @@ public partial class DirectGpuTensorEngine
                     }
                     backend.Copy(sourceBuffer.Buffer, row * rowSize, output, destinationOffset, rowSize);
                 }
-            });
+            }, fullyWritten: true);
         }
         catch (Exception)
         {

@@ -1593,6 +1593,12 @@ class Program
         // matrix that cluster #6 (VGG16 / ResNet50 / DenseNet) exercises at
         // ImageNet input scale. Stage 0 baseline for Stage 1 / 5 / 7 conv work.
         // (~15-30min).
+        if (args[0] == "--fused-attention")
+        {
+            BenchmarkRunner.Run<FusedAttentionBenchmarks>(BenchConfig);
+            return;
+        }
+
         if (args[0] == "--conv2d-backward-double")
         {
             BenchmarkRunner.Run<Conv2DBackwardDoubleBenchmarks>(BenchConfig);
@@ -1840,6 +1846,7 @@ class Program
         Console.WriteLine("  --vs-deterministic-matmul: Deterministic vs non-deterministic SimdGemm on HRE + square shapes (post-MKL-removal both paths are SimdGemm; pair with iter-17 MKL baseline for vs-MKL comparison)");
         Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
         Console.WriteLine("  --dit-xl-matmul-double : FP64 GEMM at DiT-XL + cluster-#6 shapes; Stage 0 baseline (docs/mkl-replacement/PLAN.md)");
+        Console.WriteLine("  --fused-attention : #889 attention training step, materialising SDPA vs weightless fused FlashAttention-2 (time + bytes)");
         Console.WriteLine("  --conv2d-backward-double : FP64 Conv2DBackward dW+dX across cluster-#6 shapes; Stage 0 baseline");
         Console.WriteLine("  --conv3d-backward : FP32 Conv3D dInput+dKernel at video-diffusion temporal-block shapes");
         Console.WriteLine("  --fp64-primitives   : FP64 BN/LN/Softmax/activations/pools; Stage 0 baseline for Stage 4");
