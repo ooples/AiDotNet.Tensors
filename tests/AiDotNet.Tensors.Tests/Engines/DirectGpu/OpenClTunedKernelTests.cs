@@ -327,6 +327,37 @@ public sealed class OpenClTunedKernelTests
     }
 
 
+    [SkippableFact]
+    public void Tuning_ReadbacksAreAttributedToTheRegistry_NotTheOp()
+    {
+        var backend = RequireBackend();
+        TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
+        bool previousPersist = TunedKernelPolicy.PersistDecisions;
+        TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
+        TunedKernelPolicy.PersistDecisions = false;
+        try
+        {
+            // A shape no profile covers, so the slot measures it (and snapshots candidate outputs to the host).
+            const int rows = 777, n = 40;
+            float[] x = Values(rows * n, 5, 3f);
+            using var input = backend.AllocateBuffer(x);
+            using var output = backend.AllocateBuffer(x.Length);
+            backend.SoftmaxSlot.InvalidateDecisions();
+            long tuningBefore = GpuLaunchProbe.TuningReadbacks;
+            // Thread-scoped: transfers other test classes make in parallel do not land in it.
+            using var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin();
+            backend.Softmax(input, output, rows, n);
+            var reason = Assert.Single(backend.SoftmaxSlot.CachedDecisions).Reason;
+            Assert.True(reason == TunedKernelDecisionReason.Tuned || reason == TunedKernelDecisionReason.ReferenceWon, $"measured decision expected, got {reason}");
+            Assert.True(GpuLaunchProbe.TuningReadbacks > tuningBefore, "the gate snapshots candidate outputs, so tuning must read back");
+            Assert.Equal(0, scope.Downloads);
+        }
+        finally
+        {
+            TunedKernelPolicy.ModeOverride = previousMode;
+            TunedKernelPolicy.PersistDecisions = previousPersist;
+        }
+    }
     // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.
     private static readonly (int B, int C, int H, int W, int O, int K, int S, int P, int D)[] ConvShapes =
     {

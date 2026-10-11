@@ -58,6 +58,7 @@ internal sealed class CudaTunedKernelHarness<TArgs> : ITunedKernelHarness<TArgs>
 
     public float[] SnapshotOutput(in TArgs args)
     {
+        using var _ = GpuLaunchProbe.TuningScope();
         var outs = _outputs(args);
         int total = 0;
         foreach (var o in outs) total += o.Count;
@@ -74,6 +75,7 @@ internal sealed class CudaTunedKernelHarness<TArgs> : ITunedKernelHarness<TArgs>
 
     public double MeasureMilliseconds(ITunedKernelCandidate<TArgs> candidate, in TArgs args, int repetitions)
     {
+        using var _ = GpuLaunchProbe.TuningScope();
         TArgs local = args;
         return _backend.MeasureTunedKernelMilliseconds(() => candidate.Execute(local), repetitions);
     }
