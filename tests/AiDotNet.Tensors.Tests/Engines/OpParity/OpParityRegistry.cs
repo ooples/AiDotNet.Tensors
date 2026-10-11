@@ -68,7 +68,8 @@ public static class OpParityRegistry
         GraphOutputDependency[]? graphOutputDependencies = null,
         TensorOutputOverload outputOverload = TensorOutputOverload.Unspecified,
         GraphCaptureSignatureConstraint graphCaptureSignatureConstraint = GraphCaptureSignatureConstraint.None,
-        GraphCaptureSignatureOverload graphCaptureSignatureOverload = GraphCaptureSignatureOverload.Unspecified)
+        GraphCaptureSignatureOverload graphCaptureSignatureOverload = GraphCaptureSignatureOverload.Unspecified,
+        GpuReadbackContract gpuReadbackContract = GpuReadbackContract.None)
     {
         var op = new OpCase(
             name,
@@ -86,7 +87,8 @@ public static class OpParityRegistry
             GraphCaptureSignatureOverload = graphCaptureSignatureOverload,
             TensorOutputComparisons = outputComparisons,
             GraphOutputDependencies = graphOutputDependencies,
-            TensorOutputOverload = outputOverload
+            TensorOutputOverload = outputOverload,
+            GpuReadbackContract = gpuReadbackContract
         };
         if (graphCaptureSignatureConstraint != GraphCaptureSignatureConstraint.None)
             op.GraphCaptureSignatureConstraint = graphCaptureSignatureConstraint;
@@ -815,7 +817,8 @@ public static class OpParityRegistry
         yield return HomogeneousOutputCase("TensorUnravelIndex[all-outputs]", "index", "TensorUnravelIndex",
             e => e.TensorUnravelIndex(new Tensor<float>(new float[] { 0, 5, 11, 7 }, new[] { 4 }), new[] { 3, 4 }),
             e => e.TensorUnravelIndex(new Tensor<double>(new double[] { 0, 5, 11, 7 }, new[] { 4 }), new[] { 3, 4 }), ParityTol.Exact,
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary,
+            gpuReadbackContract: GpuReadbackContract.ElementValidation);
         yield return HomogeneousOutputCase("TensorStdMean[all-outputs]", "reduction", "TensorStdMean",
             e => { var (std, mean) = e.TensorStdMean(x.F(), new[] { 1 }); return new[] { std, mean }; },
             e => { var (std, mean) = e.TensorStdMean(x.D(), new[] { 1 }); return new[] { std, mean }; }, ParityTol.Accum(1e-5));
@@ -2864,7 +2867,19 @@ public static class OpParityRegistry
             e => e.ScaledDotProductAttention(q.D(), k.D(), val.D(),
                 new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, out _),
             ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttention",
-            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.ScaledDotProductAttention_Tensor_T_Tensor_T_Tensor_T_Tensor_Boolean_Nullable_Double_Out_Tensor_T_Double);
+
+        // #889: the weightless fused attention (FlashAttention-2 on the CPU float path), with a mask, causality and a
+        // soft-cap, against the same function on the reference engine.
+        yield return new OpCase("ScaledDotProductAttentionFused[1,2,4,8;mask,causal,softcap]", "attention",
+            e => e.ScaledDotProductAttention(q.F(), k.F(), val.F(),
+                new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, isCausal: true, softcap: 4.0),
+            e => e.ScaledDotProductAttention(q.D(), k.D(), val.D(),
+                new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, isCausal: true, softcap: 4.0),
+            ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttention",
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.ScaledDotProductAttention_Tensor_T_Tensor_T_Tensor_T_Tensor_Boolean_Nullable_Double_Boolean_Double);
 
         // ScatterMax: every output index covered (0..3) so no empty-group -inf; max is deterministic.
         var smSrc = OpInput.Rand(3510, new[] { 6 });

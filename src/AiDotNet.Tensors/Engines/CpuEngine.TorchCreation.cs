@@ -15,7 +15,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 public partial class CpuEngine
 {
-    private static int NormalizeDim(int dim, int rank)
+    private protected static int NormalizeDim(int dim, int rank)
     {
         int d = dim < 0 ? dim + rank : dim;
         if (d < 0 || d >= rank) throw new ArgumentOutOfRangeException(nameof(dim), $"dim {dim} is out of range for rank {rank}.");
@@ -74,7 +74,7 @@ public partial class CpuEngine
         return FromDoubles<T>(new[] { count }, i => start + i * step);
     }
 
-    private static int RangeCount(double start, double end, double step, double size)
+    private protected static int RangeCount(double start, double end, double step, double size)
     {
         if (double.IsNaN(start) || double.IsInfinity(start)) throw new ArgumentOutOfRangeException(nameof(start), "start must be finite.");
         if (double.IsNaN(end) || double.IsInfinity(end)) throw new ArgumentOutOfRangeException(nameof(end), "end must be finite.");
@@ -235,10 +235,13 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         long total = shape.Aggregate(1L, (a, d) => a * d);
         var source = indices.IsContiguous ? indices : indices.Contiguous();
-        var flat = source.AsSpan().ToArray().Select(v => (long)ops.ToDouble(v)).ToArray();
-        foreach (var f in flat)
-            if (f < -total || f >= total)
-                throw new ArgumentOutOfRangeException(nameof(indices), $"index {f} is out of range for shape [{string.Join(", ", shape)}].");
+        // Truncate toward zero and range-check the truncated value. NaN and infinities are rejected explicitly: a bare
+        // (long) cast is runtime-dependent (.NET Framework gives long.MinValue, .NET 9+ saturates NaN to 0).
+        var truncated = source.AsSpan().ToArray().Select(v => Math.Truncate(ops.ToDouble(v))).ToArray();
+        foreach (var t in truncated)
+            if (double.IsNaN(t) || t < -total || t >= total)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"index {t} is out of range for shape [{string.Join(", ", shape)}].");
+        var flat = truncated.Select(t => (long)t).ToArray();
         var result = new Tensor<T>[shape.Length];
         long stride = 1;
         for (int d = shape.Length - 1; d >= 0; d--)

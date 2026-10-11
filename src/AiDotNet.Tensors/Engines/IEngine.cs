@@ -4253,6 +4253,46 @@ public partial interface IEngine
         double softcap = 0.0);
 
     /// <summary>
+    /// Memory-efficient, tape-aware scaled dot-product attention: <c>softmax(f(scale * Q K^T) masked) V</c> without
+    /// materialising the [batch, heads, querySequence, keySequence] score or probability matrix and without returning
+    /// attention weights (the counterpart of PyTorch's <c>F.scaled_dot_product_attention</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On the CPU engine with float32 this runs a FlashAttention-2 style kernel: an online softmax over key tiles in
+    /// the forward, saving only one log-sum-exp per query row, and a backward that rebuilds each probability tile from
+    /// it. Training memory is therefore O(sequence) per head instead of the O(sequence^2) attention-weights tensor
+    /// the weights-returning overload keeps for its backward. Other element types and GPU engines compute the same
+    /// function through the materialising primitives.
+    /// </para>
+    /// <para>
+    /// <paramref name="query"/>, <paramref name="key"/> and <paramref name="value"/> are [batch, heads, sequence, dim]
+    /// and may be strided views (for example a permute of [batch, sequence, heads, dim] projections): they are read in
+    /// place unless their last axis is not unit-stride.
+    /// </para>
+    /// </remarks>
+    /// <param name="query">[batch, heads, querySequence, headDim].</param>
+    /// <param name="key">[batch, heads, keySequence, headDim].</param>
+    /// <param name="value">[batch, heads, keySequence, valueDim].</param>
+    /// <param name="mask">Optional boolean mask broadcastable to [batch, heads, querySequence, keySequence]
+    /// (right-aligned; each extent 1 or full): <c>true</c> = the query may attend the key.</param>
+    /// <param name="scale">Score scale; defaults to <c>1 / sqrt(headDim)</c>.</param>
+    /// <param name="isCausal">Query i attends only keys j &lt;= i (top-left aligned, as PyTorch's <c>is_causal</c>);
+    /// combined with <paramref name="mask"/> by AND when both are given.</param>
+    /// <param name="softcap">Optional attention-logit soft-cap (Gemma-2): when &gt; 0 the scaled scores pass through
+    /// <c>softcap * tanh(score / softcap)</c> before masking and the softmax.</param>
+    /// <returns>[batch, heads, querySequence, valueDim]. A query row with no allowed key outputs zeros (and passes no
+    /// gradient), as FlashAttention does, instead of NaN.</returns>
+    Tensor<T> ScaledDotProductAttention<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        Tensor<bool>? mask = null,
+        double? scale = null,
+        bool isCausal = false,
+        double softcap = 0.0);
+
+    /// <summary>
     /// Grouped-query scaled dot-product attention (inference), device-agnostically: <paramref name="key"/> and
     /// <paramref name="value"/> may carry fewer heads than <paramref name="query"/> (<c>qHeads % kvHeads == 0</c>)
     /// and each KV head is shared across its query-head group WITHOUT materializing an expanded copy. The GPU

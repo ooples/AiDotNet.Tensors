@@ -243,6 +243,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // call site instead of an opaque "kernel not found" deep in dispatch.
     private bool _fusedAdvancedKernelsAvailable;
     private IntPtr _activationModule;
+    private IntPtr _torchParityElementwiseModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
     private IntPtr _poolingModule;
@@ -1136,6 +1137,22 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // catch that degraded silently to the CPU. See CudaMissingLookupKernels.
         CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
             Kernels.CudaMissingLookupKernels.GetKernelNames());
+
+        // PyTorch-parity elementwise ops that computed on the host (#1112). useFastMath:false -- erff, log1pf, expf
+        // and sinpif must be the accurate versions to match the CPU's double-precision reference.
+        // Optional: if this module fails to compile, its kernels stay out of the cache, every parity launcher throws
+        // "kernel not found", and the engine's device helpers fall back to the CPU (recording the fallback) -- the rest
+        // of the backend stays available.
+        try
+        {
+            _torchParityElementwiseModule = CompileKernelModule(device, Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity_elementwise_kernels",
+                Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
+        }
+        catch (Exception ex)
+        {
+            _torchParityElementwiseModule = IntPtr.Zero;
+            System.Diagnostics.Trace.TraceWarning($"CUDA torch-parity kernels unavailable; those ops use the CPU path: {ex.Message}");
+        }
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
@@ -2020,11 +2037,33 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_asyncAlloc)
             return AllocateBuffer(size);
         using var _ = PushContext();
-        if (TryRentAsyncBuffer(size) is { } reused)
-            return reused;
-        var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
-        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+        var buffer = TryRentAsyncBuffer(size)
+            ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
+                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+        if (PoisonUninitializedBuffers)
+        {
+            try
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemsetD8Async(buffer.Handle, 0xFF, (ulong)size * sizeof(float), _stream),
+                    "cuMemsetD8Async(poison)");
+            }
+            catch
+            {
+                buffer.Dispose();
+                throw;
+            }
+        }
+        return buffer;
     }
+
+    /// <summary>
+    /// Debug switch (env <c>AIDOTNET_GPU_POISON_UNINITIALIZED=1</c>): fill every uninitialized buffer with 0xFF bytes,
+    /// a NaN in every float, so an op that allocates uninitialized but does not write every element surfaces as NaN in
+    /// GPU-vs-CPU tests instead of passing on whatever the reused memory happened to hold.
+    /// </summary>
+    internal static readonly bool PoisonUninitializedBuffers =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_POISON_UNINITIALIZED") == "1";
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
@@ -13632,6 +13671,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // Upper bound on the multi-tensor reduction's grid: enough blocks to fill the device, few enough that the one
     // atomic per block does not serialize.
     private const int MultiTensorReductionMaxBlocks = 1024;
+    // Elements per gradient-table chunk for the multi-tensor norm and scale kernels (MT_CHUNK in
+    // CudaOptimizerKernels must match): 16 per thread as four float4s, so a 10M-parameter model is ~2.4K chunks
+    // rather than ~39K 256-element ones (#1106).
+    private const int GradientTableChunk = 4096;
+    // Grid cap for the grid-stride multi-tensor scale.
+    private const int MultiTensorScaleMaxBlocks = 4096;
 
     private MultiTensorTable GetGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
     {
@@ -13660,15 +13705,15 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             handles[t] = tensors[t].Handle;
             WriteAddress(addresses, t, handles[t]);
             sizeArray[t] = size;
-            totalChunks += (size + MultiTensorChunk - 1) / MultiTensorChunk;
+            totalChunks += (size + GradientTableChunk - 1) / GradientTableChunk;
         }
         var chunkTensor = new int[totalChunks];
         var chunkStart = new int[totalChunks];
         int c = 0;
         for (int t = 0; t < n; t++)
         {
-            int chunks = (sizeArray[t] + MultiTensorChunk - 1) / MultiTensorChunk;
-            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
+            int chunks = (sizeArray[t] + GradientTableChunk - 1) / GradientTableChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * GradientTableChunk; c++; }
         }
 
         // Build the replacement completely before retiring the cached table: a failed allocation or upload disposes
@@ -13745,15 +13790,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (tensors is null || tensors.Count == 0) return;
         if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         lock (_gradientTableSync)
         {
             var table = GetGradientTable(tensors, sizes);
             using var _ = PushContext();
             IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
             IntPtr scH = scale.Handle;
-            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
-            LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+            int totalChunks = table.TotalChunks;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH; args[5] = &totalChunks;
+            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), MultiTensorChunk, args);
         }
     }
 
@@ -17947,6 +17993,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             CudaNativeBindings.cuModuleUnload(_activationModule);
             _activationModule = IntPtr.Zero;
+        }
+
+        if (_torchParityElementwiseModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
+            _torchParityElementwiseModule = IntPtr.Zero;
         }
 
         if (_parity210Module != IntPtr.Zero)

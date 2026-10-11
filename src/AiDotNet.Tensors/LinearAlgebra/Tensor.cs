@@ -500,6 +500,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // the current strided source offset incrementally — no divisions at
         // all on the hot path.
         if (Rank == 0 || Length == 0) return FinalizeContiguousCopy(result);
+        // Large views: tiled / row-chunked copy across threads straight between the backing arrays (#653).
+        // (On one thread the span walk below is faster than the tiled copy.)
+        if (Length >= ParallelStridedCopyMinElements && Helpers.CpuParallelSettings.MaxDegreeOfParallelism > 1
+            && GetCpuBackingForStridedRead(out int srcBase) is { } srcArr
+            && result.GetCpuBackingForContiguousWrite(out int dstBase) is { } dstArr)
+        {
+            CopyStridedToRowMajorParallel(srcArr, srcBase, _shape, _strides, dstArr, dstBase);   // srcBase already includes the view offset
+            return FinalizeContiguousCopy(result);
+        }
         // Run-wise: block copies (or tight strided loops) per innermost run instead of an odometer step per element.
         CopyStridedToRowMajor(_data.AsSpan(), _storageOffset, _shape, _strides, dstSpan);
         return FinalizeContiguousCopy(result);
