@@ -8,7 +8,7 @@ using S = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBatchExecutionKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed partial class VulkanBackend
+public sealed partial class VulkanBackend : IMeshgridBackend
 {
     private readonly List<VulkanComputePipeline> _batchRecordedPipelines = new List<VulkanComputePipeline>();
     private Action? _flushPendingBatchAction;
@@ -139,4 +139,12 @@ public sealed partial class VulkanBackend
 
     public void BatchOuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int batchSize, int M, int N)
         => GlslNaryOp(S.BatchOuterProduct, new[] { a, b, output }, batchSize * M * N, new[] { Bits(batchSize), Bits(M), Bits(N) });
+
+    public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
+        int n0, int n1, bool xy)
+    {
+        if (n0 <= 0) throw new ArgumentOutOfRangeException(nameof(n0));
+        if (n1 <= 0) throw new ArgumentOutOfRangeException(nameof(n1));
+        GlslNaryOp(S.Meshgrid2D, new[] { source0, source1, output0, output1 }, checked(n0 * n1), new[] { Bits(n0), Bits(n1), xy ? 1u : 0u });
+    }
 }

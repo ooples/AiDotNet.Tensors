@@ -350,4 +350,11 @@ void main() {
     int mn = M * N; int bt = i / mn; int r = i % mn;
     outp[i] = a[bt * M + r / N] * b[bt * N + r % N];
 }");
-}
+
+    public static readonly string Meshgrid2D = Shader(new[] { "r:source0", "r:source1", "w:output0", "w:output1" }, "int n0; int n1; int xy;", @"
+void main() {
+    int i = bx_gid(); if (i >= n0 * n1) return;
+    int cols = xy != 0 ? n0 : n1; int r = i / cols; int c = i % cols;
+    output0[i] = source0[xy != 0 ? c : r];
+    output1[i] = source1[xy != 0 ? r : c];
+}");}

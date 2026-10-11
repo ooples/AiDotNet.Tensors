@@ -5,7 +5,7 @@ using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IGpuBatchExecution
+public sealed partial class CudaBackend : IMeshgridBackend, IGpuBatchExecution
 {
     private int _batchDepth;
     private int _secondaryStreamOwnerThreadId;
@@ -94,5 +94,13 @@ public sealed partial class CudaBackend : IGpuBatchExecution
         if (Interlocked.CompareExchange(ref _secondaryStreamOwnerThreadId, 0, thread) != thread)
             throw new InvalidOperationException("Not in a secondary stream on this thread.");
         Synchronize();
+    }
+
+    public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
+        int n0, int n1, bool xy)
+    {
+        if (n0 <= 0) throw new ArgumentOutOfRangeException(nameof(n0));
+        if (n1 <= 0) throw new ArgumentOutOfRangeException(nameof(n1));
+        LaunchBatchKernel("bx_meshgrid2d", checked(n0 * n1), source0, source1, output0, output1, n0, n1, xy ? 1 : 0);
     }
 }

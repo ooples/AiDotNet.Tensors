@@ -5,7 +5,7 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
+public sealed partial class MetalBackend : IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
@@ -27,4 +27,12 @@ public sealed partial class MetalBackend : ISeededGumbelSoftmaxBackend, IUniniti
         float weightDecay, int step)
         => PerTensorMultiTensorOptimizer.Update(this, true, parameters, gradients, firstMoments, secondMoments,
             sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
+        int n0, int n1, bool xy)
+    {
+        if (n0 <= 0) throw new ArgumentOutOfRangeException(nameof(n0));
+        if (n1 <= 0) throw new ArgumentOutOfRangeException(nameof(n1));
+        LaunchBatch("bx_meshgrid2d", checked(n0 * n1), source0, source1, output0, output1, n0, n1, xy ? 1 : 0);
+    }
 }

@@ -327,6 +327,16 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_batch_outer_product(const
     output[i] = a[bt * M + r / N] * b[bt * N + r % N];
 }
 
+// Two-vector meshgrid: 'ij' gives [n0, n1] grids (row from source0, column from source1); 'xy' gives [n1, n0] grids
+// with source0 along the columns and source1 along the rows.
+extern ""C"" __global__ __launch_bounds__(256) void bx_meshgrid2d(const float* source0, const float* source1, float* output0, float* output1,
+    int n0, int n1, int xy) {
+    int i = bx_gid(); if (i >= n0 * n1) return;
+    int cols = xy ? n0 : n1; int r = i / cols; int c = i % cols;
+    output0[i] = source0[xy ? c : r];
+    output1[i] = source1[xy ? r : c];
+}
+
 ";
 
     public static string[] GetKernelNames() => new[]
@@ -335,6 +345,6 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_batch_outer_product(const
         "bx_broadcast_first", "bx_gated_backward", "bx_concat_axis", "bx_slice_last_axis", "bx_set_slice_last_axis",
         "bx_slice_axis", "bx_set_slice_axis", "bx_stack2", "bx_window_2d", "bx_tile_last_axis", "bx_repeat_elements",
         "bx_linspace", "bx_diag", "bx_extract_diag", "bx_triangular_mask", "bx_index_select", "bx_row_loss",
-        "bx_dropout_mask", "bx_gaussian_noise", "bx_gumbel_softmax", "bx_batch_outer_product"
+        "bx_dropout_mask", "bx_gaussian_noise", "bx_gumbel_softmax", "bx_batch_outer_product", "bx_meshgrid2d"
     };
 }

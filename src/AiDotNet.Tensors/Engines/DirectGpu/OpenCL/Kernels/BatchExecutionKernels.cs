@@ -124,6 +124,14 @@ __kernel void bx_mse_loss_rows(__global const float* predictions, __global const
     for (int f = 0; f < numFeatures; f++) { float d = predictions[b * numFeatures + f] - targets[b * numFeatures + f]; sum += d * d; }
     loss[b] = sum / (float)numFeatures;
 }
+
+__kernel void bx_meshgrid2d(__global const float* source0, __global const float* source1, __global float* output0,
+    __global float* output1, int n0, int n1, int xy) {
+    int i = get_global_id(0); if (i >= n0 * n1) return;
+    int cols = xy ? n0 : n1; int r = i / cols; int c = i % cols;
+    output0[i] = source0[xy ? c : r];
+    output1[i] = source1[xy ? r : c];
+}
 ";
     }
 
@@ -133,7 +141,7 @@ __kernel void bx_mse_loss_rows(__global const float* predictions, __global const
         {
             "bx_full_reduce", "bx_reduce_max_backward", "bx_reduce_variance_backward", "bx_reduce_log_variance",
             "bx_reduce_log_variance_backward", "bx_sincos", "bx_slice_axis", "bx_set_slice_axis",
-            "bx_crop_2d_backward", "bx_sparsemax", "bx_mse_loss_rows"
+            "bx_crop_2d_backward", "bx_sparsemax", "bx_mse_loss_rows", "bx_meshgrid2d"
         };
     }
 }

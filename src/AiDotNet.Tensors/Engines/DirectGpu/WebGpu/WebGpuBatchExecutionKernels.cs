@@ -338,6 +338,13 @@ var<workgroup> scratch: array<f32, 256>;
     outp[i] = a[bt * p.M + r / p.N] * b[bt * p.N + r % p.N];
 }");
 
+    public static readonly string Meshgrid2D = Shader(new[] { "r:source0", "r:source1", "rw:output0", "rw:output1" }, "n0: i32, n1: i32, xy: i32", Main + @"
+    if (i >= p.n0 * p.n1) { return; }
+    let cols = select(p.n1, p.n0, p.xy != 0); let r = i / cols; let c = i % cols;
+    output0[i] = source0[select(r, c, p.xy != 0)];
+    output1[i] = source1[select(c, r, p.xy != 0)];
+}");
+
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
@@ -352,7 +359,7 @@ var<workgroup> scratch: array<f32, 256>;
         ["bx_extract_diag"] = ExtractDiag, ["bx_triangular_mask"] = TriangularMask,
         ["bx_index_select"] = IndexSelect, ["bx_row_loss"] = RowLoss, ["bx_dropout_mask"] = DropoutMask,
         ["bx_gaussian_noise"] = GaussianNoise, ["bx_gumbel_softmax"] = GumbelSoftmax,
-        ["bx_batch_outer_product"] = BatchOuterProduct,
+        ["bx_batch_outer_product"] = BatchOuterProduct, ["bx_meshgrid2d"] = Meshgrid2D,
     };
 }
 #endif
