@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -140,6 +141,110 @@ public class CoreSaturationFanOutTests
             int rem = flat;
             for (int d = view.Rank - 1; d >= 0; d--) { idx[d] = rem % view._shape[d]; rem /= view._shape[d]; }
             Assert.Equal(view[idx], p[flat]);
+        }
+    }
+
+    // ELU fans out in vector-aligned chunks: equal to one whole-array SIMD pass (the pre-#653 result) at every DOP.
+    [Theory]
+    [InlineData(4096 * 96)]
+    [InlineData(1_000_003)]   // a ragged tail
+    [InlineData(1000)]        // below the grain
+    public void Elu_FansOut_EqualsWholeArrayPass(int n)
+    {
+        var engine = new CpuEngine();
+        var xf = Filled<float>(5, n);
+        var xd = Filled<double>(5, n);
+        var refF = new float[n];
+        unsafe
+        {
+            fixed (float* src = xf.GetDataArray())
+            fixed (float* dst = refF)
+                SimdKernels.ELUUnsafe(src, dst, n, 0.7f);   // the engine's float kernel, one whole-array pass
+        }
+        var refD = new double[n];
+        SimdKernels.ELU(xd.AsSpan(), 0.7, refD);
+        foreach (int dop in new[] { 1, 16, 64 })
+        {
+            var f = AtDop(dop, () => engine.ELU(xf, 0.7));
+            var d = AtDop(dop, () => engine.ELU(xd, 0.7));
+            for (int i = 0; i < n; i++)
+            {
+                Assert.True(f[i].Equals(refF[i]), $"float elu[{i}] at DOP {dop}: {f[i]} vs {refF[i]}");
+                Assert.True(d[i].Equals(refD[i]), $"double elu[{i}] at DOP {dop}: {d[i]} vs {refD[i]}");
+            }
+        }
+    }
+
+    // Concat copies row blocks in parallel: element-for-element equal to the inputs, any axis, any DOP.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(0)]
+    [InlineData(2)]
+    public void Concat_FansOut_CopiesEveryBlock(int axis)
+    {
+        var engine = new CpuEngine();
+        var a = Filled<float>(6, 300, 70, 9);
+        var b = Filled<float>(7, axis == 0 ? 120 : 300, axis == 1 ? 33 : 70, axis == 2 ? 4 : 9);
+        foreach (int dop in new[] { 1, 16 })
+        {
+            var r = AtDop(dop, () => engine.Concat(new[] { a, b }, axis));
+            int[] s = r._shape;
+            for (int i = 0; i < r.Length; i += 7)
+            {
+                int i2 = i % s[2], i1 = i / s[2] % s[1], i0 = i / (s[1] * s[2]);
+                int[] c = { i0, i1, i2 };
+                var src = c[axis] < a._shape[axis] ? a : b;
+                if (src == b) c[axis] -= a._shape[axis];
+                Assert.Equal(src[(c[0] * src._shape[1] + c[1]) * src._shape[2] + c[2]], r[i]);
+            }
+        }
+    }
+
+    // Single-axis ReduceMax fans out: values and absolute argmax indices equal the serial semantics (MinValue start,
+    // strictly-greater updates so the first maximum wins and NaN never does, -inf below MinValue keeps index -1).
+    [Theory]
+    [InlineData(1)]
+    [InlineData(0)]
+    [InlineData(2)]
+    public void ReduceMaxSingleAxis_FansOut_MatchesSerialSemantics(int axis)
+    {
+        var engine = new CpuEngine();
+        var x = Filled<float>(8, 600, 5, 200);
+        for (int i = 0; i < x.Length; i += 37) x[i] = float.NaN;
+        for (int i = 3; i < x.Length; i += 53) x[i] = 2.0f;   // ties
+        for (int j = 0; j < 200; j++) for (int a = 0; a < 5; a++) x[(1 * 5 + a) * 200 + j] = float.NegativeInfinity;   // an all -inf slab
+        {
+            // A tied maximum at two positions along the reduced axis for every cell of the first outer row: the first
+            // occurrence must win.
+            int[] sh = x._shape;
+            int innerT = 1;
+            for (int d = axis + 1; d < 3; d++) innerT *= sh[d];
+            for (int j = 0; j < innerT; j++)
+            {
+                x[(0 * sh[axis] + 1) * innerT + j] = 1e6f;
+                x[(0 * sh[axis] + sh[axis] - 1) * innerT + j] = 1e6f;
+            }
+        }
+        foreach (int dop in new[] { 1, 16 })
+        {
+            int[] idx = Array.Empty<int>();
+            var r = AtDop(dop, () => engine.ReduceMax(x, new[] { axis }, false, out idx));
+            int[] shape = x._shape;
+            int outer = 1, inner = 1;
+            for (int d = 0; d < axis; d++) outer *= shape[d];
+            for (int d = axis + 1; d < 3; d++) inner *= shape[d];
+            for (int o = 0; o < outer; o++)
+                for (int j = 0; j < inner; j++)
+                {
+                    float best = float.MinValue; int bi = -1;
+                    for (int a = 0; a < shape[axis]; a++)
+                    {
+                        int flat = (o * shape[axis] + a) * inner + j;
+                        if (x[flat] > best) { best = x[flat]; bi = flat; }
+                    }
+                    Assert.True(best.Equals(r[o * inner + j]), $"max[{o},{j}] at DOP {dop}: {r[o * inner + j]} vs {best}");
+                    Assert.Equal(bi, idx[o * inner + j]);
+                }
         }
     }
 }
