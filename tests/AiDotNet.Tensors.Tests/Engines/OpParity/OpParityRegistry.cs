@@ -2863,7 +2863,19 @@ public static class OpParityRegistry
             e => e.ScaledDotProductAttention(q.D(), k.D(), val.D(),
                 new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, out _),
             ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttention",
-            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.ScaledDotProductAttention_Tensor_T_Tensor_T_Tensor_T_Tensor_Boolean_Nullable_Double_Out_Tensor_T_Double);
+
+        // #889: the weightless fused attention (FlashAttention-2 on the CPU float path), with a mask, causality and a
+        // soft-cap, against the same function on the reference engine.
+        yield return new OpCase("ScaledDotProductAttentionFused[1,2,4,8;mask,causal,softcap]", "attention",
+            e => e.ScaledDotProductAttention(q.F(), k.F(), val.F(),
+                new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, isCausal: true, softcap: 4.0),
+            e => e.ScaledDotProductAttention(q.D(), k.D(), val.D(),
+                new Tensor<bool>((bool[])maskData.Clone(), new[] { 1, 2, 4, 4 }), null, isCausal: true, softcap: 4.0),
+            ParityTol.Accum(1e-3), opMethod: "ScaledDotProductAttention",
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.ScaledDotProductAttention_Tensor_T_Tensor_T_Tensor_T_Tensor_Boolean_Nullable_Double_Boolean_Double);
 
         // ScatterMax: every output index covered (0..3) so no empty-group -inf; max is deterministic.
         var smSrc = OpInput.Rand(3510, new[] { 6 });
