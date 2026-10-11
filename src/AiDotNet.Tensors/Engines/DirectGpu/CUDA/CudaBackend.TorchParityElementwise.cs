@@ -299,7 +299,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     {
         if (n <= 0) return;
         RequireCapacity(scale, n, nameof(scale), "n");
-        RequireCapacity(offset, n, nameof(offset), "n");
+        if (alpha) RequireCapacity(offset, n, nameof(offset), "n");
         IntPtr dropoutKernel = ParityKernel("parity_dropout_affine");
         using var _ = PushContext();
         IntPtr pscale = scale.Handle, poffset = offset.Handle;
@@ -443,10 +443,13 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         LaunchKernel(unravelKernel, ParityGrid(n), DefaultBlockSize, args);
     }
 
-    unsafe void ITorchParityElementwiseBackend.TorchParitySliceBitonicStep(IGpuBuffer slices, IGpuBuffer order, int rowLen, int k, int j, int length)
+    unsafe void ITorchParityElementwiseBackend.TorchParitySliceBitonicStep(IGpuBuffer slices, IGpuBuffer order, int rowLen, int k, int j, int length,
+        int sliceCount)
     {
         if (rowLen <= 0) return;
+        if (sliceCount > rowLen) throw new ArgumentOutOfRangeException(nameof(sliceCount), "more slices than order slots.");
         RequireCapacity(order, rowLen, nameof(order), "rowLen");
+        RequireCapacity(slices, (long)sliceCount * length, nameof(slices), "sliceCount*length");
         IntPtr stepKernel = ParityKernel("parity_slice_bitonic_step");
         using var _ = PushContext();
         IntPtr ps = slices.Handle, po = order.Handle;
@@ -470,9 +473,10 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     }
 
     unsafe void ITorchParityElementwiseBackend.TorchParitySliceGatherUnique(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags,
-        IGpuBuffer positions, IGpuBuffer output, int n, int length)
+        IGpuBuffer positions, IGpuBuffer output, int n, int length, int outputRows)
     {
-        int total = n * length;
+        int total = checked(n * length);
+        RequireCapacity(output, (long)outputRows * length, nameof(output), "outputRows*length");
         if (total <= 0) return;
         RequireCapacity(slices, (long)n * length, nameof(slices), "n*length");
         RequireCapacity(order, n, nameof(order), "n");
@@ -489,7 +493,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityGridSample3D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output, int batches,
         int channels, int depth, int height, int width, int points, int mode, int padding, bool alignCorners)
     {
-        int threads = batches * points;
+        int threads = checked(batches * points);
         if (threads <= 0) return;
         RequireCapacity(input, (long)batches * channels * depth * height * width, nameof(input), "N*C*D*H*W");
         RequireCapacity(grid, 3L * batches * points, nameof(grid), "N*points*3");
@@ -508,7 +512,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         IGpuBuffer inputGrad, IGpuBuffer gridGrad, int batches, int channels, int depth, int height, int width, int points, int mode,
         int padding, bool alignCorners)
     {
-        int threads = batches * points;
+        int threads = checked(batches * points);
         if (threads <= 0) return;
         RequireCapacity(input, (long)batches * channels * depth * height * width, nameof(input), "N*C*D*H*W");
         RequireCapacity(inputGrad, (long)batches * channels * depth * height * width, nameof(inputGrad), "N*C*D*H*W");

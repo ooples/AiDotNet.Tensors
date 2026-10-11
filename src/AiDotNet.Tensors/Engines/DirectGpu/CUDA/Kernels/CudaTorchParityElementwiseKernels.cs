@@ -857,7 +857,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_dropout_affine(float*
     ParityRng r = parity_rng(seed, (unsigned long long)(i / block));
     double keep = parity_uniform(&r) >= p ? 1.0 : 0.0;
     if (alpha) { scale[i] = (float)(a * keep); offset[i] = (float)(a * sat * (1.0 - keep) + b); }
-    else { scale[i] = (float)(keep * a); offset[i] = 0.0f; }
+    else scale[i] = (float)(keep * a);   // channel dropout: no offset (the argument may alias scale)
 }
 
 // rrelu: slope 1 above zero; below, the eval slope (training = 0) or a uniform draw in [lower, upper].
@@ -899,19 +899,19 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_nonzero_static_scatte
 }
 
 // unravel_index, one launch per output axis: ((flat + total) % total) / stride % extent. The first launch also flags
-// (code 1) an index outside [-total, total), or a NaN (which the CPU's (long) cast also rejects).
+// (code 1) an index whose truncation lies outside [-total, total), or a NaN.
 extern ""C"" __global__ __launch_bounds__(256) void parity_unravel_axis(const float* __restrict__ indices, float* __restrict__ y, int n,
     long long total, long long stride, long long extent, int validate, unsigned long long* flag)
 {
     PARITY_INDEX
-    double v = (double)indices[i];
-    if (isnan(v) || v < -(double)total || v >= (double)total)
+    // As the CPU: truncate toward zero, then range-check the truncated value; NaN is rejected explicitly.
+    double t = trunc((double)indices[i]);
+    if (isnan(t) || t < -(double)total || t >= (double)total)
     {
         if (validate) parity_flag(flag, (unsigned long long)i, 1);
         return;
     }
-    long long f = (long long)v;
-    if (f < -total || f >= total) { if (validate) parity_flag(flag, (unsigned long long)i, 1); return; }
+    long long f = (long long)t;
     y[i] = (float)(((f + total) % total) / stride % extent);
 }
 

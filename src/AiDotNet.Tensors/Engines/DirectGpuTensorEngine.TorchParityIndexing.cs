@@ -72,10 +72,21 @@ public partial class DirectGpuTensorEngine
             using var positions = AllocateOutputBuffer(backend, n);
             kernels.TorchParityUnary(TorchParityUnaryOp.NonZero, x.Buffer, flags.Buffer, n, 0f, 0f);
             kernels.TorchParityInclusiveScan(flags.Buffer, positions.Buffer, n);
-            var output = AllocateOutputBuffer(backend, size * rank);
-            backend.Fill(output.Buffer, fillValue, size * rank);
-            kernels.TorchParityNonzeroStaticScatter(x.Buffer, positions.Buffer, output.Buffer, n, size, tensor._shape);
-            return new Tensor<int>(FinishGpuOp<int>(backend, output, size * rank), new[] { size, rank });
+            int count = checked(size * rank);
+            var output = AllocateOutputBuffer(backend, count);
+            bool ownsOutput = true;
+            try
+            {
+                backend.Fill(output.Buffer, fillValue, count);
+                kernels.TorchParityNonzeroStaticScatter(x.Buffer, positions.Buffer, output.Buffer, n, size, tensor._shape);
+                var data = FinishGpuOp<int>(backend, output, count);
+                ownsOutput = false;
+                return new Tensor<int>(data, new[] { size, rank });
+            }
+            finally
+            {
+                if (ownsOutput) output.Dispose();
+            }
         }
         catch (Exception ex)
         {
@@ -120,8 +131,8 @@ public partial class DirectGpuTensorEngine
         if (flagValue == NoParityError) return result;
         foreach (var t in result) t?.Dispose();
         long index = (long)((flagValue >> 3) & ((1UL << 58) - 1));
-        long f = (long)MathHelper.GetNumericOperations<T>().ToDouble(indices[(int)index]);
-        throw new ArgumentOutOfRangeException(nameof(indices), $"index {f} is out of range for shape [{string.Join(", ", shape)}].");
+        double bad = Math.Truncate(MathHelper.GetNumericOperations<T>().ToDouble(indices[(int)index]));
+        throw new ArgumentOutOfRangeException(nameof(indices), $"index {bad} is out of range for shape [{string.Join(", ", shape)}].");
     }
 
     // unique_dim: slices along dim moved to rows, bitonic-sorted by the CPU's slice order, first-of-run flags scanned to
@@ -150,14 +161,14 @@ public partial class DirectGpuTensorEngine
             backend.IotaPad(order.Buffer, extent, padded, 1);
             for (int k = 2; k <= padded; k <<= 1)
                 for (int j = k >> 1; j > 0; j >>= 1)
-                    kernels.TorchParitySliceBitonicStep(slices.Buffer, order.Buffer, padded, k, j, length);
+                    kernels.TorchParitySliceBitonicStep(slices.Buffer, order.Buffer, padded, k, j, length, extent);
             using var flags = AllocateOutputBuffer(backend, extent);
             using var positions = AllocateOutputBuffer(backend, extent);
             kernels.TorchParitySliceFirstFlags(slices.Buffer, order.Buffer, flags.Buffer, extent, length);
             kernels.TorchParityInclusiveScan(flags.Buffer, positions.Buffer, extent);
             int unique = (int)DownloadScalar(backend, positions.Buffer, extent - 1);
             using var rows = AllocateOutputBuffer(backend, unique * length);
-            kernels.TorchParitySliceGatherUnique(slices.Buffer, order.Buffer, flags.Buffer, positions.Buffer, rows.Buffer, extent, length);
+            kernels.TorchParitySliceGatherUnique(slices.Buffer, order.Buffer, flags.Buffer, positions.Buffer, rows.Buffer, extent, length, unique);
             var shape = (int[])tensor._shape.Clone();
             shape[d] = unique;
             int count = unique * length;

@@ -110,10 +110,6 @@ internal interface ITorchParityElementwiseBackend
     void TorchParityRandomKeys(IGpuBuffer output, int n, ulong seed);
 
     /// <summary>
-    /// nonzero_static's scatter: each non-zero element whose inclusive-scan position is within <paramref name="size"/>
-    /// writes its coordinates (shape at most 8 axes) to that row of the [size, rank] output.
-    /// </summary>
-    /// <summary>
     /// An int32 binary op on raw int32 buffers, computed in 64 bits and wrapped: 0 and, 1 or, 2 xor, 3 left shift,
     /// 4 right shift, 5 gcd, 6 lcm, 7 floor divide (flag code 1 for a zero divisor).
     /// </summary>
@@ -125,19 +121,27 @@ internal interface ITorchParityElementwiseBackend
     /// <summary>Inclusive prefix sum of n floats (exact for integer counts below 2^24).</summary>
     void TorchParityInclusiveScan(IGpuBuffer input, IGpuBuffer output, int n);
 
+    /// <summary>
+    /// nonzero_static's scatter: each non-zero element whose inclusive-scan position is within <paramref name="size"/>
+    /// writes its coordinates (shape at most 8 axes) to that row of the [size, rank] output.
+    /// </summary>
     void TorchParityNonzeroStaticScatter(IGpuBuffer input, IGpuBuffer positions, IGpuBuffer output, int n, int size, int[] shape);
 
     /// <summary>One unravel_index output axis; <paramref name="validate"/> flags (code 1) indices outside [-total, total).</summary>
     void TorchParityUnravelAxis(IGpuBuffer indices, IGpuBuffer output, int n, long total, long stride, long extent, bool validate, IGpuBuffer flag);
 
-    /// <summary>One bitonic step over slice indices (padding = -1) ordered by the CPU's unique_dim slice comparison.</summary>
-    void TorchParitySliceBitonicStep(IGpuBuffer slices, IGpuBuffer order, int rowLen, int k, int j, int length);
+    /// <summary>
+    /// One bitonic step over slice indices (padding = -1) ordered by the CPU's unique_dim slice comparison;
+    /// <paramref name="sliceCount"/> real slices of <paramref name="length"/> elements.
+    /// </summary>
+    void TorchParitySliceBitonicStep(IGpuBuffer slices, IGpuBuffer order, int rowLen, int k, int j, int length, int sliceCount);
 
     /// <summary>1 where a sorted slice differs from the previous one (the first always), else 0.</summary>
     void TorchParitySliceFirstFlags(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags, int n, int length);
 
     /// <summary>Gathers each first-of-a-run sorted slice into row (position - 1) of the output.</summary>
-    void TorchParitySliceGatherUnique(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags, IGpuBuffer positions, IGpuBuffer output, int n, int length);
+    void TorchParitySliceGatherUnique(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags, IGpuBuffer positions, IGpuBuffer output, int n, int length,
+        int outputRows);
 
     /// <summary>grid_sample 3-D (mode 0 bilinear / 1 nearest; padding 0 zeros / 1 border / 2 reflection).</summary>
     void TorchParityGridSample3D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output, int batches, int channels, int depth, int height,

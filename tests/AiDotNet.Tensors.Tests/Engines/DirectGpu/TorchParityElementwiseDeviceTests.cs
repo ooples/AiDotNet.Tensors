@@ -175,7 +175,8 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
             "greaterEqual" => e => e.TensorGreaterEqual(a, b),
             "igamma" => e => e.TensorIgamma(a, b),
             "igammac" => e => e.TensorIgammac(a, b),
-            _ => e => e.TensorLessEqual(a, b),
+            "lessEqual" => e => e.TensorLessEqual(a, b),
+            _ => throw new ArgumentOutOfRangeException(nameof(op), op, "no case for this op"),
         };
         string probeName = "Tensor" + char.ToUpperInvariant(op[0]) + op.Substring(1);
         AssertMatches(op, f(cpu), OnDevice(probeName, () => f(gpu)), op.StartsWith("igamma") ? 1e-5 : 2e-6);
@@ -216,7 +217,8 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
         "HermitePolynomialH" => (e, x, n) => e.TensorHermitePolynomialH(x, n),
         "HermitePolynomialHe" => (e, x, n) => e.TensorHermitePolynomialHe(x, n),
         "LaguerrePolynomialL" => (e, x, n) => e.TensorLaguerrePolynomialL(x, n),
-        _ => (e, x, n) => e.TensorLegendrePolynomialP(x, n),
+        "LegendrePolynomialP" => (e, x, n) => e.TensorLegendrePolynomialP(x, n),
+        _ => throw new ArgumentOutOfRangeException(nameof(op), op, "no case for this op"),
     };
 
     // Per-element degrees cover the CPU's degree rules -- NaN gives NaN, a fraction truncates toward zero (2.7 -> 2,

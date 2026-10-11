@@ -196,6 +196,7 @@ public class TorchParityStructureDeviceTests : IClassFixture<DirectGpuTensorEngi
         var shape = new[] { 3, 4, 5 };
         var indices = new Tensor<float>(new[] { 6, 10 });
         for (int i = 0; i < indices.Length; i++) indices[i] = (i * 7 % 120) - 60;   // negative indices wrap
+        indices[4] = -60.5f;   // truncates toward zero to -60: in range on both engines
         var expected = cpu.TensorUnravelIndex(indices, shape);
         var actual = OnDevice(() => gpu.TensorUnravelIndex(indices, shape), r => _ = r[0][0]);
         Assert.Equal(expected.Length, actual.Length);
@@ -204,7 +205,8 @@ public class TorchParityStructureDeviceTests : IClassFixture<DirectGpuTensorEngi
         indices[17] = 60;
         var e = Assert.Throws<ArgumentOutOfRangeException>(() => gpu.TensorUnravelIndex(indices, shape));
         Assert.Contains("index 60", e.Message);
-        indices[17] = float.NaN;
+        indices[17] = float.NaN;   // rejected on both engines, whatever the runtime's (long) cast of NaN
+        Assert.Throws<ArgumentOutOfRangeException>(() => cpu.TensorUnravelIndex(indices, shape));
         Assert.Throws<ArgumentOutOfRangeException>(() => gpu.TensorUnravelIndex(indices, shape));
     }
 

@@ -64,6 +64,9 @@ public partial class DirectGpuTensorEngine
             || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
+        // Row-major copies of strided views: the degree scan reads a span and the kernel reads both row-major.
+        if (!x.IsContiguous) x = x.Contiguous();
+        if (!degree.IsContiguous) degree = degree.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
         foreach (var value in degree.AsSpan())
         {

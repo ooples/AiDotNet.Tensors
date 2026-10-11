@@ -164,6 +164,7 @@ public partial class DirectGpuTensorEngine
         if (probabilities is null || probabilities.Rank < 1 || probabilities.Rank > 2 || numSamples <= 0) return null;
         int categories = probabilities._shape[probabilities.Rank - 1];
         if (categories == 0 || (!replacement && numSamples > categories)) return null;
+        if (categories > (1 << 24)) return null;   // picks travel as float indices, exact only up to 2^24
         int rows = probabilities.Length / categories;
         if (!TryRandomBackend<T>("TensorMultinomial", out var backend, out var kernels)) return null;
         int total = checked(rows * numSamples);
@@ -221,9 +222,14 @@ public partial class DirectGpuTensorEngine
             {
                 scaleBuffer = AllocateOutputBuffer(backend, n);
                 ownsScale = true;
-                offsetBuffer = AllocateOutputBuffer(backend, n);
-                ownsOffset = true;
-                kernels.TorchParityDropoutAffine(scaleBuffer.Buffer, offsetBuffer.Buffer, n, Math.Max(1, block), p, a, seluSaturation, b, alpha, deviceSeed);
+                if (alpha)
+                {
+                    offsetBuffer = AllocateOutputBuffer(backend, n);
+                    ownsOffset = true;
+                }
+                // Channel dropout writes only the scale (the kernel leaves its offset argument untouched).
+                kernels.TorchParityDropoutAffine(scaleBuffer.Buffer, alpha ? offsetBuffer.Buffer : scaleBuffer.Buffer, n, Math.Max(1, block), p, a,
+                    seluSaturation, b, alpha, deviceSeed);
                 var shape = (int[])tensor._shape.Clone();
                 var scale = new Tensor<T>(FinishGpuOp<T>(backend, scaleBuffer, n), shape);
                 ownsScale = false;
