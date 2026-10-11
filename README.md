@@ -10,8 +10,7 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 > `Microsoft.Extensions.Logging.Abstractions`, `System.Text.Json`,
 > `System.Threading.Channels`, `K4os.Compression.LZ4` (LZ4 compression for
 > serialized tensor blobs), `AiDotNet.Native.OpenBLAS` (transitive native
-> OpenBLAS for fallback paths only — our SimdGemm beats it for d=128
-> transformer hot paths), and **MKL via Microsoft.ML.Mkl.Redist (~66 MB on
+> OpenBLAS for fallback paths only — the hot paths run SimdGemm), and **MKL via Microsoft.ML.Mkl.Redist (~66 MB on
 > win-x64) + `intelmkl.redist.win-x64` (~500 MB on win-x64)** for the FP64
 > kernels that haven't yet been ported to pure-managed AVX2 (Phase 0 remediation
 > work tracks the port). For air-gapped / federal deployments we ship a custom
@@ -21,13 +20,13 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 >
 > **Performance numbers above assume net8.0+.** On net471 the SIMD/intrinsics
 > helpers are excluded (System.Runtime.Intrinsics is unavailable pre-net6); a
-> custom net471 SIMD path that beats `System.Numerics.Vector<T>` is on the
+> custom net471 SIMD path to replace `System.Numerics.Vector<T>` there is on the
 > roadmap as Phase 5.
 
 ## Features
 
 - **Zero Allocations**: In-place operations with `ArrayPool<T>` and `Span<T>` for hot paths
-- **Hand-Tuned SIMD**: Custom AVX2/FMA kernels with 4x loop unrolling, not just `Vector<T>` wrappers
+- **Hand-Tuned SIMD**: Custom AVX2/FMA kernels with 4-way loop unrolling, not just `Vector<T>` wrappers
 - **JIT-Compiled Kernels**: Runtime x86-64 machine code generation for size-specialized operations
 - **BLIS-Style GEMM**: Tiled matrix multiply with FMA micro-kernel, cache-aware panel packing
 - **GPU Acceleration**: Optional CUDA, HIP/ROCm, OpenCL, Metal, Vulkan, and WebGPU support via separate packages, with CPU-vs-GPU op-parity validated across every backend (#775)
@@ -106,6 +105,13 @@ dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework ne
 `--vs-all-filter <glob>` and `--linalg-filter <glob>` run a subset.
 
 The BenchmarkDotNet reports behind every table are in [`tests/AiDotNet.Tensors.Benchmarks/Results/2026-10-08-threadripper-3990x/`](tests/AiDotNet.Tensors.Benchmarks/Results/2026-10-08-threadripper-3990x/); `python tests/AiDotNet.Tensors.Benchmarks/make_readme_tables.py <reports> <reports>` regenerates the tables from them.
+
+**Updating these numbers.** `--vs-all` and `--linalg` also write `manifest.json` (the competitor versions that ran,
+the commit and runtime) beside the reports. Copy the reports and the manifest into a new `Results/<run>/` folder, point the
+link above at it and paste the regenerated tables. CI runs
+[`check_benchmark_claims.py`](tests/AiDotNet.Tensors.Benchmarks/check_benchmark_claims.py) on every pull request: it fails if a
+table row, count or speedup in this README is not what the reports produce, if a competitor's version differs from the one
+that ran, or if the package or repository description quotes a speed number.
 
 ### How to read these numbers
 
@@ -320,7 +326,7 @@ Provides GPU acceleration via OpenCL (works on AMD, Intel, and NVIDIA GPUs):
 dotnet add package AiDotNet.Native.CLBlast
 ```
 
-**Performance**: 10x+ faster for large matrix operations on GPU.
+**Performance**: not benchmarked yet, so no speedup is published for it.
 
 ### AiDotNet.Native.CUDA
 

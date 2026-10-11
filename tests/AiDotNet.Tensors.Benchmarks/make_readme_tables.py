@@ -98,28 +98,48 @@ def simple_table(path, other, label, suite):
     return '\n'.join(out), wins, losses
 
 def linalg_table(path):
+    """Returns (markdown, {'NumSharp': [wins, losses], 'MathNet': [wins, losses]}). A suite with no MathNet arm (the
+    element-wise suite) gets NumSharp columns only, so every row it prints is the row the README carries."""
     rows = list(csv.DictReader(open(path, encoding='utf-8-sig')))
     data = defaultdict(dict)
     for r in rows:
         lib, op = split(r['Method'])
         if lib is None: continue
         data[(op, r.get('N') or r.get('Size') or r.get('size') or '')][lib] = us(r['Mean'])
-    out = ['| Operation | N | AiDotNet | NumSharp 0.70.0 | MathNet 5.0.0 | Speedup vs NumSharp | Speedup vs MathNet |',
-           '|---|--:|--:|--:|--:|--:|--:|']
+    others = [o for o in ('NumSharp', 'MathNet') if any(d.get(o) is not None for d in data.values())]
+    labels = {'NumSharp': 'NumSharp 0.70.0', 'MathNet': 'MathNet 5.0.0'}
+    out = ['| Operation | N | AiDotNet | ' + ' | '.join(labels[o] for o in others) + ' | '
+           + ' | '.join(f'Speedup vs {o}' for o in others) + ' |',
+           '|---|--:|--:|' + '--:|' * (2 * len(others))]
+    counts = {o: [0, 0] for o in others}
     for (op, n), d in sorted(data.items(), key=lambda kv: (kv[0][0], int(kv[0][1]) if kv[0][1].isdigit() else 0)):
         a = d.get('AiDotNet')
-        if a is None or ('NumSharp' not in d and 'MathNet' not in d): continue
-        out.append(f"| {op} | {n} | {fmt(a)} | {fmt(d.get('NumSharp'))} | {fmt(d.get('MathNet'))} | {sp(a, d.get('NumSharp'))} | {sp(a, d.get('MathNet'))} |")
-    return '\n'.join(out)
+        if a is None or all(d.get(o) is None for o in others): continue
+        for o in others:
+            if d.get(o) is not None: counts[o][0 if a <= d[o] else 1] += 1
+        out.append(f'| {op} | {n} | {fmt(a)} | ' + ' | '.join(fmt(d.get(o)) for o in others) + ' | '
+                   + ' | '.join(sp(a, d.get(o)) for o in others) + ' |')
+    return '\n'.join(out), counts
 
-if __name__ == '__main__':
-    vs, la = sys.argv[1], sys.argv[2]
+def generate(vs, la):
+    """All README benchmark tables from one run's reports: (markdown, {library: [wins, losses]})."""
+    parts, counts = [], {}
     t, w, l = torch_table(glob.glob(os.path.join(vs, '*TorchSharp*report.csv'))[0])
-    print(f'### vs TorchSharp — {w} wins, {l} losses\n\n{t}\n')
+    parts.append(f'### vs TorchSharp — {w} wins, {l} losses\n\n{t}\n'); counts['TorchSharp'] = [w, l]
     t, w, l = simple_table(glob.glob(os.path.join(vs, '*MlNet*report.csv'))[0], 'MlNet', 'ML.NET 5.0.0', 'MlNet')
-    print(f'### vs ML.NET — {w} wins, {l} losses\n\n{t}\n')
+    parts.append(f'### vs ML.NET — {w} wins, {l} losses\n\n{t}\n'); counts['ML.NET'] = [w, l]
     t, w, l = simple_table(glob.glob(os.path.join(vs, '*TensorFlow*report.csv'))[0], 'TensorFlow', 'TensorFlow.NET 0.150.0', 'TensorFlowCpuComparisonBenchmarks')
-    print(f'### vs TensorFlow.NET — {w} wins, {l} losses\n\n{t}\n')
+    parts.append(f'### vs TensorFlow.NET — {w} wins, {l} losses\n\n{t}\n'); counts['TensorFlow.NET'] = [w, l]
     for f in sorted(glob.glob(os.path.join(la, '*report.csv'))):
         if not re.search(r'(LinearAlgebra|SmallMatrix|ElementWise)Benchmarks', f): continue
-        print(f'### {os.path.basename(f).split(".")[-2].replace("-report", "")}\n\n{linalg_table(f)}\n')
+        t, c = linalg_table(f)
+        for o, (w, l) in c.items():
+            key = 'MathNet.Numerics' if o == 'MathNet' else o
+            counts.setdefault(key, [0, 0]); counts[key][0] += w; counts[key][1] += l
+        parts.append(f'### {os.path.basename(f).split(".")[-2].replace("-report", "")}\n\n{t}\n')
+    summary = '\n'.join(f'- {lib}: {w} wins, {l} losses' for lib, (w, l) in counts.items())
+    return '\n'.join(parts) + f'\n### Summary\n\n{summary}\n', counts
+
+if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8')  # the tables carry ×, µ and ᵀ; a cp1252 console cannot print them
+    print(generate(sys.argv[1], sys.argv[2])[0])
