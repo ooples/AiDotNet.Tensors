@@ -8325,8 +8325,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int[] outShape;
                 if (axes == null || axes.Length == 0)
                 {
-                    outShape = keepDims ? new int[tensor.Rank] : new[] { 1 };
-                    if (keepDims) for (int i = 0; i < tensor.Rank; i++) outShape[i] = 1;
+                    outShape = FullReductionShape(tensor.Rank, keepDims);
                 }
                 else
                 {
@@ -8341,7 +8340,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                         else shapeList.Add(tensor._shape[i]);
                     }
-                    outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                    outShape = shapeList.ToArray();
                 }
 
                 var captured = tensor;
@@ -8414,7 +8413,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                fullResult = TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
+                fullResult = TensorAllocator.Rent<T>(Array.Empty<int>(), new Vector<T>([sum]));
             }
             DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                 new object[] { allAxes, keepDims });
@@ -33467,7 +33466,19 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return outputShape.Count == 0 ? new[] { 1 } : outputShape.ToArray();
+        return outputShape.ToArray();
+    }
+
+    /// <summary>
+    /// Output shape of a reduction over every axis: rank 0 without keepDims (as torch and the GPU engine
+    /// return), otherwise every axis kept as size 1 (#1132).
+    /// </summary>
+    private static int[] FullReductionShape(int rank, bool keepDims)
+    {
+        if (!keepDims) return Array.Empty<int>();
+        var shape = new int[rank];
+        for (int i = 0; i < rank; i++) shape[i] = 1;
+        return shape;
     }
 
     /// <inheritdoc/>
@@ -33588,7 +33599,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
                 maxIndices = new[] { maxIdx };
                 float fMax = maxVal;
-                return TensorAllocator.Rent<T>(keepDims ? new[] { 1 } : new[] { 1 },
+                return TensorAllocator.Rent<T>(FullReductionShape(1, keepDims),
                     new Vector<T>(new[] { Unsafe.As<float, T>(ref fMax) }));
             }
         }
@@ -33984,7 +33995,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (axisSet.Contains(i)) { if (keepDims) shapeList.Add(1); }
                     else shapeList.Add(input._shape[i]);
                 }
-                var outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                var outShape = shapeList.ToArray();
                 if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine && !GraphMode.IsInferenceTrace)
                 {
                     var compiledMean = TryRecordReduceMeanFloat(scope, (Tensor<float>)(object)input, axes, keepDims, outShape);
@@ -34039,7 +34050,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var dSpan = AsDoubleMemory(input.Data).Span;
                 double dSum = SimdKernels.Sum(dSpan);
                 double dMean = dSum / input.Length;
-                var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                var scalarResult = AutoTensorCache.RentOrAllocate<T>(FullReductionShape(input.Rank, keepDims));
                 ((double[])(object)scalarResult.GetDataArray())[0] = dMean;
                 DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                     BackwardFunctions<T>.ReduceMeanBackward,
@@ -34050,7 +34061,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // poisons compiled graphs with a stale value when the same op
                 // pattern is run on a different input tensor of identical shape.
                 { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
-                  AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
+                  var ck = keepDims; AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, ck)); }
                 return scalarResult;
             }
             if (typeof(T) == typeof(float))
@@ -34061,7 +34072,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     using var pin = mem.Pin();
                     float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, input.Length);
                     float fMean = fSum / input.Length;
-                    var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                    var scalarResult = AutoTensorCache.RentOrAllocate<T>(FullReductionShape(input.Rank, keepDims));
                     ((float[])(object)scalarResult.GetDataArray())[0] = fMean;
                     DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                         BackwardFunctions<T>.ReduceMeanBackward,
@@ -34070,7 +34081,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // this branch as a stale scalar constant — same fix as the
                     // double branch above.
                     { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
-                      AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
+                      var ck = keepDims; AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, ck)); }
                     return scalarResult;
                 }
             }
@@ -34096,7 +34107,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputShapeList.Add(inputShape[i]);
             }
         }
-        var outputShape = outputShapeList.Count > 0 ? outputShapeList.ToArray() : [1];
+        var outputShape = outputShapeList.ToArray();
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
@@ -34238,6 +34249,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        // Null or empty means every axis, as for ReduceSum and ReduceMean (and torch var(dim=None)).
+        if (axes is null || axes.Length == 0) axes = Enumerable.Range(0, input.Rank).ToArray();
+
         // Tape-aware AND lazy-graph (GraphMode) path: take the slow path
         // that explicitly allocates a `mean` Tensor<T> we can save in
         // savedState for backward. The fast paths below inline the mean
@@ -34402,7 +34417,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputShapeList.Add(inputShape[d]);
             }
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
         var outputShape = outputShapeList.ToArray();
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
@@ -34482,7 +34496,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     { if (capturedKeepDims) outShapeList.Add(1); }
                     else outShapeList.Add(inShape[d]);
                 }
-                if (outShapeList.Count == 0) outShapeList.Add(1);
                 var outShape = outShapeList.ToArray();
 
                 // For backward we need the `mean` tensor — compute once here
@@ -34527,7 +34540,6 @@ public partial class CpuEngine : ITensorLevelEngine
             if (normalizedAxes.Contains(d)) { if (keepDims) outputShapeList.Add(1); }
             else outputShapeList.Add(inputShape[d]);
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
         var outputShape = outputShapeList.ToArray();
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];

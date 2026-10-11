@@ -95,6 +95,39 @@ public class FullReductionRankTests
         Assert.Equal(eager[0], compiled[0], 10);
     }
 
+    /// <summary>
+    /// A rank-0 result is a valid loss: backward through it must give the analytic gradient, checked
+    /// against central finite differences of the same op, for every reduction and keepDims setting.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Cases))]
+    public void AllAxes_Backward_MatchesFiniteDifference(Reduction op, int rank)
+    {
+        foreach (bool keepDims in new[] { false, true })
+        {
+            var x = Input(rank);
+            var allAxes = new int[rank];
+            for (int i = 0; i < rank; i++) allAxes[i] = i;
+
+            Tensor<double> analytic;
+            using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<double>())
+            {
+                var y = Reduce(op, x, allAxes, keepDims);
+                analytic = tape.ComputeGradients(y, new[] { x })[x];
+            }
+
+            const double h = 1e-6;
+            for (int i = 0; i < x.Length; i++)
+            {
+                var plus = x.Clone(); plus[i] += h;
+                var minus = x.Clone(); minus[i] -= h;
+                double fd = (Reduce(op, plus, allAxes, keepDims)[0] - Reduce(op, minus, allAxes, keepDims)[0]) / (2 * h);
+                Assert.True(Math.Abs(analytic[i] - fd) < 1e-5,
+                    $"{op} rank {rank} keepDims={keepDims}: grad[{i}]={analytic[i]}, finite difference {fd}");
+            }
+        }
+    }
+
     [Fact]
     public void ReduceMaxWithTensorIndices_FullReduction_IndexIsRankZero()
     {
