@@ -178,9 +178,10 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null || grid is null || mode == GridSampleMode.Bicubic || input.Rank != 5 || grid.Rank != 5 || grid._shape[4] != 3
             || grid._shape[0] != input._shape[0] || input.Length == 0 || grid.Length == 0
-            || IsTapeActive<T>("TensorGridSample3D") || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
+            || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
+        Tensor<T> result;
         try
         {
             int n = input._shape[0], c = input._shape[1];
@@ -190,13 +191,73 @@ public partial class DirectGpuTensorEngine
             int modeCode = mode == GridSampleMode.Nearest ? 1 : 0;
             int paddingCode = padding == GridSamplePadding.Border ? 1 : padding == GridSamplePadding.Reflection ? 2 : 0;
             var outShape = new[] { n, c, grid._shape[1], grid._shape[2], grid._shape[3] };
-            return DispatchDeferredGpuOp<T>(backend, n * c * points, outShape, output => kernels.TorchParityGridSample3D(
+            result = DispatchDeferredGpuOp<T>(backend, n * c * points, outShape, output => kernels.TorchParityGridSample3D(
                 x.Buffer, g.Buffer, output, n, c, input._shape[2], input._shape[3], input._shape[4], points, modeCode, paddingCode, alignCorners));
         }
         catch (Exception ex)
         {
             GpuLaunchProbe.OnFallback("TensorGridSample3D", ex);
             return null;
+        }
+        // The CPU's node and saved state, with a backward that computes both adjoints on the device.
+        Autodiff.DifferentiableOps.RecordBinary("TensorGridSample3D", result, input, grid, GridSample3DDeviceBackward<T>,
+            new object[] { mode, padding, alignCorners });
+        return result;
+    }
+
+    private static void GridSample3DDeviceBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryGridSample3DAdjointsOnDevice(gradOutput, inputs[0], inputs[1], (GridSampleMode)savedState[0],
+                (GridSamplePadding)savedState[1], (bool)savedState[2]) is { } adjoints)
+        {
+            Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], adjoints.Input, engine);
+            Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[1], adjoints.Grid, engine);
+            return;
+        }
+        if (engine is DirectGpuTensorEngine) GpuLaunchProbe.OnFallback("TensorGridSample3D backward: host adjoint", null);
+        GridSample3DBackward(gradOutput, inputs, output, savedState, engine, grads);
+    }
+
+    private (Tensor<T> Input, Tensor<T> Grid)? TryGridSample3DAdjointsOnDevice<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid,
+        GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
+    {
+        if (!TryGetBackend(out var backend) || backend is not ITorchParityElementwiseBackend kernels || DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return null;
+        OwnedBuffer dx = default, dg = default;
+        bool ownsDx = false, ownsDg = false;
+        try
+        {
+            int n = input._shape[0], c = input._shape[1];
+            int points = grid._shape[1] * grid._shape[2] * grid._shape[3];
+            using var x = GetOrAllocateBuffer(backend, input.IsContiguous ? input : input.Contiguous());
+            using var g = GetOrAllocateBuffer(backend, grid.IsContiguous ? grid : grid.Contiguous());
+            using var dy = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+            dx = AllocateOutputBuffer(backend, input.Length);
+            ownsDx = true;
+            dg = AllocateOutputBuffer(backend, grid.Length);
+            ownsDg = true;
+            backend.Fill(dx.Buffer, 0f, input.Length);
+            int modeCode = mode == GridSampleMode.Nearest ? 1 : 0;
+            int paddingCode = padding == GridSamplePadding.Border ? 1 : padding == GridSamplePadding.Reflection ? 2 : 0;
+            kernels.TorchParityGridSample3DBackward(x.Buffer, g.Buffer, dy.Buffer, dx.Buffer, dg.Buffer, n, c, input._shape[2],
+                input._shape[3], input._shape[4], points, modeCode, paddingCode, alignCorners);
+            var inputGrad = new Tensor<T>(FinishGpuOp<T>(backend, dx, input.Length), (int[])input._shape.Clone());
+            ownsDx = false;
+            var gridGrad = new Tensor<T>(FinishGpuOp<T>(backend, dg, grid.Length), (int[])grid._shape.Clone());
+            ownsDg = false;
+            return (inputGrad, gridGrad);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorGridSample3D backward", ex);
+            return null;
+        }
+        finally
+        {
+            if (ownsDx) dx.Dispose();
+            if (ownsDg) dg.Dispose();
         }
     }
 

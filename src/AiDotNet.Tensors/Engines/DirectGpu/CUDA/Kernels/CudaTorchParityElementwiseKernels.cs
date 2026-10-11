@@ -1093,6 +1093,96 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_int_not(const int* __
     PARITY_INDEX
     y[i] = ~a[i];
 }
+
+// grid_sample 3-D adjoints, as the CPU's GridSample3DBackward: per (batch, point) the taps, their weights and each
+// weight's derivative with respect to the normalized coordinates (d voxel / d normalized: (size - 1) / 2 aligned,
+// size / 2 otherwise; 0 where border / reflection clipping holds the coordinate; sign-flipped by each reflection).
+// dx gathers w * dy from every point (atomics: points share voxels); dgrid is owned by its point's thread.
+__device__ double parity_grid_reflect_slope(double coord, int twiceLow, int twiceHigh, double* slope)
+{
+    if (twiceLow == twiceHigh) { *slope = 0.0; return 0.0; }
+    double mn = twiceLow / 2.0, span = (twiceHigh - twiceLow) / 2.0, sign = 1.0;
+    coord -= mn;
+    if (coord < 0.0) { sign = -1.0; coord = -coord; }
+    double extra = fmod(coord, span), flips = floor(coord / span);
+    if (fmod(flips, 2.0) == 0.0) { *slope *= sign; return extra + mn; }
+    *slope *= -sign;
+    return span - extra + mn;
+}
+
+__device__ double parity_grid_source_slope(double normalized, int size, int padding, int align, double* slope)
+{
+    double coord = align ? (normalized + 1.0) / 2.0 * (size - 1) : ((normalized + 1.0) * size - 1.0) / 2.0;
+    *slope = align ? (size - 1) / 2.0 : size / 2.0;
+    if (padding == 2)
+        coord = align ? parity_grid_reflect_slope(coord, 0, 2 * (size - 1), slope) : parity_grid_reflect_slope(coord, -1, 2 * size - 1, slope);
+    if (padding >= 1)
+    {
+        if (coord <= 0.0) { *slope = 0.0; return 0.0; }
+        if (coord >= size - 1) { *slope = 0.0; return (double)(size - 1); }
+    }
+    return coord;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_grid_sample_3d_backward(const float* __restrict__ x, const float* __restrict__ grid,
+    const float* __restrict__ dy, float* __restrict__ dx, float* __restrict__ dgrid, int batches, int channels, int depth, int height,
+    int width, int points, int mode, int padding, int align)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batches * points) return;
+    int b = idx / points, q = idx % points;
+    const float* g = grid + (long long)idx * 3;
+    double sx, sy, sz;
+    double cx = parity_grid_source_slope((double)g[0], width, padding, align, &sx);
+    double cy = parity_grid_source_slope((double)g[1], height, padding, align, &sy);
+    double cz = parity_grid_source_slope((double)g[2], depth, padding, align, &sz);
+    int volume = depth * height * width;
+    int offsets[8]; double weights[8], gradX[8], gradY[8], gradZ[8]; int taps = 0;
+    if (mode == 1)
+    {
+        long long ix = parity_grid_index(rint(cx)), iy = parity_grid_index(rint(cy)), iz = parity_grid_index(rint(cz));
+        if (ix >= 0 && ix < width && iy >= 0 && iy < height && iz >= 0 && iz < depth)
+        {
+            offsets[0] = (int)((iz * height + iy) * width + ix); weights[0] = 1.0;
+            gradX[0] = gradY[0] = gradZ[0] = 0.0; taps = 1;
+        }
+    }
+    else
+    {
+        double fx0 = floor(cx), fy0 = floor(cy), fz0 = floor(cz);
+        long long x0 = parity_grid_index(fx0), y0 = parity_grid_index(fy0), z0 = parity_grid_index(fz0);
+        double fx = cx - fx0, fy = cy - fy0, fz = cz - fz0;
+        for (int oz = 0; oz < 2; oz++)
+            for (int oy = 0; oy < 2; oy++)
+                for (int ox = 0; ox < 2; ox++)
+                {
+                    long long ix = x0 + ox, iy = y0 + oy, iz = z0 + oz;
+                    if (ix < 0 || ix >= width || iy < 0 || iy >= height || iz < 0 || iz >= depth) continue;
+                    double wx = ox == 1 ? fx : 1.0 - fx, wy = oy == 1 ? fy : 1.0 - fy, wz = oz == 1 ? fz : 1.0 - fz;
+                    offsets[taps] = (int)((iz * height + iy) * width + ix);
+                    weights[taps] = wx * wy * wz;
+                    gradX[taps] = (ox == 1 ? 1.0 : -1.0) * wy * wz * sx;
+                    gradY[taps] = (oy == 1 ? 1.0 : -1.0) * wx * wz * sy;
+                    gradZ[taps] = (oz == 1 ? 1.0 : -1.0) * wx * wy * sz;
+                    taps++;
+                }
+    }
+    double dgx = 0.0, dgy = 0.0, dgz = 0.0;
+    for (int ch = 0; ch < channels; ch++)
+    {
+        long long plane = ((long long)b * channels + ch) * volume;
+        double up = (double)dy[((long long)b * channels + ch) * points + q];
+        for (int t = 0; t < taps; t++)
+        {
+            atomicAdd(dx + plane + offsets[t], (float)(weights[t] * up));
+            double v = (double)x[plane + offsets[t]] * up;
+            dgx += v * gradX[t]; dgy += v * gradY[t]; dgz += v * gradZ[t];
+        }
+    }
+    dgrid[(long long)idx * 3] = (float)dgx;
+    dgrid[(long long)idx * 3 + 1] = (float)dgy;
+    dgrid[(long long)idx * 3 + 2] = (float)dgz;
+}
 ";
         }
 
@@ -1125,7 +1215,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_int_not(const int* __
             "parity_flag_reset", "parity_sample", "parity_bernoulli", "parity_poisson", "parity_binomial", "parity_multinomial",
             "parity_dropout_affine", "parity_rrelu", "parity_random_keys",
             "parity_nonzero_static_scatter", "parity_unravel_axis", "parity_slice_bitonic_step", "parity_slice_first_flags",
-            "parity_slice_gather_unique", "parity_grid_sample_3d", "parity_scan_block", "parity_scan_add", "parity_int_binary", "parity_int_not",
+            "parity_slice_gather_unique", "parity_grid_sample_3d", "parity_scan_block", "parity_scan_add", "parity_int_binary", "parity_int_not", "parity_grid_sample_3d_backward",
         };
     }
 }

@@ -142,4 +142,11 @@ internal interface ITorchParityElementwiseBackend
     /// <summary>grid_sample 3-D (mode 0 bilinear / 1 nearest; padding 0 zeros / 1 border / 2 reflection).</summary>
     void TorchParityGridSample3D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output, int batches, int channels, int depth, int height,
         int width, int points, int mode, int padding, bool alignCorners);
+
+    /// <summary>
+    /// grid_sample 3-D adjoints: accumulates into <paramref name="inputGrad"/> (zeroed by the caller) and writes
+    /// <paramref name="gridGrad"/> ([N, D', H', W', 3]).
+    /// </summary>
+    void TorchParityGridSample3DBackward(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer outputGrad, IGpuBuffer inputGrad, IGpuBuffer gridGrad,
+        int batches, int channels, int depth, int height, int width, int points, int mode, int padding, bool alignCorners);
 }

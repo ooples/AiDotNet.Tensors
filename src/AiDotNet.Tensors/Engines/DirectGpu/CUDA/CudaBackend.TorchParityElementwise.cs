@@ -435,6 +435,22 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         LaunchKernel(gridKernel, ParityGrid(threads), DefaultBlockSize, args);
     }
 
+    unsafe void ITorchParityElementwiseBackend.TorchParityGridSample3DBackward(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer outputGrad,
+        IGpuBuffer inputGrad, IGpuBuffer gridGrad, int batches, int channels, int depth, int height, int width, int points, int mode,
+        int padding, bool alignCorners)
+    {
+        int threads = batches * points;
+        if (threads <= 0) return;
+        IntPtr backwardKernel = ParityKernel("parity_grid_sample_3d_backward");
+        using var _ = PushContext();
+        IntPtr px = input.Handle, pg = grid.Handle, pdy = outputGrad.Handle, pdx = inputGrad.Handle, pdg = gridGrad.Handle;
+        int align = alignCorners ? 1 : 0;
+        void** args = stackalloc void*[14];
+        args[0] = &px; args[1] = &pg; args[2] = &pdy; args[3] = &pdx; args[4] = &pdg; args[5] = &batches; args[6] = &channels;
+        args[7] = &depth; args[8] = &height; args[9] = &width; args[10] = &points; args[11] = &mode; args[12] = &padding; args[13] = &align;
+        LaunchKernel(backwardKernel, ParityGrid(threads), DefaultBlockSize, args);
+    }
+
     unsafe void ITorchParityElementwiseBackend.TorchParityBinary(
         TorchParityBinaryOp op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n)
     {

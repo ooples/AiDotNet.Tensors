@@ -48,7 +48,7 @@ public partial class CpuEngine
     private static double[] ToDoubles<T>(Tensor<T> t, Interfaces.INumericOperations<T> ops)
         => (t.IsContiguous ? t : t.Contiguous()).AsSpan().ToArray().Select(v => ops.ToDouble(v)).ToArray();
 
-    private static void GridSample3DBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+    private protected static void GridSample3DBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var ops = MathHelper.GetNumericOperations<T>();

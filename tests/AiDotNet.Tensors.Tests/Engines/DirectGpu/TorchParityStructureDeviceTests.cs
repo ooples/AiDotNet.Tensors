@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Tests.TestHelpers;
@@ -117,6 +118,50 @@ public class TorchParityStructureDeviceTests : IClassFixture<DirectGpuTensorEngi
         var actual = OnDevice(() => gpu.TensorNonzeroStatic(x, 700_000, -5), r => _ = r[0]);
         Assert.Equal(expected._shape, actual._shape);
         for (int i = 0; i < expected.Length; i++) Assert.True(expected[i] == actual[i], $"[{i}]: cpu {expected[i]} gpu {actual[i]}");
+    }
+
+    // Both adjoints (input and grid) on the device: the tape gradient of sum(w * grid_sample(x, g)) must equal the CPU's
+    // for each mode / padding / alignment, with no host fallback in forward or backward.
+    [SkippableTheory]
+    [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Zeros, false)]
+    [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Border, true)]
+    [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Reflection, false)]
+    [InlineData(GridSampleMode.Bilinear, GridSamplePadding.Reflection, true)]
+    [InlineData(GridSampleMode.Nearest, GridSamplePadding.Zeros, false)]
+    public void GridSample3D_Adjoints_MatchCpu_OnDevice(GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
+    {
+        var gpu = GpuOrSkip();
+        var cpu = new CpuEngine();
+        var input = Random(10, 4, 2, 3, 4, 5, 6);
+        var grid = Random(11, 3.2f, 2, 3, 4, 2, 3);
+        var weights = Random(12, 2, 2, 3, 3, 4, 2);
+        (float[] Dx, float[] Dg) Gradients(IEngine e)
+        {
+            var previous = AiDotNetEngine.Current;
+            AiDotNetEngine.Current = e;
+            try
+            {
+                using var tape = new GradientTape<float>();
+                var y = e.TensorGridSample3D(input, grid, mode, padding, alignCorners);
+                var loss = e.ReduceSum(e.TensorMultiply(y, weights), new[] { 0, 1, 2, 3, 4 }, keepDims: false);
+                var grads = tape.ComputeGradients(loss, new[] { input, grid });
+                return (grads[input].ToArray(), grads[grid].ToArray());
+            }
+            finally
+            {
+                AiDotNetEngine.Current = previous;
+            }
+        }
+        var expected = Gradients(cpu);
+        long fallbacks = TotalFallbacks();
+        var actual = Gradients(gpu);
+        Assert.Equal(fallbacks, TotalFallbacks());
+        foreach (var (what, c, g) in new[] { ("dx", expected.Dx, actual.Dx), ("dgrid", expected.Dg, actual.Dg) })
+        {
+            Assert.Equal(c.Length, g.Length);
+            for (int i = 0; i < c.Length; i++)
+                Assert.True(Math.Abs(c[i] - g[i]) <= 1e-4 * Math.Max(1.0, Math.Abs(c[i])), $"{what}[{i}]: cpu {c[i]:R} gpu {g[i]:R}");
+        }
     }
 
     // PyTorch maps non-finite and out-of-int-range voxel coordinates out of bounds, so such points sample nothing; the
