@@ -1491,7 +1491,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <summary>
     /// Allocates an uninitialized device buffer for kernels that overwrite every element.
     /// </summary>
-    private IGpuBuffer AllocateBufferUninitialized(int size)
+    public IGpuBuffer AllocateBufferUninitialized(int size)
     {
         IntPtr devicePtr = IntPtr.Zero;
         long sizeInBytes = (long)size * sizeof(float);
