@@ -121,6 +121,16 @@ internal static partial class Program
             if (filter.Length > 0 && !name.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
             var q = R(bb, hh, ss, dd); var k = R(bb, hh, ss, dd); var v = R(bb, hh, ss, dd);
             Action run = () => eng.ScaledDotProductAttention(q, k, v, null, null, out _);
+            if (typeof(T) == typeof(float) && Environment.GetEnvironmentVariable("PROBE_SDPA_INTO") == "1")
+            {
+                // The fused-MHA layout: [B, T, H, D] permuted to [B, H, T, D], written into a resident output.
+                name = "sdpainto" + name.Substring(4);
+                var qs = R(bb, ss, hh, dd).Transpose(new[] { 0, 2, 1, 3 });
+                var ks = R(bb, ss, hh, dd).Transpose(new[] { 0, 2, 1, 3 });
+                var vs = R(bb, ss, hh, dd).Transpose(new[] { 0, 2, 1, 3 });
+                var dst = new Tensor<T>(new[] { bb, hh, ss, dd });
+                run = () => eng.ScaledDotProductAttentionInto(dst, qs, ks, vs, null);
+            }
             var times = new double[dops.Length];
             for (int di = 0; di < dops.Length; di++)
             {
