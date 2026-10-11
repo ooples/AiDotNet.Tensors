@@ -1397,6 +1397,49 @@ class Program
             return;
         }
 
+        if (args[0] == "--vulkan-engine-ops")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
+            foreach (int n in new[] { 64, 1024 })
+            {
+                var rng = new Random(1);
+                var a = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { n, n });
+                var b = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { n, n });
+                for (int i = 0; i < a.Length; i++) { a[i] = (float)rng.NextDouble(); b[i] = (float)rng.NextDouble(); }
+                double T(string name, Func<AiDotNet.Tensors.LinearAlgebra.Tensor<float>> f, int calls)
+                {
+                    for (int i = 0; i < 20; i++) f();
+                    var samples = new double[7];
+                    for (int s = 0; s < samples.Length; s++)
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < calls; i++) f();
+                        samples[s] = sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                    }
+                    Array.Sort(samples);
+                    long up = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Uploads, rb = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+                    int fb = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Fallbacks.Length;
+                    f();
+                    up = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Uploads - up; rb = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks - rb;
+                    Console.WriteLine($"VKENGINE n={n} {name}: median {samples[3]:F0}us min {samples[0]:F0} max {samples[6]:F0} (per call: {up} uploads, {rb} readbacks; pooled={AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.Pool.PooledCount}; gen0={GC.CollectionCount(0)}; fallbacks={string.Join(",", AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Fallbacks)})");
+                    return samples[3];
+                }
+                int calls = n == 64 ? 200 : 30;
+                T("add(host,host)", () => eng.TensorAdd(a, b), calls);
+                var ga = eng.TensorAdd(a, b);
+                var gb = eng.TensorMultiply(a, b);
+                T("add(dev,dev)", () => eng.TensorAdd(ga, gb), calls);
+                T("mul(dev,dev)", () => eng.TensorMultiply(ga, gb), calls);
+                T("relu(dev)", () => eng.ReLU(ga), calls);
+                T("matmul(dev,dev)", () => eng.TensorMatMul(ga, gb), n == 64 ? 200 : 10);
+                T("softmax(dev)", () => eng.Softmax(ga, -1), calls);
+                T("add+relu+add chain", () => eng.TensorAdd(eng.ReLU(eng.TensorAdd(ga, gb)), gb), calls);
+            }
+            return;
+        }
+
         // Cost of allocating and freeing a Vulkan device buffer, alone and around a small op
         if (args[0] == "--vulkan-alloc")
         {

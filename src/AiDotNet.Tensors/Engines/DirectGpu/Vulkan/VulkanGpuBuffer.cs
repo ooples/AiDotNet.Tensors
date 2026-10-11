@@ -20,8 +20,11 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     // for the next allocation of the same size (as the CUDA, HIP and OpenCL backends do). Only an exact size match is
     // reused: a Vulkan buffer's logical size is its allocation size everywhere a transfer or a kernel reads it.
     // Every dispatch is submitted and waited for, so a released buffer has no work in flight.
-    private const int MaxPooledBuffersPerBucket = 32;
+    // As many per size bucket as OpenCL keeps: a loop that never disposes its results gets them all back at once,
+    // when a collection finalizes them. The memory budget below is the real bound.
+    private const int MaxPooledBuffersPerBucket = 4096;
     private const int PooledMemoryDivisor = 4;
+    private const long MinimumReclaimCharge = 128 * 1024;
 
     /// <summary>Released buffers kept for reuse. AIDOTNET_VULKAN_BUFFER_POOL=0 disables pooling.</summary>
     internal static readonly GpuBufferPool<VulkanGpuBuffer> Pool =
@@ -96,6 +99,12 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // Run the frees queued by collected buffers; on out-of-memory collect unreachable buffers, run their frees and
         // retry once (see DeviceMemoryReclaim).
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        // Counted like the OpenCL and HIP allocators count theirs, pool hits included: a result nobody disposed comes
+        // back only when the GC finalizes it, and a GPU loop allocates too little managed memory to collect often.
+        // A small buffer is charged MinimumReclaimCharge: a driver allocation costs Vulkan about 0.7 ms however small it
+        // is, so small results have to come back from the collector by count; charged by their bytes alone, sixteen
+        // thousand 16 KB results would be created before the first collection returned any.
+        DeviceMemoryReclaim.OnDeviceAllocation(Math.Max((long)size * sizeof(float), MinimumReclaimCharge));
         if (PoolingEnabled && Pool.TryRent(size, GpuBufferPoolAffinity.Global, exactCapacity: true, out var pooled) &&
             pooled is not null)
             return pooled;
