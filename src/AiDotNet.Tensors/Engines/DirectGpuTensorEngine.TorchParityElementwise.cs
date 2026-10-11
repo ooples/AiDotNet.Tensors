@@ -152,9 +152,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> reduced;
         using (new NoGradScope<T>())
             reduced = all ? TensorAmin(indicator, reduceAxes, keepDims) : ReduceMax(indicator, reduceAxes, keepDims);
-        // The CPU's ReduceMax gives a full reduction shape [1] where the device one gives rank 0 (#1132); all / any
-        // keep the CPU's shape.
-        return reduced.Rank == 0 ? Reshape(reduced, new[] { 1 }) : reduced;
+        return reduced;
     }
 
     private Tensor<T>? TryDiagflatOnDevice<T>(Tensor<T> tensor, int offset)

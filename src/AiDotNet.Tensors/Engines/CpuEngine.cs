@@ -33473,7 +33473,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Output shape of a reduction over every axis: rank 0 without keepDims (as torch and the GPU engine
     /// return), otherwise every axis kept as size 1 (#1132).
     /// </summary>
-    private static int[] FullReductionShape(int rank, bool keepDims)
+    internal static int[] FullReductionShape(int rank, bool keepDims)
     {
         if (!keepDims) return Array.Empty<int>();
         var shape = new int[rank];
