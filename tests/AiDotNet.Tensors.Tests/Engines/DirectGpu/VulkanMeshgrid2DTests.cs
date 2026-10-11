@@ -172,6 +172,25 @@ public class VulkanMeshgrid2DTests
         Assert.False(vision.TryDirectPtxMeshgrid2DPair(small, small, small, small, 8, 8, false));
     }
 
+    // No device needed: libshaderc compiles on the CPU, so this runs wherever the native library loads (CI included).
+    [SkippableTheory]
+    [InlineData(256, 256, false)]
+    [InlineData(256, 256, true)]
+    [InlineData(1024, 256, false)]
+    [InlineData(1024, 256, true)]
+    public void Shader_CompilesToSpirv(int n0, int n1, bool xy)
+    {
+        VulkanGlslCompiler compiler;
+        try { compiler = new VulkanGlslCompiler(); }
+        catch (Exception ex) when (ex is DllNotFoundException or TypeInitializationException or BadImageFormatException) { compiler = null!; }
+        Skip.If(compiler is null || !compiler.IsAvailable, "libshaderc is not available.");
+        using (compiler)
+        {
+            uint[]? spirv = compiler!.CompileToSpirv(VulkanBackend.Meshgrid2DSource(n0, n1, xy));
+            Assert.True(spirv is { Length: > 5 }, $"meshgrid {n0}x{n1} xy={xy} did not compile: {compiler.LastError}");
+        }
+    }
+
     [Fact]
     public void Shader_CompilesTheExtentsIn_AndDiffersPerIndexingMode()
     {
