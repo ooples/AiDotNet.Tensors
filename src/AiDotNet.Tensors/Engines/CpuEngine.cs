@@ -18026,6 +18026,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var kernelData = kernel.GetFlattenedData();
 
+        if (typeof(T) == typeof(float))
+        {
+            DepthwiseConv2DFloat((float[])(object)inputData, (float[])(object)kernelData, (float[])(object)outputData,
+                batch, inChannels, height, width, multiplier, kernelHeight, kernelWidth, strideH, strideW, padH, padW,
+                outputHeight, outputWidth);
+            return;
+        }
+
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
             (long)batch * outChannels * outputHeight * outputWidth, idx =>
         {
@@ -18061,6 +18069,61 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// Float depthwise convolution (#639): one task per (batch, output channel) plane, typed arrays instead of the
+    /// generic per-element numeric interface, and for stride 1 each tap added across a whole output row as a vector
+    /// multiply then add. Every output sums its in-bounds taps in (kh, kw) order with separate multiply and add, as the
+    /// generic loop does, so the result is identical to it. The parallel grain counts the kernel taps.
+    /// </summary>
+    private static void DepthwiseConv2DFloat(float[] x, float[] w, float[] y, int batch, int inChannels, int height,
+        int width, int multiplier, int kH, int kW, int strideH, int strideW, int padH, int padW, int outH, int outW)
+    {
+        int outChannels = inChannels * multiplier;
+        int planes = batch * outChannels;
+        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * outH * outW * kH * kW, idx =>
+        {
+            int b = idx / outChannels, oc = idx % outChannels, ic = oc / multiplier;
+            int xPlane = (b * inChannels + ic) * height * width, yPlane = idx * outH * outW, wBase = oc * kH * kW;
+            int vw = System.Numerics.Vector<float>.Count;
+            for (int oh = 0; oh < outH; oh++)
+            {
+                int yRow = yPlane + oh * outW;
+                Array.Clear(y, yRow, outW);
+                for (int kh = 0; kh < kH; kh++)
+                {
+                    int ih = oh * strideH + kh - padH;
+                    if (ih < 0 || ih >= height) continue;
+                    int xRow = xPlane + ih * width;
+                    for (int kw = 0; kw < kW; kw++)
+                    {
+                        float wv = w[wBase + kh * kW + kw];
+                        // Output columns whose input column ow * strideW + kw - padW is in bounds.
+                        int lastReach = width - 1 + padW - kw;   // ow * strideW <= lastReach
+                        if (lastReach < 0) continue;              // (division would truncate a negative toward 0)
+                        int owStart = Math.Max(0, (padW - kw + strideW - 1) / strideW);
+                        int owEnd = Math.Min(outW, lastReach / strideW + 1);
+                        if (owStart >= owEnd) continue;
+                        if (strideW == 1)
+                        {
+                            int src = xRow + owStart + kw - padW, dst = yRow + owStart, n = owEnd - owStart, i = 0;
+                            var vwv = new System.Numerics.Vector<float>(wv);
+                            for (; i <= n - vw; i += vw)
+                            {
+                                var prod = new System.Numerics.Vector<float>(x, src + i) * vwv;
+                                (new System.Numerics.Vector<float>(y, dst + i) + prod).CopyTo(y, dst + i);
+                            }
+                            for (; i < n; i++) y[dst + i] += x[src + i] * wv;
+                        }
+                        else
+                        {
+                            for (int ow = owStart; ow < owEnd; ow++) y[yRow + ow] += x[xRow + ow * strideW + kw - padW] * wv;
+                        }
+                    }
+                }
+            }
+        }, deterministicSafe: true);
     }
 
     /// <inheritdoc/>
