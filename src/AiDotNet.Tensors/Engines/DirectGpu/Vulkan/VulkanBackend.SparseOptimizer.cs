@@ -18,11 +18,10 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentException("Sparse optimizer state buffers must be at least as large as the parameter buffer.");
         if (nnz == 0) return;
 
-        using var state1Dummy = state1 is null ? AllocateBuffer(1) : null;
-        using var state2Dummy = state2 is null ? AllocateBuffer(1) : null;
-        using var state3Dummy = state3 is null ? AllocateBuffer(1) : null;
+        // An optimizer that keeps fewer than three state buffers leaves the others' bindings untouched.
+        var unused = UnusedBinding;
         GlslNaryOp(VulkanOptimizerKernels.Sparse,
-            new[] { param, state1 ?? state1Dummy!, state2 ?? state2Dummy!, state3 ?? state3Dummy!, sparseIndices, sparseValues },
+            new[] { param, state1 ?? unused, state2 ?? unused, state3 ?? unused, sparseIndices, sparseValues },
             1, new[] { (uint)param.Size, (uint)nnz, (uint)operation, (uint)step, FloatBits(learningRate),
                 FloatBits(p0), FloatBits(p1), FloatBits(p2), FloatBits(p3) });
     }

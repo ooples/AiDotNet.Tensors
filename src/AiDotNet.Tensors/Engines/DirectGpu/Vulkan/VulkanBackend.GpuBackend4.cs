@@ -271,9 +271,9 @@ public sealed unsafe partial class VulkanBackend
     public void ScatterAddEdges(IGpuBuffer input, IGpuBuffer sourceIndices, IGpuBuffer targetIndices, IGpuBuffer? edgeValues, IGpuBuffer output, int numNodes, int numEdges, int features)
     {
         EnsureInitialized();
-        using var edgeValueDummy = edgeValues is null ? AllocateBuffer(1) : null;
+        // Without edge values the kernel never reads that binding (weighted = 0).
         GlslNaryOp(VulkanResidentKernels.ScatterAddEdges,
-            new[] { input, sourceIndices, targetIndices, edgeValues ?? edgeValueDummy!, output },
+            new[] { input, sourceIndices, targetIndices, edgeValues ?? UnusedBinding, output },
             checked(numNodes * features),
             new[] { (uint)numNodes, (uint)numEdges, (uint)features, edgeValues is null ? 0u : 1u });
     }
