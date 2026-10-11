@@ -3563,37 +3563,29 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// <c>r = a op b</c> where <paramref name="b"/> repeats along the leading axes of <paramref name="a"/> in tiles of
-    /// <paramref name="tile"/> elements (the [N, M] op [M] bias pattern). Above the elementwise grain the tiles are
-    /// split across threads (#653: the former single loop ran every row-bias add and scale on one core at every size --
-    /// 4.9 ms for an 8M-element float tensor at DOP 1 through 64); below it, or when a backing is not directly
-    /// addressable, it is one serial pass. Each tile is the same vectorized INumericOperations span call either way.
+    /// <paramref name="tile"/> elements (the [N, M] op [M] bias pattern). Float and double run a typed vector loop
+    /// over the tiles (no per-tile interface call), split across threads from <see cref="TrailingRepeatParallelMin"/>
+    /// elements (#653: the former single loop ran every row-bias add and scale on one core at every size -- 4.9 ms for
+    /// an 8M-element float tensor at DOP 1 through 64). Each element is one IEEE add or multiply, so the result is the
+    /// same as the serial INumericOperations loop, which other element types (and non-addressable backings) keep.
     /// </summary>
     private static void TrailingRepeatBinary<T>(Tensor<T> a, Tensor<T> b, Tensor<T> r, int tile, bool multiply)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int length = a.Length;
-        int numTiles = length / tile;
-        int chunks = Math.Min(CpuParallelSettings.ElementwiseChunkCount(length), numTiles);
-        if (chunks >= 2
+        int length = a.Length, numTiles = length / tile;
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double))
             && a.GetCpuBackingForStridedRead(out int aOff) is { } aArr
             && b.GetCpuBackingForStridedRead(out int bOff) is { } bArr
             && r.GetCpuBackingForContiguousWrite(out int rOff) is { } rArr)
         {
-            int tilesPerChunk = (numTiles + chunks - 1) / chunks;
-            CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
-            {
-                int t0 = c * tilesPerChunk, t1 = Math.Min(numTiles, t0 + tilesPerChunk);
-                var bSpanC = new ReadOnlySpan<T>(bArr, bOff, tile);
-                for (int t = t0; t < t1; t++)
-                {
-                    var aT = new ReadOnlySpan<T>(aArr, aOff + t * tile, tile);
-                    var rT = new Span<T>(rArr, rOff + t * tile, tile);
-                    if (multiply) numOps.Multiply(aT, bSpanC, rT); else numOps.Add(aT, bSpanC, rT);
-                }
-            }, deterministicSafe: true);
+            int chunks = length >= TrailingRepeatParallelMin ? Math.Min(CpuParallelSettings.ElementwiseChunkCount(length), numTiles) : 1;
+            if (typeof(T) == typeof(float))
+                TrailingRepeatFloat((float[])(object)aArr, aOff, (float[])(object)bArr, bOff, (float[])(object)rArr, rOff, tile, numTiles, multiply, chunks);
+            else
+                TrailingRepeatDouble((double[])(object)aArr, aOff, (double[])(object)bArr, bOff, (double[])(object)rArr, rOff, tile, numTiles, multiply, chunks);
             return;
         }
 
+        var numOps = MathHelper.GetNumericOperations<T>();
         var aSpan = a.AsSpan();
         var bSpan = b.AsSpan();
         var rSpan = r.AsWritableSpan();
@@ -3602,6 +3594,74 @@ public partial class CpuEngine : ITensorLevelEngine
             int off = t * tile;
             if (multiply) numOps.Multiply(aSpan.Slice(off, tile), bSpan, rSpan.Slice(off, tile));
             else numOps.Add(aSpan.Slice(off, tile), bSpan, rSpan.Slice(off, tile));
+        }
+    }
+
+    // Below this many elements a trailing-repeat broadcast stays one serial pass: a [6144, 32] row-bias add (~45 us)
+    // only lost time to the fan-out.
+    private const int TrailingRepeatParallelMin = 1 << 20;
+
+    private static void TrailingRepeatFloat(float[] a, int aOff, float[] b, int bOff, float[] r, int rOff, int tile, int numTiles,
+        bool multiply, int chunks)
+    {
+        if (chunks < 2) { TrailingRepeatFloatTiles(a, aOff, b, bOff, r, rOff, tile, 0, numTiles, multiply); return; }
+        int perChunk = (numTiles + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)numTiles * tile, c =>
+            TrailingRepeatFloatTiles(a, aOff, b, bOff, r, rOff, tile, c * perChunk, Math.Min(numTiles, (c + 1) * perChunk), multiply),
+            deterministicSafe: true);
+    }
+
+    private static void TrailingRepeatFloatTiles(float[] a, int aOff, float[] b, int bOff, float[] r, int rOff, int tile, int t0, int t1,
+        bool multiply)
+    {
+        int w = System.Numerics.Vector<float>.Count;
+        for (int t = t0; t < t1; t++)
+        {
+            int ao = aOff + t * tile, ro = rOff + t * tile, i = 0;
+            if (multiply)
+            {
+                for (; i <= tile - w; i += w)
+                    (new System.Numerics.Vector<float>(a, ao + i) * new System.Numerics.Vector<float>(b, bOff + i)).CopyTo(r, ro + i);
+                for (; i < tile; i++) r[ro + i] = a[ao + i] * b[bOff + i];
+            }
+            else
+            {
+                for (; i <= tile - w; i += w)
+                    (new System.Numerics.Vector<float>(a, ao + i) + new System.Numerics.Vector<float>(b, bOff + i)).CopyTo(r, ro + i);
+                for (; i < tile; i++) r[ro + i] = a[ao + i] + b[bOff + i];
+            }
+        }
+    }
+
+    private static void TrailingRepeatDouble(double[] a, int aOff, double[] b, int bOff, double[] r, int rOff, int tile, int numTiles,
+        bool multiply, int chunks)
+    {
+        if (chunks < 2) { TrailingRepeatDoubleTiles(a, aOff, b, bOff, r, rOff, tile, 0, numTiles, multiply); return; }
+        int perChunk = (numTiles + chunks - 1) / chunks;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)numTiles * tile, c =>
+            TrailingRepeatDoubleTiles(a, aOff, b, bOff, r, rOff, tile, c * perChunk, Math.Min(numTiles, (c + 1) * perChunk), multiply),
+            deterministicSafe: true);
+    }
+
+    private static void TrailingRepeatDoubleTiles(double[] a, int aOff, double[] b, int bOff, double[] r, int rOff, int tile, int t0, int t1,
+        bool multiply)
+    {
+        int w = System.Numerics.Vector<double>.Count;
+        for (int t = t0; t < t1; t++)
+        {
+            int ao = aOff + t * tile, ro = rOff + t * tile, i = 0;
+            if (multiply)
+            {
+                for (; i <= tile - w; i += w)
+                    (new System.Numerics.Vector<double>(a, ao + i) * new System.Numerics.Vector<double>(b, bOff + i)).CopyTo(r, ro + i);
+                for (; i < tile; i++) r[ro + i] = a[ao + i] * b[bOff + i];
+            }
+            else
+            {
+                for (; i <= tile - w; i += w)
+                    (new System.Numerics.Vector<double>(a, ao + i) + new System.Numerics.Vector<double>(b, bOff + i)).CopyTo(r, ro + i);
+                for (; i < tile; i++) r[ro + i] = a[ao + i] + b[bOff + i];
+            }
         }
     }
 
