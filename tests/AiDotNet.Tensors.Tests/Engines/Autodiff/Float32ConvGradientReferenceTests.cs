@@ -12,11 +12,12 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
 /// <summary>
-/// Float32 convolution forward and gradients against exact double-precision references, on the encoder shapes
-/// RAFT uses at a 64x64 input. 0.135.0 produced a WRONG float32 weight gradient on AVX-512 hardware: a RAFT
-/// context-encoder 3x3 conv weight came out +7.72e-3 on an AMD EPYC Zen 5 (AVX-512) runner where the exact value
-/// is -1.9116e-2 (finite differences agree to 0.000% in double, and float32 matches on non-AVX-512 CPUs). The
-/// forward was identical, so the defect is in a backward path that only AVX-512 dispatch reaches.
+/// Float32 convolution forward and gradients against exact double-precision references, on the encoder shapes RAFT
+/// uses at a 64x64 input, plus the stale-transpose regression that made 0.135.0 train segmentation models wrong on
+/// Linux: the stride-1 input gradient's flipped kernel is a recycled buffer, and the im2col conv's transposed-kernel
+/// cache (reached off Windows only) served it the previous kernel's transpose. That surfaced as a wrong RAFT weight
+/// gradient and as DiffCut, DiffSeg and SegNeXt losses rising during training on Linux CI; it was first attributed to
+/// AVX-512 because the failing runners happened to be AVX-512 ones, but it reproduces on any Linux x64 CPU.
 /// </summary>
 public sealed class Float32ConvGradientReferenceTests
 {
@@ -84,6 +85,45 @@ public sealed class Float32ConvGradientReferenceTests
     }
 
     // The defect is AVX-512-only, so a pass is meaningful only alongside the ISA it ran on.
+    /// <summary>
+    /// The stride-1 input gradient runs as a transposed conv over a flipped copy of the kernel, written into a buffer
+    /// recycled through <c>AutoTensorCache</c>. Off Windows, float conv dispatches through the im2col GEMM, whose
+    /// transposed-kernel cache is keyed by the kernel array and trusts its version: when a later backward recycles the
+    /// same buffer for a DIFFERENT kernel (the next layer of that shape, or the same layer after an optimizer step),
+    /// an un-invalidated buffer is served the old transpose and the input gradient comes out wrong. 0.135.0 did this:
+    /// DiffCut, DiffSeg, SegNeXt and RAFT trained on stale input gradients on Linux CI only. The shapes are the
+    /// SegNeXt layers that hit the stale cache (batch 1, at least 128 input channels, a plane of at most 128).
+    /// </summary>
+    [Theory]
+    [InlineData(1, 160, 8, 160, 1, 0)]
+    [InlineData(1, 640, 8, 160, 1, 0)]
+    [InlineData(1, 256, 4, 256, 1, 0)]
+    [InlineData(1, 128, 8, 128, 3, 1)]
+    public void TapedInputGradient_ASecondKernelOfTheSameShape_IsNotServedTheFirstOnesTranspose(
+        int batch, int inChannels, int size, int outChannels, int kernel, int pad)
+    {
+        LogIsa();
+        var engine = new CpuEngine();
+        var (x, w1, _, g, outSize) = Inputs(batch, inChannels, size, outChannels, kernel, 1, pad);
+        var w2 = Random(new Random(7), outChannels, inChannels, kernel, kernel);
+        var exact1 = Reference(x, w1, null, g, batch, inChannels, size, outChannels, kernel, 1, pad, outSize, relu: false).DX;
+        var exact2 = Reference(x, w2, null, g, batch, inChannels, size, outChannels, kernel, 1, pad, outSize, relu: false).DX;
+
+        // Alternate the two kernels, as consecutive same-shape layers (or one layer across optimizer steps) do.
+        for (int round = 0; round < 3; round++)
+        {
+            AssertClose($"dX kernel 1, round {round}", InputGradient(engine, x, w1, g, pad), exact1);
+            AssertClose($"dX kernel 2, round {round}", InputGradient(engine, x, w2, g, pad), exact2);
+        }
+    }
+
+    private static Tensor<float> InputGradient(CpuEngine engine, Tensor<float> x, Tensor<float> w, Tensor<float> g, int pad)
+    {
+        using var tape = new GradientTape<float>();
+        var y = engine.Conv2D(x, w, 1, pad, 1);
+        var loss = engine.ReduceSum(engine.TensorMultiply(y, g), null);
+        return tape.ComputeGradients(loss, new[] { x })[x].Clone();
+    }
     private void LogIsa()
     {
 #if NET8_0_OR_GREATER
