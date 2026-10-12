@@ -212,7 +212,8 @@ public sealed class DirectGpuEngine : IDisposable
             if (backend != null)
             {
                 _backend = backend;
-                _borrowsBackend = backend is AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend;
+                // Decided by the name TryCreateBackend dispatched on, not a concrete-class test (TENS0007).
+                _borrowsBackend = string.Equals(backendName, "vulkan", StringComparison.OrdinalIgnoreCase);
                 _isAvailable = true;
                 return;
             }
