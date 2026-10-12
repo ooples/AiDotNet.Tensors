@@ -191,7 +191,7 @@ internal sealed class CompiledMlp
 
     private static unsafe void RunLayerGemm(byte kernel, float[] src, float[] weight, float[] dst, int m, int k, int n)
     {
-#if !NET471
+#if NETCOREAPP
         // JIT'd AVX2 kernel first (opt-in, gated inside TryMultiply). CompiledMlp is
         // the path the AIsEval MLP actually takes; without this hook the JIT never
         // reached it (the kernel auto-tuner only chose between managed/native).

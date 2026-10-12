@@ -257,7 +257,7 @@ internal static partial class SimdGemm
     internal static bool TryGemmSmallJit(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
     {
-#if !NET471
+#if NETCOREAPP
         if (!_jitSmallK || !JitGemmAvx2.Available || m <= 0 || n <= 0 || k <= 0) return false;
         // Same operand contract as every other entry here: the paths below slice, index and hand raw spans to the
         // native kernel, so a short buffer must be rejected before any of that.
@@ -362,7 +362,7 @@ internal static partial class SimdGemm
 
     // Split-k weight-gradient route of TryGemmSmallJit (AIDOTNET_JIT_SPLITK=0 disables) and its output-size ceiling
     // per dimension (each chunk's partial is mPad x n).
-#if !NET471
+#if NETCOREAPP
     [ThreadStatic] private static float[]? t_splitKScratch;
 #endif
     private static readonly bool s_splitKTransA =
@@ -387,7 +387,7 @@ internal static partial class SimdGemm
     internal static bool TryJitSmallK(System.ReadOnlySpan<float> a, System.ReadOnlySpan<float> b, System.Span<float> c,
         int m, int n, int k)
     {
-#if !NET471
+#if NETCOREAPP
         long work = (long)m * n * k;
         // The work ceiling stands in for B re-read traffic, (m/6)*k*n*4 bytes, which is what regressed at giant M
         // (22-33 MB). A shape just over the ceiling with modest traffic -- the [2048,64]x[64,128] FFN GEMM, 16.8M MACs
@@ -663,7 +663,7 @@ internal static partial class SimdGemm
                 c.Length, m, k, n);
         }
 
-#if !NET471
+#if NETCOREAPP
         // Our JIT'd AVX2 kernel first (opt-in). This is the entry the MLP's
         // MlpForward path and FusedLinear's tier-3 fallback use — without this
         // hook the JIT (376-700 GFLOP/s) never reached the MLP, which is why a
@@ -1613,7 +1613,7 @@ internal static partial class SimdGemm
                 c.Length, m, k, n);
         }
 
-#if !NET471
+#if NETCOREAPP
         // Direct-2D first where it applies, as in SgemmAddInternal (measured faster than the column panel on every
         // shape both take). It needs a zeroed C; any route below overwrites C if it declines.
         if (UseParallelGemm && UseDirectParallel2D && !transA && !transB && lda == k && ldb == n

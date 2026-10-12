@@ -40,7 +40,7 @@ internal static class PtxCompat
 
     internal static long GetAllocatedBytesForCurrentThread()
     {
-#if NET471
+#if !NETCOREAPP
         // The CLR 4.7.1 surface does not expose per-thread allocation counts.
         // Returning a stable zero keeps cross-target contract tests portable;
         // the same tests perform the real measurement on every modern target.

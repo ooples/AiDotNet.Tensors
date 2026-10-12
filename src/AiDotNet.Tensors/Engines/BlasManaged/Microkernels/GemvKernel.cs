@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
-#if !NET471
+#if NETCOREAPP
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
@@ -93,7 +93,7 @@ internal static class GemvKernel
             var cf = MemoryMarshal.Cast<T, float>(c);
             int aStride = transA ? 1 : lda;
 
-#if !NET471
+#if NETCOREAPP
             // Sub-R (#408) AVX2 outer-product fast path: broadcast the scalar
             // a_i across a Vector256 and multiply by 8 contiguous b-values per
             // iter, storing to the contiguous c-row. No reduction, so a plain
@@ -142,7 +142,7 @@ internal static class GemvKernel
             var cd = MemoryMarshal.Cast<T, double>(c);
             int aStride = transA ? 1 : lda;
 
-#if !NET471
+#if NETCOREAPP
             // AVX2 FP64 mirror — 4 doubles per Vector256<double>.
             if (!transB && Avx.IsSupported && n >= 4)
             {
@@ -197,7 +197,7 @@ internal static class GemvKernel
             // a is logically [1, K]: transA=false → af[kk]; transA=true → af[kk * lda]
             int aStride = transA ? lda : 1;
 
-#if !NET471
+#if NETCOREAPP
             // AVX2 fast path for transB=false (B is [K, N] row-major).
             if (!transB && Avx2.IsSupported && Fma.IsSupported && n >= 8)
             {
@@ -251,7 +251,7 @@ internal static class GemvKernel
             var cd = MemoryMarshal.Cast<T, double>(c);
             int aStride = transA ? lda : 1;
 
-#if !NET471
+#if NETCOREAPP
             if (!transB && Avx2.IsSupported && Fma.IsSupported && n >= 4)
             {
                 int nFull = n & ~3;
@@ -311,7 +311,7 @@ internal static class GemvKernel
             var cf = MemoryMarshal.Cast<T, float>(c);
             int bStride = transB ? 1 : ldb;
 
-#if !NET471
+#if NETCOREAPP
             // Sub-R (#408) AVX2 fast path: transA=false (A-row contiguous,
             // dominant case for embedding lookups, attention-against-single-
             // query, and any "matrix · column-vector" workload). Per-row
@@ -402,7 +402,7 @@ internal static class GemvKernel
             var cd = MemoryMarshal.Cast<T, double>(c);
             int bStride = transB ? 1 : ldb;
 
-#if !NET471
+#if NETCOREAPP
             // AVX2 FP64 mirror — 4 doubles per Vector256<double>.
             bool aRowContiguous = !transA;
             bool bIsContiguousVector = bStride == 1;

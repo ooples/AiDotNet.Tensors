@@ -3373,7 +3373,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pB = (float*)pinB.Pointer;
 
-#if !NET471
+#if NETCOREAPP
             // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
             if (OneDnnProvider.IsAvailable)
             {
@@ -6333,7 +6333,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pB = (float*)pinB.Pointer;
 
-#if !NET471
+#if NETCOREAPP
             // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
             if (OneDnnProvider.IsAvailable)
             {
@@ -10429,7 +10429,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Using Environment.ProcessorCount here would over-route into
             // the direct kernel on capped hosts where it'd actually
             // task-starve.
-#if !NET471
+#if NETCOREAPP
             // SimdConvHelper.Conv3x3Stride1Double is gated on AVX2/FMA intrinsics
             // (System.Runtime.Intrinsics is unavailable on net471 — the file is
             // <Compile Remove>'d in the .csproj for that TFM). On net471 doubles
@@ -10640,7 +10640,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // CpuParallelSettings.LightweightParallel internally).
         if (typeof(T) == typeof(double))
         {
-#if !NET471
+#if NETCOREAPP
             long convFmasInto = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
             // AiDotNet#1305 perf gate: see Conv2D allocating overload above
             // for the empirical cliff (~3% peak GFLOPS at SD UNet deepest
@@ -10861,7 +10861,7 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float>? epilogueBias = null,
         bool epilogueRelu = false)
     {
-#if !NET471
+#if NETCOREAPP
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
         if (TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
@@ -10975,7 +10975,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return false;
         }
 
-#if !NET471
+#if NETCOREAPP
         // Strategy 4: Try SIMD direct convolution for small 3x3 kernels with stride=1
         if (TryConv2DSimd(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
@@ -10991,7 +10991,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return false;
     }
 
-#if !NET471
+#if NETCOREAPP
     /// <summary>
     /// Try Conv2D using Intel oneDNN library.
     /// </summary>
@@ -11186,7 +11186,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = inChannels * height * width;
 
-#if !NET471
+#if NETCOREAPP
         // Recycled exact-size column buffer (this thread's cache, byte-capped). A fresh native buffer
         // per call paid first-touch page faults on the whole column matrix every conv (2.4 MB for a
         // 16-channel 64x64 3x3 conv).
@@ -11257,7 +11257,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         finally
         {
-#if NET471
+#if !NETCOREAPP
             pool.Return(im2colArray);
 #else
             ThreadLocalTensorCache<float>.TryReturn(im2colArray);
@@ -11499,7 +11499,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
-#if !NET471
+#if NETCOREAPP
         using var im2colBuffer = new NativeBuffer<double>(sliceSize);
         var im2colSpan = im2colBuffer.Span;
 #else
@@ -11540,7 +11540,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-#if NET471
+#if !NETCOREAPP
         }
         finally
         {
@@ -14271,7 +14271,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // worker-pool wakeup overhead. Above the cutover (large M) native BLAS's raw
         // throughput wins, so keep TryGemm there. Numerically equivalent to the native
         // path (float reduction-order only). M-cutover env-tunable (AIDOTNET_CACHEDB_MAXM).
-#if !NET471
+#if NETCOREAPP
         // Our JIT'd AVX2 GEMM (opt-in). C[m,p] = A[m,n]·B[n,p] ⇒ TryMultiply(M=m,N=p,K=n).
         if (_jitGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
@@ -15899,7 +15899,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 });
                 return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputD1x1));
             }
-#if !NET471
+#if NETCOREAPP
             // #415 Phase B: direct-kernel fast path for 3×3 stride=1 padding=1
             // (the dominant VGG / ResNet 3×3 backward-input shape). Uses the
             // identity: Conv2DBackwardInput with these constraints is exactly
@@ -17170,7 +17170,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
             }
 
-#if !NET471
+#if NETCOREAPP
             // #415 Phase B-2: direct backward-kernel fast path for 3×3 /
             // stride=1 / padding=1 / FP64 (mirror of Phase B for backward-
             // input). Skips im2col allocation (~8 MB per call at ResNet
@@ -17465,7 +17465,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
-#if !NET471
+#if NETCOREAPP
             // 3x3 stride-1 dilation-1 kernels whose per-image GEMM is small: the direct FMA kernel (one task per
             // (oc, ic) pair summing over every image). The im2col + per-image GEMM route below fans one native
             // call per image across the pool, and those calls serialise on the native compute gate.
@@ -43290,7 +43290,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 bool blasDone = false;
                 var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
 
-#if !NET471
+#if NETCOREAPP
                 // Tier -3 (opt-in, AIDOTNET_JIT_GEMM=1): our runtime-JIT'd AVX2 kernel.
                 // Beats managed + oneDNN on the small-K/N FFN shape, on our own pool.
                 // Bias+activation still run in the shared SIMD epilogue below.
@@ -43590,7 +43590,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 bool blasDone = false;
                 var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
 
-#if !NET471
+#if NETCOREAPP
                 if (!blasDone && _jitGemm
                     && Simd.JitGemmAvx2.TryMultiply(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, N, K))
                     blasDone = true;

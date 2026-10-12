@@ -5,7 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.Json;
-#if !NET471
+#if NETCOREAPP
 using System.Net.Http;
 #endif
 
@@ -48,7 +48,7 @@ internal static class TensorsOnlineLicenseServices
     private static readonly object FileLock = new();
     private static string? _cacheDirOverrideForTests;
 
-#if !NET471
+#if NETCOREAPP
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
 #else
     /// <summary>Explicit HTTP timeout for the net471 <see cref="System.Net.HttpWebRequest"/> path (WebClient
@@ -101,7 +101,7 @@ internal static class TensorsOnlineLicenseServices
 
         try
         {
-#if NET471
+#if !NETCOREAPP
             var thread = new System.Threading.Thread(() => RefreshCore(validateUrl, licenseKey, machineIdHash))
             {
                 IsBackground = true,
@@ -360,7 +360,7 @@ internal static class TensorsOnlineLicenseServices
             try
             {
                 File.WriteAllText(tmp, content);
-#if NET471
+#if !NETCOREAPP
                 // .NET Framework has no File.Move overwrite overload. File.Replace is an atomic swap but
                 // requires the destination to already exist; fall back to a plain Move when it does not (a
                 // best-effort equivalent, matching the modern overwrite Move).
@@ -387,7 +387,7 @@ internal static class TensorsOnlineLicenseServices
     private static string ShortHash(string value)
     {
         byte[] bytes = Encoding.UTF8.GetBytes("license-cache:" + value);
-#if NET471
+#if !NETCOREAPP
         using var sha = System.Security.Cryptography.SHA256.Create();
         byte[] hash = sha.ComputeHash(bytes);
 #else
@@ -404,7 +404,7 @@ internal static class TensorsOnlineLicenseServices
 
     private static string? HttpGet(string url)
     {
-#if NET471
+#if !NETCOREAPP
         // WebClient has NO default timeout, so a hung endpoint could pin a background thread far beyond the
         // documented refresh budget. Use HttpWebRequest with an explicit 10s timeout (matching the modern
         // HttpClient path).
@@ -423,7 +423,7 @@ internal static class TensorsOnlineLicenseServices
 
     private static string? HttpPost(string url, string json)
     {
-#if NET471
+#if !NETCOREAPP
         // Same reasoning as HttpGet: enforce an explicit 10s timeout that WebClient.UploadString lacks.
         var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
         req.Method = "POST";
