@@ -10,17 +10,14 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// The OpenCL backend with its PyTorch-parity kernels replaced, member by member, by the FP32 kernels Metal and WebGPU
 /// run (<see cref="TorchParityF32Kernels"/>), executed as their generated WGSL on Dawn. The parity device suites run on
-/// an engine over it, so the WebGPU / Metal kernels meet the same CPU references as every other backend. Members not
-/// yet ported forward to OpenCL's own kernels.
+/// an engine over it, so the WebGPU / Metal kernels meet the same CPU references as every other backend.
 /// </summary>
 internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParityElementwiseBackend
 {
-    private readonly ITorchParityElementwiseBackend _hostParity;
     private readonly PortableGenericFft.Launcher _launch;
 
     public DawnTorchParityBackend(OpenClBackend host, DawnWgslLauncher dawn) : base(host)
     {
-        _hostParity = host;
         _launch = dawn.For(host);
     }
 
@@ -45,47 +42,47 @@ internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParit
     public void TorchParityQuantileRows(IGpuBuffer sorted, IGpuBuffer output, int rows, int length, double q, int mode, bool ignoreNan)
         => PortableTorchParity.QuantileRows(_launch, sorted, output, rows, length, q, mode, ignoreNan);
     public void TorchParityFlagReset(IGpuBuffer flag)
-        => _hostParity.TorchParityFlagReset(flag);
+        => PortableTorchParity.FlagReset(_launch, flag);
     public void TorchParitySample(IGpuBuffer output, int n, int kind, double a, double b, ulong seed)
-        => _hostParity.TorchParitySample(output, n, kind, a, b, seed);
+        => PortableTorchParity.Sample(_launch, output, n, kind, a, b, seed);
     public void TorchParityBernoulli(IGpuBuffer probabilities, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
-        => _hostParity.TorchParityBernoulli(probabilities, output, n, seed, flag);
+        => PortableTorchParity.Bernoulli(Inner, _launch, probabilities, output, n, seed, flag);
     public void TorchParityPoisson(IGpuBuffer rates, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
-        => _hostParity.TorchParityPoisson(rates, output, n, seed, flag);
+        => PortableTorchParity.Poisson(Inner, _launch, rates, output, n, seed, flag);
     public void TorchParityBinomial(IGpuBuffer counts, IGpuBuffer probabilities, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
-        => _hostParity.TorchParityBinomial(counts, probabilities, output, n, seed, flag);
+        => PortableTorchParity.Binomial(Inner, _launch, counts, probabilities, output, n, seed, flag);
     public void TorchParityMultinomial(IGpuBuffer weights, IGpuBuffer scratch, IGpuBuffer output, int rows, int categories, int numSamples, bool replacement, ulong seed, IGpuBuffer flag)
-        => _hostParity.TorchParityMultinomial(weights, scratch, output, rows, categories, numSamples, replacement, seed, flag);
+        => PortableTorchParity.Multinomial(Inner, _launch, weights, scratch, output, rows, categories, numSamples, replacement, seed, flag);
     public void TorchParityDropoutAffine(IGpuBuffer scale, IGpuBuffer offset, int n, int block, double p, double a, double sat, double b, bool alpha, ulong seed)
-        => _hostParity.TorchParityDropoutAffine(scale, offset, n, block, p, a, sat, b, alpha, seed);
+        => PortableTorchParity.DropoutAffine(_launch, scale, offset, n, block, p, a, sat, b, alpha, seed);
     public void TorchParityRrelu(IGpuBuffer input, IGpuBuffer output, int n, double lower, double upper, bool training, ulong seed)
-        => _hostParity.TorchParityRrelu(input, output, n, lower, upper, training, seed);
+        => PortableTorchParity.Rrelu(_launch, input, output, n, lower, upper, training, seed);
     public void TorchParityRandomKeys(IGpuBuffer output, int n, ulong seed)
-        => _hostParity.TorchParityRandomKeys(output, n, seed);
+        => PortableTorchParity.RandomKeys(_launch, output, n, seed);
     public void TorchParityIntBinary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, IGpuBuffer flag)
-        => _hostParity.TorchParityIntBinary(op, a, b, output, n, flag);
+        => PortableTorchParity.IntBinary(Inner, _launch, op, a, b, output, n, flag);
     public void TorchParityIntNot(IGpuBuffer input, IGpuBuffer output, int n)
-        => _hostParity.TorchParityIntNot(input, output, n);
+        => PortableTorchParity.IntNot(_launch, input, output, n);
     public void TorchParityInt64Binary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, int typeCode, IGpuBuffer flag)
-        => _hostParity.TorchParityInt64Binary(op, a, b, output, n, typeCode, flag);
+        => PortableTorchParity.Int64Binary(Inner, _launch, op, a, b, output, n, typeCode, flag);
     public void TorchParityInt64Not(IGpuBuffer input, IGpuBuffer output, int n, int typeCode)
-        => _hostParity.TorchParityInt64Not(input, output, n, typeCode);
+        => PortableTorchParity.Int64Not(_launch, input, output, n, typeCode);
     public void TorchParityInclusiveScan(IGpuBuffer input, IGpuBuffer output, int n)
-        => _hostParity.TorchParityInclusiveScan(input, output, n);
+        => PortableTorchParity.InclusiveScan(Inner, _launch, input, output, n);
     public void TorchParityNonzeroStaticScatter(IGpuBuffer input, IGpuBuffer positions, IGpuBuffer output, int n, int size, int[] shape)
-        => _hostParity.TorchParityNonzeroStaticScatter(input, positions, output, n, size, shape);
+        => PortableTorchParity.NonzeroStaticScatter(Inner, _launch, input, positions, output, n, size, shape);
     public void TorchParityUnravelAxis(IGpuBuffer indices, IGpuBuffer output, int n, long total, long stride, long extent, bool validate, IGpuBuffer flag)
-        => _hostParity.TorchParityUnravelAxis(indices, output, n, total, stride, extent, validate, flag);
+        => PortableTorchParity.UnravelAxis(Inner, _launch, indices, output, n, total, stride, extent, validate, flag);
     public void TorchParitySliceBitonicStep(IGpuBuffer slices, IGpuBuffer order, int rowLen, int k, int j, int length, int sliceCount)
-        => _hostParity.TorchParitySliceBitonicStep(slices, order, rowLen, k, j, length, sliceCount);
+        => PortableTorchParity.SliceBitonicStep(_launch, slices, order, rowLen, k, j, length, sliceCount);
     public void TorchParitySliceFirstFlags(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags, int n, int length)
-        => _hostParity.TorchParitySliceFirstFlags(slices, order, flags, n, length);
+        => PortableTorchParity.SliceFirstFlags(_launch, slices, order, flags, n, length);
     public void TorchParitySliceGatherUnique(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags, IGpuBuffer positions, IGpuBuffer output, int n, int length, int outputRows)
-        => _hostParity.TorchParitySliceGatherUnique(slices, order, flags, positions, output, n, length, outputRows);
+        => PortableTorchParity.SliceGatherUnique(_launch, slices, order, flags, positions, output, n, length, outputRows);
     public void TorchParityGridSample3D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output, int batches, int channels, int depth, int height, int width, int points, int mode, int padding, bool alignCorners)
-        => _hostParity.TorchParityGridSample3D(input, grid, output, batches, channels, depth, height, width, points, mode, padding, alignCorners);
+        => PortableTorchParity.GridSample3D(_launch, input, grid, output, batches, channels, depth, height, width, points, mode, padding, alignCorners);
     public void TorchParityGridSample3DBackward(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer outputGrad, IGpuBuffer inputGrad, IGpuBuffer gridGrad, int batches, int channels, int depth, int height, int width, int points, int mode, int padding, bool alignCorners)
-        => _hostParity.TorchParityGridSample3DBackward(input, grid, outputGrad, inputGrad, gridGrad, batches, channels, depth, height, width, points, mode, padding, alignCorners);
+        => PortableTorchParity.GridSample3DBackward(_launch, input, grid, outputGrad, inputGrad, gridGrad, batches, channels, depth, height, width, points, mode, padding, alignCorners);
 }
 
 /// <summary>An engine over <see cref="DawnTorchParityBackend"/>; unavailable without OpenCL or Dawn.</summary>

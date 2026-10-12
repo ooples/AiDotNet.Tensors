@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// <item>kernels are <c>extern "C" __global__ __launch_bounds__(256) void name(...)</c> taking <c>const float*</c>,
 /// <c>float*</c>, <c>const int*</c>, <c>int*</c> buffers and <c>int</c>, <c>unsigned int</c> or <c>float</c> scalars;
 /// a kernel reads its index with <c>bx_gid()</c>;</item>
-/// <item>helpers are <c>__device__ __forceinline__ T name(T a, ...)</c> over float, int, unsigned int and bool, and
+/// <item>helpers are <c>__device__ __forceinline__ T name(T a, ...)</c> over float, float2, uint2, int, unsigned int and bool, and
 /// never assign their parameters;</item>
 /// <item>one declaration per statement (<c>float x = ...;</c> or <c>float x;</c>), loops <c>for (int k = ...; ...;
 /// ...)</c>;</item>
@@ -33,7 +33,7 @@ internal static class CudaDialectToWgsl
     private static readonly Regex ConstTable = new(@"__device__ const float (\w+)\[(\d+)\] = \{([^}]*)\};", RegexOptions.None, Timeout);
 
     private static readonly Regex HelperHeader = new(
-        @"__device__ __forceinline__ (float2|float|int|unsigned int|bool|void) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
+        @"__device__ __forceinline__ (float2|uint2|float|int|unsigned int|bool|void) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
 
     /// <summary>Kernel name to its WGSL module.</summary>
     public static Dictionary<string, string> Translate(string source)
@@ -77,12 +77,16 @@ internal static class CudaDialectToWgsl
             foreach (string raw in parameters.Split(','))
             {
                 string p = Regex.Replace(raw.Replace("__restrict__", ""), @"\s+", " ", RegexOptions.None, Timeout).Trim();
-                var pointer = Regex.Match(p, @"^(const )?(float|int)\* ?(\w+)$", RegexOptions.None, Timeout);
+                var pointer = Regex.Match(p, @"^(const )?(float|int|unsigned int)\* ?(\w+)$", RegexOptions.None, Timeout);
                 if (pointer.Success)
                 {
+                    // An unsigned buffer the kernel updates with atomicMin / atomicAdd binds as atomic<u32>.
+                    string element = Type(pointer.Groups[2].Value);
+                    if (element == "u32" && Regex.IsMatch(body, @"atomic\w+\(&" + pointer.Groups[3].Value + @"\[", RegexOptions.None, Timeout))
+                        element = "atomic<u32>";
                     bindings.Append("@group(0) @binding(").Append(binding++).Append(") var<storage, ")
                         .Append(pointer.Groups[1].Success ? "read" : "read_write").Append("> ").Append(pointer.Groups[3].Value)
-                        .Append(" : array<").Append(Type(pointer.Groups[2].Value)).Append(">;\n");
+                        .Append(" : array<").Append(element).Append(">;\n");
                     continue;
                 }
                 var scalar = Regex.Match(p, @"^(float|int|unsigned int) (\w+)$", RegexOptions.None, Timeout);
@@ -109,7 +113,7 @@ internal static class CudaDialectToWgsl
         {
             string p = raw.Trim();
             if (p.Length == 0) continue;
-            var m = Regex.Match(p, @"^(float2|float|int|unsigned int|bool) (\w+)$", RegexOptions.None, Timeout);
+            var m = Regex.Match(p, @"^(float2|uint2|float|int|unsigned int|bool) (\w+)$", RegexOptions.None, Timeout);
             if (!m.Success) throw new System.InvalidOperationException($"Untranslatable helper parameter '{p}'.");
             parts.Add(m.Groups[2].Value + ": " + Type(m.Groups[1].Value));
         }
@@ -120,6 +124,7 @@ internal static class CudaDialectToWgsl
     {
         "float" => "f32",
         "float2" => "vec2<f32>",
+        "uint2" => "vec2<u32>",
         "int" => "i32",
         "unsigned int" => "u32",
         "bool" => "bool",
@@ -132,19 +137,23 @@ internal static class CudaDialectToWgsl
         s = Regex.Replace(s, @"(?<![\w.])(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?f\b", "$1$2", RegexOptions.None, Timeout);
         s = Casts(s);
         s = Regex.Replace(s, @"\bfor \((float|int|unsigned int) (\w+) =", m => $"for (var {m.Groups[2].Value}: {Type(m.Groups[1].Value)} =", RegexOptions.None, Timeout);
-        s = Regex.Replace(s, @"(?m)(?<=^|[;{}])(\s*)(?:const )?(float2|float|int|unsigned int|bool) (\w+)\s*(=|;)",
+        s = Regex.Replace(s, @"(?m)(?<=^|[;{}])(\s*)(?:const )?(float2|uint2|float|int|unsigned int|bool) (\w+)\s*(=|;)",
             m => $"{m.Groups[1].Value}var {m.Groups[3].Value}: {Type(m.Groups[2].Value)} {m.Groups[4].Value}", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\b(exp|log|sqrt|floor|ceil|tanh|sin|cos|tan|atan|atan2|trunc|pow)f\(", "$1(", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\bfabsf\(", "abs(", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\bfmaf\(", "fma(", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\b(ldexp|fmax|fmin)f\(", m => m.Groups[1].Value == "ldexp" ? "ldexp(" : m.Groups[1].Value == "fmax" ? "max(" : "min(", RegexOptions.None, Timeout);
-        s = s.Replace("make_float2(", "vec2<f32>(");
+        s = s.Replace("make_float2(", "vec2<f32>(").Replace("make_uint2(", "vec2<u32>(");
         s = Regex.Replace(s, @"\brintf\(", "round(", RegexOptions.None, Timeout);   // both round half to even
         s = s.Replace("__float_as_uint(", "bitcast<u32>(").Replace("__float_as_int(", "bitcast<i32>(")
              .Replace("__int_as_float(", "bitcast<f32>(")
              // A function call, so a NaN / infinity bit pattern is a runtime value (WebGpuShaderPrelude defines it).
              .Replace("__uint_as_float(", "wgsl_f32_bits(")
              .Replace("bx_gid()", "i32(id.x)");
+        // atomicAddFloat(&buf[i], v): a compare-and-swap loop over the float's bits (buf binds as atomic<u32>).
+        s = Regex.Replace(s, @"atomicAddFloat\(&(\w+)\[([^\]]+)\], ([^;]+)\);", m =>
+            $"{{ var tp_old: u32 = atomicLoad(&{m.Groups[1].Value}[{m.Groups[2].Value}]); loop {{ let tp_res = atomicCompareExchangeWeak(&{m.Groups[1].Value}[{m.Groups[2].Value}], tp_old, bitcast<u32>(bitcast<f32>(tp_old) + ({m.Groups[3].Value}))); if (tp_res.exchanged) {{ break; }} tp_old = tp_res.old_value; }} }}",
+            RegexOptions.None, Timeout);
         if (scalars is not null)
             foreach (string name in scalars)
                 s = Regex.Replace(s, @"(?<![\w.])" + name + @"\b", "p." + name, RegexOptions.None, Timeout);

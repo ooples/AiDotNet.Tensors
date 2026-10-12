@@ -15,7 +15,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal static class TorchParityF32Kernels
 {
-    public static string GetSource() => Tables() + Helpers + SpecialFunctions + Elementwise;
+    public static string GetSource() => Tables() + Helpers + SpecialFunctions + Elementwise + Sampling + Indexing;
 
     private static string Tables()
     {
@@ -995,4 +995,996 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_quantile_rows(const float
     }
     y[r] = (1.0f - w) * sorted[baseRow + (int)below] + w * sorted[baseRow + (int)above];
 }
-";}
+";
+
+    // #1125 / #1128: the random samplers, integer ops, scan and index kernels. Draws come from the CUDA kernels' Philox4x32-10
+    // counters (element, 0, draw, 0x5EED) under the seed's key, as a float with 48 random bits; a sampler's log(1 - u)
+    // is log1p(-u), so a draw near 0 keeps its tail. Invalid parameters lower a 32-bit rank (element << 3 | code, bit 31
+    // for multinomial's exhaustion code) with atomicMin, and tp_flag_merge folds it into the engine's 64-bit flag.
+    private const string Sampling = @"
+__device__ const float TP_STIRLING[10] = { 0.08106146679532726f, 0.04134069595540929f, 0.02767792568499834f, 0.02079067210376509f, 0.01664469118982119f, 0.01387612882307075f, 0.01189670994589177f, 0.01041126526197209f, 0.009255462182712733f, 0.008330563433362871f };
+
+__device__ __forceinline__ unsigned int tp_mul_hi(unsigned int a, unsigned int b)
+{
+    unsigned int al = a & 0xFFFFu;
+    unsigned int ah = a >> 16u;
+    unsigned int bl = b & 0xFFFFu;
+    unsigned int bh = b >> 16u;
+    unsigned int lh = al * bh;
+    unsigned int hl = ah * bl;
+    unsigned int mid = ((al * bl) >> 16u) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+    return ah * bh + (lh >> 16u) + (hl >> 16u) + (mid >> 16u);
+}
+
+// Words 0 and 1 of Philox4x32-10 on the counter (element, 0, draw, 0x5EED) under the key (key0, key1).
+__device__ __forceinline__ uint2 tp_philox(unsigned int key0, unsigned int key1, unsigned int element, unsigned int draw)
+{
+    unsigned int c0 = element;
+    unsigned int c1 = 0u;
+    unsigned int c2 = draw;
+    unsigned int c3 = 0x5EEDu;
+    unsigned int k0 = key0;
+    unsigned int k1 = key1;
+    for (int r = 0; r < 10; r++)
+    {
+        unsigned int lo0 = 0xD2511F53u * c0;
+        unsigned int hi0 = tp_mul_hi(0xD2511F53u, c0);
+        unsigned int lo1 = 0xCD9E8D57u * c2;
+        unsigned int hi1 = tp_mul_hi(0xCD9E8D57u, c2);
+        c0 = hi1 ^ c1 ^ k0;
+        c1 = lo1;
+        c2 = hi0 ^ c3 ^ k1;
+        c3 = lo0;
+        k0 = k0 + 0x9E3779B9u;
+        k1 = k1 + 0xBB67AE85u;
+    }
+    return make_uint2(c0, c1);
+}
+
+// A uniform float in [0, 1): 24 bits from word 0, refined by 24 more from word 1 while the sum stays below 1.
+__device__ __forceinline__ float tp_uniform(unsigned int key0, unsigned int key1, unsigned int element, unsigned int draw)
+{
+    uint2 bits = tp_philox(key0, key1, element, draw);
+    float hi = (float)(bits.x >> 8u) * 5.9604644775390625e-8f;
+    float s = hi + (float)(bits.y >> 8u) * 3.552713678800501e-15f;
+    if (s < 1.0f) { return s; }
+    return hi;
+}
+
+// A standard normal from draws draw and draw + 1 (Box-Muller, as the CUDA kernels).
+__device__ __forceinline__ float tp_normal(unsigned int key0, unsigned int key1, unsigned int element, unsigned int draw)
+{
+    float u1 = tp_uniform(key0, key1, element, draw);
+    float u2 = tp_uniform(key0, key1, element, draw + 1u);
+    return sqrtf(-2.0f * tp_log1p(-u1)) * cosf(6.283185307179586f * u2);
+}
+
+__device__ __forceinline__ unsigned int tp_flag_key(int element, int code) { return ((unsigned int)element << 3u) | (unsigned int)code; }
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_flag_reset(unsigned int* flag, int n)
+{
+    int t = bx_gid();
+    if (t >= n) { return; }
+    flag[t] = 0xFFFFFFFFu;
+}
+
+// Lowers the 64-bit flag (low word, high word) to the rank's (element << 3 | code); rank bit 31 is the 2^58 element
+// bit multinomial ranks its exhaustion code by.
+extern ""C"" __global__ __launch_bounds__(256) void tp_flag_merge(const unsigned int* rank, unsigned int* flag, int n)
+{
+    if (bx_gid() >= n) { return; }
+    unsigned int key = rank[0];
+    if (key == 0xFFFFFFFFu) { return; }
+    unsigned int lo = key & 0x7FFFFFFFu;
+    unsigned int hi = 0u;
+    if ((key & 0x80000000u) != 0u) { hi = 0x20000000u; }
+    if (hi < flag[1] || (hi == flag[1] && lo < flag[0]))
+    {
+        flag[0] = lo;
+        flag[1] = hi;
+    }
+}
+
+// 0 uniform(a, b), 1 cauchy(median a, sigma b), 2 exponential(rate a), 3 geometric(p a), 4 log-normal(a, b),
+// 5 standard normal, 6 randint(low a, span b).
+extern ""C"" __global__ __launch_bounds__(256) void tp_sample(float* y, int n, int kind, float a, float b, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    unsigned int e = (unsigned int)i;
+    float v = 0.0f;
+    if (kind == 0) { v = a + (b - a) * tp_uniform(seedLo, seedHi, e, 0u); }
+    else if (kind == 1) { v = a + b * tanf(3.14159265358979f * (tp_uniform(seedLo, seedHi, e, 0u) - 0.5f)); }
+    else if (kind == 2) { v = -tp_log1p(-tp_uniform(seedLo, seedHi, e, 0u)) / a; }
+    else if (kind == 3)
+    {
+        if (a == 1.0f) { v = 1.0f; }
+        else { v = fmaxf(1.0f, ceilf(tp_log1p(-tp_uniform(seedLo, seedHi, e, 0u)) / tp_log1p(-a))); }
+    }
+    else if (kind == 4) { v = expf(a + b * tp_normal(seedLo, seedHi, e, 0u)); }
+    else if (kind == 5) { v = tp_normal(seedLo, seedHi, e, 0u); }
+    else { v = a + fminf(floorf(tp_uniform(seedLo, seedHi, e, 0u) * b), b - 1.0f); }
+    y[i] = v;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_bernoulli(const float* prob, float* y, unsigned int* rank, int n, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    float q = prob[i];
+    if (tp_isnan(q) || q < 0.0f || q > 1.0f) { atomicMin(&rank[0], tp_flag_key(i, 1)); return; }
+    if (tp_uniform(seedLo, seedHi, (unsigned int)i, 0u) < q) { y[i] = 1.0f; } else { y[i] = 0.0f; }
+}
+
+// Poisson: Knuth's product method below rate 10, Hormann's PTRS above; code 1 for a negative or NaN rate.
+extern ""C"" __global__ __launch_bounds__(256) void tp_poisson(const float* rates, float* y, unsigned int* rank, int n, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    float rate = rates[i];
+    if (tp_isnan(rate) || rate < 0.0f) { atomicMin(&rank[0], tp_flag_key(i, 1)); return; }
+    if (rate == 0.0f) { y[i] = 0.0f; return; }
+    unsigned int e = (unsigned int)i;
+    unsigned int draw = 0u;
+    if (rate < 10.0f)
+    {
+        float limit = expf(-rate);
+        float product = tp_uniform(seedLo, seedHi, e, draw);
+        draw = draw + 1u;
+        int count = 0;
+        while (product > limit)
+        {
+            count = count + 1;
+            product = product * tp_uniform(seedLo, seedHi, e, draw);
+            draw = draw + 1u;
+        }
+        y[i] = (float)count;
+        return;
+    }
+    float slam = sqrtf(rate);
+    float logLam = logf(rate);
+    float bb = 0.931f + 2.53f * slam;
+    float aa = -0.059f + 0.02483f * bb;
+    float invAlpha = 1.1239f + 1.1328f / (bb - 3.4f);
+    float vr = 0.9277f - 3.6224f / (bb - 2.0f);
+    while (true)
+    {
+        float u = tp_uniform(seedLo, seedHi, e, draw) - 0.5f;
+        float v = tp_uniform(seedLo, seedHi, e, draw + 1u);
+        draw = draw + 2u;
+        float us = 0.5f - fabsf(u);
+        float k = floorf((2.0f * aa / us + bb) * u + rate + 0.43f);
+        if (us >= 0.07f && v <= vr) { y[i] = k; return; }
+        if (k < 0.0f || (us < 0.013f && v > us)) { continue; }
+        if (logf(v) + logf(invAlpha) - logf(aa / (us * us) + bb) <= -rate + k * logLam - tp_lgamma(k + 1.0f)) { y[i] = k; return; }
+    }
+}
+
+__device__ __forceinline__ float tp_stirling_tail(float k)
+{
+    if (k <= 9.0f) { return TP_STIRLING[(int)k]; }
+    float kp1sq = (k + 1.0f) * (k + 1.0f);
+    return (1.0f / 12.0f - (1.0f / 360.0f - 1.0f / 1260.0f / kp1sq) / kp1sq) / (k + 1.0f);
+}
+
+// Binomial: geometric waiting times while n min(p, 1-p) < 10, Hormann's BTRS above. Code 1: a count that is not a
+// whole number within the long range; code 2: count < 0, or p outside [0, 1] / NaN.
+extern ""C"" __global__ __launch_bounds__(256) void tp_binomial(const float* counts, const float* probs, float* y, unsigned int* rank, int n, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    float count = counts[i];
+    float q0 = probs[i];
+    if (tp_isnan(count) || tp_isinf(count) || count != floorf(count) || count >= 9.2233720368547758e18f) { atomicMin(&rank[0], tp_flag_key(i, 1)); return; }
+    if (count < 0.0f || tp_isnan(q0) || q0 < 0.0f || q0 > 1.0f) { atomicMin(&rank[0], tp_flag_key(i, 2)); return; }
+    if (count == 0.0f || q0 == 0.0f) { y[i] = 0.0f; return; }
+    if (q0 == 1.0f) { y[i] = count; return; }
+    unsigned int e = (unsigned int)i;
+    unsigned int draw = 0u;
+    bool flip = q0 > 0.5f;
+    float q = q0;
+    if (flip) { q = 1.0f - q0; }
+    float drawn = 0.0f;
+    if (count * q >= 10.0f)
+    {
+        float stddev = sqrtf(count * q * (1.0f - q));
+        float bb = 1.15f + 2.53f * stddev;
+        float aa = -0.0873f + 0.0248f * bb + 0.01f * q;
+        float c = count * q + 0.5f;
+        float vR = 0.92f - 4.2f / bb;
+        float ratio = q / (1.0f - q);
+        float alpha = (2.83f + 5.1f / bb) * stddev;
+        float m = floorf((count + 1.0f) * q);
+        while (true)
+        {
+            float u = tp_uniform(seedLo, seedHi, e, draw) - 0.5f;
+            float v = tp_uniform(seedLo, seedHi, e, draw + 1u);
+            draw = draw + 2u;
+            float us = 0.5f - fabsf(u);
+            float k = floorf((2.0f * aa / us + bb) * u + c);
+            if (k < 0.0f || k > count) { continue; }
+            if (us >= 0.07f && v <= vR) { drawn = k; break; }
+            float lv = logf(v * alpha / (aa / (us * us) + bb));
+            float upper = (m + 0.5f) * logf((m + 1.0f) / (ratio * (count - m + 1.0f)))
+                + (count + 1.0f) * logf((count - m + 1.0f) / (count - k + 1.0f))
+                + (k + 0.5f) * logf(ratio * (count - k + 1.0f) / (k + 1.0f))
+                + tp_stirling_tail(m) + tp_stirling_tail(count - m) - tp_stirling_tail(k) - tp_stirling_tail(count - k);
+            if (lv <= upper) { drawn = k; break; }
+        }
+    }
+    else
+    {
+        float logQ = tp_log1p(-q);
+        float successes = 0.0f;
+        float position = 0.0f;
+        while (true)
+        {
+            float stride = floorf(tp_log1p(-tp_uniform(seedLo, seedHi, e, draw)) / logQ) + 1.0f;
+            draw = draw + 1u;
+            if (!(stride <= count - position)) { break; }
+            position = position + stride;
+            successes = successes + 1.0f;
+        }
+        drawn = successes;
+    }
+    if (flip) { y[i] = count - drawn; } else { y[i] = drawn; }
+}
+
+// Multinomial: one thread per row walks numSamples draws (removing each pick without replacement), as the CPU, with
+// the running prefix (with replacement) or the remaining weights (without) in the row's scratch.
+extern ""C"" __global__ __launch_bounds__(256) void tp_multinomial(const float* weights, float* scratch, float* y, unsigned int* rank, int rows, int categories, int numSamples, int replacement, unsigned int seedLo, unsigned int seedHi)
+{
+    int row = bx_gid();
+    if (row >= rows) { return; }
+    int w0 = row * categories;
+    for (int c = 0; c < categories; c++)
+    {
+        float v = weights[w0 + c];
+        if (tp_isnan(v) || v < 0.0f || tp_isinf(v)) { atomicMin(&rank[0], tp_flag_key(w0 + c, 1)); return; }
+    }
+    unsigned int e = (unsigned int)row;
+    unsigned int draw = 0u;
+    if (replacement != 0)
+    {
+        float total = 0.0f;
+        int last = -1;
+        for (int c = 0; c < categories; c++)
+        {
+            total = total + weights[w0 + c];
+            scratch[w0 + c] = total;
+            if (weights[w0 + c] > 0.0f) { last = c; }
+        }
+        if (!(total > 0.0f)) { atomicMin(&rank[0], 0x80000000u | tp_flag_key(w0, 2)); return; }
+        for (int k = 0; k < numSamples; k++)
+        {
+            float u = tp_uniform(seedLo, seedHi, e, draw) * total;
+            draw = draw + 1u;
+            int lo = 0;
+            int hi = categories;
+            while (lo < hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (u < scratch[w0 + mid]) { hi = mid; } else { lo = mid + 1; }
+            }
+            if (lo < categories) { y[row * numSamples + k] = (float)lo; } else { y[row * numSamples + k] = (float)last; }
+        }
+        return;
+    }
+    for (int c = 0; c < categories; c++) { scratch[w0 + c] = weights[w0 + c]; }
+    for (int k = 0; k < numSamples; k++)
+    {
+        float total = 0.0f;
+        for (int c = 0; c < categories; c++) { total = total + scratch[w0 + c]; }
+        if (!(total > 0.0f)) { atomicMin(&rank[0], 0x80000000u | tp_flag_key(w0, 2)); return; }
+        float u = tp_uniform(seedLo, seedHi, e, draw) * total;
+        draw = draw + 1u;
+        float running = 0.0f;
+        int chosen = -1;
+        for (int c = categories - 1; c >= 0; c--) { if (scratch[w0 + c] > 0.0f) { chosen = c; break; } }
+        for (int c = 0; c < categories; c++)
+        {
+            running = running + scratch[w0 + c];
+            if (u < running && scratch[w0 + c] > 0.0f) { chosen = c; break; }
+        }
+        y[row * numSamples + k] = (float)chosen;
+        scratch[w0 + chosen] = 0.0f;
+    }
+}
+
+// Alpha dropout's keep mask, one draw per block: scale a or 0, offset b (kept) or gone = a sat + b (dropped).
+extern ""C"" __global__ __launch_bounds__(256) void tp_dropout_affine(float* scale, float* offset, int n, int block, float dropP, float a, float gone, float b, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    if (tp_uniform(seedLo, seedHi, (unsigned int)(i / block), 0u) >= dropP) { scale[i] = a; offset[i] = b; }
+    else { scale[i] = 0.0f; offset[i] = gone; }
+}
+
+// Channel dropout writes the scale only (its offset aliases the scale, which WebGPU cannot bind twice).
+extern ""C"" __global__ __launch_bounds__(256) void tp_dropout_scale(float* scale, int n, int block, float dropP, float a, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    if (tp_uniform(seedLo, seedHi, (unsigned int)(i / block), 0u) >= dropP) { scale[i] = a; } else { scale[i] = 0.0f; }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_rrelu(const float* x, float* y, int n, float lower, float upper, float middle, int training, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    float v = x[i];
+    float slope = 1.0f;
+    if (!(v > 0.0f))
+    {
+        if (training == 0) { slope = middle; }
+        else { slope = lower + (upper - lower) * tp_uniform(seedLo, seedHi, (unsigned int)i, 0u); }
+    }
+    y[i] = slope * v;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_random_keys(float* y, int n, unsigned int seedLo, unsigned int seedHi)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    y[i] = tp_uniform(seedLo, seedHi, (unsigned int)i, 0u);
+}
+";
+    private const string Indexing = @"
+// ---- integer ops on raw int32 / int64 storage, as the CPU's IntegerBinary ----
+
+__device__ __forceinline__ unsigned int tp_abs32(int x)
+{
+    if (x < 0) { return 0u - (unsigned int)x; }
+    return (unsigned int)x;
+}
+
+// Binary gcd of two magnitudes.
+__device__ __forceinline__ unsigned int tp_gcd32(unsigned int a0, unsigned int b0)
+{
+    unsigned int a = a0;
+    unsigned int b = b0;
+    if (a == 0u) { return b; }
+    if (b == 0u) { return a; }
+    unsigned int shift = 0u;
+    while (((a | b) & 1u) == 0u) { a = a >> 1u; b = b >> 1u; shift = shift + 1u; }
+    while ((a & 1u) == 0u) { a = a >> 1u; }
+    while (b != 0u)
+    {
+        while ((b & 1u) == 0u) { b = b >> 1u; }
+        if (a > b) { unsigned int s = a; a = b; b = s; }
+        b = b - a;
+    }
+    return a << shift;
+}
+
+// op: 0 and, 1 or, 2 xor, 3 left shift, 4 right shift, 5 gcd, 6 lcm, 7 floor divide (code 1 for a zero divisor), on the
+// sign-extended operands in 64 bits and wrapped to int32, which the low words alone determine.
+extern ""C"" __global__ __launch_bounds__(256) void tp_int_binary(const int* a, const int* b, int* y, unsigned int* rank, int n, int op)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    int x = a[i];
+    int v = b[i];
+    int r = 0;
+    if (op == 0) { r = x & v; }
+    else if (op == 1) { r = x | v; }
+    else if (op == 2) { r = x ^ v; }
+    else if (op == 3)
+    {
+        int s = v & 63;
+        if (v < 64 && s < 32) { r = (int)((unsigned int)x << (unsigned int)s); }
+    }
+    else if (op == 4)
+    {
+        int s = v & 63;
+        if (v >= 64 || s >= 31) { r = x >> 31u; } else { r = x >> (unsigned int)s; }
+    }
+    else if (op == 5) { r = (int)tp_gcd32(tp_abs32(x), tp_abs32(v)); }
+    else if (op == 6)
+    {
+        unsigned int g = tp_gcd32(tp_abs32(x), tp_abs32(v));
+        if (g != 0u)
+        {
+            unsigned int q = tp_abs32(x) / g;
+            unsigned int m = q * (unsigned int)v;
+            if (x < 0) { m = (0u - q) * (unsigned int)v; }
+            if (q != 0u && v != 0 && ((x < 0) != (v < 0))) { m = 0u - m; }
+            r = (int)m;
+        }
+    }
+    else
+    {
+        if (v == 0) { atomicMin(&rank[0], tp_flag_key(i, 1)); return; }
+        unsigned int ax = tp_abs32(x);
+        unsigned int av = tp_abs32(v);
+        unsigned int q = ax / av;
+        if ((x < 0) == (v < 0)) { r = (int)q; }
+        else
+        {
+            unsigned int up = 0u;
+            if (ax % av != 0u) { up = 1u; }
+            r = (int)(0u - (q + up));
+        }
+    }
+    y[i] = r;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_int_not(const int* a, int* y, int n)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    y[i] = ~a[i];
+}
+
+// 64-bit integers as (low word, high word).
+__device__ __forceinline__ bool tp_i64_negative(uint2 a) { return (a.y & 0x80000000u) != 0u; }
+__device__ __forceinline__ bool tp_u64_is_zero(uint2 a) { return a.x == 0u && a.y == 0u; }
+__device__ __forceinline__ bool tp_u64_less(uint2 a, uint2 b) { return a.y < b.y || (a.y == b.y && a.x < b.x); }
+
+__device__ __forceinline__ uint2 tp_u64_neg(uint2 a)
+{
+    unsigned int lo = (~a.x) + 1u;
+    unsigned int hi = ~a.y;
+    if (lo == 0u) { hi = hi + 1u; }
+    return make_uint2(lo, hi);
+}
+
+__device__ __forceinline__ uint2 tp_u64_magnitude(uint2 a)
+{
+    if (tp_i64_negative(a)) { return tp_u64_neg(a); }
+    return a;
+}
+
+__device__ __forceinline__ uint2 tp_u64_add(uint2 a, uint2 b)
+{
+    unsigned int lo = a.x + b.x;
+    unsigned int hi = a.y + b.y;
+    if (lo < a.x) { hi = hi + 1u; }
+    return make_uint2(lo, hi);
+}
+
+__device__ __forceinline__ uint2 tp_u64_sub(uint2 a, uint2 b)
+{
+    unsigned int lo = a.x - b.x;
+    unsigned int hi = a.y - b.y;
+    if (a.x < b.x) { hi = hi - 1u; }
+    return make_uint2(lo, hi);
+}
+
+// The low 64 bits of a * b.
+__device__ __forceinline__ uint2 tp_u64_mul(uint2 a, uint2 b)
+{
+    return make_uint2(a.x * b.x, tp_mul_hi(a.x, b.x) + a.x * b.y + a.y * b.x);
+}
+
+// Shifts by s in [0, 63].
+__device__ __forceinline__ uint2 tp_u64_shl(uint2 a, unsigned int s)
+{
+    if (s == 0u) { return a; }
+    if (s >= 32u) { return make_uint2(0u, a.x << (s - 32u)); }
+    return make_uint2(a.x << s, (a.y << s) | (a.x >> (32u - s)));
+}
+
+__device__ __forceinline__ uint2 tp_u64_shr(uint2 a, unsigned int s)
+{
+    if (s == 0u) { return a; }
+    if (s >= 32u) { return make_uint2(a.y >> (s - 32u), 0u); }
+    return make_uint2((a.x >> s) | (a.y << (32u - s)), a.y >> s);
+}
+
+__device__ __forceinline__ uint2 tp_i64_sar(uint2 a, unsigned int s)
+{
+    if (tp_i64_negative(a))
+    {
+        uint2 r = tp_u64_shr(make_uint2(~a.x, ~a.y), s);
+        return make_uint2(~r.x, ~r.y);
+    }
+    return tp_u64_shr(a, s);
+}
+
+// a / b for b != 0 and a, b at most 2^63 (restoring division).
+__device__ __forceinline__ uint2 tp_u64_div(uint2 a, uint2 b)
+{
+    if (a.y == 0u && b.y == 0u) { return make_uint2(a.x / b.x, 0u); }
+    uint2 q = make_uint2(0u, 0u);
+    uint2 r = make_uint2(0u, 0u);
+    for (int k = 63; k >= 0; k--)
+    {
+        r = tp_u64_shl(r, 1u);
+        if ((tp_u64_shr(a, (unsigned int)k).x & 1u) != 0u) { r.x = r.x | 1u; }
+        if (!tp_u64_less(r, b))
+        {
+            r = tp_u64_sub(r, b);
+            if (k >= 32) { q.y = q.y | (1u << (unsigned int)(k - 32)); } else { q.x = q.x | (1u << (unsigned int)k); }
+        }
+    }
+    return q;
+}
+
+__device__ __forceinline__ uint2 tp_gcd64(uint2 a0, uint2 b0)
+{
+    uint2 a = a0;
+    uint2 b = b0;
+    if (tp_u64_is_zero(a)) { return b; }
+    if (tp_u64_is_zero(b)) { return a; }
+    unsigned int shift = 0u;
+    while (((a.x | b.x) & 1u) == 0u) { a = tp_u64_shr(a, 1u); b = tp_u64_shr(b, 1u); shift = shift + 1u; }
+    while ((a.x & 1u) == 0u) { a = tp_u64_shr(a, 1u); }
+    while (!tp_u64_is_zero(b))
+    {
+        while ((b.x & 1u) == 0u) { b = tp_u64_shr(b, 1u); }
+        if (tp_u64_less(b, a)) { uint2 s = a; a = b; b = s; }
+        b = tp_u64_sub(b, a);
+    }
+    return tp_u64_shl(a, shift);
+}
+
+// Narrows to the element type t: 0 long, 1 ulong, 2 short, 3 ushort, 4 sbyte, 5 byte, 6 uint.
+__device__ __forceinline__ uint2 tp_i64_narrow(uint2 r, int t)
+{
+    if (t == 2)
+    {
+        int v = ((int)(r.x << 16u)) >> 16u;
+        return make_uint2((unsigned int)v, (unsigned int)(v >> 31u));
+    }
+    if (t == 3) { return make_uint2(r.x & 0xFFFFu, 0u); }
+    if (t == 4)
+    {
+        int v = ((int)(r.x << 24u)) >> 24u;
+        return make_uint2((unsigned int)v, (unsigned int)(v >> 31u));
+    }
+    if (t == 5) { return make_uint2(r.x & 0xFFu, 0u); }
+    if (t == 6) { return make_uint2(r.x, 0u); }
+    return r;
+}
+
+// #1135's int64 ops: signed 64-bit math narrowed to the element type. Codes: 1 a zero divisor, 2 the CPU's
+// OverflowException (Math.Abs of long.MinValue in gcd / lcm, long.MinValue / -1).
+extern ""C"" __global__ __launch_bounds__(256) void tp_int64_binary(const unsigned int* a, const unsigned int* b, unsigned int* y, unsigned int* rank, int n, int op, int typeCode)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    uint2 x = make_uint2(a[2 * i], a[2 * i + 1]);
+    uint2 v = make_uint2(b[2 * i], b[2 * i + 1]);
+    bool xMin = x.x == 0u && x.y == 0x80000000u;
+    bool vMin = v.x == 0u && v.y == 0x80000000u;
+    uint2 r = make_uint2(0u, 0u);
+    if (op == 0) { r = make_uint2(x.x & v.x, x.y & v.y); }
+    else if (op == 1) { r = make_uint2(x.x | v.x, x.y | v.y); }
+    else if (op == 2) { r = make_uint2(x.x ^ v.x, x.y ^ v.y); }
+    else if (op == 3 || op == 4)
+    {
+        bool big = !tp_i64_negative(v) && (v.y != 0u || v.x >= 64u);
+        unsigned int s = v.x & 63u;
+        if (op == 3) { if (!big) { r = tp_u64_shl(x, s); } }
+        else if (big) { r = tp_i64_sar(x, 63u); }
+        else { r = tp_i64_sar(x, s); }
+    }
+    else if (op == 5)
+    {
+        if (xMin || vMin) { atomicMin(&rank[0], tp_flag_key(i, 2)); return; }
+        r = tp_gcd64(tp_u64_magnitude(x), tp_u64_magnitude(v));
+    }
+    else if (op == 6)
+    {
+        if (xMin || vMin) { atomicMin(&rank[0], tp_flag_key(i, 2)); return; }
+        uint2 g = tp_gcd64(tp_u64_magnitude(x), tp_u64_magnitude(v));
+        uint2 q = make_uint2(0u, 0u);
+        if (!tp_u64_is_zero(g)) { q = tp_u64_div(tp_u64_magnitude(x), g); }
+        if (tp_i64_negative(x)) { q = tp_u64_neg(q); }
+        uint2 m = tp_u64_mul(q, v);
+        if (m.x == 0u && m.y == 0x80000000u) { atomicMin(&rank[0], tp_flag_key(i, 2)); return; }
+        r = tp_u64_magnitude(m);
+    }
+    else
+    {
+        if (tp_u64_is_zero(v)) { atomicMin(&rank[0], tp_flag_key(i, 1)); return; }
+        if (xMin && v.x == 0xFFFFFFFFu && v.y == 0xFFFFFFFFu) { atomicMin(&rank[0], tp_flag_key(i, 2)); return; }
+        uint2 ax = tp_u64_magnitude(x);
+        uint2 av = tp_u64_magnitude(v);
+        uint2 q = tp_u64_div(ax, av);
+        if (tp_i64_negative(x) == tp_i64_negative(v)) { r = q; }
+        else
+        {
+            uint2 rem = tp_u64_sub(ax, tp_u64_mul(q, av));
+            if (!tp_u64_is_zero(rem)) { q = tp_u64_add(q, make_uint2(1u, 0u)); }
+            r = tp_u64_neg(q);
+        }
+    }
+    r = tp_i64_narrow(r, typeCode);
+    y[2 * i] = r.x;
+    y[2 * i + 1] = r.y;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_int64_not(const unsigned int* a, unsigned int* y, int n, int typeCode)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    uint2 r = tp_i64_narrow(make_uint2(~a[2 * i], ~a[2 * i + 1]), typeCode);
+    y[2 * i] = r.x;
+    y[2 * i + 1] = r.y;
+}
+
+// One Hillis-Steele pass of the inclusive prefix sum (exact in float for counts below 2^24).
+extern ""C"" __global__ __launch_bounds__(256) void tp_scan_step(const float* src, float* dst, int n, int offset)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    if (i >= offset) { dst[i] = src[i] + src[i - offset]; } else { dst[i] = src[i]; }
+}
+
+// ---- nonzero_static / unravel_index / unique_dim / grid_sample 3-D ----
+
+// shape[0] = rank, shape[1..8] = extents.
+extern ""C"" __global__ __launch_bounds__(256) void tp_nonzero_static_scatter(const float* x, const float* positions, float* y, const int* shape, int n, int size)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    if (x[i] == 0.0f) { return; }
+    int row = (int)positions[i] - 1;
+    if (row >= size) { return; }
+    int axes = shape[0];
+    int rest = i;
+    for (int k = axes - 1; k >= 0; k--)
+    {
+        y[row * axes + k] = (float)(rest % shape[1 + k]);
+        rest = rest / shape[1 + k];
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_unravel_axis(const float* indices, float* y, unsigned int* rank, int n, int total, int stride, int extent, int validate)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    float t = truncf(indices[i]);
+    if (tp_isnan(t) || t < -2147483648.0f || t >= 2147483648.0f || (int)t < -total || (int)t >= total)
+    {
+        if (validate != 0) { atomicMin(&rank[0], tp_flag_key(i, 1)); }
+        return;
+    }
+    int f = (int)t;
+    if (f < 0) { f = f + total; }
+    y[i] = (float)((f / stride) % extent);
+}
+
+// unique_dim's slice order: element by element with double.CompareTo (NaN below every number, equal to NaN); -1 / 0 / 1
+// for slices sa and sb, inlined in each kernel (a helper cannot read a storage buffer every module declares).
+extern ""C"" __global__ __launch_bounds__(256) void tp_slice_bitonic_step(const float* data, float* order, int rowLen, int k, int j, int length)
+{
+    int i = bx_gid();
+    if (i >= rowLen) { return; }
+    int ixj = i ^ j;
+    if (ixj <= i) { return; }
+    float fa = order[i];
+    float fb = order[ixj];
+    int sa = (int)fa;
+    int sb = (int)fb;
+    bool bBeforeA = false;
+    bool aBeforeB = false;
+    if (sa < 0 || sb < 0)
+    {
+        bBeforeA = sa < 0 && sb >= 0;
+        aBeforeB = sb < 0 && sa >= 0;
+    }
+    else
+    {
+        int c = 0;
+        for (int m = 0; m < length; m++)
+        {
+            float va = data[sa * length + m];
+            float vb = data[sb * length + m];
+            bool na = tp_isnan(va);
+            bool nb = tp_isnan(vb);
+            if (na || nb)
+            {
+                if (na && nb) { continue; }
+                if (na) { c = -1; } else { c = 1; }
+                break;
+            }
+            if (va < vb) { c = -1; break; }
+            if (va > vb) { c = 1; break; }
+        }
+        bBeforeA = c > 0 || (c == 0 && sb < sa);
+        aBeforeB = c < 0 || (c == 0 && sa < sb);
+    }
+    bool swap = aBeforeB;
+    if ((i & k) == 0) { swap = bBeforeA; }
+    if (swap)
+    {
+        order[i] = fb;
+        order[ixj] = fa;
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_slice_first_flags(const float* data, const float* order, float* flags, int n, int length)
+{
+    int i = bx_gid();
+    if (i >= n) { return; }
+    if (i == 0) { flags[i] = 1.0f; return; }
+    int sa = (int)order[i];
+    int sb = (int)order[i - 1];
+    int c = 0;
+    for (int m = 0; m < length; m++)
+    {
+        float va = data[sa * length + m];
+        float vb = data[sb * length + m];
+        bool na = tp_isnan(va);
+        bool nb = tp_isnan(vb);
+        if (na || nb)
+        {
+            if (na && nb) { continue; }
+            c = 1;
+            break;
+        }
+        if (va != vb) { c = 1; break; }
+    }
+    if (c != 0) { flags[i] = 1.0f; } else { flags[i] = 0.0f; }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_slice_gather_unique(const float* data, const float* order, const float* flags, const float* positions, float* y, int total, int length)
+{
+    int idx = bx_gid();
+    if (idx >= total) { return; }
+    int s = idx / length;
+    int k = idx % length;
+    if (flags[s] == 0.0f) { return; }
+    int row = (int)positions[s] - 1;
+    y[row * length + k] = data[(int)order[s] * length + k];
+}
+
+// a mod b for a >= 0, exactly: each step subtracts the largest b 2^k <= r, which Sterbenz's lemma makes exact.
+__device__ __forceinline__ float tp_fmod(float a, float b)
+{
+    if (tp_isnan(a) || tp_isinf(a)) { return tp_nan(); }
+    float r = a;
+    while (r >= b)
+    {
+        float t = b;
+        while (t * 2.0f <= r) { t = t * 2.0f; }
+        r = r - t;
+    }
+    return r;
+}
+
+// (hi + lo) mod b in [0, b) for a double-float with hi >= 0.
+__device__ __forceinline__ float tp_df_fmod(float2 a, float b)
+{
+    float r = tp_fmod(a.x, b);
+    if (a.y >= 0.0f) { r = r + tp_fmod(a.y, b); }
+    else { r = r - tp_fmod(-a.y, b); }
+    if (r < 0.0f) { r = r + b; }
+    if (r >= b) { r = r - b; }
+    return r;
+}
+
+// The source coordinate normalized * scale + shift, as a double-float: the CPU forms it in double, and a coordinate
+// far outside the volume must keep its exact position for reflection to land where the CPU's does.
+__device__ __forceinline__ float2 tp_grid_unnormalize(float normalized, int size, int alignCorners)
+{
+    float scale = (float)size / 2.0f;
+    if (alignCorners != 0) { scale = (float)(size - 1) / 2.0f; }
+    float prod = normalized * scale;
+    return tp_df_add(make_float2(prod, tp_two_prod_err(normalized, scale, prod)), tp_df((float)(size - 1) / 2.0f));
+}
+
+// Reflects a coordinate into [twiceLow / 2, twiceHigh / 2] (the CPU's reflection: fold by the span, mirror odd folds).
+__device__ __forceinline__ float tp_grid_reflect(float2 coord0, int twiceLow, int twiceHigh)
+{
+    if (twiceLow == twiceHigh) { return 0.0f; }
+    float mn = (float)twiceLow / 2.0f;
+    float span = (float)(twiceHigh - twiceLow) / 2.0f;
+    float2 coord = tp_df_add(coord0, tp_df(-mn));
+    if (coord.x < 0.0f) { coord = tp_df_neg(coord); }
+    float m = tp_df_fmod(coord, 2.0f * span);
+    if (m < span) { return m + mn; }
+    return span - (m - span) + mn;
+}
+
+// The factor reflection applies to the coordinate's slope: 0 for a degenerate span, else +-1.
+__device__ __forceinline__ float tp_grid_reflect_sign(float2 coord0, int twiceLow, int twiceHigh)
+{
+    if (twiceLow == twiceHigh) { return 0.0f; }
+    float mn = (float)twiceLow / 2.0f;
+    float span = (float)(twiceHigh - twiceLow) / 2.0f;
+    float2 coord = tp_df_add(coord0, tp_df(-mn));
+    float sgn = 1.0f;
+    if (coord.x < 0.0f)
+    {
+        sgn = -1.0f;
+        coord = tp_df_neg(coord);
+    }
+    if (tp_df_fmod(coord, 2.0f * span) < span) { return sgn; }
+    return -sgn;
+}
+
+__device__ __forceinline__ float tp_grid_source(float normalized, int size, int padding, int alignCorners)
+{
+    float2 c = tp_grid_unnormalize(normalized, size, alignCorners);
+    float coord = c.x + c.y;
+    if (padding == 2)
+    {
+        if (alignCorners != 0) { coord = tp_grid_reflect(c, 0, 2 * (size - 1)); }
+        else { coord = tp_grid_reflect(c, -1, 2 * size - 1); }
+    }
+    if (padding >= 1)
+    {
+        if (coord <= 0.0f) { return 0.0f; }
+        if (coord >= (float)(size - 1)) { return (float)(size - 1); }
+    }
+    return coord;
+}
+
+// d source / d normalized for tp_grid_source.
+__device__ __forceinline__ float tp_grid_slope(float normalized, int size, int padding, int alignCorners)
+{
+    float2 c = tp_grid_unnormalize(normalized, size, alignCorners);
+    float coord = c.x + c.y;
+    float slope = (float)size / 2.0f;
+    if (alignCorners != 0) { slope = (float)(size - 1) / 2.0f; }
+    if (padding == 2)
+    {
+        if (alignCorners != 0)
+        {
+            slope = slope * tp_grid_reflect_sign(c, 0, 2 * (size - 1));
+            coord = tp_grid_reflect(c, 0, 2 * (size - 1));
+        }
+        else
+        {
+            slope = slope * tp_grid_reflect_sign(c, -1, 2 * size - 1);
+            coord = tp_grid_reflect(c, -1, 2 * size - 1);
+        }
+    }
+    if (padding >= 1 && (coord <= 0.0f || coord >= (float)(size - 1))) { return 0.0f; }
+    return slope;
+}
+// A voxel index as the CPU's VoxelIndex: NaN and out-of-int-range coordinates land far outside the volume.
+__device__ __forceinline__ int tp_grid_index(float v)
+{
+    if (tp_isnan(v) || v < -2147483648.0f || v >= 2147483648.0f) { return -4; }
+    return (int)v;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_grid_sample_3d(const float* x, const float* grid, float* y, int batches, int channels, int depth, int height, int width, int points, int mode, int padding, int alignCorners)
+{
+    int idx = bx_gid();
+    if (idx >= batches * points) { return; }
+    int bi = idx / points;
+    int q = idx % points;
+    float cx = tp_grid_source(grid[idx * 3], width, padding, alignCorners);
+    float cy = tp_grid_source(grid[idx * 3 + 1], height, padding, alignCorners);
+    float cz = tp_grid_source(grid[idx * 3 + 2], depth, padding, alignCorners);
+    int volume = depth * height * width;
+    float fx0 = floorf(cx);
+    float fy0 = floorf(cy);
+    float fz0 = floorf(cz);
+    int x0 = tp_grid_index(fx0);
+    int y0 = tp_grid_index(fy0);
+    int z0 = tp_grid_index(fz0);
+    float fx = cx - fx0;
+    float fy = cy - fy0;
+    float fz = cz - fz0;
+    for (int ch = 0; ch < channels; ch++)
+    {
+        int plane = (bi * channels + ch) * volume;
+        float acc = 0.0f;
+        if (mode == 1)
+        {
+            int ix = tp_grid_index(rintf(cx));
+            int iy = tp_grid_index(rintf(cy));
+            int iz = tp_grid_index(rintf(cz));
+            if (ix >= 0 && ix < width && iy >= 0 && iy < height && iz >= 0 && iz < depth) { acc = x[plane + (iz * height + iy) * width + ix]; }
+        }
+        else
+        {
+            for (int oz = 0; oz < 2; oz++)
+            {
+                for (int oy = 0; oy < 2; oy++)
+                {
+                    for (int ox = 0; ox < 2; ox++)
+                    {
+                        int ix = x0 + ox;
+                        int iy = y0 + oy;
+                        int iz = z0 + oz;
+                        if (ix < 0 || ix >= width || iy < 0 || iy >= height || iz < 0 || iz >= depth) { continue; }
+                        float wx = 1.0f - fx;
+                        if (ox == 1) { wx = fx; }
+                        float wy = 1.0f - fy;
+                        if (oy == 1) { wy = fy; }
+                        float wz = 1.0f - fz;
+                        if (oz == 1) { wz = fz; }
+                        acc = acc + wx * wy * wz * x[plane + (iz * height + iy) * width + ix];
+                    }
+                }
+            }
+        }
+        y[(bi * channels + ch) * points + q] = acc;
+    }
+}
+
+// grid_sample 3-D adjoints, as the CPU's GridSample3DBackward: dx gathers w * dy from every point through an atomic
+// float add (points share voxels), dgrid is owned by its point's thread.
+extern ""C"" __global__ __launch_bounds__(256) void tp_grid_sample_3d_backward(const float* x, const float* grid, const float* dy, unsigned int* dx, float* dgrid, int batches, int channels, int depth, int height, int width, int points, int mode, int padding, int alignCorners)
+{
+    int idx = bx_gid();
+    if (idx >= batches * points) { return; }
+    int bi = idx / points;
+    int q = idx % points;
+    float gx = grid[idx * 3];
+    float gy = grid[idx * 3 + 1];
+    float gz = grid[idx * 3 + 2];
+    float cx = tp_grid_source(gx, width, padding, alignCorners);
+    float cy = tp_grid_source(gy, height, padding, alignCorners);
+    float cz = tp_grid_source(gz, depth, padding, alignCorners);
+    float sx = tp_grid_slope(gx, width, padding, alignCorners);
+    float sy = tp_grid_slope(gy, height, padding, alignCorners);
+    float sz = tp_grid_slope(gz, depth, padding, alignCorners);
+    int volume = depth * height * width;
+    float fx0 = floorf(cx);
+    float fy0 = floorf(cy);
+    float fz0 = floorf(cz);
+    int x0 = tp_grid_index(fx0);
+    int y0 = tp_grid_index(fy0);
+    int z0 = tp_grid_index(fz0);
+    float fx = cx - fx0;
+    float fy = cy - fy0;
+    float fz = cz - fz0;
+    float dgx = 0.0f;
+    float dgy = 0.0f;
+    float dgz = 0.0f;
+    for (int ch = 0; ch < channels; ch++)
+    {
+        int plane = (bi * channels + ch) * volume;
+        float up = dy[(bi * channels + ch) * points + q];
+        if (mode == 1)
+        {
+            int ix = tp_grid_index(rintf(cx));
+            int iy = tp_grid_index(rintf(cy));
+            int iz = tp_grid_index(rintf(cz));
+            if (ix >= 0 && ix < width && iy >= 0 && iy < height && iz >= 0 && iz < depth)
+            {
+                int at = plane + (iz * height + iy) * width + ix;
+                atomicAddFloat(&dx[at], up);
+                float v = x[at] * up;
+                dgx = dgx + v * 0.0f;
+                dgy = dgy + v * 0.0f;
+                dgz = dgz + v * 0.0f;
+            }
+        }
+        else
+        {
+            for (int oz = 0; oz < 2; oz++)
+            {
+                for (int oy = 0; oy < 2; oy++)
+                {
+                    for (int ox = 0; ox < 2; ox++)
+                    {
+                        int ix = x0 + ox;
+                        int iy = y0 + oy;
+                        int iz = z0 + oz;
+                        if (ix < 0 || ix >= width || iy < 0 || iy >= height || iz < 0 || iz >= depth) { continue; }
+                        float wx = 1.0f - fx;
+                        float sgx = -1.0f;
+                        if (ox == 1) { wx = fx; sgx = 1.0f; }
+                        float wy = 1.0f - fy;
+                        float sgy = -1.0f;
+                        if (oy == 1) { wy = fy; sgy = 1.0f; }
+                        float wz = 1.0f - fz;
+                        float sgz = -1.0f;
+                        if (oz == 1) { wz = fz; sgz = 1.0f; }
+                        int at = plane + (iz * height + iy) * width + ix;
+                        atomicAddFloat(&dx[at], wx * wy * wz * up);
+                        float v = x[at] * up;
+                        dgx = dgx + v * (sgx * wy * wz * sx);
+                        dgy = dgy + v * (sgy * wx * wz * sy);
+                        dgz = dgz + v * (sgz * wx * wy * sz);
+                    }
+                }
+            }
+        }
+    }
+    dgrid[idx * 3] = dgx;
+    dgrid[idx * 3 + 1] = dgy;
+    dgrid[idx * 3 + 2] = dgz;
+}
+";
+}
