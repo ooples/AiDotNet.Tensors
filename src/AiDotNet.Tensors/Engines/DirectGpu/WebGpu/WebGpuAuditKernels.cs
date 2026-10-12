@@ -219,7 +219,7 @@ struct P { size: i32 };
   let ua = bitcast<u32>(av); let ub = bitcast<u32>(bv);
   let aNan = ((ua >> 23u) & 0xFFu) == 0xFFu && (ua & 0x7FFFFFu) != 0u;
   let bNan = ((ub >> 23u) & 0xFFu) == 0xFFu && (ub & 0x7FFFFFu) != 0u;
-  if (aNan || bNan) { outp[idx] = bitcast<f32>(0x7FC00000u); return; }
+  if (aNan || bNan) { outp[idx] = wgsl_f32_bits(0x7FC00000u); return; }
   if (av == bv) { outp[idx] = bv; return; }
   if (av == 0.0) { outp[idx] = bitcast<f32>(select(0x80000001u, 0x00000001u, bv > 0.0)); return; }
   var r = ua;
@@ -390,8 +390,8 @@ struct P { rows: i32, treeDepth: i32, numClasses: i32 };
 struct P { size: i32 };
 @group(0) @binding(3) var<uniform> pc : P;
 fn p210_zeta_scalar(xv: f32, qv: f32) -> f32 {
-  if (xv == 1.0) { return bitcast<f32>(0x7F800000u); }
-  if (qv <= 0.0 && qv == floor(qv)) { return bitcast<f32>(0x7F800000u); }
+  if (xv == 1.0) { return wgsl_f32_bits(0x7F800000u); }
+  if (qv <= 0.0 && qv == floor(qv)) { return wgsl_f32_bits(0x7F800000u); }
   var sum = 0.0;
   for (var k = 0; k < 12; k = k + 1) { sum = sum + pow(qv + f32(k), -xv); }
   let Nq = 12.0 + qv; let lnNq = log(Nq); let cont = exp((1.0 - xv) * lnNq) / (xv - 1.0); let halfTerm = 0.5 * exp(-xv * lnNq);
@@ -414,7 +414,7 @@ fn p210_zeta_scalar(xv: f32, qv: f32) -> f32 {
 struct P { n: i32, size: i32 };
 @group(0) @binding(2) var<uniform> pc : P;
 fn p210_polygamma_scalar(n: i32, xv: f32) -> f32 {
-  if (xv <= 0.0 && xv == floor(xv)) { return bitcast<f32>(0x7F800000u); }
+  if (xv <= 0.0 && xv == floor(xv)) { return wgsl_f32_bits(0x7F800000u); }
   var recurrence = 0.0; var xd = xv; let signN = select(-1, 1, (n & 1) == 1);
   loop { if (xd >= 10.0) { break; } recurrence = recurrence + f32(signN) * exp(p210_lgamma(f32(n + 1)) - f32(n + 1) * log(xd)); xd = xd + 1.0; }
   let lnX = log(xd);
