@@ -144,6 +144,60 @@ public class VulkanBufferPoolTests
         Assert.Equal(handle, again.Handle);
     }
 
+    // Runs a loop that drops every result, with the tape check answered by the test (other test classes open tapes
+    // in parallel, and the real check is process-wide). Returns how many of the allocations went to the driver.
+    private static long DriverAllocationsOfADroppingLoop(VulkanBackend backend, int size, int allocations, bool tapeOpen)
+    {
+        var realCheck = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => tapeOpen;
+        try
+        {
+            long before = VulkanGpuBuffer.DriverAllocations;
+            for (int i = 0; i < allocations; i++) AllocateAndDrop(backend, size);
+            return VulkanGpuBuffer.DriverAllocations - before;
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = realCheck;
+        }
+    }
+
+    [SkippableFact]
+    public void ALoopWithNoTape_ThatDropsItsResults_StopsGoingToTheDriverAfterAFewHundredAllocations()
+    {
+        var backend = BackendOrSkip();
+        const int allocations = 1500;
+        long driver = DriverAllocationsOfADroppingLoop(backend, OddSize + 97, allocations, tapeOpen: false);
+        // A pool miss collects once 256 buffers have gone out, and the collected ones serve the allocations after it.
+        // Without that the loop is collected only by the byte threshold (about 2,000 allocations of this size in), so
+        // nearly all 1,500 would be driver allocations.
+        Assert.InRange(driver, 1, 2 * DeviceMemoryReclaim.CollectOnMissAfterAllocations + 64);
+    }
+
+    [SkippableFact]
+    public void WithATapeOpen_APoolMissDoesNotCollect()
+    {
+        BackendOrSkip();
+        var realCheck = DeviceMemoryReclaim.TapeOpen;
+        try
+        {
+            // Enough allocations counted that only the tape check can be what declines.
+            for (int i = 0; i < 2 * DeviceMemoryReclaim.CollectOnMissAfterAllocations; i++) DeviceMemoryReclaim.OnDeviceAllocation(0);
+            DeviceMemoryReclaim.TapeOpen = () => true;
+            int collections = GC.CollectionCount(1);
+            Assert.False(DeviceMemoryReclaim.CollectOnPoolMiss());
+            DeviceMemoryReclaim.TapeOpen = () => false;
+            Assert.True(DeviceMemoryReclaim.CollectOnPoolMiss());
+            Assert.True(GC.CollectionCount(1) > collections);
+            // The count starts again after a collection.
+            Assert.False(DeviceMemoryReclaim.CollectOnPoolMiss());
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = realCheck;
+        }
+    }
+
     [SkippableFact]
     public void OpIntoAPooledBuffer_GivesTheSameResultAsIntoAFreshOne()
     {

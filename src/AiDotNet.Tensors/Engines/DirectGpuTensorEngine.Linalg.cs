@@ -24,35 +24,20 @@ public partial class DirectGpuTensorEngine
     private const int GpuLinalgMaxN = 256;
 
     /// <summary>
-    /// Backends that can report a compile-failure capability flag (currently
-    /// only OpenCL) pass through this probe. Returns true when linalg kernels
-    /// are known-good, false when they failed to compile and the caller must
-    /// fall back. Backends without a flag default to true.
+    /// True when the backend's linalg kernels built; false sends the caller to
+    /// the CPU fallback (every <see cref="ILinalgBackend"/> reports it).
     /// </summary>
     private static bool BackendLinalgReady(IDirectGpuBackend backend)
-    {
-#if !NET462
-        if (backend is AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend ocl)
-            return ocl.LinalgAvailable;
-#endif
-        return true;
-    }
+        => backend is ILinalgBackend linalg && linalg.LinalgKernelsReady;
 
     /// <summary>
     /// Per-backend hard cap on Eigh's matrix dimension. Each backend's
     /// shader statically provisions its Ash/Vsh workgroup arrays, and
     /// exceeding those bounds silently reads/writes past the workgroup
-    /// memory region. Keep this table in sync with the kernel sources.
+    /// memory region. Each backend reports its own bound next to its kernels.
     /// </summary>
     private static int BackendEighMaxN(IDirectGpuBackend backend)
-    {
-#if NET7_0_OR_GREATER
-        if (backend is AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend)
-            return 32; // WebGpuLinalgKernels.Eigh: Ash[1024] = 32×32.
-#endif
-        // CUDA/HIP/Metal/OpenCL/Vulkan all provision 64×64.
-        return 64;
-    }
+        => backend is ILinalgBackend linalg ? linalg.LinalgEighMaxN : 0;
 
     /// <summary>
     /// GPU-accelerated Cholesky. Returns null on unsupported backends or

@@ -934,7 +934,9 @@ extern ""C"" __global__ void parity210_gridsample_backward_input(const float* __
     int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; tmp /= outH; int c = tmp % C; int b = tmp / C;
     int gridBase = ((b*outH + oh)*outW + ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1); float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
-    if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
+    // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+    // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+    if (!(srcH >= -1.0f && srcH < (float)H && srcW >= -1.0f && srcW < (float)W && (__float_as_uint(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (__float_as_uint(srcW) & 0x7FFFFFFFu) < 0x7F800000u)) return;
     int h0 = (int)floorf(srcH); int h1 = h0 + 1; int w0 = (int)floorf(srcW); int w1 = w0 + 1;
     float lh = srcH - (float)h0; float lw = srcW - (float)w0; float g = gradOut[idx];
     if (h0>=0 && h0<H && w0>=0 && w0<W) atomicAdd(&gradIn[((b*C+c)*H+h0)*W+w0], g*(1.0f-lh)*(1.0f-lw));
@@ -949,7 +951,9 @@ extern ""C"" __global__ void parity210_gridsample_backward_grid(const float* __r
     int gridBase = ((b*outH+oh)*outW+ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy+1.0f)*0.5f*(float)(H-1); float srcW = (gx+1.0f)*0.5f*(float)(W-1);
     float gradGx = 0.0f; float gradGy = 0.0f;
-    if (!(srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W)) {
+    // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+    // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+    if (srcH >= -1.0f && srcH < (float)H && srcW >= -1.0f && srcW < (float)W && (__float_as_uint(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (__float_as_uint(srcW) & 0x7FFFFFFFu) < 0x7F800000u) {
         int h0 = (int)floorf(srcH); int h1 = h0+1; int w0 = (int)floorf(srcW); int w1 = w0+1;
         float lh = srcH-(float)h0; float lw = srcW-(float)w0;
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);

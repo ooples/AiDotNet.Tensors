@@ -927,7 +927,7 @@ public sealed class DirectGpuEngine : IDisposable
         out T[]? result)
     {
         result = null;
-        if (_backend is not CudaBackend cuda || operations == null || operations.Count != 3)
+        if (_backend is not IFusedResidualBatchNormRelu fused || operations == null || operations.Count != 3)
             return false;
         if (operations[0].OperationType != GpuOperationType.Residual ||
             operations[1].OperationType != GpuOperationType.BatchNorm ||
@@ -963,6 +963,7 @@ public sealed class DirectGpuEngine : IDisposable
         if (!(epsilon > 0f) || float.IsNaN(epsilon) || float.IsInfinity(epsilon))
             return false;
 
+        var cuda = _backend;
         using var inputBuffer = cuda.AllocateBuffer(ToFloatArray(input));
         using var residualBuffer = cuda.AllocateBuffer(ToFloatArray(residual));
         using var outputBuffer = cuda.AllocateBuffer((int)elementCount);
@@ -970,7 +971,7 @@ public sealed class DirectGpuEngine : IDisposable
         using var betaBuffer = cuda.AllocateBuffer(ToFloatArray(beta));
         using var meanBuffer = cuda.AllocateBuffer(ToFloatArray(runningMean));
         using var varianceBuffer = cuda.AllocateBuffer(ToFloatArray(runningVariance));
-        if (!cuda.TryResidualBatchNormRelu(
+        if (!fused.TryResidualBatchNormRelu(
                 inputBuffer, residualBuffer, outputBuffer,
                 gammaBuffer, betaBuffer, meanBuffer, varianceBuffer,
                 batch, channels, spatialSize, epsilon))
