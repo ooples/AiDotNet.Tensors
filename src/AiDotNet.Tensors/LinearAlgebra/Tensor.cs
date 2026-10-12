@@ -4884,7 +4884,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     // Sum or max over one axis, the tensor read as [outer, axisSize, inner] in row-major order. The last axis (inner = 1)
     // reduces each contiguous run with the vectorized reduction; any other axis folds the axisSize slabs of `inner`
     // elements into the result row (#1211: the loops used to reduce contiguous runs whatever the axis).
-private Tensor<T> ReduceOverAxis(int axis, bool max)
+    private Tensor<T> ReduceOverAxis(int axis, bool max)
     {
         EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
