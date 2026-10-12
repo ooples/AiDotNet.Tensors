@@ -8,6 +8,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public sealed partial class WebGpuBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
+    /// <remarks>WebGPU keeps its power-of-two FFT kernel.</remarks>
+    bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
+
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
     /// the undefined-contents contract.

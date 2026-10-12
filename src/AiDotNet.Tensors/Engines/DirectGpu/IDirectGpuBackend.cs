@@ -1401,6 +1401,13 @@ public interface IDirectGpuBackend : IDisposable
     /// Used to refresh device-resident embedding indices without replacing the buffer object.</summary>
     void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer);
 
+    /// <summary>
+    /// Writes <paramref name="data"/> into the existing <paramref name="buffer"/> (same device address, no
+    /// reallocation), as <see cref="UploadIntBufferInPlace"/> does for int data. A captured graph or a resident binding
+    /// that recorded the address reads the fresh values.
+    /// </summary>
+    void UploadBufferInPlace(float[] data, IGpuBuffer buffer);
+
     #endregion
 
     #region Dot Product Operations

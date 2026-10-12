@@ -214,9 +214,16 @@ kernel void geometry_grid_sample_2d(
     float gy = grid[gOff + 1];
     float sx = alignCorners ? (gx + 1.0) * 0.5 * (W - 1) : ((gx + 1.0) * W - 1.0) * 0.5;
     float sy = alignCorners ? (gy + 1.0) * 0.5 * (H - 1) : ((gy + 1.0) * H - 1.0) * 0.5;
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule). Tested on the bits, so fast
+    // math cannot fold the NaN case away: |x| below 2147483520 has a smaller bit pattern, NaN and infinity a larger one.
+    const uint limBits = 0x4EFFFFFFu; // 2147483520.0f, the largest float below 2^31
+    if ((as_type<uint>(sx) & 0x7FFFFFFFu) >= limBits || (as_type<uint>(sy) & 0x7FFFFFFFu) >= limBits) {
+        for (int c = 0; c < C; c++) output[((n * C + c) * outH + oy) * outW + ox] = 0.0f;
+        return;
+    }
 
     if (mode == 1) {
-        int nx = (int)round(sx), ny = (int)round(sy);
+        int nx = (int)rint(sx), ny = (int)rint(sy);
         for (int c = 0; c < C; c++)
             output[((n * C + c) * outH + oy) * outW + ox] =
                 grid_sample_safe_msl(input, n, ny, nx, c, H, W, C, padding);

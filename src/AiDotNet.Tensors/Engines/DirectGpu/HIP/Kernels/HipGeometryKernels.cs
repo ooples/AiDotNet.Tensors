@@ -246,6 +246,13 @@ extern ""C"" __global__ __launch_bounds__(256) void geometry_grid_sample_2d(
     double sx = alignCorners ? (gx + 1.0) * 0.5 * (W - 1) : ((gx + 1.0) * W - 1.0) * 0.5;
     double sy = alignCorners ? (gy + 1.0) * 0.5 * (H - 1) : ((gy + 1.0) * H - 1.0) * 0.5;
 
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule).
+    const double lim = 2147483639.0;
+    if (!(sx > -lim && sx < lim && sy > -lim && sy < lim)) {
+        for (int c = 0; c < C; c++) output[((n * C + c) * outH + oy) * outW + ox] = 0.0f;
+        return;
+    }
+
     if (mode == 1) {  // Nearest
         int nx = (int)lrint(sx), ny = (int)lrint(sy);
         for (int c = 0; c < C; c++)

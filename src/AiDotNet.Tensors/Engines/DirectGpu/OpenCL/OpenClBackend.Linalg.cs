@@ -5,6 +5,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : ILinalgBackend
     {
+    /// <inheritdoc/>
+    /// <remarks>The linalg module is compiled with the backend; a rejected compile leaves it unset.</remarks>
+    public bool LinalgKernelsReady => _linalgAvailable;
+
+    /// <inheritdoc/>
+    /// <remarks>The Eigh kernel provisions 64 x 64 workgroup arrays.</remarks>
+    public int LinalgEighMaxN => 64;
+
         private DirectOpenClKernel GetLinalgKernel(string name)
         {
             if (!_linalgAvailable)
