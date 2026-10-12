@@ -32,7 +32,8 @@ internal static class MetalBatchExecutionKernels
             .Replace("threadIdx.x", "(int)bx_lid")
             .Replace("blockDim.x", "(int)bx_bdim")
             .Replace("__float_as_uint(", "as_type<uint>(")
-            .Replace("__uint_as_float(", "as_type<float>(");
+            .Replace("__uint_as_float(", "as_type<float>(")
+            .Replace("__int_as_float(", "as_type<float>(");
         body = Regex.Replace(body, @"(?<![\w*&])const float\* (\w+) =", "device const float* $1 =", RegexOptions.None, RegexTimeout);
         body = Regex.Replace(body, @"(?<!const )(?<![\w*&])float\* (\w+) =", "device float* $1 =", RegexOptions.None, RegexTimeout);
         body = Regex.Replace(body, @"\b(exp|log|sqrt|fmax|fmin|fabs|tanh|rsqrt|sin|cos)f\(", "$1(", RegexOptions.None, RegexTimeout);

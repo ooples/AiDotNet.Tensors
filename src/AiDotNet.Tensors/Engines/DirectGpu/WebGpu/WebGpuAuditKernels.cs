@@ -581,7 +581,7 @@ fn sorts_before(va: f32, ia: f32, vb: f32, ib: f32, descending: bool) -> bool {
   if (pa) { return false; }
   let na = is_nan_bits(va); let nb = is_nan_bits(vb);
   if (na != nb) { return select(nb, na, descending); }
-  if (!na && va != vb) { return select(va < vb, va > vb, descending); }
+  if (!na && va != vb) { return select((va < vb), (va > vb), descending); }
   return ia < ib;
 }
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
