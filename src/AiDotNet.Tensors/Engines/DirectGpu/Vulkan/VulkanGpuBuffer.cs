@@ -39,10 +39,12 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     int IPoolableGpuBuffer.Capacity => Size;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Nothing to do: a parked object only carries its allocation, and <see cref="Create"/> hands that allocation
+    /// out under a new object (see there).
+    /// </remarks>
     void IPoolableGpuBuffer.MarkRented(int size)
     {
-        System.Threading.Volatile.Write(ref _disposed, 0);
-        GC.ReRegisterForFinalize(this);
     }
 
     /// <inheritdoc/>
@@ -105,9 +107,14 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // is, so small results have to come back from the collector by count; charged by their bytes alone, sixteen
         // thousand 16 KB results would be created before the first collection returned any.
         DeviceMemoryReclaim.OnDeviceAllocation(Math.Max((long)size * sizeof(float), MinimumReclaimCharge));
+        // A rented allocation goes out under a NEW object, never the parked one. A parked object that sat in the pool
+        // through a collection has been promoted, and a result dropped while holding a promoted object is not
+        // finalized by the young collections that return results to the pool: it came back only at the next older
+        // collection, and the pool ran empty in between (measured: every other 2,000-call stretch of an engine loop
+        // paid a driver allocation per call). A new object is young, so the next young collection returns it.
         if (PoolingEnabled && Pool.TryRent(size, out var pooled) &&
             pooled is not null)
-            return pooled;
+            return new VulkanGpuBuffer(pooled.Storage, pooled.Staging, size);
         // Out of memory: the parked buffers are the first thing to give back.
         return DeviceMemoryReclaim.AllocateWithRetry(() => CreateCore(size), ex => ex is GpuOutOfMemoryException,
             () => { PendingFrees.Drain(); Pool.DrainAll(); });

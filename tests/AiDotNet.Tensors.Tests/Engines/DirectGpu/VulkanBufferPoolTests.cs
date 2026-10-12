@@ -105,6 +105,46 @@ public class VulkanBufferPoolTests
     }
 
     [SkippableFact]
+    public void AStaleReference_CannotReleaseTheAllocationsNextOwner()
+    {
+        var backend = BackendOrSkip();
+        const int size = OddSize + 71;
+        var stale = backend.AllocateBuffer(size);
+        stale.Dispose();
+        using var owner = backend.AllocateBuffer(size); // the same allocation, under a new object
+        Assert.NotSame(stale, owner);
+        stale.Dispose();
+        using var other = backend.AllocateBuffer(size);
+        // Had the stale reference parked the allocation again, this would be the owner's storage.
+        Assert.NotEqual(owner.Handle, other.Handle);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static IntPtr AllocateAndDrop(VulkanBackend backend, int size) => backend.AllocateBuffer(size).Handle;
+
+    [SkippableFact]
+    public void ADroppedBuffer_WhoseAllocationSatInThePoolThroughACollection_ReturnsAtTheNextYoungCollection()
+    {
+        var backend = BackendOrSkip();
+        const int size = OddSize + 83;
+        var first = backend.AllocateBuffer(size);
+        IntPtr handle = first.Handle;
+        first.Dispose();
+        // The parked allocation survives collections; whatever object carries it is now in the oldest generation.
+        GC.Collect();
+        GC.Collect();
+
+        // A result nobody disposes: only its finalizer can return the allocation.
+        Assert.Equal(handle, AllocateAndDrop(backend, size));
+        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        GC.WaitForPendingFinalizers();
+
+        // The queued return runs on the next allocation, so this one already finds it.
+        using var again = backend.AllocateBuffer(size);
+        Assert.Equal(handle, again.Handle);
+    }
+
+    [SkippableFact]
     public void OpIntoAPooledBuffer_GivesTheSameResultAsIntoAFreshOne()
     {
         var backend = BackendOrSkip();
