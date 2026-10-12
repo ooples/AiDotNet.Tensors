@@ -3147,8 +3147,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -3311,8 +3311,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Adds tensor b to tensor a in-place (a += b). Zero allocation.
     /// Uses parallel SIMD for large float tensors.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -3431,8 +3431,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Adds tensors a and b, storing result in destination. Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
@@ -5599,8 +5599,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
@@ -5976,8 +5976,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6134,8 +6134,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6280,8 +6280,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Multiplies tensor a by tensor b in-place (a *= b). Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6388,8 +6388,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Multiplies tensors a and b, storing result in destination. Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
@@ -6446,8 +6446,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Subtracts tensor b from tensor a in-place: a[i] -= b[i]. Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6542,8 +6542,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Multiplies all elements of tensor a by a scalar in-place: a[i] *= scalar. Zero allocation.
     /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
@@ -6639,8 +6639,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination. Zero allocation.
     /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
     {
@@ -6831,8 +6831,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -8563,8 +8563,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
@@ -11992,7 +11992,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Applies Sigmoid activation in-place: x = 1 / (1 + exp(-x)). Zero allocation.
     /// Uses oneDNN for float tensors when available, otherwise falls back to SIMD.
     /// </summary>
-#if !NETFRAMEWORK
+#if NETCOREAPP
     public virtual unsafe void SigmoidInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
@@ -12311,7 +12311,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Applies ReLU activation in-place: x = max(0, x). Zero allocation.
     /// Uses parallel SIMD for large float tensors, oneDNN when available.
     /// </summary>
-#if !NETFRAMEWORK
+#if NETCOREAPP
     public virtual unsafe void ReLUInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
@@ -13691,8 +13691,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -14189,8 +14189,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     private Tensor<T> TensorMatMul2D<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
@@ -14608,8 +14608,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Batched matmul: [..., M, N] @ [N, P] = [..., M, P]
     /// Weights (b) are broadcasted over all batch dimensions of a.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     private Tensor<T> TensorMatMulBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
@@ -14754,8 +14754,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Full batched matmul: [..., M, N] @ [..., N, P] = [..., M, P]
     /// Batch dimensions must match.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     private Tensor<T> TensorMatMulFullBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
@@ -43069,8 +43069,8 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Fused Operations
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     // Phase 1 (compiled-inference) routing gate: prefer the managed cached-B GEMM
     // (persistent prepack, no pinned→managed copy) for small/medium inference
@@ -45260,7 +45260,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Output shape
         var outputShape = magnitude._shape.Take(magnitude._shape.Length - 2).ToArray();
-        outputShape = outputShape.Length > 0 ? outputShape.Append(outputLength).ToArray() : new[] { outputLength };
+        outputShape = outputShape.Length > 0 ? outputShape.Concat(new[] { outputLength }).ToArray() : new[] { outputLength };
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var windowSum = AutoTensorCache.RentOrAllocate<T>(outputShape);
         using var magDataLease = magnitude.LeaseArray();

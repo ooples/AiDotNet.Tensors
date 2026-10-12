@@ -1,4 +1,3 @@
-#if !NET462
 // Copyright (c) AiDotNet. All rights reserved.
 // Capability parity (#1142): seeded Gumbel-softmax (the IGpuBatchExecution kernel), uninitialized allocation and
 // multi-tensor Adam/AdamW (per-tensor native kernels).
@@ -54,5 +53,4 @@ public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMe
     public void LaunchFft(IGpuBuffer buffer, int batchCount, int n, bool inverse)
         => PortableGenericFft.LaunchInterleaved(this, this, buffer, batchCount, n, inverse);
 }
-#endif
 

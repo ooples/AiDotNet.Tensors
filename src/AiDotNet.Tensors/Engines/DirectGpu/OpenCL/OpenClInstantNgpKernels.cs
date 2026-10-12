@@ -1,4 +1,3 @@
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public static class OpenClInstantNgpKernels
@@ -721,4 +720,3 @@ __kernel void ctc_loss_forward(
 }
 ";
 }
-#endif

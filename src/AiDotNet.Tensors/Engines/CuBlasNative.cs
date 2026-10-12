@@ -1,4 +1,3 @@
-#if !NET462
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -1568,4 +1567,3 @@ public sealed class CuBlasMatMul : IDisposable
         Dispose();
     }
 }
-#endif

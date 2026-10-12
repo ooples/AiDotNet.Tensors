@@ -1,5 +1,4 @@
 // Copyright (c) AiDotNet. All rights reserved.
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public static class OpenClAudioKernels
@@ -111,4 +110,3 @@ __kernel void audio_resample(
 }
 " + OpenClInstantNgpKernels.GetSource();
 }
-#endif

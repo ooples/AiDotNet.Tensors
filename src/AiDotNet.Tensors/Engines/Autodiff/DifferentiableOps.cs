@@ -811,8 +811,8 @@ internal static class DifferentiableOps
     /// If the tensor already has a gradient, the new gradient is added to it.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining
-#if !NETFRAMEWORK
-        | MethodImplOptions.AggressiveOptimization
+#if NETCOREAPP
+        | AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot
 #endif
     )]
     internal static void AccumulateGrad<T>(

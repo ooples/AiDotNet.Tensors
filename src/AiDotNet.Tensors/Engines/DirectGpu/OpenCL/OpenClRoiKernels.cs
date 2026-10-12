@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL RoI kernels (Issue #217 tail).
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public static class OpenClRoiKernels
@@ -199,4 +198,3 @@ __kernel void ps_roi_pool(
 }
 ";
 }
-#endif

@@ -3169,7 +3169,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (a) be populated lazily from GPU on first CPU access, or
         // (b) never be read at all (chained GPU ops use the cached GPU buffer directly).
         // GC.AllocateUninitializedArray avoids the O(n) zero-fill of new T[n].
-#if !NETFRAMEWORK
+#if NETCOREAPP
         var result = GC.AllocateUninitializedArray<T>(elementCount);
 #else
         var result = new T[elementCount];
@@ -3238,7 +3238,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // finish works on ANY GPU backend, not just CUDA.
     private Half[] FinishGpuOpHalfStore(IDirectGpuBackend backend, IGpuBuffer halfBuffer, int elementCount, int[] shape)
     {
-#if !NETFRAMEWORK
+#if NETCOREAPP
         var result = GC.AllocateUninitializedArray<Half>(elementCount);
 #else
         var result = new Half[elementCount];
@@ -14048,7 +14048,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.IstftNormalize(resultBuffer.Buffer, windowSumBuffer.Buffer, totalOutput);
             backend.Synchronize();
 
-            var outputShape = magnitude.Shape._dims.Take(magnitude.Rank - 2).Append(outputLength).ToArray();
+            var outputShape = magnitude.Shape._dims.Take(magnitude.Rank - 2).Concat(new[] { outputLength }).ToArray();
             var result = DeferTensorResult<T>(backend, resultBuffer.Buffer, totalOutput, outputShape);
             resultBuffer.RelinquishOwnership();
 

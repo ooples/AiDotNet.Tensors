@@ -1,4 +1,3 @@
-#if !NET462
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL IGpuMixedPrecisionConvBackend (#1142): 16-bit storage over the backend's own FP32 convolution.
 using AiDotNet.Tensors.Engines.Gpu;
@@ -36,4 +35,3 @@ public sealed partial class OpenClBackend : IGpuMixedPrecisionConvBackend
         => P.BackwardFilter(this, this, input, gradOutput, gradFilter, batch, inChannels, inHeight, inWidth, outChannels,
             outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, dataType);
 }
-#endif

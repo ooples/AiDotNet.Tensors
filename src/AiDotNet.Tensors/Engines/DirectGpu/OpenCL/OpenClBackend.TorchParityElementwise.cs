@@ -1,4 +1,3 @@
-#if !NET462
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
@@ -474,4 +473,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

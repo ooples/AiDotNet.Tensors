@@ -1,4 +1,3 @@
-#if !NET462
 using System;
 using System.Runtime.InteropServices;
 
@@ -2609,4 +2608,3 @@ public sealed class CuDnnSoftmax : IDisposable
         Dispose();
     }
 }
-#endif

@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL RoI launcher shims (Issue #217 tail).
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : IRoiBackend
@@ -80,4 +79,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

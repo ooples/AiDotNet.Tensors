@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL IGpuBatchExecution (#1142, #916). The fused kernels were compiled but never reachable; this wires them.
-#if !NET462
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
@@ -229,4 +228,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             => LaunchBatch("batch_outer_product", batchSize * M * N, a, b, output, batchSize, M, N);
     }
 }
-#endif

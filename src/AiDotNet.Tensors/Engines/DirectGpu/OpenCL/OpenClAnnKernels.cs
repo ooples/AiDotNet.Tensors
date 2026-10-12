@@ -1,4 +1,3 @@
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 /// <summary>
@@ -161,4 +160,3 @@ __kernel void ann_pq_adc_scan(
 }
 ";
 }
-#endif

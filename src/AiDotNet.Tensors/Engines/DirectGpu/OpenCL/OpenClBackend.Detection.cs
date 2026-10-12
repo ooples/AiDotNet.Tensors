@@ -3,7 +3,6 @@
 // Mirrors OpenClBackend.Parity210.cs's pattern: each method pulls the
 // compiled DirectOpenClKernel from _kernelCache and dispatches via
 // kernel.Execute1D with 256-thread workgroups.
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : IDetectionBackend
@@ -134,4 +133,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

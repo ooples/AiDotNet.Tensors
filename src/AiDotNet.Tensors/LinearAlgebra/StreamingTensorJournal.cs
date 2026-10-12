@@ -126,7 +126,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
     private readonly List<FreeFileRange> _freeFileRanges = new();
     // Per-instance, internal fault seam; production journals do not allocate a callback.
     private readonly Action<StreamingTensorJournalFileOperation>? _beforeFileOperation;
-#if NETFRAMEWORK
+#if !NETCOREAPP
     // FileStream on .NET Framework has no Span-based API. One reusable bounded adapter avoids the
     // previous byte-at-a-time virtual calls without allocating per record.
     private readonly byte[] _frameworkIoBuffer;
@@ -176,7 +176,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
         _replayBuffer = new Tensor<T>(new[] { _replayBufferBytes / _elementSize });
         _payloadResidentBudget = maxResidentBytes - _replayBufferBytes;
         _residentBytesPeak = _replayBufferBytes;
-#if NETFRAMEWORK
+#if !NETCOREAPP
         // Span-based FileStream APIs are unavailable on net471. Keep one fixed-size adapter buffer
         // independent of the tensor payload budget: tying it to a valid four-byte budget degraded a
         // multi-megabyte spill into one managed FileStream call per float.
@@ -575,7 +575,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
         _beforeFileOperation?.Invoke(StreamingTensorJournalFileOperation.Write);
         FileStream stream = BackingFile();
         stream.Seek(fileOffset, SeekOrigin.Begin);
-#if NETFRAMEWORK
+#if !NETCOREAPP
         int written = 0;
         while (written < source.Length)
         {
@@ -597,7 +597,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
         int read = 0;
         while (read < destination.Length)
         {
-#if NETFRAMEWORK
+#if !NETCOREAPP
             int requested = Math.Min(_frameworkIoBuffer.Length, destination.Length - read);
             int count = stream.Read(_frameworkIoBuffer, 0, requested);
             if (count <= 0)

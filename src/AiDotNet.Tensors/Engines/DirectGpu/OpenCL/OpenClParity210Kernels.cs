@@ -1,4 +1,3 @@
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 /// <summary>
@@ -729,4 +728,3 @@ __kernel void parity210_clamp_min_max(
 }
 ";
 }
-#endif

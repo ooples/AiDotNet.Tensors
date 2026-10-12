@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
-#if !NET462
 using System;
 using AiDotNet.Tensors.Engines.Gpu;
 
@@ -163,4 +162,3 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
             dataType: cudnnDataType);
     }
 }
-#endif

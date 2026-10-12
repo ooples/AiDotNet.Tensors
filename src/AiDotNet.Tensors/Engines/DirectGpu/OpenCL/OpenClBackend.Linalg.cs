@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL dispatchers for the torch.linalg decomposition kernels (#211 moat #2).
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : ILinalgBackend
@@ -89,4 +88,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

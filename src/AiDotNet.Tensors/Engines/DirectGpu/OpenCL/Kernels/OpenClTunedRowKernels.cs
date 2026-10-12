@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Generated row / column kernel variants for OpenCL, served through the tuned-kernel registry (#1114).
-#if !NET462
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
@@ -255,4 +254,3 @@ __kernel __attribute__((reqd_work_group_size(32, {rs}, 1))) void {RmsNormGradGam
         }
     }
 }
-#endif

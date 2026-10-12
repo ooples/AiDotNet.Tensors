@@ -1,4 +1,3 @@
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 /// <summary>
@@ -656,4 +655,3 @@ internal static class OpenClKernelSources
         }
         """;
 }
-#endif

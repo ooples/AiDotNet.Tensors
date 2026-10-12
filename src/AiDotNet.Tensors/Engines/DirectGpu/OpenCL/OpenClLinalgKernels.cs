@@ -2,7 +2,6 @@
 // OpenCL C kernels for the torch.linalg decomposition surface.
 // One work-group per batch slice; work-items cooperate via barriers + local memory.
 
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public static class OpenClLinalgKernels
@@ -234,4 +233,3 @@ __kernel void parity211_eigh(
 }
 ";
 }
-#endif

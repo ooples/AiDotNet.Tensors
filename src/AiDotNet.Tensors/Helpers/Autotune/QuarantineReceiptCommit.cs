@@ -115,8 +115,16 @@ internal static class QuarantineReceiptCommit
         }
     }
 
+    // UnmanagedType.LPUTF8Str (48) is not declared on .NET Standard 2.0, but every runtime that reaches this Linux-only
+    // call through the netstandard asset (.NET 5+, Mono) marshals it.
+#if NETCOREAPP
+    private const UnmanagedType Utf8Path = UnmanagedType.LPUTF8Str;
+#else
+    private const UnmanagedType Utf8Path = (UnmanagedType)48;
+#endif
+
     [DllImport("libc", EntryPoint = "open", SetLastError = true)]
-    private static extern int OpenDirectory([MarshalAs(UnmanagedType.LPUTF8Str)] string path, LinuxDirectoryOpenFlags flags);
+    private static extern int OpenDirectory([MarshalAs(Utf8Path)] string path, LinuxDirectoryOpenFlags flags);
 
     [DllImport("libc", EntryPoint = "fsync", SetLastError = true)]
     private static extern int Synchronize(int descriptor);
