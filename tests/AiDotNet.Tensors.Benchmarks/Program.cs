@@ -1395,6 +1395,15 @@ class Program
             return;
         }
 
+#if NET7_0_OR_GREATER
+        // WebGPU fused Meshgrid2D against the composed route, on Dawn (#924)
+        if (args[0] == "--webgpu-meshgrid2d-dawn")
+        {
+            Environment.ExitCode = WebGpuMeshgrid2DDawnExperiment.Run();
+            return;
+        }
+#endif
+
         // Vulkan fused Meshgrid2D against the composed route (#923)
         if (args[0] == "--vulkan-meshgrid2d")
         {
@@ -2163,6 +2172,7 @@ class Program
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
         Console.WriteLine("  --vulkan-tuned-profile [out.json] [rounds] : Tune the Vulkan kernel registry and export a profile");
         Console.WriteLine("  --vulkan-meshgrid2d : Time the Vulkan fused Meshgrid2D route against the composed route");
+        Console.WriteLine("  --webgpu-meshgrid2d-dawn : Time WebGPU's fused Meshgrid2D against the composed route on Dawn");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");
         Console.WriteLine("  --webgpu   : Run WebGPU backend diagnostics (browser GPU compute)");
         Console.WriteLine("  --memory   : Run GPU memory transfer diagnostics");
