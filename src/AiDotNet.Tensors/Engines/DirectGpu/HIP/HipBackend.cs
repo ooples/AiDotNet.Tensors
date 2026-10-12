@@ -573,6 +573,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(BatchExecutionCudaKernels.GetSource(), "batch_execution", ref _batchExecutionModule,
                 BatchExecutionCudaKernels.GetKernelNames(), useFastMath: false);
 
+            // The PyTorch-parity kernels (#1124) compute in double and test NaN/infinity bits: never fast-math.
+            // hipRTC does not predefine NAN / INFINITY (NVRTC's math headers do).
+            const string hipMathMacros = "#ifndef NAN\n#define NAN __builtin_nanf(\"\")\n#endif\n#ifndef INFINITY\n#define INFINITY __builtin_inff()\n#endif\n";
+            CompileKernelModule(hipMathMacros + CUDA.Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity", ref _torchParityModule,
+                CUDA.Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
+
             // Categorical sampling: its own module, and NOT fast-math. Sharing the neural-net
             // module would make every kernel in it hostage to this one compiling, and fast math
             // permits reassociating the ordered double accumulation this kernel needs to reproduce
@@ -1008,6 +1014,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// </summary>
     private unsafe void LaunchKernel(IntPtr kernel, uint gridX, uint blockSize, void** args, uint sharedMem = 0)
     {
+        GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel, gridX, 1, 1, blockSize, 1, 1,
             sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
@@ -1207,6 +1214,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// </summary>
     private unsafe void LaunchKernel2D(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, void** args, uint sharedMem = 0)
     {
+        GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel, gridX, gridY, 1, blockX, blockY, 1,
             sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
@@ -1220,6 +1228,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockSize, uint sharedMemBytes, void** args)
     {
+        GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel, gridX, 1, 1, blockSize, 1, 1,
             sharedMemBytes, _stream, (IntPtr)args, IntPtr.Zero);
@@ -1230,6 +1239,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         fixed (IntPtr* argsPtr = args)
         {
+            GpuLaunchProbe.OnLaunch();
             var result = HipNativeBindings.hipModuleLaunchKernel(
                 kernel, gridX, 1, 1, blockSize, 1, 1,
                 sharedMem, stream, (IntPtr)argsPtr, IntPtr.Zero);
@@ -1322,6 +1332,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         fixed (IntPtr* argsPtr = args)
         {
             // HIP driver API calls are required for kernel dispatch.
+            GpuLaunchProbe.OnLaunch();
             var result = HipNativeBindings.hipModuleLaunchKernel(
                 kernel, gridX, gridY, 1, blockX, blockY, 1,
                 sharedMem, stream, (IntPtr)argsPtr, IntPtr.Zero);
@@ -1336,6 +1347,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchKernel3D(IntPtr kernel, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, uint blockZ, void** args, uint sharedMem = 0)
     {
+        GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel, gridX, gridY, gridZ, blockX, blockY, blockZ,
             sharedMem, _stream, (IntPtr)args, IntPtr.Zero);
@@ -1347,6 +1359,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         fixed (IntPtr* argsPtr = args)
         {
             // HIP driver API calls are required for kernel dispatch.
+            GpuLaunchProbe.OnLaunch();
             var result = HipNativeBindings.hipModuleLaunchKernel(
                 kernel, gridX, gridY, gridZ, blockX, blockY, blockZ,
                 sharedMem, stream, (IntPtr)argsPtr, IntPtr.Zero);
@@ -1654,6 +1667,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[6] = &alpha;
         args[7] = &beta;
 
+        GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel,
             gridDimX, gridDimY, 1,
@@ -2042,6 +2056,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             var size = (UIntPtr)(M * N * sizeof(float));
             var result = HipNativeBindings.hipMemcpy(C.Handle, A.Handle, size, HipMemcpyKind.DeviceToDevice);
             HipNativeBindings.CheckError(result, "hipMemcpy D2D");
+            GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
         }
 
             {
@@ -3687,6 +3702,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[5] = &i[0];
                 argsPtr[6] = &i[1];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)gridX, 1, 1,
@@ -3937,6 +3953,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[5] = &i[1];
                 argsPtr[6] = &i[2];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)gridX, (uint)gridY, 1,
@@ -3969,6 +3986,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[6] = &i[2];
                 argsPtr[7] = &epsCopy;
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)gridX, (uint)gridY, 1,
@@ -4002,6 +4020,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[7] = &i[2];
                 argsPtr[8] = &i[3];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)gridX, (uint)gridY, 1,
@@ -4036,6 +4055,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[8] = &i[2];
                 argsPtr[9] = &i[3];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)gridX, (uint)gridY, 1,
@@ -4056,6 +4076,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             argsPtr[0] = &bufferCopy;
             argsPtr[1] = &sizeCopy;
 
+            GpuLaunchProbe.OnLaunch();
             var result = HipNativeBindings.hipModuleLaunchKernel(
                 kernel,
                 (uint)grid, 1, 1,
@@ -4088,6 +4109,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[7] = &i[2];
                 argsPtr[8] = &i[3];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)gridX, (uint)gridY, 1,
@@ -6913,6 +6935,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             sizeBytes,
             HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D");
+        GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
     }
 
     public unsafe void Fill(IGpuBuffer buffer, float value, int size)
@@ -6920,12 +6943,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!IsAvailable)
             throw new InvalidOperationException("HIP backend is not available.");
 
-        // For zero, use hipMemset (efficient for 0 bytes = 0.0f in IEEE 754)
-        if (value == 0.0f)
+        // +0 is all-zero bytes, so hipMemset serves; -0 compares equal to 0 but is not, so it takes the kernel.
+        if (BitConverter.ToInt32(BitConverter.GetBytes(value), 0) == 0)
         {
             var sizeBytes = (UIntPtr)(size * sizeof(float));
             var result = HipNativeBindings.hipMemset(buffer.Handle, 0, sizeBytes);
             HipNativeBindings.CheckError(result, "hipMemset (Fill zero)");
+            GpuLaunchProbe.OnLaunch();   // a device-side memset is GPU work, as CUDA's Fill counts it
             Synchronize();
             return;
         }
@@ -6952,6 +6976,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[1] = &f[0];
                 argsPtr[2] = &i[0];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)grid, 1, 1,
@@ -6994,6 +7019,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[4] = &i[2];
                 argsPtr[5] = &i[3];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)gridX, (uint)gridY, 1,
@@ -7039,6 +7065,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[5] = &i[3];
                 argsPtr[6] = &i[4];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)grid, 1, 1,
@@ -7085,6 +7112,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 argsPtr[5] = &i[3];
                 argsPtr[6] = &i[4];
 
+                GpuLaunchProbe.OnLaunch();
                 var result = HipNativeBindings.hipModuleLaunchKernel(
                     kernel,
                     (uint)grid, 1, 1,
@@ -9944,6 +9972,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             size,
             HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D");
+        GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
     }
 
     /// <summary>
@@ -10241,6 +10270,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         args[5] = &K;
         args[6] = &alpha;
         args[7] = &beta;
+        GpuLaunchProbe.OnLaunch();
         var result = HipNativeBindings.hipModuleLaunchKernel(
             kernel,
             gridDimX, gridDimY, 1,
@@ -10323,6 +10353,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var sizeBytes = (UIntPtr)(length * sizeof(float));
         var result = HipNativeBindings.hipMemcpy(dstPtr, srcPtr, sizeBytes, HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D (strided)");
+        GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
     }
 
     /// <inheritdoc/>
@@ -11092,6 +11123,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 byteSize,
                 HipMemcpyKind.DeviceToDevice);
             HipNativeBindings.CheckError(resultH, "hipMemcpy D2D (hFinal from allH)");
+            GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
 
             // Device-to-device copy from allC[seqLen] to cFinal
             IntPtr srcC = IntPtr.Add(allC.Handle, finalStateOffset * sizeof(float));
@@ -11101,6 +11133,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 byteSize,
                 HipMemcpyKind.DeviceToDevice);
             HipNativeBindings.CheckError(resultC, "hipMemcpy D2D (cFinal from allC)");
+            GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
             }
     }
 
@@ -11415,6 +11448,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             HipNativeBindings.hipModuleUnload(_batchExecutionModule);
             _batchExecutionModule = IntPtr.Zero;
+        }
+        if (_torchParityModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_torchParityModule);
+            _torchParityModule = IntPtr.Zero;
         }
         if (_neuralNetModule != IntPtr.Zero)
         {

@@ -1271,6 +1271,18 @@ kernel void parity210_histc(
     float bw=(mx-mn)/(float)bins; int b=(int)((x-mn)/bw); if (b>=bins) b=bins-1; if (b<0) b=0; atomic_fetch_add_explicit(&hist[b], 1.0f, memory_order_relaxed);
 }
 
+// torch.sort's order as one strict total order, as CUDA's parity210_sorts_before (#1131): padding (index < 0) after
+// every real element; NaN after every number ascending and before every number descending; equal values by original
+// index (stable). NaN is tested on its bits, since Metal compiles with fast math.
+inline int parity210_sorts_before(float va, float ia, float vb, float ib, int descending) {
+    int pa = ia < 0.0f, pb = ib < 0.0f;
+    if (pa != pb) return pb;
+    if (pa) return 0;
+    int na = (as_type<uint>(va) & 0x7FFFFFFFu) > 0x7F800000u, nb = (as_type<uint>(vb) & 0x7FFFFFFFu) > 0x7F800000u;
+    if (na != nb) return descending ? na : nb;
+    if (!na && va != vb) return descending ? (va > vb) : (va < vb);
+    return ia < ib;
+}
 kernel void parity210_bitonic_step(
     device float* values [[buffer(0)]],
     device float* indices [[buffer(1)]],
@@ -1281,11 +1293,10 @@ kernel void parity210_bitonic_step(
     constant int& descending [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     int gi = (int)gid; if (gi>=numRows*rowLen) return; int i=gi%rowLen; int ixj=i^j; if (ixj<=i) return;
-    int base=(gi/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj];
-    uint ua=as_type<uint>(a), ub=as_type<uint>(b);
-    float ka=(((ua>>23)&0xFFu)==0xFFu&&(ua&0x7FFFFFu)!=0u)?INFINITY:a; float kb=(((ub>>23)&0xFFu)==0xFFu&&(ub&0x7FFFFFu)!=0u)?INFINITY:b;
-    int up=((i&k)==0); if (descending!=0) up=!up; int doSwap=up?(ka>kb):(ka<kb);
-    if (doSwap) { values[base+i]=b; values[base+ixj]=a; float t=indices[base+i]; indices[base+i]=indices[base+ixj]; indices[base+ixj]=t; }
+    int base=(gi/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj]; float ia=indices[base+i], ib=indices[base+ixj];
+    int up=((i&k)==0);
+    int doSwap = up ? parity210_sorts_before(b, ib, a, ia, descending) : parity210_sorts_before(a, ia, b, ib, descending);
+    if (doSwap) { values[base+i]=b; values[base+ixj]=a; indices[base+i]=ib; indices[base+ixj]=ia; }
 }
 
 kernel void parity210_copy_rows(
