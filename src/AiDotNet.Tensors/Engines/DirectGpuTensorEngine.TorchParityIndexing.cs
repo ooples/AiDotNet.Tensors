@@ -25,8 +25,7 @@ public partial class DirectGpuTensorEngine
             using var im = GetOrAllocateBuffer(backend, imag.IsContiguous ? imag : imag.Contiguous());
             return PackAndDeferSplitComplexResult<T>(backend, re.Buffer, im.Buffer, real.Length, (int[])real._shape.Clone());
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorComplex", ex);
             return null;
         }
@@ -49,8 +48,7 @@ public partial class DirectGpuTensorEngine
             Array.Copy(input._shape, shape, shape.Length);
             return PackAndDeferSplitComplexResult<T>(backend, re.Buffer, im.Buffer, n, shape);
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorViewAsComplex", ex);
             return null;
         }
@@ -88,8 +86,7 @@ public partial class DirectGpuTensorEngine
                 if (ownsOutput) output.Dispose();
             }
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorNonzeroStatic", ex);
             return null;
         }
@@ -122,8 +119,7 @@ public partial class DirectGpuTensorEngine
             }
             flagValue = ReadParityFlag(backend, flag.Buffer);
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             foreach (var t in result) t?.Dispose();
             GpuLaunchProbe.OnFallback("TensorUnravelIndex", ex);
             return null;
@@ -178,8 +174,7 @@ public partial class DirectGpuTensorEngine
                 else backend.Permute(rows.Buffer, output, new[] { unique, outer, inner }, new[] { 1, 0, 2 });
             });
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorUniqueDim", ex);
             return null;
         }
@@ -205,8 +200,7 @@ public partial class DirectGpuTensorEngine
             result = DispatchDeferredGpuOp<T>(backend, n * c * points, outShape, output => kernels.TorchParityGridSample3D(
                 x.Buffer, g.Buffer, output, n, c, input._shape[2], input._shape[3], input._shape[4], points, modeCode, paddingCode, alignCorners));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorGridSample3D", ex);
             return null;
         }
@@ -260,8 +254,7 @@ public partial class DirectGpuTensorEngine
             ownsDg = false;
             return (inputGrad, gridGrad);
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorGridSample3D backward", ex);
             return null;
         }
@@ -313,8 +306,7 @@ public partial class DirectGpuTensorEngine
         {
             throw;
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }
@@ -387,8 +379,7 @@ public partial class DirectGpuTensorEngine
         {
             throw;
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }

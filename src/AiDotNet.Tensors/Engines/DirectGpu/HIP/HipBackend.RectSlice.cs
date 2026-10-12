@@ -23,7 +23,7 @@ public sealed partial class HipBackend : IRectSliceKernels
         RectSliceGeometry.Build(full, slice, fullShape, start, length, meta.OutDims, meta.FullStrides, meta.Starts,
             out meta.Rank, out meta.Total);
         if (!_kernelCache.TryGetValue("rect_slice_nd", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: rect_slice_nd");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rect_slice_nd");
 
         uint gridDim = (uint)((meta.Total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr f = full.Handle, s = slice.Handle;

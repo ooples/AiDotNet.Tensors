@@ -2745,7 +2745,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             return true;
         }
-        catch (Exception ex)
+        // #1165: only a missing capability falls back to the eager step; a fault in the resident body propagates.
+        catch (NotSupportedException ex)
         {
             // The body binds step buffers to the device; StepEager writes them on the host, so the stale device
             // copies must go (see DetachCapturePathBindings).

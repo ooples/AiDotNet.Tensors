@@ -34,7 +34,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             if (output is null) throw new ArgumentNullException(nameof(output));
             if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Element count must be positive.");
             if (!_kernelCache.TryGetValue("fp16_add", out var kernel))
-                throw new InvalidOperationException("HIP kernel not found: fp16_add");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: fp16_add");
 
             // The kernel processes two elements per thread (packed __half2).
             uint grid = (uint)(((n + 1) / 2 + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -53,7 +53,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             if (output is null) throw new ArgumentNullException(nameof(output));
             if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
             if (!_kernelCache.TryGetValue("fp16_softmax", out var kernel))
-                throw new InvalidOperationException("HIP kernel not found: fp16_softmax");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: fp16_softmax");
             IntPtr inP = input.Handle, oP = output.Handle;
             int r = rows, c = cols;
             void** args = stackalloc void*[4];
@@ -76,7 +76,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps))
                 throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
             if (!_kernelCache.TryGetValue("fp16_layernorm", out var kernel))
-                throw new InvalidOperationException("HIP kernel not found: fp16_layernorm");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: fp16_layernorm");
             IntPtr inP = input.Handle, gP = gamma.Handle, bP = beta.Handle, oP = output.Handle;
             IntPtr mP = meanFp32 is null ? IntPtr.Zero : meanFp32.Handle;
             IntPtr vP = varFp32 is null ? IntPtr.Zero : varFp32.Handle;
@@ -94,7 +94,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             if (output is null) throw new ArgumentNullException(nameof(output));
             if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Element count must be positive.");
             if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-                throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+                throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
 
             uint grid = (uint)(((n + 1) / 2 + DefaultBlockSize - 1) / DefaultBlockSize);
             IntPtr inP = input.Handle, oP = output.Handle;

@@ -18,7 +18,7 @@ public sealed partial class HipBackend : IAnnBackend
                 "DirectGpuTensorEngine catches this and routes to the AnnPrimitives reference; " +
                 "direct callers to HipBackend see this exception.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         return kernel;
     }
 
