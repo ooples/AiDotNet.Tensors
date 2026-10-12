@@ -27,8 +27,7 @@ public partial class DirectGpuTensorEngine
             return DispatchDeferredGpuOp<T>(backend, n, (int[])input._shape.Clone(),
                 output => kernels.TorchParityUnary(op, x.Buffer, output, n, p0, p1));
         }
-        catch (System.Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("Tensor" + op, ex);
             return null;
         }
@@ -48,8 +47,7 @@ public partial class DirectGpuTensorEngine
             return DispatchDeferredGpuOp<T>(backend, n, (int[])a._shape.Clone(),
                 output => kernels.TorchParityBinary(op, x.Buffer, y.Buffer, output, n));
         }
-        catch (System.Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("Tensor" + op, ex);
             return null;
         }
@@ -82,8 +80,7 @@ public partial class DirectGpuTensorEngine
             return DispatchDeferredGpuOp<T>(backend, n, (int[])x._shape.Clone(),
                 output => kernels.TorchParityPolynomial(kind, shifted, xs.Buffer, ds.Buffer, output, n));
         }
-        catch (System.Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }
@@ -102,8 +99,7 @@ public partial class DirectGpuTensorEngine
         {
             return DispatchDeferredGpuOp<T>(backend, n, shape, output => generate(kernels, backend, output));
         }
-        catch (System.Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }
@@ -173,8 +169,7 @@ public partial class DirectGpuTensorEngine
             return DispatchDeferredGpuOp<T>(backend, size * size, new[] { size, size },
                 output => kernels.TorchParityDiagflat(x.Buffer, output, n, size, offset));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorDiagflat", ex);
             return null;
         }
@@ -214,8 +209,7 @@ public partial class DirectGpuTensorEngine
                     strides[d1], strides[d2], Math.Max(0, -offset), Math.Max(0, offset), diagonal);
             });
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorDiagonalScatter", ex);
             return null;
         }
@@ -240,8 +234,7 @@ public partial class DirectGpuTensorEngine
                 return DispatchDeferredGpuOp<T>(backend, tensor.Length, (int[])tensor._shape.Clone(),
                     output => backend.Transpose(sorted.Buffer, output, inner, extent));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorMsort", ex);
             return null;
         }
@@ -284,8 +277,7 @@ public partial class DirectGpuTensorEngine
                 return DispatchDeferredGpuOp<T>(backend, rowsCount, outShape,
                     output => kernels.TorchParityQuantileRows(sorted.Buffer, output, rowsCount, extent, q, (int)interpolation, ignoreNan));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }

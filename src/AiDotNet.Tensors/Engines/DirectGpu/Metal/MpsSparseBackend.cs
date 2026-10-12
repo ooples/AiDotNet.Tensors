@@ -78,7 +78,7 @@ internal static class MpsSparseBackend
         float[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("MPS sparse backend is not available on this host.");
+            throw new GpuCapabilityUnavailableException("MPS sparse backend is not available on this host.");
 
         // The Objective-C glue + descriptor lifecycle below is the
         // expected shape; the binding is left as a structured call
@@ -105,7 +105,7 @@ internal static class MpsSparseBackend
         float[] x, float[] y, int innerK)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("MPS sparse backend is not available on this host.");
+            throw new GpuCapabilityUnavailableException("MPS sparse backend is not available on this host.");
 
         throw new NotSupportedException(
             "MPS sparse SDDMM is wired to the runtime probe but the descriptor lifecycle needs " +
