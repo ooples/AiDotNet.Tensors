@@ -498,8 +498,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     //   4. disposes the scope when done (resumes eviction, frees the graph).
     // ───────────────────────────────────────────────────────────────────────────────────────────
 
-    /// <summary>True when this engine is backed by a CUDA backend that can capture/replay CUDA graphs.</summary>
-    public bool SupportsInferenceGraphCapture => GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb && cb.IsAvailable;
+    /// <summary>True when this engine's backend can capture and replay device graphs (CUDA graphs today).</summary>
+    public bool SupportsInferenceGraphCapture => GetBackend() is IGpuGraphCapture capture && capture.SupportsGraphCapture;
 
     /// <summary>Records the GPU kernel launches issued by <paramref name="forward"/> into a CUDA graph and
     /// returns a replayable handle (IntPtr.Zero on failure / a non-capturable op — caller falls back to eager).
@@ -508,39 +508,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Reject API misuse here rather than letting a null delegate surface as a backend-side failure.
         if (forward is null) throw new System.ArgumentNullException(nameof(forward));
-        return GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb ? cb.CaptureGraph(forward) : System.IntPtr.Zero;
+        return GetBackend() is IGpuGraphCapture capture ? capture.CaptureGraph(forward) : System.IntPtr.Zero;
     }
 
     /// <summary>Replays a graph captured by <see cref="CaptureGpuGraph"/> as a single cuGraphLaunch. Refresh
     /// input-buffer CONTENTS (via <see cref="RefreshResidentInputInPlace"/>) before calling to feed new data.</summary>
     public void LaunchGpuGraph(System.IntPtr graphExec)
     {
-        if (graphExec != System.IntPtr.Zero && GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
-            cb.LaunchCapturedGraph(graphExec);
+        if (graphExec != System.IntPtr.Zero && GetBackend() is IGpuGraphCapture capture)
+            capture.LaunchCapturedGraph(graphExec);
     }
 
     /// <summary>Blocks until all work on the backend's compute stream completes. Used to separate GPU-compute
-    /// time from the DtoH copy when profiling the captured-graph replay. No-op off CUDA.</summary>
+    /// time from the DtoH copy when profiling the captured-graph replay.</summary>
     public void SynchronizeStream()
     {
-        if (GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cbSync) cbSync.Synchronize();
+        if (TryGetBackend(out var backend)) backend.Synchronize();
     }
 
     /// <summary>Frees a captured graph handle.</summary>
     public void DestroyGpuGraph(System.IntPtr graphExec)
     {
-        if (graphExec != System.IntPtr.Zero && GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
-            cb.DestroyCapturedGraph(graphExec);
+        if (graphExec != System.IntPtr.Zero && GetBackend() is IGpuGraphCapture capture)
+            capture.DestroyCapturedGraph(graphExec);
     }
 
     /// <summary>Enters the resident capture path: suspends activation eviction (so resident intermediates a
     /// captured graph references survive replay), marks ResidentStepActive (GPU ops bind stable resident
     /// buffers) and inference-capture (resident in-place ops engage). The returned scope reverses all three on
     /// Dispose — keep it alive for the captured graph's whole lifetime (dispose when the graph is no longer
-    /// replayed). Returns null on a non-CUDA engine.</summary>
+    /// replayed). Returns null when the backend cannot capture graphs.</summary>
     public IDisposable? EnterResidentCaptureScope()
     {
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend) return null;
+        if (GetBackend() is not IGpuGraphCapture { SupportsGraphCapture: true }) return null;
         BeginGraphLifetime();
         BeginInferenceCapture();
         _capturePathDepth.Enter();
@@ -568,7 +568,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public void RefreshResidentInputInPlace<T>(Tensor<T> t)
     {
         if (typeof(T) != typeof(float) || t is null) return;
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        if (!TryGetBackend(out var cb)) return;
         if (t._gpuBuffer is not { } buf || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
         using var dataLease = t.LeaseArray();
         var data = dataLease.Array;
@@ -581,8 +581,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// so the captured graph reads a fixed device address and GetOrAllocateBuffer finds it (no re-upload mid-
     /// capture). Call during the non-capturing pre-residency pass for each EXTERNAL stable input (the graph's
     /// own intermediates become resident via FinishGpuOp under ResidentStepActive). Idempotent: re-binds the
-    /// current data into the existing buffer if already bound + big enough. float only. Off CUDA (no in-place float
-    /// upload, and no capture that needs a fixed address) each call binds a fresh upload of the current data.</summary>
+    /// current data into the existing buffer if already bound + big enough. float only.</summary>
     public void EnsureResidentInput<T>(Tensor<T> t)
     {
         if (typeof(T) != typeof(float) || t is null) return;
@@ -593,10 +592,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         using var dataLease = t.LeaseArray();
         var data = dataLease.Array;
-        if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda && t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
+        if (t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
             && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
         {
-            cuda.UploadBufferInPlace((float[])(object)data, existing);
+            cb.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
             return;
         }

@@ -5882,6 +5882,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
     }
 
+    /// <inheritdoc/>
+    public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        // A float buffer holds the raw IEEE bits, so the int path's byte-exact hipMemcpy writes the same bytes.
+        var bits = new int[data.Length];
+        Buffer.BlockCopy(data, 0, bits, 0, data.Length * sizeof(float));
+        UploadIntBufferInPlace(bits, buffer);
+    }
+
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
         IntPtr devicePtr = IntPtr.Zero;
