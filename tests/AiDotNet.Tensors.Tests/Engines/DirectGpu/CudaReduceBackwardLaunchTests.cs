@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
@@ -42,5 +43,20 @@ public class CudaReduceBackwardLaunchTests
                     $"mean[{i}]: expected {expected}, got {got[i]}");
             }
         }
+    }
+
+    [SkippableFact]
+    public void ReduceSumBackward_RejectsNegativeSizesAndShortBuffers()
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        using var g = backend.AllocateBuffer(new float[4]);
+        using var o = backend.AllocateBuffer(new float[8]);
+        // Two negatives multiply to a positive count; each is rejected on its own.
+        Assert.Throws<ArgumentOutOfRangeException>(() => backend.ReduceSumBackward(g, o, -2, -4));
+        Assert.Throws<ArgumentOutOfRangeException>(() => backend.ReduceMeanBackward(g, o, 2, -4));
+        Assert.Throws<ArgumentException>(() => backend.ReduceSumBackward(g, o, 5, 1));    // gradOutput holds 4 < 5
+        Assert.Throws<ArgumentException>(() => backend.ReduceSumBackward(g, o, 3, 3));    // gradInput holds 8 < 9
+        backend.ReduceSumBackward(g, o, 0, 7);                                            // empty: no launch
     }
 }
