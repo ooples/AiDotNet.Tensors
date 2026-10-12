@@ -230,8 +230,16 @@ __kernel void geometry_grid_sample_2d(
     double sx = alignCorners ? (gx + 1.0) * 0.5 * (W - 1) : ((gx + 1.0) * W - 1.0) * 0.5;
     double sy = alignCorners ? (gy + 1.0) * 0.5 * (H - 1) : ((gy + 1.0) * H - 1.0) * 0.5;
 
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule). Tested on the bits, since a
+    // program built with -cl-finite-math-only may fold a NaN comparison: |x| below 2147483639 has the smaller pattern.
+    const ulong limBits = 0x41DFFFFFFDC00000UL; // 2147483639.0
+    if ((as_ulong(sx) & 0x7FFFFFFFFFFFFFFFUL) >= limBits || (as_ulong(sy) & 0x7FFFFFFFFFFFFFFFUL) >= limBits) {
+        for (int c = 0; c < C; c++) output[((n * C + c) * outH + oy) * outW + ox] = 0.0f;
+        return;
+    }
+
     if (mode == 1) {
-        int nx = (int)round(sx), ny = (int)round(sy);
+        int nx = (int)rint(sx), ny = (int)rint(sy);
         for (int c = 0; c < C; c++)
             output[((n * C + c) * outH + oy) * outW + ox] =
                 grid_sample_safe(input, n, ny, nx, c, H, W, C, padding);

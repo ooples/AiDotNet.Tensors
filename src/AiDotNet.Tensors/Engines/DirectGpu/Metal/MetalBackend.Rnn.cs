@@ -219,15 +219,9 @@ public partial class MetalBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         ThrowIfDisposed();
-        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return;
-        int stateSize = checked(batch * hiddenSize);
-        Copy(hInit, 0, allH, 0, stateSize);
-        Copy(cInit, 0, allC, 0, stateSize);
-        DispatchResidentMetal("lstm_forward_sequence", batch,
-            new[] { input, weightsIh, weightsHh, biasIh, biasHh, output, allH, allC, cacheGates },
-            (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize);
-        Copy(allH, checked(seqLen * stateSize), hFinal, 0, stateSize);
-        Copy(allC, checked(seqLen * stateSize), cFinal, 0, stateSize);
+        // The shared lstm_p_ kernels (#1107): the source verified on OpenCL, Vulkan and HIP, translated for Metal.
+        PortableLstmSequence.Forward(this, LaunchBatch, input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
+            output, hFinal, cFinal, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
     }
 
     /// <summary>
@@ -242,16 +236,9 @@ public partial class MetalBackend
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         ThrowIfDisposed();
-        if (seqLen <= 0 || batch <= 0 || inputSize <= 0 || hiddenSize <= 0) return;
-        int stateSize = checked(batch * hiddenSize);
-        using var nextHidden = AllocateBuffer(stateSize);
-        using var nextCell = AllocateBuffer(stateSize);
-        DispatchResidentMetal("lstm_backward_sequence_serial", 1,
-            new[] { gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
-                gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh,
-                nextHidden, nextCell },
-            (uint)seqLen, (uint)batch, (uint)inputSize, (uint)hiddenSize);
-        Copy(gradBiasIh, gradBiasHh, checked(4 * hiddenSize));
+        PortableLstmSequence.Backward(this, LaunchBatch, gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
+            gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
+            seqLen, batch, inputSize, hiddenSize);
     }
 
     /// <summary>
