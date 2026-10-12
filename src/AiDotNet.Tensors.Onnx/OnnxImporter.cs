@@ -126,8 +126,7 @@ public static class OnnxImporter
         // ── Pre-pass: rewrite BERT-style GELU erf decomposition to fused
         //    Gelu. Exports from tf2onnx / torch <= opset 19 emit
         //    GELU(x) = 0.5·x·(1 + erf(x/√2)) as 5 ops (Div → Erf → Add → Mul
-        //    → Mul). Our A-S Erf approximation has only 1.5e-7 absolute
-        //    error but the engine's fused Gelu uses the same rational
+        //    → Mul). The engine's fused Gelu uses the same rational
         //    approximation as ORT — rewriting gives bit-exact parity on
         //    BERT logits instead of compounding through 12 transformer
         //    layers. Only fires when the input to Div is a regular tensor
