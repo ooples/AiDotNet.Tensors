@@ -87,13 +87,14 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// <param name="cols">Number of columns in the matrix.</param>
     /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
     /// <returns>A matrix backed by pooled memory.</returns>
-    internal static Matrix<T> FromPooledMemory(Memory<T> memory, int rows, int cols, T[] pooledArray)
+    // track: false for an array that came back from the thread cache; see Tensor<T>.FromPooledMemory.
+    internal static Matrix<T> FromPooledMemory(Memory<T> memory, int rows, int cols, T[] pooledArray, bool track = true)
     {
         var matrix = new Matrix<T>(memory, rows, cols);
         matrix.SetPooledArray(pooledArray);
         // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
         // cache once this result (and every zero-copy view of it) has been collected.
-        matrix.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
+        if (track) matrix.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         return matrix;
     }
 

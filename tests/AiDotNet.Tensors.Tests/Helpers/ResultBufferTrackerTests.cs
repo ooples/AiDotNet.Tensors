@@ -277,6 +277,47 @@ public sealed class ResultBufferTrackerPacingTests
     }
 }
 
+/// <summary>
+/// A thread-cache hit is in an explicit-return cycle, so its result is not tracked (the registration and unregistration
+/// cost about 1-2 us per call in a 1M-element subtract + Return loop); a result dropped instead of returned is collected,
+/// the next rent misses the cache, and that result is tracked again.
+/// </summary>
+[Collection(ResultBufferTrackerCollection.Name)]
+public sealed class ResultBufferTrackerExplicitReturnTests
+{
+    private const int Length = 1 << 20;   // 4 MB of floats: well above the tracking threshold
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool RentIsTracked(bool returnIt)
+    {
+        var t = TensorAllocator.RentUninitialized<float>(new[] { Length });
+        bool tracked = t.DataVector.ResultOwner is not null;
+        if (returnIt) TensorPool.Return(t);
+        return tracked;
+    }
+
+    [Fact]
+    public void ThreadCacheHits_AreNotTracked_AndDroppedResultsAreTrackedAgain()
+    {
+        bool savedStress = ResultBufferTracker.Stress;
+        ResultBufferTracker.Stress = false;
+        try
+        {
+            RentIsTracked(returnIt: true);                              // seeds the thread cache with one array
+            Assert.False(RentIsTracked(returnIt: true), "a cache hit in an explicit-return cycle was tracked");
+            Assert.False(RentIsTracked(returnIt: false), "a cache hit was tracked");   // ...and this one is dropped
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            // The dropped array is gone and the cache is empty: this rent misses and its result is tracked.
+            Assert.True(RentIsTracked(returnIt: true), "a result after a cache miss was not tracked");
+        }
+        finally
+        {
+            ResultBufferTracker.Stress = savedStress;
+        }
+    }
+}
+
 internal static class ResultBufferTrackerTestExtensions
 {
     // The backing array of a matrix or vector, read without marking it escaped (test-only identity checks).

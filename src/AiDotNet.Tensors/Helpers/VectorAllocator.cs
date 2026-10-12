@@ -64,7 +64,7 @@ public static class VectorAllocator
             Array.Clear(cached, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? cached.Length : length);
             var memory = new Memory<T>(cached, 0, length);
-            return Vector<T>.FromPooledMemory(memory, cached);
+            return Vector<T>.FromPooledMemory(memory, cached, track: false);
         }
 
         // Tier 2: ArrayPool for large allocations.

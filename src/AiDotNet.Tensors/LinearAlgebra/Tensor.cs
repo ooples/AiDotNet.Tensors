@@ -861,12 +861,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <param name="dimensions">The tensor shape.</param>
     /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
     /// <returns>A tensor backed by pooled memory.</returns>
-    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray)
+    // track: false for an array that came back from the thread cache. It is in an explicit-return cycle, so tracking
+    // its result buys nothing and cost a registration (owner, weak handle, locked map insert) plus an unregistration
+    // per call: about 1-2 us on a 1M-element subtract + Return loop. A result the caller drops instead is not lost to
+    // recycling: its array is collected, the next rent misses the cache, and that result (from the free list or fresh)
+    // is tracked as usual.
+    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray, bool track = true)
     {
         var vector = Vector<T>.FromMemory(memory);
         // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
         // cache once this tensor, its views (which share this vector through the storage) and any zero-copy wraps has been collected.
-        vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
+        if (track) vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         var tensor = new Tensor<T>(vector, dimensions);
         tensor._pooledArray = pooledArray;
         return tensor;

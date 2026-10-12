@@ -483,7 +483,7 @@ public static class TensorAllocator
             // Exactly totalSize elements (see RentExactArray), so there is no padding to carry a
             // previous renter's bytes; clearing it gives Rent's zero-init contract.
             Array.Clear(cached, 0, cached.Length);
-            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false);
         }
 
         // Tier 3: pooled sizes get an exact-size array marked as pooled, so Return can recycle it. A large miss
@@ -547,7 +547,7 @@ public static class TensorAllocator
             // there is no padding past the logical region for a previous renter's bytes to sit in.
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 Array.Clear(cached, 0, cached.Length);
-            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false);
         }
 
         if (UsesArrayPool<T>(totalSize))
