@@ -438,6 +438,51 @@ extern ""C"" __global__ __launch_bounds__(256) void sum_axis(const float* input,
     output[idx] = sum;
 }
 
+// #1157: one 256-thread block per long row -- strided partial sums, then a fixed shared-memory tree (no wavefront
+// shuffles: AMD wavefronts are 64 wide). Deterministic order.
+extern ""C"" __global__ __launch_bounds__(256) void sum_axis_rows(const float* __restrict__ input, float* __restrict__ output,
+    int outerSize, int reduceSize)
+{
+    __shared__ float scratch[256];
+    unsigned int row = blockIdx.x;
+    const float* rowPtr = input + (size_t)row * (unsigned int)reduceSize;
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < (unsigned int)reduceSize; i += blockDim.x)
+        sum += rowPtr[i];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned int s = blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) output[row] = scratch[0];
+}
+
+// #1157 (the CUDA #1150 split): block (chunk, row) sums chunk `chunk` of row `row` into partial[row * chunks + chunk];
+// the host reduces the partials with SumAxis. Fixed partition and order.
+extern ""C"" __global__ __launch_bounds__(256) void sum_axis_rows_split(const float* __restrict__ input,
+    float* __restrict__ partial, int reduceSize, int chunks, int chunkLen)
+{
+    __shared__ float scratch[256];
+    unsigned int chunk = blockIdx.x, row = blockIdx.y;
+    size_t start = (size_t)chunk * (unsigned int)chunkLen;
+    size_t end = start + (unsigned int)chunkLen;
+    if (end > (size_t)(unsigned int)reduceSize) end = (size_t)(unsigned int)reduceSize;
+    const float* rowPtr = input + (size_t)row * (unsigned int)reduceSize;
+    float sum = 0.0f;
+    for (size_t i = start + threadIdx.x; i < end; i += blockDim.x)
+        sum += rowPtr[i];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned int s = blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s) scratch[threadIdx.x] += scratch[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partial[(size_t)row * (unsigned int)chunks + chunk] = scratch[0];
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
 {
     // 2D grid: blockIdx.y = row, blockIdx.x * blockDim.x + threadIdx.x = column
@@ -1266,7 +1311,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "where_backward", "norm_backward", "logsumexp_backward",
             "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
             "scatter_mean", "scatter_mean_activation_deterministic", "scatter_mean_divide",
-            "reduce_sum", "reduce_max", "reduce_min", "sum_axis", "bias_add",
+            "reduce_sum", "reduce_max", "reduce_min", "sum_axis", "sum_axis_rows", "sum_axis_rows_split", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary
             "relu_vec4", "sigmoid_vec4", "tanh_activation_vec4", "gelu_vec4", "swish_vec4",

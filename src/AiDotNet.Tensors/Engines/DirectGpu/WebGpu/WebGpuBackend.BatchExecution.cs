@@ -21,8 +21,8 @@ public sealed partial class WebGpuBackend : IGpuBatchExecution
     /// </summary>
     private async Task DispatchBatchAsync(string name, int workgroups, object[] args)
     {
-        if (!S.ByKernelName.TryGetValue(name, out var source))
-            throw new InvalidOperationException($"WebGPU batch kernel not found: {name}");
+        if (!S.ByKernelName.TryGetValue(name, out var source) && !TorchParityModules.Value.TryGetValue(name, out source))
+            throw new GpuCapabilityUnavailableException($"WebGPU batch kernel not found: {name}");
         var buffers = new List<WebGpuBuffer>();
         var fields = new List<float>();
         foreach (var arg in args)

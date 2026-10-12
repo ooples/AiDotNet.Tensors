@@ -74,7 +74,7 @@ void main()
     private void Conv2DDirectReference(in TunedConv2DArgs a)
     {
         if (!TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, ConvPush(a), a.OutputCount, a.Input, a.Kernel, a.Output))
-            throw new InvalidOperationException("The Vulkan Conv2D shader is unavailable.");
+            throw new GpuCapabilityUnavailableException("The Vulkan Conv2D shader is unavailable.");
     }
 
     // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for B = 1).

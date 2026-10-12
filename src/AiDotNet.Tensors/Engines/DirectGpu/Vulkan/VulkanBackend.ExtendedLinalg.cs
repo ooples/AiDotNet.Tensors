@@ -11,7 +11,7 @@ public sealed partial class VulkanBackend : IExtendedLinalgBackend
     private void LaunchSolver(string name, int threads, params object[] args)
     {
         if (!VulkanBatchExecutionKernels.Solvers.TryGetValue(name, out var source))
-            throw new InvalidOperationException($"Vulkan solver kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"Vulkan solver kernel not found: {name}");
         var buffers = new List<IGpuBuffer>();
         var push = new List<uint>();
         foreach (var arg in args)

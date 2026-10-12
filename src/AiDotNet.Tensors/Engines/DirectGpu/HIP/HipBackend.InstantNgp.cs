@@ -5,9 +5,9 @@ public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRen
     private IntPtr ResolveInstantNgpKernel(string name)
     {
         if (_audioModule == IntPtr.Zero)
-            throw new InvalidOperationException("Instant-NGP HIP kernels were not compiled.");
+            throw new GpuCapabilityUnavailableException("Instant-NGP HIP kernels were not compiled.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         return kernel;
     }
 

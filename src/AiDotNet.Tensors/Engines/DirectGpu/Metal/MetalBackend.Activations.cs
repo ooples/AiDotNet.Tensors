@@ -872,7 +872,7 @@ public sealed partial class MetalBackend
         if (input is not MetalGpuBuffer source || target is not MetalGpuBuffer destination)
             throw new ArgumentException("Buffers must be MetalGpuBuffer.");
         if (_residentLibrary == IntPtr.Zero)
-            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("Metal resident kernels are unavailable.");
         var pipeline = GetPipeline("Resident", _residentLibrary, "capsule_squash");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(count);
         using (var encoder = _commandQueue.CreateScopedComputeEncoder())
@@ -903,7 +903,7 @@ public sealed partial class MetalBackend
             target is not MetalGpuBuffer destination)
             throw new ArgumentException("Buffers must be MetalGpuBuffer.");
         if (_residentLibrary == IntPtr.Zero)
-            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("Metal resident kernels are unavailable.");
         var pipeline = GetPipeline("Resident", _residentLibrary, "capsule_squash_backward");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(count);
         using (var encoder = _commandQueue.CreateScopedComputeEncoder())

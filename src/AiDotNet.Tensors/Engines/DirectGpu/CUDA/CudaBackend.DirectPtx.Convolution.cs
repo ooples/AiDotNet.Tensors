@@ -324,7 +324,7 @@ public sealed partial class CudaBackend
     private PtxFusedDepthwiseConv2D3x3F32Kernel CreateAndCacheDirectPtxDepthwiseConvKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDepthwiseConvKernels.GetOrAdd(
             1, () => new PtxFusedDepthwiseConv2D3x3F32Kernel(runtime));
     }
@@ -478,7 +478,7 @@ public sealed partial class CudaBackend
     private PtxDepthwiseConv2D3x3BackwardInputF32Kernel CreateAndCacheDirectPtxDepthwiseConvBwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDepthwiseConvBwdInputKernels.GetOrAdd(
             1, () => new PtxDepthwiseConv2D3x3BackwardInputF32Kernel(runtime));
     }
@@ -632,7 +632,7 @@ public sealed partial class CudaBackend
     private PtxDepthwiseConv2D3x3BackwardWeightF32Kernel CreateAndCacheDirectPtxDepthwiseConvBwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDepthwiseConvBwdWeightKernels.GetOrAdd(
             1, () => new PtxDepthwiseConv2D3x3BackwardWeightF32Kernel(runtime));
     }
@@ -783,7 +783,7 @@ public sealed partial class CudaBackend
     private PtxConv2DBackwardBiasF32Kernel CreateAndCacheDirectPtxConvBwdBiasKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvBwdBiasKernels.GetOrAdd(
             1, () => new PtxConv2DBackwardBiasF32Kernel(runtime));
     }
@@ -936,7 +936,7 @@ public sealed partial class CudaBackend
     private PtxConv2DNchwK1BackwardInputF32Kernel CreateAndCacheDirectPtxConvBwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvBwdInputKernels.GetOrAdd(
             1, () => new PtxConv2DNchwK1BackwardInputF32Kernel(runtime));
     }
@@ -1089,7 +1089,7 @@ public sealed partial class CudaBackend
     private PtxConv2DNchwK1BackwardWeightF32Kernel CreateAndCacheDirectPtxConvBwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvBwdWeightKernels.GetOrAdd(
             1, () => new PtxConv2DNchwK1BackwardWeightF32Kernel(runtime));
     }
@@ -1242,7 +1242,7 @@ public sealed partial class CudaBackend
     private PtxConv1DNclForwardF32Kernel CreateAndCacheDirectPtxConv1DKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv1DKernels.GetOrAdd(
             1, () => new PtxConv1DNclForwardF32Kernel(runtime));
     }
@@ -1395,7 +1395,7 @@ public sealed partial class CudaBackend
     private PtxConv1DNclBackwardInputF32Kernel CreateAndCacheDirectPtxConv1DBwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv1DBwdInputKernels.GetOrAdd(
             1, () => new PtxConv1DNclBackwardInputF32Kernel(runtime));
     }
@@ -1548,7 +1548,7 @@ public sealed partial class CudaBackend
     private PtxConv1DNclBackwardWeightF32Kernel CreateAndCacheDirectPtxConv1DBwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv1DBwdWeightKernels.GetOrAdd(
             1, () => new PtxConv1DNclBackwardWeightF32Kernel(runtime));
     }
@@ -1701,7 +1701,7 @@ public sealed partial class CudaBackend
     private PtxConv2DNchw3x3ForwardF32Kernel CreateAndCacheDirectPtxConv2D3x3KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv2D3x3Kernels.GetOrAdd(
             1, () => new PtxConv2DNchw3x3ForwardF32Kernel(runtime));
     }
@@ -1854,7 +1854,7 @@ public sealed partial class CudaBackend
     private PtxConv2DNchw3x3BackwardInputF32Kernel CreateAndCacheDirectPtxConv2D3x3BwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv2D3x3BwdInputKernels.GetOrAdd(
             1, () => new PtxConv2DNchw3x3BackwardInputF32Kernel(runtime));
     }
@@ -2007,7 +2007,7 @@ public sealed partial class CudaBackend
     private PtxConv2DNchw3x3BackwardWeightF32Kernel CreateAndCacheDirectPtxConv2D3x3BwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv2D3x3BwdWeightKernels.GetOrAdd(
             1, () => new PtxConv2DNchw3x3BackwardWeightF32Kernel(runtime));
     }
@@ -2163,7 +2163,7 @@ public sealed partial class CudaBackend
     private PtxFusedConv2DNchw3x3BiasReluF32Kernel CreateAndCacheDirectPtxFusedConv2D3x3KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxFusedConv2D3x3Kernels.GetOrAdd(
             1, () => new PtxFusedConv2DNchw3x3BiasReluF32Kernel(runtime));
     }
@@ -2316,7 +2316,7 @@ public sealed partial class CudaBackend
     private PtxConvTranspose2DNchw3x3ForwardF32Kernel CreateAndCacheDirectPtxConvTranspose2D3x3KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvTranspose2D3x3Kernels.GetOrAdd(
             1, () => new PtxConvTranspose2DNchw3x3ForwardF32Kernel(runtime));
     }
@@ -2464,7 +2464,7 @@ public sealed partial class CudaBackend
     private PtxConv3DNcdhw3x3x3ForwardF32Kernel CreateAndCacheDirectPtxConv3D3x3x3KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv3D3x3x3Kernels.GetOrAdd(
             1, () => new PtxConv3DNcdhw3x3x3ForwardF32Kernel(runtime));
     }
@@ -2617,7 +2617,7 @@ public sealed partial class CudaBackend
     private PtxDepthwiseConv1DNcl3ForwardF32Kernel CreateAndCacheDirectPtxDepthwiseConv1DKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDepthwiseConv1DKernels.GetOrAdd(
             1, () => new PtxDepthwiseConv1DNcl3ForwardF32Kernel(runtime));
     }
@@ -2761,7 +2761,7 @@ public sealed partial class CudaBackend
     private PtxUnfoldIm2ColNchw3x3F32Kernel CreateAndCacheDirectPtxUnfoldKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxUnfoldKernels.GetOrAdd(
             1, () => new PtxUnfoldIm2ColNchw3x3F32Kernel(runtime));
     }
@@ -2914,7 +2914,7 @@ public sealed partial class CudaBackend
     private PtxDepthwiseConv1DNcl3BackwardInputF32Kernel CreateAndCacheDirectPtxDepthwiseConv1DBwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDepthwiseConv1DBwdInputKernels.GetOrAdd(
             1, () => new PtxDepthwiseConv1DNcl3BackwardInputF32Kernel(runtime));
     }
@@ -3067,7 +3067,7 @@ public sealed partial class CudaBackend
     private PtxDepthwiseConv1DNcl3BackwardWeightF32Kernel CreateAndCacheDirectPtxDepthwiseConv1DBwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDepthwiseConv1DBwdWeightKernels.GetOrAdd(
             1, () => new PtxDepthwiseConv1DNcl3BackwardWeightF32Kernel(runtime));
     }
@@ -3214,7 +3214,7 @@ public sealed partial class CudaBackend
     private PtxConv2DFp16K1NchwF32Kernel CreateAndCacheDirectPtxConv2DFp16K1KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv2DFp16K1Kernels.GetOrAdd(
             1, () => new PtxConv2DFp16K1NchwF32Kernel(runtime));
     }
@@ -3367,7 +3367,7 @@ public sealed partial class CudaBackend
     private PtxConvTranspose2DNchw3x3BackwardInputF32Kernel CreateAndCacheDirectPtxConvTranspose2D3x3BwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvTranspose2D3x3BwdInputKernels.GetOrAdd(
             1, () => new PtxConvTranspose2DNchw3x3BackwardInputF32Kernel(runtime));
     }
@@ -3520,7 +3520,7 @@ public sealed partial class CudaBackend
     private PtxConvTranspose2DNchw3x3BackwardWeightF32Kernel CreateAndCacheDirectPtxConvTranspose2D3x3BwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvTranspose2D3x3BwdWeightKernels.GetOrAdd(
             1, () => new PtxConvTranspose2DNchw3x3BackwardWeightF32Kernel(runtime));
     }
@@ -3676,7 +3676,7 @@ public sealed partial class CudaBackend
     private PtxFusedConvTranspose2DNchw3x3BiasReluF32Kernel CreateAndCacheDirectPtxFusedConvTranspose2D3x3KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxFusedConvTranspose2D3x3Kernels.GetOrAdd(
             1, () => new PtxFusedConvTranspose2DNchw3x3BiasReluF32Kernel(runtime));
     }
@@ -3823,7 +3823,7 @@ public sealed partial class CudaBackend
     private PtxConv3DNcdhw3x3x3BackwardInputF32Kernel CreateAndCacheDirectPtxConv3D3x3x3BwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv3D3x3x3BwdInputKernels.GetOrAdd(
             1, () => new PtxConv3DNcdhw3x3x3BackwardInputF32Kernel(runtime));
     }
@@ -3970,7 +3970,7 @@ public sealed partial class CudaBackend
     private PtxConv3DNcdhw3x3x3BackwardWeightF32Kernel CreateAndCacheDirectPtxConv3D3x3x3BwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConv3D3x3x3BwdWeightKernels.GetOrAdd(
             1, () => new PtxConv3DNcdhw3x3x3BackwardWeightF32Kernel(runtime));
     }
@@ -4121,7 +4121,7 @@ public sealed partial class CudaBackend
     private PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel CreateAndCacheDirectPtxFusedConv3D3x3x3KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxFusedConv3D3x3x3Kernels.GetOrAdd(
             1, () => new PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel(runtime));
     }
@@ -4269,7 +4269,7 @@ public sealed partial class CudaBackend
     private PtxLocallyConnectedConv2DNchw3x3F32Kernel CreateAndCacheDirectPtxLocallyConnectedConv2DKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxLocallyConnectedConv2DKernels.GetOrAdd(
             1, () => new PtxLocallyConnectedConv2DNchw3x3F32Kernel(runtime));
     }
@@ -4420,7 +4420,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxLocallyConnectedConv2DBwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxLocallyConnectedConv2DBwdInputKernels.GetOrAdd(
             1, () => new PtxLocallyConnectedConv2DNchw3x3BackwardInputF32Kernel(runtime));
     }
@@ -4571,7 +4571,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxLocallyConnectedConv2DBwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxLocallyConnectedConv2DBwdWeightKernels.GetOrAdd(
             1, () => new PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel(runtime));
     }
@@ -4718,7 +4718,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxLocallyConnectedConv2DBwdBiasKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxLocallyConnectedConv2DBwdBiasKernels.GetOrAdd(
             1, () => new PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel(runtime));
     }
@@ -4871,7 +4871,7 @@ public sealed partial class CudaBackend
     private PtxDeformableConv2DNchw3x3F32Kernel CreateAndCacheDirectPtxDeformableConv2DKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DNchw3x3F32Kernel(runtime));
     }
@@ -5028,7 +5028,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DBwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DBwdWeightKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DNchw3x3BackwardWeightF32Kernel(runtime));
     }
@@ -5184,7 +5184,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DBwdMaskKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DBwdMaskKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel(runtime));
     }
@@ -5344,7 +5344,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DBwdOffsetKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DBwdOffsetKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DNchw3x3BackwardOffsetF32Kernel(runtime));
     }
@@ -5500,7 +5500,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DBwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DBwdInputKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DNchw3x3BackwardInputF32Kernel(runtime));
     }
@@ -5647,7 +5647,7 @@ public sealed partial class CudaBackend
     private PtxConvTranspose3DNcdhw3x3x3ForwardF32Kernel CreateAndCacheDirectPtxConvTranspose3D3x3x3KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvTranspose3D3x3x3Kernels.GetOrAdd(
             1, () => new PtxConvTranspose3DNcdhw3x3x3ForwardF32Kernel(runtime));
     }
@@ -5797,7 +5797,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxConvTranspose3D3x3x3BwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvTranspose3D3x3x3BwdInputKernels.GetOrAdd(
             1, () => new PtxConvTranspose3DNcdhw3x3x3BackwardInputF32Kernel(runtime));
     }
@@ -5948,7 +5948,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxConvTranspose3D3x3x3BwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxConvTranspose3D3x3x3BwdWeightKernels.GetOrAdd(
             1, () => new PtxConvTranspose3DNcdhw3x3x3BackwardWeightF32Kernel(runtime));
     }
@@ -6092,7 +6092,7 @@ public sealed partial class CudaBackend
     private PtxIm2colKNFp16Nchw3x3Kernel CreateAndCacheDirectPtxIm2colKNFp16KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxIm2colKNFp16Kernels.GetOrAdd(
             1, () => new PtxIm2colKNFp16Nchw3x3Kernel(runtime));
     }
@@ -6236,7 +6236,7 @@ public sealed partial class CudaBackend
     private PtxUnfoldKNFp16FromFp16Nchw3x3Kernel CreateAndCacheDirectPtxUnfoldKNFp16FromFp16KernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxUnfoldKNFp16FromFp16Kernels.GetOrAdd(
             1, () => new PtxUnfoldKNFp16FromFp16Nchw3x3Kernel(runtime));
     }
@@ -6390,7 +6390,7 @@ public sealed partial class CudaBackend
     private PtxDeformableConv2DGroupedNchw3x3F32Kernel CreateAndCacheDirectPtxDeformableConv2DGroupedKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DGroupedKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DGroupedNchw3x3F32Kernel(runtime));
     }
@@ -6547,7 +6547,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DGroupedBwdWeightKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DGroupedBwdWeightKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DGroupedNchw3x3BackwardWeightF32Kernel(runtime));
     }
@@ -6704,7 +6704,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DGroupedBwdMaskKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DGroupedBwdMaskKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DGroupedNchw3x3BackwardMaskF32Kernel(runtime));
     }
@@ -6865,7 +6865,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DGroupedBwdOffsetKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DGroupedBwdOffsetKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel(runtime));
     }
@@ -7022,7 +7022,7 @@ public sealed partial class CudaBackend
         CreateAndCacheDirectPtxDeformableConv2DGroupedBwdInputKernelSlow()
     {
         DirectPtxRuntime runtime = _directPtxRuntime ??
-            throw new InvalidOperationException("The direct-PTX runtime is not initialized.");
+            throw new GpuCapabilityUnavailableException("The direct-PTX runtime is not initialized.");
         return _directPtxDeformableConv2DGroupedBwdInputKernels.GetOrAdd(
             1, () => new PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel(runtime));
     }

@@ -7,7 +7,7 @@ public sealed partial class MetalBackend : IAudioBackend
     private MetalPipelineState GetAudioPipeline(string n)
     {
         if (_audioLibrary == IntPtr.Zero)
-            throw new InvalidOperationException("Metal Audio library was not compiled.");
+            throw new GpuCapabilityUnavailableException("Metal Audio library was not compiled.");
         return GetPipeline(AudioLibName, _audioLibrary, n);
     }
 

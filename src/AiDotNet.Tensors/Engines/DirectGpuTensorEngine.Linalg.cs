@@ -76,8 +76,7 @@ public partial class DirectGpuTensorEngine
             // Ownership of outBuf is now in the activation/deferred-download
             // caches — do NOT Dispose it below.
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             outBuf.Dispose();
             return (null, null);
         }
@@ -88,8 +87,7 @@ public partial class DirectGpuTensorEngine
             var infoTensor = BuildInfoTensor(input._shape, infoArr);
             return (factor, infoTensor);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             return (null, null); // outBuf already owned by caches; don't touch it.
         }
     }
@@ -123,8 +121,7 @@ public partial class DirectGpuTensorEngine
             luArr = FinishGpuOp<float>(backend, outBuf, batch * m * n);
             // Ownership transferred — do not dispose outBuf below.
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             outBuf.Dispose();
             return (null, null);
         }
@@ -139,8 +136,7 @@ public partial class DirectGpuTensorEngine
             Array.Copy(pivArr, pivots.GetDataArray(), pivArr.Length);
             return (lu, pivots);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             return (null, null); // outBuf owned by caches; don't touch it.
         }
     }
@@ -183,8 +179,7 @@ public partial class DirectGpuTensorEngine
             qArr = FinishGpuOp<float>(backend, qBuf, batch * m * k);
             // qBuf ownership now in caches. rBuf still owned by us.
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             qBuf.Dispose();
             rBuf.Dispose();
             return (null, null);
@@ -197,8 +192,7 @@ public partial class DirectGpuTensorEngine
             rArr = FinishGpuOp<float>(backend, rBuf, batch * k * n);
             // Now both qBuf and rBuf ownership lives in the caches.
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             rBuf.Dispose(); // qBuf is already in the cache — don't touch it.
             return (null, null);
         }
@@ -212,8 +206,7 @@ public partial class DirectGpuTensorEngine
             rShape[rank - 2] = k;
             return (new Tensor<float>(qArr, qShape), new Tensor<float>(rArr, rShape));
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             return (null, null);
         }
     }
@@ -265,8 +258,7 @@ public partial class DirectGpuTensorEngine
             wArr = FinishGpuOp<float>(backend, wBuf, batch * n);
             // wBuf ownership handed off; vBuf still ours.
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             wBuf.Dispose();
             vBuf.Dispose();
             return (null, null);
@@ -278,8 +270,7 @@ public partial class DirectGpuTensorEngine
             vArr = FinishGpuOp<float>(backend, vBuf, batch * n * n);
             // Both buffers now cache-owned.
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             vBuf.Dispose(); // wBuf is cache-owned — don't touch.
             return (null, null);
         }
@@ -291,8 +282,7 @@ public partial class DirectGpuTensorEngine
             wShape[rank - 2] = n;
             return (new Tensor<float>(wArr, wShape), new Tensor<float>(vArr, (int[])input._shape.Clone()));
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             return (null, null);
         }
     }
@@ -324,17 +314,16 @@ public partial class DirectGpuTensorEngine
             lin.LinalgSvdReduced(inBuf.Buffer, uBuf.Buffer, sBuf.Buffer, vhBuf.Buffer, batch, m, n);
             u = FinishGpuOp<float>(backend, uBuf, batch * 16);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap);
             uBuf.Dispose(); sBuf.Dispose(); vhBuf.Dispose();
             return (null, null, null);
         }
         float[] s;
         try { s = FinishGpuOp<float>(backend, sBuf, batch * 4); }
-        catch { sBuf.Dispose(); vhBuf.Dispose(); return (null, null, null); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap); sBuf.Dispose(); vhBuf.Dispose(); return (null, null, null); }
         float[] vh;
         try { vh = FinishGpuOp<float>(backend, vhBuf, batch * 16); }
-        catch { vhBuf.Dispose(); return (null, null, null); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap); vhBuf.Dispose(); return (null, null, null); }
 
         try
         {
@@ -345,7 +334,7 @@ public partial class DirectGpuTensorEngine
             return (new Tensor<float>(u, matrixShape), new Tensor<float>(s, singularShape),
                 new Tensor<float>(vh, matrixShape));
         }
-        catch { return (null, null, null); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BackendEighMaxN", capabilityGap); return (null, null, null); }
     }
 
     /// <summary>GPU exact-shape LU solve for one vector RHS per 4x4 factor.</summary>
@@ -378,8 +367,7 @@ public partial class DirectGpuTensorEngine
                 batch, 4, 1, rhsIsVector: true);
             result = FinishGpuOp<float>(backend, outBuf, rhs.Length);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLuSolve", capabilityGap);
             outBuf.Dispose();
             return null;
         }
@@ -388,7 +376,7 @@ public partial class DirectGpuTensorEngine
         // tensor materialization outside the buffer-owned failure region so a
         // constructor failure cannot return the same buffer twice.
         try { return new Tensor<float>(result, (int[])rhs._shape.Clone()); }
-        catch { return null; }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLuSolve", capabilityGap); return null; }
     }
 
     // ── Small helpers specific to linalg buffer plumbing ────────────────────
@@ -414,8 +402,7 @@ public partial class DirectGpuTensorEngine
                 batch, 4, upper);
             ld = FinishGpuOp<float>(backend, outputBuffer, batch * 16);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLuSolve", capabilityGap);
             outputBuffer.Dispose();
             return (null, null);
         }
@@ -428,7 +415,7 @@ public partial class DirectGpuTensorEngine
             return (new Tensor<float>(ld, (int[])input._shape.Clone()),
                 new Tensor<int>(pivots, pivotShape));
         }
-        catch { return (null, null); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLuSolve", capabilityGap); return (null, null); }
     }
 
     /// <summary>Exact-shape lower LDL vector solve through direct PTX.</summary>
@@ -453,13 +440,12 @@ public partial class DirectGpuTensorEngine
                 outputBuffer.Buffer, batch, 4, upper, rhsIsVector: true);
             output = FinishGpuOp<float>(backend, outputBuffer, batch * 4);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLdlSolve", capabilityGap);
             outputBuffer.Dispose();
             return null;
         }
         try { return new Tensor<float>(output, (int[])rhs._shape.Clone()); }
-        catch { return null; }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLdlSolve", capabilityGap); return null; }
     }
 
     /// <summary>Fused exact-shape general vector solve, optionally returning info.</summary>
@@ -484,8 +470,7 @@ public partial class DirectGpuTensorEngine
                 infoBuffer.Buffer, batch, 4);
             output = FinishGpuOp<float>(backend, outputBuffer, batch * 4);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLdlSolve", capabilityGap);
             outputBuffer.Dispose();
             return (null, null);
         }
@@ -494,7 +479,7 @@ public partial class DirectGpuTensorEngine
             return (new Tensor<float>(output, (int[])rhs._shape.Clone()),
                 BuildInfoTensor(input._shape, DownloadInt32(backend, infoBuffer.Buffer, batch)));
         }
-        catch { return (null, null); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuLdlSolve", capabilityGap); return (null, null); }
     }
 
     /// <summary>Exact-shape non-unit triangular vector solve through direct PTX.</summary>
@@ -518,13 +503,12 @@ public partial class DirectGpuTensorEngine
                 outputBuffer.Buffer, batch, 4, upper, unitDiagonal);
             output = FinishGpuOp<float>(backend, outputBuffer, batch * 4);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuTriangularSolveVector", capabilityGap);
             outputBuffer.Dispose();
             return null;
         }
         try { return new Tensor<float>(output, (int[])rhs._shape.Clone()); }
-        catch { return null; }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuTriangularSolveVector", capabilityGap); return null; }
     }
 
     /// <summary>Fused lower-Cholesky gradient specialization.</summary>
@@ -544,13 +528,12 @@ public partial class DirectGpuTensorEngine
                 outputBuffer.Buffer, batch, 4);
             output = FinishGpuOp<float>(backend, outputBuffer, batch * 16);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuCholeskyBackwardLower", capabilityGap);
             outputBuffer.Dispose();
             return null;
         }
         try { return new Tensor<float>(output, (int[])factor._shape.Clone()); }
-        catch { return null; }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuCholeskyBackwardLower", capabilityGap); return null; }
     }
 
     /// <summary>Fused exact-shape vector-solve gradient specialization.</summary>
@@ -575,20 +558,19 @@ public partial class DirectGpuTensorEngine
                 gradBuffer.Buffer, gradInputBuffer.Buffer, gradRhsBuffer.Buffer, batch, 4);
             gradInput = FinishGpuOp<float>(backend, gradInputBuffer, batch * 16);
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuCholeskyBackwardLower", capabilityGap);
             gradInputBuffer.Dispose(); gradRhsBuffer.Dispose();
             return (null, null);
         }
         float[] gradRhs;
         try { gradRhs = FinishGpuOp<float>(backend, gradRhsBuffer, batch * 4); }
-        catch { gradRhsBuffer.Dispose(); return (null, null); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuCholeskyBackwardLower", capabilityGap); gradRhsBuffer.Dispose(); return (null, null); }
         try
         {
             return (new Tensor<float>(gradInput, (int[])input._shape.Clone()),
                 new Tensor<float>(gradRhs, (int[])solution._shape.Clone()));
         }
-        catch { return (null, null); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuCholeskyBackwardLower", capabilityGap); return (null, null); }
     }
 
     private static int Batch4x4(Tensor<float> input)

@@ -31,9 +31,8 @@ fn fused_apply_activation(xIn : f32, activation : i32) -> f32 {
     // Launch contract (set by the WebGPU dispatch wrapper):
     //   workgroups.x   = batchSize
     //   workgroup_size = (256, 1, 1)
-    //   workgroup memory = static MAX_RANK = 256 floats — covers practical
-    //                      LoRA rank values; rank > 256 is rejected by the
-    //                      dispatch path before the kernel is reached.
+    //   workgroup memory = 256 floats, one rank chunk; the kernel walks any
+    //                      rank in chunks of 256 (#1165).
     public const string LoRAForward = @"
 @group(0) @binding(0) var<storage, read> input_ : array<f32>;
 @group(0) @binding(1) var<storage, read> baseOutput : array<f32>;
@@ -43,7 +42,11 @@ fn fused_apply_activation(xIn : f32, activation : i32) -> f32 {
 struct P { batchSize : i32, inputFeatures : i32, rank : i32, outputFeatures : i32, scaling : f32, pad0 : f32, pad1 : f32, pad2 : f32 };
 @group(0) @binding(5) var<uniform> p : P;
 
-const MAX_RANK : u32 = 256u;
+// The rank is processed in chunks of RANK_CHUNK (#1165): each chunk projects input . loraA[:, chunk] into
+// workgroup memory, then the thread owning each output column adds that chunk's proj . loraB[chunk, :]. The first
+// chunk writes base + scaling * delta and later chunks accumulate, so any rank works; a rank <= RANK_CHUNK is one
+// chunk and computes exactly the single-pass result.
+const RANK_CHUNK : u32 = 256u;
 var<workgroup> proj : array<f32, 256>;
 
 @compute @workgroup_size(256)
@@ -53,39 +56,48 @@ fn main(
 ) {
     let b = i32(wg.x);
     if (b >= p.batchSize) { return; }
+    // Fail closed if host validation regressed: the signed stride `i * p.rank` needs a positive rank.
+    if (p.rank <= 0) { return; }
 
     let blockSize : u32 = 256u;
     let inBase = b * p.inputFeatures;
-
-    // Fail closed if host validation regressed: rank must be in (0, MAX_RANK].
-    // The signed-stride term `i * p.rank` below makes a non-positive rank
-    // produce wrong indices, so refuse to run rather than silently corrupting.
-    if (p.rank <= 0 || u32(p.rank) > MAX_RANK) { return; }
-    let effRank = u32(p.rank);
-    var r : u32 = tid.x;
-    loop {
-        if (r >= effRank) { break; }
-        var acc : f32 = 0.0;
-        for (var i : i32 = 0; i < p.inputFeatures; i = i + 1) {
-            acc = acc + input_[inBase + i] * loraA[i * p.rank + i32(r)];
-        }
-        proj[r] = acc;
-        r = r + blockSize;
-    }
-
-    workgroupBarrier();
-
-    // Stage 2: each thread emits one or more output columns, reusing proj.
     let outBase = b * p.outputFeatures;
-    var o : u32 = tid.x;
+    let effRank = u32(p.rank);
+
+    var c0 : u32 = 0u;
     loop {
-        if (i32(o) >= p.outputFeatures) { break; }
-        var delta : f32 = 0.0;
-        for (var rr : u32 = 0u; rr < effRank; rr = rr + 1u) {
-            delta = delta + proj[rr] * loraB[i32(rr) * p.outputFeatures + i32(o)];
+        if (c0 >= effRank) { break; }
+        let chunk = min(RANK_CHUNK, effRank - c0);
+
+        // Stage 1: proj[r] = input . loraA[:, c0 + r] for this chunk (one thread per r).
+        if (tid.x < chunk) {
+            let r = c0 + tid.x;
+            var acc : f32 = 0.0;
+            for (var i : i32 = 0; i < p.inputFeatures; i = i + 1) {
+                acc = acc + input_[inBase + i] * loraA[i * p.rank + i32(r)];
+            }
+            proj[tid.x] = acc;
         }
-        output[outBase + i32(o)] = baseOutput[outBase + i32(o)] + p.scaling * delta;
-        o = o + blockSize;
+        workgroupBarrier();
+
+        // Stage 2: each thread owns output columns o, o + 256, ...; it adds this chunk's contribution.
+        var o : u32 = tid.x;
+        loop {
+            if (i32(o) >= p.outputFeatures) { break; }
+            var delta : f32 = 0.0;
+            for (var rr : u32 = 0u; rr < chunk; rr = rr + 1u) {
+                delta = delta + proj[rr] * loraB[i32(c0 + rr) * p.outputFeatures + i32(o)];
+            }
+            if (c0 == 0u) {
+                output[outBase + i32(o)] = baseOutput[outBase + i32(o)] + p.scaling * delta;
+            } else {
+                output[outBase + i32(o)] = output[outBase + i32(o)] + p.scaling * delta;
+            }
+            o = o + blockSize;
+        }
+        // Every thread is done reading proj before the next chunk overwrites it.
+        workgroupBarrier();
+        c0 = c0 + RANK_CHUNK;
     }
 }
 ";

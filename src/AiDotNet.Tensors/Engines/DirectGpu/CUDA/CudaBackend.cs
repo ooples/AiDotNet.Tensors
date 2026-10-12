@@ -535,7 +535,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public int MaxConcurrentStreams => 16;
     public IGpuStream DefaultStream => IsCapturingOnThisBackend && _captureStreamWrapper is { } capturing
         ? capturing
-        : _defaultStream ?? throw new InvalidOperationException("Backend not initialized");
+        : _defaultStream ?? throw new GpuCapabilityUnavailableException("Backend not initialized");
 
     public static bool IsCudaAvailable => CudaNativeBindings.IsAvailable && NvrtcNativeBindings.IsAvailable;
 
@@ -1663,7 +1663,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Cuda);
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
         LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
@@ -1988,7 +1988,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public IGpuBuffer AllocateBuffer(int size)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
@@ -2041,7 +2041,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public IGpuBuffer AllocateBufferUninitialized(int size)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
@@ -2082,7 +2082,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public IGpuBuffer AllocateByteBuffer(int size)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
@@ -2325,7 +2325,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
@@ -2360,7 +2360,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
 
         if (alpha == 1.0f && beta == 0.0f &&
@@ -2407,7 +2407,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void MatMulTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
 
         using var _ = PushContext();
@@ -2457,7 +2457,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
 
@@ -2543,7 +2543,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
         float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
         if (alpha == 1.0f && beta == 0.0f &&
@@ -2624,7 +2624,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
         float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (Q is null) throw new ArgumentNullException(nameof(Q));
         if (K is null) throw new ArgumentNullException(nameof(K));
         if (scores is null) throw new ArgumentNullException(nameof(scores));
@@ -2738,7 +2738,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool useBFloat16 = false,
         float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (Q is null) throw new ArgumentNullException(nameof(Q));
         if (K is null) throw new ArgumentNullException(nameof(K));
         if (scores is null) throw new ArgumentNullException(nameof(scores));
@@ -2857,7 +2857,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
         float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (attention is null) throw new ArgumentNullException(nameof(attention));
         if (V is null) throw new ArgumentNullException(nameof(V));
         if (output is null) throw new ArgumentNullException(nameof(output));
@@ -2966,7 +2966,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool useBFloat16 = false,
         float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
         // A/B are 2-byte (fp16/bf16); C is fp32. Use the byte-aware
         // validator — the element-count overload would interpret A.Size
@@ -3041,7 +3041,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         AiDotNet.Tensors.Engines.Gpu.GpuStreamScheduler scheduler,
         double alpha = 1.0, double beta = 0.0)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (scheduler is null) throw new ArgumentNullException(nameof(scheduler));
         // All three buffers are fp64 (8-byte). The fp32-shaped validator
         // would underestimate the byte requirement by 2× and accept a
@@ -3417,7 +3417,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N, int groupSize, int scaleCount)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         var output = AllocateBuffer(M * N);
         using var _ = PushContext();
         uint grid = (uint)(((long)M * N + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3448,7 +3448,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
         {
             output.Dispose();
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: paged_attention_decode");
         }
         using var _ = PushContext();
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3479,7 +3479,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
         {
             output.Dispose();
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: paged_attention_prefill");
         }
         using var _ = PushContext();
         int totalItems = numQueries * heads;
@@ -3510,7 +3510,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
         {
             output.Dispose();
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_decode_gqa");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: paged_attention_decode_gqa");
         }
         using var _ = PushContext();
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3540,7 +3540,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
         {
             output.Dispose();
-            throw new InvalidOperationException("CUDA kernel not found: paged_attention_prefill_gqa");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: paged_attention_prefill_gqa");
         }
         using var _ = PushContext();
         int totalItems = numQueries * heads;
@@ -3572,12 +3572,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
         {
             output.Dispose();
-            throw new InvalidOperationException("CUDA kernel not found: flash_decode_partial");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: flash_decode_partial");
         }
         if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
         {
             output.Dispose();
-            throw new InvalidOperationException("CUDA kernel not found: flash_decode_reduce");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: flash_decode_reduce");
         }
         int effSplits = splits > 0 ? splits : System.Math.Min(seqLen, 8);
         if (effSplits > seqLen) effSplits = seqLen;
@@ -3620,7 +3620,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel) ||
             !_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
-            throw new InvalidOperationException("CUDA flash-decode kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("CUDA flash-decode kernels are unavailable.");
         GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecodeCurrentInto));
         if (splits <= 0 || splits > seqLen) throw new ArgumentOutOfRangeException(nameof(splits));
         int splitLen = (seqLen + splits - 1) / splits;
@@ -3656,7 +3656,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool gqa = heads != kvHeads;
         string kernelName = gqa ? "paged_attention_decode_gqa" : "paged_attention_decode";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeCurrentInto));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeCurrentInto));
         GpuKernelGuards.PagedAttentionBuffers(
@@ -3696,7 +3696,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool gqa = heads != kvHeads;
         string kernelName = gqa ? "paged_attention_prefill_gqa" : "paged_attention_prefill";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillCurrentInto));
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillCurrentInto));
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
@@ -3773,7 +3773,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         string kernelName = useWmma ? wmmaName : scalarName;
 
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA fused kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA fused kernel not found: {kernelName}");
 
         using var _ = PushContext();
         IntPtr aPtr = A.Handle;
@@ -3818,7 +3818,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
     {
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bias_add_out");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add_out");
 
         using var _ = PushContext();
         uint gridX = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3874,7 +3874,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         Add(input, residual, output, elements);
         BiasAdd(output, preNormBias, output, rows, 64);
         if (!_kernelCache.TryGetValue("layernorm_gelu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: layernorm_gelu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: layernorm_gelu");
         using var context = PushContext();
         IntPtr inputPointer = output.Handle;
         IntPtr outputPointer = output.Handle;
@@ -3897,7 +3897,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
         if (!_kernelCache.TryGetValue("conv2d_bias_add", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_bias_add");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_bias_add");
 
         using var _ = PushContext();
         // 2D grid: x=spatial, y=batch*channels — eliminates integer division in kernel
@@ -3963,7 +3963,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (size <= 0) return;
         if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: scale_by_device_scalar");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: scale_by_device_scalar");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr bufPtr = buffer.Handle;
@@ -3986,7 +3986,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (count > dst.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Count ({count}) exceeds destination size ({dst.Size}).");
 
         if (!_kernelCache.TryGetValue("strided_gather", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: strided_gather. Register the kernel or use CPU fallback.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: strided_gather. Register the kernel or use CPU fallback.");
 
         using var _ = PushContext();
         uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -4014,7 +4014,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (count > src.Size) throw new ArgumentOutOfRangeException(nameof(count), $"Count ({count}) exceeds source size ({src.Size}).");
 
         if (!_kernelCache.TryGetValue("strided_scatter", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: strided_scatter. Register the kernel or use CPU fallback.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: strided_scatter. Register the kernel or use CPU fallback.");
 
         using var _ = PushContext();
         uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -4117,7 +4117,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
         if (!_kernelCache.TryGetValue("squash", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: squash");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: squash");
 
         using var _ = PushContext();
         uint grid = (uint)((numCapsules + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -4138,7 +4138,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
         if (!_kernelCache.TryGetValue("squash_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: squash_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: squash_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((numCapsules + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -4164,7 +4164,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxCapsulePredictions(input, weights, output, batchSize, inputCapsules, inputDim, outputCapsules, outputDim)) return;
 
         if (!_kernelCache.TryGetValue("capsule_predictions", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: capsule_predictions");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: capsule_predictions");
 
         using var _ = PushContext();
         int totalOutputs = batchSize * inputCapsules * outputCapsules * outputDim;
@@ -4195,7 +4195,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxCapsuleTransform(input, weights, output, batchSize, inputCapsules, inputDim, numCapsules, capsuleDim)) return;
 
         if (!_kernelCache.TryGetValue("capsule_transform", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: capsule_transform");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: capsule_transform");
 
         using var _ = PushContext();
         int totalOutputs = batchSize * inputCapsules * numCapsules * capsuleDim;
@@ -4226,7 +4226,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxCapsuleWeightedSum(coupling, predictions, output, batchSize, inputCapsules, outputCapsules, capsuleDim)) return;
 
         if (!_kernelCache.TryGetValue("capsule_weighted_sum", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: capsule_weighted_sum");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: capsule_weighted_sum");
 
         using var _ = PushContext();
         int totalOutputs = batchSize * outputCapsules * capsuleDim;
@@ -4255,7 +4255,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxCapsuleAgreement(predictions, output, agreement, batchSize, inputCapsules, outputCapsules, capsuleDim)) return;
 
         if (!_kernelCache.TryGetValue("capsule_agreement", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: capsule_agreement");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: capsule_agreement");
 
         using var _ = PushContext();
         int totalOutputs = batchSize * inputCapsules * outputCapsules;
@@ -4308,7 +4308,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
     {
         if (!_kernelCache.TryGetValue("tile_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: tile_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: tile_axis");
 
         using var _ = PushContext();
         int totalSize = outerSize * axisSize * repeats * innerSize;
@@ -4452,7 +4452,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(M), $"Packed 2:4 metadata requires {requiredIndexBytes} bytes but sparseIndices has {sparseIndices.SizeInBytes}.");
 
         if (!_kernelCache.TryGetValue("enforce_2x4_sparsity", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: enforce_2x4_sparsity");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: enforce_2x4_sparsity");
 
         using var _ = PushContext();
         IntPtr densePtr = denseInput.Handle;
@@ -4482,7 +4482,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException("One or more buffers are too small for the requested 2:4 decompression.");
 
         if (!_kernelCache.TryGetValue("decompress_2x4_sparse", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: decompress_2x4_sparse");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: decompress_2x4_sparse");
 
         using var _ = PushContext();
         IntPtr valsPtr = sparseValues.Handle;
@@ -4506,7 +4506,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException("K must be a multiple of 4 for 2:4 sparse GEMM.");
 
         if (!_kernelCache.TryGetValue("sparse_gemm_2x4", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_gemm_2x4");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_gemm_2x4");
 
         using var _ = PushContext();
         IntPtr valsPtr = sparseAValues.Handle;
@@ -4537,7 +4537,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException("K must be a multiple of 4 for 2:4 sparse GEMM.");
 
         if (!_kernelCache.TryGetValue("sparse_gemm_bias_relu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_gemm_bias_relu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_gemm_bias_relu");
 
         var output = AllocateBuffer(M * N);
         using var _ = PushContext();
@@ -4575,10 +4575,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_spmm");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm");
 
         using var _ = PushContext();
 
@@ -4619,11 +4619,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int nnz, int innerK)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (nnz == 0) return;
 
         if (!_kernelCache.TryGetValue("sddmm", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sddmm");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sddmm");
 
         using var _ = PushContext();
 
@@ -4663,10 +4663,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_warp");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_warp");
 
         using var _ = PushContext();
 
@@ -4708,10 +4708,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_double");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_double");
 
         using var _ = PushContext();
 
@@ -4753,7 +4753,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         // Fail fast on misaligned N: each thread computes 4 adjacent output
         // columns via float4 loads, so a non-multiple-of-4 N would silently
@@ -4767,7 +4767,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 nameof(N));
 
         if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_vec4");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_vec4");
 
         using var _ = PushContext();
 
@@ -4806,10 +4806,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm_bias", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_spmm_bias");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_spmm_bias");
 
         using var _ = PushContext();
 
@@ -4848,7 +4848,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int numNodes, int numEdges, int features)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
 
@@ -4877,7 +4877,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Issue #382: per-target-node thread scans edges in fixed order.
             if (!_kernelCache.TryGetValue("scatter_add_edges_deterministic", out var krnlD))
-                throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_add_edges_deterministic");
             uint gridDX = (uint)numNodes;
             uint gridDY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel2D(krnlD, gridDX, gridDY, (uint)DefaultBlockSize, 1, args2);
@@ -4885,7 +4885,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("scatter_add_edges", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: scatter_add_edges");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_add_edges");
 
         uint gridX = (uint)numEdges;
         uint gridY = (uint)((features + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -4895,7 +4895,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void ZeroBuffer(IGpuBuffer buffer, int size)
     {
         if (!_kernelCache.TryGetValue("zero_buffer", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: zero_buffer");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: zero_buffer");
 
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr bufferPtr = buffer.Handle;
@@ -4947,10 +4947,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_segmented_max", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_segmented_max");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_max");
 
         using var _ = PushContext();
 
@@ -4984,10 +4984,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int M, int K, int N)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_segmented_min", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_segmented_min");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_min");
 
         using var _ = PushContext();
 
@@ -5022,10 +5022,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         float epsilon = 1e-8f)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_segmented_stddev", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: csr_segmented_stddev");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: csr_segmented_stddev");
 
         using var _ = PushContext();
 
@@ -5068,7 +5068,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private float ReduceGpuScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (size <= 0)
             return emptyValue;
@@ -5118,7 +5118,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (outerSize <= 0 || reduceSize <= 0)
             throw new ArgumentException("outerSize and reduceSize must be positive.");
@@ -5170,7 +5170,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool blockPerRow = reduceSize >= SumAxisRowsMinReduce;
         string kernelName = blockPerRow ? "sum_axis_rows" : "sum_axis";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
         uint grid = blockPerRow
@@ -5333,7 +5333,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public GpuSyncPoint CreateSyncPoint()
     {
         if (_defaultStream == null)
-            throw new InvalidOperationException("Backend not initialized");
+            throw new GpuCapabilityUnavailableException("Backend not initialized");
 
         return new CudaSyncPoint(this, _defaultStream);
     }
@@ -5393,7 +5393,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // backend. Without this, a failed backend init or a freed graph-input buffer (zero handle)
         // would fall through to a raw cuMemcpyHtoD and fault the CUDA context (error 700) instead.
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (buffer.Handle == IntPtr.Zero)
             throw new ObjectDisposedException(nameof(buffer),
                 "GPU buffer was released before its in-place upload.");
@@ -5414,7 +5414,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (buffer.Handle == IntPtr.Zero)
             throw new ObjectDisposedException(nameof(buffer),
                 "GPU buffer was released before its in-place upload.");
@@ -5546,7 +5546,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         OrderAfterStagedUploads(stream);
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
@@ -5594,7 +5594,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         OrderAfterStagedUploads(stream);
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         // Softmax is row-wise; it can't fuse into the pointwise GEMM epilogue (used to throw here).
         // GEMM+bias then per-row softmax over [M, N]. Verified on CUDA + OpenCL (RTX 2060).
@@ -5632,13 +5632,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxLinearWeightLayout.InputMajor))
             return;
 
-        // Map activation to fused kernel name
+        // Map activation to the CudaFusedKernels GEMM epilogue (compiled as gemm_bias[_<activation>]; the
+        // "fused_"-prefixed names this used to look up were never compiled, so every caller-stream launch failed).
         string kernelName = activation switch
         {
-            FusedActivationType.ReLU => "fused_gemm_bias_relu",
-            FusedActivationType.Sigmoid => "fused_gemm_bias_sigmoid",
-            FusedActivationType.Tanh => "fused_gemm_bias_tanh",
-            FusedActivationType.None => "fused_gemm_bias",
+            FusedActivationType.ReLU => "gemm_bias_relu",
+            FusedActivationType.Sigmoid => "gemm_bias_sigmoid",
+            FusedActivationType.Tanh => "gemm_bias_tanh",
+            FusedActivationType.None => "gemm_bias",
             _ => throw new NotSupportedException($"Activation type {activation} not supported for fused GEMM")
         };
 
@@ -5736,7 +5737,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void ExecuteFusedGemmOnStream(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output, int M, int N, int K, IGpuStream stream)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA fused kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA fused kernel not found: {kernelName}");
 
         using var _ = PushContext();
 
@@ -5799,7 +5800,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -5846,7 +5847,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -5883,7 +5884,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("scale_vector", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: scale_vector");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: scale_vector");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -5902,7 +5903,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchUnaryWithScalarKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -5933,7 +5934,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchSoftmaxReference(IGpuBuffer input, IGpuBuffer output, int batchSize, int features)
     {
         if (!_kernelCache.TryGetValue("softmax", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: softmax");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: softmax");
 
         using var _ = PushContext();
 
@@ -5966,7 +5967,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchReductionKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, int blockSize)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         uint grid = (uint)((size + blockSize - 1) / blockSize);
         IntPtr inputPtr = input.Handle;
@@ -5984,7 +5985,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void ApplyBiasInPlace(IGpuBuffer data, IGpuBuffer bias, int rows, int cols)
     {
         if (!_kernelCache.TryGetValue("bias_add", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bias_add");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add");
 
         using var _ = PushContext();
         uint gridX = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -6434,7 +6435,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA fused kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA fused kernel not found: {kernelName}");
 
         using var _ = PushContext();
 
@@ -6730,7 +6731,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Fallback: direct convolution with correct 3D grid
         if (!_kernelCache.TryGetValue("conv2d_direct", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_direct");
 
         {
             const int BLOCK = 16;
@@ -6781,7 +6782,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("conv2d_direct_fp16hw", out var k))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_direct_fp16hw");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_direct_fp16hw");
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (weightsHalf is null) throw new ArgumentNullException(nameof(weightsHalf));
         if (output is null) throw new ArgumentNullException(nameof(output));
@@ -6833,7 +6834,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("im2col_kn_fp16hw", out var k))
-            throw new InvalidOperationException("CUDA kernel not found: im2col_kn_fp16hw");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: im2col_kn_fp16hw");
         // #671 review: validate launch dimensions before computing the grid — strideH/strideW == 0 divides by
         // zero, a non-positive output extent makes `elems` negative, and an overflowing `elems` casts to a huge
         // uint launch size. Guard the public backend boundary before LaunchKernel.
@@ -6883,7 +6884,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("im2col_kn_fp16_from_fp16", out var k))
-            throw new InvalidOperationException("CUDA kernel not found: im2col_kn_fp16_from_fp16");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: im2col_kn_fp16_from_fp16");
         IntPtr inputPtr = inputHalf.Handle, outputPtr = outputHalf.Handle;
         int outH = (height + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
         int outW = (width + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
@@ -6950,7 +6951,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             return;
         if (!_kernelCache.TryGetValue("conv2d_backward_input", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_backward_input");
 
         using var _ = PushContext();
         const int BLOCK = 16;
@@ -6994,7 +6995,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             return;
         if (!_kernelCache.TryGetValue("conv2d_backward_kernel", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_backward_kernel");
 
         using var _ = PushContext();
         // One thread per gradKernel element (see the kernel): a flat 1D grid has no 65,535 limit.
@@ -7069,7 +7070,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("im2col", out var im2colKernel))
-            throw new InvalidOperationException("CUDA kernel not found: im2col");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: im2col");
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -7104,7 +7105,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
         using var _ = PushContext();
         if (!_kernelCache.TryGetValue("col2im", out var col2imKernel))
-            throw new InvalidOperationException("CUDA kernel not found: col2im");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: col2im");
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -7138,7 +7139,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int dilationD, int dilationH, int dilationW)
     {
         if (!_kernelCache.TryGetValue("conv3d_direct", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv3d_direct");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv3d_direct");
 
         using var _ = PushContext();
         // The conv3d_direct kernel uses a 3D grid + 2D block: blockIdx.x→outWidth,
@@ -7198,7 +7199,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 
         if (!_kernelCache.TryGetValue("depthwise_conv2d", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: depthwise_conv2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: depthwise_conv2d");
 
         using var _ = PushContext();
         IntPtr inputPtr = input.Handle;
@@ -7236,7 +7237,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int outputPadH, int outputPadW)
     {
         if (!_kernelCache.TryGetValue("conv_transpose2d", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv_transpose2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv_transpose2d");
 
         using var _ = PushContext();
         IntPtr inputPtr = input.Handle;
@@ -7289,7 +7290,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"gradInput buffer too small: expected at least {requiredGradInput} elements, got {gradInput.Size}.", nameof(gradInput));
 
         if (!_kernelCache.TryGetValue("conv_transpose2d_backward_input", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv_transpose2d_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv_transpose2d_backward_input");
 
         using var _ = PushContext();
         int totalInput = batch * inChannels * inHeight * inWidth;
@@ -7340,7 +7341,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"gradKernel buffer too small: expected at least {requiredGradKernel} elements, got {gradKernel.Size}.", nameof(gradKernel));
 
         if (!_kernelCache.TryGetValue("conv_transpose2d_backward_kernel", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: conv_transpose2d_backward_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv_transpose2d_backward_kernel");
 
         using var _ = PushContext();
         int totalKernel = inChannels * outChannels * kernelH * kernelW;
@@ -7380,7 +7381,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: locally_connected_conv2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: locally_connected_conv2d");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -7421,7 +7422,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d_backward_input", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: locally_connected_conv2d_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: locally_connected_conv2d_backward_input");
 
         using var _ = PushContext();
         int totalInputSize = batch * inChannels * inHeight * inWidth;
@@ -7456,7 +7457,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d_backward_weights", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: locally_connected_conv2d_backward_weights");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: locally_connected_conv2d_backward_weights");
 
         using var _ = PushContext();
         int totalWeights = outHeight * outWidth * outChannels * inChannels * kernelH * kernelW;
@@ -7488,7 +7489,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batch, int outChannels, int outHeight, int outWidth)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d_backward_bias", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: locally_connected_conv2d_backward_bias");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: locally_connected_conv2d_backward_bias");
 
         using var _ = PushContext();
         uint gridX = (uint)((outChannels + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -7519,7 +7520,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: deformable_conv2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: deformable_conv2d");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -7570,7 +7571,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_input", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: deformable_conv2d_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: deformable_conv2d_backward_input");
 
         using var _ = PushContext();
         int totalInputSize = batch * inChannels * inHeight * inWidth;
@@ -7620,7 +7621,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_weights", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: deformable_conv2d_backward_weights");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: deformable_conv2d_backward_weights");
 
         using var _ = PushContext();
         int inChannelsPerGroup = inChannels / groups;
@@ -7674,7 +7675,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_offset", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: deformable_conv2d_backward_offset");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: deformable_conv2d_backward_offset");
 
         using var _ = PushContext();
         // The deformable_conv2d_backward_offset kernel is 1-D indexed
@@ -7731,7 +7732,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_mask", out var cudaKernel))
-            throw new InvalidOperationException("CUDA kernel not found: deformable_conv2d_backward_mask");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: deformable_conv2d_backward_mask");
 
         using var _ = PushContext();
         // The deformable_conv2d_backward_mask kernel is 1-D indexed
@@ -7796,7 +7797,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 
         if (!_kernelCache.TryGetValue("maxpool2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool2d");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -7859,7 +7860,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Issue #382: route to atomic-free variant.
             if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool2d_backward_deterministic");
             // The window geometry lets each input cell visit only the output cells whose pooling window covers
             // it (instead of every output cell of its plane); see the kernel for the bit-identity argument.
             void** argsD = stackalloc void*[15];
@@ -7887,7 +7888,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("maxpool2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool2d_backward");
 
         // The non-deterministic kernel SCATTERS via atomicAdd to max cells only — non-max cells get no
         // write, so gradInput must read as zero. AllocateBuffer zeroes it via a null-stream cuMemsetD32,
@@ -7923,7 +7924,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool countIncludePad)
     {
         if (!_kernelCache.TryGetValue("avgpool2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: avgpool2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: avgpool2d");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -7966,7 +7967,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool countIncludePad)
     {
         if (!_kernelCache.TryGetValue("avgpool2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: avgpool2d_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: avgpool2d_backward");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -8010,7 +8011,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 #endif
         if (!_kernelCache.TryGetValue("global_avgpool2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: global_avgpool2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: global_avgpool2d");
 
         using var _ = PushContext();
         uint grid = (uint)((batch * channels + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -8039,7 +8040,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices, int batch, int channels, int height, int width)
     {
         if (!_kernelCache.TryGetValue("global_maxpool2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: global_maxpool2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: global_maxpool2d");
 
         using var _ = PushContext();
         uint grid = (uint)((batch * channels + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -8063,7 +8064,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         if (!_kernelCache.TryGetValue("global_avgpool2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: global_avgpool2d_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: global_avgpool2d_backward");
 
         using var _ = PushContext();
         int totalElements = batch * channels * height * width;
@@ -8103,7 +8104,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             ? "global_maxpool2d_backward_deterministic"
             : "global_maxpool2d_backward";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: " + kernelName);
 
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
@@ -8111,7 +8112,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
         if (!_kernelCache.TryGetValue("adaptive_avgpool2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adaptive_avgpool2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adaptive_avgpool2d");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -8141,7 +8142,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideD, int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("maxpool3d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool3d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool3d");
 
         using var _ = PushContext();
         const int blockSize = 8;
@@ -8205,7 +8206,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Issue #382: deterministic kernel parallelizes per input cell (iw, ih, b*c*id).
             if (!_kernelCache.TryGetValue("maxpool3d_backward_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool3d_backward_deterministic");
             uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
             uint gridDZ = (uint)(batch * channels * inDepth);
@@ -8214,7 +8215,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("maxpool3d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: maxpool3d_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool3d_backward");
 
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
@@ -8228,7 +8229,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int scaleD, int scaleH, int scaleW)
     {
         if (!_kernelCache.TryGetValue("nearest_upsample3d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: nearest_upsample3d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: nearest_upsample3d");
 
         using var _ = PushContext();
         int outDepth = inDepth * scaleD;
@@ -8272,7 +8273,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Issue #382: per-input-cell scan of scale-cube output cells.
             if (!_kernelCache.TryGetValue("nearest_upsample3d_backward_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: nearest_upsample3d_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: nearest_upsample3d_backward_deterministic");
             void** argsD = stackalloc void*[10];
             argsD[0] = &gradOutPtr;
             argsD[1] = &gradInPtr;
@@ -8292,7 +8293,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("nearest_upsample3d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: nearest_upsample3d_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: nearest_upsample3d_backward");
 
         int outDepth = inDepth * scaleD;
         int outHeight = inHeight * scaleH;
@@ -8324,7 +8325,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void AffineGrid(IGpuBuffer theta, IGpuBuffer grid, int batch, int outputHeight, int outputWidth)
     {
         if (!_kernelCache.TryGetValue("affine_grid", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: affine_grid");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: affine_grid");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -8348,7 +8349,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int paddingMode = 0, bool alignCorners = false)
     {
         if (!_kernelCache.TryGetValue("grid_sample", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: grid_sample");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: grid_sample");
 
         using var _ = PushContext();
         const int blockSize = 16;
@@ -8395,7 +8396,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Issue #382: split into gradGrid (per output position) + gradInput
             // (per input cell) atomic-free kernels.
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_grid_deterministic", out var krnlGrid))
-                throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward_grad_grid_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: grid_sample_backward_grad_grid_deterministic");
 
             void** argsG = stackalloc void*[13];
             argsG[0] = &gradOutputPtr;
@@ -8416,7 +8417,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             LaunchKernel2D(krnlGrid, gridGX, gridGY, gridGZ, (uint)blockSize, (uint)blockSize, argsG);
 
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlIn))
-                throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward_grad_input_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: grid_sample_backward_grad_input_deterministic");
 
             void** argsI = stackalloc void*[11];
             argsI[0] = &gradOutputPtr;
@@ -8438,7 +8439,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("grid_sample_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: grid_sample_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: grid_sample_backward");
 
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
@@ -8519,7 +8520,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("batchnorm_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: batchnorm_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: batchnorm_forward");
 
         // Dispatch path telemetry — see Conv2D for the rationale.
         using var _profile = CudaDispatchPolicy.Scope(
@@ -8661,7 +8662,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 
         if (!_kernelCache.TryGetValue("batchnorm_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: batchnorm_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: batchnorm_backward");
 
         using var _ = PushContext();
         uint gridX = (uint)channels;
@@ -8755,7 +8756,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("groupnorm_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: groupnorm_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: groupnorm_forward");
 
         using var _ = PushContext();
         uint gridX = (uint)(batch * numGroups);
@@ -8790,7 +8791,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 
         if (!_kernelCache.TryGetValue("instancenorm_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: instancenorm_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: instancenorm_forward");
 
         using var _ = PushContext();
         uint gridX = (uint)(batch * channels);
@@ -8872,7 +8873,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Zero every destination before selecting the stage-one implementation. The throughput path
         // accumulates with atomicAdd; the deterministic kernels overwrite these buffers in fixed order.
         if (!_kernelCache.TryGetValue("instancenorm_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: instancenorm_backward");
 
         using var _ = PushContext();
 
@@ -8946,7 +8947,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         else
         {
             if (!_kernelCache.TryGetValue("instancenorm_backward_sums", out var sumsKernel))
-                throw new InvalidOperationException("CUDA kernel not found: instancenorm_backward_sums");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: instancenorm_backward_sums");
 
             void** sumsArgs = stackalloc void*[13];
             sumsArgs[0] = &gradOutputPtr;
@@ -8990,7 +8991,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 
         if (!_kernelCache.TryGetValue("rmsnorm_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rmsnorm_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rmsnorm_forward");
 
         using var _ = PushContext();
         uint gridX = (uint)batchSize;
@@ -9021,7 +9022,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Compute gradInput using rmsnorm_backward kernel
         if (!_kernelCache.TryGetValue("rmsnorm_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rmsnorm_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rmsnorm_backward");
 
         using var _ = PushContext();
         uint gridX = (uint)batchSize;
@@ -9063,7 +9064,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             input, output, mask, size, dropoutRate, seed))
             return;
         if (!_kernelCache.TryGetValue("dropout_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: dropout_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: dropout_forward");
 
         // dropout_forward ONLY applies a pre-generated mask (output = input * mask * scale); it does
         // NOT generate the random mask. The previous code (a) never populated `mask` — the freshly
@@ -9100,7 +9101,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxDropoutBackwardF32(gradOutput, mask, gradInput, size))
             return;
         if (!_kernelCache.TryGetValue("dropout_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: dropout_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: dropout_backward");
 
         // dropout_backward kernel signature is (gradOutput, mask, gradInput, float scale, int size).
         // The previous launch passed `size` into the kernel's `scale` slot and `dropoutRate` into its
@@ -9159,7 +9160,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
     {
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
         using var _ = PushContext();
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -9188,7 +9189,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // across runs. Route to the atomic-free deterministic variant — one
             // thread per (v, d) output cell scans numIndices in fixed order.
             if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: embedding_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward_deterministic");
 
             void** argsD = stackalloc void*[6];
             argsD[0] = &gradOutPtr;
@@ -9206,7 +9207,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args = stackalloc void*[5];
@@ -9221,7 +9222,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public IGpuBuffer AllocateIntBuffer(int size)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
@@ -9239,7 +9240,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Cuda);
@@ -9290,7 +9291,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
         if (!_kernelCache.TryGetValue("scaled_dot_product_attention", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: scaled_dot_product_attention");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: scaled_dot_product_attention");
 
         // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
         // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
@@ -9413,7 +9414,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if ((headDim & 1) != 0)
             throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
         if (!_kernelCache.TryGetValue("rope_interleaved", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rope_interleaved");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rope_interleaved");
         int total = checked(rows * headDim);
         if (input.Size < total || output.Size < total)
             throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
@@ -9865,7 +9866,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxTranspose2D(A, B, rows, cols))
             return;
         if (!_kernelCache.TryGetValue("transpose_2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: transpose_2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: transpose_2d");
 
         using var _ = PushContext();
         // Kernel reads `row = blockIdx.y * blockDim.y + threadIdx.y` and
@@ -9890,7 +9891,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BatchedTranspose(IGpuBuffer A, IGpuBuffer B, int batch, int rows, int cols)
     {
         if (!_kernelCache.TryGetValue("batched_transpose", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: batched_transpose");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: batched_transpose");
 
         using var _ = PushContext();
         // batched_transpose reads blockIdx.{x,y,z} and threadIdx.{x,y}.
@@ -9943,7 +9944,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // General permute using dedicated kernel
         if (!_kernelCache.TryGetValue("permute_general", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: permute_general");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: permute_general");
 
         using var _ = PushContext();
 
@@ -9998,7 +9999,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(float);
@@ -10020,7 +10021,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void Fill(IGpuBuffer buffer, float value, int size)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
         // cuMemsetD32 sets 32-bit values (net471 compatible conversion)
@@ -10039,10 +10040,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows, int srcCols, int destTotalCols, int destColOffset)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("copy_2d_strided", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: copy_2d_strided");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: copy_2d_strided");
 
         if (numRows <= 0 || srcCols <= 0) return;   // an empty grid is an invalid launch, and there is nothing to copy
         using var _ = PushContext();
@@ -10086,10 +10087,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: nearest_neighbor_upsample");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: nearest_neighbor_upsample");
 
         using var _ = PushContext();
 
@@ -10129,7 +10130,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         // Use checked arithmetic to detect overflow in dimension calculations
         long inputSizeLong;
@@ -10153,7 +10154,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int inputSize = (int)inputSizeLong;
 
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: nearest_neighbor_upsample_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: nearest_neighbor_upsample_backward");
 
         using var _ = PushContext();
 
@@ -10200,7 +10201,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("relu_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: relu_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: relu_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10219,7 +10220,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("sigmoid_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sigmoid_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sigmoid_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10238,7 +10239,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void TanhBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("tanh_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: tanh_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: tanh_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10257,7 +10258,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void GeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("gelu_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gelu_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gelu_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10288,7 +10289,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int features)
     {
         if (!_kernelCache.TryGetValue("softmax_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: softmax_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: softmax_backward");
 
         using var _ = PushContext();
         // One thread per row: ceil(rows / block) blocks. This launched `batchSize` blocks (256x the threads
@@ -10311,7 +10312,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("leaky_relu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: leaky_relu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: leaky_relu");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10330,7 +10331,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void LeakyReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("leaky_relu_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: leaky_relu_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: leaky_relu_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10351,7 +10352,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Elu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("elu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: elu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: elu");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10370,7 +10371,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void EluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer output, IGpuBuffer gradInput, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("elu_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: elu_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: elu_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10398,7 +10399,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("swish_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: swish_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: swish_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10454,7 +10455,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Hardtanh(IGpuBuffer A, IGpuBuffer B, float minVal, float maxVal, int size)
     {
         if (!_kernelCache.TryGetValue("hardtanh", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hardtanh");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hardtanh");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10478,7 +10479,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void MishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("mish_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mish_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mish_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10497,7 +10498,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SoftplusBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("softplus_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: softplus_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: softplus_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10516,7 +10517,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void HardswishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("hardswish_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hardswish_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hardswish_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10535,7 +10536,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, float scale, int size)
     {
         if (!_kernelCache.TryGetValue("selu_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: selu_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: selu_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10556,7 +10557,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void HardsigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("hardsigmoid_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hardsigmoid_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hardsigmoid_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10575,7 +10576,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void HardtanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float minVal, float maxVal, int size)
     {
         if (!_kernelCache.TryGetValue("hardtanh_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hardtanh_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hardtanh_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10596,7 +10597,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("relu6", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: relu6");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: relu6");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = A.Handle; IntPtr bPtr = B.Handle; int n = size;
@@ -10607,7 +10608,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("relu6_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: relu6_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: relu6_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -10618,7 +10619,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
     {
         if (!_kernelCache.TryGetValue("prelu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: prelu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: prelu");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle; IntPtr aPtr = alpha.Handle; IntPtr oPtr = output.Handle; int n = size; int aSize = alphaSize;
@@ -10629,7 +10630,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
     {
         if (!_kernelCache.TryGetValue("prelu_backward_input", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: prelu_backward_input");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr aPtr = alpha.Handle; IntPtr giPtr = gradInput.Handle; int n = size; int aSize = alphaSize;
@@ -10647,14 +10648,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Issue #382: per-alpha-channel thread scans size in strided order.
             if (!_kernelCache.TryGetValue("prelu_backward_alpha_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: prelu_backward_alpha_deterministic");
             uint gridD = (uint)((alphaSize + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel(kernelD, gridD, DefaultBlockSize, args);
             return;
         }
 
         if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: prelu_backward_alpha");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: prelu_backward_alpha");
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
@@ -10664,7 +10665,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxRreluF32(input, noise, output, size))
             return;
         if (!_kernelCache.TryGetValue("rrelu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rrelu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rrelu");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle; IntPtr nPtr = noise.Handle; IntPtr oPtr = output.Handle; int n = size;
@@ -10677,7 +10678,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxRreluBackwardF32(gradOutput, input, noise, gradInput, size))
             return;
         if (!_kernelCache.TryGetValue("rrelu_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rrelu_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rrelu_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr nPtr = noise.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -10688,7 +10689,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
     {
         if (!_kernelCache.TryGetValue("threshold_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: threshold_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: threshold_forward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle; IntPtr oPtr = output.Handle; int n = size;
@@ -10699,7 +10700,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
         if (!_kernelCache.TryGetValue("threshold_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: threshold_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: threshold_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -10710,7 +10711,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("reciprocal_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reciprocal_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: reciprocal_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr iPtr = input.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -10721,7 +10722,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("var_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: var_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: var_backward");
         using var _ = PushContext();
         int total = outerSize * reduceSize;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10735,7 +10736,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("std_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: std_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: std_backward");
         using var _ = PushContext();
         int total = outerSize * reduceSize;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10751,7 +10752,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxMaskedFillBackward(gradOutput, mask, gradInput, size)) return;
         if (!_kernelCache.TryGetValue("masked_fill_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: masked_fill_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: masked_fill_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle, mPtr = mask.Handle, giPtr = gradInput.Handle;
@@ -10764,7 +10765,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size)
     {
         if (!_kernelCache.TryGetValue("where_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: where_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: where_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle, cPtr = condition.Handle, gxPtr = gradX.Handle, gyPtr = gradY.Handle;
@@ -10781,7 +10782,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 
         if (!_kernelCache.TryGetValue("norm_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: norm_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: norm_backward");
         using var _ = PushContext();
         int total = outerSize * reduceSize;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10797,7 +10798,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #840): dX = exp(input-lse) * gradOutput[m].
         if (TryDirectPtxLogSumExpBackward(input, lse, gradOutput, gradInput, outerSize, reduceSize)) return;
         if (!_kernelCache.TryGetValue("logsumexp_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: logsumexp_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: logsumexp_backward");
         using var _ = PushContext();
         int total = outerSize * reduceSize;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10811,7 +10812,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
     {
         if (!_kernelCache.TryGetValue("avg_pool1d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: avg_pool1d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: avg_pool1d");
         using var _ = PushContext();
         long totalL = (long)batch * channels * outLength; int total = checked((int)totalL);
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10825,7 +10826,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
     {
         if (!_kernelCache.TryGetValue("max_pool1d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: max_pool1d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: max_pool1d");
         using var _ = PushContext();
         long totalL = (long)batch * channels * outLength; int total = checked((int)totalL);
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10839,7 +10840,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
     {
         if (!_kernelCache.TryGetValue("bilinear_upsample2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bilinear_upsample2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bilinear_upsample2d");
         using var _ = PushContext();
         long totalL2 = (long)batch * channels * outH * outW; int total = checked((int)totalL2);
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10862,7 +10863,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Issue #382: route to atomic-free variant — per (dstRow, col) output cell.
             if (!_kernelCache.TryGetValue("scatter_mean_activation_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: scatter_mean_activation_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_mean_activation_deterministic");
             void** argsD = stackalloc void*[7];
             argsD[0] = &sPtr; argsD[1] = &idxPtr; argsD[2] = &oPtr; argsD[3] = &cPtr;
             argsD[4] = &sourceSize; argsD[5] = &outputSize; argsD[6] = &featureSize;
@@ -10874,7 +10875,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         else
         {
             if (!_kernelCache.TryGetValue("scatter_mean", out var scatterKernel))
-                throw new InvalidOperationException("CUDA kernel not found: scatter_mean");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_mean");
             uint grid1 = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
             void** args1 = stackalloc void*[6];
             args1[0] = &sPtr; args1[1] = &idxPtr; args1[2] = &oPtr; args1[3] = &cPtr;
@@ -10889,7 +10890,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // PR #390 review: prior code passed row count and dispatched only
         // `outputSize` work-items, normalizing just the first row.
         if (!_kernelCache.TryGetValue("scatter_mean_divide", out var divideKernel))
-            throw new InvalidOperationException("CUDA kernel not found: scatter_mean_divide");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_mean_divide");
         int outputFlat = outputSize * featureSize;
         uint grid2 = (uint)((outputFlat + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args2 = stackalloc void*[4];
@@ -10904,7 +10905,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
         if (!_kernelCache.TryGetValue("l1_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: l1_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: l1_loss");
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr lPtr = loss.Handle; int bs = batchSize; int nf = numFeatures;
@@ -10915,7 +10916,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
     {
         if (!_kernelCache.TryGetValue("huber_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: huber_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: huber_loss");
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr lPtr = loss.Handle; int bs = batchSize; int nf = numFeatures;
@@ -10926,7 +10927,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
     {
         if (!_kernelCache.TryGetValue("bce_with_logits_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bce_with_logits_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bce_with_logits_loss");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr lPtr = logits.Handle; IntPtr tPtr = targets.Handle; IntPtr oPtr = loss.Handle; int n = size;
@@ -10937,7 +10938,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
     {
         if (!_kernelCache.TryGetValue("nll_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: nll_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: nll_loss");
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr lpPtr = logProbs.Handle; IntPtr tPtr = targets.Handle; IntPtr lPtr = loss.Handle; int bs = batchSize; int nc = numClasses;
@@ -10948,7 +10949,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
     {
         if (!_kernelCache.TryGetValue("kl_div_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: kl_div_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: kl_div_loss");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle; IntPtr tPtr = target.Handle; IntPtr lPtr = loss.Handle; int n = size;
@@ -10959,7 +10960,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
         if (!_kernelCache.TryGetValue("mse_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mse_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mse_loss_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -10970,7 +10971,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
         if (!_kernelCache.TryGetValue("l1_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: l1_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: l1_loss_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -10981,7 +10982,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
     {
         if (!_kernelCache.TryGetValue("huber_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: huber_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: huber_loss_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr pPtr = predictions.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -10992,7 +10993,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
         if (!_kernelCache.TryGetValue("bce_with_logits_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bce_with_logits_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bce_with_logits_backward");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle; IntPtr lPtr = logits.Handle; IntPtr tPtr = targets.Handle; IntPtr giPtr = gradInput.Handle; int n = size;
@@ -11022,7 +11023,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             DirectPtxLinearActivation.Relu, DirectPtxLinearWeightLayout.InputMajor))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_relu");
         using var _ = PushContext();
         int total = batchSize * outFeatures;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11042,7 +11043,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             DirectPtxLinearActivation.Sigmoid, DirectPtxLinearWeightLayout.InputMajor))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid");
         using var _ = PushContext();
         int total = batchSize * outFeatures;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11062,7 +11063,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             DirectPtxLinearActivation.Tanh, DirectPtxLinearWeightLayout.InputMajor))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh");
         using var _ = PushContext();
         int total = batchSize * outFeatures;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11082,7 +11083,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             DirectPtxLinearActivation.GeluTanh, DirectPtxLinearWeightLayout.InputMajor))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu");
         using var _ = PushContext();
         int total = batchSize * outFeatures;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11130,7 +11131,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             DirectPtxLinearActivation.Swish, DirectPtxLinearWeightLayout.InputMajor))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_swish", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish");
         using var _ = PushContext();
         int total = batchSize * outFeatures;
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11151,7 +11152,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
         // Grad input kernel
         if (!_kernelCache.TryGetValue("fused_linear_relu_backward_grad_input", out var giKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_relu_backward_grad_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_relu_backward_grad_input");
         using var _ = PushContext();
         int totalIn = batchSize * inFeatures;
         uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11163,7 +11164,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Bias gradient kernel
         if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_bias_grad");
         uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gbPtr = gradBias.Handle;
         int activationType = 0; // ReLU
@@ -11174,7 +11175,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Weight gradient kernel: gradWeight[i,j] = sum_b(input[b,i] * masked_grad[b,j])
         if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_weight_grad");
         int totalW = inFeatures * outFeatures;
         uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
@@ -11193,7 +11194,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Sigmoid))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid_backward_grad_input", out var giKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
         using var _ = PushContext();
         int totalIn = batchSize * inFeatures;
         uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11204,7 +11205,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
 
         if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_bias_grad");
         uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gbPtr = gradBias.Handle;
         int activationType = 1; // Sigmoid
@@ -11214,7 +11215,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
 
         if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_weight_grad");
         int totalW = inFeatures * outFeatures;
         uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
@@ -11233,7 +11234,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Tanh))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh_backward_grad_input", out var giKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
         using var _ = PushContext();
         int totalIn = batchSize * inFeatures;
         uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11244,7 +11245,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
 
         if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_bias_grad");
         uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gbPtr = gradBias.Handle;
         int activationType = 2; // Tanh
@@ -11254,7 +11255,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
 
         if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_weight_grad");
         int totalW = inFeatures * outFeatures;
         uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
@@ -11273,7 +11274,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.GeluTanh))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu_backward_grad_input", out var giKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
         using var _ = PushContext();
         int totalIn = batchSize * inFeatures;
         uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11284,7 +11285,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
 
         if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_bias_grad");
         uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gbPtr = gradBias.Handle;
         int activationType = 3; // GELU
@@ -11294,7 +11295,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
 
         if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_weight_grad");
         int totalW = inFeatures * outFeatures;
         uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
@@ -11313,7 +11314,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             batchSize, inFeatures, outFeatures, DirectPtxLinearActivation.Swish))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_swish_backward_grad_input", out var giKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
         using var _ = PushContext();
         int totalIn = batchSize * inFeatures;
         uint gridIn = (uint)((totalIn + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11324,7 +11325,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(giKernel, gridIn, DefaultBlockSize, argsIn);
 
         if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_bias_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_bias_grad");
         uint gridBias = (uint)((outFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gbPtr = gradBias.Handle;
         int activationType = 4; // Swish
@@ -11334,7 +11335,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(bgKernel, gridBias, DefaultBlockSize, argsBias);
 
         if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_linear_weight_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_weight_grad");
         int totalW = inFeatures * outFeatures;
         uint gridW = (uint)((totalW + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
@@ -11355,7 +11356,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.IoULoss,
                 predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("iou_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: iou_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: iou_loss");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
@@ -11371,7 +11372,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.GIoULoss,
                 predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("giou_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: giou_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: giou_loss");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
@@ -11387,7 +11388,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.DIoULoss,
                 predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("diou_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: diou_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: diou_loss");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
@@ -11403,7 +11404,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.CIoULoss,
                 predicted, target, loss, numBoxes)) return;
         if (!_kernelCache.TryGetValue("ciou_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: ciou_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: ciou_loss");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
@@ -11420,7 +11421,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.IoULossBackward,
                 gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("iou_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: iou_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: iou_loss_backward");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
@@ -11437,7 +11438,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.GIoULossBackward,
                 gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("giou_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: giou_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: giou_loss_backward");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
@@ -11454,7 +11455,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.DIoULossBackward,
                 gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("diou_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: diou_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: diou_loss_backward");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
@@ -11471,7 +11472,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxVisionOperation.CIoULossBackward,
                 gradOutput, predicted, target, gradPredicted, numBoxes)) return;
         if (!_kernelCache.TryGetValue("ciou_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: ciou_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: ciou_loss_backward");
         using var _ = PushContext();
         uint grid = (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
@@ -11494,7 +11495,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(numClasses), numClasses, "numClasses must be positive.");
 
         if (!_kernelCache.TryGetValue("cross_entropy_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: cross_entropy_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: cross_entropy_loss");
 
         using var _ = PushContext();
         using var temp = AllocateBuffer(batchSize);
@@ -11524,7 +11525,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(numClasses), numClasses, "numClasses must be positive.");
 
         if (!_kernelCache.TryGetValue("cross_entropy_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: cross_entropy_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: cross_entropy_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((batchSize * numClasses + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11544,7 +11545,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         if (!_kernelCache.TryGetValue("bce_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bce_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bce_loss");
 
         using var _ = PushContext();
         using var temp = AllocateBuffer(size);
@@ -11564,7 +11565,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BinaryCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("bce_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bce_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bce_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11582,7 +11583,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe float MseLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         if (!_kernelCache.TryGetValue("mse_loss_elementwise", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mse_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mse_loss");
 
         using var _ = PushContext();
         using var temp = AllocateBuffer(size);
@@ -11602,7 +11603,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("mse_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mse_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mse_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11620,7 +11621,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe float SmoothL1Loss(IGpuBuffer predictions, IGpuBuffer targets, int size, float beta)
     {
         if (!_kernelCache.TryGetValue("smooth_l1_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: smooth_l1_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: smooth_l1_loss");
 
         using var _ = PushContext();
         using var temp = AllocateBuffer(size);
@@ -11641,7 +11642,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SmoothL1Backward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float beta)
     {
         if (!_kernelCache.TryGetValue("smooth_l1_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: smooth_l1_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: smooth_l1_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11666,7 +11667,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (embeddingDim <= 0) throw new ArgumentOutOfRangeException(nameof(embeddingDim), "Embedding dimension must be positive.");
 
         if (!_kernelCache.TryGetValue("triplet_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: triplet_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: triplet_loss");
 
         using var _ = PushContext();
         using var lossBuffer = AllocateBuffer(batchSize);
@@ -11701,7 +11702,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (embeddingDim <= 0) throw new ArgumentOutOfRangeException(nameof(embeddingDim), "Embedding dimension must be positive.");
 
         if (!_kernelCache.TryGetValue("triplet_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: triplet_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: triplet_loss_backward");
 
         using var _ = PushContext();
         // Launch with batchSize blocks, embeddingDim threads per block
@@ -11730,7 +11731,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("huber_loss_elementwise", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: huber_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: huber_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -11754,7 +11755,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("huber_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: huber_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: huber_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11775,7 +11776,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("focal_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: focal_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: focal_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -11802,7 +11803,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("focal_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: focal_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: focal_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11826,7 +11827,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("mae_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mae_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mae_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -11849,7 +11850,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("mae_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mae_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mae_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11869,7 +11870,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("log_cosh_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: log_cosh_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: log_cosh_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -11892,7 +11893,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("log_cosh_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: log_cosh_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: log_cosh_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11912,7 +11913,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("quantile_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: quantile_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: quantile_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -11936,7 +11937,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("quantile_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: quantile_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: quantile_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -11957,7 +11958,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("hinge_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hinge_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hinge_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -11980,7 +11981,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("hinge_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hinge_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hinge_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12000,7 +12001,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("squared_hinge_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: squared_hinge_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: squared_hinge_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -12023,7 +12024,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("squared_hinge_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: squared_hinge_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: squared_hinge_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12043,7 +12044,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("poisson_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: poisson_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: poisson_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -12068,7 +12069,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("poisson_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: poisson_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: poisson_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12090,7 +12091,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("exponential_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: exponential_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: exponential_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -12113,7 +12114,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("exponential_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: exponential_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: exponential_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12133,7 +12134,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("modified_huber_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: modified_huber_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: modified_huber_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -12156,7 +12157,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("modified_huber_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: modified_huber_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: modified_huber_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12176,7 +12177,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("categorical_cross_entropy_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: categorical_cross_entropy_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: categorical_cross_entropy_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -12201,7 +12202,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("categorical_cross_entropy_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: categorical_cross_entropy_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: categorical_cross_entropy_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12223,7 +12224,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("charbonnier_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: charbonnier_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: charbonnier_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -12247,7 +12248,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("charbonnier_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: charbonnier_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: charbonnier_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12268,7 +12269,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("elastic_net_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: elastic_net_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: elastic_net_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(size);
@@ -12293,7 +12294,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("elastic_net_gradient", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: elastic_net_gradient");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: elastic_net_gradient");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12317,7 +12318,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (output2 is null) throw new ArgumentNullException(nameof(output2));
         if (labels is null) throw new ArgumentNullException(nameof(labels));
         if (!_kernelCache.TryGetValue("contrastive_loss", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: contrastive_loss");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: contrastive_loss");
 
         using var _ = PushContext();
         using var outputBuffer = AllocateBuffer(batchSize);
@@ -12348,7 +12349,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (gradOutput1 is null) throw new ArgumentNullException(nameof(gradOutput1));
         if (gradOutput2 is null) throw new ArgumentNullException(nameof(gradOutput2));
         if (!_kernelCache.TryGetValue("contrastive_loss_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: contrastive_loss_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: contrastive_loss_backward");
 
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize); // one thread per sample
@@ -12377,7 +12378,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Clamp(IGpuBuffer A, IGpuBuffer B, float min, float max, int size)
     {
         if (!_kernelCache.TryGetValue("clamp", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: clamp");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: clamp");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12414,9 +12415,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IGpuBuffer gradTable, int numIndices, int embeddingDim, int vocabSize)
     {
         if (!_kernelCache.TryGetValue("embedding_float_ids_links", out var linkKernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_float_ids_links");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_float_ids_links");
         if (!_kernelCache.TryGetValue("embedding_backward_float_ids_det", out var sumKernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_backward_float_ids_det");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward_float_ids_det");
         long total = (long)numIndices * embeddingDim;
         if (total <= 0) return;
 
@@ -12446,7 +12447,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int numIndices, int embeddingDim, int vocabSize)
     {
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: " + name);
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: " + name);
         long total = (long)numIndices * embeddingDim;
         if (total <= 0) return;
 
@@ -12473,7 +12474,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     internal unsafe void GatherClassValues(IGpuBuffer values, IGpuBuffer classIndices, IGpuBuffer output, int rows, int numClasses)
     {
         if (!_kernelCache.TryGetValue("gather_class_values", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gather_class_values");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gather_class_values");
         if (rows <= 0) return;
 
         using var _ = PushContext();
@@ -12494,7 +12495,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     internal unsafe void ScatterClassGrad(IGpuBuffer gradOutput, IGpuBuffer classIndices, IGpuBuffer grad, int rows, int numClasses)
     {
         if (!_kernelCache.TryGetValue("scatter_class_grad", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: scatter_class_grad");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_class_grad");
         long total = (long)rows * numClasses;
         if (total <= 0) return;
 
@@ -12515,7 +12516,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe float L2Norm(IGpuBuffer A, int size)
     {
         if (!_kernelCache.TryGetValue("l2_norm_squared", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: l2_norm_squared");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: l2_norm_squared");
 
         using var _ = PushContext();
         using var temp = AllocateBuffer(size);
@@ -12569,7 +12570,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
 
         if (!_kernelCache.TryGetValue("lerp_fused", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: lerp_fused");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lerp_fused");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12599,7 +12600,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
 
         if (!_kernelCache.TryGetValue("add_scaled", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: add_scaled");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: add_scaled");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12633,7 +12634,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         Scale(mean, mean, 1.0f / size, 1);
 
         if (!_kernelCache.TryGetValue("squared_deviation_from_mean", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: squared_deviation_from_mean");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: squared_deviation_from_mean");
 
         using (PushContext())
         {
@@ -12685,7 +12686,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (GpuDeterminism.IsActive)
         {
             if (!_kernelCache.TryGetValue("scatter_add_accumulate_deterministic", out var kernelDet))
-                throw new InvalidOperationException("CUDA kernel not found: scatter_add_accumulate_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: scatter_add_accumulate_deterministic");
             // One thread PER DESTINATION CELL (not per source element): each thread solely owns its
             // dst cell and adds the fixed-order sum of matching contributions onto the seed — race-free.
             uint gridDet = (uint)((destSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12702,7 +12703,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int embDim = 1;
 
         if (!_kernelCache.TryGetValue("embedding_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
         void** args = stackalloc void*[5];
@@ -12719,7 +12720,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         // ScatterAddBackward is essentially a Gather operation
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
         using var _ = PushContext();
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12742,7 +12743,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 #endif
         if (!_kernelCache.TryGetValue("embedding_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: embedding_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_forward");
 
         using var _ = PushContext();
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12766,7 +12767,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("greater_than", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: greater_than");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: greater_than");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -12784,7 +12785,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void LessThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("less_than", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: less_than");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: less_than");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13207,7 +13208,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("equals", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: equals");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: equals");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13225,7 +13226,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("where_select", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: where_select");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: where_select");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13245,7 +13246,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void NotEqualScalar(IGpuBuffer A, IGpuBuffer C, float scalar, int size)
     {
         if (!_kernelCache.TryGetValue("not_equal_scalar", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: not_equal_scalar");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: not_equal_scalar");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13269,7 +13270,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Mean, A, B, outerSize, reduceSize))
             return;
         if (!_kernelCache.TryGetValue("mean_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mean_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mean_axis");
 
         using var _ = PushContext();
         uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13286,7 +13287,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("var_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: var_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: var_axis");
 
         using var _ = PushContext();
         uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13305,7 +13306,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: argmax_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
         using var _ = PushContext();
         uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13322,7 +13323,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("argmin_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: argmin_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmin_axis");
 
         using var _ = PushContext();
         uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13341,7 +13342,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
             return;
         if (!_kernelCache.TryGetValue("max_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: max_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: max_axis");
 
         using var _ = PushContext();
         uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13360,7 +13361,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Use optimized small-k kernel for k <= 8
         string kernelName = k <= 8 ? "topk_small" : "topk";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
         // One block per row
@@ -13409,7 +13410,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // broadcast_multiply_FIRST_axis does exist, so only the last-axis lookup was dangling.
         // broadcast_mul_last is output[idx] = a[idx] * b[idx % innerSize] with these exact five args.
         if (!_kernelCache.TryGetValue("broadcast_mul_last", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: broadcast_mul_last");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: broadcast_mul_last");
 
         using var _ = PushContext();
         int totalSize = outerSize * innerSize;
@@ -13429,7 +13430,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BroadcastMultiplyFirstAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
         if (!_kernelCache.TryGetValue("broadcast_multiply_first_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: broadcast_multiply_first_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: broadcast_multiply_first_axis");
 
         using var _ = PushContext();
         int totalSize = outerSize * innerSize;
@@ -13467,7 +13468,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 #endif
 
         if (!_kernelCache.TryGetValue("sgd_momentum_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sgd_momentum_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_momentum_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13501,7 +13502,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("adam_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adam_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adam_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13540,7 +13541,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("adamw_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adamw_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adamw_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13606,7 +13607,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n == 0) return;
 
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         // Build the device pointer arrays (8-byte device addresses) and the chunk table.
         var paramAddr = new byte[n * sizeof(ulong)];
@@ -13795,7 +13796,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         Fill(sumOfSquares, 0f, 2);
         if (tensors is null || tensors.Count == 0) return;
         if (!_kernelCache.TryGetValue("multi_tensor_sum_squares", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: multi_tensor_sum_squares");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: multi_tensor_sum_squares");
         void** args = stackalloc void*[6];
         lock (_gradientTableSync)
         {
@@ -13818,7 +13819,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         if (!_kernelCache.TryGetValue("clip_scale_from_sum_squares", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: clip_scale_from_sum_squares");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: clip_scale_from_sum_squares");
         using var _ = PushContext();
         IntPtr sH = sumOfSquares.Handle, cH = scale.Handle;
         void** args = stackalloc void*[3];
@@ -13832,7 +13833,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         if (tensors is null || tensors.Count == 0) return;
         if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
         void** args = stackalloc void*[6];
         lock (_gradientTableSync)
         {
@@ -13870,7 +13871,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"v bf16 buffer too small: capacity={v.SizeInBytes} bytes, required={requiredMomentBytes}.", nameof(v));
 
         if (!_kernelCache.TryGetValue("adam_bf16_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adam_bf16_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adam_bf16_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13917,7 +13918,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"v bf16 buffer too small: capacity={v.SizeInBytes} bytes, required={requiredMomentBytes}.", nameof(v));
 
         if (!_kernelCache.TryGetValue("adamw_bf16_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adamw_bf16_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adamw_bf16_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13954,7 +13955,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("rmsprop_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rmsprop_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rmsprop_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -13987,7 +13988,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("adagrad_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adagrad_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adagrad_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14017,7 +14018,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
 
         if (!_kernelCache.TryGetValue("nag_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: nag_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: nag_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14049,7 +14050,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(trustCoeff), "Trust coefficient must be positive.");
 
         if (!_kernelCache.TryGetValue("lars_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: lars_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lars_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14088,7 +14089,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
 
         if (!_kernelCache.TryGetValue("sgd_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sgd_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14124,7 +14125,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"gradient buffer too small: capacity={gradient.Size}, required={size}.", nameof(gradient));
 
         if (!_kernelCache.TryGetValue("proximal_l1_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: proximal_l1_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: proximal_l1_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14160,7 +14161,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(paramLength));
 
         if (!_kernelCache.TryGetValue("adam8bit_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adam8bit_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adam8bit_update");
 
         using var _ = PushContext();
         IntPtr pPtr = param.Handle, gPtr = gradient.Handle;
@@ -14189,7 +14190,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("adadelta_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adadelta_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adadelta_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14227,7 +14228,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("amsgrad_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: amsgrad_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: amsgrad_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14269,7 +14270,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("adamax_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adamax_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adamax_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14304,7 +14305,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
 
         if (!_kernelCache.TryGetValue("lion_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: lion_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lion_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14340,7 +14341,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
 
         if (!_kernelCache.TryGetValue("nadam_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: nadam_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: nadam_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14376,7 +14377,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
 
         if (!_kernelCache.TryGetValue("ftrl_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: ftrl_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: ftrl_update");
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14424,7 +14425,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_sgd_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_sgd_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14444,7 +14445,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (velocity is null) throw new ArgumentNullException(nameof(velocity));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_sgd_momentum_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_sgd_momentum_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_sgd_momentum_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
@@ -14467,7 +14468,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (epsilon <= 0) throw new ArgumentOutOfRangeException(nameof(epsilon));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_adam_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_adam_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_adam_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14492,7 +14493,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_adamw_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_adamw_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_adamw_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14515,7 +14516,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (squaredAvg is null) throw new ArgumentNullException(nameof(squaredAvg));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_rmsprop_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_rmsprop_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_rmsprop_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pSq = squaredAvg.Handle;
@@ -14535,7 +14536,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (accumulatedGrad is null) throw new ArgumentNullException(nameof(accumulatedGrad));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_adagrad_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_adagrad_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_adagrad_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pA = accumulatedGrad.Handle;
@@ -14555,7 +14556,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (velocity is null) throw new ArgumentNullException(nameof(velocity));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_nag_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_nag_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_nag_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pVel = velocity.Handle;
@@ -14576,7 +14577,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (accumUpdate is null) throw new ArgumentNullException(nameof(accumUpdate));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_adadelta_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_adadelta_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_adadelta_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14600,7 +14601,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_amsgrad_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_amsgrad_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_amsgrad_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14625,7 +14626,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_adamax_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_adamax_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_adamax_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14648,7 +14649,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (m is null) throw new ArgumentNullException(nameof(m));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_lion_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_lion_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_lion_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle, pM = m.Handle;
@@ -14670,7 +14671,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_nadam_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_nadam_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_nadam_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14694,7 +14695,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n is null) throw new ArgumentNullException(nameof(n));
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_ftrl_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_ftrl_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_ftrl_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14715,7 +14716,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         EnsureSparseArgs(param, sparseIndices, sparseValues, nnz);
         if (nnz == 0) return;
         if (!_kernelCache.TryGetValue("sparse_proximal_l1_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sparse_proximal_l1_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sparse_proximal_l1_update");
         using var _ = PushContext();
         uint grid = (uint)((nnz + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pP = param.Handle, pI = sparseIndices.Handle, pV = sparseValues.Handle;
@@ -14787,7 +14788,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (output is null) throw new ArgumentNullException(nameof(output));
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
         if (!_kernelCache.TryGetValue("fp16_add_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_add_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_add_native");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
@@ -14808,7 +14809,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (input.SizeInBytes < (long)rows * cols * 2) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {(long)rows * cols * 2}.");
         if (output.SizeInBytes < (long)rows * cols * 2) throw new ArgumentException($"output half buffer too small: {output.SizeInBytes} < {(long)rows * cols * 2}.");
         if (!_kernelCache.TryGetValue("fp16_softmax_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_softmax_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_softmax_native");
         using var _ = PushContext();
         const uint block = 256u;
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
@@ -14846,7 +14847,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 input, gamma, beta, output, meanFp32, varFp32, rows, eps))
             return;
         if (!_kernelCache.TryGetValue("fp16_layernorm_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_layernorm_native");
         using var _ = PushContext();
         const uint block = 256u;
         IntPtr inPtr = input.Handle, gPtr = gamma.Handle, bPtr = beta.Handle, outPtr = output.Handle;
@@ -14884,7 +14885,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 batch, numGroups, channels, spatial, eps))
             return;
         if (!_kernelCache.TryGetValue("fp16_groupnorm_swish", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_groupnorm_swish");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_groupnorm_swish");
         using var _ = PushContext();
         const uint block = 256u;
         IntPtr inPtr = inHalf.Handle, gPtr = gammaFp32.Handle, bPtr = betaFp32.Handle, outPtr = outHalf.Handle;
@@ -14909,7 +14910,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (ioHalf.SizeInBytes < ioHalfBytes) throw new ArgumentException($"io half buffer too small: {ioHalf.SizeInBytes} < {ioHalfBytes}.");
         if (biasHalf.SizeInBytes < biasHalfBytes) throw new ArgumentException($"bias half buffer too small: {biasHalf.SizeInBytes} < {biasHalfBytes}.");
         if (!_kernelCache.TryGetValue("fp16_broadcast_add_channel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_broadcast_add_channel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_broadcast_add_channel");
         using var _ = PushContext();
         long elems = (long)batch * channels * spatial;
         uint grid = (uint)((elems + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -14934,7 +14935,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (input.SizeInBytes < geluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {geluHalfBytes}.");
         if (gradInput.SizeInBytes < geluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {geluHalfBytes}.");
         if (!_kernelCache.TryGetValue("fp16_gelu_backward_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_gelu_backward_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_gelu_backward_native");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, oPtr = gradInput.Handle;
@@ -14957,7 +14958,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (input.SizeInBytes < reluHalfBytes) throw new ArgumentException($"input half buffer too small: {input.SizeInBytes} < {reluHalfBytes}.");
         if (gradInput.SizeInBytes < reluHalfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {reluHalfBytes}.");
         if (!_kernelCache.TryGetValue("fp16_relu_backward_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_relu_backward_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_relu_backward_native");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, oPtr = gradInput.Handle;
@@ -14979,7 +14980,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (output.SizeInBytes < halfBytes) throw new ArgumentException($"output half buffer too small: {output.SizeInBytes} < {halfBytes}.");
         if (gradInput.SizeInBytes < halfBytes) throw new ArgumentException($"gradInput half buffer too small: {gradInput.SizeInBytes} < {halfBytes}.");
         if (!_kernelCache.TryGetValue("fp16_softmax_backward_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_softmax_backward_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_softmax_backward_native");
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gPtr = gradOutput.Handle, oPtr = output.Handle, giPtr = gradInput.Handle;
@@ -15012,7 +15013,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 gradOutput, input, gamma, saveMeanFp32, saveInvVarFp32, gradInput, rows))
             return;
         if (!_kernelCache.TryGetValue("fp16_layernorm_backward_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_backward_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_layernorm_backward_native");
         using var _ = PushContext();
         const uint block = 256u;
         IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, gamPtr = gamma.Handle;
@@ -15048,7 +15049,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 gradGamma, gradBeta, rows))
             return;
         if (!_kernelCache.TryGetValue("fp16_layernorm_grad_params_native", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fp16_layernorm_grad_params_native");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fp16_layernorm_grad_params_native");
         using var _ = PushContext();
         uint grid = (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gPtr = gradOutput.Handle, iPtr = input.Handle, mPtr = saveMeanFp32.Handle;
@@ -15081,7 +15082,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// </summary>
     public unsafe void GemmFp16(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (Ahalf is null) throw new ArgumentNullException(nameof(Ahalf));
         if (Bhalf is null) throw new ArgumentNullException(nameof(Bhalf));
         if (C is null) throw new ArgumentNullException(nameof(C));
@@ -15132,7 +15133,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchUnaryFp16(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);  // 1 elem/thread
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
@@ -15180,7 +15181,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
 
@@ -15253,7 +15254,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
 
@@ -15301,7 +15302,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
 
@@ -15343,7 +15344,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
 
@@ -15413,7 +15414,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
 
@@ -15525,7 +15526,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IGpuBuffer outputReal, IGpuBuffer outputImag,
         int batch, int height, int width, bool inverse)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
         if (batch <= 0 || height <= 0 || width <= 0) return;
 
         using var _ = PushContext();
@@ -15565,10 +15566,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         if (!_kernelCache.TryGetValue("apply_window", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: apply_window");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: apply_window");
 
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15586,12 +15587,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void ComplexMagnitude(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer magnitude, int n)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxComplexMagnitude(real, imag, magnitude, n)) return;
         if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_magnitude");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: complex_magnitude");
 
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15609,12 +15610,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void ComplexPhase(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer phase, int n)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxComplexPhase(real, imag, phase, n)) return;
         if (!_kernelCache.TryGetValue("complex_phase", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_phase");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: complex_phase");
 
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15632,10 +15633,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void PolarToComplex(IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer real, IGpuBuffer imag, int n)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         if (!_kernelCache.TryGetValue("polar_to_complex", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: polar_to_complex");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: polar_to_complex");
 
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15655,10 +15656,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec, int numFrames, int numFreqs, int nMels)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         if (!_kernelCache.TryGetValue("apply_mel_filterbank", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: apply_mel_filterbank");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: apply_mel_filterbank");
 
         using var _ = PushContext();
         IntPtr powerPtr = powerSpec.Handle;
@@ -15680,10 +15681,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         if (!_kernelCache.TryGetValue("power_to_db", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: power_to_db");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: power_to_db");
 
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15701,10 +15702,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// <inheritdoc/>
     public unsafe void DbToPower(IGpuBuffer db, IGpuBuffer power, int n, float refValue)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         if (!_kernelCache.TryGetValue("db_to_power", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: db_to_power");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: db_to_power");
 
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15730,7 +15731,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
         IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
@@ -15757,7 +15758,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(outerSize), $"outerSize*reduceSize ({(long)outerSize * reduceSize}) exceeds buffer A length ({A.Size}).");
 
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: argmax_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
         using var _ = PushContext();
         IntPtr inputPtr = A.Handle;
@@ -15785,7 +15786,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IGpuBuffer output, int size, float min, float max, ulong seed)
     {
         if (!_kernelCache.TryGetValue("generate_random_uniform", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: generate_random_uniform");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: generate_random_uniform");
 
         using var _ = PushContext();
         IntPtr outputPtr = output.Handle;
@@ -15811,7 +15812,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             threshold, scale, seed))
             return;
         if (!_kernelCache.TryGetValue("stateless_dropout_mask", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: stateless_dropout_mask");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: stateless_dropout_mask");
 
         using var _ = PushContext();
         IntPtr outputPtr = output.Handle;
@@ -15831,7 +15832,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             output, size, DirectPtxPhiloxFillKind.Normal, mean, stdDev, seed))
             return;
         if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: generate_random_normal");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: generate_random_normal");
 
         using var _ = PushContext();
         IntPtr outputPtr = output.Handle;
@@ -15862,7 +15863,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxRbfForward(input, centers, epsilons, output, batchSize, numCenters, inputDim)) return;
 
         if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rbf_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rbf_forward");
 
         using var _ = PushContext();
         IntPtr inputPtr = input.Handle;
@@ -15889,7 +15890,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
         if (!_kernelCache.TryGetValue("stdp_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: stdp_update");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: stdp_update");
 
         using var _ = PushContext();
         IntPtr wPtr = weights.Handle;
@@ -15920,7 +15921,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
     {
         if (!_kernelCache.TryGetValue("update_traces", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: update_traces");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: update_traces");
 
         using var _ = PushContext();
         IntPtr tracesPtr = traces.Handle;
@@ -15947,7 +15948,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxPoincareProject(input, output, batchSize, dim, curvature, epsilon)) return;
         if (!_kernelCache.TryGetValue("poincare_project", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: poincare_project");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: poincare_project");
 
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15969,7 +15970,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxMobiusAdd(x, y, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("mobius_add", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mobius_add");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mobius_add");
 
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15992,7 +15993,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxPoincareExpMap(basePoint, tangentVec, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("poincare_exp_map", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: poincare_exp_map");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: poincare_exp_map");
 
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -16015,7 +16016,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxPoincareDistance(x, y, output, batchSize, dim, curvature)) return;
         if (!_kernelCache.TryGetValue("poincare_distance", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: poincare_distance");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: poincare_distance");
 
         using var _ = PushContext();
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -16037,7 +16038,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_euclidean_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hyperbolic_linear_euclidean_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hyperbolic_linear_euclidean_forward");
 
         using var _ = PushContext();
         int totalThreads = batchSize * outputFeatures;
@@ -16066,7 +16067,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_input", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hyperbolic_linear_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hyperbolic_linear_backward_input");
 
         using var _ = PushContext();
         int totalThreads = batchSize * inputFeatures;
@@ -16093,7 +16094,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_weights", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hyperbolic_linear_backward_weights");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hyperbolic_linear_backward_weights");
 
         using var _ = PushContext();
         int totalThreads = outputFeatures * inputFeatures;
@@ -16118,7 +16119,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_biases", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hyperbolic_linear_backward_biases");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hyperbolic_linear_backward_biases");
 
         using var _ = PushContext();
         int totalThreads = outputFeatures;  // One thread per bias element
@@ -16147,7 +16148,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxOctonionMultiply(a, b, output, count)) return;
         if (!_kernelCache.TryGetValue("octonion_multiply", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: octonion_multiply");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: octonion_multiply");
 
         using var _ = PushContext();
         uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -16168,7 +16169,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxOctonionAdd(a, b, output, count)) return;
         if (!_kernelCache.TryGetValue("octonion_add", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: octonion_add");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: octonion_add");
 
         using var _ = PushContext();
         int totalElements = count * 8;
@@ -16189,7 +16190,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: octonion_linear_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: octonion_linear_forward");
 
         using var _ = PushContext();
         int totalThreads = batchSize * outputFeatures;
@@ -16214,7 +16215,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_backward_input", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: octonion_linear_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: octonion_linear_backward_input");
 
         using var _ = PushContext();
         int totalThreads = batchSize * inputFeatures;
@@ -16239,7 +16240,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_backward_weights", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: octonion_linear_backward_weights");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: octonion_linear_backward_weights");
 
         using var _ = PushContext();
         int totalThreads = outputFeatures * inputFeatures;
@@ -16262,7 +16263,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_backward_biases", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: octonion_linear_backward_biases");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: octonion_linear_backward_biases");
 
         using var _ = PushContext();
         uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -16289,7 +16290,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_forward_fused_relu", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: octonion_linear_forward_fused_relu");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: octonion_linear_forward_fused_relu");
 
         using var _ = PushContext();
         int totalOutputs = batchSize * outputFeatures;
@@ -16326,7 +16327,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxSpectralComplexMultiply(a, b, output, numPairs)) return;
         if (TryDirectPtxComplexMultiply(a, b, output, numPairs)) return;
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_multiply");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: complex_multiply");
         using var _ = PushContext();
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pA = a.Handle, pB = b.Handle, pO = output.Handle;
@@ -16343,7 +16344,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #854); returns false until GPU-promoted.
         if (TryDirectPtxComplexConjugate(input, output, numPairs)) return;
         if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_conjugate");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: complex_conjugate");
         using var _ = PushContext();
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pI = input.Handle, pO = output.Handle;
@@ -16360,7 +16361,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (numPairs > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
         if (!_kernelCache.TryGetValue("complex_magnitude_interleaved", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_magnitude_interleaved");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: complex_magnitude_interleaved");
         using var _ = PushContext();
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pI = input.Handle, pO = output.Handle;
@@ -16386,7 +16387,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexMultiply), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_multiply", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_multiply. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_multiply. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pAR = aReal.Handle, pAI = aImag.Handle, pBR = bReal.Handle, pBI = bImag.Handle;
@@ -16406,7 +16407,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (interleaved.Size < requiredInterleaved)
             throw new ArgumentException($"{nameof(InterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("interleave_complex", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: interleave_complex. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: interleave_complex. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pR = real.Handle, pI = imag.Handle, pO = interleaved.Handle;
@@ -16424,7 +16425,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (interleaved.Size < requiredInterleaved)
             throw new ArgumentException($"{nameof(DeinterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("deinterleave_complex", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: deinterleave_complex. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: deinterleave_complex. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIn = interleaved.Handle, pR = real.Handle, pI = imag.Handle;
@@ -16439,7 +16440,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexConjugate), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_conjugate", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_conjugate. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_conjugate. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
@@ -16453,7 +16454,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexMagnitude), inReal, inImag, outMag);
         if (!_kernelCache.TryGetValue("split_complex_magnitude", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_magnitude. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_magnitude. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outMag.Handle;
@@ -16467,7 +16468,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexMagnitudeSquared), inReal, inImag, outMagSq);
         if (!_kernelCache.TryGetValue("split_complex_magnitude_squared", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_magnitude_squared. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_magnitude_squared. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outMagSq.Handle;
@@ -16481,7 +16482,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexPhase), inReal, inImag, outPhase);
         if (!_kernelCache.TryGetValue("split_complex_phase", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_phase. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_phase. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outPhase.Handle;
@@ -16496,7 +16497,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexFromPolar), mag, phase, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_from_polar", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_from_polar. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_from_polar. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pM = mag.Handle, pP = phase.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
@@ -16511,7 +16512,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexScale), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_scale", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_scale. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_scale. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
@@ -16526,7 +16527,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexAdd), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_add", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_add. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_add. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pAR = aReal.Handle, pAI = aImag.Handle, pBR = bReal.Handle, pBI = bImag.Handle;
@@ -16543,7 +16544,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexCrossSpectral), xReal, xImag, yReal, yImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_cross_spectral", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_cross_spectral. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_cross_spectral. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pXR = xReal.Handle, pXI = xImag.Handle, pYR = yReal.Handle, pYI = yImag.Handle;
@@ -16559,7 +16560,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (n <= 0 || k <= 0) return;
         ValidateSplitBuffers(n, nameof(SplitComplexTopK), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: split_complex_topk");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: split_complex_topk");
         k = Math.Min(k, n);
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -16575,7 +16576,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxSoftmax(input, output, rows, cols)) return;
         if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: softmax_rows");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: softmax_rows");
         using var _ = PushContext();
         uint grid = (uint)rows;
         int blockSize = Math.Min(256, cols);
@@ -16610,7 +16611,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int n = (int)total;
         ValidateSplitBuffers(n, nameof(SplitComplexUnitPhaseCodebook), outReal, outImag);
         if (!_kernelCache.TryGetValue("hrr_unit_phase_codebook", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hrr_unit_phase_codebook. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hrr_unit_phase_codebook. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pOR = outReal.Handle, pOI = outImag.Handle;
@@ -16645,7 +16646,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException(
                 $"outScores must hold at least V = {V} elements (got {outScores.Size}).");
         if (!_kernelCache.TryGetValue("hrr_phase_coherence_decode", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hrr_phase_coherence_decode. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hrr_phase_coherence_decode. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)V;
         int blockSize = Math.Min(DefaultBlockSize, NextPowerOfTwoForReduction(D));
@@ -16702,7 +16703,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int nKeys = (int)nKeysL;
         int nVals = (int)nValsL;
         if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: hrr_bind_accumulate. Register CudaComplexKernels.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: hrr_bind_accumulate. Register CudaComplexKernels.");
         using var _ = PushContext();
         uint grid = (uint)((D + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pKR = keyCodeReal.Handle, pKI = keyCodeImag.Handle;
@@ -16733,7 +16734,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
         IGpuBuffer outputReal, int batch, int height, int width, int filterSliceCount)
     {
-        if (!IsAvailable) throw new InvalidOperationException("CUDA backend not available");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
         if (batch <= 0 || height <= 0 || width <= 0) return;
         if (filterSliceCount <= 0 || (filterSliceCount != 1 && filterSliceCount != batch))
             throw new ArgumentException($"filterSliceCount must be 1 (shared) or batch ({batch}). Got {filterSliceCount}.");
@@ -16791,7 +16792,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (n <= 0) return;
         if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: atan2_elementwise");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: atan2_elementwise");
         using var _ = PushContext();
         IntPtr ip = imag.Handle, rp = real.Handle, op = output.Handle;
         void** args = stackalloc void*[4];
@@ -16808,7 +16809,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             TryDirectPtxNormalizeL2D64(input, output, rows))
             return;
         if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: normalize_rows_fused");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: normalize_rows_fused");
         using var _ = PushContext();
         IntPtr ip = input.Handle, op = output.Handle;
         void** args = stackalloc void*[4];
@@ -16835,7 +16836,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: analytic_signal_mask");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: analytic_signal_mask");
         using var _ = PushContext();
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
         void** args = stackalloc void*[8];
@@ -16854,7 +16855,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bispectrum_gather");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bispectrum_gather");
         using var _ = PushContext();
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
         void** args = stackalloc void*[6];
@@ -16873,7 +16874,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: trispectrum_gather");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: trispectrum_gather");
         using var _ = PushContext();
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
         void** args = stackalloc void*[7];
@@ -16888,7 +16889,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("cavity_bounce_inplace", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: cavity_bounce_inplace");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: cavity_bounce_inplace");
         using var _ = PushContext();
         IntPtr wr = workReal.Handle, wi = workImag.Handle;
         void** args = stackalloc void*[4];
@@ -16906,7 +16907,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: wideband_log_bin_pool");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: wideband_log_bin_pool");
         using var _ = PushContext();
         IntPtr mp = magBuf.Handle, op = output.Handle;
         void** args = stackalloc void*[6];
@@ -16925,7 +16926,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mel_filterbank_apply");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mel_filterbank_apply");
         using var _ = PushContext();
         IntPtr ps = powerSpec.Handle, mf = melFilters.Handle, me = melEnergy.Handle;
         void** args = stackalloc void*[6];
@@ -16940,7 +16941,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (n <= 0) return;
         if (!_kernelCache.TryGetValue("mfcc_log1p", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mfcc_log1p");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mfcc_log1p");
         using var _ = PushContext();
         IntPtr ip = input.Handle, op = output.Handle;
         void** args = stackalloc void*[3];
@@ -16973,7 +16974,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // no shared memory needed since the deterministic variant uses statically
             // sized __shared__ inside the kernel.
             if (!_kernelCache.TryGetValue("pac_phase_bin_mi_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: pac_phase_bin_mi_deterministic");
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuLaunchKernel(kernelD, grid, 1, 1, 18, 1, 1,
                     0, _stream, (IntPtr)args, IntPtr.Zero),
@@ -16982,7 +16983,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pac_phase_bin_mi");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: pac_phase_bin_mi");
         uint block = 256;
         uint sharedMem = (uint)(2 * 18 * sizeof(float));
         CuBlasNative.CheckCudaResult(
@@ -17001,7 +17002,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxQuantumMeasurement(realPart, imagPart, probabilities, batchSize, stateSize)) return;
 
         if (!_kernelCache.TryGetValue("quantum_measurement", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: quantum_measurement");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: quantum_measurement");
 
         using var _ = PushContext();
         int totalThreads = batchSize * stateSize;
@@ -17022,7 +17023,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void NormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
     {
         if (!_kernelCache.TryGetValue("normalize_probabilities", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: normalize_probabilities");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: normalize_probabilities");
 
         // Validate state size is power of two for shared-memory reduction
         ValidateQuantumStateSize(stateSize, nameof(stateSize));
@@ -17049,7 +17050,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxComplexMatVec(matReal, matImag, vecReal, vecImag, outReal, outImag, batchSize, dim)) return;
 
         if (!_kernelCache.TryGetValue("complex_matvec", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_matvec");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: complex_matvec");
 
         using var _ = PushContext();
         int totalThreads = batchSize * dim;
@@ -17077,7 +17078,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IGpuBuffer angles, int numQubits, int batchSize)
     {
         if (!_kernelCache.TryGetValue("quantum_rotation", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: quantum_rotation");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: quantum_rotation");
 
         // Validate numQubits is in a reasonable range (1-30 to avoid overflow)
         if (numQubits <= 0 || numQubits > 30)
@@ -17110,7 +17111,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void MeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
     {
         if (!_kernelCache.TryGetValue("measurement_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: measurement_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: measurement_forward");
 
         // Validate state size is power of two for shared-memory reduction
         ValidateQuantumStateSize(stateSize, nameof(stateSize));
@@ -17159,7 +17160,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException("gate buffer is too small for the requested GLA shape.");
 
         if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gla_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_forward");
 
         using var _ = PushContext();
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle, po = output.Handle;
@@ -17186,7 +17187,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.CudaGlaKernels.MaxHeadDim}).");
         if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
             !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
-            throw new InvalidOperationException("CUDA kernel not found: gla_scan_recompute / gla_scan_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_recompute / gla_scan_backward");
 
         using var _ = PushContext();
         // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
@@ -17231,7 +17232,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException(
                 $"xLSTM headDim ({headDim}) exceeds max ({Kernels.CudaXLstmKernels.MaxHeadDim}).");
         if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: xlstm_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: xlstm_scan_forward");
 
         using var _ = PushContext();
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle;
@@ -17256,7 +17257,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
         if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gated_delta_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_forward");
 
         using var _ = PushContext();
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, pout = output.Handle;
@@ -17286,7 +17287,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int batch, int seqLen, int recDim)
     {
         if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rglru_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rglru_scan_forward");
 
         using var _ = PushContext();
         IntPtr pv = value.Handle, pr = recGate.Handle, pi = inpGate.Handle, pd = decay.Handle, pout = output.Handle;
@@ -17305,7 +17306,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
         if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rwkv4_wkv_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rwkv4_wkv_forward");
 
         using var _ = PushContext();
         IntPtr pr = r.Handle, pk = k.Handle, pv = v.Handle, pd = timeDecay.Handle, pf = timeFirst.Handle, pout = output.Handle;
@@ -17327,7 +17328,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException(
                 $"Mamba stateDim ({stateDim}) exceeds max ({Kernels.CudaMambaKernels.MaxStateDim}).");
         if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mamba_selective_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mamba_selective_scan_forward");
 
         using var _ = PushContext();
         IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
@@ -17347,7 +17348,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
             throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM dimensions must be in [1,256] for width/state.");
         if (!_kernelCache.TryGetValue("complex_diagonal_ssm_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: complex_diagonal_ssm_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: complex_diagonal_ssm_scan_forward");
         using var _ = PushContext();
         IntPtr px=input.Handle, par=transitionReal.Handle, pai=transitionImag.Handle, pbr=inputMapReal.Handle,
             pbi=inputMapImag.Handle, pcr=outputMapReal.Handle, pci=outputMapImag.Handle, pd=skip.Handle, po=output.Handle;
@@ -17383,7 +17384,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         RequireCapacity(workWeights, perBatchWeightElements, nameof(workWeights), "batch*heads*headDim*headDim");
         RequireCapacity(covariance, perBatchWeightElements, nameof(covariance), "batch*heads*headDim*headDim");
         if (!_kernelCache.TryGetValue("mesa_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mesa_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mesa_scan_forward");
         using var _ = PushContext();
         IntPtr pq=q.Handle, pk=k.Handle, pv=v.Handle, pw=initialWeights.Handle, pr=regularization.Handle,
             po=output.Handle, pww=workWeights.Handle, pc=covariance.Handle;
@@ -17428,7 +17429,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         RequireCapacity(skip, (long)experts * model, nameof(skip), "experts*model");
         RequireCapacity(output, (long)batch * time * experts * model, nameof(output), "batch*time*experts*model");
         RequireCapacity(stateScratch, (long)batch * experts * state, nameof(stateScratch), "batch*experts*state");
-        if(!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward",out var kernel))throw new InvalidOperationException("CUDA kernel not found: routed_diagonal_ssm_scan_forward");
+        if(!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward",out var kernel))throw new GpuCapabilityUnavailableException("CUDA kernel not found: routed_diagonal_ssm_scan_forward");
         using var _=PushContext();IntPtr px=input.Handle,pm=activeMask.Handle,pa=transition.Handle,pb=inputMap.Handle,pc=outputMap.Handle,pd=skip.Handle,po=output.Handle,ph=stateScratch.Handle;
         void** args=stackalloc void*[13];args[0]=&px;args[1]=&pm;args[2]=&pa;args[3]=&pb;args[4]=&pc;args[5]=&pd;args[6]=&po;args[7]=&ph;args[8]=&batch;args[9]=&time;args[10]=&model;args[11]=&experts;args[12]=&state;
         uint total=(uint)(batch*experts);LaunchKernel(kernel,(total+(uint)DefaultBlockSize-1)/(uint)DefaultBlockSize,(uint)DefaultBlockSize,args);
@@ -17447,7 +17448,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException(
                 $"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.CudaMamba2Kernels.MaxStateDim}).");
         if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: mamba2_ssd_scan_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mamba2_ssd_scan_forward");
 
         using var _ = PushContext();
         IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
@@ -17498,7 +17499,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             directTarget, hidden, weight, bias, tgt, meanLoss, n, d, vocab))
             return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         Fill(meanLoss, 0f, 1);
         IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = meanLoss.Handle;
@@ -17518,7 +17519,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("lstm_forward_sequence", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: lstm_forward_sequence");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_forward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
         if (hiddenSize > MaxRnnBlockSize)
@@ -17604,7 +17605,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("lstm_backward_sequence", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: lstm_backward_sequence");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
         if (hiddenSize > MaxRnnBlockSize)
@@ -17672,7 +17673,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("gru_forward_sequence", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gru_forward_sequence");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gru_forward_sequence");
 
         // The forward kernel uses __syncthreads() which only synchronizes within a block.
         // If hiddenSize > MaxRnnBlockSize, threads within a batch would span multiple blocks,
@@ -17730,7 +17731,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("gru_backward_sequence", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gru_backward_sequence");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gru_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
         if (hiddenSize > MaxRnnBlockSize)
@@ -17805,7 +17806,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Step 1: Call gru_cell_backward_unified to compute gate gradients and partial gradPrevH
         if (!_kernelCache.TryGetValue("gru_cell_backward_unified", out var cellBackwardKernel))
-            throw new InvalidOperationException("CUDA kernel not found: gru_cell_backward_unified");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gru_cell_backward_unified");
 
         IntPtr gradHPtr = gradH.Handle;
         IntPtr gateRPtr = gateR.Handle;
@@ -17836,7 +17837,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Step 2: Call gru_backward_prevh_unified to compute full gradPrevH using all gate gradients
         if (!_kernelCache.TryGetValue("gru_backward_prevh_unified", out var prevhKernel))
-            throw new InvalidOperationException("CUDA kernel not found: gru_backward_prevh_unified");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gru_backward_prevh_unified");
 
         void** args2 = stackalloc void*[10];
         args2[0] = &gradGateRPtr;
@@ -18285,7 +18286,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchFusedUnary(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[3];
@@ -18296,7 +18297,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchFusedBinary(string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[4];
@@ -18307,7 +18308,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchFusedAxis(string kernelName, IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[4];
@@ -18318,7 +18319,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchFusedScalar(string kernelName, IGpuBuffer input, IGpuBuffer output, float scalar, int size)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[4];
@@ -18357,7 +18358,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchFusedUnaryReduce(string kernelName, IGpuBuffer input, IGpuBuffer output, int size, bool deterministic)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         if (deterministic) Fill(output, 0f, 1);
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
@@ -18404,13 +18405,40 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
         LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
     }
-    public void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_sum_backward", gradOutput, gradInput, outerSize, reduceSize);
-    public void ReduceMeanBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_mean_backward", gradOutput, gradInput, outerSize, reduceSize);
+    // The backward kernels write one element per thread, so they need outerSize * reduceSize threads; LaunchFusedAxis
+    // launches one per row, which left every element past the first outerSize (rounded up to a block) unwritten.
+    public void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchAxisBackward("reduce_sum_backward", gradOutput, gradInput, outerSize, reduceSize);
+    public void ReduceMeanBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchAxisBackward("reduce_mean_backward", gradOutput, gradInput, outerSize, reduceSize);
+
+    private unsafe void LaunchAxisBackward(string kernelName, IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
+        // Checked one by one: two negatives would multiply to a positive element count.
+        if (outerSize < 0) throw new ArgumentOutOfRangeException(nameof(outerSize), outerSize, "outerSize must be non-negative.");
+        if (reduceSize < 0) throw new ArgumentOutOfRangeException(nameof(reduceSize), reduceSize, "reduceSize must be non-negative.");
+        long total = (long)outerSize * reduceSize;
+        if (total == 0) return;
+        if (total > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(reduceSize), $"{kernelName}: {total} elements exceed the kernel's int indexing.");
+        // The kernel reads gradOutput[0 .. outerSize) and writes gradInput[0 .. outerSize * reduceSize).
+        if (gradOutput.Size < outerSize)
+            throw new ArgumentException($"{kernelName}: gradOutput holds {gradOutput.Size} elements; {outerSize} are read.", nameof(gradOutput));
+        if (gradInput.Size < total)
+            throw new ArgumentException($"{kernelName}: gradInput holds {gradInput.Size} elements; {total} are written.", nameof(gradInput));
+        using var _ = PushContext();
+        IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &goPtr; args[1] = &giPtr; args[2] = &outerSize; args[3] = &reduceSize;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
 
     public unsafe void ReduceMaxBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer maxValues, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("reduce_max_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reduce_max_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: reduce_max_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, inPtr = input.Handle, maxPtr = maxValues.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[6];
@@ -18422,7 +18450,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ReduceVarianceBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer means, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("reduce_variance_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reduce_variance_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: reduce_variance_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, inPtr = input.Handle, mPtr = means.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[6];
@@ -18436,7 +18464,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ReduceLogVarianceBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer means, IGpuBuffer variances, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("reduce_log_variance_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reduce_log_variance_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: reduce_log_variance_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, inPtr = input.Handle, mPtr = means.Handle, vPtr = variances.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[7];
@@ -18449,7 +18477,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize)
     {
         if (!_kernelCache.TryGetValue("broadcast_add_last", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: broadcast_add_last");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: broadcast_add_last");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18466,7 +18494,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void BroadcastOpLast(string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int innerSize)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18484,7 +18512,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ClipKernel(IGpuBuffer input, IGpuBuffer output, float min, float max, int size)
     {
         if (!_kernelCache.TryGetValue("clip_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: clip_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: clip_kernel");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18497,7 +18525,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SinCosKernel(IGpuBuffer input, IGpuBuffer sinOutput, IGpuBuffer cosOutput, int size)
     {
         if (!_kernelCache.TryGetValue("sincos_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sincos_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sincos_kernel");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, sinPtr = sinOutput.Handle, cosPtr = cosOutput.Handle;
         void** args = stackalloc void*[4];
@@ -18514,7 +18542,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void GluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim)
     {
         if (!_kernelCache.TryGetValue("glu_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: glu_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: glu_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, inPtr = input.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[5];
@@ -18553,7 +18581,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int halfDim)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr inputPointer = input.Handle, outputPointer = output.Handle;
         void** args = stackalloc void*[4];
@@ -18570,7 +18598,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchGatedBackward(string kernelName, IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, inPtr = input.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[5];
@@ -18587,7 +18615,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ConcatAxis(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int outerSize, int aInnerSize, int bInnerSize)
     {
         if (!_kernelCache.TryGetValue("concat_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: concat_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: concat_axis");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -18599,7 +18627,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SliceLastAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int inputInnerSize, int start, int sliceSize)
     {
         if (!_kernelCache.TryGetValue("slice_last_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: slice_last_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: slice_last_axis");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -18611,7 +18639,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void SetSliceLastAxis(IGpuBuffer output, IGpuBuffer values, int outerSize, int outputInnerSize, int start, int sliceSize)
     {
         if (!_kernelCache.TryGetValue("set_slice_last_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: set_slice_last_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: set_slice_last_axis");
         using var _ = PushContext();
         IntPtr outPtr = output.Handle, valPtr = values.Handle;
         void** args = stackalloc void*[6];
@@ -18631,7 +18659,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // General case: each thread copies one element from the correct strided position
         // GPU kernel: out[outer * stride + s] = in[outer * axisSize * stride + index * stride + s]
         if (!_kernelCache.TryGetValue("slice_axis", out var kernel))
-            throw new InvalidOperationException("CUDA slice_axis kernel not compiled. Ensure CudaShapeKernels are loaded.");
+            throw new GpuCapabilityUnavailableException("CUDA slice_axis kernel not compiled. Ensure CudaShapeKernels are loaded.");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -18648,7 +18676,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
         }
         if (!_kernelCache.TryGetValue("set_slice_axis", out var kernel))
-            throw new InvalidOperationException("CUDA set_slice_axis kernel not compiled. Ensure CudaShapeKernels are loaded.");
+            throw new GpuCapabilityUnavailableException("CUDA set_slice_axis kernel not compiled. Ensure CudaShapeKernels are loaded.");
         using var _ = PushContext();
         IntPtr outPtr = output.Handle, valPtr = values.Handle;
         void** args = stackalloc void*[6];
@@ -18662,7 +18690,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Pad2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW, int padTop, int padLeft, float padValue)
     {
         if (!_kernelCache.TryGetValue("pad_2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pad_2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: pad_2d");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[10];
@@ -18680,7 +18708,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Pad2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int padTop, int padLeft)
     {
         if (!_kernelCache.TryGetValue("pad_2d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pad_2d_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: pad_2d_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[10];
@@ -18693,7 +18721,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void TileLastAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize, int repeats)
     {
         if (!_kernelCache.TryGetValue("tile_last_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: tile_last_axis");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: tile_last_axis");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18705,7 +18733,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void RepeatElements(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize, int repeats)
     {
         if (!_kernelCache.TryGetValue("repeat_elements", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: repeat_elements");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: repeat_elements");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18717,7 +18745,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void PixelShuffle(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int scale)
     {
         if (!_kernelCache.TryGetValue("pixel_shuffle", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pixel_shuffle");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: pixel_shuffle");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[7];
@@ -18729,7 +18757,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int scale)
     {
         if (!_kernelCache.TryGetValue("pixel_shuffle_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pixel_shuffle_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: pixel_shuffle_backward");
         using var _ = PushContext();
         IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
         void** args = stackalloc void*[7];
@@ -18741,7 +18769,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void Crop2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW)
     {
         if (!_kernelCache.TryGetValue("crop_2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: crop_2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: crop_2d");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[10];
@@ -18758,7 +18786,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void EyeKernel(IGpuBuffer output, int n)
     {
         if (!_kernelCache.TryGetValue("eye_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: eye_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: eye_kernel");
         using var _ = PushContext();
         IntPtr outPtr = output.Handle;
         void** args = stackalloc void*[2];
@@ -18770,7 +18798,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void LinspaceKernel(IGpuBuffer output, float start, float step, int size)
     {
         if (!_kernelCache.TryGetValue("linspace_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: linspace_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: linspace_kernel");
         using var _ = PushContext();
         IntPtr outPtr = output.Handle;
         void** args = stackalloc void*[4];
@@ -18781,7 +18809,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void OneHotKernel(IGpuBuffer indices, IGpuBuffer output, int batchSize, int numClasses)
     {
         if (!_kernelCache.TryGetValue("one_hot_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: one_hot_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: one_hot_kernel");
         using var _ = PushContext();
         IntPtr idxPtr = indices.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[4];
@@ -18793,7 +18821,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void DiagKernel(IGpuBuffer input, IGpuBuffer output, int n)
     {
         if (!_kernelCache.TryGetValue("diag_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: diag_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: diag_kernel");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[3];
@@ -18805,7 +18833,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void ExtractDiagKernel(IGpuBuffer input, IGpuBuffer output, int n, int cols)
     {
         if (!_kernelCache.TryGetValue("extract_diag_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: extract_diag_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: extract_diag_kernel");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[4];
@@ -18816,7 +18844,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void TriangularMask(IGpuBuffer output, int rows, int cols, int diagonal, float maskValue)
     {
         if (!_kernelCache.TryGetValue("triangular_mask", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: triangular_mask");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: triangular_mask");
         using var _ = PushContext();
         IntPtr outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18830,7 +18858,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxMaskedFill(input, mask, output, size, fillValue)) return;
         if (!_kernelCache.TryGetValue("masked_fill_kernel", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: masked_fill_kernel");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: masked_fill_kernel");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, maskPtr = mask.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18841,7 +18869,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public unsafe void IndexSelect(IGpuBuffer input, IGpuBuffer indices, IGpuBuffer output, int numIndices, int innerSize)
     {
         if (!_kernelCache.TryGetValue("index_select", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: index_select");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: index_select");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, idxPtr = indices.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18866,7 +18894,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private unsafe void LaunchLoss(string kernelName, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int dim)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         IntPtr pPtr = predictions.Handle, tPtr = targets.Handle, lPtr = loss.Handle;
         void** args = stackalloc void*[5];
@@ -18887,7 +18915,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 return;
         }
         if (!_kernelCache.TryGetValue("dropout_mask", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: dropout_mask");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: dropout_mask");
         using var _ = PushContext();
         IntPtr maskPtr = mask.Handle;
         void** args = stackalloc void*[4];
@@ -18901,7 +18929,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             output, size, DirectPtxPhiloxFillKind.Normal, mean, stdDev, seed))
             return;
         if (!_kernelCache.TryGetValue("gaussian_noise", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gaussian_noise");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gaussian_noise");
         using var _ = PushContext();
         IntPtr outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18923,7 +18951,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             logits, output, outerSize, innerSize, temperature, seed))
             return;
         if (!_kernelCache.TryGetValue("gumbel_softmax", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gumbel_softmax");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gumbel_softmax");
         using var _ = PushContext();
         IntPtr inPtr = logits.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -18955,7 +18983,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (TryDirectPtxBatchDotProduct(a, b, output, batchSize, dim)) return;
         if (!_kernelCache.TryGetValue("batch_dot_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: batch_dot_product");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: batch_dot_product");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18967,7 +18995,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (TryDirectPtxOuterProduct(a, b, output, M, N)) return;
         if (!_kernelCache.TryGetValue("outer_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: outer_product");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: outer_product");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -18980,7 +19008,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (TryDirectPtxBatchOuterProduct(a, b, output, batchSize, M, N)) return;
         if (!_kernelCache.TryGetValue("batch_outer_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: batch_outer_product");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: batch_outer_product");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -18994,7 +19022,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxCosineSimilarity(a, b, output, batchSize, dim)) return;
 
         if (!_kernelCache.TryGetValue("cosine_similarity", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: cosine_similarity");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: cosine_similarity");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -19007,7 +19035,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxPairwiseDistance(a, b, output, M, N, dim, squared: false)) return;
 
         if (!_kernelCache.TryGetValue("pairwise_distance", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pairwise_distance");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: pairwise_distance");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -19021,7 +19049,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxPairwiseDistance(a, b, output, M, N, dim, squared: true)) return;
 
         if (!_kernelCache.TryGetValue("pairwise_distance_squared", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: pairwise_distance_squared");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: pairwise_distance_squared");
         using var _ = PushContext();
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[6];
@@ -19045,7 +19073,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Issue #382: single-block strided reduce, no inter-block atomic combine.
             if (!_kernelCache.TryGetValue("dot_product_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: dot_product_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: dot_product_deterministic");
             // Pre-zero output: single-block kernel does direct write.
             Fill(output, 0f, 1);
             LaunchKernel(kernelD, 1, DefaultBlockSize, args);
@@ -19053,7 +19081,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
 
         if (!_kernelCache.TryGetValue("dot_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: dot_product");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: dot_product");
         MemsetBuffer(output, 0, sizeof(float));
         LaunchKernel(kernel, (uint)((size+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
     }
@@ -19077,13 +19105,13 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (GpuDeterminism.IsActive)
         {
             if (!_kernelCache.TryGetValue("strided_dot_product_deterministic", out var deterministicKernel))
-                throw new InvalidOperationException("CUDA kernel not found: strided_dot_product_deterministic");
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: strided_dot_product_deterministic");
             LaunchKernel(deterministicKernel, 1, DefaultBlockSize, args);
             return;
         }
 
         if (!_kernelCache.TryGetValue("strided_dot_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: strided_dot_product");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: strided_dot_product");
         MemsetBuffer(output, 0, sizeof(float));
         LaunchKernel(kernel, (uint)((aSize+DefaultBlockSize-1)/DefaultBlockSize), DefaultBlockSize, args);
     }
@@ -19092,7 +19120,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (TryDirectPtxBatchDotProduct(a, b, output, batchSize, dim)) return;
         if (!_kernelCache.TryGetValue("batched_dot_product", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: batched_dot_product");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: batched_dot_product");
         using var _ = PushContext();
         IntPtr ap=a.Handle, bp=b.Handle, op=output.Handle;
         void** args = stackalloc void*[5];

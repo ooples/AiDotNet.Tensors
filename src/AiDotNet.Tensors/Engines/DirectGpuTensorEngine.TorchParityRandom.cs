@@ -66,8 +66,7 @@ public partial class DirectGpuTensorEngine
             ulong deviceSeed = DeviceSeed(seed);
             return DispatchDeferredGpuOp<T>(backend, n, (int[])shape.Clone(), output => kernels.TorchParitySample(output, n, kind, a, b, deviceSeed));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }
@@ -88,8 +87,7 @@ public partial class DirectGpuTensorEngine
             using (indices)
                 return DispatchDeferredGpuOp<T>(backend, n, new[] { n }, output => backend.Copy(indices.Buffer, output, n));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorRandperm", ex);
             return null;
         }
@@ -108,8 +106,7 @@ public partial class DirectGpuTensorEngine
             return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(),
                 output => kernels.TorchParityRrelu(x.Buffer, output, n, lower, upper, training, deviceSeed));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorRrelu", ex);
             return null;
         }
@@ -139,8 +136,7 @@ public partial class DirectGpuTensorEngine
             });
             flagValue = ReadParityFlag(backend, flag.Buffer);
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             result?.Dispose();
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
@@ -182,8 +178,7 @@ public partial class DirectGpuTensorEngine
                 output => kernels.TorchParityMultinomial(w.Buffer, scratch.Buffer, output, rows, categories, numSamples, replacement, deviceSeed, flag.Buffer));
             flagValue = ReadParityFlag(backend, flag.Buffer);
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             result?.Dispose();
             GpuLaunchProbe.OnFallback("TensorMultinomial", ex);
             return null;
@@ -248,8 +243,7 @@ public partial class DirectGpuTensorEngine
                 if (ownsOffset) offsetBuffer.Dispose();
             }
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }

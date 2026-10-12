@@ -685,6 +685,14 @@ public sealed unsafe partial class VulkanBackend
     {
         if (reduceSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(reduceSize), "reduceSize must be positive.");
+        // A long row: the split row sum, then the same division the row kernel does.
+        if (SplitsRowSum(outerSize, reduceSize))
+        {
+            using var sums = AllocateBuffer(outerSize);
+            SumAxis(A, sums, outerSize, reduceSize);
+            DivScalar(sums, B, reduceSize, outerSize);
+            return;
+        }
         GlslUnaryOp(VulkanGlslKernels.MeanAxis, A, B, outerSize,
             new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
     }
