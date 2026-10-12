@@ -1238,9 +1238,11 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         // Wait for device to finish
         _device.WaitIdle();
 
-        // Parked buffers must be freed while the device still exists.
-        VulkanGpuBuffer.PendingFrees.Drain();
-        VulkanGpuBuffer.Pool.DrainAll();
+        // Parked buffers must be freed while the device still exists. The placeholder is pooled, so it is released
+        // first and the drain frees it with the rest.
+        var placeholder = _unusedBindingBuffer;
+        _unusedBindingBuffer = null;
+        VulkanGpuBuffer.ReleaseAndDrain(placeholder);
 
         // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()
 
@@ -1258,8 +1260,6 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
         _glslPipelineCache.Clear();
         DisposeTunedKernelResources();
-        _unusedBindingBuffer?.Dispose();
-        _unusedBindingBuffer = null;
         _glslPipelineBySource.Clear();
         _glslPipelineByInstance.Clear();
 

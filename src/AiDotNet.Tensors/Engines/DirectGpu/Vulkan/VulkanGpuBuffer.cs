@@ -67,6 +67,17 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     /// <summary>Frees of Vulkan buffers collected without Dispose, run by the next allocation.</summary>
     internal static readonly DeviceFreeQueue PendingFrees = new();
 
+    /// <summary>
+    /// Releases <paramref name="lastBuffers"/>, then frees every queued and parked buffer. The order matters: a pooled
+    /// buffer released after the drain is parked again and outlives the device. The backend calls this on dispose.
+    /// </summary>
+    internal static void ReleaseAndDrain(params IGpuBuffer?[] lastBuffers)
+    {
+        foreach (var buffer in lastBuffers) buffer?.Dispose();
+        PendingFrees.Drain();
+        Pool.DrainAll();
+    }
+
     /// <inheritdoc/>
     public int Size { get; }
 
