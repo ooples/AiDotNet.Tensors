@@ -8696,6 +8696,18 @@ KERNEL VARIANTS (A/B testing):
             ((DirectOpenClGpuBuffer)buffer).Buffer.CopyFromHost(floatData);
         }
 
+        /// <inheritdoc/>
+        public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+        {
+            if (data is null) throw new ArgumentNullException(nameof(data));
+            if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            if (data.Length > buffer.Size)
+                throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({buffer.Size}).", nameof(data));
+            if (data.Length == 0) return;
+            GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
+            ((DirectOpenClGpuBuffer)buffer).Buffer.CopyFromHost(data);
+        }
+
         // Read-only int tables a kernel takes by buffer (shapes, strides, permutations), cached by content. Never written
         // after upload, so sharing one buffer across calls and queues is safe. Bounded: when full the cache starts a new
         // generation. An evicted table is not freed then: a caller on another thread may hold it without having bound it

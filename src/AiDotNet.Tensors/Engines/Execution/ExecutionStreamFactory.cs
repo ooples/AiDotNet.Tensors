@@ -101,19 +101,12 @@ internal static class ExecutionStreamFactory
         var backend = directGpu.Backend;
         if (backend is null) return null;
 
-        // CudaBackend exposes DefaultStream as a public IGpuStream
-        // property. The IDirectGpuBackend interface itself doesn't
-        // declare DefaultStream (other backends — OpenCL, Vulkan, Metal
-        // — manage streams differently), so the lookup is concrete-type
-        // routed: typed cast on CudaBackend, fall through for everything
-        // else. Switching to a direct cast (no reflection) means a
-        // future CudaBackend rename surfaces as a compile-time error
-        // rather than a silent CPU fallback.
-        if (backend is CudaBackend cudaBackend)
+        // Every backend exposes its in-order default stream through IAsyncGpuBackend.
+        if (backend is AiDotNet.Tensors.Engines.Gpu.IAsyncGpuBackend asyncBackend)
         {
             try
             {
-                return cudaBackend.DefaultStream;
+                return asyncBackend.DefaultStream;
             }
             catch (InvalidOperationException)
             {

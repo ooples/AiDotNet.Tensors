@@ -259,6 +259,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
     }
 
+    // The device this backend runs on; IThreadContextBackend binds it to each thread that issues work.
+    private readonly int _hipDeviceIndex;
+
     public HipBackend(int deviceIndex)
     {
         _kernelCache = new Dictionary<string, IntPtr>();
@@ -274,6 +277,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         try
         {
             // Initialize HIP and get device info
+            _hipDeviceIndex = deviceIndex;
             var result = HipNativeBindings.hipSetDevice(deviceIndex);
             if (result != HipError.Success)
             {
@@ -5880,6 +5884,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             handle.Free();
         }
+    }
+
+    /// <inheritdoc/>
+    public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        // A float buffer holds the raw IEEE bits, so the int path's byte-exact hipMemcpy writes the same bytes.
+        var bits = new int[data.Length];
+        Buffer.BlockCopy(data, 0, bits, 0, data.Length * sizeof(float));
+        UploadIntBufferInPlace(bits, buffer);
     }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
@@ -12164,8 +12178,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new InvalidOperationException("HIP kernel not found: convert_fp32_to_fp16. FP16 conversion requires a proper GPU kernel.");
 
             {
-            IntPtr _p0 = ((HipGpuBuffer)input).Handle;
-            IntPtr _p1 = ((HipGpuBuffer)output).Handle;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = output.Handle;
             void** args = stackalloc void*[3];
             args[0] = &_p0;
             args[1] = &_p1;
@@ -12185,8 +12199,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new InvalidOperationException("HIP kernel not found: convert_fp16_to_fp32. FP32 conversion requires a proper GPU kernel.");
 
             {
-            IntPtr _p0 = ((HipGpuBuffer)input).Handle;
-            IntPtr _p1 = ((HipGpuBuffer)output).Handle;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = output.Handle;
             void** args = stackalloc void*[3];
             args[0] = &_p0;
             args[1] = &_p1;
