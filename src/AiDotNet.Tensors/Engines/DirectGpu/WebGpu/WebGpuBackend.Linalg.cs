@@ -13,6 +13,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public sealed partial class WebGpuBackend : ILinalgBackend
 {
+    /// <inheritdoc/>
+    /// <remarks>WGSL modules compile on first dispatch, which reports its own failure.</remarks>
+    public bool LinalgKernelsReady => true;
+
+    /// <inheritdoc/>
+    /// <remarks>WebGpuLinalgKernels.Eigh provisions Ash[1024] = 32 x 32.</remarks>
+    public int LinalgEighMaxN => 32;
+
     void ILinalgBackend.LinalgCholesky(IGpuBuffer input, IGpuBuffer output, IGpuBuffer info,
         int batchCount, int n, bool upper)
         => LinalgCholeskyAsync(input, output, info, batchCount, n, upper).GetAwaiter().GetResult();

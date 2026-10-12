@@ -4795,6 +4795,8 @@ fn grid_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g_idx = (n * params.param4 + spatial) * 2u;
     let sx = (input_b[g_idx] + 1.0) * 0.5 * f32(params.param3 - 1u);
     let sy = (input_b[g_idx + 1u] + 1.0) * 0.5 * f32(params.param2 - 1u);
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule); on the bits, as WGSL may assume finite floats.
+    if ((bitcast<u32>(sx) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(sy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) { output[idx] = 0.0; return; }
     let x0 = i32(floor(sx)); let y0 = i32(floor(sy));
     let fx = sx - f32(x0); let fy = sy - f32(y0);
     let in_base = (n * params.param1 + c) * params.param2 * params.param3;
@@ -8483,6 +8485,9 @@ fn grid_sample_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Apply padding mode to coordinates with Jacobian
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule); on the bits, as WGSL may assume finite floats.
+    if ((bitcast<u32>(ix) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(iy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) { gsb_grad_grid[grid_idx] = 0.0; gsb_grad_grid[grid_idx + 1u] = 0.0; return; }
+
     let pad_x = gsb_apply_padding(ix, gsb_p.in_width);
     let pad_y = gsb_apply_padding(iy, gsb_p.in_height);
     ix = pad_x.x; iy = pad_y.x;
@@ -9177,6 +9182,8 @@ fn grid_sample_ext(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gy = input_b[g_idx + 1u];
     var px = grid_to_pixel(gx, params.in_width, params.align_corners);
     var py = grid_to_pixel(gy, params.in_height, params.align_corners);
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule); on the bits, as WGSL may assume finite floats.
+    if ((bitcast<u32>(px) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(py) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) { output[idx] = 0.0; return; }
     px = apply_padding(px, params.in_width, params.padding_mode, params.align_corners);
     py = apply_padding(py, params.in_height, params.padding_mode, params.align_corners);
     let x0 = i32(floor(px));
