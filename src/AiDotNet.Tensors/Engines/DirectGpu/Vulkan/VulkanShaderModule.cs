@@ -202,6 +202,13 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
     // (RetainDescriptorSet), and the next UpdateDescriptorSet then writes a different set instead of this one.
     private IntPtr _descriptorSet;
     private bool _descriptorSetRetained;
+    private VulkanBuffer[] _boundBuffers = Array.Empty<VulkanBuffer>();
+
+    /// <summary>The buffers the last <see cref="UpdateDescriptorSet"/> bound, in binding order.</summary>
+    internal VulkanBuffer[] BoundBuffers
+    {
+        get { lock (_dispatchLock) return _boundBuffers; }
+    }
     private readonly Stack<IntPtr> _freeDescriptorSets = new Stack<IntPtr>();
     // Sets a pool beyond the first holds. The first pool holds one: most pipelines never have two dispatches pending.
     private const int DescriptorSetsPerGrowth = 16;
@@ -504,6 +511,7 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
 
         lock (_dispatchLock)
         {
+            _boundBuffers = buffers;
             // A dispatch recorded but not yet executed reads the set it bound when it is submitted, so that set
             // is left alone and this dispatch gets another.
             if (_descriptorSetRetained)
