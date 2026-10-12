@@ -247,4 +247,23 @@ public class VulkanBufferPoolTests
         backend.Fill(fresh, 3f, size);
         Assert.Equal(3f, backend.DownloadBuffer(fresh)[size - 1]);
     }
+
+    // The backend's dispose releases its long-lived pooled buffers (the unused-binding placeholder) through
+    // ReleaseAndDrain, which must leave none of them parked: a parked buffer would outlive the device.
+    [SkippableFact]
+    public void ReleaseAndDrain_LeavesNoReleasedBufferParked()
+    {
+        var backend = BackendOrSkip();
+        const int size = OddSize + 79;
+
+        // Control: released after a drain, a pooled buffer is parked again.
+        var late = backend.AllocateBuffer(size);
+        VulkanGpuBuffer.ReleaseAndDrain();
+        late.Dispose();
+        Assert.Equal(1, VulkanGpuBuffer.Pool.PooledCount);
+
+        var last = backend.AllocateBuffer(size);   // rents the parked buffer back
+        VulkanGpuBuffer.ReleaseAndDrain(last);
+        Assert.Equal(0, VulkanGpuBuffer.Pool.PooledCount);
+    }
 }

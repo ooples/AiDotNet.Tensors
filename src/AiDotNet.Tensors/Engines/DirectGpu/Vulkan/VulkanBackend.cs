@@ -56,7 +56,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private VulkanBufferTransfer? _transfer;
     private readonly object _computeLock = new object();
     private bool _initialized;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     // Batch execution state — records multiple dispatches into a single command buffer.
     // Thread-affine: _batchOwnerThreadId tracks which thread owns the batch. Non-owning
@@ -452,6 +452,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
         {
+            // Dispose releases the backend-owned placeholder binding under this lock.
+            if (_disposed) throw new ObjectDisposedException(nameof(VulkanBackend));
             pipeline.UpdateDescriptorSet(storages);
             RecordAndExecuteWithPushData(
                 pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes, workgroupSize);
@@ -1248,12 +1250,24 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         _disposed = true;
 
-        // Wait for device to finish
-        _device.WaitIdle();
+        // Under the compute lock: a dispatch that already holds it finishes (every dispatch submits and waits)
+        // before the placeholder is released, and one that takes it afterwards sees _disposed and stops. Without it
+        // a call could read UnusedBinding, lose the race to this method, and then bind the released buffer.
+        lock (_computeLock)
+        {
+            // Wait for device to finish
+            _device.WaitIdle();
 
-        // Parked buffers must be freed while the device still exists.
-        VulkanGpuBuffer.PendingFrees.Drain();
-        VulkanGpuBuffer.Pool.DrainAll();
+            // Parked buffers must be freed while the device still exists. The placeholder is pooled, so it is
+            // released first and the drain frees it with the rest.
+            IGpuBuffer? placeholder;
+            lock (_unusedBindingLock)
+            {
+                placeholder = _unusedBindingBuffer;
+                _unusedBindingBuffer = null;
+            }
+            VulkanGpuBuffer.ReleaseAndDrain(placeholder);
+        }
 
         // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()
 
@@ -1270,6 +1284,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pipeline.Dispose();
         }
         _glslPipelineCache.Clear();
+        DisposeTunedKernelResources();
         _glslPipelineBySource.Clear();
         _glslPipelineByInstance.Clear();
 

@@ -1,0 +1,251 @@
+{
+  "schemaVersion": 1,
+  "device": "vulkan:NVIDIA GeForce RTX 3080",
+  "entries": [
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:16x64x16x16x64x3x3x1x1x1x1x1x1x16x16",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:32x3x32x32x16x3x3x1x1x1x1x1x1x32x32",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:4x3x224x224x64x7x7x2x2x3x3x1x1x112x112",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x1x28x28x16x3x3x1x1x1x1x1x1x28x28",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:8x128x16x16x128x1x1x1x1x0x0x1x1x16x16",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:8x64x32x32x128x3x3x2x2x1x1x1x1x16x16",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 2.065
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes256",
+      "speedup": 4.668
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:512x384",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 2.8
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:512x512",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 3.121
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes256",
+      "speedup": 6.932
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 2.327
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes256",
+      "speedup": 3.488
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 5.324
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:512x384",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes16",
+      "speedup": 3.219
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:512x512",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes16",
+      "speedup": 3.604
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes256",
+      "speedup": 8.152
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:2364x197",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows8",
+      "speedup": 1.659
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "vulkan.layernorm_grad_params.thread_per_column",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 2.772
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "vulkan.rmsnorm_grad_gamma.thread_per_column",
+      "speedup": 1
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:4096x128",
+      "deterministic": true,
+      "candidate": "generated.rmsnorm_grad_gamma.rows32",
+      "speedup": 2.009
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "vulkan.rmsnorm_grad_gamma.thread_per_column",
+      "speedup": 1
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.rmsnorm_grad_gamma.rows32",
+      "speedup": 2.807
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes32",
+      "speedup": 2.016
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes256",
+      "speedup": 3.351
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes256",
+      "speedup": 4.596
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:4096x128",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes32",
+      "speedup": 1.499
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:512x512",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes32",
+      "speedup": 3.14
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes256",
+      "speedup": 6.621
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes32",
+      "speedup": 2.267
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes256",
+      "speedup": 3.738
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes256",
+      "speedup": 5.461
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:512x512",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes16",
+      "speedup": 3.582
+    }
+  ]
+}
