@@ -11,7 +11,6 @@ public static class OpenClLinalgKernels
     {
         "parity211_cholesky",
         "parity211_lu_factor",
-        "parity211_qr_reduced",
         "parity211_eigh",
     };
 
@@ -132,98 +131,6 @@ __kernel void parity211_lu_factor(
             LUb[i * n + c] -= LUb[i * n + j] * LUb[j * n + c];
         }
         barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-    }
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-// QR REDUCED — Modified Gram–Schmidt. See CudaLinalgKernels for the
-// algorithm derivation; this mirrors it in OpenCL C.
-// ═════════════════════════════════════════════════════════════════════════
-__kernel void parity211_qr_reduced(
-    __global const float* A,
-    __global float* Q,
-    __global float* R,
-    const int batchCount, const int m, const int n)
-{
-    const int b = get_group_id(0);
-    if (b >= batchCount) return;
-    const int tid = get_local_id(0);
-    const int blockSize = get_local_size(0);
-    const int k = min(m, n);
-
-    __global const float* Ab = A + (long)b * m * n;
-    __global float* Qb = Q + (long)b * m * k;
-    __global float* Rb = R + (long)b * k * n;
-
-    __local float partials[1024];
-    __local float sScalar;
-
-    // Zero R.
-    for (int idx = tid; idx < k * n; idx += blockSize) Rb[idx] = 0.0f;
-    barrier(CLK_GLOBAL_MEM_FENCE);
-
-    // Stage 1: MGS on the first k columns.
-    for (int j = 0; j < k; ++j) {
-        for (int i = tid; i < m; i += blockSize) Qb[i * k + j] = Ab[i * n + j];
-        barrier(CLK_GLOBAL_MEM_FENCE);
-
-        for (int p = 0; p < j; ++p) {
-            float partial = 0.0f;
-            for (int i = tid; i < m; i += blockSize)
-                partial += Qb[i * k + p] * Qb[i * k + j];
-            partials[tid] = partial;
-            barrier(CLK_LOCAL_MEM_FENCE);
-            for (int s = blockSize / 2; s > 0; s >>= 1) {
-                if (tid < s) partials[tid] += partials[tid + s];
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
-            if (tid == 0) { sScalar = partials[0]; Rb[p * n + j] = sScalar; }
-            barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-            float rp = sScalar;
-            for (int i = tid; i < m; i += blockSize)
-                Qb[i * k + j] -= rp * Qb[i * k + p];
-            barrier(CLK_GLOBAL_MEM_FENCE);
-        }
-
-        float partialN = 0.0f;
-        for (int i = tid; i < m; i += blockSize) {
-            float vi = Qb[i * k + j];
-            partialN += vi * vi;
-        }
-        partials[tid] = partialN;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (int s = blockSize / 2; s > 0; s >>= 1) {
-            if (tid < s) partials[tid] += partials[tid + s];
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-        if (tid == 0) { sScalar = sqrt(partials[0]); Rb[j * n + j] = sScalar; }
-        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-
-        float norm = sScalar;
-        // A per-element select, not an if/else around the loops: POCL cannot form parallel regions for a branch
-        // that is followed by a barrier (Kernel.cc createParallelRegionBefore asserts and kills the process).
-        // Same values as the branch, including +0.0 (not -0.0) for a degenerate column and NaN norm -> 0.
-        const int keep = norm > 1e-30f;
-        float invNorm = keep ? 1.0f / norm : 0.0f;
-        for (int i = tid; i < m; i += blockSize) Qb[i * k + j] = keep ? Qb[i * k + j] * invNorm : 0.0f;
-        barrier(CLK_GLOBAL_MEM_FENCE);
-    }
-
-    // Stage 2: fill R[:, c] for c >= k via Qᵀ · A[:, c].
-    for (int c = k; c < n; ++c) {
-        for (int p = 0; p < k; ++p) {
-            float partial = 0.0f;
-            for (int i = tid; i < m; i += blockSize)
-                partial += Qb[i * k + p] * Ab[i * n + c];
-            partials[tid] = partial;
-            barrier(CLK_LOCAL_MEM_FENCE);
-            for (int s = blockSize / 2; s > 0; s >>= 1) {
-                if (tid < s) partials[tid] += partials[tid + s];
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
-            if (tid == 0) Rb[p * n + c] = partials[0];
-            barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-        }
     }
 }
 

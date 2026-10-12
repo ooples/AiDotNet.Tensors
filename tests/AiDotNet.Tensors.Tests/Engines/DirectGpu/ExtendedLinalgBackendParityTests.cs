@@ -301,6 +301,13 @@ public sealed class ExtendedLinalgBackendParityTests
             lin.LinalgQrReducedDirect(aBuf, qBuf, rBuf, Batch, m, n);
             AssertClose(q.GetDataArray(), backend.DownloadBuffer(qBuf), $"QR Q {m}x{n}");
             AssertClose(r.GetDataArray(), backend.DownloadBuffer(rBuf), $"QR R {m}x{n}");
+
+            // The engine's general Linalg.QR route (ILinalgBackend) runs the same Householder kernel.
+            using var q2 = backend.AllocateBuffer(Batch * m * k);
+            using var r2 = backend.AllocateBuffer(Batch * k * n);
+            Assert.IsAssignableFrom<ILinalgBackend>(backend).LinalgQrReduced(aBuf, q2, r2, Batch, m, n);
+            AssertClose(q.GetDataArray(), backend.DownloadBuffer(q2), $"LinalgQrReduced Q {m}x{n}");
+            AssertClose(r.GetDataArray(), backend.DownloadBuffer(r2), $"LinalgQrReduced R {m}x{n}");
         }
     }
 
