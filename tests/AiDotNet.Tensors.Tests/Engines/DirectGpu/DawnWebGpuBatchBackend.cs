@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// suites check the code and the shaders WebGPU ships. Buffers live on an OpenCL host, which the launcher copies to
 /// and from Dawn around each dispatch.
 /// <para>Not verified here, and forwarded to the OpenCL host instead: batch and stream state (WebGPU's waits on every
-/// submission), and <c>CosineSimilarity</c>, <c>PairwiseDistance</c>, <c>PairwiseDistanceSquared</c>,
+/// submission), <c>Copy</c> (a buffer copy), and <c>CosineSimilarity</c>, <c>PairwiseDistance</c>, <c>PairwiseDistanceSquared</c>,
 /// <c>PixelShuffle</c> and <c>PixelShuffleBackward</c>, which WebGPU dispatches through other WGSL modules.</para>
 /// </summary>
 internal sealed class DawnWebGpuBatchBackend : DelegatingGpuBackend, IGpuBatchExecution, IMeshgridBackend, IGenericFftBackend, IFftBackend
@@ -52,6 +52,15 @@ internal sealed class DawnWebGpuBatchBackend : DelegatingGpuBackend, IGpuBatchEx
         => _host.PixelShuffle(input, output, batch, channels, inH, inW, scale);
     public void PixelShuffleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int scale)
         => _host.PixelShuffleBackward(gradOutput, gradInput, batch, channels, inH, inW, scale);
+
+    // ---- WebGPU's radix-2 BatchedFFT, as WebGpuBackend.BatchedFFT runs a power-of-two length ----
+    public override void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
+        int batch, int n, bool inverse)
+    {
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw new NotSupportedException("The Dawn harness runs WebGPU's radix-2 path only; other lengths use fft_1d.");
+        PortableGenericFft.BatchedRadix2(this, _launch, inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
+    }
 
     // ---- WebGPU's generic FFT, as WebGpuBackend.CapabilityParity calls it ----
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;

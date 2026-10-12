@@ -253,5 +253,60 @@ public sealed class GenericFftBackendParityTests
         }
     }
 
+
+    /// <summary>
+    /// #965: the batched radix-2 kernels (<see cref="PortableGenericFft.BatchedRadix2"/>) against the DFT, including the
+    /// lengths Bluestein pads to and an aliased input / output, with a tolerance in line with a float FFT's error.
+    /// </summary>
+    private delegate void Radix2(IGpuBuffer inRe, IGpuBuffer inIm, IGpuBuffer outRe, IGpuBuffer outIm, int batch, int n, bool inverse);
+
+    private static void CheckRadix2(IDirectGpuBackend backend, Radix2 transform)
+    {
+        foreach (int n in new[] { 1, 2, 8, 64, 1024, 4096 })
+            foreach (bool inverse in new[] { false, true })
+                foreach (bool aliased in new[] { false, true })
+                {
+                    int batch = n >= 1024 ? 2 : Batch;
+                    var re = Values(batch * n, n + 1);
+                    var im = Values(batch * n, n + 5);
+                    Dft(re, im, n, inverse, out var eRe, out var eIm);
+                    using var bRe = backend.AllocateBuffer(re);
+                    using var bIm = backend.AllocateBuffer(im);
+                    using var oRe = aliased ? null : backend.AllocateBuffer(batch * n);
+                    using var oIm = aliased ? null : backend.AllocateBuffer(batch * n);
+                    IGpuBuffer outRe = oRe ?? bRe, outIm = oIm ?? bIm;
+                    transform(bRe, bIm, outRe, outIm, batch, n, inverse);
+                    var aRe = backend.DownloadBuffer(outRe);
+                    var aIm = backend.DownloadBuffer(outIm);
+                    double tol = (1e-3 + 1e-6 * n) * (inverse ? 1.0 / n : 1.0) + 1e-6;
+                    for (int i = 0; i < batch * n; i++)
+                        Assert.True(Math.Abs(aRe[i] - eRe[i]) <= tol && Math.Abs(aIm[i] - eIm[i]) <= tol,
+                            $"radix-2 n={n} {(inverse ? "inverse" : "forward")}{(aliased ? " aliased" : "")} [{i}]: got ({aRe[i]}, {aIm[i]}), expected ({eRe[i]}, {eIm[i]})");
+                }
+    }
+
+    [SkippableFact]
+    public void WebGpuWgsl_Radix2BatchedFft_MatchesDft_OnDawn()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            // Through the backend's BatchedFFT, the member WebGpuBackend routes power-of-two lengths with.
+            CheckRadix2(backend, backend.BatchedFFT);
+        }
+    }
+
+    // The shared CUDA-dialect kernels on HIP (the source CUDA compiles and Metal translates); OpenCL and Vulkan
+    // run their own radix-2 BatchedFFT and do not carry these kernels.
+    [SkippableFact]
+    public void Hip_Radix2BatchedFftKernels_MatchDft()
+    {
+        using var backend = new HipBackend();
+        Skip.IfNot(backend.IsAvailable, "HIP is not available.");
+        CheckRadix2(backend, (re, im, oRe, oIm, b, n, inv) => PortableGenericFft.BatchedRadix2(backend, backend.LaunchBatch, re, im, oRe, oIm, b, n, inv));
+    }
+
+
 }
 #endif
