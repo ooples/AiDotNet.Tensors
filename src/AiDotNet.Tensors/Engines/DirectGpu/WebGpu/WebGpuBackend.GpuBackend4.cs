@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // IDirectGpuBackend implementation part 4: Optimizers, FP16/32, Specialized, Hyperbolic, Octonion, Quantum, FFT, RNN.
 
 #if NET7_0_OR_GREATER
@@ -1050,55 +1050,9 @@ public sealed partial class WebGpuBackend
         IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        int cellTotal = batch * hiddenSize;
-        int gateTotal = batch * 4 * hiddenSize;
-        if (seqLen <= 0 || cellTotal <= 0)
-        {
-            if (cellTotal > 0)
-            {
-                Copy(hInit, hFinal, cellTotal);
-                Copy(cInit, cFinal, cellTotal);
-            }
-            return;
-        }
-        using var hA = (WebGpuBuffer)AllocateBuffer(cellTotal);
-        using var hB = (WebGpuBuffer)AllocateBuffer(cellTotal);
-        using var cA = (WebGpuBuffer)AllocateBuffer(cellTotal);
-        using var cB = (WebGpuBuffer)AllocateBuffer(cellTotal);
-        using var inputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
-        using var gates = (WebGpuBuffer)AllocateBuffer(gateTotal);
-        Copy(hInit, hA, cellTotal);
-        Copy(cInit, cA, cellTotal);
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(batch),
-            BitConverter.Int32BitsToSingle(inputSize),
-            BitConverter.Int32BitsToSingle(hiddenSize),
-            0
-        };
-        var stateUniforms = MakeUniformInts2(batch, hiddenSize);
-        for (int t = 0; t < seqLen; t++)
-        {
-            var prevH = (t & 1) == 0 ? hA : hB;
-            var nextH = (t & 1) == 0 ? hB : hA;
-            var prevC = (t & 1) == 0 ? cA : cB;
-            var nextC = (t & 1) == 0 ? cB : cA;
-            GatherSequenceSlice(input, inputSlice, t, seqLen, batch, inputSize);
-            DispatchNBufferAsync("LstmForwardLinear", WebGpuKernels.LstmForwardLinearSource,
-                "lstm_forward_linear",
-                new IGpuBuffer[] { inputSlice, prevH, weightsIh, weightsHh, biasIh, biasHh, gates },
-                uniforms, gateTotal).GetAwaiter().GetResult();
-            Dispatch4BufferAsync("LstmForwardState", WebGpuKernels.LstmForwardStateSource,
-                "lstm_forward_state", gates, prevC, nextH, nextC, stateUniforms, cellTotal).GetAwaiter().GetResult();
-            Copy(nextH, 0, allH, t * cellTotal, cellTotal);
-            Copy(nextC, 0, allC, t * cellTotal, cellTotal);
-            Copy(gates, 0, cacheGates, t * gateTotal, gateTotal);
-            ScatterSequenceSlice(nextH, output, t, seqLen, batch, hiddenSize);
-        }
-        var finalH = (seqLen & 1) == 0 ? hA : hB;
-        var finalC = (seqLen & 1) == 0 ? cA : cB;
-        Copy(finalH, hFinal, cellTotal);
-        Copy(finalC, cFinal, cellTotal);
+        // The shared lstm_p_ kernels (#1108): the source verified on OpenCL, Vulkan and HIP, as a line-for-line WGSL port.
+        PortableLstmSequence.Forward(this, LaunchBatch, input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
+            output, hFinal, cFinal, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
     }
 
     public void LstmBackwardSequence(
@@ -1109,140 +1063,9 @@ public sealed partial class WebGpuBackend
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        // LSTM Backpropagation Through Time (BPTT)
-        // Initialize gradient accumulators to zero
-        int hs = hiddenSize;
-        int cellTotal = batch * hs;
-        Fill(gradInput, 0f, batch * seqLen * inputSize);
-        Fill(gradWeightsIh, 0f, 4 * hs * inputSize);
-        Fill(gradWeightsHh, 0f, 4 * hs * hs);
-        Fill(gradBiasIh, 0f, 4 * hs);
-        Fill(gradBiasHh, 0f, 4 * hs);
-
-        // Running gradient of hidden state and cell state
-        using var gradH = (WebGpuBuffer)AllocateBuffer(cellTotal);
-        using var gradC = (WebGpuBuffer)AllocateBuffer(cellTotal);
-        Fill(gradH, 0f, cellTotal);
-        Fill(gradC, 0f, cellTotal);
-
-        // Iterate backwards through time
-        for (int t = seqLen - 1; t >= 0; t--)
-        {
-            // Add gradient from output at this timestep to gradH
-            // gradOutput[b, t, :] -> gradH[b, :]
-            using var gradOutSlice = (WebGpuBuffer)AllocateBuffer(cellTotal);
-            var sliceUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(hs),
-                BitConverter.Int32BitsToSingle(seqLen * hs),
-                BitConverter.Int32BitsToSingle(hs),
-                BitConverter.Int32BitsToSingle(t * hs),
-                BitConverter.Int32BitsToSingle(0),
-                0, 0
-            };
-            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
-                gradOutput, gradOutSlice, sliceUniforms, cellTotal).GetAwaiter().GetResult();
-            Add(gradH, gradOutSlice, gradH, cellTotal);
-
-            // Get h_prev and c_prev for this timestep
-            // c_prev = t > 0 ? allC[(t-1)*batch*hs : t*batch*hs] : cInit
-            using var cPrev = (WebGpuBuffer)AllocateBuffer(cellTotal);
-            if (t > 0)
-                Copy(allC, (t - 1) * cellTotal, cPrev, 0, cellTotal);
-            else
-                Copy(cInit, cPrev, cellTotal);
-
-            // h_prev for this timestep
-            using var hPrev = (WebGpuBuffer)AllocateBuffer(cellTotal);
-            if (t > 0)
-                Copy(allH, (t - 1) * cellTotal, hPrev, 0, cellTotal);
-            else
-                Copy(hInit, hPrev, cellTotal);
-
-            // Get input slice for this timestep
-            using var inputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
-            var inSliceUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(inputSize),
-                BitConverter.Int32BitsToSingle(seqLen * inputSize),
-                BitConverter.Int32BitsToSingle(inputSize),
-                BitConverter.Int32BitsToSingle(t * inputSize),
-                BitConverter.Int32BitsToSingle(0),
-                0, 0
-            };
-            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
-                input, inputSlice, inSliceUniforms, batch * inputSize).GetAwaiter().GetResult();
-            int gateSize = 4 * hs;
-            int gateTotal = batch * gateSize;
-            using var gates = (WebGpuBuffer)AllocateBuffer(gateTotal);
-            using var cNew = (WebGpuBuffer)AllocateBuffer(cellTotal);
-            using var gradGates = (WebGpuBuffer)AllocateBuffer(gateTotal);
-            using var newGradC = (WebGpuBuffer)AllocateBuffer(cellTotal);
-            using var newGradH = (WebGpuBuffer)AllocateBuffer(cellTotal);
-            using var gradInputSlice = (WebGpuBuffer)AllocateBuffer(batch * inputSize);
-            Copy(cacheGates, t * gateTotal, gates, 0, gateTotal);
-            Copy(allC, t * cellTotal, cNew, 0, cellTotal);
-            DispatchNBufferAsync("LstmBackwardGates", WebGpuKernels.LstmBackwardGatesSource,
-                "lstm_backward_gates",
-                new IGpuBuffer[] { gradH, gradC, gates, cPrev, cNew, gradGates, newGradC },
-                MakeUniformInts2(batch, hs), cellTotal).GetAwaiter().GetResult();
-            var inputProjectUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(gateSize),
-                BitConverter.Int32BitsToSingle(inputSize),
-                0
-            };
-            Dispatch3BufferAsync("RnnBackwardProject", WebGpuKernels.RnnBackwardProjectSource,
-                "rnn_backward_project", gradGates, weightsIh, gradInputSlice,
-                inputProjectUniforms, batch * inputSize).GetAwaiter().GetResult();
-            // Scatter to gradInput[b, t, :]
-            var scatterUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(inputSize),
-                BitConverter.Int32BitsToSingle(inputSize),
-                BitConverter.Int32BitsToSingle(seqLen * inputSize),
-                BitConverter.Int32BitsToSingle(0),
-                BitConverter.Int32BitsToSingle(t * inputSize),
-                0, 0
-            };
-            Dispatch2BufferAsync("StridedSlice", WebGpuKernels.StridedSliceSource, "strided_slice",
-                gradInputSlice, gradInput, scatterUniforms, batch * inputSize).GetAwaiter().GetResult();
-
-            var hiddenProjectUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(gateSize),
-                BitConverter.Int32BitsToSingle(hs),
-                0
-            };
-            Dispatch3BufferAsync("RnnBackwardProject", WebGpuKernels.RnnBackwardProjectSource,
-                "rnn_backward_project", gradGates, weightsHh, newGradH,
-                hiddenProjectUniforms, cellTotal).GetAwaiter().GetResult();
-
-            var accumulateUniforms = new float[]
-            {
-                BitConverter.Int32BitsToSingle(batch),
-                BitConverter.Int32BitsToSingle(gateSize),
-                BitConverter.Int32BitsToSingle(inputSize),
-                BitConverter.Int32BitsToSingle(hs)
-            };
-            int accumulateSize = Math.Max(gateSize * inputSize, Math.Max(gateSize * hs, gateSize));
-            DispatchNBufferAsync("LstmBackwardAccumulate", WebGpuKernels.LstmBackwardAccumulateSource,
-                "lstm_backward_accumulate",
-                new IGpuBuffer[] { gradGates, inputSlice, hPrev, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh },
-                accumulateUniforms, accumulateSize).GetAwaiter().GetResult();
-
-            Copy(newGradH, gradH, cellTotal);
-            Copy(newGradC, gradC, cellTotal);
-        }
-
-        // Copy final gradients
-        Copy(gradH, gradHInit, cellTotal);
-        Copy(gradC, gradCInit, cellTotal);
+        PortableLstmSequence.Backward(this, LaunchBatch, gradOutput, allH, allC, cacheGates, weightsIh, weightsHh, input,
+            gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
+            seqLen, batch, inputSize, hiddenSize);
     }
 
     public void GruForwardSequence(

@@ -70,7 +70,7 @@ public partial class DirectGpuTensorEngine
     // any other backend.
     private static void ZeroLstmGradient(IDirectGpuBackend backend, IGpuBuffer buffer, int length)
     {
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.MemsetBuffer(buffer, 0, (long)length * sizeof(float));
+        if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(buffer, length);
         else backend.Fill(buffer, 0f, length);
     }
 
