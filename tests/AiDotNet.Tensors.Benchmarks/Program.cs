@@ -1397,6 +1397,36 @@ class Program
             return;
         }
 
+        // Per-call cost of the Vulkan ops with an optional operand when it is left out (max pooling without indices)
+        if (args[0] == "--vulkan-optional-binding")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
+            foreach (var (b, c, hw) in new[] { (1, 16, 32), (8, 64, 56), (32, 64, 112) })
+            {
+                int o = hw / 2, total = b * c * o * o;
+                using var x = vb.AllocateBuffer(new float[b * c * hw * hw]);
+                using var y = vb.AllocateBuffer(total);
+                using var idx = vb.AllocateIntBuffer(total);
+                double Time(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer? indices)
+                {
+                    for (int i = 0; i < 200; i++) vb.MaxPool2D(x, y, indices, b, c, hw, hw, o, o, 2, 2, 2, 2, 0, 0);
+                    var samples = new double[9];
+                    for (int s = 0; s < samples.Length; s++)
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < 300; i++) vb.MaxPool2D(x, y, indices, b, c, hw, hw, o, o, 2, 2, 2, 2, 0, 0);
+                        samples[s] = sw.Elapsed.TotalMilliseconds * 1000 / 300;
+                    }
+                    Array.Sort(samples);
+                    return samples[samples.Length / 2];
+                }
+                double without = Time(null), with = Time(idx), without2 = Time(null);
+                Console.WriteLine($"MAXPOOL2D [{b},{c},{hw},{hw}] out={total} no-indices={without:F1}us with-indices={with:F1}us no-indices(again)={without2:F1}us");
+            }
+            return;
+        }
+
         // A forward that keeps its intermediates alive until it ends, with no gradient tape: how many driver
         // allocations it pays per forward, and whether device buffers pile up, as the loop runs
         if (args[0] == "--vulkan-forward-lifetime")
@@ -1442,7 +1472,7 @@ class Program
         if (args[0] == "--vulkan-result-lifetime")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
             var a = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
             var b = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
@@ -1482,7 +1512,7 @@ class Program
             if (Environment.GetEnvironmentVariable("VKENGINE_NO_MISS_COLLECT") == "1")
                 AiDotNet.Tensors.Engines.DirectGpu.DeviceMemoryReclaim.TapeOpen = () => true;
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
             foreach (int n in new[] { 64, 1024 })
             {
@@ -1530,7 +1560,7 @@ class Program
         if (args[0] == "--vulkan-alloc")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             static double Median(Func<double> sample)
             {
                 var samples = new double[9];
@@ -1609,9 +1639,10 @@ class Program
         if (args[0] == "--vulkan-pipeline-lookup")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             var method = typeof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend).GetMethod("GetOrCreateGlslPipeline",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                ?? throw new MissingMethodException(nameof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend), "GetOrCreateGlslPipeline");
             var lookup = (Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>)Delegate.CreateDelegate(
                 typeof(Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>), vb, method);
             foreach (var (name, get, bindings, push) in new (string, Func<string>, int, uint)[]
