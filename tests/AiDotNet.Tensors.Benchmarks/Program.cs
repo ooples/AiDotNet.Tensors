@@ -1664,9 +1664,12 @@ class Program
                 using var b = vb.AllocateBuffer(n);
                 // chain: `ops` softmax calls ping-ponging between two buffers, then one wait for all of them
                 // read:  the same calls, each followed by a download of its 1-row result (a host read per op)
-                double Median(bool deferred, int ops, bool readEach)
+                var device = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.Instance;
+                // arm 0: submit and wait per op; arm 1: submit per op without waiting; arm 2: coalesced (the default)
+                double Median(int arm, int ops, bool readEach)
                 {
-                    vb.SubmitsWithoutWaiting = deferred;
+                    vb.SubmitsWithoutWaiting = arm != 0;
+                    device.CoalescedDispatchLimit = arm == 1 ? 1 : AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.MaxCoalescedDispatches;
                     var samples = new double[9];
                     for (int s = -2; s < samples.Length; s++)
                     {
@@ -1685,14 +1688,17 @@ class Program
                 }
                 foreach (int ops in new[] { 1, 8, 64 })
                 {
-                    // Interleaved: waited, unwaited, waited, unwaited.
-                    double w1 = Median(false, ops, false), d1 = Median(true, ops, false), w2 = Median(false, ops, false), d2 = Median(true, ops, false);
-                    Console.WriteLine($"VKSUBMIT {rows}x{cols} chain of {ops}: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/op, not waited {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/op");
+                    // Interleaved: waited, per-op, coalesced, twice.
+                    double w1 = Median(0, ops, false), d1 = Median(1, ops, false), c1 = Median(2, ops, false);
+                    double w2 = Median(0, ops, false), d2 = Median(1, ops, false), c2 = Median(2, ops, false);
+                    Console.WriteLine($"VKSUBMIT {rows}x{cols} chain of {ops}: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/op, submitted per op {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/op, coalesced {Math.Min(c1, c2):F1}-{Math.Max(c1, c2):F1} us/op");
                 }
                 {
-                    double w1 = Median(false, 16, true), d1 = Median(true, 16, true), w2 = Median(false, 16, true), d2 = Median(true, 16, true);
-                    Console.WriteLine($"VKSUBMIT {rows}x{cols} op + host read, 16 times: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/pair, not waited {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/pair");
+                    double w1 = Median(0, 16, true), d1 = Median(1, 16, true), c1 = Median(2, 16, true);
+                    double w2 = Median(0, 16, true), d2 = Median(1, 16, true), c2 = Median(2, 16, true);
+                    Console.WriteLine($"VKSUBMIT {rows}x{cols} op + host read, 16 times: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/pair, submitted per op {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/pair, coalesced {Math.Min(c1, c2):F1}-{Math.Max(c1, c2):F1} us/pair");
                 }
+                device.CoalescedDispatchLimit = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.MaxCoalescedDispatches;
             }
             vb.SubmitsWithoutWaiting = true;
             return;

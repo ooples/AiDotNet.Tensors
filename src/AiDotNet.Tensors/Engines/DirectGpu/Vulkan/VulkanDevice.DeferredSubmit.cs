@@ -47,6 +47,12 @@ public sealed unsafe partial class VulkanDevice
     internal const int MaxCoalescedDispatches = 16;
 
     /// <summary>
+    /// The limit in force: <see cref="MaxCoalescedDispatches"/> unless a benchmark or test lowers it. At 1 every
+    /// dispatch is submitted on its own, which is what the backend did before coalescing.
+    /// </summary>
+    internal int CoalescedDispatchLimit { get; set; } = MaxCoalescedDispatches;
+
+    /// <summary>
     /// Held while a dispatch is recorded into the open command buffer, and by anything that ends and submits that
     /// buffer. The Vulkan backend uses this object as its compute lock, so a flush from another thread (a transfer,
     /// a host read) waits for a dispatch that is mid-recording. Always taken before <c>_pendingLock</c>.
@@ -134,7 +140,7 @@ public sealed unsafe partial class VulkanDevice
         // Under the lock a release takes to compare serials, so a release cannot slip in before the mark.
         lock (_pendingLock)
             foreach (var buffer in boundBuffers) buffer.MarkUsedBySubmission(_openSerial);
-        if (_openSets.Count >= MaxCoalescedDispatches) SubmitOpenCommands();
+        if (_openSets.Count >= Math.Max(1, CoalescedDispatchLimit)) SubmitOpenCommands();
     }
 
     /// <summary>Ends the open command buffer and submits it without waiting. Does nothing when none is open.</summary>
