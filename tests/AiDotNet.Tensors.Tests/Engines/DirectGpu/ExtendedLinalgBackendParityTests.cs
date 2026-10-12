@@ -327,6 +327,29 @@ public sealed class ExtendedLinalgBackendParityTests
         Check(backend);
     }
 
+    // No device needed. The solvers factor in place, and NVIDIA's Vulkan compiler reused a value read before a pivot
+    // swap unless the written buffer is volatile (la_ldl_factor then chose a different pivot from every other
+    // backend). The device test above catches that only on a machine with such a driver; this keeps the qualifier
+    // from being dropped on one without.
+    [Fact]
+    public void VulkanSolverShaders_DeclareEveryWrittenBufferVolatile()
+    {
+        Assert.NotEmpty(VulkanBatchExecutionKernels.Solvers);
+        foreach (var solver in VulkanBatchExecutionKernels.Solvers)
+        {
+            int buffers = 0;
+            foreach (string line in solver.Value.Split('\n'))
+            {
+                if (!line.StartsWith("layout(set = 0, binding = ", StringComparison.Ordinal)) continue;
+                buffers++;
+                Assert.True(line.Contains(") readonly buffer ") || line.Contains(") volatile buffer "),
+                    $"{solver.Key}: a buffer is neither read-only nor volatile: {line.Trim()}");
+            }
+            Assert.True(buffers > 0, $"{solver.Key} declares no buffers");
+        }
+        Assert.Contains(") volatile buffer Buf1 { float ld[]; };", VulkanBatchExecutionKernels.Solvers["la_ldl_factor"]);
+    }
+
     [SkippableFact]
     public void Hip_ExtendedLinalg_MatchesManagedReference()
     {
