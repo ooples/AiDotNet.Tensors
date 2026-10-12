@@ -230,7 +230,7 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
         if (!_kernelCache.TryGetValue("im2col_kn_fp16hw", out var k))
-            throw new System.InvalidOperationException("HIP kernel not found: im2col_kn_fp16hw");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: im2col_kn_fp16hw");
         // #671 review: validate at the public entry (the rest of this backend does) — null/foreign buffers,
         // a zero stride/dilation (divide-by-zero), and a non-positive output extent (negative elems cast to a
         // huge uint grid) would otherwise pass invalid pointers/launch sizes into hipModuleLaunchKernel.

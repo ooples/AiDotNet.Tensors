@@ -49,6 +49,8 @@ internal sealed class MockGpuBuffer : IGpuBuffer
 /// </summary>
 internal sealed class MockBackendState
 {
+    /// <summary>Backend members (by method name) that throw the given exception instead of running (#1165).</summary>
+    public Dictionary<string, Exception> ThrowOnCall { get; } = new();
     public long MaxBufferAllocBytes { get; set; } = long.MaxValue;
     /// <summary>
     /// Total device memory — semantically separate from the per-allocation
@@ -103,6 +105,7 @@ public class MockDirectGpuBackend : DispatchProxy
 
     protected override object Invoke(MethodInfo targetMethod, object[] args)
     {
+        if (_state.ThrowOnCall.TryGetValue(targetMethod.Name, out var injected)) throw injected;
         switch (targetMethod.Name)
         {
             // ── Identity / device info — implemented ──

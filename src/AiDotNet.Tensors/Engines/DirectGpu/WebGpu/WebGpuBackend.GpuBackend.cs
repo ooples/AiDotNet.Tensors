@@ -21,7 +21,7 @@ public sealed partial class WebGpuBackend
     private void EnsureInitialized()
     {
         if (!_initialized || _disposed)
-            throw new InvalidOperationException("WebGPU backend not initialized.");
+            throw new GpuCapabilityUnavailableException("WebGPU backend not initialized.");
     }
 
     private void UploadToBuffer(float[] data, IGpuBuffer buffer)

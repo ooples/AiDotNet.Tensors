@@ -15,7 +15,7 @@ public sealed partial class HipBackend : IGpuBatchExecution
     {
         if (threads <= 0) return;
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         ulong* slots = stackalloc ulong[args.Length];
         void** pointers = stackalloc void*[args.Length];
         for (int i = 0; i < args.Length; i++)
@@ -38,7 +38,7 @@ public sealed partial class HipBackend : IGpuBatchExecution
     private unsafe void FullReduce(IGpuBuffer input, IGpuBuffer output, int size, int mode, float maxVal)
     {
         if (!_kernelCache.TryGetValue("bx_full_reduce", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: bx_full_reduce");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: bx_full_reduce");
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];
         args[0] = &inPtr; args[1] = &outPtr; args[2] = &size; args[3] = &mode; args[4] = &maxVal;

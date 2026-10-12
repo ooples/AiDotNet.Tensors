@@ -185,7 +185,7 @@ internal static class PortableTorchParity
     {
         RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         if (elements >= 1L << 28)
-            throw new ArgumentOutOfRangeException(nameof(elements), "FP32 backends flag at most 2^28 elements per launch.");
+            throw new GpuCapabilityUnavailableException("FP32 backends flag at most 2^28 elements per launch.");
         using var rank = backend.AllocateIntBuffer(new[] { -1 });
         run(rank);
         launch("tp_flag_merge", 1, rank, flag, 1);
@@ -375,8 +375,8 @@ internal static class PortableTorchParity
         if (n <= 0) return;
         RequireCapacity(indices, n, nameof(indices), "n");
         RequireCapacity(output, n, nameof(output), "n");
-        if (total <= 0 || total > int.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(total), "FP32 backends unravel at most int.MaxValue elements.");
+        if (total <= 0) throw new ArgumentOutOfRangeException(nameof(total));
+        if (total > int.MaxValue) throw new GpuCapabilityUnavailableException("FP32 backends unravel at most int.MaxValue elements.");
         if (stride <= 0 || stride > total) throw new ArgumentOutOfRangeException(nameof(stride));
         if (extent <= 0 || extent > total) throw new ArgumentOutOfRangeException(nameof(extent));
         Flagged(backend, launch, flag, n, rank =>

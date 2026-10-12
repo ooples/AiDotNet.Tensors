@@ -97,7 +97,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(DirectOpenClContext));
                 var tl = _threadCommandQueue
-                    ?? throw new InvalidOperationException("DirectOpenClContext not initialized.");
+                    ?? throw new GpuCapabilityUnavailableException("DirectOpenClContext not initialized.");
                 return tl.Value;
             }
         }
@@ -117,7 +117,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (_disposed) throw new ObjectDisposedException(nameof(DirectOpenClContext));
                 if (!_profilingSupported) return IntPtr.Zero;
                 var tl = _threadProfilingCommandQueue
-                    ?? throw new InvalidOperationException("DirectOpenClContext not initialized.");
+                    ?? throw new GpuCapabilityUnavailableException("DirectOpenClContext not initialized.");
                 return tl.Value;
             }
         }

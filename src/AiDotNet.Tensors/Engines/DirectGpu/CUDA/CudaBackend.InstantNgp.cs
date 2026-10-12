@@ -7,9 +7,9 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRe
     private IntPtr ResolveInstantNgpKernel(string name)
     {
         if (_audioModule == IntPtr.Zero)
-            throw new InvalidOperationException("Instant-NGP CUDA kernels were not compiled.");
+            throw new GpuCapabilityUnavailableException("Instant-NGP CUDA kernels were not compiled.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         return kernel;
     }
 

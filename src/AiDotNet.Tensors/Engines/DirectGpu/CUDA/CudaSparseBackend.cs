@@ -48,7 +48,7 @@ internal static class CudaSparseBackend
         float[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA custom-kernel SpMM backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA custom-kernel SpMM backend is not available.");
 
         var backend = CudaBackend.CreateOrThrow();
         var output = new float[rows * n];
@@ -109,7 +109,7 @@ internal static class CudaSparseBackend
         float[] x, float[] y, int innerK)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA custom-kernel SDDMM backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA custom-kernel SDDMM backend is not available.");
 
         int nnz = rowIndices.Length;
         var output = new float[nnz];
@@ -155,7 +155,7 @@ internal static class CudaSparseBackend
         double[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA custom-kernel SpMM backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA custom-kernel SpMM backend is not available.");
 
         var backend = CudaBackend.CreateOrThrow();
         var output = new double[rows * n];
