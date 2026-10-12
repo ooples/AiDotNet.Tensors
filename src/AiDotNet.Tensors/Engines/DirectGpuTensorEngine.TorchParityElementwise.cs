@@ -8,8 +8,8 @@ namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
 /// Device paths for PyTorch-parity elementwise ops that computed on the host (#1112). They run on backends implementing
-/// <see cref="ITorchParityElementwiseBackend"/>, which today is CUDA and Vulkan; HIP, Metal, OpenCL and WebGPU take the
-/// recorded host fallback until #1124, #1125, #1126 and #1128 land. Under an active tape or graph recording they
+/// <see cref="ITorchParityElementwiseBackend"/>: CUDA, OpenCL and Vulkan; HIP, Metal and WebGPU take the recorded host
+/// fallback until #1124, #1125 and #1128 land. Under an active tape or graph recording they
 /// defer to the CPU implementation, which records the backward (the convention of the engine's other parity
 /// overrides); so do non-float precisions, mismatched binary shapes and argument errors the CPU reports.
 /// </summary>
