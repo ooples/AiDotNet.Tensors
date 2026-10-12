@@ -56,7 +56,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private VulkanBufferTransfer? _transfer;
     private readonly object _computeLock = new object();
     private bool _initialized;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     // Batch execution state — records multiple dispatches into a single command buffer.
     // Thread-affine: _batchOwnerThreadId tracks which thread owns the batch. Non-owning
@@ -1255,8 +1255,12 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         // Parked buffers must be freed while the device still exists. The placeholder is pooled, so it is released
         // first and the drain frees it with the rest.
-        var placeholder = _unusedBindingBuffer;
-        _unusedBindingBuffer = null;
+        IGpuBuffer? placeholder;
+        lock (_unusedBindingLock)
+        {
+            placeholder = _unusedBindingBuffer;
+            _unusedBindingBuffer = null;
+        }
         VulkanGpuBuffer.ReleaseAndDrain(placeholder);
 
         // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()

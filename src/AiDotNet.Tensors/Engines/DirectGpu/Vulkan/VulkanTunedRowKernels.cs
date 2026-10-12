@@ -25,9 +25,13 @@ internal static class VulkanTunedRowKernels
     /// <summary>
     /// Whether a row of <paramref name="n"/> columns is worth offering to the <paramref name="lanes"/>-lane variant:
     /// a lane walks n / lanes columns, so a narrow lane count is not offered rows where each lane would still walk
-    /// more than 64. The widest count (a whole workgroup per row) has no such limit; it is the one for the widest rows.
+    /// more than <see cref="MaxColumnsPerLane"/>. The widest count (a whole workgroup per row) has no such limit; it
+    /// is the one for the widest rows.
     /// </summary>
-    internal static bool RowLanesFit(int n, int lanes) => lanes == GroupSize || n <= 64 * lanes;
+    internal static bool RowLanesFit(int n, int lanes) => lanes == GroupSize || n <= MaxColumnsPerLane * lanes;
+
+    /// <summary>Columns one lane may walk before a narrow lane count stops being offered for the row.</summary>
+    internal const int MaxColumnsPerLane = 64;
 
     /// <summary>Row-lane counts the column-reduction family is instantiated for.</summary>
     internal static readonly int[] ColumnRowLanes = { 8, 32 };

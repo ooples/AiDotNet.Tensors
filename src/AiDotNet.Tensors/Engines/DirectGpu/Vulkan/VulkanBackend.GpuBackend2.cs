@@ -760,8 +760,17 @@ void main() {
     {
         get
         {
-            if (_unusedBindingBuffer is { } b) return b;
-            lock (_unusedBindingLock) return _unusedBindingBuffer ??= AllocateBuffer(1);
+            if (System.Threading.Volatile.Read(ref _unusedBindingBuffer) is { } b) return b;
+            lock (_unusedBindingLock)
+            {
+                if (_unusedBindingBuffer is { } existing) return existing;
+                // Dispose takes this lock to remove the placeholder, so a call racing with it either publishes
+                // before Dispose reads the field (and Dispose releases it) or sees the backend disposed here.
+                if (_disposed) throw new ObjectDisposedException(nameof(VulkanBackend));
+                var created = AllocateBuffer(1);
+                System.Threading.Volatile.Write(ref _unusedBindingBuffer, created);
+                return created;
+            }
         }
     }
 
