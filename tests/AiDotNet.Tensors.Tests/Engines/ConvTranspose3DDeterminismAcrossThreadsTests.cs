@@ -68,8 +68,10 @@ public sealed class ConvTranspose3DDeterminismAcrossThreadsTests : IDisposable
     // would never ask that question.
     private static readonly int[] ThreadBudgets = { 1, 2, 3, 4, 1, 4, 3, 2 };
 
-    // PersistentParallelExecutor.DefaultSerialGrainSize: below this much reported work a loop runs serially.
-    private const int ParallelGateElements = 32 * 1024;
+    // Below this much reported work a loop runs serially. Read from the executor, not copied: if the threshold
+    // is ever raised past these workloads the assertions below fail, where a copied constant would let the tests
+    // pass while running serially.
+    private static int ParallelGateElements => PersistentParallelExecutor.DefaultSerialGrainSize;
 
     [Fact]
     public void ConvTranspose3D_is_bit_identical_regardless_of_the_thread_budget()
@@ -113,11 +115,16 @@ public sealed class ConvTranspose3DDeterminismAcrossThreadsTests : IDisposable
         // The spatial extent is not part of that gate and is kept small: at 12^3 input this test accumulated
         // 226M products per run, eight runs, and took 5 to 8 minutes on a CI runner under coverage, long enough
         // on a slow runner to trip the 10-minute hang watchdog and abort the whole test run. At 6^3 it is an
-        // eighth of that with the same kernel, the same task partition and the same reported work.
+        // eighth of that per batch entry, with the same kernel, the same task partition and the same reported work.
+        //
+        // THREE batch entries, not two. The defect merged one partial per (batch, input channel) task, and a
+        // kernel element belongs to one input channel, so it received exactly `batch` partials. With two, the
+        // merge is a + b against b + a, which is the same float in either order: the test could not have failed.
+        // Three is the smallest count where the order of the additions can change the result.
         var kernelShape = new[] { 32, 32, 4, 4, 4 };
         Assert.True(32 * 32 * 4 * 4 * 4 >= ParallelGateElements, "the kernel gradient must clear the serial grain gate");
-        var input = Fill(new[] { 2, 32, 6, 6, 6 }, seed: 779);
-        var gradOutput = Fill(new[] { 2, 32, 9, 9, 9 }, seed: 780);
+        var input = Fill(new[] { 3, 32, 6, 6, 6 }, seed: 779);
+        var gradOutput = Fill(new[] { 3, 32, 9, 9, 9 }, seed: 780);
 
         float[]? baseline = null;
         foreach (var dop in ThreadBudgets)
