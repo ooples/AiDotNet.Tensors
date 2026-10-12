@@ -12567,13 +12567,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var statsT = new Tensor<T>(new T[(long)batch * heads * seqQ], new[] { batch, heads, seqQ });
                 var outBufR = GetOrCreateResidentBuffer(backend, outT, batch * heads * seqQ * headDim);
                 var statsBufR = GetOrCreateResidentBuffer(backend, statsT, batch * heads * seqQ);
-                using var biasNoneR = default(OwnedBuffer);
                 if (qBufR.Buffer.Handle != System.IntPtr.Zero && kBufR.Buffer.Handle != System.IntPtr.Zero
                     && vBufR.Buffer.Handle != System.IntPtr.Zero
                     && outBufR.Handle != System.IntPtr.Zero && statsBufR.Handle != System.IntPtr.Zero)
                 {
                     backend.FlashAttentionV2(qBufR.Buffer, kBufR.Buffer, vBufR.Buffer, outBufR, statsBufR,
-                        batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal, biasNoneR.Buffer, 0);
+                        batch, heads, seqQ, seqK, headDim, scaleFloat, isCausal, null, 0);   // no bias: the eager path's null
                     ResidentSyncCheck("FlashAttention");
                     BindResidentBuffer(outT, outBufR, backend);
                     BindResidentBuffer(statsT, statsBufR, backend);
