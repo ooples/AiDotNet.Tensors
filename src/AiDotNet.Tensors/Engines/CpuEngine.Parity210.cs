@@ -3986,7 +3986,7 @@ public partial class CpuEngine
         if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
-            return ops.Subtract(ops.One, MathHelper.Erf(x));
+            return MathHelper.Erfc(x);
         }, "TensorErfc");
         DifferentiableOps.RecordUnary("TensorErfc", result, tensor, BackwardFunctions<T>.ErfcBackward);
         return result;
@@ -4147,8 +4147,8 @@ public partial class CpuEngine
             double t = 2.0 / (System.Math.PI * a) + ln / 2.0;
             double xs = System.Math.Sign(y) * System.Math.Sqrt(System.Math.Sqrt(t * t - ln / a) - t);
             // Refine with 2 Newton steps: f(x) = erf(x) - y, f'(x) = 2/√π · e^(-x²).
-            // Using MathHelper.Erf (Abramowitz-Stegun, 6-digit) — .NET doesn't
-            // expose Math.Erf until very recent versions.
+            // MathHelper.Erf is accurate to double precision (Cody 1969), so the
+            // refinement converges on the true inverse.
             for (int it = 0; it < 2; it++)
             {
                 double e = MathHelper.Erf(xs);

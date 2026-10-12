@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Distributions.Helpers;
 
@@ -94,24 +95,11 @@ public static class SpecialFunctions
         return (float)result;
     }
 
-    /// <summary>Error function erf(x). Abramowitz &amp; Stegun 7.1.26.</summary>
-    public static float Erf(float x)
-    {
-        const float a1 = 0.254829592f;
-        const float a2 = -0.284496736f;
-        const float a3 = 1.421413741f;
-        const float a4 = -1.453152027f;
-        const float a5 = 1.061405429f;
-        const float p  = 0.3275911f;
-        int sign = x < 0 ? -1 : 1;
-        float ax = MathF.Abs(x);
-        float t = 1f / (1f + p * ax);
-        float y = 1f - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * MathF.Exp(-ax * ax);
-        return sign * y;
-    }
+    /// <summary>Error function erf(x) (Cody 1969, evaluated in double precision).</summary>
+    public static float Erf(float x) => (float)ErrorFunction.Erf(x);
 
-    /// <summary>Complementary error function erfc(x) = 1 − erf(x).</summary>
-    public static float Erfc(float x) => 1f - Erf(x);
+    /// <summary>Complementary error function erfc(x) = 1 − erf(x), computed directly.</summary>
+    public static float Erfc(float x) => (float)ErrorFunction.Erfc(x);
 
     /// <summary>Inverse error function erf⁻¹(p) for p ∈ (-1, 1). Winitzki rational approximation.</summary>
     public static float ErfInv(float p)
