@@ -26,29 +26,26 @@ extern ""C"" __global__ __launch_bounds__(256) void batchnorm_forward(
     if (c >= channels) return;
 
     int batchSpatial = batch * spatialSize;
-
-    float mean = 0.0f;
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            mean += input[(b * channels + c) * spatialSize + s];
-        }
-    }
-    mean /= (float)batchSpatial;
-
-    float var = 0.0f;
-    for (int b = 0; b < batch; b++) {
-        for (int s = 0; s < spatialSize; s++) {
-            float diff = input[(b * channels + c) * spatialSize + s] - mean;
-            var += diff * diff;
-        }
-    }
-    var /= (float)batchSpatial;
-
-    float invVar = 1.0f / sqrtf(var + epsilon);
-    saveMean[c] = mean;
-    saveInvVar[c] = invVar;
-
+    float mean, invVar;
     if (training) {
+        mean = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            for (int s = 0; s < spatialSize; s++) {
+                mean += input[(b * channels + c) * spatialSize + s];
+            }
+        }
+        mean /= (float)batchSpatial;
+        float var = 0.0f;
+        for (int b = 0; b < batch; b++) {
+            for (int s = 0; s < spatialSize; s++) {
+                float diff = input[(b * channels + c) * spatialSize + s] - mean;
+                var += diff * diff;
+            }
+        }
+        var /= (float)batchSpatial;
+        invVar = 1.0f / sqrtf(var + epsilon);
+        saveMean[c] = mean;
+        saveInvVar[c] = invVar;
         runningMean[c] = (1.0f - momentum) * runningMean[c] + momentum * mean;
         // Unbiased (Bessel-corrected) running variance — paper-faithful
         // (Ioffe & Szegedy 2015 §3.1), matches cuDNN. Normalization uses the
@@ -57,8 +54,11 @@ extern ""C"" __global__ __launch_bounds__(256) void batchnorm_forward(
             ? var * (float)batchSpatial / (float)(batchSpatial - 1)
             : var;
         runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * runVarUnbiased;
+    } else {
+        // Inference normalizes with the running statistics, as CUDA and PyTorch's eval mode do.
+        mean = runningMean[c];
+        invVar = 1.0f / sqrtf(runningVar[c] + epsilon);
     }
-
     float g = gamma[c];
     float b_val = beta[c];
     for (int b = 0; b < batch; b++) {

@@ -137,7 +137,7 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         foreach (var reference in method.DeclaringSyntaxReferences)
         {
             if (reference.GetSyntax(context.CancellationToken) is not BaseMethodDeclarationSyntax declaration) continue;
-            string? thrown = OnlyThrownType(declaration);
+            string? thrown = OnlyThrownType(declaration, context.Compilation.GetSemanticModel(declaration.SyntaxTree));
             if (thrown is null) continue;
 
             var implemented = ImplementedInterfaceMember(owner, method);
@@ -220,7 +220,9 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         || name.StartsWith("Read", StringComparison.Ordinal) || name.StartsWith("Copy", StringComparison.Ordinal)
         || name.StartsWith("Synchronize", StringComparison.Ordinal);
 
-    private static string? OnlyThrownType(BaseMethodDeclarationSyntax declaration)
+    // The thrown expression is judged by its type, not its spelling, so routing the exception through a helper
+    // (throw NoKernel(name)) is still recognised as a stub.
+    private static string? OnlyThrownType(BaseMethodDeclarationSyntax declaration, SemanticModel model)
     {
         ExpressionSyntax? thrownExpression = null;
         if (declaration.ExpressionBody?.Expression is ThrowExpressionSyntax throwExpression)
@@ -228,11 +230,14 @@ public sealed class BackendParityAnalyzer : DiagnosticAnalyzer
         else if (declaration.Body is { Statements.Count: 1 } body && body.Statements[0] is ThrowStatementSyntax throwStatement)
             thrownExpression = throwStatement.Expression;
 
-        if (thrownExpression is not ObjectCreationExpressionSyntax creation) return null;
-        string typeName = creation.Type.ToString();
-        int dot = typeName.LastIndexOf('.');
-        if (dot >= 0) typeName = typeName.Substring(dot + 1);
-        return typeName is "NotSupportedException" or "NotImplementedException" ? typeName : null;
+        if (thrownExpression is null) return null;
+        for (var type = model.GetTypeInfo(thrownExpression).Type; type is not null; type = type.BaseType)
+        {
+            if (type.ContainingNamespace?.ToDisplayString() == "System"
+                && type.Name is "NotSupportedException" or "NotImplementedException")
+                return type.Name;
+        }
+        return null;
     }
 
     private static ISymbol? ImplementedInterfaceMember(INamedTypeSymbol owner, IMethodSymbol method)

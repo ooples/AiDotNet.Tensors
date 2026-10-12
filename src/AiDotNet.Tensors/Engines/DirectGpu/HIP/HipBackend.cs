@@ -12178,8 +12178,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new InvalidOperationException("HIP kernel not found: convert_fp32_to_fp16. FP16 conversion requires a proper GPU kernel.");
 
             {
-            IntPtr _p0 = ((HipGpuBuffer)input).Handle;
-            IntPtr _p1 = ((HipGpuBuffer)output).Handle;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = output.Handle;
             void** args = stackalloc void*[3];
             args[0] = &_p0;
             args[1] = &_p1;
@@ -12199,8 +12199,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new InvalidOperationException("HIP kernel not found: convert_fp16_to_fp32. FP32 conversion requires a proper GPU kernel.");
 
             {
-            IntPtr _p0 = ((HipGpuBuffer)input).Handle;
-            IntPtr _p1 = ((HipGpuBuffer)output).Handle;
+            IntPtr _p0 = input.Handle;
+            IntPtr _p1 = output.Handle;
             void** args = stackalloc void*[3];
             args[0] = &_p0;
             args[1] = &_p1;
