@@ -6,7 +6,7 @@ public sealed partial class OpenClBackend
 {
     private void EnsureFusedAdvancedKernelsAvailable(string opName)
     {
-        if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+        if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
         if (!_fusedAdvancedKernelsAvailable)
             throw new NotSupportedException(
                 $"OpenCL fused-advanced kernels are not available on this device — " +
@@ -20,7 +20,7 @@ public sealed partial class OpenClBackend
         // EnsureFusedAdvancedKernelsAvailable already validated _context is non-null;
         // this restates it locally so net471's nullable analysis is satisfied
         // without depending on [MemberNotNull] (which net471 cannot honour).
-        return _context ?? throw new InvalidOperationException("OpenCL context not available");
+        return _context ?? throw new GpuCapabilityUnavailableException("OpenCL context not available");
     }
 
     public void FusedLoRAForward(

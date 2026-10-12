@@ -473,7 +473,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         EnsureInitialized();
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 1, pushConstantSize);
-        if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
+        if (pipeline is null) throw new GpuCapabilityUnavailableException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbO = AsVulkan(O);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
@@ -499,7 +499,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 4, pushConstantSize);
         if (pipeline is null)
-            throw new InvalidOperationException("Vulkan GLSL pipeline unavailable - install libshaderc for runtime compilation.");
+            throw new GpuCapabilityUnavailableException("Vulkan GLSL pipeline unavailable - install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
@@ -524,7 +524,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         EnsureInitialized();
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 5, pushConstantSize);
-        if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
+        if (pipeline is null) throw new GpuCapabilityUnavailableException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D); var vbE = AsVulkan(E);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
@@ -545,7 +545,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         EnsureInitialized();
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 8, pushConstantSize);
-        if (pipeline is null) throw new InvalidOperationException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
+        if (pipeline is null) throw new GpuCapabilityUnavailableException("Vulkan GLSL pipeline unavailable — install libshaderc for runtime compilation.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
         var vbE = AsVulkan(E); var vbF = AsVulkan(F); var vbG = AsVulkan(G); var vbH = AsVulkan(H);
         var threadRes = _device.AcquireThreadResources();
@@ -592,7 +592,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     {
         if (!_initialized || _disposed)
         {
-            throw new InvalidOperationException("Vulkan backend not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan backend not initialized.");
         }
 
         if (a.Length != b.Length || a.Length != result.Length)
@@ -625,7 +625,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         stagingA.WriteData(a);
         stagingB.WriteData(b);
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         _transfer.CopyToDevice(stagingA, bufferA);
         _transfer.CopyToDevice(stagingB, bufferB);
 
@@ -661,7 +661,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     {
         if (!_initialized || _disposed)
         {
-            throw new InvalidOperationException("Vulkan backend not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan backend not initialized.");
         }
 
         if (input.Length != result.Length)
@@ -690,7 +690,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         // Upload data
         stagingA.WriteData(input);
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         _transfer.CopyToDevice(stagingA, bufferA);
 
         // Get or create pipeline
@@ -725,7 +725,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     {
         if (!_initialized || _disposed)
         {
-            throw new InvalidOperationException("Vulkan backend not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan backend not initialized.");
         }
 
         if (input.Length != result.Length)
@@ -754,7 +754,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         // Upload data
         stagingA.WriteData(input);
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         _transfer.CopyToDevice(stagingA, bufferA);
 
         // Get or create pipeline (push constants: uint size, float scalar)
@@ -872,11 +872,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
             var batchCmd = _batchThreadRes.CommandBuffer;
-            TrackBatchPipeline(pipeline);
             if (_batchDispatchCount > 0)
                 RecordComputeMemoryBarrier(batchCmd);
             VulkanNativeBindings.vkCmdBindPipeline(batchCmd, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle);
-            var batchDs = pipeline.DescriptorSet;
+            var batchDs = RetainBatchDescriptorSet(pipeline);
             VulkanNativeBindings.vkCmdBindDescriptorSets(batchCmd, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Layout, 0, 1, &batchDs, 0, null);
             fixed (uint* ptr = pushConstants)
             {
@@ -935,7 +934,6 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
             var batchCmd = _batchThreadRes.CommandBuffer;
-            TrackBatchPipeline(pipeline);
 
             // Insert barrier between dispatches to ensure data dependencies
             if (_batchDispatchCount > 0)
@@ -948,7 +946,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
                 pipeline.Handle);
 
             // Bind descriptor set
-            var descriptorSet = pipeline.DescriptorSet;
+            var descriptorSet = RetainBatchDescriptorSet(pipeline);
             VulkanNativeBindings.vkCmdBindDescriptorSets(
                 batchCmd,
                 VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1138,7 +1136,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         var threadRes = _device.AcquireThreadResources();
         _batchThreadRes = threadRes;
         _batchDispatchCount = 0;
-        ClearBatchMarks();
+        ReleaseBatchDescriptorSets();
 
         var cmdBuffer = threadRes.CommandBuffer;
         VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
@@ -1169,7 +1167,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
         _device.SubmitAndWait(cmdBuffer, _batchThreadRes.Fence);
-        ClearBatchMarks();
+        ReleaseBatchDescriptorSets();
 
         _batchMode = false;
         _batchDispatchCount = 0;

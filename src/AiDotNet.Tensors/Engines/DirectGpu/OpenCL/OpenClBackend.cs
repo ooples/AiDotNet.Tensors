@@ -178,7 +178,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public bool SupportsAsyncTransfer => true;
         public bool SupportsGraphCapture => false;
         public int MaxConcurrentStreams => 8;
-        public IGpuStream DefaultStream => _defaultStream ?? throw new InvalidOperationException("Backend not initialized");
+        public IGpuStream DefaultStream => _defaultStream ?? throw new GpuCapabilityUnavailableException("Backend not initialized");
 
         // Dynamic GPU capabilities - initialized from device queries
         private readonly ulong _maxWorkGroupSize;
@@ -346,7 +346,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private DirectOpenClProgram CompileOrLoadCached(string source, string buildOptions, string label)
         {
-            if (_context == null) throw new InvalidOperationException("Context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("Context not available");
 
             // Try loading from binary cache first
             var cached = DirectOpenClProgram.TryCreateFromCache(_context, source, buildOptions);
@@ -1353,7 +1353,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer AllocateBuffer(float[] data)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
             DrainCollectedBuffers();
 
@@ -1374,7 +1374,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer AllocateBuffer(int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
@@ -1482,7 +1482,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public void Copy(IGpuBuffer source, int srcOffset, IGpuBuffer destination, int destOffset, int size)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var srcHandle = ((DirectOpenClGpuBuffer)source).Buffer.Handle;
             var destHandle = ((DirectOpenClGpuBuffer)destination).Buffer.Handle;
@@ -2543,7 +2543,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private string? ValidateDynamicGemmConfig(GemmConfig config)
         {
             DirectOpenClContext context = _context ??
-                throw new InvalidOperationException("OpenCL context not available.");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available.");
             int maxWorkGroupSize = checked((int)Math.Min(context.MaxWorkGroupSize, (ulong)int.MaxValue));
             int maxWorkItemSizeX = checked((int)Math.Min(
                 context.MaxWorkItemSizes.Length > 0
@@ -2568,7 +2568,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (M <= 0 || N <= 0 || K <= 0)
                 throw new ArgumentOutOfRangeException(nameof(M), "Matrix dimensions M, N, K must all be positive.");
@@ -2637,7 +2637,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -2871,7 +2871,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private void ExecuteGemmKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta, int tileSize, int wgSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -2910,7 +2910,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (batchCount <= 0)
                 throw new ArgumentException("Batch count must be positive", nameof(batchCount));
@@ -3004,7 +3004,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer PagedAttentionDecode(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
             int heads, int headDim, int blockSize, int seqLen, float scale)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
             GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
             var output = AllocateBuffer(heads * headDim);
@@ -3043,7 +3043,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer PagedAttentionPrefill(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
             int heads, int headDim, int blockSize, int numQueries, int startPos, float scale)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefill));
             if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
             GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
@@ -3081,7 +3081,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer PagedAttentionDecodeGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
             int heads, int kvHeads, int headDim, int blockSize, int seqLen, float scale)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecodeGqa));
             GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
             GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
@@ -3113,7 +3113,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer PagedAttentionPrefillGqa(IGpuBuffer q, IGpuBuffer kcache, IGpuBuffer vcache, IGpuBuffer blockTable,
             int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos, float scale)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.Attention(heads, headDim, blockSize, numQueries, nameof(PagedAttentionPrefillGqa));
             GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionPrefillGqa));
             if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
@@ -3155,7 +3155,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer FlashDecode(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v,
             int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
             GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
             GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
@@ -3222,7 +3222,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int K, int N, int groupSize, int scaleCount)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt8));
             GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt8));
             GpuKernelGuards.Capacity(weightsInt8, (long)K * N, nameof(weightsInt8), nameof(DequantGemmInt8));
@@ -3268,7 +3268,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int K, int N, int groupSize, int scaleCount)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmInt4));
             GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmInt4));
             GpuKernelGuards.Capacity(weightsInt4Packed, ((long)K * N + 1) / 2, nameof(weightsInt4Packed), nameof(DequantGemmInt4));
@@ -3314,7 +3314,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int K, int N, int groupSize, int scaleCount)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuKernelGuards.DequantGemm(M, K, N, groupSize, scaleCount, nameof(DequantGemmFp8E4M3));
             GpuKernelGuards.Capacity(activations, (long)M * K, nameof(activations), nameof(DequantGemmFp8E4M3));
             GpuKernelGuards.Capacity(weightsFp8, (long)K * N, nameof(weightsFp8), nameof(DequantGemmFp8E4M3));
@@ -3468,7 +3468,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private IGpuBuffer ExecuteFusedGemm(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -3502,7 +3502,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferBias = ((DirectOpenClGpuBuffer)bias).Buffer;
@@ -3540,7 +3540,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferOutput = ((DirectOpenClGpuBuffer)output).Buffer;
             var bufferBias = ((DirectOpenClGpuBuffer)bias).Buffer;
@@ -3612,7 +3612,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer result, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (size <= 0)
             {
                 // Zero result for empty input
@@ -3655,7 +3655,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int aSize, int bSize, int bOffset, int bStride)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (aSize <= 0) return;
 
             var bufA = ((DirectOpenClGpuBuffer)a).Buffer;
@@ -3692,7 +3692,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int batchSize, int vecSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (batchSize <= 0 || vecSize <= 0) return;
             long totalElements = (long)batchSize * vecSize;
             if (totalElements > a.Size) throw new ArgumentOutOfRangeException(nameof(batchSize), $"batchSize*vecSize ({totalElements}) exceeds buffer A length ({a.Size}).");
@@ -3717,7 +3717,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Scale(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -3736,7 +3736,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void StridedGather(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (count <= 0) return;
             if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
             if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
@@ -3759,7 +3759,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void StridedScatter(IGpuBuffer src, IGpuBuffer dst, int offset, int stride, int count)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (count <= 0) return;
             if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
             if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
@@ -3782,7 +3782,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Power(IGpuBuffer A, IGpuBuffer B, float exponent, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -3948,7 +3948,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private void ExecuteElementwise(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -3969,7 +3969,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private void ExecuteScalarElementwise(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache[kernelName];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
@@ -3994,7 +3994,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // [-1, 0, 0] for input [1, 1, 1] on the backward path. Fix: launch
             // exactly `size` work items so every element gets one.
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -4031,7 +4031,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private void ExecuteActivation(string kernelName, IGpuBuffer A, IGpuBuffer B, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -4050,7 +4050,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -4110,7 +4110,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferInput = ((DirectOpenClGpuBuffer)input).Buffer;
             var bufferOutput = ((DirectOpenClGpuBuffer)output).Buffer;
@@ -4129,7 +4129,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferGradOutput = ((DirectOpenClGpuBuffer)gradOutput).Buffer;
             var bufferInput = ((DirectOpenClGpuBuffer)input).Buffer;
@@ -4151,7 +4151,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["capsule_predictions"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -4172,7 +4172,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["capsule_transform"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -4193,7 +4193,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["capsule_weighted_sum"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)coupling).Buffer.Handle);
@@ -4213,7 +4213,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["capsule_agreement"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)predictions).Buffer.Handle);
@@ -4232,7 +4232,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferInput = ((DirectOpenClGpuBuffer)input).Buffer;
             var bufferOutput = ((DirectOpenClGpuBuffer)output).Buffer;
@@ -4251,7 +4251,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferInput = ((DirectOpenClGpuBuffer)input).Buffer;
             var bufferOutput = ((DirectOpenClGpuBuffer)output).Buffer;
@@ -4291,7 +4291,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private float ReduceScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (size <= 0) return emptyValue;
             var kernel = _kernelCache[kernelName];
             int maximumLocalSize = CalculateOptimalWorkGroupSize1D(size);
@@ -4335,7 +4335,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -4358,7 +4358,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuBuffer AllocateByteBuffer(int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             // Allocate as byte buffer (size in bytes, not floats)
             var context = _context;
@@ -4369,7 +4369,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Enforce2x4Sparsity(IGpuBuffer denseInput, IGpuBuffer sparseValues, IGpuBuffer sparseIndices, int M, int K)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (K % 4 != 0)
                 throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
@@ -4394,7 +4394,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Decompress2x4Sparse(IGpuBuffer sparseValues, IGpuBuffer sparseIndices, IGpuBuffer denseOutput, int M, int K)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (K % 4 != 0)
                 throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
@@ -4423,7 +4423,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (K % 4 != 0)
                 throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
@@ -4455,7 +4455,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int N, int K)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (K % 4 != 0)
                 throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
@@ -4498,7 +4498,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int K, int N, int nnz)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["csr_spmm"];
             var bufferValues = ((DirectOpenClGpuBuffer)csrValues).Buffer;
@@ -4536,7 +4536,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int nnz, int innerK)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (nnz == 0) return;
 
             var kernel = _kernelCache["sddmm"];
@@ -4567,7 +4567,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int nnz, int innerK)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (nnz == 0) return;
 
             const int WorkgroupSize = 256;
@@ -4604,7 +4604,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int K, int N, int nnz)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["csr_spmm_bias"];
             var bufferValues = ((DirectOpenClGpuBuffer)csrValues).Buffer;
@@ -4639,7 +4639,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int numNodes, int numEdges, int features)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             // First zero the output buffer
             var zeroKernel = _kernelCache["zero_buffer"];
@@ -4696,7 +4696,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int K, int N)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["csr_segmented_max"];
             var bufferColIndices = ((DirectOpenClGpuBuffer)csrColIndices).Buffer;
@@ -4725,7 +4725,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int K, int N)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["csr_segmented_min"];
             var bufferColIndices = ((DirectOpenClGpuBuffer)csrColIndices).Buffer;
@@ -4755,7 +4755,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             float epsilon = 1e-8f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["csr_segmented_stddev"];
             var bufferColIndices = ((DirectOpenClGpuBuffer)csrColIndices).Buffer;
@@ -4789,7 +4789,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuStream CreateStream(GpuStreamType streamType)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             return new OpenClCommandQueue(this, _context.Context, _context.Device, streamType, enableProfiling: false);
         }
@@ -4802,7 +4802,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public IGpuStream CreateProfilingStream(GpuStreamType streamType)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (!_context.IsProfilingEnabled)
                 throw new NotSupportedException("The selected OpenCL device does not support profiling queues.");
             return new OpenClCommandQueue(
@@ -4860,7 +4860,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public GpuSyncPoint CreateSyncPoint()
         {
             if (_defaultStream == null)
-                throw new InvalidOperationException("Backend not initialized");
+                throw new GpuCapabilityUnavailableException("Backend not initialized");
 
             return new OpenClSyncPoint(this, _defaultStream);
         }
@@ -4869,7 +4869,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (data == null) throw new ArgumentNullException(nameof(data));
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
@@ -4922,7 +4922,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
 
@@ -4936,7 +4936,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void DownloadBufferAsync(IGpuBuffer buffer, float[] destination, IGpuStream stream)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (destination == null) throw new ArgumentNullException(nameof(destination));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
@@ -4998,7 +4998,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void CopyBufferAsync(IGpuBuffer source, IGpuBuffer destination, int size, IGpuStream stream)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (source == null) throw new ArgumentNullException(nameof(source));
             if (destination == null) throw new ArgumentNullException(nameof(destination));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
@@ -5026,7 +5026,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             float alpha, float beta, IGpuStream stream)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -5060,7 +5060,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int M, int N, int K, FusedActivationType activation, IGpuStream stream)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             // Softmax is row-wise; it can't fuse into the pointwise GEMM epilogue (used to throw here).
             // GEMM+bias then a per-row softmax over [M, N]. GemmBias + softmax run on the backend's
@@ -5094,7 +5094,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             };
 
             if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-                throw new InvalidOperationException($"Fused kernel not found: {kernelName}");
+                throw new GpuCapabilityUnavailableException($"Fused kernel not found: {kernelName}");
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -5231,7 +5231,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public GemmDiagnostics GemmWithDiagnostics(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var diagnostics = new GemmDiagnostics
             {
@@ -5579,7 +5579,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public double GemmWithDynamicKernel(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, GemmConfig config)
         {
             if (_context == null || _dynamicGemm == null)
-                throw new InvalidOperationException("OpenCL context or dynamic GEMM not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context or dynamic GEMM not available");
 
             var sw = Stopwatch.StartNew();
             if (!TryExecutePackedDynamicGemm(A, B, C, M, N, K, 1.0f, 0.0f, config))
@@ -5609,7 +5609,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public TuningResult[] RunBayesianGemmOptimization(int M, int N, int K, int maxTrials = 20, int warmupRuns = 2, int benchmarkRuns = 3)
         {
             if (_context == null || _dynamicGemm == null)
-                throw new InvalidOperationException("OpenCL context or dynamic GEMM not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context or dynamic GEMM not available");
 
             ConfigureOfflineTuning();
 
@@ -5806,7 +5806,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public TuningResult[] RunExhaustiveGemmOptimization(int M, int N, int K, int warmupRuns = 2, int benchmarkRuns = 3)
         {
             if (_context == null || _dynamicGemm == null)
-                throw new InvalidOperationException("OpenCL context or dynamic GEMM not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context or dynamic GEMM not available");
 
             ConfigureOfflineTuning();
 
@@ -5971,7 +5971,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public double GemmWithClBlast(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var sw = Stopwatch.StartNew();
             bool ok = TryExecuteClBlastLibraryGemm(A, B, C, M, N, K, alpha, beta);
@@ -6095,7 +6095,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public RooflineAnalysis ProfileGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f, int warmupRuns = 2, int benchmarkRuns = 5)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             // Get GPU specs from environment or estimate
             double peakGflops = GetEnvInt(GpuPeakGflopsEnvVar, 0);
@@ -6234,7 +6234,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public string CompareWithClBlast(int M, int N, int K, int warmupRuns = 3, int benchmarkRuns = 10)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"=== GEMM Comparison: Our Implementation vs CLBlast ({M}x{N}x{K}) ===");
@@ -6363,7 +6363,7 @@ KERNEL VARIANTS (A/B testing):
         public string ABTestKernelVariants(int M, int N, int K, int warmupRuns = 3, int benchmarkRuns = 10)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"=== A/B Testing Kernel Variants ({M}x{N}x{K}) ===");
@@ -6513,7 +6513,7 @@ KERNEL VARIANTS (A/B testing):
         public string ComprehensiveAbTest(int[]? sizes = null, int warmupRuns = 2, int benchmarkRuns = 5)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             sizes ??= new[] { 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096 };
 
@@ -7520,7 +7520,7 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW)
         {
             if (!_kernelCache.TryGetValue("maxpool2d_backward", out var k))
-                throw new InvalidOperationException("OpenCL kernel not found: maxpool2d_backward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: maxpool2d_backward");
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
@@ -7573,7 +7573,7 @@ KERNEL VARIANTS (A/B testing):
             bool countIncludePad)
         {
             if (!_kernelCache.TryGetValue("avgpool2d_backward", out var k))
-                throw new InvalidOperationException("OpenCL kernel not found: avgpool2d_backward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: avgpool2d_backward");
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
@@ -7641,7 +7641,7 @@ KERNEL VARIANTS (A/B testing):
         public void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
         {
             if (!_kernelCache.TryGetValue("global_avgpool2d_backward", out var k))
-                throw new InvalidOperationException("OpenCL kernel not found: global_avgpool2d_backward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: global_avgpool2d_backward");
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
@@ -7657,7 +7657,7 @@ KERNEL VARIANTS (A/B testing):
         public void GlobalMaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput, int batch, int channels, int height, int width)
         {
             if (!_kernelCache.TryGetValue("global_maxpool2d_backward", out var k))
-                throw new InvalidOperationException("OpenCL kernel not found: global_maxpool2d_backward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: global_maxpool2d_backward");
 
             // First zero out the gradient input
             Fill(gradInput, 0f, batch * channels * height * width);
@@ -8401,7 +8401,7 @@ KERNEL VARIANTS (A/B testing):
             int batch, int channels, int spatialSize, float epsilon)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             int totalSize = batch * channels * spatialSize;
             int localSize = CalculateOptimalWorkGroupSize1D(totalSize);
@@ -8674,7 +8674,7 @@ KERNEL VARIANTS (A/B testing):
         public IGpuBuffer AllocateIntBuffer(int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
@@ -8742,7 +8742,7 @@ KERNEL VARIANTS (A/B testing):
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.OpenCl);
 
             // Convert int array to float array for storage (net471 compatible)
@@ -9276,7 +9276,7 @@ KERNEL VARIANTS (A/B testing):
         public void Fill(IGpuBuffer buffer, float value, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (size <= 0) return;
             var kernel = _kernelCache["fill_buffer"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
@@ -9289,7 +9289,7 @@ KERNEL VARIANTS (A/B testing):
         public void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows, int srcCols, int destTotalCols, int destColOffset)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var kernel = _kernelCache["copy_2d_strided"];
             var bufferSrc = ((DirectOpenClGpuBuffer)source).Buffer;
@@ -9310,10 +9310,10 @@ KERNEL VARIANTS (A/B testing):
         public void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (!_kernelCache.TryGetValue("nearest_neighbor_upsample", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: nearest_neighbor_upsample");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: nearest_neighbor_upsample");
 
             var bufferIn = ((DirectOpenClGpuBuffer)input).Buffer;
             var bufferOut = ((DirectOpenClGpuBuffer)output).Buffer;
@@ -9337,10 +9337,10 @@ KERNEL VARIANTS (A/B testing):
         public void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             if (!_kernelCache.TryGetValue("nearest_neighbor_upsample_backward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: nearest_neighbor_upsample_backward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: nearest_neighbor_upsample_backward");
 
             int inputSize = batchChannels * height * width;
 
@@ -11260,7 +11260,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var aBuf = ((DirectOpenClGpuBuffer)A).Buffer;
             var bBuf = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -11283,7 +11283,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var aBuf = ((DirectOpenClGpuBuffer)A).Buffer;
             var idxBuf = ((DirectOpenClGpuBuffer)indices).Buffer;
@@ -11719,7 +11719,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var inReal = ((DirectOpenClGpuBuffer)inputReal).Buffer;
             var inImag = ((DirectOpenClGpuBuffer)inputImag).Buffer;
@@ -11778,7 +11778,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             // Allocate temporary buffers for full complex FFT
             var tempReal = AllocateBuffer(n);
@@ -11812,7 +11812,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             // Allocate temporary buffers for full complex FFT
             var tempReal = AllocateBuffer(n);
@@ -11846,7 +11846,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var inReal = ((DirectOpenClGpuBuffer)inputReal).Buffer;
             var inImag = ((DirectOpenClGpuBuffer)inputImag).Buffer;
@@ -11899,7 +11899,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var inReal = ((DirectOpenClGpuBuffer)inputReal).Buffer;
             var inImag = ((DirectOpenClGpuBuffer)inputImag).Buffer;
@@ -12033,7 +12033,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var inBuf = ((DirectOpenClGpuBuffer)input).Buffer;
             var winBuf = ((DirectOpenClGpuBuffer)window).Buffer;
@@ -12050,7 +12050,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void ComplexMagnitude(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer magnitude, int n)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var realBuf = ((DirectOpenClGpuBuffer)real).Buffer;
             var imagBuf = ((DirectOpenClGpuBuffer)imag).Buffer;
@@ -12067,7 +12067,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void ComplexPhase(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer phase, int n)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var realBuf = ((DirectOpenClGpuBuffer)real).Buffer;
             var imagBuf = ((DirectOpenClGpuBuffer)imag).Buffer;
@@ -12084,7 +12084,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void PolarToComplex(IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer real, IGpuBuffer imag, int n)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var magBuf = ((DirectOpenClGpuBuffer)magnitude).Buffer;
             var phaseBuf = ((DirectOpenClGpuBuffer)phase).Buffer;
@@ -12103,7 +12103,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec, int numFrames, int numFreqs, int nMels)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var powerBuf = ((DirectOpenClGpuBuffer)powerSpec).Buffer;
             var fbBuf = ((DirectOpenClGpuBuffer)filterbank).Buffer;
@@ -12126,7 +12126,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var powerBuf = ((DirectOpenClGpuBuffer)power).Buffer;
             var dbBuf = ((DirectOpenClGpuBuffer)db).Buffer;
@@ -12143,7 +12143,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void DbToPower(IGpuBuffer db, IGpuBuffer power, int n, float refValue)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var dbBuf = ((DirectOpenClGpuBuffer)db).Buffer;
             var powerBuf = ((DirectOpenClGpuBuffer)power).Buffer;
@@ -12159,7 +12159,7 @@ KERNEL VARIANTS (A/B testing):
         public void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
             if (size == 0) return;
             IntPtr inputHandle = GetPrecisionBufferHandle(input, (long)size * sizeof(float));
@@ -12190,7 +12190,7 @@ KERNEL VARIANTS (A/B testing):
         public void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
             if (size == 0) return;
             IntPtr inputHandle = GetPrecisionBufferHandle(input, (long)size * sizeof(ushort));
@@ -12269,7 +12269,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException(
                     $"ScaleByDeviceScalar requires a scalar buffer with at least {sizeof(float)} bytes.", nameof(scalar));
             if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: scale_by_device_scalar");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: scale_by_device_scalar");
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)buffer).Buffer.Handle);
             kernel.SetArg(1, ((DirectOpenClGpuBuffer)scalar).Buffer.Handle);
             kernel.SetArg(2, size);
@@ -12294,7 +12294,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferOut = ((DirectOpenClGpuBuffer)output).Buffer;
             var kernel = _kernelCache["GenerateRandomUniform"];
@@ -12311,7 +12311,7 @@ KERNEL VARIANTS (A/B testing):
         public void GenerateStatelessDropoutMask(
             IGpuBuffer output, int size, uint threshold, float scale, uint seed)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (size <= 0) return;
             var kernel = _kernelCache["stateless_dropout_mask"];
             uint arg = 0;
@@ -12325,7 +12325,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var bufferOut = ((DirectOpenClGpuBuffer)output).Buffer;
             var kernel = _kernelCache["GenerateRandomNormal"];
@@ -12343,7 +12343,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void GenerateSecureRandomUniform(IGpuBuffer output, int size, float min, float max)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (size <= 0) return;
             GenerateRandomUniform(output, size, min, max, GpuRandomSeed.Create());
         }
@@ -12355,7 +12355,7 @@ KERNEL VARIANTS (A/B testing):
         public void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output,
             int batchSize, int numCenters, int inputDim)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var inBuf = ((DirectOpenClGpuBuffer)input).Buffer;
             var cBuf = ((DirectOpenClGpuBuffer)centers).Buffer;
@@ -12377,7 +12377,7 @@ KERNEL VARIANTS (A/B testing):
         public void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input,
             float decay, float threshold, int size)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var trBuf = ((DirectOpenClGpuBuffer)traces).Buffer;
             var spBuf = ((DirectOpenClGpuBuffer)spikes).Buffer;
@@ -12401,7 +12401,7 @@ KERNEL VARIANTS (A/B testing):
             float minWeight, float maxWeight,
             int numPre, int numPost)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context not available");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             var wBuf = ((DirectOpenClGpuBuffer)weights).Buffer;
             var preT = ((DirectOpenClGpuBuffer)preTrace).Buffer;
@@ -12433,7 +12433,7 @@ KERNEL VARIANTS (A/B testing):
         public void PoincareProject(IGpuBuffer input, IGpuBuffer output, int batchSize, int dim, float curvature, float epsilon = 1e-5f)
         {
             if (!_kernelCache.TryGetValue("poincare_project", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: poincare_project");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: poincare_project");
 
             int localSize = CalculateOptimalWorkGroupSize1D(batchSize);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -12448,7 +12448,7 @@ KERNEL VARIANTS (A/B testing):
         public void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
         {
             if (!_kernelCache.TryGetValue("mobius_add", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: mobius_add");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: mobius_add");
 
             int localSize = CalculateOptimalWorkGroupSize1D(batchSize);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
@@ -12463,7 +12463,7 @@ KERNEL VARIANTS (A/B testing):
         public void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
         {
             if (!_kernelCache.TryGetValue("poincare_exp_map", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: poincare_exp_map");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: poincare_exp_map");
 
             int localSize = CalculateOptimalWorkGroupSize1D(batchSize);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)basePoint).Buffer.Handle);
@@ -12478,7 +12478,7 @@ KERNEL VARIANTS (A/B testing):
         public void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
         {
             if (!_kernelCache.TryGetValue("poincare_distance", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: poincare_distance");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: poincare_distance");
 
             int localSize = CalculateOptimalWorkGroupSize1D(batchSize);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
@@ -12494,7 +12494,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
         {
             if (!_kernelCache.TryGetValue("hyperbolic_linear_euclidean_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hyperbolic_linear_euclidean_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: hyperbolic_linear_euclidean_forward");
 
             int totalThreads = batchSize * outputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -12516,7 +12516,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures, float curvature)
         {
             if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_input", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hyperbolic_linear_backward_input");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: hyperbolic_linear_backward_input");
 
             int totalThreads = batchSize * inputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -12536,7 +12536,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures, float curvature)
         {
             if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_weights", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hyperbolic_linear_backward_weights");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: hyperbolic_linear_backward_weights");
 
             int totalThreads = outputFeatures * inputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -12555,7 +12555,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures, float curvature)
         {
             if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_biases", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hyperbolic_linear_backward_biases");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: hyperbolic_linear_backward_biases");
 
             // Bias gradients: one per output feature (not outputFeatures * inputFeatures)
             int totalThreads = outputFeatures;
@@ -12577,7 +12577,7 @@ KERNEL VARIANTS (A/B testing):
         public void OctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
         {
             if (!_kernelCache.TryGetValue("octonion_multiply", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: octonion_multiply");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: octonion_multiply");
 
             int localSize = CalculateOptimalWorkGroupSize1D(count);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
@@ -12590,7 +12590,7 @@ KERNEL VARIANTS (A/B testing):
         public void OctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
         {
             if (!_kernelCache.TryGetValue("octonion_add", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: octonion_add");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: octonion_add");
 
             int totalElements = count * 8;
             int localSize = CalculateOptimalWorkGroupSize1D(totalElements);
@@ -12605,7 +12605,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures)
         {
             if (!_kernelCache.TryGetValue("octonion_linear_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: octonion_linear_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: octonion_linear_forward");
 
             int totalThreads = batchSize * outputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -12623,7 +12623,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures)
         {
             if (!_kernelCache.TryGetValue("octonion_linear_backward_input", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: octonion_linear_backward_input");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: octonion_linear_backward_input");
 
             int totalThreads = batchSize * inputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -12641,7 +12641,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures)
         {
             if (!_kernelCache.TryGetValue("octonion_linear_backward_weights", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: octonion_linear_backward_weights");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: octonion_linear_backward_weights");
 
             int totalThreads = outputFeatures * inputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -12658,7 +12658,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int outputFeatures)
         {
             if (!_kernelCache.TryGetValue("octonion_linear_backward_biases", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: octonion_linear_backward_biases");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: octonion_linear_backward_biases");
 
             int localSize = CalculateOptimalWorkGroupSize1D(outputFeatures);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
@@ -12680,7 +12680,7 @@ KERNEL VARIANTS (A/B testing):
             int batchSize, int inputFeatures, int outputFeatures)
         {
             if (!_kernelCache.TryGetValue("octonion_linear_forward_fused_relu", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: octonion_linear_forward_fused_relu");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: octonion_linear_forward_fused_relu");
 
             int totalOutputs = batchSize * outputFeatures;
             int localSize = CalculateOptimalWorkGroupSize1D(totalOutputs);
@@ -12704,7 +12704,7 @@ KERNEL VARIANTS (A/B testing):
             if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
                 throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
             if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: complex_multiply");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: complex_multiply");
             int localSize = CalculateOptimalWorkGroupSize1D(numPairs);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
@@ -12719,7 +12719,7 @@ KERNEL VARIANTS (A/B testing):
             if (numPairs * 2 > input.Size || numPairs * 2 > output.Size)
                 throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are in={input.Size}, out={output.Size}.");
             if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: complex_conjugate");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: complex_conjugate");
             int localSize = CalculateOptimalWorkGroupSize1D(numPairs);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -12736,7 +12736,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
 
             if (!_kernelCache.TryGetValue("complex_magnitude_interleaved", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: complex_magnitude_interleaved");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: complex_magnitude_interleaved");
             int localSize = CalculateOptimalWorkGroupSize1D(numPairs);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -12750,7 +12750,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (n <= 0) return;
             if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-                throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}. Register ComplexKernels.");
+                throw new GpuCapabilityUnavailableException($"OpenCL kernel not found: {kernelName}. Register ComplexKernels.");
             int localSize = CalculateOptimalWorkGroupSize1D(n);
             uint argIdx = 0;
             foreach (var buf in buffers)
@@ -12820,7 +12820,7 @@ KERNEL VARIANTS (A/B testing):
             if (n <= 0 || k <= 0) return;
             // GPU magnitude + CPU threshold + GPU kernel
             if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: split_complex_topk");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: split_complex_topk");
             k = Math.Min(k, n);
             int localSize = CalculateOptimalWorkGroupSize1D(n);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)inReal).Buffer.Handle);
@@ -12836,7 +12836,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (rows <= 0 || cols <= 0) return;
             if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: softmax_rows");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: softmax_rows");
             int localSize = CalculateOptimalWorkGroupSize1D(rows);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -12869,7 +12869,7 @@ KERNEL VARIANTS (A/B testing):
             EnsureHrrMinSize(outReal, n, nameof(outReal));
             EnsureHrrMinSize(outImag, n, nameof(outImag));
             if (!_kernelCache.TryGetValue("hrr_unit_phase_codebook", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hrr_unit_phase_codebook");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: hrr_unit_phase_codebook");
             int localSize = CalculateOptimalWorkGroupSize1D(n);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)outImag).Buffer.Handle);
@@ -12895,7 +12895,7 @@ KERNEL VARIANTS (A/B testing):
             EnsureHrrMinSize(queryImag, D, nameof(queryImag));
             EnsureHrrMinSize(outScores, V, nameof(outScores));
             if (!_kernelCache.TryGetValue("hrr_phase_coherence_decode", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hrr_phase_coherence_decode");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: hrr_phase_coherence_decode");
             int localSize = CalculateOptimalWorkGroupSize1D(V);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)codesReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)codesImag).Buffer.Handle);
@@ -12924,7 +12924,7 @@ KERNEL VARIANTS (A/B testing):
             EnsureHrrMinSize(valPermCodeReal, D, nameof(valPermCodeReal));
             EnsureHrrMinSize(valPermCodeImag, D, nameof(valPermCodeImag));
             if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: hrr_bind_accumulate");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: hrr_bind_accumulate");
             int localSize = CalculateOptimalWorkGroupSize1D(D);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)keyCodeReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)keyCodeImag).Buffer.Handle);
@@ -12998,7 +12998,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (n <= 0) return;
             if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: atan2_elementwise");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: atan2_elementwise");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)imag).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)real).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -13011,7 +13011,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (rows <= 0 || cols <= 0) return;
             if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: normalize_rows_fused");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: normalize_rows_fused");
             // Tree reduction requires a power-of-two local work-group size. Clamp to the
             // device's max work-group size via the backend's sizing helper.
             int ideal = CalculateOptimalWorkGroupSize1D(cols);
@@ -13035,7 +13035,7 @@ KERNEL VARIANTS (A/B testing):
             if (totalL <= 0 || totalL > int.MaxValue) return;
             int total = (int)totalL;
             if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: analytic_signal_mask");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: analytic_signal_mask");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)specReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)specImag).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
@@ -13056,7 +13056,7 @@ KERNEL VARIANTS (A/B testing):
             if (totalL <= 0 || totalL > int.MaxValue) return;
             int total = (int)totalL;
             if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: bispectrum_gather");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: bispectrum_gather");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)specReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)specImag).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
@@ -13075,7 +13075,7 @@ KERNEL VARIANTS (A/B testing):
             if (totalL <= 0 || totalL > int.MaxValue) return;
             int total = (int)totalL;
             if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: trispectrum_gather");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: trispectrum_gather");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)specReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)specImag).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)outReal).Buffer.Handle);
@@ -13091,7 +13091,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (total <= 0) return;
             if (!_kernelCache.TryGetValue("cavity_bounce_inplace", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: cavity_bounce_inplace");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: cavity_bounce_inplace");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)workReal).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)workImag).Buffer.Handle);
             kernel.SetArg(2u, total);
@@ -13108,7 +13108,7 @@ KERNEL VARIANTS (A/B testing):
             if (totalL <= 0 || totalL > int.MaxValue) return;
             int total = (int)totalL;
             if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: wideband_log_bin_pool");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: wideband_log_bin_pool");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)magBuf).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
             kernel.SetArg(2u, totalSegBatch);
@@ -13127,7 +13127,7 @@ KERNEL VARIANTS (A/B testing):
             if (totalL <= 0 || totalL > int.MaxValue) return;
             int total = (int)totalL;
             if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: mel_filterbank_apply");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: mel_filterbank_apply");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)powerSpec).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)melFilters).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)melEnergy).Buffer.Handle);
@@ -13142,7 +13142,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (n <= 0) return;
             if (!_kernelCache.TryGetValue("mfcc_log1p", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: mfcc_log1p");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: mfcc_log1p");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
             kernel.SetArg(2u, n);
@@ -13161,7 +13161,7 @@ KERNEL VARIANTS (A/B testing):
             if (gammaIdx < 0 || gammaIdx >= numGammaBands)
                 throw new ArgumentOutOfRangeException(nameof(gammaIdx), $"gammaIdx must be in [0, {numGammaBands}).");
             if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: pac_phase_bin_mi");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: pac_phase_bin_mi");
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)thetaPhase).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)gammaAmp).Buffer.Handle);
             kernel.SetArg(2u, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -13179,7 +13179,7 @@ KERNEL VARIANTS (A/B testing):
         public void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
         {
             if (!_kernelCache.TryGetValue("quantum_measurement", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: quantum_measurement");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: quantum_measurement");
 
             int totalElements = batchSize * stateSize;
             int localSize = CalculateOptimalWorkGroupSize1D(totalElements);
@@ -13194,7 +13194,7 @@ KERNEL VARIANTS (A/B testing):
         public void NormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
         {
             if (!_kernelCache.TryGetValue("normalize_probabilities", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: normalize_probabilities");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: normalize_probabilities");
 
             int localSize = CalculateOptimalWorkGroupSize1D(batchSize);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)probabilities).Buffer.Handle);
@@ -13209,7 +13209,7 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
         {
             if (!_kernelCache.TryGetValue("complex_matvec", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: complex_matvec");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: complex_matvec");
 
             int totalElements = batchSize * dim;
             int localSize = CalculateOptimalWorkGroupSize1D(totalElements);
@@ -13228,7 +13228,7 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer angles, int numQubits, int batchSize)
         {
             if (!_kernelCache.TryGetValue("quantum_rotation", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: quantum_rotation");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: quantum_rotation");
 
             int localSize = CalculateOptimalWorkGroupSize1D(batchSize);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)stateReal).Buffer.Handle);
@@ -13245,7 +13245,7 @@ KERNEL VARIANTS (A/B testing):
         public void MeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
         {
             if (!_kernelCache.TryGetValue("measurement_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: measurement_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: measurement_forward");
 
             int localSize = CalculateOptimalWorkGroupSize1D(batchSize);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -13267,7 +13267,7 @@ KERNEL VARIANTS (A/B testing):
             int batch, int seqLen, int modelDim, int numHeads, int headDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanForward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GlaScanForward.");
             if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
             if (modelDim != numHeads * headDim)
@@ -13275,7 +13275,7 @@ KERNEL VARIANTS (A/B testing):
             if (headDim > Kernels.GlaKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: gla_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gla_scan_forward");
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
@@ -13301,7 +13301,7 @@ KERNEL VARIANTS (A/B testing):
             int batch, int seqLen, int modelDim, int numHeads, int headDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GlaScanBackward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GlaScanBackward.");
             if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
             if (modelDim != numHeads * headDim)
@@ -13310,7 +13310,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new InvalidOperationException($"GLA headDim ({headDim}) exceeds max ({Kernels.GlaKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
                 !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
-                throw new InvalidOperationException("OpenCL kernel not found: gla_scan_recompute / gla_scan_backward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gla_scan_recompute / gla_scan_backward");
 
             long totalLong = checked((long)batch * numHeads * headDim);
             long trajLenLong = checked(totalLong * seqLen * headDim);
@@ -13358,7 +13358,7 @@ KERNEL VARIANTS (A/B testing):
             int batch, int seqLen, int modelDim, int numHeads, int headDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute XLstmScanForward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute XLstmScanForward.");
             if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "xLSTM dimensions must be positive.");
             if (modelDim != numHeads * headDim)
@@ -13366,7 +13366,7 @@ KERNEL VARIANTS (A/B testing):
             if (headDim > Kernels.XLstmKernels.MaxHeadDim)
                 throw new InvalidOperationException($"xLSTM headDim ({headDim}) exceeds max ({Kernels.XLstmKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: xlstm_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: xlstm_scan_forward");
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
@@ -13393,7 +13393,7 @@ KERNEL VARIANTS (A/B testing):
             int batch, int seqLen, int modelDim, int numHeads, int headDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanForward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanForward.");
             if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
             if (modelDim != numHeads * headDim)
@@ -13401,7 +13401,7 @@ KERNEL VARIANTS (A/B testing):
             if (headDim > Kernels.GatedDeltaNetKernels.MaxHeadDim)
                 throw new InvalidOperationException($"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.GatedDeltaNetKernels.MaxHeadDim}).");
             if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: gated_delta_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gated_delta_scan_forward");
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)q).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
@@ -13427,11 +13427,11 @@ KERNEL VARIANTS (A/B testing):
             int batch, int seqLen, int recDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute RgLruScanForward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute RgLruScanForward.");
             if (batch <= 0 || seqLen <= 0 || recDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
             if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: rglru_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: rglru_scan_forward");
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)value).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)recGate).Buffer.Handle);
@@ -13454,11 +13454,11 @@ KERNEL VARIANTS (A/B testing):
             int batch, int seqLen, int modelDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute Rwkv4WkvForward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute Rwkv4WkvForward.");
             if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
             if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: rwkv4_wkv_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: rwkv4_wkv_forward");
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)r).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)k).Buffer.Handle);
@@ -13482,13 +13482,13 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer output, int batch, int seqLen, int innerDim, int stateDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute MambaSelectiveScanForward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute MambaSelectiveScanForward.");
             if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || stateDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "Mamba dimensions must be positive.");
             if (stateDim > Kernels.MambaKernels.MaxStateDim)
                 throw new InvalidOperationException($"Mamba stateDim ({stateDim}) exceeds max ({Kernels.MambaKernels.MaxStateDim}).");
             if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: mamba_selective_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: mamba_selective_scan_forward");
 
             int total = batch * innerDim;
 
@@ -13522,11 +13522,11 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer outputMapReal, IGpuBuffer outputMapImag, IGpuBuffer skip,
             IGpuBuffer output, int batch, int time, int groups, int width, int state)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context is not initialized.");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context is not initialized.");
             if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM dimensions must be positive.");
             if (!_kernelCache.TryGetValue("complex_diagonal_ssm_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: complex_diagonal_ssm_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: complex_diagonal_ssm_scan_forward");
             int total = batch * groups;
             using var stateR = AllocateBuffer(total * state);
             using var stateI = AllocateBuffer(total * state);
@@ -13545,12 +13545,12 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer workWeights, IGpuBuffer covariance,
             int batch, int time, int model, int heads, int headDim)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context is not initialized.");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context is not initialized.");
             if (batch <= 0 || time <= 0 || model <= 0 || heads <= 0 || headDim <= 0 ||
                 model != heads * headDim || headDim > 32)
                 throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
             if (!_kernelCache.TryGetValue("mesa_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: mesa_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: mesa_scan_forward");
             IGpuBuffer[] buffers = { q, k, v, initialWeights, regularization, output, workWeights, covariance };
             for (uint i = 0; i < buffers.Length; i++) kernel.SetArg(i, ((DirectOpenClGpuBuffer)buffers[i]).Buffer.Handle);
             kernel.SetArg(8u, batch); kernel.SetArg(9u, time); kernel.SetArg(10u, model);
@@ -13564,9 +13564,9 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer input, IGpuBuffer activeMask, IGpuBuffer transition, IGpuBuffer inputMap, IGpuBuffer outputMap, IGpuBuffer skip,
             IGpuBuffer output, IGpuBuffer stateScratch, int batch, int time, int model, int experts, int state)
         {
-            if (_context == null) throw new InvalidOperationException("OpenCL context is not initialized.");
+            if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context is not initialized.");
             if (batch <= 0 || time <= 0 || model <= 0 || experts <= 0 || state <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
-            if (!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward", out var kernel)) throw new InvalidOperationException("OpenCL kernel not found: routed_diagonal_ssm_scan_forward");
+            if (!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward", out var kernel)) throw new GpuCapabilityUnavailableException("OpenCL kernel not found: routed_diagonal_ssm_scan_forward");
             IGpuBuffer[] buffers = { input, activeMask, transition, inputMap, outputMap, skip, output, stateScratch }; for (uint i = 0; i < buffers.Length; i++) kernel.SetArg(i, ((DirectOpenClGpuBuffer)buffers[i]).Buffer.Handle);
             kernel.SetArg(8u, batch); kernel.SetArg(9u, time); kernel.SetArg(10u, model); kernel.SetArg(11u, experts); kernel.SetArg(12u, state);
             int total = batch * experts, local = CalculateOptimalWorkGroupSize1D(total); kernel.Execute1D(((total + local - 1) / local) * local, local); _context.Finish();
@@ -13578,7 +13578,7 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer output, int batch, int seqLen, int innerDim, int numHeads, int headDim, int stateDim)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute Mamba2SsdScanForward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute Mamba2SsdScanForward.");
             if (batch <= 0 || seqLen <= 0 || innerDim <= 0 || numHeads <= 0 || headDim <= 0 || stateDim <= 0)
                 throw new ArgumentOutOfRangeException(nameof(batch), "Mamba-2 dimensions must be positive.");
             if (innerDim != numHeads * headDim)
@@ -13586,7 +13586,7 @@ KERNEL VARIANTS (A/B testing):
             if (stateDim > Kernels.Mamba2Kernels.MaxStateDim)
                 throw new InvalidOperationException($"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.Mamba2Kernels.MaxStateDim}).");
             if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: mamba2_ssd_scan_forward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: mamba2_ssd_scan_forward");
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)x).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)delta).Buffer.Handle);
@@ -13640,11 +13640,11 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer meanLoss, int n, int d, int vocab)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute FusedLinearCrossEntropy.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute FusedLinearCrossEntropy.");
             if (n <= 0 || d <= 0 || vocab <= 0)
                 throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
             if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-                throw new InvalidOperationException($"OpenCL kernel not found: {kernelName}");
+                throw new GpuCapabilityUnavailableException($"OpenCL kernel not found: {kernelName}");
 
             Fill(meanLoss, 0f, 1);
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)hidden).Buffer.Handle);
@@ -13670,7 +13670,7 @@ KERNEL VARIANTS (A/B testing):
             int seqLen, int batch, int inputSize, int hiddenSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute LstmForwardSequence.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute LstmForwardSequence.");
 
             if (seqLen <= 0)
                 throw new ArgumentException($"seqLen must be positive, got {seqLen}", nameof(seqLen));
@@ -13682,7 +13682,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"hiddenSize must be positive, got {hiddenSize}", nameof(hiddenSize));
 
             if (!_kernelCache.TryGetValue("lstm_forward_sequence", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: lstm_forward_sequence");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: lstm_forward_sequence");
 
             // One work-group per batch row: each work-item reads only its own row's previous hidden state, and the
             // kernel's barrier orders those reads only within a work-group. A generic work-group size let a row
@@ -13725,7 +13725,7 @@ KERNEL VARIANTS (A/B testing):
             int seqLen, int batch, int inputSize, int hiddenSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute LstmBackwardSequence.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute LstmBackwardSequence.");
 
             if (seqLen <= 0)
                 throw new ArgumentException($"seqLen must be positive, got {seqLen}", nameof(seqLen));
@@ -13744,9 +13744,9 @@ KERNEL VARIANTS (A/B testing):
             // weight/bias grads with one work-item per output element. hInit/cInit are unused here -- the
             // initial states are already in allH[0]/allC[0].
             if (!_kernelCache.TryGetValue("lstm_backward_dgates", out var kGates))
-                throw new InvalidOperationException("OpenCL kernel not found: lstm_backward_dgates");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: lstm_backward_dgates");
             if (!_kernelCache.TryGetValue("lstm_backward_dweights", out var kWeights))
-                throw new InvalidOperationException("OpenCL kernel not found: lstm_backward_dweights");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: lstm_backward_dweights");
 
             int gateCount = 4 * hiddenSize;
 
@@ -13804,7 +13804,7 @@ KERNEL VARIANTS (A/B testing):
             int seqLen, int batch, int inputSize, int hiddenSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GruForwardSequence.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GruForwardSequence.");
 
             if (seqLen <= 0)
                 throw new ArgumentException($"seqLen must be positive, got {seqLen}", nameof(seqLen));
@@ -13816,7 +13816,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"hiddenSize must be positive, got {hiddenSize}", nameof(hiddenSize));
 
             if (!_kernelCache.TryGetValue("gru_forward_sequence", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: gru_forward_sequence");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gru_forward_sequence");
 
             int localSize = GruSequenceWorkGroupSize(hiddenSize);
 
@@ -13847,7 +13847,7 @@ KERNEL VARIANTS (A/B testing):
             int seqLen, int batch, int inputSize, int hiddenSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GruBackwardSequence.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GruBackwardSequence.");
 
             if (seqLen <= 0)
                 throw new ArgumentException($"seqLen must be positive, got {seqLen}", nameof(seqLen));
@@ -13859,7 +13859,7 @@ KERNEL VARIANTS (A/B testing):
                 throw new ArgumentException($"hiddenSize must be positive, got {hiddenSize}", nameof(hiddenSize));
 
             if (!_kernelCache.TryGetValue("gru_backward_sequence", out var kernel))
-                throw new InvalidOperationException("OpenCL kernel not found: gru_backward_sequence");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gru_backward_sequence");
 
             int localSize = GruSequenceWorkGroupSize(hiddenSize);
             long localBytes = 4L * hiddenSize * sizeof(float);   // one step's r, z, n and r*n gate gradients
@@ -13911,7 +13911,7 @@ KERNEL VARIANTS (A/B testing):
             int batch, int hiddenSize)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context is not initialized. Cannot execute GruCellBackward.");
+                throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GruCellBackward.");
 
             if (batch <= 0)
                 throw new ArgumentException($"batch must be positive, got {batch}", nameof(batch));
@@ -13920,7 +13920,7 @@ KERNEL VARIANTS (A/B testing):
 
             // Step 1: Call gru_cell_backward to compute gate gradients and partial gradPrevH (direct path only)
             if (!_kernelCache.TryGetValue("gru_cell_backward", out var cellBackwardKernel))
-                throw new InvalidOperationException("OpenCL kernel not found: gru_cell_backward");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gru_cell_backward");
 
             int totalThreads = batch * hiddenSize;
             int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
@@ -13944,7 +13944,7 @@ KERNEL VARIANTS (A/B testing):
             // Step 2: Call gru_backward_prevh to compute full gradPrevH using all gate gradients
             // This overwrites the partial result from step 1 with the complete gradient
             if (!_kernelCache.TryGetValue("gru_backward_prevh", out var prevhKernel))
-                throw new InvalidOperationException("OpenCL kernel not found: gru_backward_prevh");
+                throw new GpuCapabilityUnavailableException("OpenCL kernel not found: gru_backward_prevh");
 
             prevhKernel.SetArg(0u, ((DirectOpenClGpuBuffer)gradGateR).Buffer.Handle);
             prevhKernel.SetArg(1u, ((DirectOpenClGpuBuffer)gradGateZ).Buffer.Handle);

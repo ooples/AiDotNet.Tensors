@@ -41,7 +41,7 @@ internal static class SparseSemiStructuredGpuDispatch
         float[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available for 2:4 sparse dispatch.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available for 2:4 sparse dispatch.");
 
         var backend = CudaBackend.CreateOrThrow();
         var output = new float[rows * n];

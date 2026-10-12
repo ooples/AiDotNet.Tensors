@@ -157,7 +157,7 @@ public sealed partial class HipBackend
     private IntPtr RequireResidentKernel(string kernelName)
     {
         if (!_kernelCache.TryGetValue(kernelName, out IntPtr kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         return kernel;
     }
 
@@ -237,7 +237,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexMultiply), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_multiply", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_multiply. Register HipComplexKernels.");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_multiply. Register HipComplexKernels.");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pAR = aReal.Handle, pAI = aImag.Handle, pBR = bReal.Handle, pBI = bImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
         void** args = stackalloc void*[7]; args[0] = &pAR; args[1] = &pAI; args[2] = &pBR; args[3] = &pBI; args[4] = &pOR; args[5] = &pOI; args[6] = &n;
@@ -253,7 +253,7 @@ public sealed partial class HipBackend
         if (interleaved.Size < requiredInterleaved)
             throw new ArgumentException($"{nameof(InterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("interleave_complex", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: interleave_complex");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: interleave_complex");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pR = real.Handle, pI = imag.Handle, pO = interleaved.Handle;
         void** args = stackalloc void*[4]; args[0] = &pR; args[1] = &pI; args[2] = &pO; args[3] = &n;
@@ -269,7 +269,7 @@ public sealed partial class HipBackend
         if (interleaved.Size < requiredInterleaved)
             throw new ArgumentException($"{nameof(DeinterleaveComplex)}: n ({n}) requires {requiredInterleaved} interleaved elements but buffer size is {interleaved.Size}.", nameof(interleaved));
         if (!_kernelCache.TryGetValue("deinterleave_complex", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: deinterleave_complex");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: deinterleave_complex");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIn = interleaved.Handle, pR = real.Handle, pI = imag.Handle;
         void** args = stackalloc void*[4]; args[0] = &pIn; args[1] = &pR; args[2] = &pI; args[3] = &n;
@@ -281,7 +281,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexConjugate), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_conjugate", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_conjugate");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_conjugate");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
         void** args = stackalloc void*[5]; args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &n;
@@ -293,7 +293,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexMagnitude), inReal, inImag, outMag);
         if (!_kernelCache.TryGetValue("split_complex_magnitude", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_magnitude");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_magnitude");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outMag.Handle;
         void** args = stackalloc void*[4]; args[0] = &pIR; args[1] = &pII; args[2] = &pO; args[3] = &n;
@@ -305,7 +305,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexMagnitudeSquared), inReal, inImag, outMagSq);
         if (!_kernelCache.TryGetValue("split_complex_magnitude_squared", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_magnitude_squared");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_magnitude_squared");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outMagSq.Handle;
         void** args = stackalloc void*[4]; args[0] = &pIR; args[1] = &pII; args[2] = &pO; args[3] = &n;
@@ -317,7 +317,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexPhase), inReal, inImag, outPhase);
         if (!_kernelCache.TryGetValue("split_complex_phase", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_phase");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_phase");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pO = outPhase.Handle;
         void** args = stackalloc void*[4]; args[0] = &pIR; args[1] = &pII; args[2] = &pO; args[3] = &n;
@@ -329,7 +329,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexFromPolar), mag, phase, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_from_polar", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_from_polar");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_from_polar");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pM = mag.Handle, pP = phase.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
         void** args = stackalloc void*[5]; args[0] = &pM; args[1] = &pP; args[2] = &pOR; args[3] = &pOI; args[4] = &n;
@@ -341,7 +341,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexScale), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_scale", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_scale");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_scale");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
         void** args = stackalloc void*[6]; args[0] = &pIR; args[1] = &pII; args[2] = &pOR; args[3] = &pOI; args[4] = &scalar; args[5] = &n;
@@ -353,7 +353,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexAdd), aReal, aImag, bReal, bImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_add", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_add");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_add");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pAR = aReal.Handle, pAI = aImag.Handle, pBR = bReal.Handle, pBI = bImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
         void** args = stackalloc void*[7]; args[0] = &pAR; args[1] = &pAI; args[2] = &pBR; args[3] = &pBI; args[4] = &pOR; args[5] = &pOI; args[6] = &n;
@@ -365,7 +365,7 @@ public sealed partial class HipBackend
         if (n <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexCrossSpectral), xReal, xImag, yReal, yImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_cross_spectral", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_cross_spectral");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_cross_spectral");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pXR = xReal.Handle, pXI = xImag.Handle, pYR = yReal.Handle, pYI = yImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
         void** args = stackalloc void*[7]; args[0] = &pXR; args[1] = &pXI; args[2] = &pYR; args[3] = &pYI; args[4] = &pOR; args[5] = &pOI; args[6] = &n;
@@ -377,7 +377,7 @@ public sealed partial class HipBackend
         if (n <= 0 || k <= 0) return;
         ValidateHipSplitBuffers(n, nameof(SplitComplexTopK), inReal, inImag, outReal, outImag);
         if (!_kernelCache.TryGetValue("split_complex_topk", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: split_complex_topk");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: split_complex_topk");
         k = Math.Min(k, n);
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pIR = inReal.Handle, pII = inImag.Handle, pOR = outReal.Handle, pOI = outImag.Handle;
@@ -390,7 +390,7 @@ public sealed partial class HipBackend
     {
         if (rows <= 0 || cols <= 0) return;
         if (!_kernelCache.TryGetValue("softmax_rows", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: softmax_rows");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: softmax_rows");
         uint grid = (uint)rows;
         int blockSize = Math.Min(256, cols);
         int sharedMem = blockSize * sizeof(float);
@@ -418,7 +418,7 @@ public sealed partial class HipBackend
         int n = (int)total;
         ValidateHipSplitBuffers(n, nameof(SplitComplexUnitPhaseCodebook), outReal, outImag);
         if (!_kernelCache.TryGetValue("hrr_unit_phase_codebook", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hrr_unit_phase_codebook");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hrr_unit_phase_codebook");
         uint grid = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pOR = outReal.Handle, pOI = outImag.Handle;
         int kPskI = kPsk ? 1 : 0;
@@ -450,7 +450,7 @@ public sealed partial class HipBackend
             throw new ArgumentException(
                 $"outScores must hold at least V = {V} elements (got {outScores.Size}).");
         if (!_kernelCache.TryGetValue("hrr_phase_coherence_decode", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hrr_phase_coherence_decode");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hrr_phase_coherence_decode");
         uint grid = (uint)V;
         int blockSize = 1;
         while (blockSize < D && blockSize < 1024) blockSize <<= 1;
@@ -506,7 +506,7 @@ public sealed partial class HipBackend
         int nKeys = (int)nKeysL;
         int nVals = (int)nValsL;
         if (!_kernelCache.TryGetValue("hrr_bind_accumulate", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hrr_bind_accumulate");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hrr_bind_accumulate");
         uint grid = (uint)((D + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pKR = keyCodeReal.Handle, pKI = keyCodeImag.Handle;
         IntPtr pVR = valPermCodeReal.Handle, pVI = valPermCodeImag.Handle;
@@ -536,7 +536,7 @@ public sealed partial class HipBackend
             throw new InvalidOperationException(
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.HipGlaKernels.MaxHeadDim}).");
         if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: gla_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gla_scan_forward");
 
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle, po = output.Handle;
         void** args = stackalloc void*[10];
@@ -562,7 +562,7 @@ public sealed partial class HipBackend
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.HipGlaKernels.MaxHeadDim}).");
         if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
             !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
-            throw new InvalidOperationException("HIP kernel not found: gla_scan_recompute / gla_scan_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gla_scan_recompute / gla_scan_backward");
 
         // State trajectory scratch: [batch * numHeads * seqLen * headDim * headDim].
         long trajLenLong = (long)batch * numHeads * seqLen * headDim * headDim;
@@ -608,7 +608,7 @@ public sealed partial class HipBackend
             throw new InvalidOperationException(
                 $"xLSTM headDim ({headDim}) exceeds max ({Kernels.HipXLstmKernels.MaxHeadDim}).");
         if (!_kernelCache.TryGetValue("xlstm_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: xlstm_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: xlstm_scan_forward");
 
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle;
         IntPtr pi = iGate.Handle, pf = fGate.Handle, po = oGate.Handle, pout = output.Handle;
@@ -632,7 +632,7 @@ public sealed partial class HipBackend
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.HipGatedDeltaNetKernels.MaxHeadDim}).");
         if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: gated_delta_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gated_delta_scan_forward");
 
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, pout = output.Handle;
         void** args = stackalloc void*[11];
@@ -650,7 +650,7 @@ public sealed partial class HipBackend
         if (batch <= 0 || seqLen <= 0 || recDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "RG-LRU dimensions must be positive.");
         if (!_kernelCache.TryGetValue("rglru_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: rglru_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rglru_scan_forward");
 
         IntPtr pv = value.Handle, pr = recGate.Handle, pi = inpGate.Handle, pd = decay.Handle, pout = output.Handle;
         void** args = stackalloc void*[8];
@@ -668,7 +668,7 @@ public sealed partial class HipBackend
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "RWKV-4 dimensions must be positive.");
         if (!_kernelCache.TryGetValue("rwkv4_wkv_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: rwkv4_wkv_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rwkv4_wkv_forward");
 
         IntPtr pr = r.Handle, pk = k.Handle, pv = v.Handle, pd = timeDecay.Handle, pf = timeFirst.Handle, pout = output.Handle;
         void** args = stackalloc void*[9];
@@ -689,7 +689,7 @@ public sealed partial class HipBackend
             throw new InvalidOperationException(
                 $"Mamba stateDim ({stateDim}) exceeds max ({Kernels.HipMambaKernels.MaxStateDim}).");
         if (!_kernelCache.TryGetValue("mamba_selective_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: mamba_selective_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mamba_selective_scan_forward");
 
         IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
         void** args = stackalloc void*[11];
@@ -708,7 +708,7 @@ public sealed partial class HipBackend
         if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
             throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM dimensions must be in [1,256] for width/state.");
         if (!_kernelCache.TryGetValue("complex_diagonal_ssm_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: complex_diagonal_ssm_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: complex_diagonal_ssm_scan_forward");
         IntPtr px=input.Handle, par=transitionReal.Handle, pai=transitionImag.Handle, pbr=inputMapReal.Handle,
             pbi=inputMapImag.Handle, pcr=outputMapReal.Handle, pci=outputMapImag.Handle, pd=skip.Handle, po=output.Handle;
         void** args = stackalloc void*[14];
@@ -727,7 +727,7 @@ public sealed partial class HipBackend
             model != heads * headDim || headDim > 32)
             throw new ArgumentOutOfRangeException(nameof(batch), "Mesa dimensions are invalid or headDim exceeds 32.");
         if (!_kernelCache.TryGetValue("mesa_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: mesa_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mesa_scan_forward");
         IntPtr pq=q.Handle, pk=k.Handle, pv=v.Handle, pw=initialWeights.Handle, pr=regularization.Handle,
             po=output.Handle, pww=workWeights.Handle, pc=covariance.Handle;
         void** args=stackalloc void*[13];
@@ -742,7 +742,7 @@ public sealed partial class HipBackend
         IGpuBuffer output,IGpuBuffer stateScratch,int batch,int time,int model,int experts,int state)
     {
         if(batch<=0||time<=0||model<=0||experts<=0||state<=0)throw new ArgumentOutOfRangeException(nameof(batch));
-        if(!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward",out var kernel))throw new InvalidOperationException("HIP kernel not found: routed_diagonal_ssm_scan_forward");
+        if(!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward",out var kernel))throw new GpuCapabilityUnavailableException("HIP kernel not found: routed_diagonal_ssm_scan_forward");
         IntPtr px=input.Handle,pm=activeMask.Handle,pa=transition.Handle,pb=inputMap.Handle,pc=outputMap.Handle,pd=skip.Handle,po=output.Handle,ph=stateScratch.Handle;
         void** args=stackalloc void*[13];args[0]=&px;args[1]=&pm;args[2]=&pa;args[3]=&pb;args[4]=&pc;args[5]=&pd;args[6]=&po;args[7]=&ph;args[8]=&batch;args[9]=&time;args[10]=&model;args[11]=&experts;args[12]=&state;
         uint total=(uint)(batch*experts);LaunchKernel(kernel,(total+(uint)DefaultBlockSize-1)/(uint)DefaultBlockSize,(uint)DefaultBlockSize,args);
@@ -761,7 +761,7 @@ public sealed partial class HipBackend
             throw new InvalidOperationException(
                 $"Mamba-2 stateDim ({stateDim}) exceeds max ({Kernels.HipMamba2Kernels.MaxStateDim}).");
         if (!_kernelCache.TryGetValue("mamba2_ssd_scan_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: mamba2_ssd_scan_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mamba2_ssd_scan_forward");
 
         IntPtr px = x.Handle, pdt = delta.Handle, pa = aLog.Handle, pb = bParam.Handle, pc = cParam.Handle, pd = dParam.Handle, pout = output.Handle;
         void** args = stackalloc void*[13];
@@ -806,7 +806,7 @@ public sealed partial class HipBackend
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         Fill(meanLoss, 0f, 1);
         IntPtr ph = hidden.Handle, pw = weight.Handle, pb = bias.Handle, pt = tgt.Handle, pl = meanLoss.Handle;
         void** args = stackalloc void*[8];
