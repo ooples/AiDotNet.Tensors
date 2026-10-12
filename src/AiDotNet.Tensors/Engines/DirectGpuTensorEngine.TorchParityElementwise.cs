@@ -8,8 +8,8 @@ namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
 /// Device paths for PyTorch-parity elementwise ops that computed on the host (#1112). They run on backends implementing
-/// <see cref="ITorchParityElementwiseBackend"/>, which today is CUDA only; HIP, Metal, OpenCL, Vulkan and WebGPU take the
-/// recorded host fallback until #1124, #1125, #1126, #1127 and #1128 land. Under an active tape or graph recording they
+/// <see cref="ITorchParityElementwiseBackend"/>, which today is CUDA and Vulkan; HIP, Metal, OpenCL and WebGPU take the
+/// recorded host fallback until #1124, #1125, #1126 and #1128 land. Under an active tape or graph recording they
 /// defer to the CPU implementation, which records the backward (the convention of the engine's other parity
 /// overrides); so do non-float precisions, mismatched binary shapes and argument errors the CPU reports.
 /// </summary>
@@ -152,9 +152,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> reduced;
         using (new NoGradScope<T>())
             reduced = all ? TensorAmin(indicator, reduceAxes, keepDims) : ReduceMax(indicator, reduceAxes, keepDims);
-        // The CPU's ReduceMax gives a full reduction shape [1] where the device one gives rank 0 (#1132); all / any
-        // keep the CPU's shape.
-        return reduced.Rank == 0 ? Reshape(reduced, new[] { 1 }) : reduced;
+        return reduced;
     }
 
     private Tensor<T>? TryDiagflatOnDevice<T>(Tensor<T> tensor, int offset)

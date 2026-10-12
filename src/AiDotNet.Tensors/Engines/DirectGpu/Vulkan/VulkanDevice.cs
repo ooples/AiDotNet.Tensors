@@ -51,6 +51,8 @@ public sealed unsafe class VulkanDevice : IDisposable
     private string _deviceName = string.Empty;
     private string _vendorName = string.Empty;
     private VkPhysicalDeviceLimits _limits;
+    private bool _shaderFloat64;
+    private bool _shaderInt64;
     private VkPhysicalDeviceMemoryProperties _memoryProperties;
 
     /// <summary>
@@ -151,6 +153,16 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// Gets the maximum storage buffer range.
     /// </summary>
     public uint MaxStorageBufferRange => _limits.maxStorageBufferRange;
+
+    /// <summary>
+    /// True when the device supports 64-bit floats in shaders (shaderFloat64) and the feature is enabled.
+    /// </summary>
+    public bool SupportsShaderFloat64 => _shaderFloat64;
+
+    /// <summary>
+    /// True when the device supports 64-bit integers in shaders (shaderInt64) and the feature is enabled.
+    /// </summary>
+    public bool SupportsShaderInt64 => _shaderInt64;
 
     /// <summary>
     /// Gets the total device-local memory in bytes by summing all device-local heaps.
@@ -569,6 +581,17 @@ public sealed unsafe class VulkanDevice : IDisposable
             pQueuePriorities = &queuePriority
         };
 
+        // Enable the 64-bit shader types where the device has them: kernels that compute in double or int64 need the
+        // feature enabled, not merely supported. Everything else stays off, as before.
+        uint* supported = stackalloc uint[VulkanNativeBindings.PhysicalDeviceFeatureCount];
+        uint* enabled = stackalloc uint[VulkanNativeBindings.PhysicalDeviceFeatureCount];
+        for (int i = 0; i < VulkanNativeBindings.PhysicalDeviceFeatureCount; i++) { supported[i] = 0; enabled[i] = 0; }
+        VulkanNativeBindings.vkGetPhysicalDeviceFeatures(_physicalDevice, supported);
+        _shaderFloat64 = supported[VulkanNativeBindings.FeatureShaderFloat64] != 0;
+        _shaderInt64 = supported[VulkanNativeBindings.FeatureShaderInt64] != 0;
+        enabled[VulkanNativeBindings.FeatureShaderFloat64] = _shaderFloat64 ? 1u : 0u;
+        enabled[VulkanNativeBindings.FeatureShaderInt64] = _shaderInt64 ? 1u : 0u;
+
         var deviceCreateInfo = new VkDeviceCreateInfo
         {
             sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -580,7 +603,7 @@ public sealed unsafe class VulkanDevice : IDisposable
             ppEnabledLayerNames = null,
             enabledExtensionCount = 0,
             ppEnabledExtensionNames = null,
-            pEnabledFeatures = null
+            pEnabledFeatures = enabled
         };
 
         var result = VulkanNativeBindings.vkCreateDevice(_physicalDevice, &deviceCreateInfo, IntPtr.Zero, out _device);

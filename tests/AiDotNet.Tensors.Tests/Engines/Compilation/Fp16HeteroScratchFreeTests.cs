@@ -60,6 +60,22 @@ public class Fp16HeteroScratchFreeTests
         return (plan.Fp16HeteroOrderForTest, plan.LossOutput);
     }
 
+    // Entries die with their storage, so a garbage collection inside the measured window changes the bytes it reads.
+    // The window runs in a no-GC region when one can start: on net471 the small gen-0 budget let background allocation
+    // from earlier tests trigger a collection in every one of 8 attempts. If the region cannot start, or the window
+    // outgrows it, the collected flag still reports it and the caller retries.
+    private static bool BeginNoGc()
+    {
+        try { return GC.TryStartNoGCRegion(32L << 20); }
+        catch (InvalidOperationException) { return false; }   // already in a region
+    }
+
+    private static void EndNoGc(bool started)
+    {
+        if (started && System.Runtime.GCSettings.LatencyMode == System.Runtime.GCLatencyMode.NoGCRegion)
+            GC.EndNoGCRegion();
+    }
+
     // Run one ISOLATED forward+backward with scratch-free on/off, returning the param-grad L2 norm (correctness
     // fingerprint) and the resident activation-cache bytes right after the backward. Each run captures its OWN
     // fresh graph (distinct tensors) and clears the activation cache first, so the two runs don't share cache
@@ -78,11 +94,19 @@ public class Fp16HeteroScratchFreeTests
             gpu.SuspendActivationEviction();
             try
             {
+                bool quiet = BeginNoGc();
                 int gen0 = GC.CollectionCount(0);
-                plan.Forward();
-                var grads = plan.Backward();
-                long bytes = gpu.CurrentActivationCacheBytes;
-                bool collected = GC.CollectionCount(0) != gen0;
+                MixedPrecisionGraphBackward.Result grads;
+                long bytes;
+                bool collected;
+                try
+                {
+                    plan.Forward();
+                    grads = plan.Backward();
+                    bytes = gpu.CurrentActivationCacheBytes;
+                    collected = GC.CollectionCount(0) != gen0;
+                }
+                finally { EndNoGc(quiet); }
                 double sum = 0;
                 foreach (var kv in grads.Fp32)
                 {
@@ -114,12 +138,19 @@ public class Fp16HeteroScratchFreeTests
             gpu.ResetOwnedResultTracking();
             try
             {
+                bool quiet = BeginNoGc();
                 int gen0 = GC.CollectionCount(0);
-                plan.Forward();
-                // Resident activation storage right after the forward: the activation cache PLUS the results that own
-                // their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
-                long bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
-                bool collected = GC.CollectionCount(0) != gen0;
+                long bytes;
+                bool collected;
+                try
+                {
+                    plan.Forward();
+                    // Resident activation storage right after the forward: the activation cache PLUS the results that
+                    // own their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
+                    bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
+                    collected = GC.CollectionCount(0) != gen0;
+                }
+                finally { EndNoGc(quiet); }
                 var grads = plan.Backward();
                 double sum = 0;
                 foreach (var kv in grads.Fp32)

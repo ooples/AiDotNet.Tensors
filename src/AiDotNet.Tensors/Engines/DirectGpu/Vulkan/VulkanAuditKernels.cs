@@ -780,14 +780,27 @@ float p210_lgamma(float x) {
     return 0.5*log(2.0*M_PI) + (xx+0.5)*log(t) - t + log(a);
 }
 
+// torch's total order, as the CUDA kernel's parity210_sorts_before: padding (index < 0) after every real element; NaN
+// after every number ascending and before every number descending; equal values (-0 equals +0) by original index, so
+// the sort is stable. Keying NaN as +inf instead tied it with +inf and with the padding of ascending rows.
+bool p210_isnan(float x) { uint u = floatBitsToUint(x); return ((u >> 23) & 0xFFu) == 0xFFu && (u & 0x7FFFFFu) != 0u; }
+bool p210_sorts_before(float va, float ia, float vb, float ib) {
+    bool pa = ia < 0.0, pb = ib < 0.0;
+    if (pa != pb) return pb;
+    if (pa) return false;
+    bool na = p210_isnan(va), nb = p210_isnan(vb);
+    if (na != nb) return descending != 0 ? na : nb;
+    if (!na && va != vb) return descending != 0 ? (va > vb) : (va < vb);
+    return ia < ib;
+}
+
 void main() {
 
     int gid = int(gl_GlobalInvocationID.x); if (gid>=numRows*rowLen) return; int i=gid%rowLen; int ixj=i^j; if (ixj<=i) return;
-    int base=(gid/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj];
-    uint ua=floatBitsToUint(a), ub=floatBitsToUint(b);
-    float ka=(((ua>>23)&0xFFu)==0xFFu&&(ua&0x7FFFFFu)!=0u)?P210_INF:a; float kb=(((ub>>23)&0xFFu)==0xFFu&&(ub&0x7FFFFFu)!=0u)?P210_INF:b;
-    bool up=((i&k)==0); if (descending!=0) up=!up; bool doSwap=up?(ka>kb):(ka<kb);
-    if (doSwap) { values[base+i]=b; values[base+ixj]=a; float t=indices[base+i]; indices[base+i]=indices[base+ixj]; indices[base+ixj]=t; }
+    int base=(gid/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj]; float ia=indices[base+i], ib=indices[base+ixj];
+    bool up=((i&k)==0);
+    bool doSwap = up ? p210_sorts_before(b, ib, a, ia) : p210_sorts_before(a, ia, b, ib);
+    if (doSwap) { values[base+i]=b; values[base+ixj]=a; indices[base+i]=ib; indices[base+ixj]=ia; }
 
 }";
 

@@ -1,0 +1,3542 @@
+{
+ "abs_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Abs"
+  ],
+  "base": "Abs",
+  "engineName": "TensorAbs",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "absolute_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Abs"
+  ],
+  "base": "Abs",
+  "engineName": "TensorAbs",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "acos_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Acos"
+  ],
+  "base": "Acos",
+  "engineName": "TensorAcos",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "acosh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Acosh"
+  ],
+  "base": "Acosh",
+  "engineName": null,
+  "overloads": []
+ },
+ "addbmm_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAddbmm"
+  ],
+  "base": "TensorAddbmm",
+  "engineName": "TensorAddbmm",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> batch1, Tensor<T> batch2, double beta = 1, double alpha = 1",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> batch1",
+     "Tensor<T> batch2",
+     "double beta = 1",
+     "double alpha = 1"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "addcdiv_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAddcdiv"
+  ],
+  "base": "TensorAddcdiv",
+  "engineName": "TensorAddcdiv",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> tensor1, Tensor<T> tensor2, double value = 1",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> tensor1",
+     "Tensor<T> tensor2",
+     "double value = 1"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "addcmul_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAddcmul"
+  ],
+  "base": "TensorAddcmul",
+  "engineName": "TensorAddcmul",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> tensor1, Tensor<T> tensor2, double value = 1",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> tensor1",
+     "Tensor<T> tensor2",
+     "double value = 1"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "addmm_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAddMM"
+  ],
+  "base": "TensorAddMM",
+  "engineName": "TensorAddMM",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> a, Tensor<T> b, T alpha, T beta",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> a",
+     "Tensor<T> b",
+     "T alpha",
+     "T beta"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "addmv_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAddmv"
+  ],
+  "base": "TensorAddmv",
+  "engineName": "TensorAddmv",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> mat, Tensor<T> vec, double beta = 1, double alpha = 1",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> mat",
+     "Tensor<T> vec",
+     "double beta = 1",
+     "double alpha = 1"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "addr_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAddr"
+  ],
+  "base": "TensorAddr",
+  "engineName": "TensorAddr",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> vec1, Tensor<T> vec2, double beta = 1, double alpha = 1",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> vec1",
+     "Tensor<T> vec2",
+     "double beta = 1",
+     "double alpha = 1"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "alpha_dropout_": {
+  "cats": [
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAlphaDropout"
+  ],
+  "base": "TensorAlphaDropout",
+  "engineName": "TensorAlphaDropout",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double p, bool training, int? seed = null",
+    "plist": [
+     "Tensor<T> tensor",
+     "double p",
+     "bool training",
+     "int? seed = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "apply_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "arccos_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Acos"
+  ],
+  "base": "Acos",
+  "engineName": "TensorAcos",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "arccosh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Acosh"
+  ],
+  "base": "Acosh",
+  "engineName": null,
+  "overloads": []
+ },
+ "arcsin_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Asin"
+  ],
+  "base": "Asin",
+  "engineName": "TensorAsin",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "arcsinh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Asinh"
+  ],
+  "base": "Asinh",
+  "engineName": null,
+  "overloads": []
+ },
+ "arctan2_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAtan2"
+  ],
+  "base": "TensorAtan2",
+  "engineName": "TensorAtan2",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> y, Tensor<T> x",
+    "plist": [
+     "Tensor<T> y",
+     "Tensor<T> x"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "arctan_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Atan"
+  ],
+  "base": "Atan",
+  "engineName": "TensorAtan",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "arctanh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Atanh"
+  ],
+  "base": "Atanh",
+  "engineName": "TensorAtanh",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "as_strided_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::StridedGather"
+  ],
+  "base": "StridedGather",
+  "engineName": null,
+  "overloads": []
+ },
+ "asin_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Asin"
+  ],
+  "base": "Asin",
+  "engineName": "TensorAsin",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "asinh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Asinh"
+  ],
+  "base": "Asinh",
+  "engineName": null,
+  "overloads": []
+ },
+ "atan2_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorAtan2"
+  ],
+  "base": "TensorAtan2",
+  "engineName": "TensorAtan2",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> y, Tensor<T> x",
+    "plist": [
+     "Tensor<T> y",
+     "Tensor<T> x"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "atan_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Atan"
+  ],
+  "base": "Atan",
+  "engineName": "TensorAtan",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "atanh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Atanh"
+  ],
+  "base": "Atanh",
+  "engineName": "TensorAtanh",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "baddbmm_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBaddbmm"
+  ],
+  "base": "TensorBaddbmm",
+  "engineName": "TensorBaddbmm",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<T> batch1, Tensor<T> batch2, double beta = 1, double alpha = 1",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<T> batch1",
+     "Tensor<T> batch2",
+     "double beta = 1",
+     "double alpha = 1"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "bernoulli_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBernoulli"
+  ],
+  "base": "TensorBernoulli",
+  "engineName": "TensorBernoulli",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> probabilities, int? seed = null",
+    "plist": [
+     "Tensor<T> probabilities",
+     "int? seed = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "bitwise_and_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseAnd"
+  ],
+  "base": "TensorBitwiseAnd",
+  "engineName": "TensorBitwiseAnd",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "bitwise_left_shift_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseLeftShift"
+  ],
+  "base": "TensorBitwiseLeftShift",
+  "engineName": "TensorBitwiseLeftShift",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "bitwise_not_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseNot"
+  ],
+  "base": "TensorBitwiseNot",
+  "engineName": "TensorBitwiseNot",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "bitwise_or_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseOr"
+  ],
+  "base": "TensorBitwiseOr",
+  "engineName": "TensorBitwiseOr",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "bitwise_right_shift_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseRightShift"
+  ],
+  "base": "TensorBitwiseRightShift",
+  "engineName": "TensorBitwiseRightShift",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "bitwise_xor_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseXor"
+  ],
+  "base": "TensorBitwiseXor",
+  "engineName": "TensorBitwiseXor",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "cauchy_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorCauchy"
+  ],
+  "base": "TensorCauchy",
+  "engineName": null,
+  "overloads": []
+ },
+ "ceil_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Ceiling"
+  ],
+  "base": "Ceiling",
+  "engineName": "TensorCeiling",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "celu_": {
+  "cats": [
+   "aten",
+   "nn.functional",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorCelu"
+  ],
+  "base": "TensorCelu",
+  "engineName": "TensorCelu",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double alpha = 1.0",
+    "plist": [
+     "Tensor<T> tensor",
+     "double alpha = 1.0"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "clamp_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Clamp"
+  ],
+  "base": "Clamp",
+  "engineName": "TensorClamp",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T min, T max",
+    "plist": [
+     "Tensor<T> tensor",
+     "T min",
+     "T max"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "clamp_max_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorClampMax"
+  ],
+  "base": "TensorClampMax",
+  "engineName": "TensorClampMax",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T max",
+    "plist": [
+     "Tensor<T> tensor",
+     "T max"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "clamp_min_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorClampMin"
+  ],
+  "base": "TensorClampMin",
+  "engineName": "TensorClampMin",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T min",
+    "plist": [
+     "Tensor<T> tensor",
+     "T min"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "clip_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorClip"
+  ],
+  "base": "TensorClip",
+  "engineName": "TensorClip",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T minValue, T maxValue",
+    "plist": [
+     "Tensor<T> tensor",
+     "T minValue",
+     "T maxValue"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "conj_physical_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorComplexConjugate"
+  ],
+  "base": "TensorComplexConjugate",
+  "engineName": "TensorComplexConjugate",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a",
+    "plist": [
+     "Tensor<T> a"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "copy_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorCopy"
+  ],
+  "base": "TensorCopy",
+  "engineName": null,
+  "overloads": []
+ },
+ "copysign_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorCopysign"
+  ],
+  "base": "TensorCopysign",
+  "engineName": "TensorCopysign",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "cos_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Cos"
+  ],
+  "base": "Cos",
+  "engineName": "TensorCos",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "cosh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Cosh"
+  ],
+  "base": "Cosh",
+  "engineName": "TensorCosh",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "cumprod_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorCumProd"
+  ],
+  "base": "TensorCumProd",
+  "engineName": "TensorCumProd",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "cumsum_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorCumSum"
+  ],
+  "base": "TensorCumSum",
+  "engineName": "TensorCumSum",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "deg2rad_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorDeg2Rad"
+  ],
+  "base": "TensorDeg2Rad",
+  "engineName": "TensorDeg2Rad",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "detach_": {
+  "cats": [
+   "Tensor",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::StopGradient"
+  ],
+  "base": "StopGradient",
+  "engineName": "StopGradient",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "digamma_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorDigamma"
+  ],
+  "base": "TensorDigamma",
+  "engineName": "TensorDigamma",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "dropout_": {
+  "cats": [
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Dropout"
+  ],
+  "base": "Dropout",
+  "engineName": "Dropout",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask",
+    "plist": [
+     "Tensor<T> input",
+     "double dropoutRate",
+     "bool training",
+     "out Tensor<T> mask"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "elu_": {
+  "cats": [
+   "aten",
+   "nn.functional"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::ELU"
+  ],
+  "base": "ELU",
+  "engineName": "ELU",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double alpha = 1.0",
+    "plist": [
+     "Tensor<T> tensor",
+     "double alpha = 1.0"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "embedding_renorm_": {
+  "cats": [
+   "torch"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "eq_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorEq"
+  ],
+  "base": "TensorEq",
+  "engineName": "TensorEq",
+  "overloads": [
+   {
+    "ret": "Tensor<Bit>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "erf_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorErf"
+  ],
+  "base": "TensorErf",
+  "engineName": "TensorErf",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "erfc_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorErfc"
+  ],
+  "base": "TensorErfc",
+  "engineName": "TensorErfc",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "erfinv_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorErfinv"
+  ],
+  "base": "TensorErfinv",
+  "engineName": "TensorErfinv",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "exp2_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Exp2"
+  ],
+  "base": "Exp2",
+  "engineName": null,
+  "overloads": []
+ },
+ "exp_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Exp"
+  ],
+  "base": "Exp",
+  "engineName": "TensorExp",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "expm1_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::ExpM1"
+  ],
+  "base": "ExpM1",
+  "engineName": null,
+  "overloads": []
+ },
+ "exponential_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorExponential"
+  ],
+  "base": "TensorExponential",
+  "engineName": null,
+  "overloads": []
+ },
+ "feature_alpha_dropout_": {
+  "cats": [
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorFeatureAlphaDropout"
+  ],
+  "base": "TensorFeatureAlphaDropout",
+  "engineName": "TensorFeatureAlphaDropout",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double p, bool training, int? seed = null",
+    "plist": [
+     "Tensor<T> tensor",
+     "double p",
+     "bool training",
+     "int? seed = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "feature_dropout_": {
+  "cats": [
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorChannelDropout"
+  ],
+  "base": "TensorChannelDropout",
+  "engineName": "TensorChannelDropout",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double p, bool training, int spatialDims, int? seed = null",
+    "plist": [
+     "Tensor<T> tensor",
+     "double p",
+     "bool training",
+     "int spatialDims",
+     "int? seed = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "fill_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Fill"
+  ],
+  "base": "Fill",
+  "engineName": null,
+  "overloads": []
+ },
+ "fill_diagonal_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "fix_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Truncate"
+  ],
+  "base": "Truncate",
+  "engineName": null,
+  "overloads": []
+ },
+ "float_power_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorFloatPower"
+  ],
+  "base": "TensorFloatPower",
+  "engineName": "TensorFloatPower",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "floor_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Floor"
+  ],
+  "base": "Floor",
+  "engineName": "TensorFloor",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "floor_divide_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorFloorDivide"
+  ],
+  "base": "TensorFloorDivide",
+  "engineName": "TensorFloorDivide",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "fmod_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorFmod"
+  ],
+  "base": "TensorFmod",
+  "engineName": "TensorFmod",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "frac_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorFrac"
+  ],
+  "base": "TensorFrac",
+  "engineName": "TensorFrac",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "gcd_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorGcd"
+  ],
+  "base": "TensorGcd",
+  "engineName": "TensorGcd",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "ge_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual"
+  ],
+  "base": "TensorGreaterEqual",
+  "engineName": "TensorGreaterEqual",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "geometric_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorGeometric"
+  ],
+  "base": "TensorGeometric",
+  "engineName": null,
+  "overloads": []
+ },
+ "greater_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan"
+  ],
+  "base": "TensorGreaterThan",
+  "engineName": "TensorGreaterThan",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "T value"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "greater_equal_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual"
+  ],
+  "base": "TensorGreaterEqual",
+  "engineName": "TensorGreaterEqual",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "gt_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan"
+  ],
+  "base": "TensorGreaterThan",
+  "engineName": "TensorGreaterThan",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "T value"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "hardsigmoid_": {
+  "cats": [
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorHardSigmoid"
+  ],
+  "base": "TensorHardSigmoid",
+  "engineName": "TensorHardSigmoid",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "hardswish_": {
+  "cats": [
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::HardSwish"
+  ],
+  "base": "HardSwish",
+  "engineName": "HardSwish",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input",
+    "plist": [
+     "Tensor<T> input"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "hardtanh_": {
+  "cats": [
+   "aten",
+   "nn.functional"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorHardtanh"
+  ],
+  "base": "TensorHardtanh",
+  "engineName": "TensorHardtanh",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double minValue = -1.0, double maxValue = 1.0",
+    "plist": [
+     "Tensor<T> tensor",
+     "double minValue = -1.0",
+     "double maxValue = 1.0"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "heaviside_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorHeaviside"
+  ],
+  "base": "TensorHeaviside",
+  "engineName": "TensorHeaviside",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, Tensor<T> values",
+    "plist": [
+     "Tensor<T> tensor",
+     "Tensor<T> values"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "hypot_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorHypot"
+  ],
+  "base": "TensorHypot",
+  "engineName": "TensorHypot",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "i0_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorI0"
+  ],
+  "base": "TensorI0",
+  "engineName": "TensorI0",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "igamma_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorIgamma"
+  ],
+  "base": "TensorIgamma",
+  "engineName": "TensorIgamma",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> x",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> x"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "igammac_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorIgammac"
+  ],
+  "base": "TensorIgammac",
+  "engineName": "TensorIgammac",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> x",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> x"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "index_add_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorIndexAdd"
+  ],
+  "base": "TensorIndexAdd",
+  "engineName": "TensorIndexAdd",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis",
+     "Tensor<int> indices",
+     "Tensor<T> source"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "index_copy_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorIndexCopy"
+  ],
+  "base": "TensorIndexCopy",
+  "engineName": "TensorIndexCopy",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis, Tensor<int> indices, Tensor<T> source",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis",
+     "Tensor<int> indices",
+     "Tensor<T> source"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "index_fill_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorIndexFill"
+  ],
+  "base": "TensorIndexFill",
+  "engineName": "TensorIndexFill",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis, Tensor<int> indices, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis",
+     "Tensor<int> indices",
+     "T value"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "index_put_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorIndexPut"
+  ],
+  "base": "TensorIndexPut",
+  "engineName": "TensorIndexPut",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, Tensor<int>[] indices, Tensor<T> source, bool accumulate = false",
+    "plist": [
+     "Tensor<T> tensor",
+     "Tensor<int>[] indices",
+     "Tensor<T> source",
+     "bool accumulate = false"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "index_reduce_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorIndexReduce"
+  ],
+  "base": "TensorIndexReduce",
+  "engineName": "TensorIndexReduce",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int dim, Tensor<int> index, Tensor<T> source, ScatterReduceMode reduce, bool includeSelf = true",
+    "plist": [
+     "Tensor<T> tensor",
+     "int dim",
+     "Tensor<int> index",
+     "Tensor<T> source",
+     "ScatterReduceMode reduce",
+     "bool includeSelf = true"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "lcm_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLcm"
+  ],
+  "base": "TensorLcm",
+  "engineName": "TensorLcm",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "ldexp_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLdexp"
+  ],
+  "base": "TensorLdexp",
+  "engineName": "TensorLdexp",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> x, Tensor<int> exp",
+    "plist": [
+     "Tensor<T> x",
+     "Tensor<int> exp"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "le_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual"
+  ],
+  "base": "TensorLessEqual",
+  "engineName": "TensorLessEqual",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "lerp_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Lerp"
+  ],
+  "base": "Lerp",
+  "engineName": "TensorLerp",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b, T t",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b",
+     "T t"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "less_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLessThan"
+  ],
+  "base": "TensorLessThan",
+  "engineName": "TensorLessThan",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "T value"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "less_equal_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual"
+  ],
+  "base": "TensorLessEqual",
+  "engineName": "TensorLessEqual",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "lgamma_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLgamma"
+  ],
+  "base": "TensorLgamma",
+  "engineName": "TensorLgamma",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "log10_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Log10"
+  ],
+  "base": "Log10",
+  "engineName": null,
+  "overloads": []
+ },
+ "log1p_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Log1P"
+  ],
+  "base": "Log1P",
+  "engineName": null,
+  "overloads": []
+ },
+ "log2_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Log2"
+  ],
+  "base": "Log2",
+  "engineName": null,
+  "overloads": []
+ },
+ "log_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Log"
+  ],
+  "base": "Log",
+  "engineName": "TensorLog",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "log_normal_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLogNormal"
+  ],
+  "base": "TensorLogNormal",
+  "engineName": null,
+  "overloads": []
+ },
+ "logical_and_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLogicalAnd"
+  ],
+  "base": "TensorLogicalAnd",
+  "engineName": "TensorLogicalAnd",
+  "overloads": [
+   {
+    "ret": "Tensor<Bit>",
+    "gen": "",
+    "params": "Tensor<Bit> a, Tensor<Bit> b",
+    "plist": [
+     "Tensor<Bit> a",
+     "Tensor<Bit> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "logical_not_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLogicalNot"
+  ],
+  "base": "TensorLogicalNot",
+  "engineName": "TensorLogicalNot",
+  "overloads": [
+   {
+    "ret": "Tensor<Bit>",
+    "gen": "",
+    "params": "Tensor<Bit> a",
+    "plist": [
+     "Tensor<Bit> a"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "logical_or_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLogicalOr"
+  ],
+  "base": "TensorLogicalOr",
+  "engineName": "TensorLogicalOr",
+  "overloads": [
+   {
+    "ret": "Tensor<Bit>",
+    "gen": "",
+    "params": "Tensor<Bit> a, Tensor<Bit> b",
+    "plist": [
+     "Tensor<Bit> a",
+     "Tensor<Bit> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "logical_xor_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLogicalXor"
+  ],
+  "base": "TensorLogicalXor",
+  "engineName": "TensorLogicalXor",
+  "overloads": [
+   {
+    "ret": "Tensor<Bit>",
+    "gen": "",
+    "params": "Tensor<Bit> a, Tensor<Bit> b",
+    "plist": [
+     "Tensor<Bit> a",
+     "Tensor<Bit> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "logit_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLogit"
+  ],
+  "base": "TensorLogit",
+  "engineName": "TensorLogit",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double? eps = null",
+    "plist": [
+     "Tensor<T> tensor",
+     "double? eps = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "lt_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorLessThan"
+  ],
+  "base": "TensorLessThan",
+  "engineName": "TensorLessThan",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "T value"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "map2_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "map_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "masked_fill_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorMaskedFill"
+  ],
+  "base": "TensorMaskedFill",
+  "engineName": "TensorMaskedFill",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, Tensor<bool> mask, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "Tensor<bool> mask",
+     "T value"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, Tensor<Bit> mask, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "Tensor<Bit> mask",
+     "T value"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, bool[] mask, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "bool[] mask",
+     "T value"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "masked_scatter_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorMaskedScatter"
+  ],
+  "base": "TensorMaskedScatter",
+  "engineName": "TensorMaskedScatter",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, Tensor<Bit> mask, Tensor<T> source",
+    "plist": [
+     "Tensor<T> tensor",
+     "Tensor<Bit> mask",
+     "Tensor<T> source"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "mvlgamma_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorMvlgamma"
+  ],
+  "base": "TensorMvlgamma",
+  "engineName": "TensorMvlgamma",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int p",
+    "plist": [
+     "Tensor<T> tensor",
+     "int p"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "nan_to_num_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorNanToNum"
+  ],
+  "base": "TensorNanToNum",
+  "engineName": "TensorNanToNum",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double? nan = null, double? posinf = null, double? neginf = null",
+    "plist": [
+     "Tensor<T> tensor",
+     "double? nan = null",
+     "double? posinf = null",
+     "double? neginf = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "ne_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals"
+  ],
+  "base": "TensorNotEquals",
+  "engineName": "TensorNotEquals",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "T value"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "neg_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Negate"
+  ],
+  "base": "Negate",
+  "engineName": "TensorNegate",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "negative_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Negate"
+  ],
+  "base": "Negate",
+  "engineName": "TensorNegate",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "nextafter_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorNextAfter"
+  ],
+  "base": "TensorNextAfter",
+  "engineName": "TensorNextAfter",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "normal_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorNormal"
+  ],
+  "base": "TensorNormal",
+  "engineName": "TensorNormal",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> mean, Tensor<T> std, int? seed = null",
+    "plist": [
+     "Tensor<T> mean",
+     "Tensor<T> std",
+     "int? seed = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "not_equal_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals"
+  ],
+  "base": "TensorNotEquals",
+  "engineName": "TensorNotEquals",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "T value"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "polygamma_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorPolygamma"
+  ],
+  "base": "TensorPolygamma",
+  "engineName": "TensorPolygamma",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "int n, Tensor<T> tensor",
+    "plist": [
+     "int n",
+     "Tensor<T> tensor"
+    ],
+    "self": 1
+   }
+  ]
+ },
+ "pow_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorPow"
+  ],
+  "base": "TensorPow",
+  "engineName": "TensorPow",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T exponent",
+    "plist": [
+     "Tensor<T> tensor",
+     "T exponent"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "put_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorPut"
+  ],
+  "base": "TensorPut",
+  "engineName": "TensorPut",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, Tensor<int> indices, Tensor<T> source",
+    "plist": [
+     "Tensor<T> tensor",
+     "Tensor<int> indices",
+     "Tensor<T> source"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "rad2deg_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorRad2Deg"
+  ],
+  "base": "TensorRad2Deg",
+  "engineName": "TensorRad2Deg",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "random_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "reciprocal_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Reciprocal"
+  ],
+  "base": "Reciprocal",
+  "engineName": "TensorReciprocal",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "remainder_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorRemainder"
+  ],
+  "base": "TensorRemainder",
+  "engineName": "TensorRemainder",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> a, Tensor<T> b",
+    "plist": [
+     "Tensor<T> a",
+     "Tensor<T> b"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "rename_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "renorm_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorRenorm"
+  ],
+  "base": "TensorRenorm",
+  "engineName": "TensorRenorm",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double p, int dim, double maxNorm",
+    "plist": [
+     "Tensor<T> tensor",
+     "double p",
+     "int dim",
+     "double maxNorm"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "requires_grad_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "resize_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "resize_as_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "resize_as_sparse_": {
+  "cats": [
+   "Tensor",
+   "torch"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "round_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Round"
+  ],
+  "base": "Round",
+  "engineName": "TensorRound",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "rrelu_": {
+  "cats": [
+   "nn.functional",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorRReLU"
+  ],
+  "base": "TensorRReLU",
+  "engineName": "TensorRReLU",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double lower = 0.125, double upper = 0.333, bool training = true, int? seed = null",
+    "plist": [
+     "Tensor<T> tensor",
+     "double lower = 0.125",
+     "double upper = 0.333",
+     "bool training = true",
+     "int? seed = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "rrelu_with_noise_": {
+  "cats": [
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorRrelu"
+  ],
+  "base": "TensorRrelu",
+  "engineName": "TensorRrelu",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null",
+    "plist": [
+     "Tensor<T> tensor",
+     "double lower = 1.0 / 8",
+     "double upper = 1.0 / 3",
+     "bool training = false",
+     "int? seed = null"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "rsqrt_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::ReciprocalSqrt"
+  ],
+  "base": "ReciprocalSqrt",
+  "engineName": null,
+  "overloads": []
+ },
+ "scatter_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Scatter"
+  ],
+  "base": "Scatter",
+  "engineName": "Scatter",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<int> indices",
+     "Tensor<T> values",
+     "int axis"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "scatter_add_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::ScatterAdd"
+  ],
+  "base": "ScatterAdd",
+  "engineName": "ScatterAdd",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> source, Tensor<int> indices, int dim = 0, int? outputSize = null",
+    "plist": [
+     "Tensor<T> source",
+     "Tensor<int> indices",
+     "int dim = 0",
+     "int? outputSize = null"
+    ],
+    "self": 0
+   },
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis",
+    "plist": [
+     "Tensor<T> input",
+     "Tensor<int> indices",
+     "Tensor<T> values",
+     "int axis"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "scatter_reduce_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorScatterReduce"
+  ],
+  "base": "TensorScatterReduce",
+  "engineName": "TensorScatterReduce",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source, ScatterReduceMode mode, bool includeSelf = true",
+    "plist": [
+     "Tensor<T> tensor",
+     "int dim",
+     "Tensor<int> indices",
+     "Tensor<T> source",
+     "ScatterReduceMode mode",
+     "bool includeSelf = true"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "selu_": {
+  "cats": [
+   "aten",
+   "nn.functional",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorSELU"
+  ],
+  "base": "TensorSELU",
+  "engineName": "TensorSELU",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "set_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "sgn_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Sign"
+  ],
+  "base": "Sign",
+  "engineName": "TensorSign",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "share_memory_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "sign_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Sign"
+  ],
+  "base": "Sign",
+  "engineName": "TensorSign",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "sin_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Sin"
+  ],
+  "base": "Sin",
+  "engineName": "TensorSin",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "sinc_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorSinc"
+  ],
+  "base": "TensorSinc",
+  "engineName": "TensorSinc",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "sinh_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Sinh"
+  ],
+  "base": "Sinh",
+  "engineName": "TensorSinh",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "sparse_resize_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "sparse_resize_and_clear_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "sqrt_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Sqrt"
+  ],
+  "base": "Sqrt",
+  "engineName": "TensorSqrt",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "square_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorSquare"
+  ],
+  "base": "TensorSquare",
+  "engineName": "TensorSquare",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "squeeze_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorSqueeze",
+   "AiDotNet.Tensors.LinearAlgebra.Tensor`1::Squeeze"
+  ],
+  "base": "TensorSqueeze",
+  "engineName": "TensorSqueeze",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis = -1",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis = -1"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "swapaxes_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorSwapAxes"
+  ],
+  "base": "TensorSwapAxes",
+  "engineName": "TensorSwapAxes",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis1, int axis2",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis1",
+     "int axis2"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "swapdims_": {
+  "cats": [
+   "Tensor"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorSwapAxes"
+  ],
+  "base": "TensorSwapAxes",
+  "engineName": "TensorSwapAxes",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int axis1, int axis2",
+    "plist": [
+     "Tensor<T> tensor",
+     "int axis1",
+     "int axis2"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "t_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.LinearAlgebra.Tensor`1::TransposeLast2D"
+  ],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "tan_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Tan"
+  ],
+  "base": "Tan",
+  "engineName": null,
+  "overloads": []
+ },
+ "threshold_": {
+  "cats": [
+   "aten",
+   "nn.functional",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorThreshold",
+   "AiDotNet.Tensors.NN.Activations.Activations::Threshold"
+  ],
+  "base": "TensorThreshold",
+  "engineName": "TensorThreshold",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, T threshold, T value",
+    "plist": [
+     "Tensor<T> tensor",
+     "T threshold",
+     "T value"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "transpose_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorTranspose",
+   "AiDotNet.Tensors.LinearAlgebra.Tensor`1::Transpose"
+  ],
+  "base": "TensorTranspose",
+  "engineName": "TensorTranspose",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "tril_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorTril"
+  ],
+  "base": "TensorTril",
+  "engineName": "TensorTril",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int diagonal = 0",
+    "plist": [
+     "Tensor<T> tensor",
+     "int diagonal = 0"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "triu_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorTriu"
+  ],
+  "base": "TensorTriu",
+  "engineName": "TensorTriu",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor, int diagonal = 0",
+    "plist": [
+     "Tensor<T> tensor",
+     "int diagonal = 0"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "trunc_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::Truncate"
+  ],
+  "base": "Truncate",
+  "engineName": null,
+  "overloads": []
+ },
+ "uniform_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorUniform"
+  ],
+  "base": "TensorUniform",
+  "engineName": null,
+  "overloads": []
+ },
+ "unsqueeze_": {
+  "cats": [
+   "Tensor",
+   "aten"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.LinearAlgebra.Tensor`1::Unsqueeze"
+  ],
+  "base": null,
+  "engineName": null,
+  "overloads": []
+ },
+ "xlogy_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorXlogy"
+  ],
+  "base": "TensorXlogy",
+  "engineName": "TensorXlogy",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> x, Tensor<T> y",
+    "plist": [
+     "Tensor<T> x",
+     "Tensor<T> y"
+    ],
+    "self": 0
+   }
+  ]
+ },
+ "zero_": {
+  "cats": [
+   "Tensor",
+   "aten",
+   "torch"
+  ],
+  "syms": [
+   "AiDotNet.Tensors.Engines.IEngine::TensorZerosLike"
+  ],
+  "base": "TensorZerosLike",
+  "engineName": "TensorZerosLike",
+  "overloads": [
+   {
+    "ret": "Tensor<T>",
+    "gen": "<T>",
+    "params": "Tensor<T> tensor",
+    "plist": [
+     "Tensor<T> tensor"
+    ],
+    "self": 0
+   }
+  ]
+ }
+}

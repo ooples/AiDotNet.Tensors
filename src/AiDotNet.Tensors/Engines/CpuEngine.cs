@@ -3228,18 +3228,17 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorAddInPlace", (e, x) => e.TensorAdd(x, ReferenceEquals(b, a) ? x : b)); return; }
+
         // Save input before mutation when tape is active (for backward pass)
-        Tensor<T>? savedA = null;
-        var tape = GradientTape<T>.Current;
-        if (tape is not null && tape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedA = a.Clone();
 
         // Increment version BEFORE mutation so prior tape entries detect the change
         a.IncrementVersion();
 
         // Stride-aware: in-place requires contiguous target; materialize source if needed
         if (!a.IsContiguous) throw new InvalidOperationException("In-place add requires contiguous target tensor.");
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -3261,7 +3260,6 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (OneDnnProvider.TryAdd(pB, pA, pA, length))
                 {
-                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
                     return;
                 }
             }
@@ -3269,7 +3267,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Strategy 2: SimdKernels, split across threads above the elementwise grain
             JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
             return;
         }
 
@@ -3301,14 +3298,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
             }
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
-        if (savedA is not null)
-            DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
     }
 
     /// <summary>
@@ -4217,6 +4211,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorBroadcastAddInPlace", (e, x) => ((CpuEngine)e).TensorBroadcastAdd(x, ReferenceEquals(b, a) ? x : b)); return; }
+
         // A non-contiguous target (a transpose, a strided slice) used to be swapped for a contiguous
         // COPY here, so every kernel below added into the copy and the caller's tensor came back
         // unchanged — an in-place op that silently did nothing. Compute into a contiguous working
@@ -4553,6 +4551,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "SwishInPlace", static (e, x) => e.Swish(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4615,6 +4617,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
         }
+
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "GELUInPlace", static (e, x) => e.GELU(x)); return; }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -4681,6 +4687,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "TanhInPlace", static (e, x) => e.Tanh(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4738,6 +4748,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "MishInPlace", static (e, x) => e.Mish(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4790,6 +4804,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
         }
+
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "LeakyReLUInPlace", (e, x) => e.LeakyReLU(x, alpha)); return; }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -5998,15 +6016,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        Tensor<T>? savedA = null;
-        var mulTape = GradientTape<T>.Current;
-        if (mulTape is not null && mulTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedA = a.Clone();
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorMultiplyInPlace", (e, x) => e.TensorMultiply(x, ReferenceEquals(b, a) ? x : b)); return; }
+
 
         a.IncrementVersion();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place multiply requires contiguous target tensor.");
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -6029,14 +6046,12 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (OneDnnProvider.TryMultiply(pB, pA, pA, length))
                 {
-                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
                     return;
                 }
             }
 #endif
 
             JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
             return;
         }
 
@@ -6066,14 +6081,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
             }
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
-        if (savedA is not null)
-            DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
     }
 
     /// <summary>
@@ -6155,15 +6167,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        Tensor<T>? savedASub = null;
-        var subTape = GradientTape<T>.Current;
-        if (subTape is not null && subTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedASub = a.Clone();
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorSubtractInPlace", (e, x) => e.TensorSubtract(x, ReferenceEquals(b, a) ? x : b)); return; }
+
 
         a.IncrementVersion();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place subtract requires contiguous target tensor.");
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -6179,7 +6190,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // No oneDNN subtract primitive — go straight to SIMD
             JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
-            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
             return;
         }
 
@@ -6209,14 +6219,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
             }
-            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
-        if (savedASub is not null)
-            DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
     }
 
     /// <summary>
@@ -6245,6 +6252,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
         }
+
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorMultiplyScalarInPlace", (e, x) => e.TensorMultiplyScalar(x, scalar)); return; }
 
         int length = a.Length;
 
@@ -8325,8 +8336,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int[] outShape;
                 if (axes == null || axes.Length == 0)
                 {
-                    outShape = keepDims ? new int[tensor.Rank] : new[] { 1 };
-                    if (keepDims) for (int i = 0; i < tensor.Rank; i++) outShape[i] = 1;
+                    outShape = FullReductionShape(tensor.Rank, keepDims);
                 }
                 else
                 {
@@ -8341,7 +8351,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                         else shapeList.Add(tensor._shape[i]);
                     }
-                    outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                    outShape = shapeList.ToArray();
                 }
 
                 var captured = tensor;
@@ -8414,7 +8424,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                fullResult = TensorAllocator.Rent<T>([1], new Vector<T>([sum]));
+                fullResult = TensorAllocator.Rent<T>(Array.Empty<int>(), new Vector<T>([sum]));
             }
             DifferentiableOps.RecordUnary("ReduceSum", fullResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                 new object[] { allAxes, keepDims });
@@ -11472,13 +11482,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "SigmoidInPlace", static (e, x) => e.Sigmoid(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
@@ -11494,7 +11504,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (OneDnnProvider.TrySigmoid(ptr, tensor.Length))
                     {
                         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-                        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
                         return;
                     }
                 }
@@ -11503,7 +11512,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
         SigmoidParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #else
     public virtual void SigmoidInPlace<T>(Tensor<T> tensor)
@@ -11525,19 +11533,18 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "SigmoidInPlace", static (e, x) => e.Sigmoid(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
         SigmoidParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #endif
 
@@ -11779,13 +11786,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "ReLUInPlace", static (e, x) => e.ReLU(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
@@ -11801,7 +11808,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (OneDnnProvider.TryReLU(ptr, tensor.Length))
                     {
                         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-                        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
                         return;
                     }
                 }
@@ -11810,7 +11816,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
         ReLUParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #else
     public virtual void ReLUInPlace<T>(Tensor<T> tensor)
@@ -11832,19 +11837,18 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "ReLUInPlace", static (e, x) => e.ReLU(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
         ReLUParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #endif
 
@@ -27451,39 +27455,10 @@ public partial class CpuEngine : ITensorLevelEngine
             float featureSizeF = fs;
             float invFeatureSizeF = 1f / featureSizeF;
 
-            // gradGamma / gradBeta: sum across batches. Left sequential to avoid
-            // cross-thread contention on the [featureSize] accumulators. For
-            // typical transformer LN (featureSize ≈ hidden dim ≈ 768–4096 and
-            // batchSize × seq ≈ 1k–4k), the sequential pass is memory-bound, not
-            // compute-bound, so threading doesn't help.
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
-                float m = fMean[b];
-                int f = 0;
-#if NET5_0_OR_GREATER
-                if (Vector256.IsHardwareAccelerated && fs >= 8)
-                {
-                    var vM = Vector256.Create(m);
-                    var vInvStd = Vector256.Create(invStd);
-                    for (; f + 8 <= fs; f += 8)
-                    {
-                        var go = Vector256.LoadUnsafe(ref fGradOut[off + f]);
-                        var norm = (Vector256.LoadUnsafe(ref fInput[off + f]) - vM) * vInvStd;
-                        (Vector256.LoadUnsafe(ref fGradGamma[f]) + go * norm).StoreUnsafe(ref fGradGamma[f]);
-                        (Vector256.LoadUnsafe(ref fGradBeta[f]) + go).StoreUnsafe(ref fGradBeta[f]);
-                    }
-                }
-#endif
-                for (; f < fs; f++)
-                {
-                    float go = fGradOut[off + f];
-                    float normalized = (fInput[off + f] - m) * invStd;
-                    fGradGamma[f] += go * normalized;
-                    fGradBeta[f] += go;
-                }
-            }
+            // gradGamma / gradBeta: sum across batches, split into feature-column ranges (each accumulated over the
+            // rows in order, so bit-identical to the whole-width loop at any thread count). One core cannot pull the
+            // memory bandwidth this pass needs; the serial loop left the rest of the machine idle.
+            LayerNormBackwardFloatAccumGammaBeta(fGradOut, fInput, fMean, fVar, fGradGamma, fGradBeta, batchSize, fs, fEps);
 
             // gradInput: per-batch two-pass (sum reductions, then per-element).
             // Safe to parallelize over batches since each batch writes to a
@@ -27794,6 +27769,213 @@ public partial class CpuEngine : ITensorLevelEngine
             output[off + f] = gamma[f] * ((input[off + f] - mS) * invStdS) + beta[f];
     }
 
+    // Rows per partial in the norm-backward gamma/beta accumulations. Each work item accumulates a fixed block of whole
+    // rows (contiguous reads across every column -- column strips read a sliver of each page and starved the
+    // prefetcher) into its own partial, and the partials are then summed per column in block order. The blocking does
+    // not depend on the thread count, so the result is bit-identical at any degree of parallelism; at or below one
+    // block it is the plain serial loop.
+    private const int NormRowBlock = 128;
+
+    private static void LayerNormBackwardFloatAccumGammaBeta(
+        float[] gradOut, float[] input, float[] mean, float[] variance,
+        float[] gradGamma, float[] gradBeta,
+        int rows, int fs, float eps)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1)
+        {
+            LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, gradGamma, 0, gradBeta, 0, 0, rows, fs, eps);
+            return;
+        }
+        var partial = System.Buffers.ArrayPool<float>.Shared.Rent(2 * blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                int gOff = blk * fs, bOff = (blocks + blk) * fs;
+                Array.Clear(partial, gOff, fs);
+                Array.Clear(partial, bOff, fs);
+                LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, partial, gOff, partial, bOff,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs, eps);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+            AccumulateAxisRows(partial, blocks * fs, fs, blocks, gradBeta, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(partial);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void LayerNormBackwardFloatAccumGammaBetaRows(
+        float[] gradOut, float[] input, float[] mean, float[] variance,
+        float[] gAcc, int gOff, float[] bAcc, int bOff,
+        int r0, int r1, int fs, float eps)
+    {
+        for (int b = r0; b < r1; b++)
+        {
+            int off = b * fs;
+            float invStd = 1f / MathF.Sqrt(variance[b] + eps);
+            float m = mean[b];
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= 8)
+            {
+                var vM = Vector256.Create(m);
+                var vInvStd = Vector256.Create(invStd);
+                for (; f + 8 <= fs; f += 8)
+                {
+                    var go = Vector256.LoadUnsafe(ref gradOut[off + f]);
+                    var norm = (Vector256.LoadUnsafe(ref input[off + f]) - vM) * vInvStd;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + go * norm).StoreUnsafe(ref gAcc[gOff + f]);
+                    (Vector256.LoadUnsafe(ref bAcc[bOff + f]) + go).StoreUnsafe(ref bAcc[bOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
+            {
+                float go = gradOut[off + f];
+                float normalized = (input[off + f] - m) * invStd;
+                gAcc[gOff + f] += go * normalized;
+                bAcc[bOff + f] += go;
+            }
+        }
+    }
+
+    private static void RmsNormBackwardAccumGamma(float[] gradOut, float[] input, float[] rms, float[] gradGamma, int rows, int fs)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1) { RmsNormBackwardAccumGammaRows(gradOut, input, rms, gradGamma, 0, 0, rows, fs); return; }
+        var partial = System.Buffers.ArrayPool<float>.Shared.Rent(blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                Array.Clear(partial, blk * fs, fs);
+                RmsNormBackwardAccumGammaRows(gradOut, input, rms, partial, blk * fs,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(partial);
+        }
+    }
+
+    // Vector multiply and add round exactly as the scalar tail (no fused multiply-add), so every column's bits are
+    // the same whether it falls in the SIMD body or the tail.
+    [MethodImpl(Hot)]
+    private static void RmsNormBackwardAccumGammaRows(float[] gradOut, float[] input, float[] rms, float[] gAcc, int gOff, int r0, int r1, int fs)
+    {
+        for (int b = r0; b < r1; b++)
+        {
+            int off = b * fs;
+            float invRms = 1f / rms[b];
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= Vector256<float>.Count)
+            {
+                var vInv = Vector256.Create(invRms);
+                for (; f + Vector256<float>.Count <= fs; f += Vector256<float>.Count)
+                {
+                    var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + Vector256.LoadUnsafe(ref gradOut[off + f]) * normalized)
+                        .StoreUnsafe(ref gAcc[gOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
+            {
+                float normalized = input[off + f] * invRms;
+                gAcc[gOff + f] += gradOut[off + f] * normalized;
+            }
+        }
+    }
+
+    private static void RmsNormBackwardAccumGamma(double[] gradOut, double[] input, double[] rms, double[] gradGamma, int rows, int fs)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1) { RmsNormBackwardAccumGammaRows(gradOut, input, rms, gradGamma, 0, 0, rows, fs); return; }
+        var partial = System.Buffers.ArrayPool<double>.Shared.Rent(blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                Array.Clear(partial, blk * fs, fs);
+                RmsNormBackwardAccumGammaRows(gradOut, input, rms, partial, blk * fs,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(partial);
+        }
+    }
+
+    // Vector multiply and add round exactly as the scalar tail (no fused multiply-add), so every column's bits are
+    // the same whether it falls in the SIMD body or the tail.
+    [MethodImpl(Hot)]
+    private static void RmsNormBackwardAccumGammaRows(double[] gradOut, double[] input, double[] rms, double[] gAcc, int gOff, int r0, int r1, int fs)
+    {
+        for (int b = r0; b < r1; b++)
+        {
+            int off = b * fs;
+            double invRms = 1.0 / rms[b];
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= Vector256<double>.Count)
+            {
+                var vInv = Vector256.Create(invRms);
+                for (; f + Vector256<double>.Count <= fs; f += Vector256<double>.Count)
+                {
+                    var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + Vector256.LoadUnsafe(ref gradOut[off + f]) * normalized)
+                        .StoreUnsafe(ref gAcc[gOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
+            {
+                double normalized = input[off + f] * invRms;
+                gAcc[gOff + f] += gradOut[off + f] * normalized;
+            }
+        }
+    }
+
+    private static void LayerNormBackwardDoubleAccumGammaBeta(
+        double[] gradOut, double[] input, double[] mean, double[] variance,
+        double[] gradGamma, double[] gradBeta,
+        int rows, int fs, double epsilon)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1)
+        {
+            LayerNormBackwardDoubleAccumGammaBetaRows(gradOut, input, mean, variance, gradGamma, 0, gradBeta, 0, 0, rows, fs, epsilon);
+            return;
+        }
+        var partial = System.Buffers.ArrayPool<double>.Shared.Rent(2 * blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                int gOff = blk * fs, bOff = (blocks + blk) * fs;
+                Array.Clear(partial, gOff, fs);
+                Array.Clear(partial, bOff, fs);
+                LayerNormBackwardDoubleAccumGammaBetaRows(gradOut, input, mean, variance, partial, gOff, partial, bOff,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs, epsilon);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+            AccumulateAxisRows(partial, blocks * fs, fs, blocks, gradBeta, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(partial);
+        }
+    }
+
     /// <summary>
     /// Stage 4 (#415): SIMD FP64 LayerNorm-backward gradGamma/gradBeta
     /// accumulation. Pass 1 of 2 — sequential over batches (gradGamma/Beta
@@ -27802,17 +27984,18 @@ public partial class CpuEngine : ITensorLevelEngine
     /// structure at CpuEngine.cs:19580.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void LayerNormBackwardDoubleAccumGammaBeta(
+    private static unsafe void LayerNormBackwardDoubleAccumGammaBetaRows(
         double[] gradOut, double[] input, double[] mean, double[] variance,
-        double[] gradGamma, double[] gradBeta,
-        int batchSize, int fs, double epsilon)
+        double[] gAcc, int gOff, double[] bAcc, int bOff,
+        int r0, int r1, int fs, double epsilon)
     {
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
         {
-            fixed (double* pGO = gradOut, pI = input, pGG = gradGamma, pGB = gradBeta)
+            fixed (double* pGO = gradOut, pI = input, pGG0 = gAcc, pGB0 = bAcc)
             {
-                for (int b = 0; b < batchSize; b++)
+                double* pGG = pGG0 + gOff, pGB = pGB0 + bOff;
+                for (int b = r0; b < r1; b++)
                 {
                     int off = b * fs;
                     double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
@@ -27872,15 +28055,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         double goS = go[f];
                         double normalized = (ip[f] - m) * invStd;
-                        gradGamma[f] += goS * normalized;
-                        gradBeta[f] += goS;
+                        gAcc[gOff + f] += goS * normalized;
+                        bAcc[bOff + f] += goS;
                     }
                 }
             }
             return;
         }
 #endif
-        for (int b = 0; b < batchSize; b++)
+        for (int b = r0; b < r1; b++)
         {
             int off = b * fs;
             double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
@@ -27889,8 +28072,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 double go = gradOut[off + f];
                 double normalized = (input[off + f] - m) * invStd;
-                gradGamma[f] += go * normalized;
-                gradBeta[f] += go;
+                gAcc[gOff + f] += go * normalized;
+                bAcc[bOff + f] += go;
             }
         }
     }
@@ -28228,6 +28411,233 @@ public partial class CpuEngine : ITensorLevelEngine
         return output;
     }
 
+    // GroupNorm backward, float. Work items are (batch, channel) -- a batch-1 diffusion feature map has tens to
+    // thousands of channels but only a handful of groups -- in two passes over the data, as before:
+    //  1. per (b, c), one read of the channel: its gamma/beta contributions and its share of the group's two
+    //     gradient sums;
+    //  2. per (b, c), the group's sums (its channels' shares added in channel order) and the channel's gradInput.
+    // gradGamma/gradBeta add each channel's per-batch contributions in batch order, the serial order. Every sum has a
+    // fixed order independent of the thread count, so the result is bit-identical at any degree of parallelism.
+    private static void GroupNormBackwardFloat(float[] gradOut, float[] input, float[] gamma, float[] mean, float[] variance,
+        float[] gradGamma, float[] gradBeta, float[] gradInput, int batch, int channels, int spatial, int numGroups, float eps)
+    {
+        int cpg = channels / numGroups;
+        int items = batch * channels;
+        // Per (b, c): [gamma contribution | beta contribution | sum(gamma*go) | sum(gamma*go*xhat)].
+        var stats = System.Buffers.ArrayPool<float>.Shared.Rent(4 * items);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardFloatChannelStats(gradOut, input, gamma, mean, variance, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+            for (int c = 0; c < channels; c++)
+            {
+                float gAcc = 0f, bAcc = 0f;
+                for (int bi = 0; bi < batch; bi++)
+                {
+                    gAcc += stats[bi * channels + c];
+                    bAcc += stats[items + bi * channels + c];
+                }
+                gradGamma[c] = gAcc;
+                gradBeta[c] = bAcc;
+            }
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardFloatChannelInput(gradOut, input, gamma, mean, variance, gradInput, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(stats);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardFloatChannelStats(float[] gradOut, float[] input, float[] gamma, float[] mean,
+        float[] variance, float[] stats, int items, int bc, int channels, int spatial, int numGroups, int cpg, float eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        float groupMean = mean[b * numGroups + g];
+        float invStd = 1f / MathF.Sqrt(variance[b * numGroups + g] + eps);
+        float gammaC = gamma[c];
+        int off = bc * spatial;
+        float gammaAcc = 0f, betaAcc = 0f, sumGrad = 0f, sumGradNorm = 0f;
+        int s = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && spatial >= 8)
+        {
+            var vMean = Vector256.Create(groupMean);
+            var vInvStd = Vector256.Create(invStd);
+            var vGamma = Vector256.Create(gammaC);
+            var accG = Vector256<float>.Zero;
+            var accB = Vector256<float>.Zero;
+            var accGrad = Vector256<float>.Zero;
+            var accGradNorm = Vector256<float>.Zero;
+            for (; s + 8 <= spatial; s += 8)
+            {
+                var go = Vector256.LoadUnsafe(ref gradOut[off + s]);
+                var norm = (Vector256.LoadUnsafe(ref input[off + s]) - vMean) * vInvStd;
+                var scaledGrad = vGamma * go;
+                accG += go * norm;
+                accB += go;
+                accGrad += scaledGrad;
+                accGradNorm += scaledGrad * norm;
+            }
+            gammaAcc = Vector256.Sum(accG);
+            betaAcc = Vector256.Sum(accB);
+            sumGrad = Vector256.Sum(accGrad);
+            sumGradNorm = Vector256.Sum(accGradNorm);
+        }
+#endif
+        for (; s < spatial; s++)
+        {
+            float go = gradOut[off + s];
+            float normalized = (input[off + s] - groupMean) * invStd;
+            float scaledGrad = gammaC * go;
+            gammaAcc += go * normalized;
+            betaAcc += go;
+            sumGrad += scaledGrad;
+            sumGradNorm += scaledGrad * normalized;
+        }
+        stats[bc] = gammaAcc;
+        stats[items + bc] = betaAcc;
+        stats[2 * items + bc] = sumGrad;
+        stats[3 * items + bc] = sumGradNorm;
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardFloatChannelInput(float[] gradOut, float[] input, float[] gamma, float[] mean,
+        float[] variance, float[] gradInput, float[] stats, int items, int bc, int channels, int spatial, int numGroups,
+        int cpg, float eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        float groupMean = mean[b * numGroups + g];
+        float invStd = 1f / MathF.Sqrt(variance[b * numGroups + g] + eps);
+        float sumGrad = 0f, sumGradNorm = 0f;
+        int first = b * channels + g * cpg;
+        for (int k = 0; k < cpg; k++)
+        {
+            sumGrad += stats[2 * items + first + k];
+            sumGradNorm += stats[3 * items + first + k];
+        }
+        float groupSizeF = (float)cpg * spatial;
+        float scale = invStd * (1f / groupSizeF);
+        float gammaC = gamma[c];
+        int off = bc * spatial;
+        int s = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && spatial >= 8)
+        {
+            var vMean = Vector256.Create(groupMean);
+            var vInvStd = Vector256.Create(invStd);
+            var vGamma = Vector256.Create(gammaC);
+            var vGroupSize = Vector256.Create(groupSizeF);
+            var vSumGrad = Vector256.Create(sumGrad);
+            var vSumGradNorm = Vector256.Create(sumGradNorm);
+            var vScale = Vector256.Create(scale);
+            for (; s + 8 <= spatial; s += 8)
+            {
+                var norm = (Vector256.LoadUnsafe(ref input[off + s]) - vMean) * vInvStd;
+                var gradNorm = vGamma * Vector256.LoadUnsafe(ref gradOut[off + s]);
+                var res = vScale * (vGroupSize * gradNorm - vSumGrad - norm * vSumGradNorm);
+                res.StoreUnsafe(ref gradInput[off + s]);
+            }
+        }
+#endif
+        for (; s < spatial; s++)
+        {
+            float normalized = (input[off + s] - groupMean) * invStd;
+            float gradNorm = gammaC * gradOut[off + s];
+            gradInput[off + s] = scale * (groupSizeF * gradNorm - sumGrad - normalized * sumGradNorm);
+        }
+    }
+
+    // GroupNorm backward, double: the same (batch, channel) passes as the float kernel, scalar arithmetic. The per-item
+    // bodies are static methods so their arrays are locals (a closure's captured fields kept the JIT from hoisting).
+    private static void GroupNormBackwardDouble(double[] gradOut, double[] input, double[] gamma, double[] mean, double[] variance,
+        double[] gradGamma, double[] gradBeta, double[] gradInput, int batch, int channels, int spatial, int numGroups, double eps)
+    {
+        int cpg = channels / numGroups;
+        int items = batch * channels;
+        var stats = System.Buffers.ArrayPool<double>.Shared.Rent(4 * items);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardDoubleChannelStats(gradOut, input, gamma, mean, variance, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+            for (int c = 0; c < channels; c++)
+            {
+                double gAcc = 0, bAcc = 0;
+                for (int bi = 0; bi < batch; bi++)
+                {
+                    gAcc += stats[bi * channels + c];
+                    bAcc += stats[items + bi * channels + c];
+                }
+                gradGamma[c] = gAcc;
+                gradBeta[c] = bAcc;
+            }
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardDoubleChannelInput(gradOut, input, gamma, mean, variance, gradInput, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(stats);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardDoubleChannelStats(double[] gradOut, double[] input, double[] gamma, double[] mean,
+        double[] variance, double[] stats, int items, int bc, int channels, int spatial, int numGroups, int cpg, double eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        double groupMean = mean[b * numGroups + g];
+        double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
+        double gammaC = gamma[c];
+        int off = bc * spatial;
+        double gammaAcc = 0, betaAcc = 0, sumGrad = 0, sumGradNorm = 0;
+        for (int s = 0; s < spatial; s++)
+        {
+            double go = gradOut[off + s];
+            double normalized = (input[off + s] - groupMean) * invStd;
+            double scaledGrad = gammaC * go;
+            gammaAcc += go * normalized;
+            betaAcc += go;
+            sumGrad += scaledGrad;
+            sumGradNorm += scaledGrad * normalized;
+        }
+        stats[bc] = gammaAcc;
+        stats[items + bc] = betaAcc;
+        stats[2 * items + bc] = sumGrad;
+        stats[3 * items + bc] = sumGradNorm;
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardDoubleChannelInput(double[] gradOut, double[] input, double[] gamma, double[] mean,
+        double[] variance, double[] gradInput, double[] stats, int items, int bc, int channels, int spatial, int numGroups,
+        int cpg, double eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        double groupMean = mean[b * numGroups + g];
+        double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
+        double sumGrad = 0, sumGradNorm = 0;
+        int first = b * channels + g * cpg;
+        for (int k = 0; k < cpg; k++)
+        {
+            sumGrad += stats[2 * items + first + k];
+            sumGradNorm += stats[3 * items + first + k];
+        }
+        double groupSizeD = (double)cpg * spatial;
+        double scale = invStd / groupSizeD;
+        double gammaC = gamma[c];
+        int off = bc * spatial;
+        for (int s = 0; s < spatial; s++)
+        {
+            double normalized = (input[off + s] - groupMean) * invStd;
+            double gradNorm = gammaC * gradOut[off + s];
+            gradInput[off + s] = scale * (groupSizeD * gradNorm - sumGrad - normalized * sumGradNorm);
+        }
+    }
+
     /// <inheritdoc/>
     public Tensor<T> GroupNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
@@ -28283,148 +28693,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradBeta = (float[])(object)gradBetaData;
             var fGradInput = (float[])(object)gradInputData;
             float fEps = (float)epsilon;
-            float groupSizeF = groupSize;
-            float invGroupSizeF = 1f / groupSizeF;
 
-            // gradGamma / gradBeta: sum across (batch, spatial). Sequential
-            // across batches to avoid per-channel accumulator contention, but
-            // spatial inner loop runs on direct floats. We pre-compute invStd
-            // once per (b, g) to avoid recomputing inside the spatial loop.
-            for (int b = 0; b < batch; b++)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    float groupMean = fMean[b * numGroups + g];
-                    float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
-                    int startChannel = g * channelsPerGroup;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        float gammaAcc = 0f;
-                        float betaAcc = 0f;
-                        int s = 0;
-#if NET5_0_OR_GREATER
-                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
-                        {
-                            var vMean = Vector256.Create(groupMean);
-                            var vInvStd = Vector256.Create(invStd);
-                            var accG = Vector256<float>.Zero;
-                            var accB = Vector256<float>.Zero;
-                            for (; s + 8 <= spatialSize; s += 8)
-                            {
-                                var go = Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
-                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
-                                accG += go * norm;
-                                accB += go;
-                            }
-                            gammaAcc = Vector256.Sum(accG);
-                            betaAcc = Vector256.Sum(accB);
-                        }
-#endif
-                        for (; s < spatialSize; s++)
-                        {
-                            float go = fGradOut[chanOffset + s];
-                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
-                            gammaAcc += go * normalized;
-                            betaAcc += go;
-                        }
-                        fGradGamma[channel] += gammaAcc;
-                        fGradBeta[channel] += betaAcc;
-                    }
-                }
-            }
-
-            // gradInput: parallel over batch. Each batch writes a disjoint
-            // [b*channels*spatialSize, (b+1)*channels*spatialSize) slice.
-            [MethodImpl(Hot)]
-            void ProcessBatch(int b)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    float groupMean = fMean[b * numGroups + g];
-                    float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
-                    int startChannel = g * channelsPerGroup;
-
-                    // Pass 1: sumGrad and sumGradNorm over the group.
-                    float sumGrad = 0f;
-                    float sumGradNorm = 0f;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        float gammaC = fGamma[channel];
-                        int s = 0;
-#if NET5_0_OR_GREATER
-                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
-                        {
-                            var vMean = Vector256.Create(groupMean);
-                            var vInvStd = Vector256.Create(invStd);
-                            var vGamma = Vector256.Create(gammaC);
-                            var accGrad = Vector256<float>.Zero;
-                            var accGradNorm = Vector256<float>.Zero;
-                            for (; s + 8 <= spatialSize; s += 8)
-                            {
-                                var scaledGrad = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
-                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
-                                accGrad += scaledGrad;
-                                accGradNorm += scaledGrad * norm;
-                            }
-                            sumGrad += Vector256.Sum(accGrad);
-                            sumGradNorm += Vector256.Sum(accGradNorm);
-                        }
-#endif
-                        for (; s < spatialSize; s++)
-                        {
-                            float scaledGrad = gammaC * fGradOut[chanOffset + s];
-                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
-                            sumGrad += scaledGrad;
-                            sumGradNorm += scaledGrad * normalized;
-                        }
-                    }
-
-                    // Pass 2: write gradInput.
-                    float scale = invStd * invGroupSizeF;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        float gammaC = fGamma[channel];
-                        int s = 0;
-#if NET5_0_OR_GREATER
-                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
-                        {
-                            var vMean = Vector256.Create(groupMean);
-                            var vInvStd = Vector256.Create(invStd);
-                            var vGamma = Vector256.Create(gammaC);
-                            var vGroupSize = Vector256.Create(groupSizeF);
-                            var vSumGrad = Vector256.Create(sumGrad);
-                            var vSumGradNorm = Vector256.Create(sumGradNorm);
-                            var vScale = Vector256.Create(scale);
-                            for (; s + 8 <= spatialSize; s += 8)
-                            {
-                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
-                                var gradNorm = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
-                                var res = vScale * (vGroupSize * gradNorm - vSumGrad - norm * vSumGradNorm);
-                                res.StoreUnsafe(ref fGradInput[chanOffset + s]);
-                            }
-                        }
-#endif
-                        for (; s < spatialSize; s++)
-                        {
-                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
-                            float gradNorm = gammaC * fGradOut[chanOffset + s];
-                            float term1 = groupSizeF * gradNorm;
-                            float term3 = normalized * sumGradNorm;
-                            fGradInput[chanOffset + s] = scale * (term1 - sumGrad - term3);
-                        }
-                    }
-                }
-            }
-
-            // Batch typically small (1–16) for diffusion training, but each
-            // batch's work is large (channels × spatialSize). Always parallel.
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatch);
+            GroupNormBackwardFloat(fGradOut, fInput, fGamma, fMean, fVar, fGradGamma, fGradBeta, fGradInput,
+                batch, channels, spatialSize, numGroups, fEps);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -28436,79 +28707,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradGamma = (double[])(object)gradGammaData;
             var dGradBeta = (double[])(object)gradBetaData;
             var dGradInput = (double[])(object)gradInputData;
-            double groupSizeD = groupSize;
-            double invGroupSizeD = 1.0 / groupSizeD;
 
-            for (int b = 0; b < batch; b++)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    double groupMean = dMean[b * numGroups + g];
-                    double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
-                    int startChannel = g * channelsPerGroup;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        double gammaAcc = 0.0;
-                        double betaAcc = 0.0;
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            double go = dGradOut[chanOffset + s];
-                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
-                            gammaAcc += go * normalized;
-                            betaAcc += go;
-                        }
-                        dGradGamma[channel] += gammaAcc;
-                        dGradBeta[channel] += betaAcc;
-                    }
-                }
-            }
-
-            [MethodImpl(Hot)]
-            void ProcessBatchD(int b)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    double groupMean = dMean[b * numGroups + g];
-                    double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
-                    int startChannel = g * channelsPerGroup;
-
-                    double sumGrad = 0.0;
-                    double sumGradNorm = 0.0;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        double gammaC = dGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            double scaledGrad = gammaC * dGradOut[chanOffset + s];
-                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
-                            sumGrad += scaledGrad;
-                            sumGradNorm += scaledGrad * normalized;
-                        }
-                    }
-
-                    double scale = invStd * invGroupSizeD;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        double gammaC = dGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
-                            double gradNorm = gammaC * dGradOut[chanOffset + s];
-                            double term1 = groupSizeD * gradNorm;
-                            double term3 = normalized * sumGradNorm;
-                            dGradInput[chanOffset + s] = scale * (term1 - sumGrad - term3);
-                        }
-                    }
-                }
-            }
-
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatchD);
+            GroupNormBackwardDouble(dGradOut, dInput, dGamma, dMean, dVar, dGradGamma, dGradBeta, dGradInput,
+                batch, channels, spatialSize, numGroups, epsilon);
         }
         else
         {
@@ -28933,16 +29134,8 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             float invFeatureSizeF = 1f / fs;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                float invRms = 1f / fRms[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    float normalized = fInput[off + f] * invRms;
-                    fGradGamma[f] += fGradOut[off + f] * normalized;
-                }
-            }
+            // gradGamma over feature-column ranges, each accumulated over the rows in order (bit-identical).
+            RmsNormBackwardAccumGamma(fGradOut, fInput, fRms, fGradGamma, batchSize, fs);
 
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {
@@ -28975,16 +29168,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             double invFeatureSizeD = 1.0 / fs;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                double invRms = 1.0 / dRms[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    double normalized = dInput[off + f] * invRms;
-                    dGradGamma[f] += dGradOut[off + f] * normalized;
-                }
-            }
+            RmsNormBackwardAccumGamma(dGradOut, dInput, dRms, dGradGamma, batchSize, fs);
 
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {
@@ -29498,10 +29682,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return resultGen;
     }
 
+    // Query rows per SDPA work item: the unit of the CPU attention fan-out. Fixed (not derived from the thread count),
+    // so the GEMM blocking -- and therefore every output bit -- is the same at any degree of parallelism.
+    private const int SdpaRowBlock = 64;
+
     /// <summary>
     /// BLAS-backed float-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
     /// Replaces the scalar virtual-dispatch triple-loop with two batched SGEMMs per head
-    /// (Q·K^T then P·V), parallelized across batch*heads. Expected to collapse the
+    /// (Q·K^T then P·V), parallelized across (head, query-row block). Expected to collapse the
     /// DiT-XL SDPA wall clock from tens of seconds to tens of milliseconds per forward
     /// pass (Issue #162).
     /// </summary>
@@ -29543,22 +29731,38 @@ public partial class CpuEngine : ITensorLevelEngine
         float capF = (float)softcap;
         float invCapF = useSoftcap ? 1f / capF : 0f;
 
-        // Process each batch-head slice in parallel. Each slice is two independent
-        // SGEMMs separated by a softmax pass. The individual SGEMMs are sized well
-        // above BLAS's 4096-FMA threshold for typical MHA (seqQ*seqK*d_k = 4.7M for
-        // DiT-XL per-head), so each head's GEMM hits either MKL or our blocked AVX2
-        // kernel — not the scalar fallback.
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
+        // Work items are (head, block of SdpaRowBlock query rows): scores for the block's rows (Q rows · K^T), their
+        // softmax, then the block's output rows (P rows · V). A batch-1 forward has few heads -- 8 heads left 56 of
+        // 64 cores idle when the split was per head -- but many row blocks. Every item runs the same single-threaded
+        // SIMD GEMM on the same fixed blocks whatever the thread count, so the output is bit-identical at any degree
+        // of parallelism (the old per-head split switched between a multi-threaded BLAS call and a sequential kernel
+        // depending on whether the head loop happened to run in parallel).
+        int qBlocks = (seqQ + SdpaRowBlock - 1) / SdpaRowBlock;
+        int ktLen = bhCount * d_k * seqK;
+        var ktAll = System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, ktLen));
+        try
         {
+        // K^T per head, once: [d_k, seqK] so each block's scores GEMM reads K^T row-major.
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)ktLen, bh =>
+        {
+            int kOff = bh * seqK * d_k, tOff = bh * d_k * seqK;
+            for (int i = 0; i < seqK; i++)
+                for (int j = 0; j < d_k; j++)
+                    ktAll[tOff + j * seqK + i] = kf[kOff + i * d_k + j];
+        }, deterministicSafe: true);
+
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount * qBlocks, (long)bhCount * seqQ * seqK * (d_k + d_v), [MethodImpl(Hot)] (item) =>
+        {
+            int bh = item / qBlocks;
+            int i0 = (item % qBlocks) * SdpaRowBlock;
+            int rows = Math.Min(SdpaRowBlock, seqQ - i0);
             int b = bh / heads;
             int h = bh % heads;
 
             // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
             // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
             // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
-            // of indexing past its bounds. The MHA fast paths already did this; these generic
-            // SDPA workers did not, which is why the GQA causal path had to materialize a full
-            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            // of indexing past its bounds.
             int mskB = mask is null ? 1 : mask.Shape[0];
             int mskH = mask is null ? 1 : mask.Shape[1];
             int mskQ = mask is null ? 1 : mask.Shape[2];
@@ -29566,56 +29770,21 @@ public partial class CpuEngine : ITensorLevelEngine
             int mskb = BroadcastMaskIndex(b, mskB);
             int mskh = BroadcastMaskIndex(h, mskH);
 
-            int qOff = bh * seqQ * d_k;
-            int kOff = bh * seqK * d_k;
-            int sOff = bh * seqQ * seqK;
+            int qOff = bh * seqQ * d_k + i0 * d_k;
+            int sOff = bh * seqQ * seqK + i0 * seqK;
 
-            // ──── Step 1: scores = Q @ K^T, via BLAS TryGemmEx with transB=true.
-            // If TryGemmEx is unavailable (deterministic mode, MKL absent), fall back
-            // to pre-transposing K and calling SimdGemm.Sgemm.
-            //
-            // Nested-threading guard: this body runs inside ParallelForOrSerial over
-            // batch·heads. TryGemmEx routes to a MULTI-THREADED GEMM (native OpenBLAS
-            // cblas_sgemm, or the managed machine kernel). Invoking that from each of N
-            // parallel head-workers oversubscribes the box (N × innerThreads) and the
-            // native BLAS pool blocks in native sync — a [1,8,1024,64] forward then
-            // crawls for minutes. So when this thread is already a parallel worker
-            // (IsInParallelRegion) we force the single-threaded AVX2 SgemmSequential
-            // path below — mirroring the double path, which always uses a sequential
-            // inner GEMM for exactly this reason. When the head loop ran serially (few
-            // heads / small work) we keep the fast multi-threaded GEMM for the lone head.
-            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: seqK, k: d_k,
-                a: qf, aOffset: qOff, lda: d_k, transA: false,
-                b: kf, bOffset: kOff, ldb: d_k, transB: true,
-                c: scoresData, cOffset: sOff, ldc: seqK);
-            if (!gemmed)
-            {
-                // Manual K^T for this head, then SimdGemm (AVX2 blocked).
-                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                try
-                {
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_k; j++)
-                            kt[j * seqK + i] = kf[kOff + i * d_k + j];
-                    // SgemmSequential: we're already inside Parallel.For(bhCount), so
-                    // forcing the inner SIMD kernel to run sequential avoids
-                    // bhCount × maxThreads workers on (maxThreads) cores.
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        qf.AsSpan(qOff, seqQ * d_k),
-                        kt.AsSpan(0, d_k * seqK),
-                        scoresData.AsSpan(sOff, seqQ * seqK),
-                        seqQ, d_k, seqK);
-                }
-                finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
-            }
+            // ──── Step 1: the block's scores = Q[i0 .. i0+rows) @ K^T.
+            Engines.Simd.SimdGemm.SgemmSequential(
+                qf.AsSpan(qOff, rows * d_k),
+                ktAll.AsSpan(bh * d_k * seqK, d_k * seqK),
+                scoresData.AsSpan(sOff, rows * seqK),
+                rows, d_k, seqK);
 
-            // ──── Step 2: fused scale + mask + numerically-stable softmax,
-            // row-wise over the [seqQ, seqK] scores matrix for this head.
-            for (int i = 0; i < seqQ; i++)
+            // ──── Step 2: fused scale + mask + numerically-stable softmax, row-wise.
+            for (int r = 0; r < rows; r++)
             {
-                int rowOff = sOff + i * seqK;
+                int i = i0 + r;
+                int rowOff = sOff + r * seqK;
                 // First pass: scale in-place, mask, and find row max.
                 float maxVal = negInfF;
                 for (int j = 0; j < seqK; j++)
@@ -29627,11 +29796,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (v > maxVal) maxVal = v;
                     scoresData[rowOff + j] = v;
                 }
-                // Second pass: exp(v - max), sum.
-                // Edge case: if the entire row was masked out, maxVal is still -Infinity.
-                // (scores - (-Inf)) == +Inf; MathF.Exp(+Inf) == +Inf; normalizing produces
-                // NaN. Detect that case up front and emit an all-zero softmax row, which
-                // is the sensible behavior (no attention anywhere → no value flows).
+                // A fully masked row has maxVal = -Infinity: exp(v - max) would be NaN. No attention anywhere -> an
+                // all-zero softmax row (no value flows).
                 if (float.IsNegativeInfinity(maxVal))
                 {
                     for (int j = 0; j < seqK; j++)
@@ -29642,9 +29808,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 float sumExp = 0f;
                 for (int j = 0; j < seqK; j++)
                 {
-                    float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
-                    weightsData[rowOff + j] = e;
-                    sumExp += e;
+                    float ex = MathF.Exp(scoresData[rowOff + j] - maxVal);
+                    weightsData[rowOff + j] = ex;
+                    sumExp += ex;
                 }
                 // Third pass: normalize. Use 1/sumExp to turn N divides into N muls.
                 float inv = sumExp != 0f ? 1f / sumExp : 0f;
@@ -29652,26 +29818,18 @@ public partial class CpuEngine : ITensorLevelEngine
                     weightsData[rowOff + j] *= inv;
             }
 
-            // ──── Step 3: output = weights @ V, via BLAS (no transpose).
-            // Same nested-threading guard as Step 1: serial inner GEMM when this is a
-            // parallel head-worker, multi-threaded GEMM only when the head loop is serial.
-            int wOff = bh * seqQ * seqK;
-            int vOff = bh * seqK * d_v;
-            int oOff = bh * seqQ * d_v;
-            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: d_v, k: seqK,
-                a: weightsData, aOffset: wOff, lda: seqK, transA: false,
-                b: vf, bOffset: vOff, ldb: d_v, transB: false,
-                c: outputData, cOffset: oOff, ldc: d_v);
-            if (!gemmed2)
-            {
-                Engines.Simd.SimdGemm.SgemmSequential(
-                    weightsData.AsSpan(wOff, seqQ * seqK),
-                    vf.AsSpan(vOff, seqK * d_v),
-                    outputData.AsSpan(oOff, seqQ * d_v),
-                    seqQ, seqK, d_v);
-            }
-        });
+            // ──── Step 3: the block's output rows = weights[i0 .. i0+rows) @ V.
+            Engines.Simd.SimdGemm.SgemmSequential(
+                weightsData.AsSpan(sOff, rows * seqK),
+                vf.AsSpan(bh * seqK * d_v, seqK * d_v),
+                outputData.AsSpan(bh * seqQ * d_v + i0 * d_v, rows * d_v),
+                rows, seqK, d_v);
+        }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(ktAll, clearArray: false);
+        }
 
         // Return strongly typed Tensor<float> (no generic cast). Caller bridges
         // to the outer Tensor<T> via a single (Tensor<T>)(object) cast at the
@@ -29748,17 +29906,43 @@ public partial class CpuEngine : ITensorLevelEngine
 
         float scaleF = (float)scaleValue;
         float negInfF = float.NegativeInfinity;
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
+
+        // Work items are (head, block of SdpaRowBlock query rows), as in ScaledDotProductAttentionFloat: few heads no
+        // longer leave most cores idle, and every item runs the same single-threaded SIMD GEMM on the same fixed
+        // blocks, so the output is bit-identical at any degree of parallelism. K^T (and V, when its rows are strided)
+        // is packed once per head; a strided Q block is packed per item.
+        int qBlocks = (seqQ + SdpaRowBlock - 1) / SdpaRowBlock;
+        int ktLen = bhCount * d_k * seqK;
+        bool packV = vRowStride != d_v;
+        var ktAll = System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, ktLen));
+        var vPacked = packV ? System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, bhCount * seqK * d_v)) : null;
+        try
         {
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqK * (d_k + d_v), bh =>
+        {
+            int b = bh / heads, h = bh % heads;
+            int kOff = kBase + b * kBatchStride + h * kHeadStride, tOff = bh * d_k * seqK;
+            for (int i = 0; i < seqK; i++)
+                for (int j = 0; j < d_k; j++)
+                    ktAll[tOff + j * seqK + i] = kf[kOff + i * kRowStride + j];
+            if (vPacked != null)
+            {
+                int vOff = vBase + b * vBatchStride + h * vHeadStride, pOff = bh * seqK * d_v;
+                for (int i = 0; i < seqK; i++)
+                    Array.Copy(vf, vOff + i * vRowStride, vPacked, pOff + i * d_v, d_v);
+            }
+        }, deterministicSafe: true);
+
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount * qBlocks, (long)bhCount * seqQ * seqK * (d_k + d_v), [MethodImpl(Hot)] (item) =>
+        {
+            int bh = item / qBlocks;
+            int i0 = (item % qBlocks) * SdpaRowBlock;
+            int rows = Math.Min(SdpaRowBlock, seqQ - i0);
             int b = bh / heads;
             int h = bh % heads;
 
             // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
-            // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
-            // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
-            // of indexing past its bounds. The MHA fast paths already did this; these generic
-            // SDPA workers did not, which is why the GQA causal path had to materialize a full
-            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            // [batch, heads, seq_q, seq_k]); a size-1 axis maps every index to 0.
             int mskB = mask is null ? 1 : mask.Shape[0];
             int mskH = mask is null ? 1 : mask.Shape[1];
             int mskQ = mask is null ? 1 : mask.Shape[2];
@@ -29766,67 +29950,42 @@ public partial class CpuEngine : ITensorLevelEngine
             int mskb = BroadcastMaskIndex(b, mskB);
             int mskh = BroadcastMaskIndex(h, mskH);
             // Per-head storage offsets via the operands' (possibly permuted) strides.
-            int qOff = qBase + b * qBatchStride + h * qHeadStride;
-            int kOff = kBase + b * kBatchStride + h * kHeadStride;
-            int vOff = vBase + b * vBatchStride + h * vHeadStride;
-            int sOff = bh * seqQ * seqK;
-            int oOff = bh * seqQ * d_v;
+            int qOff = qBase + b * qBatchStride + h * qHeadStride + i0 * qRowStride;
+            int sOff = bh * seqQ * seqK + i0 * seqK;
+            int oOff = bh * seqQ * d_v + i0 * d_v;
 
-            // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
-            // force the single-threaded inner GEMM when this body is itself a parallel worker.
-            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-
-            // Step 1: scores = Q @ K^T → scratch. Q is [seqQ,d_k] with leading dim qRowStride,
-            // K is [seqK,d_k] (used transposed) with leading dim kRowStride; the resolver
-            // guarantees the d_k dimension is unit-stride, which is all BLAS lda/ldb require.
-            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: seqK, k: d_k,
-                a: qf, aOffset: qOff, lda: qRowStride, transA: false,
-                b: kf, bOffset: kOff, ldb: kRowStride, transB: true,
-                c: scratch, cOffset: sOff, ldc: seqK);
-            if (!gemmed)
+            // Step 1: the block's scores = Q[i0 .. i0+rows) @ K^T -> scratch. The d_k dimension is unit-stride (the
+            // resolver guarantees it); rows with a wider stride are packed first.
+            float[]? qPackRented = qRowStride != d_k ? System.Buffers.ArrayPool<float>.Shared.Rent(rows * d_k) : null;
+            try
             {
-                // SgemmSequential needs packed (row-major, leading dim == cols) inputs, so
-                // gather strided Q/K per-head slices into small reused buffers. kt holds K^T.
-                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                float[]? qPackRented = qRowStride != d_k
-                    ? System.Buffers.ArrayPool<float>.Shared.Rent(seqQ * d_k) : null;
-                try
+                ReadOnlySpan<float> qSpan;
+                if (qPackRented != null)
                 {
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_k; j++)
-                            kt[j * seqK + i] = kf[kOff + i * kRowStride + j];
-
-                    ReadOnlySpan<float> qSpan;
-                    if (qPackRented != null)
-                    {
-                        for (int i = 0; i < seqQ; i++)
-                            for (int j = 0; j < d_k; j++)
-                                qPackRented[i * d_k + j] = qf[qOff + i * qRowStride + j];
-                        qSpan = qPackRented.AsSpan(0, seqQ * d_k);
-                    }
-                    else
-                    {
-                        qSpan = qf.AsSpan(qOff, seqQ * d_k);
-                    }
-
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        qSpan,
-                        kt.AsSpan(0, d_k * seqK),
-                        scratch.AsSpan(sOff, seqQ * seqK),
-                        seqQ, d_k, seqK);
+                    for (int r = 0; r < rows; r++)
+                        Array.Copy(qf, qOff + r * qRowStride, qPackRented, r * d_k, d_k);
+                    qSpan = qPackRented.AsSpan(0, rows * d_k);
                 }
-                finally
+                else
                 {
-                    System.Buffers.ArrayPool<float>.Shared.Return(kt);
-                    if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
+                    qSpan = qf.AsSpan(qOff, rows * d_k);
                 }
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    qSpan,
+                    ktAll.AsSpan(bh * d_k * seqK, d_k * seqK),
+                    scratch.AsSpan(sOff, rows * seqK),
+                    rows, d_k, seqK);
+            }
+            finally
+            {
+                if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
             }
 
             // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
-            for (int i = 0; i < seqQ; i++)
+            for (int r = 0; r < rows; r++)
             {
-                int rowOff = sOff + i * seqK;
+                int i = i0 + r;
+                int rowOff = sOff + r * seqK;
                 float maxVal = negInfF;
                 for (int j = 0; j < seqK; j++)
                 {
@@ -29851,44 +30010,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
             }
 
-            // Step 3: output = probs @ V → outBuf. V is [seqK,d_v] with leading dim vRowStride
-            // (resolver guarantees d_v unit-stride). TryGemmEx beta=0 SET / SgemmSequential
-            // self-clears, so outBuf needs no pre-zero.
-            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: d_v, k: seqK,
-                a: scratch, aOffset: sOff, lda: seqK, transA: false,
-                b: vf, bOffset: vOff, ldb: vRowStride, transB: false,
-                c: outBuf, cOffset: oOff, ldc: d_v);
-            if (!gemmed2)
-            {
-                ReadOnlySpan<float> vSpan;
-                float[]? vPackRented = null;
-                if (vRowStride != d_v)
-                {
-                    vPackRented = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * d_v);
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_v; j++)
-                            vPackRented[i * d_v + j] = vf[vOff + i * vRowStride + j];
-                    vSpan = vPackRented.AsSpan(0, seqK * d_v);
-                }
-                else
-                {
-                    vSpan = vf.AsSpan(vOff, seqK * d_v);
-                }
-                try
-                {
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        scratch.AsSpan(sOff, seqQ * seqK),
-                        vSpan,
-                        outBuf.AsSpan(oOff, seqQ * d_v),
-                        seqQ, seqK, d_v);
-                }
-                finally
-                {
-                    if (vPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(vPackRented);
-                }
-            }
-        });
+            // Step 3: the block's output rows = probs @ V -> outBuf (SgemmSequential overwrites, no pre-zero).
+            ReadOnlySpan<float> vSpan = vPacked != null
+                ? vPacked.AsSpan(bh * seqK * d_v, seqK * d_v)
+                : vf.AsSpan(vBase + b * vBatchStride + h * vHeadStride, seqK * d_v);
+            Engines.Simd.SimdGemm.SgemmSequential(
+                scratch.AsSpan(sOff, rows * seqK),
+                vSpan,
+                outBuf.AsSpan(oOff, rows * d_v),
+                rows, seqK, d_v);
+        }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(ktAll, clearArray: false);
+            if (vPacked != null) System.Buffers.ArrayPool<float>.Shared.Return(vPacked, clearArray: false);
+        }
     }
 
     /// <summary>
@@ -33475,7 +33612,19 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        return outputShape.Count == 0 ? new[] { 1 } : outputShape.ToArray();
+        return outputShape.ToArray();
+    }
+
+    /// <summary>
+    /// Output shape of a reduction over every axis: rank 0 without keepDims (as torch and the GPU engine
+    /// return), otherwise every axis kept as size 1 (#1132).
+    /// </summary>
+    internal static int[] FullReductionShape(int rank, bool keepDims)
+    {
+        if (!keepDims) return Array.Empty<int>();
+        var shape = new int[rank];
+        for (int i = 0; i < rank; i++) shape[i] = 1;
+        return shape;
     }
 
     /// <inheritdoc/>
@@ -33596,7 +33745,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
                 maxIndices = new[] { maxIdx };
                 float fMax = maxVal;
-                return TensorAllocator.Rent<T>(keepDims ? new[] { 1 } : new[] { 1 },
+                return TensorAllocator.Rent<T>(FullReductionShape(1, keepDims),
                     new Vector<T>(new[] { Unsafe.As<float, T>(ref fMax) }));
             }
         }
@@ -33992,7 +34141,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (axisSet.Contains(i)) { if (keepDims) shapeList.Add(1); }
                     else shapeList.Add(input._shape[i]);
                 }
-                var outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                var outShape = shapeList.ToArray();
                 if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine && !GraphMode.IsInferenceTrace)
                 {
                     var compiledMean = TryRecordReduceMeanFloat(scope, (Tensor<float>)(object)input, axes, keepDims, outShape);
@@ -34047,7 +34196,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var dSpan = AsDoubleMemory(input.Data).Span;
                 double dSum = SimdKernels.Sum(dSpan);
                 double dMean = dSum / input.Length;
-                var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                var scalarResult = AutoTensorCache.RentOrAllocate<T>(FullReductionShape(input.Rank, keepDims));
                 ((double[])(object)scalarResult.GetDataArray())[0] = dMean;
                 DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                     BackwardFunctions<T>.ReduceMeanBackward,
@@ -34058,7 +34207,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // poisons compiled graphs with a stale value when the same op
                 // pattern is run on a different input tensor of identical shape.
                 { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
-                  AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
+                  var ck = keepDims; AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, ck)); }
                 return scalarResult;
             }
             if (typeof(T) == typeof(float))
@@ -34069,7 +34218,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     using var pin = mem.Pin();
                     float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, input.Length);
                     float fMean = fSum / input.Length;
-                    var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
+                    var scalarResult = AutoTensorCache.RentOrAllocate<T>(FullReductionShape(input.Rank, keepDims));
                     ((float[])(object)scalarResult.GetDataArray())[0] = fMean;
                     DifferentiableOps.RecordUnary("ReduceMean", scalarResult, input,
                         BackwardFunctions<T>.ReduceMeanBackward,
@@ -34078,7 +34227,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // this branch as a stale scalar constant — same fix as the
                     // double branch above.
                     { var c = input; var ca = Enumerable.Range(0, input.Rank).ToArray();
-                      AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, keepDims: false)); }
+                      var ck = keepDims; AutoTracer.RecordOp("ReduceMean", scalarResult, eng => eng.ReduceMean(c, ca, ck)); }
                     return scalarResult;
                 }
             }
@@ -34104,7 +34253,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputShapeList.Add(inputShape[i]);
             }
         }
-        var outputShape = outputShapeList.Count > 0 ? outputShapeList.ToArray() : [1];
+        var outputShape = outputShapeList.ToArray();
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
@@ -34246,6 +34395,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ReduceVariance<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        // Null or empty means every axis, as for ReduceSum and ReduceMean (and torch var(dim=None)).
+        if (axes is null || axes.Length == 0) axes = Enumerable.Range(0, input.Rank).ToArray();
+
         // Tape-aware AND lazy-graph (GraphMode) path: take the slow path
         // that explicitly allocates a `mean` Tensor<T> we can save in
         // savedState for backward. The fast paths below inline the mean
@@ -34410,7 +34563,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 outputShapeList.Add(inputShape[d]);
             }
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
         var outputShape = outputShapeList.ToArray();
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
@@ -34490,7 +34642,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     { if (capturedKeepDims) outShapeList.Add(1); }
                     else outShapeList.Add(inShape[d]);
                 }
-                if (outShapeList.Count == 0) outShapeList.Add(1);
                 var outShape = outShapeList.ToArray();
 
                 // For backward we need the `mean` tensor — compute once here
@@ -34535,7 +34686,6 @@ public partial class CpuEngine : ITensorLevelEngine
             if (normalizedAxes.Contains(d)) { if (keepDims) outputShapeList.Add(1); }
             else outputShapeList.Add(inputShape[d]);
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
         var outputShape = outputShapeList.ToArray();
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
@@ -37515,8 +37665,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public void TensorFill<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Filled through its own layout: filling tensor.Contiguous() filled a copy of a view and left the view, and
+        // every alias of its storage, unchanged.
         tensor.Fill(value);
     }
 
@@ -38281,7 +38431,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (d == capAxis) { if (keepDims) outShape.Add(1); }
                     else outShape.Add(tensor._shape[d]);
                 }
-                if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSumExp", tensor, outShape.ToArray(),
                     (eng, output) => { var r = eng.TensorLogSumExp(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.LogSumExpBackward, new object[] { capAxis });
@@ -38312,7 +38461,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var maxSqueezed = TensorSqueeze(maxVals, axis);
+            // Reshape, not TensorSqueeze: squeeze keeps a vector's last axis, which would broadcast a rank-0
+            // logSum back up to [1] (#1132).
+            var maxSqueezed = Reshape(maxVals, logSum._shape);
             return TensorAdd(logSum, maxSqueezed);
         }
     }
@@ -39228,7 +39379,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (d == capAxis) { if (keepDims) outShape.Add(1); }
                     else outShape.Add(tensor._shape[d]);
                 }
-                if (outShape.Count == 0) outShape.Add(1);
                 return scope.RecordUnary(LazyNodeType.Custom, "Norm", tensor, outShape.ToArray(),
                     (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NormBackward, new object[] { capAxis });

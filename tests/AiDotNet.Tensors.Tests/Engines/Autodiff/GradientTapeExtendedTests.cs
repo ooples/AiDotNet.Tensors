@@ -183,13 +183,18 @@ public class GradientTapeExtendedTests
         using var tape = new GradientTape<float>();
         _engine.TensorAddInPlace(a, b);
 
-        // In-place add should be recorded
-        Assert.Equal(1, tape.EntryCount);
+        // Recorded as the add on a snapshot of a's old value plus the write-back into a (the rebased in-place contract,
+        // GradientTape.RebaseForInPlace), so a keeps one identity while its old and new values have separate gradients.
+        Assert.Equal(2, tape.EntryCount);
 
         // a is now [5, 7, 9]
         Assert.Equal(5f, a[0], 5);
         Assert.Equal(7f, a[1], 5);
         Assert.Equal(9f, a[2], 5);
+
+        // and the write differentiates: d sum(a + b) / d b = 1
+        var gb = tape.ComputeGradients(_engine.ReduceSum(a, null), new[] { b })[b].ToArray();
+        Assert.Equal(new float[] { 1, 1, 1 }, gb);
     }
 
     // ──────────────────────────────────────────────────────────────

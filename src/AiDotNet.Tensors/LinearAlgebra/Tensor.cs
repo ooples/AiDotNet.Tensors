@@ -221,6 +221,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         view._gpuBackend = _gpuBackend;
         view._gpuBufferIsSplitComplex = _gpuBufferIsSplitComplex;
         view._gpuBufferContainsRawInt32 = _gpuBufferContainsRawInt32;
+        view._gpuBufferContainsRawInt64 = _gpuBufferContainsRawInt64;
         view._gpuRole = _gpuRole;
         view._ownsGpuBuffer = false;
         view._gpuMaterializerCallback = _gpuMaterializerCallback;
@@ -1570,7 +1571,16 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         EnsureMaterialized();
         EnsureOwnedForWrite();
-        _numOps.Fill(_data.AsWritableSpan(), value);
+        // Only this tensor's elements. Filling the whole data vector also overwrote every other view of the storage
+        // (a row of a matrix filled the matrix), and a strided view filled the elements between its own.
+        if (IsContiguous)
+        {
+            _numOps.Fill(AsWritableSpan(), value);
+        }
+        else
+        {
+            FillStridedElements(value);   // one ownership check (above) and one version bump (below), not one per element
+        }
         IncrementVersion();
         UniformFillValue = _numOps.ToDouble(value);
     }
@@ -3574,16 +3584,62 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <param name="role">The GPU memory management role for allocation decisions.</param>
     /// <param name="ownsBuffer">If true, the tensor owns the buffer lifetime.</param>
     /// <returns>A GPU-resident Tensor with deferred CPU synchronization.</returns>
+    /// <summary>True for the element types the GPU engine stores as raw int64 words (#1135).</summary>
+    internal static bool IsRawInt64Element()
+        => typeof(T) == typeof(long) || typeof(T) == typeof(ulong) || typeof(T) == typeof(short)
+           || typeof(T) == typeof(ushort) || typeof(T) == typeof(sbyte) || typeof(T) == typeof(byte) || typeof(T) == typeof(uint);
+
+    /// <summary>Widens elements to the raw int64 device layout (ulong keeps its bits).</summary>
+    internal static long[] ToRawInt64(T[] values)
+    {
+        var result = new long[values.Length];
+        if (typeof(T) == typeof(long)) Array.Copy((long[])(object)values, result, values.Length);
+        else if (typeof(T) == typeof(ulong)) System.Buffer.BlockCopy((ulong[])(object)values, 0, result, 0, values.Length * sizeof(long));
+        else if (typeof(T) == typeof(short)) { var s = (short[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(ushort)) { var s = (ushort[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(sbyte)) { var s = (sbyte[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(byte)) { var s = (byte[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(uint)) { var s = (uint[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else throw new NotSupportedException($"{typeof(T).Name} has no raw int64 device layout.");
+        return result;
+    }
+
+    /// <summary>Narrows raw int64 values (unchecked) to the element type.</summary>
+    internal static T[] FromRawInt64(long[] values)
+    {
+        if (typeof(T) == typeof(long)) return (T[])(object)values;
+        if (typeof(T) == typeof(ulong))
+        {
+            var u = new ulong[values.Length];
+            System.Buffer.BlockCopy(values, 0, u, 0, values.Length * sizeof(long));
+            return (T[])(object)u;
+        }
+        unchecked
+        {
+            if (typeof(T) == typeof(short)) { var r = new short[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (short)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(ushort)) { var r = new ushort[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (ushort)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(sbyte)) { var r = new sbyte[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (sbyte)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(byte)) { var r = new byte[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (byte)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(uint)) { var r = new uint[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (uint)values[i]; return (T[])(object)r; }
+        }
+        throw new NotSupportedException($"{typeof(T).Name} has no raw int64 device layout.");
+    }
+
     internal static Tensor<T> FromGpuBuffer(
         Engines.DirectGpu.IDirectGpuBackend backend,
         Engines.DirectGpu.IGpuBuffer buffer,
         int[] shape,
         Engines.Gpu.GpuTensorRole role = Engines.Gpu.GpuTensorRole.General,
         bool ownsBuffer = true,
-        bool bufferContainsRawInt32 = false)
+        bool bufferContainsRawInt32 = false,
+        bool bufferContainsRawInt64 = false)
     {
         if (bufferContainsRawInt32 && typeof(T) != typeof(int))
             throw new ArgumentException("Raw int32 GPU storage is only valid for Tensor<int>.", nameof(bufferContainsRawInt32));
+        if (bufferContainsRawInt64 && !IsRawInt64Element())
+            throw new ArgumentException(
+                "Raw int64 GPU storage is only valid for long, ulong, short, ushort, sbyte, byte and uint tensors.",
+                nameof(bufferContainsRawInt64));
 
         var tensor = new Tensor<T>(shape, backend.DeviceType);
         tensor._gpuBuffer = buffer;
@@ -3591,6 +3647,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         tensor._gpuBufferVersion = tensor.GpuCacheVersion;
         tensor._gpuRole = role;
         tensor._gpuBufferContainsRawInt32 = bufferContainsRawInt32;
+        tensor._gpuBufferContainsRawInt64 = bufferContainsRawInt64;
         if (ownsBuffer)
             tensor._storage.AttachGpuBufferOwner(buffer);
         tensor._ownsGpuBuffer = false;
@@ -3607,6 +3664,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Action<object> materializeCallback = _ =>
         {
             var downloaded = capturedBackend.DownloadBuffer(capturedBuffer);
+            if (bufferContainsRawInt64)
+            {
+                // Two raw words per element: the int64 value, narrowed (unchecked) to the element type.
+                if (downloaded.Length < 2L * capturedLength)
+                    throw new InvalidOperationException(
+                        $"GPU buffer returned {downloaded.Length} words for a {capturedLength}-element int64 tensor.");
+                var longs = new long[capturedLength];
+                System.Buffer.BlockCopy(downloaded, 0, longs, 0, capturedLength * sizeof(long));
+                capturedVector.MaterializeBacking(FromRawInt64(longs));
+                return;
+            }
             var floatData = downloaded;
             if (downloaded.Length != capturedLength)
             {
@@ -4916,6 +4984,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // int32 bits. See the note on the same pair in Gpu() below.
         _gpuBufferIsSplitComplex = false;
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
         _gpuDeviceIndex = deviceInfo.Index;
         _device = deviceInfo.Type;
         _gpuBufferVersion = GpuCacheVersion; // filled from the current host data, so in sync (see Gpu())
@@ -4982,6 +5051,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // consumer unconverted, and index 3 would arrive as 0x40400000.
         _gpuBufferIsSplitComplex = false;
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
         // Tag the freshly-uploaded buffer with the CURRENT tensor version. The buffer was just filled from this
         // tensor's host data, so it IS in sync — but every version-gated resident-buffer consumer
         // (GetOrAllocateBuffer / GetWeightBufferPreferResident: `_gpuBufferVersion == GpuCacheVersion`) leaves
@@ -5031,6 +5101,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         {
             _gpuBufferIsSplitComplex = false;
             _gpuBufferContainsRawInt32 = false;
+            _gpuBufferContainsRawInt64 = false;
             _device = TensorDevice.CPU;
             return this;
         }
@@ -5070,6 +5141,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // the markers that described its encoding must not survive into the next upload.
         _gpuBufferIsSplitComplex = false;
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
         _device = TensorDevice.CPU;
         return this;
     }
