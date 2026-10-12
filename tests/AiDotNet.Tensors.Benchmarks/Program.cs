@@ -1523,6 +1523,39 @@ class Program
             return;
         }
 
+        // Cost of finding an already-built Vulkan pipeline, which every dispatch pays
+        if (args[0] == "--vulkan-pipeline-lookup")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            var method = typeof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend).GetMethod("GetOrCreateGlslPipeline",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var lookup = (Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>)Delegate.CreateDelegate(
+                typeof(Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>), vb, method);
+            foreach (var (name, get, bindings, push) in new (string, Func<string>, int, uint)[]
+            {
+                ("SoftmaxRows", () => AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels.SoftmaxRows, 2, 8u),
+                ("NormalizationForward", () => AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels.NormalizationForward, 8, 32u),
+            })
+            {
+                if (lookup(get(), bindings, push) is null) { Console.WriteLine($"{name}: no pipeline"); continue; }
+                const int calls = 200_000;
+                var samples = new double[9];
+                long allocated = 0;
+                for (int s = 0; s < samples.Length; s++)
+                {
+                    long a0 = GC.GetAllocatedBytesForCurrentThread();
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < calls; i++) lookup(get(), bindings, push);
+                    samples[s] = sw.Elapsed.TotalMilliseconds * 1e6 / calls;
+                    allocated = (GC.GetAllocatedBytesForCurrentThread() - a0) / calls;
+                }
+                Array.Sort(samples);
+                Console.WriteLine($"VKLOOKUP {name} ({get().Length} chars): {samples[4]:F0} ns per lookup (min {samples[0]:F0}, max {samples[8]:F0}), {allocated} bytes allocated per lookup");
+            }
+            return;
+        }
+
         // Run Vulkan backend diagnostics and bottleneck analysis
         if (args[0] == "--vulkan")
         {

@@ -495,6 +495,19 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
+    /// Before an in-place write: moves <paramref name="target"/>'s autograd history to a snapshot of its value and
+    /// returns the snapshot, or null when no tape records in-place ops (see <see cref="GradientTape{T}.RebaseForInPlace"/>).
+    /// The in-place op reads the snapshot and records snapshot -> target.
+    /// </summary>
+    internal static Tensor<T>? RebaseForInPlace<T>(Tensor<T> target)
+    {
+        if (_anyTapeActive == 0) return null;
+        var tape = GradientTape<T>.Current;
+        if (tape is null || !tape.Options.RecordInPlace || NoGradScope<T>.IsSuppressed) return null;
+        return tape.RebaseForInPlace(target);
+    }
+
+    /// <summary>
     /// Records a binary operation (two inputs). Zero heap allocation, zero struct copy.
     /// Writes directly into the arena slot via ref return.
     /// </summary>

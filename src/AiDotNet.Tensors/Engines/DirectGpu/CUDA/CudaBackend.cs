@@ -10008,6 +10008,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, byteSize, _stream),
             "cuMemcpyDtoDAsync (Copy)");
+        // Device-side copy IS GPU work, as in the strided overload and CopyBufferAsync. This overload alone was not
+        // counted, so ops whose device work is one whole-buffer copy (TensorReal/TensorImag of a split-complex
+        // input) showed up on the residency probe as CPU fallbacks.
+        GpuLaunchProbe.OnLaunch();
     }
 
     public void Fill(IGpuBuffer buffer, float value, int size)
