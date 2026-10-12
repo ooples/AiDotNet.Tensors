@@ -441,7 +441,9 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
   let gridBase = ((b * pc.outH + oh) * pc.outW + ow) * 2; let gx = grid[gridBase]; let gy = grid[gridBase + 1];
   let srcH = (gy + 1.0) * 0.5 * f32(pc.H - 1); let srcW = (gx + 1.0) * 0.5 * f32(pc.W - 1);
   var gradGx = 0.0; var gradGy = 0.0;
-  if (!(srcH <= -1.0 || srcH >= f32(pc.H) || srcW <= -1.0 || srcW >= f32(pc.W))) {
+  // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+  // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+  if (srcH >= -1.0 && srcH < f32(pc.H) && srcW >= -1.0 && srcW < f32(pc.W) && (bitcast<u32>(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (bitcast<u32>(srcW) & 0x7FFFFFFFu) < 0x7F800000u) {
     let h0 = i32(floor(srcH)); let h1 = h0 + 1; let w0 = i32(floor(srcW)); let w1 = w0 + 1; let lh = srcH - f32(h0); let lw = srcW - f32(w0);
     let in00 = h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W; let in01 = h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W;
     let in10 = h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W; let in11 = h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W;
@@ -510,7 +512,9 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
   let ow = idx % pc.outW; var tmp = idx / pc.outW; let oh = tmp % pc.outH; tmp = tmp / pc.outH; let c = tmp % pc.C; let b = tmp / pc.C;
   let gridBase = ((b * pc.outH + oh) * pc.outW + ow) * 2; let gx = grid[gridBase]; let gy = grid[gridBase + 1];
   let srcH = (gy + 1.0) * 0.5 * f32(pc.H - 1); let srcW = (gx + 1.0) * 0.5 * f32(pc.W - 1);
-  if (srcH <= -1.0 || srcH >= f32(pc.H) || srcW <= -1.0 || srcW >= f32(pc.W)) { return; }
+  // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+  // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+  if (!(srcH >= -1.0 && srcH < f32(pc.H) && srcW >= -1.0 && srcW < f32(pc.W) && (bitcast<u32>(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (bitcast<u32>(srcW) & 0x7FFFFFFFu) < 0x7F800000u)) { return; }
   let h0 = i32(floor(srcH)); let h1 = h0 + 1; let w0 = i32(floor(srcW)); let w1 = w0 + 1; let lh = srcH - f32(h0); let lw = srcW - f32(w0); let g = gradOut[idx];
   if (h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w0, g*(1.0-lh)*(1.0-lw)); }
   if (h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w1, g*(1.0-lh)*lw); }
