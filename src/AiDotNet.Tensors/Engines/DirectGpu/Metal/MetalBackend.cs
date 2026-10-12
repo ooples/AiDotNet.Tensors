@@ -34,7 +34,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// through IGpuMixedPrecisionConvBackend yet — returns null so the
     /// capability is reported as absent until the Metal adapter lands.
     /// </summary>
-    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
     private readonly MetalDevice _device;
     private readonly MetalCommandQueue _commandQueue;

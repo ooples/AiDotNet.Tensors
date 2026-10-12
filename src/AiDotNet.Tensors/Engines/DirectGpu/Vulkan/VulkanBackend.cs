@@ -41,7 +41,6 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// null so IDirectGpuBackend's mixed-precision discovery surface
     /// (Issue #337) correctly reports the capability as absent.
     /// </summary>
-    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
     private static readonly Lazy<VulkanBackend> _instance = new(
         () => new VulkanBackend(), LazyThreadSafetyMode.ExecutionAndPublication);

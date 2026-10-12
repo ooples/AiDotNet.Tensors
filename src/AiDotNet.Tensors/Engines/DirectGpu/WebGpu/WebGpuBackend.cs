@@ -40,7 +40,6 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// null so IDirectGpuBackend's mixed-precision discovery surface
     /// (Issue #337) correctly reports the capability as absent.
     /// </summary>
-    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
     private readonly WebGpuDevice _device;
     private readonly WebGpuShaderModule _shaderLibrary;

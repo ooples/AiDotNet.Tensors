@@ -11,11 +11,6 @@ capability IFusedLstmSequenceTraining MetalBackend #1107
 capability IFusedLstmSequenceTraining WebGpuBackend #1108
 capability IGpuBufferViews MetalBackend #1142
 capability IGpuBufferViews WebGpuBackend #1142
-capability IGpuMixedPrecisionConvBackend HipBackend #1142
-capability IGpuMixedPrecisionConvBackend MetalBackend #1142
-capability IGpuMixedPrecisionConvBackend OpenClBackend #1142
-capability IGpuMixedPrecisionConvBackend VulkanBackend #1142
-capability IGpuMixedPrecisionConvBackend WebGpuBackend #1142
 capability ITorchParityElementwiseBackend HipBackend #1124
 capability ITorchParityElementwiseBackend MetalBackend #1125
 capability ITorchParityElementwiseBackend OpenClBackend #1126
