@@ -2,7 +2,6 @@
 // CUDA NVRTC source for the core torch.linalg decomposition kernels:
 //   - parity211_cholesky  (SPD factorization)
 //   - parity211_lu_factor (LU with partial pivoting)
-//   - parity211_qr_reduced (Householder QR, reduced mode)
 //   - parity211_eigh      (symmetric cyclic Jacobi)
 //
 // Each kernel processes one batch slice per CUDA thread block. Threads
@@ -19,7 +18,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
         {
             "parity211_cholesky",
             "parity211_lu_factor",
-            "parity211_qr_reduced",
             "parity211_eigh",
         };
 
@@ -179,125 +177,6 @@ extern ""C"" __global__ void parity211_lu_factor(
             LUb[i * n + c] -= LUb[i * n + j] * LUb[j * n + c];
         }
         __syncthreads();
-    }
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-// QR FACTORIZATION (Modified Gram–Schmidt, reduced). One block per batch.
-// Q is (m × k), R is (k × n), where k = min(m, n).
-//
-// Why MGS (not Householder)? The reflector variant needs an m×n working
-// buffer to keep the trailing rows in sync after each reflector; MGS
-// writes Q and R directly from the columns of A, with no hidden state.
-// Stability is sufficient for the well-conditioned cases ML cares about
-// (the managed CPU path still runs Householder for ill-conditioned
-// inputs — this is the GPU fast-path only).
-//
-// Algorithm:
-//   Stage 1 (columns 0..k-1):
-//     v ← A[:, j]
-//     for p = 0..j-1:
-//         R[p,j] ← ⟨Q[:, p], v⟩
-//         v      ← v − R[p,j] · Q[:, p]
-//     R[j,j] ← ‖v‖
-//     Q[:, j] ← v / R[j,j]
-//     R[i,j] ← 0 for i>j  (upper triangular)
-//   Stage 2 (columns k..n-1, only when n > k):
-//     R[p,c] ← ⟨Q[:, p], A[:, c]⟩  for p = 0..k-1
-// ═════════════════════════════════════════════════════════════════════════
-extern ""C"" __global__ void parity211_qr_reduced(
-    const float* __restrict__ A,
-    float* __restrict__ Q,
-    float* __restrict__ R,
-    int batchCount, int m, int n)
-{
-    int b = blockIdx.x;
-    if (b >= batchCount) return;
-    int tid = threadIdx.x;
-    int k = min(m, n);
-
-    const float* Ab = A + b * m * n;
-    float* Qb = Q + b * m * k;
-    float* Rb = R + b * k * n;
-
-    // Zero R up front — the strict lower triangle stays zero, and stage-2
-    // off-diagonal cells above row k are written below.
-    for (int idx = tid; idx < k * n; idx += blockDim.x) Rb[idx] = 0.0f;
-    __syncthreads();
-
-    // Block-wide reduction scratch.
-    __shared__ float partials[1024];
-    __shared__ float sScalar;
-
-    // Stage 1: MGS on the first k columns.
-    for (int j = 0; j < k; ++j) {
-        // Load column j of A into Q[:, j] as the starting v vector.
-        for (int i = tid; i < m; i += blockDim.x) Qb[i * k + j] = Ab[i * n + j];
-        __syncthreads();
-
-        // Orthogonalize v against each earlier Q column.
-        for (int p = 0; p < j; ++p) {
-            // dot = ⟨Q[:, p], v⟩ via block-wide reduction.
-            float partial = 0.0f;
-            for (int i = tid; i < m; i += blockDim.x)
-                partial += Qb[i * k + p] * Qb[i * k + j];
-            partials[tid] = partial;
-            __syncthreads();
-            for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
-                if (tid < s && tid + s < s_active) partials[tid] += partials[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) { sScalar = partials[0]; Rb[p * n + j] = sScalar; }
-            __syncthreads();
-            // v ← v − dot · Q[:, p].
-            float rp = sScalar;
-            for (int i = tid; i < m; i += blockDim.x)
-                Qb[i * k + j] -= rp * Qb[i * k + p];
-            __syncthreads();
-        }
-
-        // R[j, j] = ‖v‖.
-        float partialN = 0.0f;
-        for (int i = tid; i < m; i += blockDim.x) {
-            float vi = Qb[i * k + j];
-            partialN += vi * vi;
-        }
-        partials[tid] = partialN;
-        __syncthreads();
-        for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
-            if (tid < s && tid + s < s_active) partials[tid] += partials[tid + s];
-            __syncthreads();
-        }
-        if (tid == 0) { sScalar = sqrtf(partials[0]); Rb[j * n + j] = sScalar; }
-        __syncthreads();
-
-        // Q[:, j] = v / R[j, j]. If the column is rank-deficient (norm ≈ 0),
-        // leave Q[:, j] zero — the consumer can detect via R[j, j].
-        float norm = sScalar;
-        if (norm > 1e-30f) {
-            float invNorm = 1.0f / norm;
-            for (int i = tid; i < m; i += blockDim.x) Qb[i * k + j] *= invNorm;
-        } else {
-            for (int i = tid; i < m; i += blockDim.x) Qb[i * k + j] = 0.0f;
-        }
-        __syncthreads();
-    }
-
-    // Stage 2: fill R[:, c] for c in [k, n) via Qᵀ · A[:, c].
-    for (int c = k; c < n; ++c) {
-        for (int p = 0; p < k; ++p) {
-            float partial = 0.0f;
-            for (int i = tid; i < m; i += blockDim.x)
-                partial += Qb[i * k + p] * Ab[i * n + c];
-            partials[tid] = partial;
-            __syncthreads();
-            for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
-                if (tid < s && tid + s < s_active) partials[tid] += partials[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) Rb[p * n + c] = partials[0];
-            __syncthreads();
-        }
     }
 }
 

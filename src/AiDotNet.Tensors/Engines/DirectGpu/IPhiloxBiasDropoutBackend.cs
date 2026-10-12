@@ -5,6 +5,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// inside the bias-add/dropout consumer instead of materializing a private mask
 /// in a separate launch.
 /// </summary>
+[BackendSpecificRoute("CUDA direct-PTX Philox mask fused into bias-add and dropout; every backend runs dropout and bias-add natively",
+    nameof(IDirectGpuBackend.Dropout), nameof(IDirectGpuBackend.BiasAdd))]
 internal interface IPhiloxBiasDropoutBackend
 {
     bool TryFusedBiasPhiloxDropout(

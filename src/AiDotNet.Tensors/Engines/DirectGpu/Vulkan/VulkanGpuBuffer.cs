@@ -14,6 +14,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal readonly VulkanBuffer Storage;
     internal readonly VulkanBuffer Staging;
     private int _disposed;
+    private readonly VulkanGpuBuffer? _viewParent;
 
     // Creating and destroying a storage + staging pair costs about 0.7 ms for a small buffer and several
     // milliseconds for a large one, many times the ~80 microseconds a dispatch takes, so a released buffer is kept
@@ -89,6 +90,13 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
         Size = size;
+    }
+
+    /// <summary>A view wrapper: holds <paramref name="parent"/> so its finalizer cannot free memory the view still uses.</summary>
+    internal VulkanGpuBuffer(VulkanBuffer storage, VulkanBuffer staging, int size, VulkanGpuBuffer parent)
+        : this(storage, staging, size)
+    {
+        _viewParent = parent;
     }
 
     /// <summary>

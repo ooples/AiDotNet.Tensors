@@ -263,6 +263,30 @@ public static partial class WebGpuNativeBindings
         return CreateBindGroupInternal(pipelineId, doubleIds);
     }
 
+    [JSImport("createBindGroupRanges", ModuleName)]
+    internal static partial int CreateBindGroupRangesInternal(int pipelineId,
+        [JSMarshalAs<JSType.Array<JSType.Number>>] double[] bufferIds,
+        [JSMarshalAs<JSType.Array<JSType.Number>>] double[] offsetBytes,
+        [JSMarshalAs<JSType.Array<JSType.Number>>] double[] sizeBytes);
+
+    /// <summary>
+    /// Creates a bind group whose entries bind a byte range of each buffer (buffer views, #1142).
+    /// </summary>
+    public static int CreateBindGroupRanges(int pipelineId, int[] bufferIds, int[] offsetBytes, int[] sizeBytes)
+    {
+        if (offsetBytes.Length != bufferIds.Length || sizeBytes.Length != bufferIds.Length)
+            throw new ArgumentException("Every bound buffer needs one offset and one size.", nameof(offsetBytes));
+        var ids = new double[bufferIds.Length];
+        var offsets = new double[bufferIds.Length];
+        var sizes = new double[bufferIds.Length];
+        for (int i = 0; i < bufferIds.Length; i++)
+        {
+            ids[i] = bufferIds[i];
+            offsets[i] = offsetBytes[i];
+            sizes[i] = sizeBytes[i];
+        }
+        return CreateBindGroupRangesInternal(pipelineId, ids, offsets, sizes);
+    }
     /// <summary>
     /// Destroys a bind group.
     /// </summary>

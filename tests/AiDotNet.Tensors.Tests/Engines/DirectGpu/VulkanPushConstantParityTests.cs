@@ -14,7 +14,6 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class VulkanPushConstantParityTests
 {
     private const float Tolerance = 1e-5f;
-    private const float LogFloor = 1e-7f;   // the CUDA and Vulkan loss kernels clamp predictions to this before the log
     private const int Rows = 5, Width = 7;
 
     [SkippableFact]
@@ -60,10 +59,17 @@ public sealed class VulkanPushConstantParityTests
         for (int r = 0; r < Rows; r++)
         {
             double ce = 0, sq = 0, dot = 0;
+            // IGpuBatchExecution.CrossEntropyLoss takes logits on every backend (#775, PyTorch semantics): the row's
+            // values are scores, and the loss is -sum(t * log_softmax).
+            double rowMax = double.NegativeInfinity;
+            for (int c = 0; c < Width; c++) rowMax = Math.Max(rowMax, probabilities[r * Width + c]);
+            double sumExp = 0;
+            for (int c = 0; c < Width; c++) sumExp += Math.Exp(probabilities[r * Width + c] - rowMax);
+            double logSumExp = rowMax + Math.Log(sumExp);
             for (int c = 0; c < Width; c++)
             {
                 int i = r * Width + c;
-                if (targets[i] > 0f) ce -= targets[i] * Math.Log(Math.Max(probabilities[i], LogFloor));
+                if (targets[i] > 0f) ce -= targets[i] * (probabilities[i] - logSumExp);
                 double d = values[i] - targets[i];
                 sq += d * d;
                 dot += values[i] * probabilities[i];

@@ -65,6 +65,13 @@ public sealed class WebGpuShaderModule : IDisposable
         return moduleId;
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> PipelineNames =
+        new System.Collections.Concurrent.ConcurrentDictionary<int, string>();
+
+    /// <summary>The module and entry point a pipeline id was created from, for the launch journal.</summary>
+    internal static string DescribePipeline(int pipelineId)
+        => PipelineNames.TryGetValue(pipelineId, out var name) ? name : "webgpu-pipeline#" + pipelineId;
+
     /// <summary>
     /// Creates or retrieves a cached compute pipeline.
     /// </summary>
@@ -92,6 +99,7 @@ public sealed class WebGpuShaderModule : IDisposable
         }
 
         _pipelines[pipelineKey] = pipelineId;
+        PipelineNames[pipelineId] = "webgpu:" + pipelineKey;
         return pipelineId;
     }
 
@@ -173,8 +181,14 @@ public sealed class WebGpuBindGroup : IDisposable
         }
 
         _pipelineId = pipelineId;
+        // Every dispatch binds a group first, so this is where the launch journal sees WebGPU work (#996). The
+        // work size is set by the dispatch that follows, so it is recorded as unknown (0).
+        GpuKernelDiagnostics.RecordLaunch(WebGpuShaderModule.DescribePipeline(pipelineId), 0, 0, buffers.Length);
 
         var bufferIds = new int[buffers.Length];
+        var offsets = new int[buffers.Length];
+        var sizes = new int[buffers.Length];
+        bool anyView = false;
         for (int i = 0; i < buffers.Length; i++)
         {
             if (buffers[i] is null || !buffers[i].IsValid)
@@ -182,9 +196,15 @@ public sealed class WebGpuBindGroup : IDisposable
                 throw new ArgumentException($"Buffer at index {i} is null or invalid", nameof(buffers));
             }
             bufferIds[i] = buffers[i].BufferId;
+            offsets[i] = buffers[i].OffsetBytes;
+            sizes[i] = buffers[i].SizeBytes;
+            anyView |= buffers[i].IsView;
         }
 
-        _bindGroupId = WebGpuNativeBindings.CreateBindGroup(pipelineId, bufferIds);
+        // A view binds only its own byte range of the shared buffer (#1142); whole buffers keep the plain call.
+        _bindGroupId = anyView
+            ? WebGpuNativeBindings.CreateBindGroupRanges(pipelineId, bufferIds, offsets, sizes)
+            : WebGpuNativeBindings.CreateBindGroup(pipelineId, bufferIds);
         if (_bindGroupId < 0)
         {
             throw new InvalidOperationException("Failed to create bind group");

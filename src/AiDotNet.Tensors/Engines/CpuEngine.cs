@@ -43442,12 +43442,29 @@ public partial class CpuEngine : ITensorLevelEngine
             imaginaryData[i] = source[(2 * i) + 1];
         }
 
-        Tensor<float> outputReal;
-        Tensor<float> outputImaginary;
-        if (inverse)
-            IFFT(real, imaginary, out outputReal, out outputImaginary);
-        else
-            FFT(real, imaginary, out outputReal, out outputImaginary);
+        // FFTCore zero-pads a non-power-of-two length to the next power of two, which is a different transform; the
+        // generic contract is arbitrary length, so every row takes the exact n-point transform (Bluestein when needed).
+        var outputReal = new Tensor<float>(componentShape);
+        var outputImaginary = new Tensor<float>(componentShape);
+        float[] rowReal = outputReal.GetDataArray();
+        float[] rowImaginary = outputImaginary.GetDataArray();
+        float scale = inverse ? 1f / n : 1f;
+        for (int row = 0; row < real.Length / n; row++)
+        {
+            var re = new Vector<float>(n);
+            var im = new Vector<float>(n);
+            for (int k = 0; k < n; k++)
+            {
+                re[k] = realData[row * n + k];
+                im[k] = imaginaryData[row * n + k];
+            }
+            var (transformedReal, transformedImaginary) = UnnormalizedTransform(re, im, inverse);
+            for (int k = 0; k < n; k++)
+            {
+                rowReal[row * n + k] = transformedReal[k] * scale;
+                rowImaginary[row * n + k] = transformedImaginary[k] * scale;
+            }
+        }
 
         var result = new Tensor<float>((int[])input._shape.Clone());
         float[] destination = result.GetDataArray();

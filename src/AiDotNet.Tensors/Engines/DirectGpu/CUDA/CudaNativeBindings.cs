@@ -185,6 +185,13 @@ internal static class CudaNativeBindings
         IntPtr kernelParams,
         IntPtr extra)
     {
+        // Grid launches are always a whole number of blocks, so the remaining launch faults are a released handle and
+        // an empty block; check those without building a name, so the common path allocates nothing (#996).
+        if (function == IntPtr.Zero || (long)blockDimX * blockDimY * blockDimZ == 0)
+            GpuKernelDiagnostics.ValidateLaunch("kernel@0x" + function.ToString("x"), handleIsValid: function != IntPtr.Zero,
+                stagedArgCount: 0, declaredArgCount: -1,
+                globalSize: (long)gridDimX * gridDimY * gridDimZ * blockDimX * blockDimY * blockDimZ,
+                localSize: (long)blockDimX * blockDimY * blockDimZ);
         GpuKernelDiagnostics.RecordLaunchByHandle(
             function,
             (long)gridDimX * gridDimY * gridDimZ * blockDimX * blockDimY * blockDimZ,

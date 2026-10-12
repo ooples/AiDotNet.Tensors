@@ -4531,6 +4531,41 @@ public partial class DirectGpuTensorEngine
                 }
             }
 
+            // Fused two-grid kernel (#922): one launch instead of two broadcasts. Measured against this composed
+            // route at (256, 256) and (1024, 256), both indexings: 1.25-1.48x median on OpenCL and ~2x on HIP, p95
+            // lower too, so it clears the >= 1.10x stability gate. Under an active tape the composed route stays so
+            // the reshape and broadcast record their gradients.
+            if (d == 2 && !IsTapeActive<T>() && backend is IMeshgridBackend fused)
+            {
+                int n0 = tensors[0]._shape[0], n1 = tensors[1]._shape[0];
+                int outputLength = checked(n0 * n1);
+                using var source0 = GetOrAllocateBuffer(backend, tensors[0]);
+                using var source1 = GetOrAllocateBuffer(backend, tensors[1]);
+                IGpuBuffer? output0 = null, output1 = null;
+                Tensor<T>? grid0 = null;
+                try
+                {
+                    output0 = backend.AllocateBuffer(outputLength);
+                    output1 = backend.AllocateBuffer(outputLength);
+                    fused.Meshgrid2DPair(source0.Buffer, source1.Buffer, output0, output1, n0, n1, xy);
+                    grid0 = DeferTensorResult<T>(backend, output0, outputLength, outShape);
+                    output0 = null;
+                    var grid1 = DeferTensorResult<T>(backend, output1, outputLength, outShape);
+                    output1 = null;
+                    return [grid0, grid1];
+                }
+                catch
+                {
+                    grid0?.Dispose();
+                    throw;
+                }
+                finally
+                {
+                    output0?.Dispose();
+                    output1?.Dispose();
+                }
+            }
+
             var result = new Tensor<T>[d];
             for (int k = 0; k < d; k++)
             {

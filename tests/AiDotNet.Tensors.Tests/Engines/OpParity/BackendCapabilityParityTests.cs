@@ -25,11 +25,10 @@ public sealed class BackendCapabilityParityTests
         "Metal.MetalBackend", "Vulkan.VulkanBackend", "WebGpu.WebGpuBackend",
     };
 
-    // Op-family capability interfaces that must be resident on EVERY backend. (Backend-specific interfaces
-    // like IFftBackend [Metal/Vulkan], IMultiTensorGpuOptimizerBackend [CUDA], IGpuBatchExecution [Vulkan],
-    // and the OpenCL-only composite IExtendedConvKernels / scaffold IScatterRowsKernels are intentionally
-    // NOT listed — those families are served on other backends via the 9 IExtendedConv sub-interfaces and
-    // IResidentIndexBackend, which are also asserted below.)
+    // Op-family capability interfaces that must be resident on EVERY backend. This list is a runtime
+    // spot-check only: the build-time gate is the BackendParityAnalyzer (TENS0001), which covers every
+    // capability interface without an opt-in list. Known gaps are tracked in
+    // src/AiDotNet.Tensors/BackendParityBaseline.txt (#1142) and may only shrink.
     public static readonly string[] UniversalFamilies =
     {
         "IAudioBackend", "IDetectionBackend", "IGeometryBackend", "ILinalgBackend",
@@ -38,6 +37,8 @@ public sealed class BackendCapabilityParityTests
         "IPool3DKernels", "IConv3DBackwardKernels", "IDepthwiseConv2DBackwardKernels",
         "ITrilinearInterpolationKernels", "IConvTranspose3DKernels", "ISpiralConvKernels",
         "IAdaptiveMaxPool2DKernels", "IGaussianSplatKernels", "IResidentIndexBackend",
+        // closed in #1142: every backend now carries the full extended-conv composite and GNN scatter rows
+        "IScatterRowsKernels", "IExtendedConvKernels",
     };
 
     public static TheoryData<string> Families()

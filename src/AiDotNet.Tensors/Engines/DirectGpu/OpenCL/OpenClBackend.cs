@@ -38,7 +38,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// returns null so IDirectGpuBackend's mixed-precision discovery
         /// surface (Issue #337) correctly reports the capability as absent.
         /// </summary>
-        public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
         /// <summary>
         /// Controls whether initialization and diagnostic output is written to Console.
@@ -877,6 +876,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in SoftmaxVariantKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, softmaxVarProgram, name);
 
+                // IGpuBatchExecution kernels no other program provides (#1142). Safe math: min |x| starts at
+                // INFINITY and the comparisons must keep IEEE semantics.
+                var batchExecutionProgram = CompileOrLoadCached(BatchExecutionKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Batch execution kernels");
+                _programs.Add(batchExecutionProgram);
+                foreach (var name in BatchExecutionKernels.GetKernelNames())
+                    _kernelCache[name] = new DirectOpenClKernel(_context, batchExecutionProgram, name);
                 // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
                 var complexProgram = CompileOrLoadCached(ComplexKernels.GetSource(), optimizationFlags, "Complex kernels");
                 _programs.Add(complexProgram);
@@ -3445,6 +3450,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        /// <summary>
+        /// The fused GEMM kernels stage 16 x 16 tiles in local memory and read every tile element, so the work-group
+        /// must be exactly 16 x 16; the global size is padded to whole tiles and the kernels guard their stores. A
+        /// smaller work-group (the old min(16, M) x min(16, N) for small outputs) left tile entries unloaded and
+        /// produced wrong results.
+        /// </summary>
+        private (int GlobalX, int GlobalY, int Tile) FusedGemmLaunchShape(int M, int N)
+        {
+            const int Tile = 16;
+            if (_maxWorkGroupSize > 0 && _maxWorkGroupSize < Tile * Tile)
+                throw new InvalidOperationException(
+                    $"Fused GEMM needs a {Tile}x{Tile} work-group; this device allows {_maxWorkGroupSize} work-items.");
+            return ((M + Tile - 1) / Tile * Tile, (N + Tile - 1) / Tile * Tile, Tile);
+        }
+
         private IGpuBuffer ExecuteFusedGemm(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K)
         {
             if (_context == null)
@@ -3468,24 +3488,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             // Fused kernels use 16x16 tiles with one thread per output element
             // Local work size must be 16x16 to match kernel's TILE_SIZE
-            const int FusedTileSize = 16;
-            int localSizeX = Math.Min(FusedTileSize, M);
-            int localSizeY = Math.Min(FusedTileSize, N);
-
-            // Ensure local sizes fit within GPU limits
-            while ((ulong)(localSizeX * localSizeY) > _maxWorkGroupSize && localSizeX > 1 && localSizeY > 1)
-            {
-                if (localSizeX >= localSizeY)
-                    localSizeX /= 2;
-                else
-                    localSizeY /= 2;
-            }
-
-            // Global size is M x N (one thread per output), padded to local size
-            int globalSizeX = ((M + localSizeX - 1) / localSizeX) * localSizeX;
-            int globalSizeY = ((N + localSizeY - 1) / localSizeY) * localSizeY;
-
-            kernel.Execute2D(globalSizeX, globalSizeY, localSizeX, localSizeY);
+            var (globalSizeX, globalSizeY, tile) = FusedGemmLaunchShape(M, N);
+            kernel.Execute2D(globalSizeX, globalSizeY, tile, tile);
             _context?.Finish();  // Sync when returning buffer for immediate use
 
             return C;
@@ -5105,8 +5109,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(5, N);
             kernel.SetArg(6, K);
 
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
-            kernel.Execute2DOnQueue(stream.Handle, M, N, localSizeX, localSizeY);
+            var (globalX, globalY, tile) = FusedGemmLaunchShape(M, N);
+            kernel.Execute2DOnQueue(stream.Handle, globalX, globalY, tile, tile);
         }
 
         /// <inheritdoc/>
