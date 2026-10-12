@@ -14,7 +14,7 @@ internal static partial class BatchExecutionCudaKernels
     public const string LaSymmetrize = "la_symmetrize", LaLuSolve = "la_lu_solve", LaLdlFactor = "la_ldl_factor",
         LaLdlSolve = "la_ldl_solve", LaSolveVector = "la_solve_vector", LaTriangularSolveVector = "la_tri_solve_vector",
         LaCholeskyBackwardLower = "la_cholesky_backward_lower", LaSolveBackwardVector = "la_solve_backward_vector",
-        LaSvdReduced = "la_svd_reduced";
+        LaSvdReduced = "la_svd_reduced", LaQrReduced = "la_qr_reduced";
 
     internal const string SolverSource = @"
 #define LA_MAXN 8
@@ -229,6 +229,53 @@ extern ""C"" __global__ __launch_bounds__(256) void la_solve_backward_vector(con
     for (int i = 0; i < n; i++) {
         gb[vo + i] = y[i];
         for (int j = 0; j < n; j++) ga[o + i * n + j] = -y[i] * xs[vo + j];
+    }
+}
+
+// QrDecomposition (reduced): Householder with alpha = -sign(x0) |x|, as LAPACK geqrf, so R's diagonal carries the
+// same signs as the CPU and PyTorch. work holds, per matrix, the m x n working copy (reflector j in column j from
+// row j down) followed by k betas and k diagonal entries of R.
+extern ""C"" __global__ __launch_bounds__(256) void la_qr_reduced(const float* a, float* q, float* r, float* work,
+    int batch, int m, int n) {
+    int b = bx_gid(); if (b >= batch) return;
+    int k = m < n ? m : n;
+    int ao = b * m * n; int wo = b * (m * n + 2 * k); int bo = wo + m * n; int dg = bo + k;
+    int qo = b * m * k; int ro = b * k * n;
+    for (int i = 0; i < m * n; i++) work[wo + i] = a[ao + i];
+    for (int j = 0; j < k; j++) {
+        float norm2 = 0.0f;
+        for (int i = j; i < m; i++) norm2 += work[wo + i * n + j] * work[wo + i * n + j];
+        float norm = sqrtf(norm2);
+        float x0 = work[wo + j * n + j];
+        float alpha = x0 > 0.0f ? -norm : (x0 < 0.0f ? norm : 0.0f);
+        if (x0 == 0.0f && alpha == 0.0f) alpha = norm;
+        work[wo + j * n + j] = x0 - alpha;
+        float vnorm2 = 0.0f;
+        for (int i = j; i < m; i++) vnorm2 += work[wo + i * n + j] * work[wo + i * n + j];
+        float beta = vnorm2 == 0.0f ? 0.0f : 2.0f / vnorm2;
+        work[bo + j] = beta;
+        work[dg + j] = alpha;
+        for (int c = j + 1; c < n; c++) {
+            float dot = 0.0f;
+            for (int i = j; i < m; i++) dot += work[wo + i * n + j] * work[wo + i * n + c];
+            float sc = beta * dot;
+            for (int i = j; i < m; i++) work[wo + i * n + c] -= sc * work[wo + i * n + j];
+        }
+    }
+    for (int i = 0; i < k; i++)
+        for (int c = 0; c < n; c++)
+            r[ro + i * n + c] = c < i ? 0.0f : (c == i ? work[dg + i] : work[wo + i * n + c]);
+    for (int i = 0; i < m; i++)
+        for (int c = 0; c < k; c++) q[qo + i * k + c] = i == c ? 1.0f : 0.0f;
+    for (int j = k - 1; j >= 0; j--) {
+        float beta = work[bo + j];
+        if (beta == 0.0f) continue;
+        for (int c = 0; c < k; c++) {
+            float dot = 0.0f;
+            for (int i = j; i < m; i++) dot += work[wo + i * n + j] * q[qo + i * k + c];
+            float sc = beta * dot;
+            for (int i = j; i < m; i++) q[qo + i * k + c] -= sc * work[wo + i * n + j];
+        }
     }
 }
 

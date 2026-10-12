@@ -260,7 +260,7 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             "bx_crop_2d_backward", "bx_sparsemax", "bx_mse_loss_rows", "bx_meshgrid2d",
             "bx_fft_chirp", "bx_fft_bluestein_pre", "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage",
             K.LaSymmetrize, K.LaLuSolve, K.LaLdlFactor, K.LaLdlSolve, K.LaSolveVector, K.LaTriangularSolveVector,
-            K.LaCholeskyBackwardLower, K.LaSolveBackwardVector, K.LaSvdReduced
+            K.LaCholeskyBackwardLower, K.LaSolveBackwardVector, K.LaSvdReduced, K.LaQrReduced
         };
     }
 }

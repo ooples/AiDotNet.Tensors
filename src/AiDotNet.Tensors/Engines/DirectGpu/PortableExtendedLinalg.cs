@@ -4,17 +4,27 @@ using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
-/// <see cref="IExtendedLinalgBackend"/> for every backend without CUDA's direct-PTX solver family (#1142). QR and the
-/// symmetric eigendecomposition run the backend's own <see cref="ILinalgBackend"/> kernels (Eigh after symmetrizing
-/// from the requested triangle, so both triangles are honoured); the rest run the shared <c>la_</c> kernels, ports of
-/// the managed references the engine otherwise falls back to. Kernels that factor in registers take matrices up to
-/// <see cref="K.LaMaxN"/> on a side; the substitution and LDL kernels work in the output buffer and take any size.
+/// <see cref="IExtendedLinalgBackend"/> for every backend without CUDA's direct-PTX solver family (#1142). The
+/// symmetric eigendecomposition runs the backend's own <see cref="ILinalgBackend.LinalgEigh"/> after symmetrizing from
+/// the requested triangle, so both triangles are honoured; everything else runs the shared <c>la_</c> kernels, ports
+/// of the managed references the engine otherwise falls back to. Kernels that factor in registers take matrices up to
+/// <see cref="K.LaMaxN"/> on a side; QR, LDL and the substitutions work in device memory and take any size.
 /// </summary>
 internal static class PortableExtendedLinalg
 {
-    public static void QrReduced(ILinalgBackend linalg, IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
-        int batchCount, int m, int n)
-        => linalg.LinalgQrReduced(input, q, r, batchCount, m, n);
+    /// <summary>
+    /// Householder QR as <c>QrDecomposition</c> and LAPACK <c>geqrf</c> compute it, so R's diagonal signs match the
+    /// CPU and PyTorch (Gram-Schmidt would force them positive). One thread per matrix over a device workspace.
+    /// </summary>
+    public static void QrReduced(IDirectGpuBackend backend, PortableGenericFft.Launcher launch, IGpuBuffer input,
+        IGpuBuffer q, IGpuBuffer r, int batchCount, int m, int n)
+    {
+        if (m < 1) throw new ArgumentOutOfRangeException(nameof(m));
+        if (!Validate(batchCount, n)) return;
+        int k = Math.Min(m, n);
+        using var work = backend.AllocateBuffer(checked(batchCount * (m * n + 2 * k)));
+        launch(K.LaQrReduced, batchCount, input, q, r, work, batchCount, m, n);
+    }
 
     public static void EighSymmetric(IDirectGpuBackend backend, ILinalgBackend linalg, PortableGenericFft.Launcher launch,
         IGpuBuffer input, IGpuBuffer eigenvalues, IGpuBuffer eigenvectors, int batchCount, int n, bool upper)

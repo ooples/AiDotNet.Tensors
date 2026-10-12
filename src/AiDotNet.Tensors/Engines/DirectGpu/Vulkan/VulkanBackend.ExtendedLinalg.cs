@@ -28,7 +28,7 @@ public sealed partial class VulkanBackend : IExtendedLinalgBackend
     }
 
     void IExtendedLinalgBackend.LinalgQrReducedDirect(IGpuBuffer input, IGpuBuffer q, IGpuBuffer r, int batchCount, int m, int n)
-        => P.QrReduced(this, input, q, r, batchCount, m, n);
+        => P.QrReduced(this, LaunchSolver, input, q, r, batchCount, m, n);
 
     void IExtendedLinalgBackend.LinalgSvdReduced(IGpuBuffer input, IGpuBuffer u, IGpuBuffer singularValues, IGpuBuffer vh,
         int batchCount, int m, int n)

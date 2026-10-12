@@ -728,6 +728,50 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
         }
     }
 }");
+    public static readonly string LaQrReduced = Shader(new[] { "r:a", "rw:q", "rw:r", "rw:work" }, "batch: i32, m: i32, n: i32", LaCommon + Main + @"
+    let b = i; let m = p.m; let n = p.n;
+    if (b >= p.batch) { return; }
+    let k = min(m, n);
+    let ao = b * m * n; let wo = b * (m * n + 2 * k); let bo = wo + m * n; let dg = bo + k;
+    let qo = b * m * k; let ro = b * k * n;
+    for (var t = 0; t < m * n; t++) { work[wo + t] = a[ao + t]; }
+    for (var j = 0; j < k; j++) {
+        var norm2 = 0.0;
+        for (var q2 = j; q2 < m; q2++) { norm2 += work[wo + q2 * n + j] * work[wo + q2 * n + j]; }
+        let norm = sqrt(norm2);
+        let x0 = work[wo + j * n + j];
+        var alpha = select(select(0.0, norm, x0 < 0.0), -norm, x0 > 0.0);
+        if (x0 == 0.0 && alpha == 0.0) { alpha = norm; }
+        work[wo + j * n + j] = x0 - alpha;
+        var vnorm2 = 0.0;
+        for (var q2 = j; q2 < m; q2++) { vnorm2 += work[wo + q2 * n + j] * work[wo + q2 * n + j]; }
+        let beta = select(2.0 / vnorm2, 0.0, vnorm2 == 0.0);
+        work[bo + j] = beta;
+        work[dg + j] = alpha;
+        for (var c = j + 1; c < n; c++) {
+            var dot = 0.0;
+            for (var q2 = j; q2 < m; q2++) { dot += work[wo + q2 * n + j] * work[wo + q2 * n + c]; }
+            let sc = beta * dot;
+            for (var q2 = j; q2 < m; q2++) { work[wo + q2 * n + c] -= sc * work[wo + q2 * n + j]; }
+        }
+    }
+    for (var t = 0; t < k; t++) {
+        for (var c = 0; c < n; c++) {
+            r[ro + t * n + c] = select(select(work[wo + t * n + c], work[dg + t], c == t), 0.0, c < t);
+        }
+    }
+    for (var t = 0; t < m; t++) { for (var c = 0; c < k; c++) { q[qo + t * k + c] = select(0.0, 1.0, t == c); } }
+    for (var j = k - 1; j >= 0; j--) {
+        let beta = work[bo + j];
+        if (beta == 0.0) { continue; }
+        for (var c = 0; c < k; c++) {
+            var dot = 0.0;
+            for (var q2 = j; q2 < m; q2++) { dot += work[wo + q2 * n + j] * q[qo + q2 * k + c]; }
+            let sc = beta * dot;
+            for (var q2 = j; q2 < m; q2++) { q[qo + q2 * k + c] -= sc * work[wo + q2 * n + j]; }
+        }
+    }
+}");
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
@@ -750,6 +794,7 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
         [BatchExecutionCudaKernels.LaSolveVector] = LaSolveVector, [BatchExecutionCudaKernels.LaTriangularSolveVector] = LaTriangularSolveVector,
         [BatchExecutionCudaKernels.LaCholeskyBackwardLower] = LaCholeskyBackwardLower,
         [BatchExecutionCudaKernels.LaSolveBackwardVector] = LaSolveBackwardVector, [BatchExecutionCudaKernels.LaSvdReduced] = LaSvdReduced,
+        [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
     };
 }
 #endif
