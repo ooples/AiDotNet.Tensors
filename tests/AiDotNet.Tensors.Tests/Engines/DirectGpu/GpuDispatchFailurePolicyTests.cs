@@ -53,7 +53,7 @@ public sealed class GpuDispatchFailurePolicyTests
             float[] expected = Input().ToArray().Select(MathF.Tanh).ToArray();
             float[] actual = y.ToArray();
             for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i], 6);
-            Assert.Contains(GpuLaunchProbe.Fallbacks, f => f.StartsWith("TensorTanh", StringComparison.Ordinal));
+            Assert.Contains(GpuLaunchProbe.Fallbacks, f => f.Contains("TensorTanh: " + (namedGap ? "GpuCapabilityUnavailableException" : "NotSupportedException"), StringComparison.Ordinal));
         }
     }
 
