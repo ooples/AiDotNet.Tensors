@@ -270,3 +270,9 @@ public class TorchParityElementwiseVulkanDeviceTests : TorchParityElementwiseDev
 {
     public TorchParityElementwiseVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }
+
+[Collection("DirectGpuSerial")]
+public class TorchParityElementwiseHipDeviceTests : TorchParityElementwiseDeviceTestsBase, IClassFixture<HipTensorEngineTestFixture>
+{
+    public TorchParityElementwiseHipDeviceTests(HipTensorEngineTestFixture fixture) : base(fixture) { }
+}

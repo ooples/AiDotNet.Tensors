@@ -397,6 +397,7 @@ public sealed partial class HipBackend
         IntPtr pI = input.Handle, pO = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &pI; args[1] = &pO; args[2] = &rows; args[3] = &cols;
+        GpuLaunchProbe.OnLaunch();
         HipNativeBindings.hipModuleLaunchKernel(kernel, grid, 1, 1, (uint)blockSize, 1, 1,
             (uint)sharedMem, IntPtr.Zero, (IntPtr)args, IntPtr.Zero);
     }

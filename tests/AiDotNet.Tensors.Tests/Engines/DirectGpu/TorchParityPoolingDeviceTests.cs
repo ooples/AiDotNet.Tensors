@@ -92,3 +92,9 @@ public class TorchParityPoolingVulkanDeviceTests : TorchParityPoolingDeviceTests
 {
     public TorchParityPoolingVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }
+
+[Collection("DirectGpuSerial")]
+public class TorchParityPoolingHipDeviceTests : TorchParityPoolingDeviceTestsBase, IClassFixture<HipTensorEngineTestFixture>
+{
+    public TorchParityPoolingHipDeviceTests(HipTensorEngineTestFixture fixture) : base(fixture) { }
+}

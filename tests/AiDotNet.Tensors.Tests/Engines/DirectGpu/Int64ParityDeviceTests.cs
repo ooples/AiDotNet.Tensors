@@ -197,3 +197,9 @@ public class Int64ParityVulkanDeviceTests : Int64ParityDeviceTestsBase, IClassFi
 {
     public Int64ParityVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }
+
+[Collection("DirectGpuSerial")]
+public class Int64ParityHipDeviceTests : Int64ParityDeviceTestsBase, IClassFixture<HipTensorEngineTestFixture>
+{
+    public Int64ParityHipDeviceTests(HipTensorEngineTestFixture fixture) : base(fixture) { }
+}

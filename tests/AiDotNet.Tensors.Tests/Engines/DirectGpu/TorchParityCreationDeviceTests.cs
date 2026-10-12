@@ -130,3 +130,9 @@ public class TorchParityCreationVulkanDeviceTests : TorchParityCreationDeviceTes
 {
     public TorchParityCreationVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }
+
+[Collection("DirectGpuSerial")]
+public class TorchParityCreationHipDeviceTests : TorchParityCreationDeviceTestsBase, IClassFixture<HipTensorEngineTestFixture>
+{
+    public TorchParityCreationHipDeviceTests(HipTensorEngineTestFixture fixture) : base(fixture) { }
+}
