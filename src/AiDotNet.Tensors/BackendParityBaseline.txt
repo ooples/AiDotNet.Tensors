@@ -2,11 +2,6 @@
 // The analyzer fails the build on a stale entry, so this file may only shrink.
 // Format: capability <Interface> <Backend> #issue   |   stub <Backend>.<Member> #issue
 
-capability IFusedAttentionBackend HipBackend #1179
-capability IFusedAttentionBackend MetalBackend #1179
-capability IFusedAttentionBackend OpenClBackend #1179
-capability IFusedAttentionBackend VulkanBackend #1179
-capability IFusedAttentionBackend WebGpuBackend #1179
 capability IFusedLstmSequenceTraining MetalBackend #1107
 capability IFusedLstmSequenceTraining WebGpuBackend #1108
 capability ITorchParityElementwiseBackend HipBackend #1124

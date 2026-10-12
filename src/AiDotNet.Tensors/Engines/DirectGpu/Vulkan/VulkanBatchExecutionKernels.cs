@@ -33,7 +33,8 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
     /// runs the same code as HIP, OpenCL and Metal: each pointer parameter becomes a storage buffer of the same name
     /// (read-only when const), each scalar a push constant in order, and the float builtins their GLSL names.
     /// </summary>
-    public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(BatchExecutionCudaKernels.SolverSource);
+    public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(
+        BatchExecutionCudaKernels.SolverSource + BatchExecutionCudaKernels.AttentionSource);
 
     private static Dictionary<string, string> TranslateSolvers(string cuda)
     {
@@ -48,8 +49,8 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             int end = k + 1 < kernels.Count ? kernels[k + 1].Index : cuda.Length;
             string body = cuda.Substring(kernel.Index + kernel.Length, end - kernel.Index - kernel.Length)
                 .Replace("__uint_as_float(", "uintBitsToFloat(");
-            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax)f\(",
-                m => m.Groups[1].Value == "sqrt" ? "sqrt(" : m.Groups[1].Value == "fabs" ? "abs(" : "max(",
+            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax|exp|log|tanh)f\(",
+                m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
                 RegexOptions.None, RegexTimeout);
             var buffers = new List<string>();
             var push = new StringBuilder();
