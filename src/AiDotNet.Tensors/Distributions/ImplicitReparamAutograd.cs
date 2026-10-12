@@ -37,8 +37,10 @@ public static class ImplicitReparamAutograd
         if (rng is null) throw new ArgumentNullException(nameof(rng));
 
         var output = new Tensor<float>((int[])alpha._shape.Clone());
-        var aSpan = alpha.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var aSpanLease = alpha.Lease();
+        var aSpan = aSpanLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < aSpan.Length; i++)
             dst[i] = GammaFamilyDistributions_MarsagliaTsangProxy(rng, aSpan[i]);
 
@@ -47,7 +49,8 @@ public static class ImplicitReparamAutograd
         // Snapshot α so backward sees the values that produced these
         // samples even if α gets mutated downstream.
         var alphaSnapshot = new Tensor<float>((int[])alpha._shape.Clone());
-        aSpan.CopyTo(alphaSnapshot.AsWritableSpan());
+        using var alphaSnapshotKeep1 = new KeepAliveScope(alphaSnapshot);
+        aSpan.CopyTo(alphaSnapshot.AsWritableSpanUnmarked());
         var savedState = new object[] { alphaSnapshot };
         DifferentiableOps.RecordUnary(
             "GammaRSample",
@@ -69,9 +72,12 @@ public static class ImplicitReparamAutograd
         if (alpha.Length != beta.Length) throw new ArgumentException("alpha and beta length mismatch.");
 
         var output = new Tensor<float>((int[])alpha._shape.Clone());
-        var aSpan = alpha.AsSpan();
-        var bSpan = beta.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var aSpanLease = alpha.Lease();
+        var aSpan = aSpanLease.Span;
+        using var bSpanLease = beta.Lease();
+        var bSpan = bSpanLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < aSpan.Length; i++)
         {
             float ga = GammaFamilyDistributions_MarsagliaTsangProxy(rng, aSpan[i]);
@@ -82,9 +88,11 @@ public static class ImplicitReparamAutograd
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
         var alphaSnapshot = new Tensor<float>((int[])alpha._shape.Clone());
-        aSpan.CopyTo(alphaSnapshot.AsWritableSpan());
+        using var alphaSnapshotKeep2 = new KeepAliveScope(alphaSnapshot);
+        aSpan.CopyTo(alphaSnapshot.AsWritableSpanUnmarked());
         var betaSnapshot = new Tensor<float>((int[])beta._shape.Clone());
-        bSpan.CopyTo(betaSnapshot.AsWritableSpan());
+        using var betaSnapshotKeep1 = new KeepAliveScope(betaSnapshot);
+        bSpan.CopyTo(betaSnapshot.AsWritableSpanUnmarked());
         var savedState = new object[] { alphaSnapshot, betaSnapshot };
         DifferentiableOps.RecordBinary(
             "BetaRSample",
@@ -110,8 +118,10 @@ public static class ImplicitReparamAutograd
 
         int batch = concentration.Length / k;
         var output = new Tensor<float>((int[])concentration._shape.Clone());
-        var aSpan = concentration.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var aSpanLease = concentration.Lease();
+        var aSpan = aSpanLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
 
         // Capture the underlying Gamma samples so backward can chain-rule
         // through the normalisation.
@@ -134,7 +144,8 @@ public static class ImplicitReparamAutograd
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
         var alphaSnapshot = new Tensor<float>((int[])concentration._shape.Clone());
-        aSpan.CopyTo(alphaSnapshot.AsWritableSpan());
+        using var alphaSnapshotKeep3 = new KeepAliveScope(alphaSnapshot);
+        aSpan.CopyTo(alphaSnapshot.AsWritableSpanUnmarked());
         var savedState = new object[] { alphaSnapshot, gammaSamples, gammaSums, k };
         DifferentiableOps.RecordUnary(
             "DirichletRSample",
@@ -156,10 +167,14 @@ public static class ImplicitReparamAutograd
         var alpha = inputs[0];
         var alphaSnapshot = (Tensor<float>)savedState[0];
         var gradAlpha = new Tensor<float>((int[])alpha._shape.Clone());
-        var aSpan = alphaSnapshot.AsSpan();
-        var xSpan = output.AsSpan();
-        var goSpan = gradOutput.AsSpan();
-        var dst = gradAlpha.AsWritableSpan();
+        using var aSpanLease = alphaSnapshot.Lease();
+        var aSpan = aSpanLease.Span;
+        using var xSpanLease = output.Lease();
+        var xSpan = xSpanLease.Span;
+        using var goSpanLease = gradOutput.Lease();
+        var goSpan = goSpanLease.Span;
+        using var dstLease = gradAlpha.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < aSpan.Length; i++)
         {
             // d output_i / d alpha_i — only diagonal contribution
@@ -184,12 +199,18 @@ public static class ImplicitReparamAutograd
         var betaSnapshot = (Tensor<float>)savedState[1];
         var gradAlpha = new Tensor<float>((int[])alpha._shape.Clone());
         var gradBeta = new Tensor<float>((int[])beta._shape.Clone());
-        var aSpan = alphaSnapshot.AsSpan();
-        var bSpan = betaSnapshot.AsSpan();
-        var xSpan = output.AsSpan();
-        var goSpan = gradOutput.AsSpan();
-        var dstA = gradAlpha.AsWritableSpan();
-        var dstB = gradBeta.AsWritableSpan();
+        using var aSpanLease = alphaSnapshot.Lease();
+        var aSpan = aSpanLease.Span;
+        using var bSpanLease = betaSnapshot.Lease();
+        var bSpan = bSpanLease.Span;
+        using var xSpanLease = output.Lease();
+        var xSpan = xSpanLease.Span;
+        using var goSpanLease = gradOutput.Lease();
+        var goSpan = goSpanLease.Span;
+        using var dstALease = gradAlpha.LeaseWritable();
+        var dstA = dstALease.Span;
+        using var dstBLease = gradBeta.LeaseWritable();
+        var dstB = dstBLease.Span;
         for (int i = 0; i < aSpan.Length; i++)
         {
             float dXdA = ImplicitReparamMath.BetaSampleDerivAlpha(aSpan[i], bSpan[i], xSpan[i]);
@@ -216,9 +237,12 @@ public static class ImplicitReparamAutograd
         int k = (int)savedState[3];
 
         var gradAlpha = new Tensor<float>((int[])alpha._shape.Clone());
-        var aSpan = alphaSnapshot.AsSpan();
-        var goSpan = gradOutput.AsSpan();
-        var dst = gradAlpha.AsWritableSpan();
+        using var aSpanLease = alphaSnapshot.Lease();
+        var aSpan = aSpanLease.Span;
+        using var goSpanLease = gradOutput.Lease();
+        var goSpan = goSpanLease.Span;
+        using var dstLease = gradAlpha.LeaseWritable();
+        var dst = dstLease.Span;
         int batch = alpha.Length / k;
         for (int b = 0; b < batch; b++)
         {

@@ -166,10 +166,12 @@ public sealed class CpuSparseEngine : ISparseEngine
             Format = BlasManaged.SparseLayoutFormat.Csr,
         };
         int n = dense.Columns;
+        using var denseKeep1 = new KeepAliveScope(dense);
+        using var resultKeep1 = new KeepAliveScope(result);
         BlasManaged.BlasManaged.SpMM<TU>(
             ops.One, layout,
-            dense.AsSpan(), n, n,
-            ops.Zero, result.AsWritableSpan(), n);
+            dense.AsSpanUnmarked(), n, n,
+            ops.Zero, result.AsWritableSpanUnmarked(), n);
 
         return result;
     }

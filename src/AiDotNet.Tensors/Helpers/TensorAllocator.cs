@@ -483,15 +483,16 @@ public static class TensorAllocator
             // Exactly totalSize elements (see RentExactArray), so there is no padding to carry a
             // previous renter's bytes; clearing it gives Rent's zero-init contract.
             Array.Clear(cached, 0, cached.Length);
-            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false);
         }
 
-        // Tier 3: pooled sizes get an exact-size array marked as pooled, so Return can recycle it.
+        // Tier 3: pooled sizes get an exact-size array marked as pooled, so Return can recycle it. A large miss
+        // takes the array of a collected result first (ResultBufferTracker), cleared for Rent's zero-init contract.
         if (UsesArrayPool<T>(totalSize))
         {
             MemoryProfiler.RecordAllocation(
                 "TensorAllocator", bytesIfTracking, shape, typeof(T).Name);
-            T[] pooled = new T[totalSize];
+            T[] pooled = RentExactArray<T>(totalSize, zeroed: true);
             return Tensor<T>.FromPooledMemory(new Memory<T>(pooled), shape, pooled);
         }
 
@@ -546,7 +547,7 @@ public static class TensorAllocator
             // there is no padding past the logical region for a previous renter's bytes to sit in.
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 Array.Clear(cached, 0, cached.Length);
-            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false);
         }
 
         if (UsesArrayPool<T>(totalSize))
@@ -696,6 +697,8 @@ public static class TensorAllocator
         // Zero-copy path: if the Vector's backing array is exactly totalSize,
         // wrap it directly — no allocation, no copy. This is the common case when
         // callers do: var arr = new T[n]; compute(arr); Rent(shape, new Vector<T>(arr))
+        // Read only to wrap it zero-copy: the tensor built over it attaches the array's result owner (if any), so this
+        // is not an escape.
         T[]? backingArray = data._cachedArray;
         if (backingArray is not null && backingArray.Length == totalSize)
         {
