@@ -276,7 +276,12 @@ void main()
     // A double parameter arrives as two push-constant words (low, high).
     // ------------------------------------------------------------------------------------------------------------
 
-    private const string Unpack = "double U(uint lo, uint hi) { return packDouble2x32(uvec2(lo, hi)); }\n";
+    // A double built from push-constant words must not reach the driver as a uniform value: AMD's Windows Vulkan
+    // compiler (gfx1012) stores such a double correctly but computes with it as if its bits were 1 (d + d gave the bit
+    // pattern 2), which turned arange into zeros and logspace into ones. OR-ing in gl_WorkGroupID.y, always 0 for these
+    // one-dimensional dispatches but unknown to the compiler, makes the words per-invocation and the arithmetic exact.
+    private const string Unpack =
+        "double U(uint lo, uint hi) { uint z = gl_WorkGroupID.y; return packDouble2x32(uvec2(lo | z, hi | z)); }\n";
 
     /// <summary>arange / range / linspace-style points: start + i * span / denominator.</summary>
     public static string Range => Cached("range", () => DoubleShader(@"
@@ -817,7 +822,8 @@ layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
 " + FlagSlots(2) + @"
 layout(push_constant) uniform P { uint n; uint totalLo; uint totalHi; uint strideLo; uint strideHi; uint extentLo; uint extentHi; int validate; };
 ", @"
-int64_t L(uint lo, uint hi) { return int64_t((uint64_t(hi) << 32) | uint64_t(lo)); }
+// Laundered through gl_WorkGroupID.y (always 0 here) for the same uniform-64-bit miscompile as U above.
+int64_t L(uint lo, uint hi) { uint z = gl_WorkGroupID.y; return int64_t((uint64_t(hi | z) << 32) | uint64_t(lo | z)); }
 
 void main()
 {
@@ -966,12 +972,13 @@ layout(set = 0, binding = 2) writeonly buffer O { int o[]; };
 " + FlagSlots(3) + @"
 layout(push_constant) uniform P { uint n; int op; };
 ", @"
-int64_t parity_gcd(int64_t x, int64_t y)
+// The loop runs in uint64: AMD's Windows Vulkan compiler (gfx1012) returns a signed int64 loop variable with its low
+// word copied into the high word (gcd(100, 7) came back as 0x100000001); unsigned loop variables come through intact.
+int64_t parity_gcd(int64_t x0, int64_t y0)
 {
-    x = x < 0L ? -x : x;
-    y = y < 0L ? -y : y;
-    while (y != 0L) { int64_t t = x % y; x = y; y = t; }
-    return x;
+    uint64_t x = uint64_t(x0 < 0L ? -x0 : x0), y = uint64_t(y0 < 0L ? -y0 : y0);
+    while (y != 0UL) { uint64_t t = x % y; x = y; y = t; }
+    return int64_t(x);
 }
 
 void main()
@@ -1040,12 +1047,13 @@ layout(set = 0, binding = 2) writeonly buffer O { int64_t o[]; };
 layout(push_constant) uniform P { uint n; int op; int t; };
 ", Int64Narrow + @"
 // Both operands are non-negative here: the caller rejects long.MinValue before taking magnitudes.
-int64_t parity_gcd(int64_t x, int64_t y)
+// The loop runs in uint64: AMD's Windows Vulkan compiler (gfx1012) returns a signed int64 loop variable with its low
+// word copied into the high word (gcd(100, 7) came back as 0x100000001); unsigned loop variables come through intact.
+int64_t parity_gcd(int64_t x0, int64_t y0)
 {
-    x = x < 0L ? -x : x;
-    y = y < 0L ? -y : y;
-    while (y != 0L) { int64_t r = x % y; x = y; y = r; }
-    return x;
+    uint64_t x = uint64_t(x0 < 0L ? -x0 : x0), y = uint64_t(y0 < 0L ? -y0 : y0);
+    while (y != 0UL) { uint64_t t = x % y; x = y; y = t; }
+    return int64_t(x);
 }
 
 void main()
