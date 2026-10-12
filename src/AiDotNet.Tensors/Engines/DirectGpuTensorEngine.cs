@@ -1526,21 +1526,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private static void DisposeBufferAfterQueuedUse(IDirectGpuBackend backend, IGpuBuffer buffer)
     {
-        if (backend is DirectGpu.CUDA.CudaBackend cudaBackend)
-        {
-            cudaBackend.FreeBufferDeferred(buffer);
-        }
-        else if (backend is DirectGpu.HIP.HipBackend hipBackend)
-        {
-            // HIP has no event-ordered release here, and hipFree does not wait for work queued on a non-default
-            // stream, so drain the queue before the buffer can go back to the allocator.
-            hipBackend.Synchronize();
-            buffer.Dispose();
-        }
-        else
-        {
-            buffer.Dispose();
-        }
+        if (backend is IQueuedBufferRelease release) release.ReleaseAfterQueuedWork(buffer);
+        else buffer.Dispose();
     }
 
     private static void ConvertInverseStandardDeviationToVariance(

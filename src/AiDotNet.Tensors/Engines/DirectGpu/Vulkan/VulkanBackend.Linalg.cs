@@ -6,6 +6,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend : ILinalgBackend
 {
+    /// <inheritdoc/>
+    /// <remarks>The GLSL kernels compile at dispatch through the runtime compiler, so readiness is that compiler.</remarks>
+    public bool LinalgKernelsReady => IsGlslCompilerAvailable;
+
+    /// <inheritdoc/>
+    /// <remarks>The Eigh kernel provisions 64 x 64 workgroup arrays.</remarks>
+    public int LinalgEighMaxN => 64;
+
     public void LinalgCholesky(
         IGpuBuffer input, IGpuBuffer output, IGpuBuffer info,
         int batchCount, int n, bool upper)

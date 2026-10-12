@@ -28,16 +28,12 @@ cast DirectGpuTensorEngine.AbcScanForward CudaBackend #1154
 cast DirectGpuTensorEngine.AddGroupNormInto CudaBackend #1154
 cast DirectGpuTensorEngine.AllocateReclaiming CudaBackend #1154
 cast DirectGpuTensorEngine.AllocateStreamOrderedScratch CudaBackend #1154
-cast DirectGpuTensorEngine.BackendEighMaxN WebGpuBackend #1154
-cast DirectGpuTensorEngine.BackendLinalgReady OpenClBackend #1154
 cast DirectGpuTensorEngine.BindResidentBuffer CudaBackend #1154
 cast DirectGpuTensorEngine.CaptureGpuGraph CudaBackend #1154
 cast DirectGpuTensorEngine.Conv2DInto CudaBackend #1154
 cast DirectGpuTensorEngine.ConvTranspose2D CudaBackend #1154
 cast DirectGpuTensorEngine.DepthwiseConv2D CudaBackend #1154
 cast DirectGpuTensorEngine.DestroyGpuGraph CudaBackend #1154
-cast DirectGpuTensorEngine.DisposeBufferAfterQueuedUse CudaBackend #1154
-cast DirectGpuTensorEngine.DisposeBufferAfterQueuedUse HipBackend #1154
 cast DirectGpuTensorEngine.EnsureResidentInput CudaBackend #1154
 cast DirectGpuTensorEngine.EnterResidentCaptureScope CudaBackend #1154
 cast DirectGpuTensorEngine.FlashAttention CudaBackend #1154
