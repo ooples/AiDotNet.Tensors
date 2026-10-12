@@ -8,5 +8,4 @@ capability ITorchParityElementwiseBackend HipBackend #1124
 capability ITorchParityElementwiseBackend MetalBackend #1125
 capability ITorchParityElementwiseBackend WebGpuBackend #1128
 
-// TENS0007: library code reaching a capability through a concrete backend class (#1154).
 
