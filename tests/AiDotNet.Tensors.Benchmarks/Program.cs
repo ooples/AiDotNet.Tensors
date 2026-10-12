@@ -1397,6 +1397,47 @@ class Program
             return;
         }
 
+        // A forward that keeps its intermediates alive until it ends, with no gradient tape: how many driver
+        // allocations it pays per forward, and whether device buffers pile up, as the loop runs
+        if (args[0] == "--vulkan-forward-lifetime")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
+            int depth = args.Length > 1 ? int.Parse(args[1]) : 60;
+            int forwards = args.Length > 2 ? int.Parse(args[2]) : 400;
+            var a = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
+            var b = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
+            for (int i = 0; i < a.Length; i++) { a[i] = (i % 7) * 0.01f; b[i] = 0.5f; }
+            var ga = eng.TensorAdd(a, b);
+            var gb = eng.TensorMultiply(a, b);
+            var pool = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.Pool;
+            [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+            void Forward()
+            {
+                var live = new List<AiDotNet.Tensors.LinearAlgebra.Tensor<float>>(depth);
+                var x = ga;
+                for (int i = 0; i < depth; i++)
+                {
+                    x = (i % 3) switch { 0 => eng.TensorAdd(x, gb), 1 => eng.ReLU(x), _ => eng.TensorMultiply(x, gb) };
+                    live.Add(x);
+                }
+                GC.KeepAlive(live);
+            }
+            int block = forwards / 8;
+            for (int k = 0; k < 8; k++)
+            {
+                long d0 = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.DriverAllocations;
+                int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int f = 0; f < block; f++) Forward();
+                double ms = sw.Elapsed.TotalMilliseconds / block;
+                long d1 = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.DriverAllocations;
+                Console.WriteLine($"VKFWD depth={depth} forwards {k * block}-{(k + 1) * block - 1}: {ms:F2} ms per forward, {(d1 - d0) / (double)block:F1} driver allocations per forward (total {d1}), pooled {pool.PooledCount}, collections gen0 {GC.CollectionCount(0) - g0} gen1 {GC.CollectionCount(1) - g1} gen2 {GC.CollectionCount(2) - g2}");
+            }
+            return;
+        }
+
         // Which collection returns a dropped engine result's device buffer to the Vulkan pool
         if (args[0] == "--vulkan-result-lifetime")
         {
