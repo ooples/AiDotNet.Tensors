@@ -12,46 +12,31 @@ public sealed partial class VulkanBackend : IMeshgridBackend
 {
     private static uint Bits(int value) => unchecked((uint)value);
 
-    private readonly List<VulkanComputePipeline> _batchRecordedPipelines = new List<VulkanComputePipeline>();
-    private Action? _flushPendingBatchAction;
+    // The descriptor set each dispatch recorded into the open batch bound, held until the batch has executed.
+    private readonly List<(VulkanComputePipeline Pipeline, IntPtr DescriptorSet)> _batchDescriptorSets =
+        new List<(VulkanComputePipeline, IntPtr)>();
 
     /// <summary>
-    /// Every pipeline owns one descriptor set, and a recorded dispatch reads it only when the batch is submitted.
-    /// Marking the pipeline makes its next <see cref="VulkanComputePipeline.UpdateDescriptorSet"/> submit the batch
-    /// first, so reusing a kernel on other buffers inside a batch cannot retarget the earlier dispatch.
+    /// A recorded dispatch reads its descriptor set only when the batch is submitted, so each one keeps its own:
+    /// the pipeline's current set is retained for it, and reusing the same kernel on other buffers later in the
+    /// batch writes a different set (see <see cref="VulkanComputePipeline.RetainDescriptorSet"/>).
     /// </summary>
-    private void TrackBatchPipeline(VulkanComputePipeline pipeline)
+    private IntPtr RetainBatchDescriptorSet(VulkanComputePipeline pipeline)
     {
-        if (_batchRecordedPipelines.Contains(pipeline)) return;
-        pipeline.MarkRecordedInBatch(_flushPendingBatchAction ??= FlushPendingBatch);
-        _batchRecordedPipelines.Add(pipeline);
+        IntPtr set = pipeline.RetainDescriptorSet();
+        _batchDescriptorSets.Add((pipeline, set));
+        return set;
     }
 
-    private void ClearBatchMarks()
+    /// <summary>Hands the batch's descriptor sets back once it has executed.</summary>
+    private void ReleaseBatchDescriptorSets()
     {
-        foreach (var pipeline in _batchRecordedPipelines) pipeline.ClearBatchMark();
-        _batchRecordedPipelines.Clear();
+        foreach (var (pipeline, set) in _batchDescriptorSets) pipeline.ReleaseDescriptorSet(set);
+        _batchDescriptorSets.Clear();
     }
 
-    /// <summary>Submits what the batch has recorded so far and reopens its command buffer for the rest.</summary>
-    private unsafe void FlushPendingBatch()
-    {
-        if (!_batchMode || Environment.CurrentManagedThreadId != _batchOwnerThreadId || _batchDispatchCount == 0) return;
-        var cmdBuffer = _batchThreadRes.CommandBuffer;
-        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
-        _device.SubmitAndWait(cmdBuffer, _batchThreadRes.Fence);
-        ClearBatchMarks();
-        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
-        var beginInfo = new VkCommandBufferBeginInfo
-        {
-            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            pNext = null,
-            flags = VkCommandBufferUsageFlags.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            pInheritanceInfo = null
-        };
-        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
-        _batchDispatchCount = 0;
-    }
+    /// <summary>Dispatches recorded into the open batch, for tests.</summary>
+    internal int BatchDispatchCount => _batchDispatchCount;
 
     private void FullReduce(IGpuBuffer input, IGpuBuffer output, int size, int mode, float maxVal)
         => GlslNaryOp(S.FullReduce, new[] { input, output }, K.FullReduceBlockSize, new[] { Bits(size), Bits(mode), FloatBits(maxVal) });
