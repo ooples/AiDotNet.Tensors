@@ -24,7 +24,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAcosh", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorAcosh", ex); }
         return base.TensorAcosh(tensor);
     }
 
@@ -42,7 +42,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAsinh", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorAsinh", ex); }
         return base.TensorAsinh(tensor);
     }
 
@@ -60,7 +60,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorExp2", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorExp2", ex); }
         return base.TensorExp2(tensor);
     }
 
@@ -78,7 +78,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorExpm1", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorExpm1", ex); }
         return base.TensorExpm1(tensor);
     }
 
@@ -96,7 +96,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorLog10", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorLog10", ex); }
         return base.TensorLog10(tensor);
     }
 
@@ -114,7 +114,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorLog1p", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorLog1p", ex); }
         return base.TensorLog1p(tensor);
     }
 
@@ -132,7 +132,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorLog2", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorLog2", ex); }
         return base.TensorLog2(tensor);
     }
 
@@ -160,7 +160,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorRsqrt", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorRsqrt", ex); }
         return base.TensorRsqrt(tensor);
     }
 
@@ -178,7 +178,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorTan", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorTan", ex); }
         return base.TensorTan(tensor);
     }
 
@@ -196,7 +196,7 @@ public partial class DirectGpuTensorEngine
                 return output;
             }
         }
-        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorTrunc", ex); }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TensorTrunc", ex); }
         return base.TensorTrunc(tensor);
     }
 }

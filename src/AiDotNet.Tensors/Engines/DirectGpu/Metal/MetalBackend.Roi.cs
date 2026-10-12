@@ -7,7 +7,7 @@ public sealed partial class MetalBackend : IRoiBackend
     private MetalPipelineState GetRoiPipeline(string n)
     {
         if (_roiLibrary == IntPtr.Zero)
-            throw new InvalidOperationException("Metal RoI library was not compiled.");
+            throw new GpuCapabilityUnavailableException("Metal RoI library was not compiled.");
         return GetPipeline(RoiLibName, _roiLibrary, n);
     }
 

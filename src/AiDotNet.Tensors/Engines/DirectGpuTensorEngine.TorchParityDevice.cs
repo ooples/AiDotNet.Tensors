@@ -35,8 +35,7 @@ public partial class DirectGpuTensorEngine
             backend.Synchronize();
             return result;
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(imaginary ? "TensorImag" : "TensorReal", ex);
             return null;
         }
@@ -60,8 +59,7 @@ public partial class DirectGpuTensorEngine
             backend.Synchronize();
             return result;
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorViewAsReal", ex);
             return base.TensorViewAsReal(input);
         }
@@ -132,8 +130,7 @@ public partial class DirectGpuTensorEngine
             var outShape = x._shape.Take(x.Rank - dims).Concat(plan.OutputSize).ToArray();
             return (Reshape(values, outShape), new Tensor<int>(indices, outShape));
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }
@@ -154,8 +151,7 @@ public partial class DirectGpuTensorEngine
             var padded = TensorConcatenate(new[] { Reshape(input, new[] { input.Length }), new Tensor<T>(new[] { 1 }) }, 0);
             return Reshape(TensorTake(padded, new Tensor<int>(map, new[] { map.Length })), shape);
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TensorMaxUnpool", ex);
             return base.TensorMaxUnpool(input, indices, outputSize);
         }

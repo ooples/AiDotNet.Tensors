@@ -140,7 +140,7 @@ public sealed partial class OpenClBackend
     {
         if (_disposed) throw new ObjectDisposedException(nameof(OpenClBackend));
         if (_context is null || !IsAvailable)
-            throw new InvalidOperationException("OpenCL context not available.");
+            throw new GpuCapabilityUnavailableException("OpenCL context not available.");
         if (sourceKernel is null) throw new ArgumentNullException(nameof(sourceKernel));
         if (inputs is null) throw new ArgumentNullException(nameof(inputs));
         if (outputs is null) throw new ArgumentNullException(nameof(outputs));
@@ -173,7 +173,7 @@ public sealed partial class OpenClBackend
         string parameterName)
     {
         DirectOpenClContext context = _context ??
-            throw new InvalidOperationException("OpenCL context not available.");
+            throw new GpuCapabilityUnavailableException("OpenCL context not available.");
         for (int i = 0; i < buffers.Count; i++)
         {
             if (buffers[i] is not DirectOpenClGpuBuffer buffer ||
@@ -201,7 +201,7 @@ public sealed partial class OpenClBackend
     private CompiledOpenClCodegenKernel GetOrCompileCodegenKernel(GpuSourceKernel sourceKernel)
     {
         DirectOpenClContext context = _context ??
-            throw new InvalidOperationException("OpenCL context not available.");
+            throw new GpuCapabilityUnavailableException("OpenCL context not available.");
         string key = EvolutionHash.Combine(new[]
         {
             "opencl-codegen-v1",
@@ -253,7 +253,7 @@ public sealed partial class OpenClBackend
             CalculateOptimalWorkGroupSize1D(elementCount),
             localElementBytes: 0);
         DirectOpenClContext context = _context ??
-            throw new InvalidOperationException("OpenCL context not available.");
+            throw new GpuCapabilityUnavailableException("OpenCL context not available.");
         UIntPtr preferredResult = OpenClNativeBindings.GetKernelWorkGroupInfoSizeT(
             kernel.Handle,
             context.Device,

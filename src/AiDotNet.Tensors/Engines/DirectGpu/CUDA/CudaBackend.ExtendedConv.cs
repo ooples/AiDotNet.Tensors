@@ -12,7 +12,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
     {
         if (numGaussians <= 0) return;
         if (!_kernelCache.TryGetValue("gaussian_covariance", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: gaussian_covariance");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gaussian_covariance");
         using var _ = PushContext();
         uint gridDim = (uint)((numGaussians + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr r = rotations.Handle, s = scales.Handle, c = covariances.Handle;
@@ -30,7 +30,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         if (TryDirectPtxSphericalHarmonics(shCoefficients, viewDirections, output, numPoints, basisCount, numChannels, degree, broadcastDir)) return;
 
         if (!_kernelCache.TryGetValue("spherical_harmonics", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: spherical_harmonics");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: spherical_harmonics");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr sh = shCoefficients.Handle, vd = viewDirections.Handle, o = output.Handle;
@@ -50,7 +50,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         if (TryDirectPtxSphericalHarmonicsBackward(shCoefficients, viewDirections, outputGradient, shGrad, numPoints, basisCount, numChannels, degree, broadcastDir)) return;
 
         if (!_kernelCache.TryGetValue("spherical_harmonics_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: spherical_harmonics_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: spherical_harmonics_backward");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr sh = shCoefficients.Handle, vd = viewDirections.Handle, og = outputGradient.Handle, sg = shGrad.Handle;
@@ -80,7 +80,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
     {
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pa = a.Handle, pb = b.Handle, pc = c.Handle;
@@ -102,7 +102,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
     {
         if (batch * channels * outDepth <= 0) return;
         if (!_kernelCache.TryGetValue("avgpool3d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: avgpool3d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: avgpool3d");
         using var _ = PushContext();
         const int blockSize = 8;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
@@ -129,7 +129,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
     {
         if (batch * channels * inDepth <= 0) return;
         if (!_kernelCache.TryGetValue("avgpool3d_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: avgpool3d_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: avgpool3d_backward");
         using var _ = PushContext();
         const int blockSize = 8;
         uint gridX = (uint)((inWidth + blockSize - 1) / blockSize);
@@ -168,7 +168,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         int total = checked(batch * channels * outHeight * outWidth);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("adaptive_max_pool2d", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: adaptive_max_pool2d");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: adaptive_max_pool2d");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr i = input.Handle, o = output.Handle;
@@ -185,7 +185,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         int total = checked(p * c);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("trilinear_interpolate", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: trilinear_interpolate");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: trilinear_interpolate");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr g = grid.Handle, pos = positions.Handle, o = output.Handle;
@@ -203,7 +203,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         int total = checked(d * h * w * c);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("trilinear_interpolate_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: trilinear_interpolate_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: trilinear_interpolate_backward");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr go = gradOutput.Handle, pos = positions.Handle, gg = gradGrid.Handle;
@@ -242,7 +242,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         int total = checked(v * outC);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spiral_conv", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: spiral_conv");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: spiral_conv");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr vf = vertexFeatures.Handle, si = spiralIndices.Handle, w = weights.Handle, b = biases.Handle, o = output.Handle;
@@ -259,7 +259,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         int total = checked(v * inC);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spiral_conv_backward_input", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: spiral_conv_backward_input");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: spiral_conv_backward_input");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr go = gradOutput.Handle, si = spiralIndices.Handle, w = weights.Handle, gvf = gradVertexFeatures.Handle;
@@ -276,7 +276,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
         int total = checked(outC * inC * spiralLength);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spiral_conv_backward_weights", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: spiral_conv_backward_weights");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: spiral_conv_backward_weights");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr go = gradOutput.Handle, vf = vertexFeatures.Handle, si = spiralIndices.Handle, gw = gradWeights.Handle;
@@ -294,7 +294,7 @@ public sealed partial class CudaBackend : ITrilinearInterpolationKernels, IConvT
     {
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pa = a.Handle, pb = b.Handle, pc = c.Handle;

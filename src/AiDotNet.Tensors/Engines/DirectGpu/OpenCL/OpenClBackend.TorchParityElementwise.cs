@@ -12,7 +12,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private DirectOpenClKernel ParityKernel(string name)
             => _kernelCache.TryGetValue(name, out var kernel)
                 ? kernel
-                : throw new InvalidOperationException($"OpenCL kernel not found: {name}. The parity module may have failed to compile.");
+                : throw new GpuCapabilityUnavailableException($"OpenCL kernel not found: {name}. The parity module may have failed to compile.");
 
         private static void ParityRequire(IGpuBuffer buffer, long requiredElements, string parameter, string formula)
         {
