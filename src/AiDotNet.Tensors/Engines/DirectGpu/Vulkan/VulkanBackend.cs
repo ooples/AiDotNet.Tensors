@@ -1173,6 +1173,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         _batchMode = false;
         _batchDispatchCount = 0;
+        ReleaseBuffersHeldForBatch();
     }
 
     /// <summary>

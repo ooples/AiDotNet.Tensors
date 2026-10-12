@@ -808,7 +808,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (!Fp16ActEnabled || typeof(T) != typeof(float)) return false;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims)) return false;
-        if (!TryGetBackend(out var be) || be is not Engines.DirectGpu.CUDA.CudaBackend cb || !cb.SupportsFp16NativeOps) return false;
+        if (!TryGetBackend(out var be) || be is not IFp16ActivationBackend cb || !cb.SupportsFp16NativeOps) return false;
         var aHalf = TryFp16ResidentInput(a, out _);
         if (aHalf is null) return false; // only when the in-place target is FP16
         var aArr = a.GetBackingArrayForCacheLookupUnsafe();
@@ -836,7 +836,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (b.Shape._dims[2] != 1 || b.Shape._dims[3] != 1 || a.Shape._dims[1] != b.Shape._dims[1]) return false;
         int n = a.Shape._dims[0];
         if (!(n == 1 || b.Shape._dims[0] == n)) return false; // bias[b·C+c] addressing valid (capture is n=1)
-        if (!TryGetBackend(out var be) || be is not Engines.DirectGpu.CUDA.CudaBackend cb || !cb.Fp16BroadcastAddChannelAvailable) return false;
+        if (!TryGetBackend(out var be) || be is not IFp16ActivationBackend cb || !cb.Fp16BroadcastAddChannelAvailable) return false;
         var aHalf = TryFp16ResidentInput(a, out _);
         if (aHalf is null) return false;
         var aArr = a.GetBackingArrayForCacheLookupUnsafe();
@@ -926,8 +926,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReclaimGpuMemoryUnderPressure()
     {
-        if (TryGetBackend(out var backend) && backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
-            cudaBackend.ReclaimUnderPressure();
+        if (TryGetBackend(out var backend) && backend is IDeviceMemoryPressure pressure)
+            pressure.ReclaimUnderPressure();
     }
 
 
@@ -2396,7 +2396,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!_activationCache.TryGetValue(key, out var e)) return false;
             if (e.IsFp16) return true;
-            if (e.Backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return false;
+            if (e.Backend is not IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cuda) return false;
             // Only compress genuine FP32 buffers (elementCount*4 bytes); skip anything unexpected.
             if (e.Buffer.SizeInBytes != (long)elementCount * sizeof(float)) return false;
             IGpuBuffer fp16;
@@ -2409,7 +2409,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: true, elementCount: elementCount, hostVersion: e.HostVersion);
             old = e;
         }
-        if (old is not null && old.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
+        if (old is not null && old.Backend is IQueuedBufferRelease c) c.ReleaseAfterQueuedWork(old.Buffer);
         else old?.Dispose();
         return true;
     }
@@ -2425,7 +2425,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool TryTransientUpcastFp16(object key, IDirectGpuBackend backend, out OwnedBuffer transient)
     {
         transient = default;
-        if (backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return false;
+        if (backend is not IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cuda) return false;
         IGpuBuffer halfBuf; int elems;
         lock (_activationCacheLock)
         {
@@ -2451,7 +2451,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!_activationCache.TryGetValue(key, out var e)) return false;
             if (!e.IsFp16) return true;
-            if (e.Backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return false;
+            if (e.Backend is not IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cuda) return false;
             IGpuBuffer fp32;
             try
             {
@@ -2463,7 +2463,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: false, elementCount: e.ElementCount, hostVersion: e.HostVersion);
             old = e;
         }
-        if (old is not null && old.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
+        if (old is not null && old.Backend is IQueuedBufferRelease c) c.ReleaseAfterQueuedWork(old.Buffer);
         else old?.Dispose();
         return true;
     }
@@ -2528,12 +2528,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // leaving the registration behind would point a later bulk drain at a
         // freed buffer. Remove only after the cache entry is actually owned.
         Helpers.HostSync.Remove(key);
-        // CUDA uses STREAM-ORDERED deferred free (cuMemFreeAsync) to release the buffer at the stream's
-        // current point without a host sync — a CUDA-stream-specific optimization with no portable
-        // equivalent. Every other backend takes the immediate, equally-correct e.Dispose() (no leak, no
-        // cross-backend semantic difference — just a synchronous free). This asymmetry is intentional, not a
-        // missing feature; a deferred-free abstraction across all backends is tracked as a follow-up.
-        if (e.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(e.Buffer);
+        // Each backend releases after the work already queued on it (CUDA: stream-ordered cuMemFreeAsync).
+        if (e.Backend is IQueuedBufferRelease c) c.ReleaseAfterQueuedWork(e.Buffer);
         else e.Dispose();
         return true;
     }
@@ -2693,7 +2689,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReclaimDetachedResultsOverBudget()
     {
-        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return;
+        if (!TryGetBackend(out var backend) || backend is not IDeviceMemoryPressure cuda) return;
         if (!cuda.TryGetDeviceMemory(out ulong free, out ulong total)) return;
         long freeNow = (long)free;
         long last = System.Threading.Interlocked.Read(ref _freeBytesAtLastReclaim);
@@ -3098,7 +3094,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal static IGpuBuffer AllocateReclaiming(IDirectGpuBackend backend, Func<IDirectGpuBackend, IGpuBuffer> allocate)
     {
         try { return allocate(backend); }
-        catch (Exception ex) when (backend is not Engines.DirectGpu.CUDA.CudaBackend && ex is not ObjectDisposedException)
+        catch (Exception ex) when (backend is not IDeviceMemoryPressure { ReclaimsOnAllocationFailure: true } && ex is not ObjectDisposedException)
         {
             GC.Collect();
             GC.WaitForPendingFinalizers();
@@ -3808,7 +3804,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // CUDA-specific overload (#34): the FP16-native backward methods that already hold a CudaBackend cb call this
     // form; ConvertToFp16Native is the same self-contained conversion as the agnostic ConvertToFp16 above.
-    private IGpuBuffer ResolveToFp16<T>(Tensor<T> t, int elems, DirectGpu.CUDA.CudaBackend cb, IDirectGpuBackend backend, out IGpuBuffer? owned)
+    private IGpuBuffer ResolveToFp16<T>(Tensor<T> t, int elems, IFp16ActivationBackend cb, IDirectGpuBackend backend, out IGpuBuffer? owned)
     {
         owned = null;
         if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
@@ -5132,7 +5128,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // An op that overwrites every output element (GEMM with beta 0, elementwise, row reductions) needs no
             // zeroed buffer: the memset was a captured graph node per op per step (AiDotNet #1804: 525 per N-BEATS step).
             if (fullyWritten) return b;
-            if (backend is DirectGpu.CUDA.CudaBackend cudaZ) cudaZ.MemsetBuffer(b, 0, (long)length * sizeof(float));
+            if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(b, length);
             else backend.Fill(b, 0f, length);
             return b;
         }
@@ -5234,9 +5230,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Release it only after its obsolete materializer has been detached. CUDA can
             // preserve stream ordering; other backends synchronize only on this exceptional
             // duplicate-owner repair path, never on the normal bind path.
-            if (displacedEntry.Backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
+            if (displacedEntry.Backend is IQueuedBufferRelease release)
             {
-                cudaBackend.FreeBufferDeferred(displacedEntry.Buffer);
+                release.ReleaseAfterQueuedWork(displacedEntry.Buffer);
             }
             else
             {
@@ -5591,7 +5587,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // on a RAW FP16 input; else bufIn is needed (FP32 input down-convert, or the FP32 fallback when the
             // kernel didn't compile — where the central guard up-converts an FP16 input).
             var ihGn = TryFp16ResidentInput(input, out _);
-            bool gnFp16Path = ihGn is not null && backend is Engines.DirectGpu.CUDA.CudaBackend cbAvail && cbAvail.Fp16GroupNormSwishAvailable;
+            bool gnFp16Path = ihGn is not null && backend is IFp16ActivationBackend cbAvail && cbAvail.Fp16GroupNormSwishAvailable;
             using var bufIn = gnFp16Path ? default : GetOrAllocateContiguousInputBuffer(backend, input);
             using var bufGamma = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
             using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.Biases);
@@ -5599,7 +5595,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // #3 FP16-ACTIVATIONS: fused FP16 GroupNorm+Swish (FP16 in/out, FP32-internal mean/var) — keeps the
             // activation FP16 for the next conv (no convert). Input is the FP16-resident buffer, or an FP32 input
             // down-converted once (convert-at-gap, e.g. after attention/resample). gamma/beta stay FP32.
-            if (Fp16ActEnabled && backend is Engines.DirectGpu.CUDA.CudaBackend cbGn && cbGn.Fp16GroupNormSwishAvailable)
+            if (Fp16ActEnabled && backend is IFp16ActivationBackend cbGn && cbGn.Fp16GroupNormSwishAvailable)
             {
                 var inHalfGn = ihGn is not null ? ihGn : Fp32InputToFp16Stable(backend, bufIn.Buffer, input.Length, arr);
                 cbGn.Fp16GroupNormSwish(inHalfGn, bufGamma.Buffer, bufBeta.Buffer, outBuf,
@@ -5608,7 +5604,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 BindResidentBufferFp16(output, outBuf, backend, input.Length);
                 return true;
             }
-            if (ihGn is null && backend is Engines.DirectGpu.CUDA.CudaBackend cbDirectGn &&
+            if (ihGn is null && backend is IDirectPtxBackend cbDirectGn &&
                 cbDirectGn.TryDirectPtxGroupNormSwishUnit64(
                     bufIn.Buffer, outBuf, bufGamma.Buffer, bufBeta.Buffer,
                     batch, numGroups, channels, spatial, (float)epsilon))
@@ -6814,7 +6810,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     int K = gemmK, N = gemmN, M = gemmM;
                     // STABLE cached col scratch (NOT a per-call `using` alloc) — capture-replay-safe (see method doc).
                     var colHalf = GetOrCacheFp16ColScratch(rbk, bufK.Buffer, K * N);
-                    if (inHalf is not null && rbk is Engines.DirectGpu.CUDA.CudaBackend cbIn && cbIn.Fp16Im2colFromFp16Available)
+                    if (inHalf is not null && rbk is IFp16ActivationBackend cbIn && cbIn.Fp16Im2colFromFp16Available)
                         cbIn.UnfoldKNFp16FromFp16(inHalf, colHalf, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
                     else
                         hbConvR.Im2colKNFp16(bufIn.Buffer, colHalf, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
@@ -6830,7 +6826,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     hbConvR.GemmFp16In32fOut(wHalf, colHalf, outBuf, M, N, K);
                 }
                 else if (s_fp16Conv && gemmN <= Fp16ConvTinyGemmN && gemmK >= 64 && gemmM >= 16
-                    && rbk is Engines.DirectGpu.CUDA.CudaBackend cudaDirectConv && cudaDirectConv.Fp16DirectConvAvailable)
+                    && rbk is IFp16ActivationBackend cudaDirectConv && cudaDirectConv.Fp16DirectConvAvailable)
                 {
                     // #671: the tiny-spatial deep convs (N <= Fp16ConvTinyGemmN) that the im2col+GEMM path skips run
                     // through the DIRECT FP16 conv (no im2col materialization) for FP16-consistent numerics on the
@@ -7323,7 +7319,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuBeta = GetWeightBufferPreferResident(
                     gpuBackend, floatBeta, PersistentTensorRole.Biases);
                 using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
-                if (gpuBackend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
+                if (gpuBackend is IDirectPtxBackend cudaBackend &&
                     cudaBackend.TryDirectPtxGroupNormSwishUnit64(
                         gpuIn.Buffer, gpuOut, gpuGamma.Buffer, gpuBeta.Buffer,
                         batch, numGroups, channels, spatial, (float)epsilon))
@@ -7373,7 +7369,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuBeta = GetWeightBufferPreferResident(
                     gpuBackend, floatBeta, PersistentTensorRole.Biases);
                 using var gpuOut = gpuBackend.AllocateBuffer(a.Length);
-                if (gpuBackend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
+                if (gpuBackend is IDirectPtxBackend cudaBackend &&
                     cudaBackend.TryDirectPtxAddGroupNormUnit64(
                         gpuA.Buffer, gpuB.Buffer, gpuOut, gpuGamma.Buffer, gpuBeta.Buffer,
                         batch, numGroups, channels, spatial, (float)epsilon))
@@ -8955,7 +8951,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 activation == FusedActivationType.ReLU &&
                 kernelH == 1 && kernelW == 1 && strideH == 1 && strideW == 1 &&
                 padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1 &&
-                backend is Engines.DirectGpu.CUDA.CudaBackend rbCuda &&
+                backend is IDirectPtxBackend rbCuda &&
                 rbCuda.IsDirectPtxConvolutionEnabled)
             {
                 using var rbBiasBuffer = GetWeightBufferPreferResident(
@@ -8976,7 +8972,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             if (typeof(T) == typeof(float) && bias is { } directBias &&
                 activation == FusedActivationType.ReLU &&
-                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                backend is IDirectPtxBackend directCuda &&
                 directCuda.IsDirectPtxConvolutionEnabled)
             {
                 using var directBiasBuffer = GetWeightBufferPreferResident(
@@ -10070,7 +10066,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // depthwise kernel below.
 #if NET5_0_OR_GREATER
             if (typeof(T) == typeof(float) &&
-                backend is Engines.DirectGpu.CUDA.CudaBackend directCuda &&
+                backend is IDirectPtxBackend directCuda &&
                 directCuda.IsDirectPtxConvolutionEnabled)
             {
                 var directShape = new DirectGpu.CUDA.Ptx.DirectPtxConvolutionShape(
@@ -12696,14 +12692,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result = null!;
         softmaxStats = null!;
         if (typeof(T) != typeof(float) || attentionBias is not null
-            || backend is not Engines.DirectGpu.CUDA.CudaBackend directCuda)
+            || backend is not IDirectPtxBackend directCuda)
             return false;
 
         if (!directCuda.IsDirectPtxAttentionEnabled
             // Module JIT and the eager scratch allocations below are not
             // stream-capture safe. Captured graphs keep the established
             // resident NVRTC path until a PTX prewarm/capture API is added.
-            || directCuda.IsStreamCapturing()
+            || (directCuda is IGpuGraphCapture capturing && capturing.IsStreamCapturing())
             || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqQ)
             || !PtxOnlineFusedAttention128x64Kernel.IsSupportedSequenceLength(seqK)
             || headDim != PtxOnlineFusedAttention128x64Kernel.HeadDimension
@@ -13048,8 +13044,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // including GQA/MQA. Physical FP16 conversion and dense-BHSD proof happen
         // once at this boundary; the emitted kernel receives only canonical pointers.
         if (typeof(T) == typeof(float) && softcap == 0
-            && backend is Engines.DirectGpu.CUDA.CudaBackend directCuda
-            && directCuda.IsDirectPtxAttentionEnabled && !directCuda.IsStreamCapturing()
+            && backend is IDirectPtxBackend directCuda
+            && directCuda.IsDirectPtxAttentionEnabled && !(directCuda is IGpuGraphCapture { } capturing && capturing.IsStreamCapturing())
             // Track the kernel's supported shape set and the extracted canonical-dense contract instead
             // of re-inlining them, so this gate cannot silently diverge from what the PTX actually accepts
             // when the kernel's supported lengths/head-dim change.
@@ -14469,7 +14465,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // FP16 Half-native backward: read IsFp16 grad + softmax output directly, FP16-native softmax
                 // backward (Half grad out), store Half. Parity-equivalent to softmax_backward (same math).
                 if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                    && backend is Engines.DirectGpu.CUDA.CudaBackend cbS && cbS.SupportsFp16NativeOps)
+                    && backend is IFp16ActivationBackend cbS && cbS.SupportsFp16NativeOps)
                 {
                     IGpuBuffer? hgOwned = null, hoOwned = null, hOut = null;
                     bool ok = false;
@@ -15303,7 +15299,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // backward (gradInput) + grad-params (gradGamma/gradBeta), store Half. mean/invVar stay FP32 (tiny,
             // one per row) exactly like the float path. Parity-equivalent to layernorm_backward + grad_params.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is Engines.DirectGpu.CUDA.CudaBackend cbL && cbL.SupportsFp16NativeOps)
+                && backend is IFp16ActivationBackend cbL && cbL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hgOwned = null, hiOwned = null, hgamOwned = null;
                 OwnedBuffer? meanOwned = null, varianceOwned = null;
@@ -16664,7 +16660,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         foreach (var dim in shape)
             size = checked(size * dim);
         var buffer = RentActionScratchOrAllocate(backend, size, fullyWritten: true);
-        if (backend is DirectGpu.CUDA.CudaBackend cuda) cuda.MemsetBuffer(buffer, 0, (long)size * sizeof(float));
+        if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(buffer, size);
         else backend.Fill(buffer, 0f, size);
         zeros = DeferTensorResult<T>(backend, buffer, size, shape);
         return true;
@@ -20487,7 +20483,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // FP16 Half-resident store (keystone-enabled): the transformer residual add. Read both IsFp16 inputs
         // directly, FP16-native add (FP32 accumulate, Half out), store Half — keeps the residual stream Half.
         if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkA)
-            && bkA is Engines.DirectGpu.CUDA.CudaBackend cbA && cbA.SupportsFp16NativeOps)
+            && bkA is IFp16ActivationBackend cbA && cbA.SupportsFp16NativeOps)
         {
             IGpuBuffer? hAOwned = null, hBOwned = null, hOut = null;
             bool ok = false;
@@ -20817,7 +20813,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // FP16 Half-native backward: read IsFp16 grad + input directly, FP16-native ReLU backward
                 // (Half grad out), store Half. Parity-equivalent to relu_backward.
                 if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                    && backend is Engines.DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
+                    && backend is IFp16ActivationBackend cbR && cbR.SupportsFp16NativeOps)
                 {
                     IGpuBuffer? hgOwned = null, hiOwned = null, hOut = null;
                     bool ok = false;
@@ -20934,7 +20930,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // (Half grad out), store Half — keeps the backward signal Half (no up-cast). Parity-equivalent
                 // to the FP32 gelu_backward kernel (same formula).
                 if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                    && backend is Engines.DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
+                    && backend is IFp16ActivationBackend cbG && cbG.SupportsFp16NativeOps)
                 {
                     IGpuBuffer? hgOwned = null, hiOwned = null, hOut = null;
                     bool ok = false;
@@ -24322,7 +24318,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // FP16 Half-resident store (keystone-enabled): read IsFp16 input directly, FP16-native ReLU (Half out),
         // store Half — keeps the activation Half end-to-end. Gated like the other forward stores.
         if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkR)
-            && bkR is Engines.DirectGpu.CUDA.CudaBackend cbR && cbR.SupportsFp16NativeOps)
+            && bkR is IFp16ActivationBackend cbR && cbR.SupportsFp16NativeOps)
         {
             IGpuBuffer? hInOwned = null, hOut = null;
             bool ok = false;
@@ -24368,7 +24364,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (Half output, FP32-in-register math), store the Half output as an IsFp16 entry — keeps the activation
         // Half end-to-end so the next op reads Half (no up-cast/re-inflate). Gated like the other forward stores.
         if (typeof(T) == typeof(Half) && s_fp16FwdStore && TryGetBackend(out var bkG)
-            && bkG is Engines.DirectGpu.CUDA.CudaBackend cbG && cbG.SupportsFp16NativeOps)
+            && bkG is IFp16ActivationBackend cbG && cbG.SupportsFp16NativeOps)
         {
             IGpuBuffer? hInOwned = null, hOut = null;
             bool ok = false;
