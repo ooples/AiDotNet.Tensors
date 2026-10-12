@@ -26,7 +26,7 @@ public sealed partial class CudaBackend : IParity210Backend
             throw new InvalidOperationException(
                 "Parity-210 CUDA module was not compiled (older CUDA toolkit?). Falling back to CPU reference.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         return kernel;
     }
 

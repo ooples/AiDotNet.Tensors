@@ -106,7 +106,7 @@ public sealed partial class MetalBackend
         if (size <= 0) return;
         IntPtr library = GetCompressedOptLibrary();
         if (library == IntPtr.Zero)
-            throw new InvalidOperationException("Metal compressed optimizer kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("Metal compressed optimizer kernels are unavailable.");
         if (param is not MetalGpuBuffer parameter || gradient is not MetalGpuBuffer grad ||
             m is not MetalGpuBuffer firstMoment || v is not MetalGpuBuffer secondMoment)
             throw new ArgumentException("Buffers must be MetalGpuBuffer.");
@@ -140,7 +140,7 @@ public sealed partial class MetalBackend
         if (paramLength <= 0 || numBlocks <= 0) return;
         IntPtr library = GetCompressedOptLibrary();
         if (library == IntPtr.Zero)
-            throw new InvalidOperationException("Metal compressed optimizer kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("Metal compressed optimizer kernels are unavailable.");
         if (param is not MetalGpuBuffer parameter || gradient is not MetalGpuBuffer grad ||
             mQuant is not MetalGpuBuffer firstQuantized || vQuant is not MetalGpuBuffer secondQuantized ||
             mScales is not MetalGpuBuffer firstScales || vScales is not MetalGpuBuffer secondScales)

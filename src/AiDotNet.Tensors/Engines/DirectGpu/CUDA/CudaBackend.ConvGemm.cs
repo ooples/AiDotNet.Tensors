@@ -43,7 +43,7 @@ public sealed partial class CudaBackend
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outH, int outW)
     {
         if (!_kernelCache.TryGetValue("im2col", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: im2col");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: im2col");
         IntPtr inPtr = input.Handle, outPtr = col.Handle;
         int totalPatches = batch * outH * outW;
         void** args = stackalloc void*[16];
@@ -60,7 +60,7 @@ public sealed partial class CudaBackend
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outH, int outW)
     {
         if (!_kernelCache.TryGetValue("col2im", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: col2im");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: col2im");
         IntPtr inPtr = col.Handle, outPtr = output.Handle;
         int total = batch * channels * height * width;
         void** args = stackalloc void*[16];

@@ -61,7 +61,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         RequireCapacity(output, n, nameof(output), "n");
         string name = UnaryKernelName(op);
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         using var _ = PushContext();
         IntPtr x = input.Handle, y = output.Handle;
         void** args = stackalloc void*[5];
@@ -77,7 +77,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         RequireCapacity(degree, n, nameof(degree), "n");
         RequireCapacity(output, n, nameof(output), "n");
         if (!_kernelCache.TryGetValue("parity_polynomial", out var polynomialKernel))
-            throw new InvalidOperationException("CUDA kernel not found: parity_polynomial");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: parity_polynomial");
         using var _ = PushContext();
         IntPtr px = x.Handle, pd = degree.Handle, py = output.Handle;
         int shift = shifted ? 1 : 0;
@@ -87,7 +87,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     }
 
     private IntPtr ParityKernel(string name)
-        => _kernelCache.TryGetValue(name, out var found) ? found : throw new InvalidOperationException($"CUDA kernel not found: {name}");
+        => _kernelCache.TryGetValue(name, out var found) ? found : throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
 
     private static uint ParityGrid(int n) => (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -356,9 +356,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         int typeCode, IGpuBuffer flag)
     {
         if (n <= 0) return;
-        RequireCapacity(a, 2 * n, nameof(a), "2n (int64 words)");
-        RequireCapacity(b, 2 * n, nameof(b), "2n (int64 words)");
-        RequireCapacity(output, 2 * n, nameof(output), "2n (int64 words)");
+        RequireCapacity(a, 2L * n, nameof(a), "2n (int64 words)");
+        RequireCapacity(b, 2L * n, nameof(b), "2n (int64 words)");
+        RequireCapacity(output, 2L * n, nameof(output), "2n (int64 words)");
         RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr int64Kernel = ParityKernel("parity_int64_binary");
         using var _ = PushContext();
@@ -371,8 +371,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityInt64Not(IGpuBuffer input, IGpuBuffer output, int n, int typeCode)
     {
         if (n <= 0) return;
-        RequireCapacity(input, 2 * n, nameof(input), "2n (int64 words)");
-        RequireCapacity(output, 2 * n, nameof(output), "2n (int64 words)");
+        RequireCapacity(input, 2L * n, nameof(input), "2n (int64 words)");
+        RequireCapacity(output, 2L * n, nameof(output), "2n (int64 words)");
         IntPtr int64NotKernel = ParityKernel("parity_int64_not");
         using var _ = PushContext();
         IntPtr pa = input.Handle, py = output.Handle;
@@ -441,6 +441,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityNonzeroStaticScatter(IGpuBuffer input, IGpuBuffer positions, IGpuBuffer output,
         int n, int size, int[] shape)
     {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
         if (n <= 0) return;
         RequireCapacity(input, n, nameof(input), "n");
         RequireCapacity(positions, n, nameof(positions), "n");
@@ -567,7 +568,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         RequireCapacity(output, n, nameof(output), "n");
         string name = BinaryKernelName(op);
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         using var _ = PushContext();
         IntPtr pa = a.Handle, pb = b.Handle, y = output.Handle;
         void** args = stackalloc void*[4];

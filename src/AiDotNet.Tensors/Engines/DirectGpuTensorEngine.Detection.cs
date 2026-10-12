@@ -62,7 +62,7 @@ public partial class DirectGpuTensorEngine
                 catch { outBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BoxArea", capabilityGap); }
         return base.BoxArea(boxes);
     }
 
@@ -89,7 +89,7 @@ public partial class DirectGpuTensorEngine
                 catch { outBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BoxConvert", capabilityGap); }
         return base.BoxConvert(boxes, from, to);
     }
 
@@ -149,7 +149,7 @@ public partial class DirectGpuTensorEngine
                 catch { gABuf.Dispose(); gBBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BoxConvert", capabilityGap); }
         return null;
     }
 
@@ -186,7 +186,7 @@ public partial class DirectGpuTensorEngine
                 catch { outBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryGpuBoxIou", capabilityGap); }
         return null;
     }
 }

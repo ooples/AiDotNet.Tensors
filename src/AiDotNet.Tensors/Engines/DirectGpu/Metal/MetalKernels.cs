@@ -1663,6 +1663,58 @@ kernel void sum_axis(
     }
 }
 
+// #1157: one 256-thread threadgroup per long row -- strided partial sums, then a fixed threadgroup-memory tree.
+// Deterministic order. Dispatched only with exactly 256 threads per threadgroup.
+kernel void sum_axis_rows(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& outer_size [[buffer(2)]],
+    constant uint& reduce_size [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsz [[threads_per_threadgroup]])
+{
+    threadgroup float scratch[256];
+    device const float* rowPtr = input + (ulong)row * (ulong)reduce_size;
+    float sum = 0.0f;
+    for (uint i = lid; i < reduce_size; i += lsz) sum += rowPtr[i];
+    scratch[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = lsz >> 1; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0 && row < outer_size) output[row] = scratch[0];
+}
+
+// #1157 (the CUDA #1150 split): threadgroup (chunk, row) sums chunk `chunk` of row `row` into
+// partial[row * chunks + chunk]; the host reduces the partials with SumAxis. Fixed partition and order.
+kernel void sum_axis_rows_split(
+    device const float* input [[buffer(0)]],
+    device float* partial [[buffer(1)]],
+    constant uint& reduce_size [[buffer(2)]],
+    constant uint& chunks [[buffer(3)]],
+    constant uint& chunk_len [[buffer(4)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsz [[threads_per_threadgroup]])
+{
+    threadgroup float scratch[256];
+    uint chunk = group.x, row = group.y;
+    ulong start = (ulong)chunk * (ulong)chunk_len;
+    ulong end = min(start + (ulong)chunk_len, (ulong)reduce_size);
+    device const float* rowPtr = input + (ulong)row * (ulong)reduce_size;
+    float sum = 0.0f;
+    for (ulong i = start + lid; i < end; i += lsz) sum += rowPtr[i];
+    scratch[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = lsz >> 1; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) partial[(ulong)row * (ulong)chunks + (ulong)chunk] = scratch[0];
+}
+
 // Mean along axis
 kernel void mean_axis(
     device const float* input [[buffer(0)]],

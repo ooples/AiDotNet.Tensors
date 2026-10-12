@@ -51,7 +51,7 @@ public sealed partial class CudaBackend
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
-        if (!IsAvailable) throw new InvalidOperationException("CUDA is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA is not available.");
         if (kernel is not PtxCodegenKernel ptxKernel)
             throw new ArgumentException("The kernel must contain direct PTX.", nameof(kernel));
         if (ptxKernel.ComputeMajor != _ccMajor || ptxKernel.ComputeMinor != _ccMinor)

@@ -18,11 +18,7 @@ public sealed partial class WebGpuBackend
         float scaling)
     {
         if (batchSize <= 0 || rank <= 0 || outputFeatures <= 0) return;
-        if (rank > 256)
-            throw new System.NotSupportedException(
-                $"WebGPU LoRA fused kernel currently caps rank at 256 (got {rank}). " +
-                "Increase MAX_RANK in WebGpuFusedAdvancedKernels.LoRAForward and the " +
-                "workgroup-private array size if higher ranks are required.");
+        // Any rank: the kernel walks the rank in chunks of 256 (#1165; it used to refuse rank > 256).
 
         // The two-stage WGSL kernel uses one workgroup per batch row with a
         // workgroup_size of 256. Dispatch5BufferAsync's CalculateWorkgroups1D

@@ -35,6 +35,10 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         Environment.GetEnvironmentVariable("AIDOTNET_VULKAN_BUFFER_POOL") != "0";
 
     private static int s_poolBudgetSet;
+    private static long s_driverAllocations;
+
+    /// <summary>Buffers created through the driver (pool misses) since the process started.</summary>
+    internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
 
     /// <inheritdoc/>
     int IPoolableGpuBuffer.Capacity => Size;
@@ -66,6 +70,17 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     /// <summary>Frees of Vulkan buffers collected without Dispose, run by the next allocation.</summary>
     internal static readonly DeviceFreeQueue PendingFrees = new();
+
+    /// <summary>
+    /// Releases <paramref name="lastBuffers"/>, then frees every queued and parked buffer. The order matters: a pooled
+    /// buffer released after the drain is parked again and outlives the device. The backend calls this on dispose.
+    /// </summary>
+    internal static void ReleaseAndDrain(params IGpuBuffer?[] lastBuffers)
+    {
+        foreach (var buffer in lastBuffers) buffer?.Dispose();
+        PendingFrees.Drain();
+        Pool.DrainAll();
+    }
 
     /// <inheritdoc/>
     public int Size { get; }
@@ -123,6 +138,13 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         if (PoolingEnabled && Pool.TryRent(size, out var pooled) &&
             pooled is not null)
             return new VulkanGpuBuffer(pooled.Storage, pooled.Staging, size);
+        if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss())
+        {
+            PendingFrees.Drain();
+            if (Pool.TryRent(size, out pooled) && pooled is not null)
+                return new VulkanGpuBuffer(pooled.Storage, pooled.Staging, size);
+        }
+        System.Threading.Interlocked.Increment(ref s_driverAllocations);
         // Out of memory: the parked buffers are the first thing to give back.
         return DeviceMemoryReclaim.AllocateWithRetry(() => CreateCore(size), ex => ex is GpuOutOfMemoryException,
             () => { PendingFrees.Drain(); Pool.DrainAll(); });
