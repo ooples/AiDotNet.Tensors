@@ -1,4 +1,4 @@
-#if !NETFRAMEWORK
+#if NETCOREAPP
 #nullable disable
 using System;
 using AiDotNet.Tensors.Engines;

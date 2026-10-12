@@ -14,7 +14,7 @@
 // They run only when a GPU is present; on CPU-only machines each case returns
 // early (a no-op pass) so the suite stays portable.
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
 #nullable disable
 
 using System;

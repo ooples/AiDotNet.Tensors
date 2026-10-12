@@ -3,7 +3,7 @@
 // full set that must be replaced by a promoted PTX kernel before the CUDA
 // kernels can be deleted. Reflected from the same GetKernelNames() registries
 // the backend compiles, so it cannot drift from what actually ships.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Collections.Generic;

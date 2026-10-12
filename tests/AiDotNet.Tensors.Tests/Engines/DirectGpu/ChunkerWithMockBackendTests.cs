@@ -3,7 +3,7 @@
 // Gated to non-Framework targets: DispatchProxy (.NET Core 5+) isn't
 // on .NET Framework, and the mock backend depends on it.
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
 #nullable disable
 
 using System;

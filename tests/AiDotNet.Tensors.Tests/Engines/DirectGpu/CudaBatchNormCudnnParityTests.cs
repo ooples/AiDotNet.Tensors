@@ -13,7 +13,7 @@
 // accumulated runningVar differs by the N/(N-1) factor. Each path is asserted against its own
 // convention. Runs only when a CUDA GPU is present.
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
 #nullable disable
 
 using System;

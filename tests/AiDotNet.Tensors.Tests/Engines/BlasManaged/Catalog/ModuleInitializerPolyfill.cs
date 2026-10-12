@@ -1,4 +1,4 @@
-#if NETFRAMEWORK
+#if !NETCOREAPP
 namespace System.Runtime.CompilerServices
 {
     /// <summary>

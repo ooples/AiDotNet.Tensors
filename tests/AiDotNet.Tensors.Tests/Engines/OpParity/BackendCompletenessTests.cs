@@ -9,7 +9,7 @@
 // automatically enforced, always-visible worklist: the reports list every gap, and the floors
 // ratchet so a regression (an op quietly losing its GPU override, or a backend gaining a stub)
 // fails the build. Drive the floors to zero by writing the missing kernels for all backends.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Collections.Generic;

@@ -1,4 +1,4 @@
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using AiDotNet.Tensors.Engines.Simd;
 using Xunit;

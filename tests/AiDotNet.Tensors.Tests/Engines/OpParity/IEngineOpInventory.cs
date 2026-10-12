@@ -4,7 +4,7 @@
 // tensor-producing op is enumerated, and coverage is measured against this ground truth. (A
 // Roslyn source generator could emit the same inventory at compile time; reflection gives the
 // identical auto-sync with far less machinery and is the recommended mechanism here.)
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System.Collections.Generic;
 using System.Linq;

@@ -13,7 +13,7 @@
 // This complements GpuCpuCorrectnessTests, which has the thorough hand-written shape sweeps
 // (matmul tile boundaries, non-aligned softmax widths, etc.) for the highest-value kernels.
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
 #nullable disable
 
 using System;

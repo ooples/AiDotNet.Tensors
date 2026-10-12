@@ -4,7 +4,7 @@
 // LayerNorm, GELU/Sigmoid) to localize the CPU/GPU divergence; expands to the full IEngine
 // surface from here. Tolerances: exact ops at 0 ULP; accumulation ops at a fp32 relative bound
 // (matched to the 1e-3 the existing GPU parity tests use); elementwise transcendentals at a few ULP.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System.Collections.Generic;
 using System.Linq;

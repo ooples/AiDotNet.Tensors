@@ -5,7 +5,7 @@
 // training actually runs — drifted, feeding the BCE-with-logits amplification #775 describes.
 // These tests pin that the two paths now agree, and that the compiled path is accurate near zero
 // against a double reference. CPU-only, so they run everywhere (no GPU required).
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using AiDotNet.Tensors.Engines;

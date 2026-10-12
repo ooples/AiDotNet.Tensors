@@ -3,7 +3,7 @@
 // Auto-covers every registered op: one theory case per op (keyed by serializable op name).
 // The Roslyn generator (follow-up) will additionally emit a discoverable [Fact] per IEngine op
 // that calls the SAME harness; this theory already provides full coverage over the registry.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System.Collections.Generic;
 using System.Linq;

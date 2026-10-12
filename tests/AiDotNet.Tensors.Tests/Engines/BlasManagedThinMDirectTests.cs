@@ -7,7 +7,7 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
-#if !NET471 // The direct-parallel kernel + the #368 carve-out are net5+/x86 only.
+#if NETCOREAPP // The direct-parallel kernel + the #368 carve-out are net5+/x86 only.
 /// <summary>
 /// #368 thin-M fast path. Verifies (a) the no-pack direct-parallel kernel
 /// <see cref="SimdGemm.SgemmDirectParallelMInto"/> matches a naive reference across

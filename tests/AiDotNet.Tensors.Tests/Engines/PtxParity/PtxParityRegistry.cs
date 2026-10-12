@@ -1,6 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // PTX-vs-CUDA-vs-CPU parity scaffold. Per-kernel coverage decisions.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Collections.Generic;

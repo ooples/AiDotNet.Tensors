@@ -8,7 +8,7 @@
 // The op reduces CONTIGUOUS MIDDLE axes, so the correct broadcast is interleaved:
 //      gradInput[(o*R + r)*I + i] = gradOutput[o*I + i] / R
 // This test asserts that directly, with I > 1 and o > 1 — the case both bugs get wrong.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;

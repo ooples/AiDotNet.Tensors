@@ -23,7 +23,7 @@ public class CpuTrainingHotPathTests
         return data;
     }
 
-#if !NET471 // SimdConvHelper is not compiled for net471 (AiDotNet.Tensors.csproj removes it there).
+#if NETCOREAPP // SimdConvHelper is not compiled for net471 (AiDotNet.Tensors.csproj removes it there).
     /// <summary>
     /// Output channel counts pick each variant: 16 -> Block4, 6 -> Block2, 3 -> per-channel. Batch &gt; 1 so tasks
     /// span batch items, and small spatial sizes so each task sits below the old per-task parallel gate.

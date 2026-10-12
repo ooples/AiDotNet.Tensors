@@ -3,7 +3,7 @@
 // [SkippableFact] per tensor-returning IEngine op that calls into here; this looks up the
 // registered parity case(s) for that op and runs the harness, or skips with a visible NEEDS-SPEC
 // message so the test explorer shows the full IEngine surface and exactly which ops still lack a spec.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System.Collections.Generic;
 using System.Linq;

@@ -1,6 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775). ULP-accurate comparison primitives.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 

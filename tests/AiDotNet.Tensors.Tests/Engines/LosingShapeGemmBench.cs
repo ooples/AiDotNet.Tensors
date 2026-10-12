@@ -1,4 +1,4 @@
-#if !NET471 // JitGemmAvx2 is the AVX2 runtime-emit kernel — net5+/x86 only (see JitGemmAvx2.cs).
+#if NETCOREAPP // JitGemmAvx2 is the AVX2 runtime-emit kernel — net5+/x86 only (see JitGemmAvx2.cs).
 // Per-shape GEMM bake-off on the exact AIsEval losing shapes: managed (RyuJIT
 // codegen) vs the raw-machine-code asm-JIT kernel vs OpenBLAS. Answers whether
 // RyuJIT codegen is the gap and whether the asm-JIT closes it at these shapes.
