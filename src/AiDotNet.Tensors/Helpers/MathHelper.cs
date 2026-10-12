@@ -422,6 +422,18 @@ public static class MathHelper
     }
 
     /// <summary>
+    /// Calculates ln|Γ(x)| without forming Γ(x), so it stays finite for large x.
+    /// </summary>
+    /// <typeparam name="T">The numeric type to use for calculations.</typeparam>
+    /// <param name="x">The argument.</param>
+    /// <returns>ln|Γ(x)|; +∞ at the poles.</returns>
+    public static T LogGamma<T>(T x)
+    {
+        var ops = GetNumericOperations<T>();
+        return ops.FromDouble(GammaFunction.LogGamma(ops.ToDouble(x)));
+    }
+
+    /// <summary>
     /// Calculates the modified Bessel function of the second kind of order nu at point x.
     /// </summary>
     /// <typeparam name="T">The numeric type to use for calculations.</typeparam>

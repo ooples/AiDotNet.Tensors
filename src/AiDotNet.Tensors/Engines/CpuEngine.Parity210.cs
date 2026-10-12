@@ -4030,7 +4030,8 @@ public partial class CpuEngine
         if (lazy != null) return lazy;
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
-            return ops.Log(ops.Abs(MathHelper.Gamma(x)));
+            // In log space: ln(Γ(x)) overflowed to +∞ for x > 171.6 when Γ(x) was formed first.
+            return ops.FromDouble(GammaFunction.LogGamma(ops.ToDouble(x)));
         }, "TensorLgamma");
         DifferentiableOps.RecordUnary("TensorLgamma", result, tensor, BackwardFunctions<T>.LgammaBackward);
         return result;
