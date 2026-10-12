@@ -139,6 +139,60 @@ __kernel void sum_axis(
     output[outerIdx] = sum;
 }
 
+// One work-group per row (#1157): strided partial sums, then a fixed local-memory tree, so long rows are read
+// coalesced and summed in parallel (sum_axis gives a whole row to one work-item). Deterministic order.
+// The work-group size must be a power of two no larger than 256.
+__kernel void sum_axis_rows(
+    __global const float* input,
+    __global float* output,
+    const int outerSize,
+    const int reduceSize)
+{
+    __local float scratch[256];
+    const int row = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    __global const float* rowPtr = input + (size_t)row * (size_t)reduceSize;
+    float sum = 0.0f;
+    for (int i = lid; i < reduceSize; i += lsz) sum += rowPtr[i];
+    scratch[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = lsz >> 1; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) output[row] = scratch[0];
+}
+
+// Few long rows (#1157, the CUDA #1150 split): work-group (chunk, row) sums chunk `chunk` of row `row` into
+// partial[row * chunks + chunk]; the host then reduces the partials with SumAxis. Fixed partition and order.
+__kernel void sum_axis_rows_split(
+    __global const float* input,
+    __global float* partial,
+    const int reduceSize,
+    const int chunks,
+    const int chunkLen)
+{
+    __local float scratch[256];
+    const int chunk = get_group_id(0);
+    const int row = get_group_id(1);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const size_t start = (size_t)chunk * (size_t)chunkLen;
+    size_t end = start + (size_t)chunkLen;
+    if (end > (size_t)reduceSize) end = (size_t)reduceSize;
+    __global const float* rowPtr = input + (size_t)row * (size_t)reduceSize;
+    float sum = 0.0f;
+    for (size_t i = start + (size_t)lid; i < end; i += (size_t)lsz) sum += rowPtr[i];
+    scratch[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = lsz >> 1; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) partial[(size_t)row * (size_t)chunks + (size_t)chunk] = scratch[0];
+}
+
 // Max along axis
 __kernel void max_axis(
     __global const float* input,
@@ -303,7 +357,7 @@ __kernel void reduce_sum_of_squares(
             return new string[]
             {
                 "reduce_sum", "reduce_max", "reduce_min",
-                "sum_axis", "max_axis", "variance_axis", "std_axis",
+                "sum_axis", "sum_axis_rows", "sum_axis_rows_split", "max_axis", "variance_axis", "std_axis",
                 "product_axis", "norm_axis", "logsumexp_axis",
                 "cumsum_axis", "scalar_minus_tensor", "normalize_l2",
                 "reduce_sum_backward", "reduce_mean_backward",

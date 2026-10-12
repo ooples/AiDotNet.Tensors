@@ -4337,8 +4337,47 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 
+            if (outerSize <= 0 || reduceSize <= 0)
+                throw new ArgumentException("outerSize and reduceSize must be positive.");
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
+            int rowGroup = SumAxisRowGroupSize();
+
+            // #1157 (the CUDA #1150 split): few long rows -- a full reduction is one -- would leave all but a handful
+            // of compute units idle with a work-group per row. Split each row into chunks of about 4 work-groups per
+            // compute unit, sum them into partials, then reduce the partials with this same method. Fixed partition
+            // and order: deterministic.
+            if (rowGroup > 0 && reduceSize >= SumAxisSplitMinReduce && outerSize < 2 * Math.Max(1, ComputeUnits)
+                && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
+            {
+                int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin,
+                    4L * Math.Max(1, ComputeUnits) / outerSize));
+                int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+                chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+                using var partial = AllocateBuffer(outerSize * chunks);
+                splitKernel.SetArg(0, bufferA.Handle);
+                splitKernel.SetArg(1, ((DirectOpenClGpuBuffer)partial).Buffer.Handle);
+                splitKernel.SetArg(2, reduceSize);
+                splitKernel.SetArg(3, chunks);
+                splitKernel.SetArg(4, chunkLen);
+                splitKernel.Execute2D(chunks * rowGroup, outerSize, rowGroup, 1);
+                System.Threading.Interlocked.Increment(ref _sumAxisSplitLaunches);
+                SumAxis(partial, B, outerSize, chunks);
+                return;
+            }
+
+            // Rows of at least SumAxisRowsMinReduce elements: one work-group per row (coalesced reads, parallel
+            // in-row tree). Short rows keep sum_axis (one work-item per row), where a work-group would mostly idle.
+            if (rowGroup > 0 && reduceSize >= SumAxisRowsMinReduce
+                && _kernelCache.TryGetValue("sum_axis_rows", out var rowsKernel))
+            {
+                rowsKernel.SetArg(0, bufferA.Handle);
+                rowsKernel.SetArg(1, bufferB.Handle);
+                rowsKernel.SetArg(2, outerSize);
+                rowsKernel.SetArg(3, reduceSize);
+                rowsKernel.Execute1D(outerSize * rowGroup, rowGroup);
+                return;
+            }
 
             var kernel = _kernelCache["sum_axis"];
             kernel.SetArg(0, bufferA.Handle);
@@ -4349,6 +4388,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int localSize = CalculateOptimalWorkGroupSize1D(outerSize);
             kernel.Execute1D(outerSize, localSize);
             // No sync - can be chained asynchronously
+        }
+
+        // SumAxis thresholds, as on CUDA (#1150 / #1157).
+        internal const int SumAxisRowsMinReduce = 32;
+        internal const int SumAxisSplitMinReduce = 64 * 1024;
+        internal const int SumAxisSplitChunkMin = 8 * 1024;
+        private long _sumAxisSplitLaunches;
+        internal long SumAxisSplitLaunches => System.Threading.Interlocked.Read(ref _sumAxisSplitLaunches);
+
+        // The row kernels' work-group size: 256 (their local scratch), or the largest power of two the device
+        // allows; 0 when that is below 32 (then sum_axis serves every shape).
+        private int SumAxisRowGroupSize()
+        {
+            long max = Math.Min(256L, (long)_maxWorkGroupSize);
+            int size = 1;
+            while (size * 2 <= max) size *= 2;
+            return size >= 32 ? size : 0;
         }
 
         #endregion
