@@ -1105,6 +1105,20 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     }
 
     /// <inheritdoc/>
+    public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        EnsureInitialized();
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({buffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+        UploadToBuffer(data, buffer);
+        // UploadToBuffer stages the whole buffer, so that is what crosses the boundary.
+        GpuLaunchProbe.OnUpload((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
+    }
+
+    /// <inheritdoc/>
     public IGpuBuffer AllocateWorkspaceBuffer(int totalElements)
     {
         return AllocateBuffer(totalElements);
@@ -1159,6 +1173,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         _batchMode = false;
         _batchDispatchCount = 0;
+        ReleaseBuffersHeldForBatch();
     }
 
     /// <summary>

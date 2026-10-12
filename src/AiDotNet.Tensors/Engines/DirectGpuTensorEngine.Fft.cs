@@ -74,11 +74,11 @@ public partial class DirectGpuTensorEngine
         int batch = interleaved.Length / last;
 
         // Preferred generic path: arbitrary length, batched, and fully device-resident. CUDA takes it for every
-        // length. A backend that also has an established power-of-two kernel (Vulkan) keeps that kernel for
+        // length. A backend that also has an established power-of-two kernel keeps that kernel for
         // power-of-two lengths and takes this path for the lengths that otherwise had no device route at all.
         // The public Fft module records the backward operation after this method returns.
         bool powerOfTwo = (n & (n - 1)) == 0;
-        if (backend is IGenericFftBackend generic && (backend is CudaBackend || !powerOfTwo) &&
+        if (backend is IGenericFftBackend generic && (generic.PrefersGenericFftForPowerOfTwo || !powerOfTwo) &&
             generic.SupportsFftElementType(FftElementType.Float32))
         {
             try
