@@ -122,7 +122,8 @@ for await (const line of rl) {
 
     /// <summary>
     /// Builds <paramref name="name"/>'s compute pipeline on Dawn without dispatching it: null when it compiles, else
-    /// Dawn's error (the way a backend's readiness check asks its device compiler).
+    /// Dawn's error (the way a backend's readiness check asks its device compiler). A hung server is killed and the
+    /// call throws <see cref="TimeoutException"/>, since its stream can no longer be trusted.
     /// </summary>
     public string? Compile(string name)
     {
@@ -133,7 +134,13 @@ for await (const line of rl) {
         _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));
         _node.StandardInput.Flush();
         var read = _node.StandardOutput.ReadLineAsync();
-        if (!read.Wait(ReplyTimeout)) return $"{name}: Dawn did not reply within {ReplyTimeout.TotalMinutes} minutes.";
+        if (!read.Wait(ReplyTimeout))
+        {
+            // Replies are untagged and sequential: a late one would answer the next request. Stop the server, as Launch
+            // does, so nothing reads this launcher's stream again.
+            try { _node.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+            throw new TimeoutException($"{name} on Dawn did not compile within {ReplyTimeout.TotalMinutes} minutes: {StderrText()}");
+        }
         string? reply = read.Result;
         if (reply is null) return "Dawn server exited: " + StderrText();
         using var doc = JsonDocument.Parse(reply);

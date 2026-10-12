@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using Xunit;
 
@@ -49,7 +50,9 @@ public sealed class GenericFftReadinessTests
                      @"launch\(""(\w+)""", System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(1)))
             launched.Add(m.Groups[1].Value);
         Assert.NotEmpty(launched);
-        Assert.Subset(new HashSet<string>(PortableGenericFft.KernelNames, StringComparer.Ordinal), launched);
+        // Both ways: a launch missing from the list would let the capability report a kernel that never compiled, and a
+        // listed kernel that is never launched would withhold the capability for nothing.
+        Assert.Equal(launched.OrderBy(n => n, StringComparer.Ordinal), PortableGenericFft.KernelNames.OrderBy(n => n, StringComparer.Ordinal));
     }
 
     private static string RepoRoot()
