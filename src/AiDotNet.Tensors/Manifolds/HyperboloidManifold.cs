@@ -132,7 +132,9 @@ public sealed class HyperboloidManifold<T>
     {
         EnsureSameLength(a, b);
         var result = new T[a.Length];
-        _ops.Add(a.AsSpan(), b.AsSpan(), result);
+        using var aKeep1 = new KeepAliveScope(a);
+        using var bKeep1 = new KeepAliveScope(b);
+        _ops.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result);
         return new Vector<T>(result);
     }
 
@@ -140,14 +142,17 @@ public sealed class HyperboloidManifold<T>
     {
         EnsureSameLength(a, b);
         var result = new T[a.Length];
-        _ops.Subtract(a.AsSpan(), b.AsSpan(), result);
+        using var aKeep2 = new KeepAliveScope(a);
+        using var bKeep2 = new KeepAliveScope(b);
+        _ops.Subtract(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result);
         return new Vector<T>(result);
     }
 
     private Vector<T> Scale(Vector<T> v, T scalar)
     {
         var result = new T[v.Length];
-        _ops.MultiplyScalar(v.AsSpan(), scalar, result);
+        using var vKeep1 = new KeepAliveScope(v);
+        _ops.MultiplyScalar(v.AsSpanUnmarked(), scalar, result);
         return new Vector<T>(result);
     }
 

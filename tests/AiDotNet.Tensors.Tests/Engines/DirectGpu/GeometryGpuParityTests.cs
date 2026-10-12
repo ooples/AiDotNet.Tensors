@@ -1,3 +1,4 @@
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -119,6 +120,50 @@ public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFix
         var g = Gpu.GridSample(input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, false);
         var c = _cpu.GridSample(input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, false);
         AssertClose(g, c);
+    }
+
+    // #1134: a NaN / infinite / out-of-int-range grid point samples nothing on the device too, in every mode and
+    // padding; finite points are unaffected.
+    [SkippableTheory]
+    [MemberData(nameof(NonFiniteSortAndGridSampleTests.AllModes), MemberType = typeof(NonFiniteSortAndGridSampleTests))]
+    public void GridSample2D_NonFinitePoints_GpuMatchesCpu(GridSampleMode mode, GridSamplePadding padding, bool alignCorners)
+    {
+        SkipIfUnavailable();
+        var input = new Tensor<float>(Enumerable.Range(1, 24).Select(v => (float)v).ToArray(), new[] { 1, 2, 3, 4 });
+        var (grid, bad) = NonFiniteSortAndGridSampleTests.MixedGrid();
+        var g = Gpu.GridSample(input, grid, mode, padding, alignCorners);
+        var c = _cpu.GridSample(input, grid, mode, padding, alignCorners);
+        for (int ch = 0; ch < 2; ch++)
+            for (int i = 0; i < bad.Length; i++)
+                if (bad[i]) Assert.True(g[ch * bad.Length + i] == 0f, $"{mode}/{padding}/align={alignCorners} point {i}: {g[ch * bad.Length + i]}");
+        AssertClose(g, c);
+    }
+
+    [SkippableFact]
+    public void GridSample2D_TwoArgument_NonFinitePoints_ForwardAndGradientsMatchCpu()
+    {
+        SkipIfUnavailable();
+        var input = new Tensor<float>(Enumerable.Range(1, 24).Select(v => (float)v).ToArray(), new[] { 1, 2, 3, 4 });
+        var (grid, bad) = NonFiniteSortAndGridSampleTests.MixedGrid();
+        var (go, gdx, gdg) = NonFiniteSortAndGridSampleTests.BilinearWithGradients(Gpu, input, grid);
+        var (co, cdx, cdg) = NonFiniteSortAndGridSampleTests.BilinearWithGradients(_cpu, input, grid);
+        foreach (var (name, gv, cv) in new[] { ("output", go, co), ("dInput", gdx, cdx), ("dGrid", gdg, cdg) })
+        {
+            Assert.Equal(cv.Length, gv.Length);
+            for (int i = 0; i < cv.Length; i++)
+            {
+                // A NaN on either side fails here (a bare tolerance test would pass it: NaN > x is false).
+                Assert.False(float.IsNaN(gv[i]) || float.IsInfinity(gv[i]), $"{name}[{i}]: gpu {gv[i]} is not finite");
+                Assert.False(float.IsNaN(cv[i]) || float.IsInfinity(cv[i]), $"{name}[{i}]: cpu {cv[i]} is not finite");
+                Assert.True(Math.Abs(gv[i] - cv[i]) <= Tolerance * (1 + Math.Abs(cv[i])), $"{name}[{i}]: gpu {gv[i]} cpu {cv[i]}");
+            }
+        }
+        for (int i = 0; i < bad.Length; i++)
+            if (bad[i])
+            {
+                Assert.Equal(0f, gdg[2 * i]);
+                Assert.Equal(0f, gdg[2 * i + 1]);
+            }
     }
 
     [SkippableFact]

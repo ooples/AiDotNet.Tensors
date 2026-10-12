@@ -345,7 +345,8 @@ internal static class MixedPrecisionEmit
             {
                 if (e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine fg && fg.TryCastResidentForwardHalf(x, o))
                     return;
-                MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpan());
+                using var oKeep1 = new KeepAliveScope(o);
+                MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpanUnmarked());
             },
             // Up-cast the Half gradient into the FP32 grad space ON-DEVICE on the GPU (the host Tensor.Cast
             // would pull the gradient to CPU — CastResidentDtype keeps it resident); host cast otherwise.
@@ -363,6 +364,8 @@ internal static class MixedPrecisionEmit
     private static void LandHalf(IEngine e, Tensor<Half> r, Tensor<Half> o)
     {
         if (e is DirectGpuTensorEngine gpu && gpu.TryLandResidentHalf(r, o)) return;
-        r.AsSpan().CopyTo(o.AsWritableSpan());
+        using var rKeep1 = new KeepAliveScope(r);
+        using var oKeep2 = new KeepAliveScope(o);
+        r.AsSpanUnmarked().CopyTo(o.AsWritableSpanUnmarked());
     }
 }

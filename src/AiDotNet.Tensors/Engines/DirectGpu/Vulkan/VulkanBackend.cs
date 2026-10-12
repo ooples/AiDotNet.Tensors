@@ -50,6 +50,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     private readonly ConcurrentDictionary<(VulkanKernelType kernelType, int bindingCount, uint pushConstantSize), VulkanComputePipeline> _pipelineCache;
     private readonly ConcurrentDictionary<VulkanKernelType, VulkanShaderModule> _shaderCache;
     private readonly ConcurrentDictionary<string, VulkanComputePipeline> _glslPipelineCache;
+    private readonly ConcurrentDictionary<(string Source, int Bindings, uint PushSize), VulkanComputePipeline> _glslPipelineBySource = new();
+    private readonly ConcurrentDictionary<(string Source, int Bindings, uint PushSize), VulkanComputePipeline> _glslPipelineByInstance =
+        new(SourceInstanceComparer.Instance);
     private VulkanGlslCompiler? _glslCompiler;
     private VulkanBufferTransfer? _transfer;
     private readonly object _computeLock = new object();
@@ -225,11 +228,40 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         return pipeline;
     }
 
+    private void RememberPipeline((string Source, int Bindings, uint PushSize) key, VulkanComputePipeline pipeline)
+    {
+        _glslPipelineBySource.TryAdd(key, pipeline);
+        // Only an interned instance (a literal) is remembered by reference: a source built per call would add an
+        // entry, and keep its string alive, on every call.
+        if (ReferenceEquals(string.IsInterned(key.Source), key.Source))
+            _glslPipelineByInstance.TryAdd(key, pipeline);
+    }
+
+    /// <summary>Compares pipeline keys by the source string's identity rather than its text.</summary>
+    private sealed class SourceInstanceComparer : IEqualityComparer<(string Source, int Bindings, uint PushSize)>
+    {
+        internal static readonly SourceInstanceComparer Instance = new();
+
+        public bool Equals((string Source, int Bindings, uint PushSize) x, (string Source, int Bindings, uint PushSize) y) =>
+            ReferenceEquals(x.Source, y.Source) && x.Bindings == y.Bindings && x.PushSize == y.PushSize;
+
+        public int GetHashCode((string Source, int Bindings, uint PushSize) key) =>
+            unchecked(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(key.Source) * 31 + key.Bindings * 17 + (int)key.PushSize);
+    }
+
     /// <summary>
     /// Gets or creates a compute pipeline from a GLSL source string using runtime compilation.
     /// </summary>
     private VulkanComputePipeline? GetOrCreateGlslPipeline(string glslSource, int bindingCount, uint pushConstantSize = 0)
     {
+        // Every dispatch comes through here. Hashing the source with SHA-256, formatting the digest and building the
+        // key string below cost 2-4 microseconds and 1.5-4 KB of garbage per op. Most kernel sources are string
+        // literals, so the same instance comes back every time and is found by reference; a source built at run time
+        // is found by its text.
+        var sourceKey = (glslSource, bindingCount, pushConstantSize);
+        if (_glslPipelineByInstance.TryGetValue(sourceKey, out var known) ||
+            _glslPipelineBySource.TryGetValue(sourceKey, out known))
+            return known;
         // Use SHA256 instead of GetHashCode to prevent cache key collisions
         string sourceHash;
         using (var sha = System.Security.Cryptography.SHA256.Create())
@@ -239,7 +271,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
         string cacheKey = $"{sourceHash}_{bindingCount}_{pushConstantSize}";
         if (_glslPipelineCache.TryGetValue(cacheKey, out var cached))
+        {
+            RememberPipeline(sourceKey, cached);
             return cached;
+        }
 
         if (_glslCompiler is null || !_glslCompiler.IsAvailable)
             return null;
@@ -252,7 +287,13 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         {
             var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
             if (pipeline is not null)
-                _glslPipelineCache.TryAdd(cacheKey, pipeline);
+            {
+                // Another thread may have compiled the same source meanwhile: keep the cached pipeline for every
+                // caller and release this one.
+                var kept = _glslPipelineCache.GetOrAdd(cacheKey, pipeline);
+                if (!ReferenceEquals(kept, pipeline)) { pipeline.Dispose(); pipeline = kept; }
+                RememberPipeline(sourceKey, pipeline);
+            }
             return pipeline;
         }
         finally
@@ -262,11 +303,22 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
     }
 
+    // The size-only shorthands below push exactly one word. A kernel whose push-constant block is larger must pass
+    // every word explicitly: vkCmdPushConstants would otherwise read past the one-element array.
+    private static void RequireSizeOnlyPush(uint pushConstantSize)
+    {
+        if (pushConstantSize != sizeof(uint))
+            throw new ArgumentException(
+                $"This kernel declares {pushConstantSize} bytes of push constants; pass each value explicitly instead of the size-only shorthand.",
+                nameof(pushConstantSize));
+    }
+
     /// <summary>
     /// Executes a GLSL-compiled compute pipeline with 2 buffers + push constants.
     /// </summary>
     private void GlslUnaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         // Single-parameter shorthand — pushes {size} as the only push constant
         GlslUnaryOp(glslSource, A, B, size, new uint[] { (uint)size }, pushConstantSize);
     }
@@ -323,6 +375,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslBinaryOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslBinaryOp(glslSource, A, B, C, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -379,6 +432,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslGenerateOp(string glslSource, IGpuBuffer O, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslGenerateOp(glslSource, O, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -403,6 +457,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslQuadOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslQuadOp(glslSource, A, B, C, D, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -428,6 +483,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void GlslQuintOp(string glslSource, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, IGpuBuffer E, int size, uint pushConstantSize = sizeof(uint))
     {
+        RequireSizeOnlyPush(pushConstantSize);
         GlslQuintOp(glslSource, A, B, C, D, E, size, new uint[] { (uint)size }, pushConstantSize);
     }
 
@@ -775,6 +831,11 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         int workgroupSize = VulkanKernels.WorkgroupSize)
     {
         if (workgroupSize <= 0) throw new ArgumentOutOfRangeException(nameof(workgroupSize));
+        if (pushConstants is null) throw new ArgumentNullException(nameof(pushConstants));
+        if ((long)pushConstants.Length * sizeof(uint) < pushConstantSize)
+            throw new ArgumentException(
+                $"The kernel declares {pushConstantSize} bytes of push constants but only {pushConstants.Length * sizeof(uint)} were supplied.",
+                nameof(pushConstants));
         // Batch mode: record into batch command buffer without immediate submit
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
@@ -1151,6 +1212,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pipeline.Dispose();
         }
         _glslPipelineCache.Clear();
+        _glslPipelineBySource.Clear();
+        _glslPipelineByInstance.Clear();
 
         // Dispose shaders
         foreach (var shader in _shaderCache.Values)
@@ -1161,6 +1224,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         // Dispose GLSL compiler
         _glslCompiler?.Dispose();
+
+        _parityFlagSlots?.Dispose();
+        _parityFlagSlots = null;
 
         // Dispose transfer
         _transfer?.Dispose();

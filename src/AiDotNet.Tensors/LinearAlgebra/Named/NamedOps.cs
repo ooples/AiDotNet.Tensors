@@ -57,8 +57,10 @@ public static class NamedOps
         // broadcast natively (Add via TensorAdd) skip this.
         var result = new Tensor<T>(targetShape);
         var srcStrides = ComputeStrides(source._shape);
-        var dstSpan = result.AsWritableSpan();
-        var srcSpan = source.AsSpan();
+        using var dstSpanLease = result.LeaseWritable();
+        var dstSpan = dstSpanLease.Span;
+        using var srcSpanLease = source.Lease();
+        var srcSpan = srcSpanLease.Span;
         var idx = new int[targetShape.Length];
         for (int linear = 0; linear < result.Length; linear++)
         {
@@ -171,8 +173,10 @@ public static class NamedOps
         // Cheap path when b's names are exactly a subset and ordered the
         // same way: we just reshape b to alignedShape — no per-element move.
         // General path: iterate b's elements, project into alignedShape index.
-        var bSpan = b.Tensor.AsSpan();
-        var dst = aligned.AsWritableSpan();
+        using var bSpanLease = b.Tensor.Lease();
+        var bSpan = bSpanLease.Span;
+        using var dstLease = aligned.LeaseWritable();
+        var dst = dstLease.Span;
         var bShape = b.Tensor._shape;
         var bStrides = ComputeStrides(bShape);
         var alignedStrides = ComputeStrides(alignedShape);

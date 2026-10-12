@@ -226,7 +226,8 @@ public static class DualOps<T>
         var zero = ops.Zero;
         var one = ops.One;
         var maskData = new T[x.Primal.Length];
-        var primalData = x.Primal.AsSpan();
+        using var primalDataLease = x.Primal.Lease();
+        var primalData = primalDataLease.Span;
         for (int i = 0; i < maskData.Length; i++)
             maskData[i] = ops.GreaterThan(primalData[i], zero) ? one : zero;
         var mask = new Tensor<T>(maskData, (int[])x.Primal._shape.Clone());

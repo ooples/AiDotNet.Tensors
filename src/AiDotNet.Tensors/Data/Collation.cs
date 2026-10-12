@@ -51,7 +51,8 @@ public static class Collators
         for (int d = 0; d < sampleShape.Length; d++) batchShape[d + 1] = sampleShape[d];
 
         var batch = new Tensor<T>(batchShape);
-        var dst = batch.AsWritableSpan();
+        using var dstLease = batch.LeaseWritable();
+        var dst = dstLease.Span;
         int sampleLen = first.Length;
         for (int s = 0; s < samples.Count; s++)
         {
@@ -81,7 +82,8 @@ public static class Collators
         }
 
         var batch = new Tensor<T>(new[] { samples.Count, maxLen });
-        var dst = batch.AsWritableSpan();
+        using var dstLease = batch.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < dst.Length; i++) dst[i] = padValue;
 
         for (int s = 0; s < samples.Count; s++)

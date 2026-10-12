@@ -495,6 +495,19 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
+    /// Before an in-place write: moves <paramref name="target"/>'s autograd history to a snapshot of its value and
+    /// returns the snapshot, or null when no tape records in-place ops (see <see cref="GradientTape{T}.RebaseForInPlace"/>).
+    /// The in-place op reads the snapshot and records snapshot -> target.
+    /// </summary>
+    internal static Tensor<T>? RebaseForInPlace<T>(Tensor<T> target)
+    {
+        if (_anyTapeActive == 0) return null;
+        var tape = GradientTape<T>.Current;
+        if (tape is null || !tape.Options.RecordInPlace || NoGradScope<T>.IsSuppressed) return null;
+        return tape.RebaseForInPlace(target);
+    }
+
+    /// <summary>
     /// Records a binary operation (two inputs). Zero heap allocation, zero struct copy.
     /// Writes directly into the arena slot via ref return.
     /// </summary>
@@ -733,9 +746,11 @@ internal static class DifferentiableOps
         if (HasOverlappingStorage(existing, source)) return false;
 
         var numOps = global::AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
-        var dest = existing.AsWritableSpan();
+        using var destLease = existing.LeaseWritable();
+        var dest = destLease.Span;
         if (ClaimFirstWrite(existing)) dest.Clear();   // stale buffer from an earlier step: this is its first write
-        var src = source.AsSpan();
+        using var srcLease = source.Lease();
+        var src = srcLease.Span;
         var fullShape = existing._shape;
         int rank = fullShape.Length;
         int rowLength = regionShape[rank - 1];
@@ -1084,7 +1099,8 @@ internal static class DifferentiableOps
             // The copy overwrites every element, so rent uninitialized: a zeroed fresh array per fan-out
             // (every residual add hands one gradient to two slots) paid page faults on top of the copy.
             owned = AiDotNet.Tensors.Helpers.TensorAllocator.RentUninitialized<T>(contribution._shape);
-            contribution.CopyTo(owned.AsWritableSpan());
+            using var ownedKeep1 = new KeepAliveScope(owned);
+            contribution.CopyTo(owned.AsWritableSpanUnmarked());
         }
         owners[owned] = destination;
         return owned;

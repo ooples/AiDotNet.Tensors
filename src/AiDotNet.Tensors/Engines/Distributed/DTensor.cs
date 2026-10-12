@@ -217,7 +217,9 @@ public sealed class DTensor<T>
     private static Tensor<T> AllReduceCopy(Tensor<T> t, IProcessGroup g)
     {
         var copy = new Tensor<T>((int[])t._shape.Clone());
-        t.AsSpan().CopyTo(copy.AsWritableSpan());
+        using var tKeep1 = new KeepAliveScope(t);
+        using var copyKeep1 = new KeepAliveScope(copy);
+        t.AsSpanUnmarked().CopyTo(copy.AsWritableSpanUnmarked());
         g.AllReduce(copy, ReduceOp.Sum);
         return copy;
     }
@@ -313,8 +315,10 @@ public sealed class DTensor<T>
         int dstAxis = dst._shape[axis];
         int copyLen = srcLen < 0 ? dstAxis : srcLen;
 
-        var s = src.AsSpan();
-        var d = dst.AsWritableSpan();
+        using var sLease = src.Lease();
+        var s = sLease.Span;
+        using var dLease = dst.LeaseWritable();
+        var d = dLease.Span;
         for (int o = 0; o < outer; o++)
         {
             int srcRowStart = (o * srcAxis + srcStart) * inner;

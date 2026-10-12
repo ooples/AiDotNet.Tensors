@@ -160,7 +160,8 @@ internal static class OpReplay
         if (axes is null)
         {
             var scalar = new Tensor<T>(new[] { 1 });
-            scalar.AsWritableSpan()[0] = engine.TensorMean(input);
+            using var scalarKeep1 = new KeepAliveScope(scalar);
+            scalar.AsWritableSpanUnmarked()[0] = engine.TensorMean(input);
             return scalar;
         }
         return engine.ReduceMean(input, axes, keepDims);
