@@ -69,6 +69,7 @@ public sealed class CrossBackendKernelCoverageTests
         "clip_by_value", "where_select", "max_axis", "var_axis", // elementwise/axis-reduce (CudaBackend.cs)
         "mixed_precision_forward", "mixed_precision_backward",  // CudaBackend.MixedPrecisionConv.cs
         "global_maxpool2d_with_indices",                       // -> global_maxpool2d (+backward)
+        "tk_im2col_pbl",                                       // -> im2col (CudaBackend.ConvGemm.cs); [P, B*L] layout for the registry
         "conv_transpose2d_backward_weights",                   // -> conv_transpose2d_backward_kernel
         "gru_accumulate_bias_gradients", "gru_accumulate_weight_gradients_hh",
         "gru_accumulate_weight_gradients_ih",                  // -> gru_accumulate_weight_gradients (fused hh/ih/bias)

@@ -955,8 +955,9 @@ void main() {
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
         if (batchSize <= 0 || features <= 0) return;
-        GlslUnaryOp(VulkanGlslKernels.SoftmaxRows, A, B, batchSize,
-            new uint[] { (uint)batchSize, (uint)features }, 2 * sizeof(uint));
+        // Registry dispatch (#1115): the established shader or a generated row variant, chosen per shape class.
+        if (SoftmaxSlot.TryExecute(RowShape(batchSize, features), new TunedSoftmaxArgs(A, B, batchSize, features))) return;
+        SoftmaxReference(A, B, batchSize, features);
     }
 
     #endregion

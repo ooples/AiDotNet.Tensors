@@ -889,6 +889,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in ComplexKernels.GetKernelNames())
                     _kernelCache[name] = new DirectOpenClKernel(_context, complexProgram, name);
 
+                // Generated row / column variants for the tuned-kernel registry (#1114). Optional: without them every
+                // slot keeps its reference candidate (the established kernels above).
+                try
+                {
+                    var tunedProgram = CompileOrLoadCached(Kernels.OpenClTunedRowKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Tuned row kernels");
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in Kernels.OpenClTunedRowKernels.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, tunedProgram, name)));
+                    _programs.Add(tunedProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL tuned row kernels compilation failed: {ex.Message}");
+                }
+
                 // Compile Parity-210 kernels (hot-path subset of #210 op surface).
                 // Optional — on drivers that reject any op the whole module we
                 // swallow the exception and fall back to the CpuEngine path.
@@ -4029,17 +4045,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return;
             }
 
-            var kernel = _kernelCache["softmax"];
-            kernel.SetArg(0, bufferA.Handle);
-            kernel.SetArg(1, bufferB.Handle);
-            kernel.SetArg(2, batchSize);
-            kernel.SetArg(3, features);
-
-            int localSize = Math.Min(256, features);
-            localSize = (int)Math.Pow(2, Math.Floor(Math.Log(localSize, 2)));
-            localSize = Math.Max(1, localSize);
-            kernel.SetLocalArg(4, localSize * sizeof(float));
-            kernel.Execute1D(batchSize * localSize, localSize);
+            // Registry dispatch (#1114): the established kernel or a generated row variant, chosen per shape class.
+            if (batchSize > 0 && features > 0
+                && SoftmaxSlot.TryExecute(RowShape(batchSize, features), new TunedSoftmaxArgs(A, B, batchSize, features)))
+                return;
+            SoftmaxReference(A, B, batchSize, features);
         }
 
         /// <summary>
@@ -6727,6 +6737,22 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW,
             int dilationH, int dilationW)
         {
+            // Registry dispatch (#1114): the established generic dispatch, the explicit tiled / direct kernels, or
+            // im2col + GEMM, chosen per shape class.
+            var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)) return;
+            Conv2DGenericCore(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        }
+
+        private void Conv2DGenericCore(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+            int batch, int inChannels, int inHeight, int inWidth,
+            int outChannels, int outHeight, int outWidth,
+            int kernelH, int kernelW,
+            int strideH, int strideW, int padH, int padW,
+            int dilationH, int dilationW)
+        {
             // Route: Winograd (3x3 stride-1 dilation-1) → Tiled (shared mem) → Direct fallback
             bool useWinograd = kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1
                                && dilationH == 1 && dilationW == 1;
@@ -8290,66 +8316,26 @@ KERNEL VARIANTS (A/B testing):
         public void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
             IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
         {
-            var k = _kernelCache["layernorm_forward"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
-            k.SetArg(arg++, batchSize);
-            k.SetArg(arg++, normalizedSize);
-            k.SetArg(arg++, epsilon);
-
-            // Workgroup-parallel: 1 workgroup per batch element
-            int lnLocalSize = Math.Min(256, normalizedSize);
-            lnLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, lnLocalSize), 2)));
-            lnLocalSize = Math.Max(1, lnLocalSize);
-            k.SetLocalArg(arg++, lnLocalSize * sizeof(float));
-            k.Execute1D(batchSize * lnLocalSize, lnLocalSize);
+            var args = new TunedLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar, batchSize, normalizedSize, epsilon);
+            if (batchSize > 0 && normalizedSize > 0 && LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), args))
+                return;
+            LayerNormReference(args);
         }
 
         public void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
             IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
             int batchSize, int normalizedSize, float epsilon)
         {
-            // First compute gradInput
-            var k = _kernelCache["layernorm_backward"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
-            k.SetArg(arg++, batchSize);
-            k.SetArg(arg++, normalizedSize);
-            k.SetArg(arg++, epsilon);
-
-            // Workgroup-parallel: 1 workgroup per batch element
-            int lnbLocalSize = Math.Min(256, normalizedSize);
-            lnbLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, lnbLocalSize), 2)));
-            lnbLocalSize = Math.Max(1, lnbLocalSize);
-            k.SetLocalArg(arg++, lnbLocalSize * sizeof(float));
-            k.SetLocalArg(arg++, lnbLocalSize * sizeof(float));
-            k.Execute1D(batchSize * lnbLocalSize, lnbLocalSize);
-
-            // Then accumulate gradient params
-            var kp = _kernelCache["layernorm_grad_params"];
-            arg = 0;
-            kp.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            kp.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            kp.SetArg(arg++, ((DirectOpenClGpuBuffer)saveMean).Buffer.Handle);
-            kp.SetArg(arg++, ((DirectOpenClGpuBuffer)saveInvVar).Buffer.Handle);
-            kp.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
-            kp.SetArg(arg++, ((DirectOpenClGpuBuffer)gradBeta).Buffer.Handle);
-            kp.SetArg(arg++, batchSize);
-            kp.SetArg(arg++, normalizedSize);
-
-            kp.Execute1D(normalizedSize, Math.Min(64, normalizedSize));
+            // Two registry slots: the input gradient (row kernels) and the affine gradients (column reductions).
+            bool rowsValid = batchSize > 0 && normalizedSize > 0;
+            var inputGradArgs = new TunedNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, null,
+                batchSize, normalizedSize);
+            if (!(rowsValid && LayerNormBackwardSlot.TryExecute(RowShape(batchSize, normalizedSize), inputGradArgs)))
+                LayerNormBackwardInputReference(inputGradArgs);
+            var paramArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar, gradGamma, gradBeta,
+                batchSize, normalizedSize);
+            if (!(rowsValid && LayerNormGradParametersSlot.TryExecute(RowShape(batchSize, normalizedSize), paramArgs)))
+                ColumnGradReference(rms: false, paramArgs);
         }
 
         public void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -8539,16 +8525,11 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(batchSize * rmsbLocalSize, rmsbLocalSize);
 
             // Compute gradGamma
-            var k2 = _kernelCache["rmsnorm_grad_gamma"];
-            arg = 0;
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)saveRms).Buffer.Handle);
-            k2.SetArg(arg++, ((DirectOpenClGpuBuffer)gradGamma).Buffer.Handle);
-            k2.SetArg(arg++, batchSize);
-            k2.SetArg(arg++, normalizedSize);
-
-            k2.Execute1D(normalizedSize, Math.Min(256, normalizedSize));
+            // The gamma gradient is a column reduction served by the registry (#1114).
+            var gammaArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null, batchSize, normalizedSize);
+            if (!(batchSize > 0 && normalizedSize > 0
+                  && RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)))
+                ColumnGradReference(rms: true, gammaArgs);
         }
 
         #endregion
@@ -9403,20 +9384,12 @@ KERNEL VARIANTS (A/B testing):
 
         public void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
         {
-            var k = _kernelCache["softmax_backward"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            k.SetArg(arg++, batchSize);
-            k.SetArg(arg++, features);
-
-            // Workgroup-parallel: 1 workgroup per batch row
-            int smLocalSize = Math.Min(256, features);
-            smLocalSize = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, smLocalSize), 2)));
-            smLocalSize = Math.Max(1, smLocalSize);
-            k.SetLocalArg(arg++, smLocalSize * sizeof(float));
-            k.Execute1D(batchSize * smLocalSize, smLocalSize);
+            // Registry dispatch (#1114): the established kernel or a generated row variant, chosen per shape class.
+            if (batchSize > 0 && features > 0
+                && SoftmaxBackwardSlot.TryExecute(RowShape(batchSize, features),
+                    new TunedSoftmaxBackwardArgs(gradOutput, output, gradInput, batchSize, features)))
+                return;
+            SoftmaxBackwardReference(gradOutput, output, gradInput, batchSize, features);
         }
 
         public void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
