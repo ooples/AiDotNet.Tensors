@@ -1,5 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
+using System.Collections.Generic;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -24,6 +26,49 @@ float bx_unit(uint h) { return float(h >> 8) * (1.0 / 16777216.0); }
 int bx_gid() { return int(gl_GlobalInvocationID.x); }
 ";
 
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// GLSL for the IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C (#1142) so Vulkan
+    /// runs the same code as HIP, OpenCL and Metal: each pointer parameter becomes a storage buffer of the same name
+    /// (read-only when const), each scalar a push constant in order, and the float builtins their GLSL names.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(BatchExecutionCudaKernels.SolverSource);
+
+    private static Dictionary<string, string> TranslateSolvers(string cuda)
+    {
+        var defines = new StringBuilder();
+        foreach (Match d in Regex.Matches(cuda, @"^#define [^\n]*\n", RegexOptions.Multiline, RegexTimeout)) defines.Append(d.Value);
+        var kernels = Regex.Matches(cuda, @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\) \{",
+            RegexOptions.None, RegexTimeout);
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (int k = 0; k < kernels.Count; k++)
+        {
+            Match kernel = kernels[k];
+            int end = k + 1 < kernels.Count ? kernels[k + 1].Index : cuda.Length;
+            string body = cuda.Substring(kernel.Index + kernel.Length, end - kernel.Index - kernel.Length)
+                .Replace("__uint_as_float(", "uintBitsToFloat(");
+            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax)f\(",
+                m => m.Groups[1].Value == "sqrt" ? "sqrt(" : m.Groups[1].Value == "fabs" ? "abs(" : "max(",
+                RegexOptions.None, RegexTimeout);
+            var buffers = new List<string>();
+            var push = new StringBuilder();
+            foreach (string raw in kernel.Groups[2].Value.Split(','))
+            {
+                string p = Regex.Replace(raw.Trim(), @"\s+", " ", RegexOptions.None, RegexTimeout);
+                Match pointer = Regex.Match(p, @"^(const )?(float|int)\* (\w+)$", RegexOptions.None, RegexTimeout);
+                if (pointer.Success)
+                    buffers.Add((pointer.Groups[1].Success ? "r:" : "rw:") + pointer.Groups[3].Value + ":" + pointer.Groups[2].Value);
+                else if (Regex.IsMatch(p, @"^int \w+$", RegexOptions.None, RegexTimeout))
+                    push.Append(p).Append("; ");
+                else
+                    throw new InvalidOperationException($"Untranslatable kernel parameter '{p}' in {kernel.Groups[1].Value}.");
+            }
+            result[kernel.Groups[1].Value] = Shader(buffers.ToArray(), push.ToString().TrimEnd(),
+                defines + "void main() {" + body);
+        }
+        return result;
+    }
     /// <summary>Buffer specs are "r:name", "w:name" or "rw:name", bound to bindings 0..n-1 in order.</summary>
     private static string Shader(string[] buffers, string push, string body)
     {

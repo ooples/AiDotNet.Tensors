@@ -51,6 +51,7 @@ internal static class MetalBatchExecutionKernels
                 : p.StartsWith("const unsigned int* ", StringComparison.Ordinal) ? "device const uint* " + p.Substring("const unsigned int* ".Length)
                 : p.StartsWith("unsigned int* ", StringComparison.Ordinal) ? "device uint* " + p.Substring("unsigned int* ".Length)
                 : p.StartsWith("float* ", StringComparison.Ordinal) ? "device " + p
+                : p.StartsWith("const int* ", StringComparison.Ordinal) || p.StartsWith("int* ", StringComparison.Ordinal) ? "device " + p
                 : p.StartsWith("unsigned long long ", StringComparison.Ordinal) ? "constant ulong& " + p.Substring("unsigned long long ".Length)
                 : p.StartsWith("int ", StringComparison.Ordinal) ? "constant int& " + p.Substring(4)
                 : p.StartsWith("float ", StringComparison.Ordinal) ? "constant float& " + p.Substring(6)

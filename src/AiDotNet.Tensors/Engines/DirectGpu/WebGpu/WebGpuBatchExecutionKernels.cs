@@ -446,6 +446,288 @@ var<workgroup> scratch: array<f32, 256>;
     destination[i] = bx_from_16(select(word & 0xffffu, word >> 16u, (i & 1) != 0), p.mode);
 }");
 
+    // IExtendedLinalgBackend solvers (#1142): line-for-line ports of BatchExecutionCudaKernels.SolverSource. Scalars
+    // are read into locals first because a local pivot would otherwise shadow the parameter struct p.
+    private const string LaCommon = @"
+fn la_nan() -> f32 { let bits = 0x7fc00000u; return bitcast<f32>(bits); }
+";
+
+    public static readonly string LaSymmetrize = Shader(new[] { "r:a", "rw:outp" }, "batch: i32, n: i32, upper: i32", LaCommon + Main + @"
+    let n = p.n;
+    if (i >= p.batch * n * n) { return; }
+    let o = (i / (n * n)) * n * n; let r = (i / n) % n; let c = i % n;
+    let keep = select(r >= c, r <= c, p.upper != 0);
+    outp[i] = select(a[o + c * n + r], a[i], keep);
+}");
+
+    public static readonly string LaLuSolve = Shader(new[] { "r:lu", "r:piv:i32", "r:rhs", "rw:x" }, "batch: i32, n: i32, nrhs: i32", LaCommon + Main + @"
+    let b = i; let n = p.n; let nrhs = p.nrhs;
+    if (b >= p.batch) { return; }
+    let ao = b * n * n; let po = b * n; let xo = b * n * nrhs;
+    for (var k = 0; k < n * nrhs; k++) { x[xo + k] = rhs[xo + k]; }
+    for (var r = 0; r < n; r++) {
+        let pr = piv[po + r];
+        if (pr != r && pr >= 0 && pr < n) {
+            for (var c = 0; c < nrhs; c++) {
+                let t = x[xo + r * nrhs + c]; x[xo + r * nrhs + c] = x[xo + pr * nrhs + c]; x[xo + pr * nrhs + c] = t;
+            }
+        }
+    }
+    for (var c = 0; c < nrhs; c++) {
+        for (var r = 1; r < n; r++) {
+            var s = x[xo + r * nrhs + c];
+            for (var j = 0; j < r; j++) { s -= lu[ao + r * n + j] * x[xo + j * nrhs + c]; }
+            x[xo + r * nrhs + c] = s;
+        }
+        for (var r = n - 1; r >= 0; r--) {
+            var s = x[xo + r * nrhs + c];
+            for (var j = r + 1; j < n; j++) { s -= lu[ao + r * n + j] * x[xo + j * nrhs + c]; }
+            x[xo + r * nrhs + c] = s / lu[ao + r * n + r];
+        }
+    }
+}");
+
+    public static readonly string LaLdlFactor = Shader(new[] { "r:a", "rw:ld", "rw:piv:i32" }, "batch: i32, n: i32, upper: i32", LaCommon + Main + @"
+    let b = i; let n = p.n; let upper = p.upper;
+    if (b >= p.batch) { return; }
+    let o = b * n * n; let po = b * n;
+    for (var k = 0; k < n * n; k++) { ld[o + k] = a[o + k]; }
+    for (var j = 0; j < n; j++) {
+        var pr = j; var best = abs(ld[o + j * n + j]);
+        for (var r = j + 1; r < n; r++) {
+            let v = abs(ld[o + r * n + r]);
+            if (v > best) { best = v; pr = r; }
+        }
+        piv[po + j] = pr;
+        if (pr != j) {
+            for (var k = 0; k < n; k++) { let t = ld[o + j * n + k]; ld[o + j * n + k] = ld[o + pr * n + k]; ld[o + pr * n + k] = t; }
+            for (var k = 0; k < n; k++) { let t = ld[o + k * n + j]; ld[o + k * n + j] = ld[o + k * n + pr]; ld[o + k * n + pr] = t; }
+        }
+        let d = ld[o + j * n + j];
+        if (d == 0.0) { continue; }
+        for (var r = j + 1; r < n; r++) {
+            let lij = ld[o + r * n + j] / d;
+            ld[o + r * n + j] = lij;
+            for (var k = j + 1; k < n; k++) { ld[o + r * n + k] -= lij * ld[o + j * n + k]; }
+        }
+    }
+    for (var r = 0; r < n; r++) { for (var j = r + 1; j < n; j++) { ld[o + r * n + j] = 0.0; } }
+    if (upper != 0) {
+        for (var r = 0; r < n; r++) {
+            for (var j = 0; j < r; j++) { ld[o + j * n + r] = ld[o + r * n + j]; ld[o + r * n + j] = 0.0; }
+        }
+    }
+}");
+
+    public static readonly string LaLdlSolve = Shader(new[] { "r:ld", "r:piv:i32", "r:rhs", "rw:x" }, "batch: i32, n: i32, nrhs: i32, upper: i32", LaCommon + Main + @"
+    let b = i; let n = p.n; let nrhs = p.nrhs; let upper = p.upper;
+    if (b >= p.batch) { return; }
+    let o = b * n * n; let po = b * n; let xo = b * n * nrhs;
+    for (var k = 0; k < n * nrhs; k++) { x[xo + k] = rhs[xo + k]; }
+    for (var c = 0; c < nrhs; c++) {
+        for (var j = 0; j < n; j++) {
+            let pr = piv[po + j];
+            if (pr != j && pr >= 0 && pr < n) { let t = x[xo + j * nrhs + c]; x[xo + j * nrhs + c] = x[xo + pr * nrhs + c]; x[xo + pr * nrhs + c] = t; }
+        }
+        for (var r = 0; r < n; r++) {
+            var s = x[xo + r * nrhs + c];
+            for (var k = 0; k < r; k++) { s -= select(ld[o + r * n + k], ld[o + k * n + r], upper != 0) * x[xo + k * nrhs + c]; }
+            x[xo + r * nrhs + c] = s;
+        }
+        for (var r = 0; r < n; r++) {
+            let d = ld[o + r * n + r];
+            x[xo + r * nrhs + c] = select(x[xo + r * nrhs + c] / d, la_nan(), d == 0.0);
+        }
+        for (var r = n - 1; r >= 0; r--) {
+            var s = x[xo + r * nrhs + c];
+            for (var k = r + 1; k < n; k++) { s -= select(ld[o + k * n + r], ld[o + r * n + k], upper != 0) * x[xo + k * nrhs + c]; }
+            x[xo + r * nrhs + c] = s;
+        }
+        for (var j = n - 1; j >= 0; j--) {
+            let pr = piv[po + j];
+            if (pr != j && pr >= 0 && pr < n) { let t = x[xo + j * nrhs + c]; x[xo + j * nrhs + c] = x[xo + pr * nrhs + c]; x[xo + pr * nrhs + c] = t; }
+        }
+    }
+}");
+
+    // Partial-pivot LU of the n x n matrix in w (row-major), pivots into pv; shared by solve and solve-backward.
+    private const string LaLuInRegisters = @"
+fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: i32) {
+    for (var j = 0; j < n; j++) {
+        var pr = j; var best = abs((*w)[j * n + j]);
+        for (var r = j + 1; r < n; r++) { let v = abs((*w)[r * n + j]); if (v > best) { best = v; pr = r; } }
+        (*pv)[j] = pr;
+        if (pr != j) { for (var c = 0; c < n; c++) { let t = (*w)[pr * n + c]; (*w)[pr * n + c] = (*w)[j * n + c]; (*w)[j * n + c] = t; } }
+        let d = (*w)[j * n + j];
+        if (d == 0.0) { continue; }
+        for (var r = j + 1; r < n; r++) {
+            let f = (*w)[r * n + j] / d;
+            (*w)[r * n + j] = f;
+            for (var c = j + 1; c < n; c++) { (*w)[r * n + c] -= f * (*w)[j * n + c]; }
+        }
+    }
+}
+";
+
+    public static readonly string LaSolveVector = Shader(new[] { "r:a", "r:rhs", "rw:x", "rw:info:i32" }, "batch: i32, n: i32", LaCommon + LaLuInRegisters + Main + @"
+    let b = i; let n = p.n;
+    if (b >= p.batch) { return; }
+    var w: array<f32, 64>; var pv: array<i32, 8>;
+    let o = b * n * n; let xo = b * n;
+    for (var k = 0; k < n * n; k++) { w[k] = a[o + k]; }
+    la_lu(&w, &pv, n);
+    var status = 0;
+    for (var k = 0; k < n; k++) { if (w[k * n + k] == 0.0) { status = k + 1; break; } }
+    info[b] = status;
+    for (var r = 0; r < n; r++) { x[xo + r] = rhs[xo + r]; }
+    for (var r = 0; r < n; r++) { let pr = pv[r]; if (pr != r) { let t = x[xo + r]; x[xo + r] = x[xo + pr]; x[xo + pr] = t; } }
+    for (var r = 1; r < n; r++) { var s = x[xo + r]; for (var j = 0; j < r; j++) { s -= w[r * n + j] * x[xo + j]; } x[xo + r] = s; }
+    for (var r = n - 1; r >= 0; r--) {
+        var s = x[xo + r];
+        for (var j = r + 1; j < n; j++) { s -= w[r * n + j] * x[xo + j]; }
+        x[xo + r] = s / w[r * n + r];
+    }
+}");
+
+    public static readonly string LaTriangularSolveVector = Shader(new[] { "r:a", "r:rhs", "rw:x" }, "batch: i32, n: i32, upper: i32, unitDiagonal: i32", LaCommon + Main + @"
+    let b = i; let n = p.n; let upper = p.upper; let unitDiagonal = p.unitDiagonal;
+    if (b >= p.batch) { return; }
+    let o = b * n * n; let xo = b * n;
+    for (var k = 0; k < n; k++) { x[xo + k] = rhs[xo + k]; }
+    for (var st = 0; st < n; st++) {
+        let r = select(st, n - 1 - st, upper != 0);
+        var s = x[xo + r];
+        if (upper != 0) { for (var j = r + 1; j < n; j++) { s -= a[o + r * n + j] * x[xo + j]; } }
+        else { for (var j = 0; j < r; j++) { s -= a[o + r * n + j] * x[xo + j]; } }
+        x[xo + r] = select(s / a[o + r * n + r], s, unitDiagonal != 0);
+    }
+}");
+
+    public static readonly string LaCholeskyBackwardLower = Shader(new[] { "r:l", "r:g", "rw:ga" }, "batch: i32, n: i32", LaCommon + Main + @"
+    let b = i; let n = p.n;
+    if (b >= p.batch) { return; }
+    var t: array<f32, 64>; var inv: array<f32, 64>; var row: array<f32, 8>;
+    let o = b * n * n;
+    for (var r = 0; r < n; r++) {
+        for (var j = 0; j < n; j++) {
+            var s = 0.0;
+            for (var k = 0; k < n; k++) { s += l[o + k * n + r] * g[o + k * n + j]; }
+            t[r * n + j] = s;
+        }
+    }
+    for (var r = 0; r < n; r++) { for (var j = r + 1; j < n; j++) { t[r * n + j] = t[j * n + r]; } }
+    for (var c = 0; c < n; c++) {
+        for (var r = 0; r < n; r++) {
+            var s = select(0.0, 1.0, r == c);
+            for (var k = 0; k < r; k++) { s -= l[o + r * n + k] * inv[k * n + c]; }
+            inv[r * n + c] = s / l[o + r * n + r];
+        }
+    }
+    for (var r = 0; r < n; r++) {
+        for (var k = 0; k < n; k++) {
+            var s = 0.0;
+            for (var q = 0; q < n; q++) { s += inv[q * n + r] * t[q * n + k]; }
+            row[k] = s;
+        }
+        for (var j = 0; j < n; j++) {
+            var s = 0.0;
+            for (var k = 0; k < n; k++) { s += row[k] * inv[k * n + j]; }
+            ga[o + r * n + j] = 0.5 * s;
+        }
+    }
+}");
+
+    public static readonly string LaSolveBackwardVector = Shader(new[] { "r:a", "r:xs", "r:g", "rw:ga", "rw:gb" }, "batch: i32, n: i32", LaCommon + LaLuInRegisters + Main + @"
+    let b = i; let n = p.n;
+    if (b >= p.batch) { return; }
+    var w: array<f32, 64>; var pv: array<i32, 8>; var y: array<f32, 8>;
+    let o = b * n * n; let vo = b * n;
+    for (var r = 0; r < n; r++) { for (var j = 0; j < n; j++) { w[r * n + j] = a[o + j * n + r]; } }
+    la_lu(&w, &pv, n);
+    for (var r = 0; r < n; r++) { y[r] = g[vo + r]; }
+    for (var r = 0; r < n; r++) { let pr = pv[r]; if (pr != r) { let t = y[r]; y[r] = y[pr]; y[pr] = t; } }
+    for (var r = 1; r < n; r++) { var s = y[r]; for (var j = 0; j < r; j++) { s -= w[r * n + j] * y[j]; } y[r] = s; }
+    for (var r = n - 1; r >= 0; r--) { var s = y[r]; for (var j = r + 1; j < n; j++) { s -= w[r * n + j] * y[j]; } y[r] = s / w[r * n + r]; }
+    for (var r = 0; r < n; r++) {
+        gb[vo + r] = y[r];
+        for (var j = 0; j < n; j++) { ga[o + r * n + j] = -y[r] * xs[vo + j]; }
+    }
+}");
+
+    public static readonly string LaSvdReduced = Shader(new[] { "r:a", "rw:u", "rw:s", "rw:vh" }, "batch: i32, m: i32, n: i32", LaCommon + Main + @"
+    let b = i; let m = p.m; let n = p.n;
+    if (b >= p.batch) { return; }
+    var gm: array<f32, 64>; var v: array<f32, 64>; var w: array<f32, 8>; var ord: array<i32, 8>;
+    let tall = m >= n; let k = min(m, n); let d = select(m, n, tall);
+    let ao = b * m * n; let uo = b * m * k; let so = b * k; let vo = b * k * n;
+    for (var r = 0; r < d; r++) {
+        for (var j = 0; j < d; j++) {
+            var acc = 0.0;
+            if (tall) { for (var q = 0; q < m; q++) { acc += a[ao + q * n + r] * a[ao + q * n + j]; } }
+            else { for (var q = 0; q < n; q++) { acc += a[ao + r * n + q] * a[ao + j * n + q]; } }
+            gm[r * d + j] = acc;
+            v[r * d + j] = select(0.0, 1.0, r == j);
+        }
+    }
+    var scale = 0.0;
+    for (var q = 0; q < d * d; q++) { scale += gm[q] * gm[q]; }
+    scale = sqrt(scale);
+    for (var sweep = 0; sweep < 100; sweep++) {
+        var off = 0.0;
+        for (var pp = 0; pp < d - 1; pp++) { for (var qq = pp + 1; qq < d; qq++) { off += gm[pp * d + qq] * gm[pp * d + qq]; } }
+        off = sqrt(off);
+        if (off < 1e-12 || off <= 1e-7 * scale) { break; }
+        for (var pp = 0; pp < d - 1; pp++) {
+            for (var qq = pp + 1; qq < d; qq++) {
+                let apq = gm[pp * d + qq];
+                if (abs(apq) < 1e-12) { continue; }
+                let theta = (gm[qq * d + qq] - gm[pp * d + pp]) / (2.0 * apq);
+                let sg = select(select(0.0, -1.0, theta < 0.0), 1.0, theta > 0.0);
+                let t = select(sg / (abs(theta) + sqrt(1.0 + theta * theta)), 1.0, theta == 0.0);
+                let c = 1.0 / sqrt(1.0 + t * t);
+                let sn = t * c;
+                for (var q = 0; q < d; q++) {
+                    let aip = gm[q * d + pp]; let aiq = gm[q * d + qq];
+                    gm[q * d + pp] = c * aip - sn * aiq; gm[q * d + qq] = sn * aip + c * aiq;
+                }
+                for (var q = 0; q < d; q++) {
+                    let api = gm[pp * d + q]; let aqi = gm[qq * d + q];
+                    gm[pp * d + q] = c * api - sn * aqi; gm[qq * d + q] = sn * api + c * aqi;
+                }
+                for (var q = 0; q < d; q++) {
+                    let vip = v[q * d + pp]; let viq = v[q * d + qq];
+                    v[q * d + pp] = c * vip - sn * viq; v[q * d + qq] = sn * vip + c * viq;
+                }
+            }
+        }
+    }
+    for (var q = 0; q < d; q++) { w[q] = gm[q * d + q]; ord[q] = q; }
+    for (var q = 1; q < d; q++) {
+        let cur = ord[q]; var j = q - 1;
+        while (j >= 0 && w[ord[j]] < w[cur]) { ord[j + 1] = ord[j]; j--; }
+        ord[j + 1] = cur;
+    }
+    for (var j = 0; j < k; j++) {
+        let sigma = sqrt(max(0.0, w[ord[j]]));
+        s[so + j] = sigma;
+        let e = ord[j];
+        if (tall) {
+            for (var c = 0; c < n; c++) { vh[vo + j * n + c] = v[c * d + e]; }
+            for (var r = 0; r < m; r++) {
+                var acc = 0.0;
+                for (var c = 0; c < n; c++) { acc += a[ao + r * n + c] * v[c * d + e]; }
+                u[uo + r * k + j] = select(0.0, acc / sigma, sigma > 1e-14);
+            }
+        } else {
+            for (var r = 0; r < m; r++) { u[uo + r * k + j] = v[r * d + e]; }
+            for (var c = 0; c < n; c++) {
+                var acc = 0.0;
+                for (var r = 0; r < m; r++) { acc += v[r * d + e] * a[ao + r * n + c]; }
+                vh[vo + j * n + c] = select(0.0, acc / sigma, sigma > 1e-14);
+            }
+        }
+    }
+}");
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
@@ -463,6 +745,11 @@ var<workgroup> scratch: array<f32, 256>;
         ["bx_batch_outer_product"] = BatchOuterProduct, ["bx_meshgrid2d"] = Meshgrid2D,
         ["bx_fft_chirp"] = FftChirp, ["bx_fft_bluestein_pre"] = FftBluesteinPre, ["bx_fft_cmul"] = FftCmul,
         ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
+        [BatchExecutionCudaKernels.LaSymmetrize] = LaSymmetrize, [BatchExecutionCudaKernels.LaLuSolve] = LaLuSolve,
+        [BatchExecutionCudaKernels.LaLdlFactor] = LaLdlFactor, [BatchExecutionCudaKernels.LaLdlSolve] = LaLdlSolve,
+        [BatchExecutionCudaKernels.LaSolveVector] = LaSolveVector, [BatchExecutionCudaKernels.LaTriangularSolveVector] = LaTriangularSolveVector,
+        [BatchExecutionCudaKernels.LaCholeskyBackwardLower] = LaCholeskyBackwardLower,
+        [BatchExecutionCudaKernels.LaSolveBackwardVector] = LaSolveBackwardVector, [BatchExecutionCudaKernels.LaSvdReduced] = LaSvdReduced,
     };
 }
 #endif

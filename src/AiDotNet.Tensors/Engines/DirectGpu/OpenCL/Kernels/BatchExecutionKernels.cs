@@ -1,3 +1,6 @@
+using System.Text.RegularExpressions;
+using K = AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 
 /// <summary>
@@ -11,9 +14,26 @@ public static class BatchExecutionKernels
     /// <summary>Work-group size of <c>bx_full_reduce</c>; the tree reduction needs a power of two.</summary>
     public const int FullReduceGroupSize = 256;
 
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// The IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C so OpenCL runs the same
+    /// code HIP and Metal run: kernel qualifiers, global pointers, the thread index and the float builtins.
+    /// </summary>
+    private static readonly string SolverSource = TranslateSolvers(K.SolverSource);
+
+    private static string TranslateSolvers(string cuda)
+    {
+        string body = cuda.Replace("extern \"C\" __global__ __launch_bounds__(256) void", "__kernel void")
+            .Replace("bx_gid()", "(int)get_global_id(0)")
+            .Replace("__uint_as_float(", "as_float(");
+        body = Regex.Replace(body, @"(?<![\w*])(const )?(float|int)\* ", "__global $1$2* ", RegexOptions.None, RegexTimeout);
+        return Regex.Replace(body, @"\b(sqrt|fmax|fabs)f\(", "$1(", RegexOptions.None, RegexTimeout);
+    }
+
     public static string GetSource()
     {
-        return @"
+        return SolverSource + @"
 // mode: 0 sum of squares, 1 L2 norm, 2 product, 3 max |x|, 4 min |x|, 5 log-sum-exp around maxVal.
 // One work-group strides over the whole input, so the result is deterministic and always overwrites output[0].
 __kernel void bx_full_reduce(__global const float* input, __global float* output, int size, int mode, float maxVal) {
@@ -238,7 +258,9 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             "bx_full_reduce", "bx_reduce_max_backward", "bx_reduce_variance_backward", "bx_reduce_log_variance",
             "bx_reduce_log_variance_backward", "bx_sincos", "bx_slice_axis", "bx_set_slice_axis",
             "bx_crop_2d_backward", "bx_sparsemax", "bx_mse_loss_rows", "bx_meshgrid2d",
-            "bx_fft_chirp", "bx_fft_bluestein_pre", "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage"
+            "bx_fft_chirp", "bx_fft_bluestein_pre", "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage",
+            K.LaSymmetrize, K.LaLuSolve, K.LaLdlFactor, K.LaLdlSolve, K.LaSolveVector, K.LaTriangularSolveVector,
+            K.LaCholeskyBackwardLower, K.LaSolveBackwardVector, K.LaSvdReduced
         };
     }
 }

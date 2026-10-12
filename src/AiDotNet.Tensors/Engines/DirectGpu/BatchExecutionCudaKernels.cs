@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// norm or the full log-sum-exp; the crop backward writes zero outside the window; sparsemax has no row-length cap;
 /// the random kernels use the shared counter hash so a seed gives the same values on every backend.
 /// </summary>
-internal static class BatchExecutionCudaKernels
+internal static partial class BatchExecutionCudaKernels
 {
     public const int FullReduceBlockSize = 256;
 
@@ -22,7 +22,9 @@ internal static class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => @"
+    public static string GetSource() => CoreSource + SolverSource;
+
+    private const string CoreSource = @"
 #ifndef INFINITY
 #define INFINITY __builtin_huge_valf()
 #endif
@@ -447,6 +449,8 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const un
         "bx_slice_axis", "bx_set_slice_axis", "bx_stack2", "bx_window_2d", "bx_tile_last_axis", "bx_repeat_elements",
         "bx_linspace", "bx_diag", "bx_extract_diag", "bx_triangular_mask", "bx_index_select", "bx_row_loss",
         "bx_dropout_mask", "bx_gaussian_noise", "bx_gumbel_softmax", "bx_batch_outer_product", "bx_meshgrid2d", "bx_fft_chirp", "bx_fft_bluestein_pre",
-        "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage"
+        "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage",
+        LaSymmetrize, LaLuSolve, LaLdlFactor, LaLdlSolve, LaSolveVector, LaTriangularSolveVector, LaCholeskyBackwardLower,
+        LaSolveBackwardVector, LaSvdReduced
     };
 }
