@@ -806,6 +806,11 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-mlp-gemm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.MlpGemmSweep.Run();
+            return;
+        }
         if (args[0] == "--ab-aiseval-floor")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.RawGemmFloor();
