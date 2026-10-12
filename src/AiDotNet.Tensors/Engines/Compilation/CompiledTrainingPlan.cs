@@ -341,7 +341,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private void RollBackCaptureResidency(Engines.DirectGpuTensorEngine engine, bool deviceHoldsResults = false)
     {
         // A disposed engine's context is gone: nothing can be downloaded, and nothing can read the results anyway.
-        bool landResults = deviceHoldsResults && engine.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend { ContextIsLive: true };
+        bool landResults = deviceHoldsResults && engine.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true, ContextIsLive: true };
         void Unbind(Tensor<T>? t)
         {
             if (t is null || t._gpuBuffer is null) return;
@@ -387,7 +387,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// caller's read of the returned loss saw the capture step's value on every replay (the training itself was right
     /// - the weights matched an eager run exactly - but every reported loss after capture was the same number).
     /// </summary>
-    private void RearmLossDownload(Engines.DirectGpuTensorEngine engine, Engines.DirectGpu.CUDA.CudaBackend backend)
+    private void RearmLossDownload(Engines.DirectGpuTensorEngine engine, Engines.DirectGpu.IGpuGraphCapture backend)
     {
         if (_lossOutput._gpuBuffer is { } lossBuffer)
             engine.BindResidentBuffer(_lossOutput, lossBuffer, backend);
@@ -500,7 +500,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (_stepGraphExec != IntPtr.Zero
             && _engine is Engines.DirectGpuTensorEngine gte
-            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+            && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
         {
             cb.DestroyCapturedGraph(_stepGraphExec);
         }
@@ -567,10 +567,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (buffer is null || buffer.Handle == IntPtr.Zero || parameter._gpuBackend is not { } backend) continue;
             if (parameter._gpuBufferVersion == parameter.GpuCacheVersion) continue;
 
-            if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && buffer.Size >= parameter.Length)
+            if (buffer.Size >= parameter.Length)
             {
                 var host = (float[])(object)parameter.ToArray();
-                cuda.UploadBufferInPlace(host, buffer);
+                backend.UploadBufferInPlace(host, buffer);
                 gte.CommitParameterUpdatedOnDevice((Tensor<float>)(object)parameter, buffer, backend, syncPoint: null);
             }
             else if (buffer.Size >= parameter.Length)
@@ -1260,7 +1260,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             var resident = gradient.TryGetGpuBuffer();
             bool streamCapturing =
-                backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing();
+                backend is Engines.DirectGpu.IGpuGraphCapture cuda && cuda.IsStreamCapturing();
             if (resident is not null &&
                 (streamCapturing || gradient._gpuBufferVersion == gradient.GpuCacheVersion))
             {
@@ -1472,7 +1472,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         out bool allFinite)
     {
         allFinite = true;
-        Engines.DirectGpu.CUDA.CudaBackend? cuda = null;
+        Engines.DirectGpu.IGpuBatchExecution? cuda = null;
         // Plan-owned lists, cleared per step: this runs on every optimizer step.
         var buffers = _finitenessBuffers;
         var sizes = _finitenessSizes;
@@ -1482,7 +1482,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             if (gpuGradients[p] is not { } gradient || lengths[p] <= 0)
                 continue;
-            if (gpuBackends[p] is not Engines.DirectGpu.CUDA.CudaBackend owner)
+            if (gpuBackends[p] is not Engines.DirectGpu.IDeviceScalarOps { SupportsMultiTensorSumOfSquares: true } || gpuBackends[p] is not Engines.DirectGpu.IGpuBatchExecution owner)
                 return false;
             if (cuda is null) cuda = owner;
             else if (!ReferenceEquals(cuda, owner)) return false;
@@ -1498,7 +1498,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             _finitenessSumSquares = cuda.AllocateBuffer(2);
             _finitenessBackend = cuda;
         }
-        cuda.MultiTensorSumOfSquares(buffers, sizes, _finitenessSumSquares);
+        ((Engines.DirectGpu.IDeviceScalarOps)cuda).MultiTensorSumOfSquares(buffers, sizes, _finitenessSumSquares);
         double sumSquares = BitConverter.ToDouble(cuda.DownloadByteBuffer(_finitenessSumSquares, sizeof(double)), 0);
         allFinite = !double.IsNaN(sumSquares) && !double.IsInfinity(sumSquares);
         return true;
@@ -1994,7 +1994,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // parameter lives on the device; otherwise it reads the host array. Writing on the device merely because
             // both tensors HAD a buffer put the term on a stale device copy while the optimizer read the host
             // gradient - L2 silently dropped.
-            bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing();
+            bool capturing = backend is Engines.DirectGpu.IGpuGraphCapture cuda && cuda.IsStreamCapturing();
             if (typeof(T) == typeof(float) && backend is not null
                 && CurrentDeviceBuffer(grad, capturing) is { } gradBuffer
                 && CurrentDeviceBuffer(param, capturing) is { } paramBuffer)
@@ -2377,7 +2377,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
             && _checkpointing is null && _fp16HeteroOrder is null
             && _engine is Engines.DirectGpuTensorEngine gte
-            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+            && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
         {
             _graphStepCalls++;
             if (_graphStepCalls > GraphWarmupSteps)
@@ -2626,7 +2626,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// corrupt its next owner. Also false for any binding the pre-pass did not make (left by an eager step, possibly
     /// released or re-rented). True with a null <paramref name="buffer"/> when the graph reads no device copy of it.
     /// </summary>
-    private bool LeafStillBoundToCapturedBuffer(Tensor<T> leaf, Engines.DirectGpu.CUDA.CudaBackend cb,
+    private bool LeafStillBoundToCapturedBuffer(Tensor<T> leaf, Engines.DirectGpu.IGpuGraphCapture cb,
         out Engines.DirectGpu.IGpuBuffer? buffer)
     {
         buffer = null;
@@ -2663,7 +2663,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// host tensor). No-op until the input has a resident buffer (the pre-residency pass allocates it).</summary>
     /// <returns>False when a bound input buffer has already been released (zero handle). Before a capture that is
     /// harmless - the pre-pass rebinds every external input - but a captured graph would read freed memory.</returns>
-    private bool RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
+    private bool RefreshGraphInputInPlace(Engines.DirectGpu.IGpuGraphCapture cb)
     {
         bool allLive = true;
         if (!_graphHasEmbedding)
@@ -2725,7 +2725,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// </summary>
     private bool DeviceParametersLiveOn(Engines.DirectGpu.IDirectGpuBackend backend)
     {
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend) return true;
+        if (backend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true }) return true;
         foreach (var parameter in _parameters)
             if (parameter.TryGetGpuBuffer() is null || !ReferenceEquals(parameter._gpuBackend, backend))
                 return false;
@@ -2786,7 +2786,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static void ZeroDeviceBuffer(Engines.DirectGpu.IDirectGpuBackend backend, Engines.DirectGpu.IGpuBuffer buffer,
         int length, int elementSize)
     {
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.MemsetBuffer(buffer, 0, (long)length * elementSize);
+        if (backend is Engines.DirectGpu.IDeviceZeroFill zero) zero.ZeroBytes(buffer, (long)length * elementSize);
         else backend.Fill(buffer, 0f, length);
     }
 
@@ -2794,7 +2794,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         var engine = _engine;
         // Stream capture exists only on CUDA; every other backend runs this body uncaptured.
-        var cb = backend as Engines.DirectGpu.CUDA.CudaBackend;
+        var cb = backend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } capture ? capture : null;
         bool IsCapturing() => cb is not null && cb.IsStreamCapturing();
         // PR #638 capture-determinism: tag each compiled action so its transient scratch draws from the engine's
         // STATIC (action,local)-keyed pool → identical device addresses across the pre-residency pass, the capture
@@ -2828,7 +2828,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             de?.SetCurrentScratchAction(i);   // pool this forward action's transient scratch by (i, local)
             fwd[i](engine);
-            if (capDiag && cb!.StreamCaptureStatusRaw() == 2)
+            if (capDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
             {
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                     $"[CAPTURE-INVALIDATED-BY] forwardAction#{i} op={Engines.DirectGpuTensorEngine.s_currentForwardOp}" + System.Environment.NewLine); } catch { }
@@ -2887,7 +2887,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
         {
-            if (cb is not null) cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
+            if (cb is Engines.DirectGpu.IFp16ActivationBackend rawCopy) rawCopy.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
             else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
             residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, backend);
             if (_lossGradDest is { } seededDestination)
@@ -2908,7 +2908,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 bwd[i](engine);
-                if (bwdDiag && cb!.StreamCaptureStatusRaw() == 2)
+                if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
                     string nm = i < bwdNames.Length ? bwdNames[i] : "?";
                     try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
@@ -4681,7 +4681,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 && paramCount > 0
                 && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend mtBackend)
             {
-                bool eligible = !(gpuBackends[0] is Engines.DirectGpu.CUDA.CudaBackend cbMt && cbMt.IsStreamCapturing());
+                bool eligible = !(gpuBackends[0] is Engines.DirectGpu.IGpuGraphCapture cbMt && cbMt.IsStreamCapturing());
                 var mtParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
                 var mtGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
                 var mtM = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
@@ -9923,7 +9923,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 var buf = g.TryGetGpuBuffer();
                 if (buf is null) continue;
                 // grad *= scale[0]: CUDA's device-scalar kernel, elsewhere a [1, n] broadcast against the scalar.
-                if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.ScaleByDeviceScalar(buf, sumSq, g.Length);
+                if (cb is Engines.DirectGpu.IDeviceScalarOps scalarOps) scalarOps.ScaleByDeviceScalar(buf, sumSq, g.Length);
                 else cb.BroadcastMultiplyFirstAxis(buf, sumSq, buf, 1, g.Length);
                 // The scale is a device write: re-arm the host copy's pending download, or a host reader whose copy
                 // was already materialized (a host optimizer, for one) keeps the UNCLIPPED values. Measured on an LM

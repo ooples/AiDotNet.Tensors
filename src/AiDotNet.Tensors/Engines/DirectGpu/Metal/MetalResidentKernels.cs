@@ -1372,6 +1372,13 @@ kernel void affine_grid(
     grid[gid * 2u] = theta[offset] * x + theta[offset + 1u] * y + theta[offset + 2u]; grid[gid * 2u + 1u] = theta[offset + 3u] * x + theta[offset + 4u] * y + theta[offset + 5u];
 }
 
+// #1134: a NaN, infinite or out-of-int-range grid point samples nothing and has no gradient (the CPU rule). Tested on
+// the bits so fast math cannot fold the NaN case: |x| below 2147483520 (0x4EFFFFFF) has the smaller bit pattern, NaN
+// and infinity a larger one.
+inline bool gs_point_usable(float ix, float iy)
+{
+    return (as_type<uint>(ix) & 0x7FFFFFFFu) < 0x4EFFFFFFu && (as_type<uint>(iy) & 0x7FFFFFFFu) < 0x4EFFFFFFu;
+}
 kernel void grid_sample(
     device const float* input [[buffer(0)]], device const float* grid [[buffer(1)]], device float* output [[buffer(2)]],
     constant uint& batch [[buffer(3)]], constant uint& channels [[buffer(4)]], constant uint& inputHeight [[buffer(5)]], constant uint& inputWidth [[buffer(6)]],
@@ -1381,6 +1388,7 @@ kernel void grid_sample(
     uint gridIndex = (b * outputHeight * outputWidth + yIndex * outputWidth + xIndex) * 2u; float x = grid[gridIndex], y = grid[gridIndex + 1u];
     float inputX = alignCorners != 0u ? (x + 1.0f) * float(inputWidth - 1u) / 2.0f : ((x + 1.0f) * float(inputWidth) - 1.0f) / 2.0f;
     float inputY = alignCorners != 0u ? (y + 1.0f) * float(inputHeight - 1u) / 2.0f : ((y + 1.0f) * float(inputHeight) - 1.0f) / 2.0f;
+    if (!gs_point_usable(inputX, inputY)) { output[gid] = 0.0f; return; }
     int y0 = int(floor(inputY)), x0 = int(floor(inputX)); float fy = inputY - float(y0), fx = inputX - float(x0);
     float v00 = resident_pixel(input, b, c, y0, x0, channels, inputHeight, inputWidth, padding), v01 = resident_pixel(input, b, c, y0, x0 + 1, channels, inputHeight, inputWidth, padding);
     float v10 = resident_pixel(input, b, c, y0 + 1, x0, channels, inputHeight, inputWidth, padding), v11 = resident_pixel(input, b, c, y0 + 1, x0 + 1, channels, inputHeight, inputWidth, padding);
@@ -1395,6 +1403,7 @@ kernel void grid_sample_backward_serial(
     if (gid != 0u) return; uint inputCount = batch * channels * inputHeight * inputWidth; for (uint i = 0; i < inputCount; ++i) gradInput[i] = 0.0f;
     for (uint b = 0; b < batch; ++b) for (uint oy = 0; oy < outputHeight; ++oy) for (uint ox = 0; ox < outputWidth; ++ox) { uint gridIndex = (b * outputHeight * outputWidth + oy * outputWidth + ox) * 2u; float x = grid[gridIndex], y = grid[gridIndex + 1u];
         float inputX = alignCorners != 0u ? (x + 1.0f) * float(inputWidth - 1u) / 2.0f : ((x + 1.0f) * float(inputWidth) - 1.0f) / 2.0f, inputY = alignCorners != 0u ? (y + 1.0f) * float(inputHeight - 1u) / 2.0f : ((y + 1.0f) * float(inputHeight) - 1.0f) / 2.0f;
+        if (!gs_point_usable(inputX, inputY)) { gradGrid[gridIndex] = 0.0f; gradGrid[gridIndex + 1u] = 0.0f; continue; }
         int y0 = int(floor(inputY)), x0 = int(floor(inputX)); float fy = inputY - float(y0), fx = inputX - float(x0), gradX = 0.0f, gradY = 0.0f;
         for (uint c = 0; c < channels; ++c) { uint outputIndex = (b * channels + c) * outputHeight * outputWidth + oy * outputWidth + ox; float gradient = gradOutput[outputIndex];
             int ys[4] = { y0, y0, y0 + 1, y0 + 1 }, xs[4] = { x0, x0 + 1, x0, x0 + 1 }; float factors[4] = { (1.0f - fy) * (1.0f - fx), (1.0f - fy) * fx, fy * (1.0f - fx), fy * fx };

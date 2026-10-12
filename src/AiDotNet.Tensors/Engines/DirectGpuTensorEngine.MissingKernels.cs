@@ -2399,7 +2399,7 @@ public partial class DirectGpuTensorEngine
         if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || typeof(T) != typeof(float)
             || embeddings.Rank != 2 || !TryGetBackend(out var backend))
             return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
-        var cuda = backend as DirectGpu.CUDA.CudaBackend;
+        var cuda = backend as IFusedIndexKernels;
         bool fusedFloatIds = cuda is not null && cuda.HasFloatIdEmbeddingKernels;
         var indexBackend = backend as IResidentIndexBackend;
         if (!fusedFloatIds && indexBackend is null)
@@ -2427,9 +2427,9 @@ public partial class DirectGpuTensorEngine
                 if (!fusedFloatIds && rowOnes is null) return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
                 output = DispatchDeferredGpuOp<T>(backend, checked(numIndices * embeddingDim), outputShape, result =>
                 {
-                    if (fusedFloatIds)
+                    if (fusedFloatIds && cuda is not null)
                     {
-                        cuda!.EmbeddingFromFloatIds(idBuffer.Buffer, table.Buffer, result, numIndices, embeddingDim, vocabSize);
+                        cuda.EmbeddingFromFloatIds(idBuffer.Buffer, table.Buffer, result, numIndices, embeddingDim, vocabSize);
                         return;
                     }
                     // Read each id as the CPU does (round half to even, NaN ignored), select rows through ids clamped into
@@ -2471,7 +2471,7 @@ public partial class DirectGpuTensorEngine
             return null;
         int numIndices = floatIndices.Length;
         if (gradOutput.Length != (long)numIndices * embeddingDim) return null;
-        if (backend is not DirectGpu.CUDA.CudaBackend cuda || !cuda.HasFloatIdEmbeddingKernels)
+        if (backend is not IFusedIndexKernels cuda || !cuda.HasFloatIdEmbeddingKernels)
             return backend is IResidentIndexBackend indexBackend
                 ? EmbeddingBackwardFromFloatIdsByIndexAdd(backend, indexBackend, gradOutput, floatIndices, vocabSize, embeddingDim)
                 : null;
@@ -2841,7 +2841,7 @@ public partial class DirectGpuTensorEngine
             using var gammaBuffer = GetOrAllocateBuffer(backend, gamma);
             using var meanBuffer = GetOrAllocateBuffer(backend, mean);
             using var varianceBuffer = GetOrAllocateBuffer(backend, variance);
-            if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
+            if (backend is IDirectPtxBackend cudaBackend &&
                 batch == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormBatch &&
                 numGroups == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormGroups &&
                 channels == Engines.DirectGpu.CUDA.Ptx.PtxChannelNormalizationD64Kernel.GroupNormChannels &&
@@ -3477,7 +3477,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float) || normalizedAxis != input.Rank - 1
             || input.Length == 0 || !input.IsContiguous
             || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
-            || (backend is DirectGpu.CUDA.CudaBackend cudaBackend && !cudaBackend.HasWhereSelectKernel))
+            || (backend is IFusedIndexKernels { HasWhereSelectKernel: false }))
             return base.Sparsemax(input, axis);
 
         int columns = input._shape[normalizedAxis];
