@@ -8,4 +8,7 @@ public sealed partial class OpenClBackend : IThreadContextBackend
     void IThreadContextBackend.EnsureContextCurrent()
     {
     }
+
+    /// <remarks>No driver context object is shared with other components here.</remarks>
+    IntPtr IThreadContextBackend.NativeContextHandle => IntPtr.Zero;
 }

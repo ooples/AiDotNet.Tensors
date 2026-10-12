@@ -17,4 +17,7 @@ public sealed partial class HipBackend : IThreadContextBackend
         t_boundDevice = _hipDeviceIndex;
         t_bound = true;
     }
+
+    /// <remarks>HIP runs on the device's primary context; there is no context object to share.</remarks>
+    IntPtr IThreadContextBackend.NativeContextHandle => IntPtr.Zero;
 }

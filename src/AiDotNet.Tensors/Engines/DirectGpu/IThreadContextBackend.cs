@@ -10,4 +10,8 @@ internal interface IThreadContextBackend
 {
     /// <summary>Binds this backend's device to the calling thread; cheap when it already is.</summary>
     void EnsureContextCurrent();
+
+    /// <summary>The driver context other components must share to touch this backend's memory, or zero when the
+    /// backend has no context object to share.</summary>
+    IntPtr NativeContextHandle { get; }
 }

@@ -9,7 +9,4 @@ capability ITorchParityElementwiseBackend MetalBackend #1125
 capability ITorchParityElementwiseBackend WebGpuBackend #1128
 
 // TENS0007: library code reaching a capability through a concrete backend class (#1154).
-cast AiDotNetEngine.TryRegisterGpuOffloadAllocator CudaBackend #1154
-cast DirectGpuEngine.TryExecuteFusedResidualBatchNormRelu CudaBackend #1154
-cast ExecutionStreamFactory.TryGetCudaStream CudaBackend #1154
 
