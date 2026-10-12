@@ -81,5 +81,47 @@ public sealed class MeshgridBackendParityTests
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
         Check(backend);
     }
+
+    /// <summary>
+    /// WebGPU's WGSL ports on Dawn, driven through the dispatch WebGPU ships (<see cref="DawnWebGpuBatchBackend"/>).
+    /// Needs AIDOTNET_WEBGPU_NODE_DIR and an OpenCL host for the buffers.
+    /// </summary>
+    private static DawnWebGpuBatchBackend? DawnOrSkip(out IDisposable owner)
+    {
+        owner = new NoOp();
+        var dawn = DawnWgslLauncher.TryCreate();
+        Skip.If(dawn is null, "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).");
+        var host = new AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend();
+        if (!host.IsAvailable)
+        {
+            host.Dispose();
+            dawn?.Dispose();
+            Skip.If(true, "OpenCL (the buffer host) is not available.");
+        }
+        owner = new Owned(host, dawn);
+        return dawn is null ? null : new DawnWebGpuBatchBackend(host, dawn);
+    }
+
+    private sealed class NoOp : IDisposable { public void Dispose() { } }
+
+    private sealed class Owned : IDisposable
+    {
+        private readonly IDisposable _host;
+        private readonly IDisposable? _dawn;
+        public Owned(IDisposable host, IDisposable? dawn) { _host = host; _dawn = dawn; }
+        public void Dispose() { _dawn?.Dispose(); _host.Dispose(); }
+    }
+
+    [SkippableFact]
+    public void WebGpuWgsl_Meshgrid2DPair_MatchesTorch_OnDawn()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            Check(backend);
+        }
+    }
+
 }
 #endif

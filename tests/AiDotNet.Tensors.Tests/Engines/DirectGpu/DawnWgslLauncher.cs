@@ -140,7 +140,7 @@ for await (const line of rl) {
             {
                 case IGpuBuffer buffer:
                     byte[] bytes;
-                    if (buffer.SizeInBytes != (long)buffer.Size * sizeof(float))
+                    if (IsByteBuffer(buffer))
                     {
                         // A byte buffer (FP16 or int8 operands): its Size is a byte count, and the host reads it
                         // through its own call. The shader binds it as 32-bit words, so the copy is padded to a
@@ -184,6 +184,14 @@ for await (const line of rl) {
         {
             if (!writable.Contains(b)) continue;
             byte[] bytes = Convert.FromBase64String(outputs[b].GetString() ?? "");
+            if (IsByteBuffer(buffers[b]))
+            {
+                // The shader wrote whole 32-bit words; the buffer holds only SizeInBytes of them.
+                var exact = new byte[checked((int)buffers[b].SizeInBytes)];
+                Buffer.BlockCopy(bytes, 0, exact, 0, Math.Min(exact.Length, bytes.Length));
+                host.UploadByteBuffer(buffers[b], exact);
+                continue;
+            }
             var data = new float[bytes.Length / 4];
             Buffer.BlockCopy(bytes, 0, data, 0, bytes.Length);
             host.UploadBufferInPlace(data, buffers[b]);
@@ -194,6 +202,9 @@ for await (const line of rl) {
     {
         lock (_stderr) return _stderr.ToString();
     }
+
+    // A byte buffer (AllocateByteBuffer) counts its Size in bytes; a float buffer's SizeInBytes is four times its Size.
+    private static bool IsByteBuffer(IGpuBuffer buffer) => buffer.SizeInBytes != (long)buffer.Size * sizeof(float);
 
     public void Dispose()
     {
