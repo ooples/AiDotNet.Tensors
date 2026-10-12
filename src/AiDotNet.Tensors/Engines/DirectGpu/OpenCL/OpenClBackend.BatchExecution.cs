@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private DirectOpenClKernel GetBatchKernel(string name)
         {
             if (!_kernelCache.TryGetValue(name, out var k))
-                throw new InvalidOperationException($"OpenCL kernel not found: {name}.");
+                throw new GpuCapabilityUnavailableException($"OpenCL kernel not found: {name}.");
             return k;
         }
 

@@ -8,9 +8,9 @@ public sealed partial class HipBackend : IRoiBackend
     private IntPtr ResolveRoiKernel(string name)
     {
         if (_roiModule == IntPtr.Zero)
-            throw new InvalidOperationException("RoI HIP module was not compiled.");
+            throw new GpuCapabilityUnavailableException("RoI HIP module was not compiled.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         return kernel;
     }
 

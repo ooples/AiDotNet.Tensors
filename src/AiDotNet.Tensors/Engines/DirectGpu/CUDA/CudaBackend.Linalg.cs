@@ -7,13 +7,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : ILinalgBackend
 {
+    /// <inheritdoc/>
+    /// <remarks>The linalg module is compiled with the backend; a rejected compile leaves it unset.</remarks>
+    public bool LinalgKernelsReady => _linalgModule != IntPtr.Zero;
+
+    /// <inheritdoc/>
+    /// <remarks>The Eigh kernel provisions 64 x 64 workgroup arrays.</remarks>
+    public int LinalgEighMaxN => 64;
+
     private IntPtr ResolveLinalgKernel(string name)
     {
         if (_linalgModule == IntPtr.Zero)
             throw new InvalidOperationException(
                 "Linalg CUDA module was not compiled (older toolkit or NVRTC failure). Falling back to CPU reference.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         return kernel;
     }
 

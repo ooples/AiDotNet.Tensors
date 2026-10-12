@@ -189,6 +189,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private Tensor<T> CreateStorageView(int[] shape, int[] strides, int storageOffset)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
         // vector/storage snapshot and family registration under the detach lock; otherwise a
         // concurrent writer could swap storage between evaluation of the two constructor args.
@@ -395,6 +396,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <inheritdoc/>
     public override TensorBase<T> CloneShared()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // O(1) storage share only for the plain dense weight case: CPU-resident, contiguous, zero
         // offset, backing length == logical length, not mmap-backed, not sparse, not already a view.
         // Anything else falls back to a correct eager deep copy.
@@ -457,6 +459,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public Tensor<T> Contiguous()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         if (IsContiguous && _storageOffset == 0) return this;
 
@@ -555,6 +558,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public void CopyTo(Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         EnsureMaterialized();
         if (destination.Length < Length)
@@ -834,6 +838,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// not contiguous, has a non-zero storage offset, or is sparse.</exception>
     public Vector<T> AsVector()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (_shape.Length != 1)
             throw new InvalidOperationException(
                 $"AsVector requires a rank-1 tensor, got rank {_shape.Length}. " +
@@ -1120,6 +1125,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </example>
     public Tensor<TOut> Cast<TOut>()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var sourceOps = MathHelper.GetNumericOperations<T>();
         var targetOps = MathHelper.GetNumericOperations<TOut>();
 
@@ -1449,6 +1455,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Add(Vector<T> vector)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Support both 2D and 3D tensors
         // For 2D: [batch, features] + [features] -> broadcasts vector across batch
         // For 3D: [batch, seq, features] + [features] -> broadcasts vector across batch and seq
@@ -1525,6 +1532,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SetSlice(int index, Tensor<T> slice)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         EnsureMaterialized();
         slice.EnsureMaterialized();
@@ -1561,6 +1569,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T DotProduct(Tensor<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for dot product.");
 
@@ -1880,6 +1889,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void SubtractInPlace(Tensor<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for subtraction.");
 
@@ -1906,6 +1916,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Sum(int[]? axes = null)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         if (axes == null || axes.Length == 0)
         {
@@ -2111,6 +2122,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetSlice(int start, int length)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         EnsureMaterialized();
         if (start < 0 || start >= _data.Length)
@@ -2147,6 +2159,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public (T maxVal, int maxIndex) Max()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         EnsureMaterialized();
         // Use vectorized Max to find the value quickly (5-15x faster with AVX2)
@@ -2330,6 +2343,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void DivideInPlace(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         _numOps.DivideScalar(_data.AsSpan(), scalar, _data.AsWritableSpan());
     }
@@ -2352,6 +2366,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Multiply(Matrix<T> matrix)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (this.Rank != 3 || this._shape[2] != matrix.Rows)
             throw new ArgumentException("Matrix rows must match the last dimension of the tensor.");
 
@@ -3192,6 +3207,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public T Mean()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         // Use vectorized Sum for SIMD acceleration (8-12x speedup with AVX2)
         T sum = _numOps.Sum(_data.AsSpan());
@@ -3217,6 +3233,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> Slice(int startRow, int startCol, int endRow, int endCol)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         if (this.Rank != 2)
         {
@@ -3407,6 +3424,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public Vector<T> GetRow(int rowIndex)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         if (rowIndex < 0 || rowIndex >= Shape[0])
         {
@@ -3456,6 +3474,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public Vector<T> GetVectorAlongAxis(int axis, params int[] fixedIndices)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis),
                 $"Axis {axis} is out of range for tensor with {Rank} dimensions.");
@@ -3517,6 +3536,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public void SetVectorAlongAxis(Vector<T> values, int axis, params int[] fixedIndices)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis),
                 $"Axis {axis} is out of range for tensor with {Rank} dimensions.");
@@ -3745,6 +3765,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     internal T[] GetCpuData()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (IsGpuResident)
         {
             Synchronize();
@@ -4188,6 +4209,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public void AddInPlace(Tensor<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!ShapeEquals(_shape, other._shape))
             throw new ArgumentException("Tensors must have the same shape for addition.");
 
@@ -4629,6 +4651,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public void SetSlice(int start, Vector<T> slice)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         EnsureMaterialized();
         for (int i = 0; i < slice.Length; i++)
@@ -4660,6 +4683,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public void SetSlice(int dimension, int index, Tensor<T> slice)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         EnsureMaterialized();
         slice.EnsureMaterialized();
@@ -4801,6 +4825,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <summary>Legacy SumOverAxis implementation for internal use.</summary>
     internal Tensor<T> SumOverAxisDirect(int axis)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
@@ -4835,6 +4860,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> MaxOverAxis(int axis)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
@@ -4876,6 +4902,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <summary>Legacy MeanOverAxis for internal use.</summary>
     internal Tensor<T> MeanOverAxisDirect(int axis)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
         EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
@@ -5099,6 +5126,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public Tensor<T> Cpu()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!IsGpuResident)
             return this;
 

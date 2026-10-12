@@ -13,7 +13,6 @@ public sealed unsafe partial class VulkanBackend
     private const double TunedRowTolerance = 1e-4;
 
     private readonly object _tunedSlotsLock = new object();
-    private readonly object _tuneMeasureLock = new object();
     private TunedKernelSlot<TunedSoftmaxArgs>? _softmaxSlot;
     private TunedKernelSlot<TunedSoftmaxBackwardArgs>? _softmaxBackwardSlot;
     private TunedKernelSlot<TunedLayerNormArgs>? _layerNormSlot;
@@ -27,15 +26,115 @@ public sealed unsafe partial class VulkanBackend
 
     private static TunedShape RowShape(int rows, int n) => TunedShape.Of2(TunedKernelDType.Float32, rows, n);
 
-    // Outside batch mode every dispatch submits and waits, so host time over `repetitions` runs is the device time
-    // plus submission overhead, the same for every candidate compared. A batch would only record, so it is not measured.
+    private readonly object _tuneTimingLock = new object();
+    private IntPtr _tuneQueryPool;
+    private bool _tuneQueryPoolUnavailable;
+
+    /// <summary>True when timing runs on the device's timestamp clock rather than the host's.</summary>
+    internal bool TunedKernelTimingUsesDeviceClock
+    {
+        get { lock (_tuneTimingLock) return EnsureTimestampPool(); }
+    }
+
+    /// <summary>
+    /// Time of <paramref name="repetitions"/> back-to-back runs. Every dispatch is submitted and waited for, so the
+    /// interval between a timestamp written before the first run and one written after the last is what the op
+    /// costs a caller, on the device clock. A device without timestamp queries is timed on the host clock.
+    /// </summary>
     internal double MeasureTunedKernelMilliseconds(Action run, int repetitions)
     {
-        lock (_tuneMeasureLock)
+        // Its own lock: gates of different slots tuning concurrently would otherwise overwrite each other's queries.
+        // Nothing acquires a slot lock while holding it (run launches a candidate kernel), so the order
+        // slot lock -> this lock is safe.
+        lock (_tuneTimingLock)
         {
-            var watch = Stopwatch.StartNew();
+            if (EnsureTimestampPool())
+            {
+                WriteTuneTimestamp(0, reset: true);
+                for (int i = 0; i < repetitions; i++) run();
+                WriteTuneTimestamp(1, reset: false);
+                ulong* ticks = stackalloc ulong[2];
+                int result = VulkanTimestampBindings.vkGetQueryPoolResults(_device.Device, _tuneQueryPool, 0, 2,
+                    (UIntPtr)(2 * sizeof(ulong)), ticks, sizeof(ulong),
+                    VulkanTimestampBindings.VK_QUERY_RESULT_64_BIT | VulkanTimestampBindings.VK_QUERY_RESULT_WAIT_BIT);
+                if (result == VulkanNativeBindings.VK_SUCCESS && ticks[1] >= ticks[0])
+                    return (ticks[1] - ticks[0]) * (double)_device.Limits.timestampPeriod / 1e6;
+                // A failed read or a wrapped counter: stop using the device clock for this process.
+                _tuneQueryPoolUnavailable = true;
+            }
+
+            _device.WaitForPendingSubmissions();
+            long start = Stopwatch.GetTimestamp();
             for (int i = 0; i < repetitions; i++) run();
-            return watch.Elapsed.TotalMilliseconds;
+            // The runs are submitted without waiting; the clock stops when they have executed.
+            _device.WaitForPendingSubmissions();
+            return (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
+        }
+    }
+
+    // Caller holds _tuneTimingLock.
+    private bool EnsureTimestampPool()
+    {
+        if (_tuneQueryPoolUnavailable) return false;
+        if (_tuneQueryPool != IntPtr.Zero) return true;
+        var limits = _device.Limits;
+        if (limits.timestampComputeAndGraphics == 0 || !(limits.timestampPeriod > 0f))
+        {
+            _tuneQueryPoolUnavailable = true;
+            return false;
+        }
+        var info = new VkQueryPoolCreateInfo
+        {
+            sType = VulkanTimestampBindings.VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            pNext = null,
+            flags = 0,
+            queryType = VulkanTimestampBindings.VK_QUERY_TYPE_TIMESTAMP,
+            queryCount = 2,
+            pipelineStatistics = 0,
+        };
+        if (VulkanTimestampBindings.vkCreateQueryPool(_device.Device, &info, IntPtr.Zero, out _tuneQueryPool) !=
+            VulkanNativeBindings.VK_SUCCESS || _tuneQueryPool == IntPtr.Zero)
+        {
+            _tuneQueryPool = IntPtr.Zero;
+            _tuneQueryPoolUnavailable = true;
+            return false;
+        }
+        return true;
+    }
+
+    private void WriteTuneTimestamp(uint query, bool reset)
+    {
+        var threadRes = _device.AcquireThreadResources();
+        lock (_computeLock)
+        {
+            var cmd = threadRes.CommandBuffer;
+            VulkanNativeBindings.vkResetCommandBuffer(cmd, 0);
+            var beginInfo = new VkCommandBufferBeginInfo
+            {
+                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                pNext = null,
+                flags = VkCommandBufferUsageFlags.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                pInheritanceInfo = null
+            };
+            VulkanNativeBindings.vkBeginCommandBuffer(cmd, &beginInfo);
+            if (reset) VulkanTimestampBindings.vkCmdResetQueryPool(cmd, _tuneQueryPool, 0, 2);
+            VulkanTimestampBindings.vkCmdWriteTimestamp(cmd, VulkanTimestampBindings.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                _tuneQueryPool, query);
+            VulkanNativeBindings.vkEndCommandBuffer(cmd);
+            _device.SubmitAndWait(cmd, threadRes.Fence);
+        }
+    }
+
+    private void DisposeTunedKernelResources()
+    {
+        lock (_tuneTimingLock)
+        {
+            if (_tuneQueryPool != IntPtr.Zero)
+            {
+                try { VulkanTimestampBindings.vkDestroyQueryPool(_device.Device, _tuneQueryPool, IntPtr.Zero); } catch { }
+                _tuneQueryPool = IntPtr.Zero;
+            }
+            _tuneQueryPoolUnavailable = true;
         }
     }
 
@@ -79,7 +178,7 @@ public sealed unsafe partial class VulkanBackend
                         int l = lanes;
                         string source = VulkanTunedRowKernels.Softmax(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxArgs>("generated.softmax.lanes" + l,
-                            TunedKernelOrigin.Generated, true, shape => shape[1] <= 64 * l && TunedVariantsAvailable,
+                            TunedKernelOrigin.Generated, true, shape => VulkanTunedRowKernels.RowLanesFit((int)shape[1], l) && TunedVariantsAvailable,
                             (in TunedSoftmaxArgs a) => GlslNaryOp(source, new[] { a.Input, a.Output }, RowThreads(a.Rows, l), Push(a.Rows, a.N))));
                     }
                     _softmaxSlot = new TunedKernelSlot<TunedSoftmaxArgs>(TunedKernelOp.Softmax, TunedDeviceKey,
@@ -111,7 +210,7 @@ public sealed unsafe partial class VulkanBackend
                         int l = lanes;
                         string source = VulkanTunedRowKernels.SoftmaxBackward(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxBackwardArgs>("generated.softmax_backward.lanes" + l,
-                            TunedKernelOrigin.Generated, true, shape => shape[1] <= 64 * l && TunedVariantsAvailable,
+                            TunedKernelOrigin.Generated, true, shape => VulkanTunedRowKernels.RowLanesFit((int)shape[1], l) && TunedVariantsAvailable,
                             (in TunedSoftmaxBackwardArgs a) => GlslNaryOp(source, new[] { a.GradOutput, a.Output, a.GradInput },
                                 RowThreads(a.Rows, l), Push(a.Rows, a.N))));
                     }
@@ -146,7 +245,7 @@ public sealed unsafe partial class VulkanBackend
                         int l = lanes;
                         string source = VulkanTunedRowKernels.LayerNorm(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedLayerNormArgs>("generated.layernorm_forward.lanes" + l,
-                            TunedKernelOrigin.Generated, true, shape => shape[1] <= 64 * l && TunedVariantsAvailable,
+                            TunedKernelOrigin.Generated, true, shape => VulkanTunedRowKernels.RowLanesFit((int)shape[1], l) && TunedVariantsAvailable,
                             (in TunedLayerNormArgs a) => GlslNaryOp(source,
                                 new[] { a.Input, a.Output, a.Gamma, a.Beta, a.SaveMean, a.SaveInvVar }, RowThreads(a.Rows, l),
                                 new[] { unchecked((uint)a.Rows), unchecked((uint)a.N), FloatBits(a.Epsilon) })));
@@ -181,7 +280,7 @@ public sealed unsafe partial class VulkanBackend
                         int l = lanes;
                         string source = VulkanTunedRowKernels.LayerNormBackward(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>("generated.layernorm_backward.lanes" + l,
-                            TunedKernelOrigin.Generated, true, shape => shape[1] <= 64 * l && TunedVariantsAvailable,
+                            TunedKernelOrigin.Generated, true, shape => VulkanTunedRowKernels.RowLanesFit((int)shape[1], l) && TunedVariantsAvailable,
                             (in TunedNormBackwardArgs a) => GlslNaryOp(source,
                                 new[] { a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0 },
                                 RowThreads(a.Rows, l), Push(a.Rows, a.N))));
@@ -264,21 +363,17 @@ public sealed unsafe partial class VulkanBackend
 
     private void LayerNormReference(in TunedLayerNormArgs a)
     {
-        using var runningMeanDummy = AllocateBuffer(1);
-        using var runningVarianceDummy = AllocateBuffer(1);
         DispatchNormalizationForward(
-            new[] { a.Input, a.Output, a.Gamma, a.Beta, runningMeanDummy, runningVarianceDummy, a.SaveMean, a.SaveInvVar }, a.Rows,
+            new[] { a.Input, a.Output, a.Gamma, a.Beta, UnusedBinding, UnusedBinding, a.SaveMean, a.SaveInvVar }, a.Rows,
             new[] { 1u, (uint)a.Rows, (uint)a.N, 1u, 1u, FloatBits(a.Epsilon), 0u, 1u });
     }
 
     // NormalizationBackward (mode 1 LayerNorm, operation 0) writes only the input gradient; its gamma / beta bindings
-    // are unused there and take dummies.
+    // are unused there and take the shared placeholder.
     private void LayerNormBackwardInputReference(in TunedNormBackwardArgs a)
     {
-        using var gradGammaDummy = AllocateBuffer(1);
-        using var gradBetaDummy = AllocateBuffer(1);
         GlslNaryOp(VulkanGlslKernels.NormalizationBackward,
-            new[] { a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0, gradGammaDummy, gradBetaDummy },
+            new[] { a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0, UnusedBinding, UnusedBinding },
             a.Rows, new[] { 1u, 0u, (uint)a.Rows, (uint)a.N, 1u });
     }
 
@@ -288,19 +383,13 @@ public sealed unsafe partial class VulkanBackend
     {
         if (rms)
         {
-            using var savedMeanDummy = AllocateBuffer(Math.Max(1, a.Rows));
-            using var gammaDummy = AllocateBuffer(Math.Max(1, a.N));
-            using var gradInputDummy = AllocateBuffer(1);
-            using var gradBetaDummy = AllocateBuffer(Math.Max(1, a.N));
             DispatchNormalizationBackward(
-                new[] { a.GradOutput, a.Input, gammaDummy, savedMeanDummy, a.Stat0, gradInputDummy, a.Out0, gradBetaDummy }, a.N,
+                new[] { a.GradOutput, a.Input, UnusedBinding, UnusedBinding, a.Stat0, UnusedBinding, a.Out0, UnusedBinding }, a.N,
                 new[] { 3u, 1u, (uint)a.Rows, (uint)a.N, 1u });
             return;
         }
-        using var gammaUnused = AllocateBuffer(Math.Max(1, a.N));
-        using var gradInputUnused = AllocateBuffer(1);
         DispatchNormalizationBackward(
-            new[] { a.GradOutput, a.Input, gammaUnused, a.Stat0, Required(a.Stat1), gradInputUnused, a.Out0, Required(a.Out1) }, a.N,
+            new[] { a.GradOutput, a.Input, UnusedBinding, a.Stat0, Required(a.Stat1), UnusedBinding, a.Out0, Required(a.Out1) }, a.N,
             new[] { 1u, 1u, (uint)a.Rows, (uint)a.N, 1u });
     }
 }

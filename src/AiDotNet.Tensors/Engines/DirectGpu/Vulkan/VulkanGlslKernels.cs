@@ -315,18 +315,20 @@ layout(push_constant) uniform Params { uint batch; uint outputHeight; uint outpu
 void main(){uint point=gl_GlobalInvocationID.x;if(point>=batch*outputHeight*outputWidth)return;uint w=point%outputWidth,q=point/outputWidth,h=q%outputHeight,batchIndex=q/outputHeight;float ny=outputHeight>1u?2.0*float(h)/float(outputHeight-1u)-1.0:0.0;float nx=outputWidth>1u?2.0*float(w)/float(outputWidth-1u)-1.0:0.0;uint t=batchIndex*6u;b[point*2u]=a[t]*nx+a[t+1u]*ny+a[t+2u];b[point*2u+1u]=a[t+3u]*nx+a[t+4u]*ny+a[t+5u];}";
 
     private const string GridSampleHelpers = @"
+// #1134: a NaN, infinite or out-of-int-range point samples nothing and has no gradient; tested on the bits.
+bool gsUsable(float x,float y){return (floatBitsToUint(x)&0x7FFFFFFFu)<0x4EFFFFFFu&&(floatBitsToUint(y)&0x7FFFFFFFu)<0x4EFFFFFFu;}
 int gridPad(int coordinate,int size,uint paddingMode){if(coordinate>=0&&coordinate<size)return coordinate;if(paddingMode==0u)return -1;if(paddingMode==1u)return clamp(coordinate,0,size-1);if(size<=1)return 0;int period=2*(size-1),value=coordinate%period;if(value<0)value+=period;return value<size?value:period-value;}
 ";
 
     public static string GridSampleBackwardInput => Header + ThreeBufferLayout + @"
 layout(push_constant) uniform Params { uint batch; uint channels; uint inHeight; uint inWidth; uint outHeight; uint outWidth; uint paddingMode; uint alignCorners; };
 " + GridSampleHelpers + @"
-void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*channels*inHeight*inWidth)return;uint ixTarget=idx%inWidth,q=idx/inWidth,iyTarget=q%inHeight;q/=inHeight;uint channel=q%channels,batchIndex=q/channels;float sum=0.0;for(uint oh=0u;oh<outHeight;++oh)for(uint ow=0u;ow<outWidth;++ow){uint gridOffset=(batchIndex*outHeight*outWidth+oh*outWidth+ow)*2u;float gx=bdata[gridOffset],gy=bdata[gridOffset+1u];float ix=alignCorners!=0u?(gx+1.0)*0.5*float(inWidth-1u):(gx+1.0)*0.5*float(inWidth)-0.5;float iy=alignCorners!=0u?(gy+1.0)*0.5*float(inHeight-1u):(gy+1.0)*0.5*float(inHeight)-0.5;int ix0=int(floor(ix)),iy0=int(floor(iy));float dx=ix-float(ix0),dy=iy-float(iy0);for(int jy=0;jy<=1;++jy)for(int jx=0;jx<=1;++jx){int py=gridPad(iy0+jy,int(inHeight),paddingMode),px=gridPad(ix0+jx,int(inWidth),paddingMode);if(py==int(iyTarget)&&px==int(ixTarget)){float wy=jy==0?1.0-dy:dy,wx=jx==0?1.0-dx:dx;sum+=a[((batchIndex*channels+channel)*outHeight+oh)*outWidth+ow]*wy*wx;}}}c[idx]=sum;}";
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=batch*channels*inHeight*inWidth)return;uint ixTarget=idx%inWidth,q=idx/inWidth,iyTarget=q%inHeight;q/=inHeight;uint channel=q%channels,batchIndex=q/channels;float sum=0.0;for(uint oh=0u;oh<outHeight;++oh)for(uint ow=0u;ow<outWidth;++ow){uint gridOffset=(batchIndex*outHeight*outWidth+oh*outWidth+ow)*2u;float gx=bdata[gridOffset],gy=bdata[gridOffset+1u];float ix=alignCorners!=0u?(gx+1.0)*0.5*float(inWidth-1u):(gx+1.0)*0.5*float(inWidth)-0.5;float iy=alignCorners!=0u?(gy+1.0)*0.5*float(inHeight-1u):(gy+1.0)*0.5*float(inHeight)-0.5;if(!gsUsable(ix,iy))continue;int ix0=int(floor(ix)),iy0=int(floor(iy));float dx=ix-float(ix0),dy=iy-float(iy0);for(int jy=0;jy<=1;++jy)for(int jx=0;jx<=1;++jx){int py=gridPad(iy0+jy,int(inHeight),paddingMode),px=gridPad(ix0+jx,int(inWidth),paddingMode);if(py==int(iyTarget)&&px==int(ixTarget)){float wy=jy==0?1.0-dy:dy,wx=jx==0?1.0-dx:dx;sum+=a[((batchIndex*channels+channel)*outHeight+oh)*outWidth+ow]*wy*wx;}}}c[idx]=sum;}";
 
     public static string GridSampleBackwardGrid => Header + FourBufferLayout + @"
 layout(push_constant) uniform Params { uint batch; uint channels; uint inHeight; uint inWidth; uint outHeight; uint outWidth; uint paddingMode; uint alignCorners; };
 " + GridSampleHelpers + @"
-void main(){uint point=gl_GlobalInvocationID.x;if(point>=batch*outHeight*outWidth)return;uint ow=point%outWidth,q=point/outWidth,oh=q%outHeight,batchIndex=q/outHeight;float gx=c[point*2u],gy=c[point*2u+1u];float ix=alignCorners!=0u?(gx+1.0)*0.5*float(inWidth-1u):(gx+1.0)*0.5*float(inWidth)-0.5;float iy=alignCorners!=0u?(gy+1.0)*0.5*float(inHeight-1u):(gy+1.0)*0.5*float(inHeight)-0.5;float dix=alignCorners!=0u?0.5*float(inWidth-1u):0.5*float(inWidth),diy=alignCorners!=0u?0.5*float(inHeight-1u):0.5*float(inHeight);int ix0=int(floor(ix)),iy0=int(floor(iy));float dx=ix-float(ix0),dy=iy-float(iy0),gradX=0.0,gradY=0.0;for(uint channel=0u;channel<channels;++channel){float grad=a[((batchIndex*channels+channel)*outHeight+oh)*outWidth+ow];for(int jy=0;jy<=1;++jy)for(int jx=0;jx<=1;++jx){int py=gridPad(iy0+jy,int(inHeight),paddingMode),px=gridPad(ix0+jx,int(inWidth),paddingMode);if(py>=0&&px>=0){float wy=jy==0?1.0-dy:dy,wx=jx==0?1.0-dx:dx,pixel=bdata[((batchIndex*channels+channel)*inHeight+uint(py))*inWidth+uint(px)];gradY+=grad*pixel*(jy==0?-1.0:1.0)*wx;gradX+=grad*pixel*wy*(jx==0?-1.0:1.0);}}}d[point*2u]=gradX*dix;d[point*2u+1u]=gradY*diy;}";
+void main(){uint point=gl_GlobalInvocationID.x;if(point>=batch*outHeight*outWidth)return;uint ow=point%outWidth,q=point/outWidth,oh=q%outHeight,batchIndex=q/outHeight;float gx=c[point*2u],gy=c[point*2u+1u];float ix=alignCorners!=0u?(gx+1.0)*0.5*float(inWidth-1u):(gx+1.0)*0.5*float(inWidth)-0.5;float iy=alignCorners!=0u?(gy+1.0)*0.5*float(inHeight-1u):(gy+1.0)*0.5*float(inHeight)-0.5;if(!gsUsable(ix,iy)){d[point*2u]=0.0;d[point*2u+1u]=0.0;return;}float dix=alignCorners!=0u?0.5*float(inWidth-1u):0.5*float(inWidth),diy=alignCorners!=0u?0.5*float(inHeight-1u):0.5*float(inHeight);int ix0=int(floor(ix)),iy0=int(floor(iy));float dx=ix-float(ix0),dy=iy-float(iy0),gradX=0.0,gradY=0.0;for(uint channel=0u;channel<channels;++channel){float grad=a[((batchIndex*channels+channel)*outHeight+oh)*outWidth+ow];for(int jy=0;jy<=1;++jy)for(int jx=0;jx<=1;++jx){int py=gridPad(iy0+jy,int(inHeight),paddingMode),px=gridPad(ix0+jx,int(inWidth),paddingMode);if(py>=0&&px>=0){float wy=jy==0?1.0-dy:dy,wx=jx==0?1.0-dx:dx,pixel=bdata[((batchIndex*channels+channel)*inHeight+uint(py))*inWidth+uint(px)];gradY+=grad*pixel*(jy==0?-1.0:1.0)*wx;gradX+=grad*pixel*wy*(jx==0?-1.0:1.0);}}}d[point*2u]=gradX*dix;d[point*2u+1u]=gradY*diy;}";
 
     public static string TileBatch => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint repeats; uint innerSize; };
@@ -1328,6 +1330,34 @@ void main() {
     uint offset = idx * reduceSize;
     for (uint j = 0u; j < reduceSize; ++j) sum += a[offset + j];
     b[idx] = sum;
+}";
+
+    // A long row split into chunks: one workgroup sums one chunk of one row, its 256 invocations each taking every
+    // 256th element and folding through shared memory in a fixed tree, and writes b[row * chunks + chunk]. The
+    // partials are then summed by SumAxis again. Fixed partition, fixed order, no atomics: deterministic.
+    public static string SumAxisChunks => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; uint chunks; uint chunkLen; };
+shared float scratch[256];
+void main() {
+    uint group = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint row = group / chunks;
+    uint chunk = group % chunks;
+    bool live = row < outerSize;
+    float sum = 0.0;
+    if (live) {
+        uint start = chunk * chunkLen;
+        uint end = min(start + chunkLen, reduceSize);
+        uint offset = row * reduceSize;
+        for (uint j = start + lid; j < end; j += 256u) sum += a[offset + j];
+    }
+    scratch[lid] = sum;
+    barrier();
+    for (uint o = 128u; o > 0u; o >>= 1) {
+        if (lid < o) scratch[lid] += scratch[lid + o];
+        barrier();
+    }
+    if (live && lid == 0u) b[group] = scratch[0];
 }";
 
     public static string ScalarReduce => Header + TwoBufferLayout + @"

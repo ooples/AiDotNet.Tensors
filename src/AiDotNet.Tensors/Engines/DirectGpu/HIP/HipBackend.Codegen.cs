@@ -58,7 +58,7 @@ public sealed partial class HipBackend
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (_disposed) throw new ObjectDisposedException(nameof(HipBackend));
-        if (!IsAvailable) throw new InvalidOperationException("HIP is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("HIP is not available.");
         if (kernel is not GpuSourceKernel sourceKernel ||
             sourceKernel.Target != CodegenTarget.Hip)
         {
@@ -89,7 +89,7 @@ public sealed partial class HipBackend
         if (sourceKernel.Target != CodegenTarget.Hip)
             throw new ArgumentException("The source kernel must target HIP.", nameof(sourceKernel));
         if (_disposed) throw new ObjectDisposedException(nameof(HipBackend));
-        if (!IsAvailable) throw new InvalidOperationException("HIP is not available.");
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("HIP is not available.");
 
         CodegenTargetRuntime runtime = sourceKernel.RequiredRuntime;
         if (runtime.Backend != KernelTuningBackend.Hip ||

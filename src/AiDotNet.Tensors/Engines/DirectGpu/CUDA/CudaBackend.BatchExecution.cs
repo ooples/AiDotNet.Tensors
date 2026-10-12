@@ -14,7 +14,7 @@ public sealed partial class CudaBackend : IFftBackend, IMeshgridBackend, IGpuBat
     {
         if (threads <= 0) return;
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         ulong* slots = stackalloc ulong[args.Length];
         void** pointers = stackalloc void*[args.Length];
         for (int i = 0; i < args.Length; i++)
@@ -41,7 +41,7 @@ public sealed partial class CudaBackend : IFftBackend, IMeshgridBackend, IGpuBat
     private unsafe void BatchFullReduce(IGpuBuffer input, IGpuBuffer output, int size, int mode, float maxVal)
     {
         if (!_kernelCache.TryGetValue("bx_full_reduce", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: bx_full_reduce");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: bx_full_reduce");
         using var _ = PushContext();
         IntPtr inPtr = input.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[5];

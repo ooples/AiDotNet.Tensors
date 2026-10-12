@@ -772,6 +772,245 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
         }
     }
 }");
+    // #1179 fused attention: line-for-line ports of BatchExecutionCudaKernels.AttentionSource (WGSL reserves "meta",
+    // hence "fam" for the metadata buffer on every port). -inf is tested on its bits, since WGSL lets an implementation
+    // assume floats are finite. No kernel binds more than 8 storage buffers, WebGPU's guaranteed per-stage limit.
+    private const string FaLoad = @"
+struct Fa { B: i32, H: i32, Sq: i32, Sk: i32, D: i32, qb: i32, qh: i32, qr: i32, kb: i32, kh: i32, kr: i32, vb: i32,
+    vh: i32, vr: i32, ob: i32, oh: i32, orw: i32, mb: i32, mh: i32, mi: i32, mj: i32, causal: i32, coff: i32,
+    hasMask: i32, scale: f32, cap: f32 }
+fn fa_load() -> Fa {
+    return Fa(fam[0], fam[1], fam[2], fam[3], fam[4], fam[5], fam[6], fam[7], fam[8], fam[9], fam[10], fam[11], fam[12],
+        fam[13], fam[14], fam[15], fam[16], fam[17], fam[18], fam[19], fam[20], fam[21], fam[22], fam[23],
+        bitcast<f32>(fam[24]), bitcast<f32>(fam[25]));
+}
+fn fa_neg_inf() -> f32 { let bits = 0xff800000u; return bitcast<f32>(bits); }
+fn fa_has_keys(lr: f32) -> bool { return bitcast<u32>(lr) != 0xff800000u; }
+";
+
+    private const string FaScore = @"
+fn fa_allowed(f: Fa, b: i32, h: i32, i: i32, j: i32) -> bool {
+    if (f.causal != 0 && j > i + f.coff) { return false; }
+    if (f.hasMask != 0 && mask[b * f.mb + h * f.mh + i * f.mi + j * f.mj] == 0) { return false; }
+    return true;
+}
+// The capped score and d(capped) / d(raw).
+fn fa_score(f: Fa, b: i32, h: i32, i: i32, j: i32) -> vec2<f32> {
+    var s = 0.0;
+    for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * f.scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
+    if (f.cap > 0.0) { let t = tanh(s / f.cap); return vec2<f32>(f.cap * t, 1.0 - t * t); }
+    return vec2<f32>(s, 1.0);
+}
+";
+
+    private const string FaDp = @"
+fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
+    var dp = 0.0;
+    for (var e = 0; e < f.D; e++) { dp += dout[b * f.ob + h * f.oh + i * f.orw + e] * v[b * f.vb + h * f.vh + j * f.vr + e]; }
+    return dp;
+}
+";
+
+    public static readonly string FaLse = Shader(new[] { "r:q", "r:k", "r:fam:i32", "r:mask:i32", "rw:lse" }, "total: i32",
+        FaLoad + FaScore + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let qi = i % f.Sq; let bh = i / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    var m = 0.0; var seen = false;
+    for (var j = 0; j < f.Sk; j++) {
+        if (!fa_allowed(f, b, h, qi, j)) { continue; }
+        let s = fa_score(f, b, h, qi, j).x;
+        if (!seen || s > m) { m = s; }
+        seen = true;
+    }
+    if (!seen) { lse[i] = fa_neg_inf(); return; }
+    var l = 0.0;
+    for (var j = 0; j < f.Sk; j++) {
+        if (!fa_allowed(f, b, h, qi, j)) { continue; }
+        l += exp(fa_score(f, b, h, qi, j).x - m);
+    }
+    lse[i] = m + log(l);
+}");
+
+    public static readonly string FaOut = Shader(new[] { "r:q", "r:k", "r:v", "r:fam:i32", "r:mask:i32", "r:lse", "rw:o" },
+        "total: i32", FaLoad + FaScore + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let e = i % f.D; let r = i / f.D; let qi = r % f.Sq; let bh = r / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    let lr = lse[r]; var acc = 0.0;
+    if (fa_has_keys(lr)) {
+        for (var j = 0; j < f.Sk; j++) {
+            if (!fa_allowed(f, b, h, qi, j)) { continue; }
+            acc += exp(fa_score(f, b, h, qi, j).x - lr) * v[b * f.vb + h * f.vh + j * f.vr + e];
+        }
+    }
+    o[b * f.ob + h * f.oh + qi * f.orw + e] = acc;
+}");
+
+    public static readonly string FaDelta = Shader(new[] { "r:o", "r:dout", "r:fam:i32", "rw:st" }, "total: i32", FaLoad + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let qi = i % f.Sq; let bh = i / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    var acc = 0.0;
+    for (var e = 0; e < f.D; e++) { acc += dout[b * f.ob + h * f.oh + qi * f.orw + e] * o[b * f.ob + h * f.oh + qi * f.orw + e]; }
+    st[p.total + i] = acc;
+}");
+
+    public static readonly string FaDq = Shader(
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dq" }, "total: i32",
+        FaLoad + FaScore + FaDp + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let rows = f.B * f.H * f.Sq;
+    let e = i % f.D; let r = i / f.D; let qi = r % f.Sq; let bh = r / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    let lr = st[r]; var acc = 0.0;
+    if (fa_has_keys(lr)) {
+        let dl = st[rows + r];
+        for (var j = 0; j < f.Sk; j++) {
+            if (!fa_allowed(f, b, h, qi, j)) { continue; }
+            let s = fa_score(f, b, h, qi, j);
+            acc += exp(s.x - lr) * (fa_dp(f, b, h, qi, j) - dl) * s.y * k[b * f.kb + h * f.kh + j * f.kr + e];
+        }
+    }
+    dq[b * f.qb + h * f.qh + qi * f.qr + e] = acc * f.scale;
+}");
+
+    public static readonly string FaDk = Shader(
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dk" }, "total: i32",
+        FaLoad + FaScore + FaDp + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let rows = f.B * f.H * f.Sq;
+    let e = i % f.D; let r = i / f.D; let j = r % f.Sk; let bh = r / f.Sk; let b = bh / f.H; let h = bh % f.H;
+    var ak = 0.0;
+    for (var qi = 0; qi < f.Sq; qi++) {
+        let lr = st[bh * f.Sq + qi];
+        if (!fa_has_keys(lr) || !fa_allowed(f, b, h, qi, j)) { continue; }
+        let s = fa_score(f, b, h, qi, j);
+        ak += exp(s.x - lr) * (fa_dp(f, b, h, qi, j) - st[rows + bh * f.Sq + qi]) * s.y * q[b * f.qb + h * f.qh + qi * f.qr + e] * f.scale;
+    }
+    dk[b * f.kb + h * f.kh + j * f.kr + e] = ak;
+}");
+
+    public static readonly string FaDv = Shader(
+        new[] { "r:q", "r:k", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dv" }, "total: i32",
+        FaLoad + FaScore + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let e = i % f.D; let r = i / f.D; let j = r % f.Sk; let bh = r / f.Sk; let b = bh / f.H; let h = bh % f.H;
+    var av = 0.0;
+    for (var qi = 0; qi < f.Sq; qi++) {
+        let lr = st[bh * f.Sq + qi];
+        if (!fa_has_keys(lr) || !fa_allowed(f, b, h, qi, j)) { continue; }
+        av += exp(fa_score(f, b, h, qi, j).x - lr) * dout[b * f.ob + h * f.oh + qi * f.orw + e];
+    }
+    dv[b * f.vb + h * f.vh + j * f.vr + e] = av;
+}");
+
+    // #1107 / #1108 fused LSTM: line-for-line ports of BatchExecutionCudaKernels.LstmSource.
+    private const string LstmSig = @"
+fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
+";
+
+    public static readonly string LstmGates = Shader(
+        new[] { "r:x", "r:wih", "r:whh", "r:bih", "r:bhh", "r:allH", "rw:gates" }, "t: i32, B: i32, T: i32, In: i32, H: i32",
+        LstmSig + Main + @"
+    let H = p.H; let In = p.In; let B = p.B;
+    if (i >= B * 4 * H) { return; }
+    let b = i / (4 * H); let row = i - b * 4 * H;
+    var s = bih[row] + bhh[row];
+    for (var k = 0; k < In; k++) { s += wih[row * In + k] * x[(b * p.T + p.t) * In + k]; }
+    for (var j = 0; j < H; j++) { s += whh[row * H + j] * allH[(p.t * B + b) * H + j]; }
+    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), tanh(s), row / H == 2);
+}");
+
+    public static readonly string LstmCell = Shader(
+        new[] { "r:gates", "rw:allC", "rw:allH", "rw:y" }, "t: i32, B: i32, T: i32, H: i32", Main + @"
+    let H = p.H; let B = p.B; let t = p.t;
+    if (i >= B * H) { return; }
+    let b = i / H; let h = i - b * H;
+    let gb = (t * B + b) * 4 * H;
+    let c = gates[gb + H + h] * allC[(t * B + b) * H + h] + gates[gb + h] * gates[gb + 2 * H + h];
+    let hv = gates[gb + 3 * H + h] * tanh(c);
+    allC[((t + 1) * B + b) * H + h] = c;
+    allH[((t + 1) * B + b) * H + h] = hv;
+    y[(b * p.T + t) * H + h] = hv;
+}");
+
+    public static readonly string LstmCellBackward = Shader(
+        new[] { "r:gy", "r:gates", "r:allC", "r:dh", "rw:dc", "rw:dpre" }, "t: i32, B: i32, T: i32, H: i32", Main + @"
+    let H = p.H; let B = p.B; let t = p.t;
+    if (i >= B * H) { return; }
+    let b = i / H; let h = i - b * H;
+    let gb = (t * B + b) * 4 * H;
+    let ig = gates[gb + h]; let fg = gates[gb + H + h]; let gg = gates[gb + 2 * H + h]; let og = gates[gb + 3 * H + h];
+    let tc = tanh(allC[((t + 1) * B + b) * H + h]);
+    let dhv = gy[(b * p.T + t) * H + h] + dh[i];
+    let dcv = dhv * og * (1.0 - tc * tc) + dc[i];
+    dpre[gb + h] = dcv * gg * ig * (1.0 - ig);
+    dpre[gb + H + h] = dcv * allC[(t * B + b) * H + h] * fg * (1.0 - fg);
+    dpre[gb + 2 * H + h] = dcv * ig * (1.0 - gg * gg);
+    dpre[gb + 3 * H + h] = dhv * tc * og * (1.0 - og);
+    dc[i] = dcv * fg;
+}");
+
+    public static readonly string LstmHiddenBackward = Shader(
+        new[] { "r:dpre", "r:whh", "rw:dh" }, "t: i32, B: i32, H: i32", Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let j = i - b * H;
+    let gb = (p.t * B + b) * 4 * H;
+    var s = 0.0;
+    for (var row = 0; row < 4 * H; row++) { s += dpre[gb + row] * whh[row * H + j]; }
+    dh[i] = s;
+}");
+
+    public static readonly string LstmInputGrad = Shader(
+        new[] { "r:dpre", "r:wih", "rw:gin" }, "B: i32, T: i32, In: i32, H: i32", Main + @"
+    let H = p.H; let In = p.In;
+    if (i >= p.B * p.T * In) { return; }
+    let k = i % In; let bt = i / In; let t = bt % p.T; let b = bt / p.T;
+    let gb = (t * p.B + b) * 4 * H;
+    var s = 0.0;
+    for (var row = 0; row < 4 * H; row++) { s += dpre[gb + row] * wih[row * In + k]; }
+    gin[i] = s;
+}");
+
+    public static readonly string LstmWeightIhGrad = Shader(
+        new[] { "r:dpre", "r:x", "rw:gwih" }, "B: i32, T: i32, In: i32, H: i32", Main + @"
+    let H = p.H; let In = p.In;
+    if (i >= 4 * H * In) { return; }
+    let row = i / In; let k = i - row * In;
+    var s = 0.0;
+    for (var t = 0; t < p.T; t++) {
+        for (var b = 0; b < p.B; b++) { s += dpre[(t * p.B + b) * 4 * H + row] * x[(b * p.T + t) * In + k]; }
+    }
+    gwih[i] = s;
+}");
+
+    public static readonly string LstmWeightHhGrad = Shader(
+        new[] { "r:dpre", "r:allH", "rw:gwhh" }, "B: i32, T: i32, H: i32", Main + @"
+    let H = p.H;
+    if (i >= 4 * H * H) { return; }
+    let row = i / H; let j = i - row * H;
+    var s = 0.0;
+    for (var t = 0; t < p.T; t++) {
+        for (var b = 0; b < p.B; b++) { s += dpre[(t * p.B + b) * 4 * H + row] * allH[(t * p.B + b) * H + j]; }
+    }
+    gwhh[i] = s;
+}");
+
+    public static readonly string LstmBiasGrad = Shader(
+        new[] { "r:dpre", "rw:gbih", "rw:gbhh" }, "B: i32, T: i32, H: i32", Main + @"
+    let H = p.H;
+    if (i >= 4 * H) { return; }
+    var s = 0.0;
+    for (var t = 0; t < p.T; t++) {
+        for (var b = 0; b < p.B; b++) { s += dpre[(t * p.B + b) * 4 * H + i]; }
+    }
+    gbih[i] = s;
+    gbhh[i] = s;
+}");
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
@@ -795,6 +1034,12 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
         [BatchExecutionCudaKernels.LaCholeskyBackwardLower] = LaCholeskyBackwardLower,
         [BatchExecutionCudaKernels.LaSolveBackwardVector] = LaSolveBackwardVector, [BatchExecutionCudaKernels.LaSvdReduced] = LaSvdReduced,
         [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
+        [BatchExecutionCudaKernels.FaLse] = FaLse, [BatchExecutionCudaKernels.FaOut] = FaOut, [BatchExecutionCudaKernels.FaDelta] = FaDelta,
+        [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDk] = FaDk, [BatchExecutionCudaKernels.FaDv] = FaDv,
+        [BatchExecutionCudaKernels.LstmGates] = LstmGates, [BatchExecutionCudaKernels.LstmCell] = LstmCell,
+        [BatchExecutionCudaKernels.LstmCellBackward] = LstmCellBackward, [BatchExecutionCudaKernels.LstmHiddenBackward] = LstmHiddenBackward,
+        [BatchExecutionCudaKernels.LstmInputGrad] = LstmInputGrad, [BatchExecutionCudaKernels.LstmWeightIhGrad] = LstmWeightIhGrad,
+        [BatchExecutionCudaKernels.LstmWeightHhGrad] = LstmWeightHhGrad, [BatchExecutionCudaKernels.LstmBiasGrad] = LstmBiasGrad,
     };
 }
 #endif

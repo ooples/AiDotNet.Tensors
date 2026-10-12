@@ -27,7 +27,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Prefers discrete GPUs over integrated GPUs. Falls back to any available device.
 /// </para>
 /// </remarks>
-public sealed unsafe class VulkanDevice : IDisposable
+public sealed unsafe partial class VulkanDevice : IDisposable
 {
     private static VulkanDevice? _instance;
     private static readonly object _lock = new();
@@ -800,6 +800,8 @@ public sealed unsafe class VulkanDevice : IDisposable
         {
             // The binding counts the drain for the residency probe, as it does for the teardown and fence waits.
             VulkanNativeBindings.vkDeviceWaitIdle(_device);
+            // Everything submitted without waiting has now executed: hand its resources back.
+            WaitForPendingSubmissions();
         }
     }
 
@@ -811,7 +813,7 @@ public sealed unsafe class VulkanDevice : IDisposable
     {
         if (!_initialized || _disposed)
         {
-            throw new InvalidOperationException("Vulkan device not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan device not initialized.");
         }
 
         // Managed thread IDs can be reused after a thread exits, but this is safe:
@@ -883,6 +885,22 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// </summary>
     private volatile bool _deviceWarmedUp;
 
+    // On first submit, wait for the device to be fully idle to avoid cold-start race
+    // conditions with AMD Vulkan drivers that return VK_ERROR_DEVICE_LOST (-2) on
+    // the first queue submit if the driver hasn't finished internal initialization.
+    private void EnsureDeviceWarm()
+    {
+        if (_deviceWarmedUp) return;
+        lock (_submitLock)
+        {
+            if (!_deviceWarmedUp)
+            {
+                VulkanNativeBindings.vkDeviceWaitIdle(_device);
+                _deviceWarmedUp = true;
+            }
+        }
+    }
+
     public void SubmitAndWait(IntPtr commandBuffer, IntPtr fence)
     {
         if (_device == IntPtr.Zero || _computeQueue == IntPtr.Zero || fence == IntPtr.Zero)
@@ -890,20 +908,12 @@ public sealed unsafe class VulkanDevice : IDisposable
             return;
         }
 
-        // On first submit, wait for the device to be fully idle to avoid cold-start race
-        // conditions with AMD Vulkan drivers that return VK_ERROR_DEVICE_LOST (-2) on
-        // the first queue submit if the driver hasn't finished internal initialization.
-        if (!_deviceWarmedUp)
-        {
-            lock (_submitLock)
-            {
-                if (!_deviceWarmedUp)
-                {
-                    VulkanNativeBindings.vkDeviceWaitIdle(_device);
-                    _deviceWarmedUp = true;
-                }
-            }
-        }
+        EnsureDeviceWarm();
+
+        // A submission that is waited for is a point where the host is about to look at device state (a transfer,
+        // a batch, a timestamp), so everything submitted without waiting finishes first. It also means a waited
+        // submission never needs a barrier against the unwaited ones before it.
+        WaitForPendingSubmissions();
 
         // Vulkan spec requires external synchronization for vkQueueSubmit on the same queue
         lock (_submitLock)
@@ -964,6 +974,8 @@ public sealed unsafe class VulkanDevice : IDisposable
 
     private void Cleanup()
     {
+        DestroyDeferredSubmissionResources();
+
         // Clean up per-thread resources
         foreach (var kvp in _threadResources)
         {

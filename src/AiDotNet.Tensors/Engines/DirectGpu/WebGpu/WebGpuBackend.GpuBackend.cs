@@ -21,7 +21,7 @@ public sealed partial class WebGpuBackend
     private void EnsureInitialized()
     {
         if (!_initialized || _disposed)
-            throw new InvalidOperationException("WebGPU backend not initialized.");
+            throw new GpuCapabilityUnavailableException("WebGPU backend not initialized.");
     }
 
     private void UploadToBuffer(float[] data, IGpuBuffer buffer)
@@ -869,9 +869,52 @@ public sealed partial class WebGpuBackend
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (outerSize <= 0 || reduceSize <= 0)
+            throw new ArgumentException("outerSize and reduceSize must be positive.");
+        int maxGroups = _device?.MaxWorkgroupsPerDimension ?? 65535;
+
+        // #1157 (the CUDA #1150 split): few long rows -- a full reduction is one -- are split into chunks whose
+        // partials are reduced again with this same method. WebGPU does not report its compute-unit count, so the
+        // chunk count follows the data (one per SumAxisSplitChunkMin elements, 2 .. 256). Fixed partition and order.
+        if (reduceSize >= SumAxisSplitMinReduce && outerSize <= SumAxisSplitMaxRows)
+        {
+            int chunks = (int)Math.Max(2, Math.Min(256L, ((long)reduceSize + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin));
+            int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+            chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+            if ((long)chunks * outerSize <= maxGroups)
+            {
+                using var partial = AllocateBuffer(outerSize * chunks);
+                Dispatch2BufferAsync("SumAxisRows", WebGpuKernels.SumAxisRowsSource, "sum_axis_rows_split",
+                    A, partial, SumAxisUniform(outerSize, reduceSize, chunks, chunkLen), chunks * outerSize * 256)
+                    .GetAwaiter().GetResult();
+                SumAxis(partial, B, outerSize, chunks);
+                return;
+            }
+        }
+
+        // Rows of at least SumAxisRowsMinReduce elements: a workgroup per row (coalesced reads, parallel tree).
+        if (reduceSize >= SumAxisRowsMinReduce && outerSize <= maxGroups)
+        {
+            Dispatch2BufferAsync("SumAxisRows", WebGpuKernels.SumAxisRowsSource, "sum_axis_rows",
+                A, B, SumAxisUniform(outerSize, reduceSize, 1, reduceSize), outerSize * 256).GetAwaiter().GetResult();
+            return;
+        }
+
         Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "sum_axis",
             A, B, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
+
+    // SumAxis thresholds, as on the other backends (#1150 / #1157).
+    internal const int SumAxisRowsMinReduce = 32;
+    internal const int SumAxisSplitMinReduce = 64 * 1024;
+    internal const int SumAxisSplitChunkMin = 8 * 1024;
+    internal const int SumAxisSplitMaxRows = 8;
+
+    private static float[] SumAxisUniform(int outer, int reduce, int chunks, int chunkLen) => new[]
+    {
+        BitConverter.Int32BitsToSingle(outer), BitConverter.Int32BitsToSingle(reduce),
+        BitConverter.Int32BitsToSingle(chunks), BitConverter.Int32BitsToSingle(chunkLen),
+    };
 
     #endregion
 

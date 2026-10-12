@@ -219,7 +219,7 @@ struct P { size: i32 };
   let ua = bitcast<u32>(av); let ub = bitcast<u32>(bv);
   let aNan = ((ua >> 23u) & 0xFFu) == 0xFFu && (ua & 0x7FFFFFu) != 0u;
   let bNan = ((ub >> 23u) & 0xFFu) == 0xFFu && (ub & 0x7FFFFFu) != 0u;
-  if (aNan || bNan) { outp[idx] = bitcast<f32>(0x7FC00000u); return; }
+  if (aNan || bNan) { outp[idx] = wgsl_f32_bits(0x7FC00000u); return; }
   if (av == bv) { outp[idx] = bv; return; }
   if (av == 0.0) { outp[idx] = bitcast<f32>(select(0x80000001u, 0x00000001u, bv > 0.0)); return; }
   var r = ua;
@@ -390,8 +390,8 @@ struct P { rows: i32, treeDepth: i32, numClasses: i32 };
 struct P { size: i32 };
 @group(0) @binding(3) var<uniform> pc : P;
 fn p210_zeta_scalar(xv: f32, qv: f32) -> f32 {
-  if (xv == 1.0) { return bitcast<f32>(0x7F800000u); }
-  if (qv <= 0.0 && qv == floor(qv)) { return bitcast<f32>(0x7F800000u); }
+  if (xv == 1.0) { return wgsl_f32_bits(0x7F800000u); }
+  if (qv <= 0.0 && qv == floor(qv)) { return wgsl_f32_bits(0x7F800000u); }
   var sum = 0.0;
   for (var k = 0; k < 12; k = k + 1) { sum = sum + pow(qv + f32(k), -xv); }
   let Nq = 12.0 + qv; let lnNq = log(Nq); let cont = exp((1.0 - xv) * lnNq) / (xv - 1.0); let halfTerm = 0.5 * exp(-xv * lnNq);
@@ -414,7 +414,7 @@ fn p210_zeta_scalar(xv: f32, qv: f32) -> f32 {
 struct P { n: i32, size: i32 };
 @group(0) @binding(2) var<uniform> pc : P;
 fn p210_polygamma_scalar(n: i32, xv: f32) -> f32 {
-  if (xv <= 0.0 && xv == floor(xv)) { return bitcast<f32>(0x7F800000u); }
+  if (xv <= 0.0 && xv == floor(xv)) { return wgsl_f32_bits(0x7F800000u); }
   var recurrence = 0.0; var xd = xv; let signN = select(-1, 1, (n & 1) == 1);
   loop { if (xd >= 10.0) { break; } recurrence = recurrence + f32(signN) * exp(p210_lgamma(f32(n + 1)) - f32(n + 1) * log(xd)); xd = xd + 1.0; }
   let lnX = log(xd);
@@ -441,7 +441,9 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
   let gridBase = ((b * pc.outH + oh) * pc.outW + ow) * 2; let gx = grid[gridBase]; let gy = grid[gridBase + 1];
   let srcH = (gy + 1.0) * 0.5 * f32(pc.H - 1); let srcW = (gx + 1.0) * 0.5 * f32(pc.W - 1);
   var gradGx = 0.0; var gradGy = 0.0;
-  if (!(srcH <= -1.0 || srcH >= f32(pc.H) || srcW <= -1.0 || srcW >= f32(pc.W))) {
+  // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+  // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+  if (srcH >= -1.0 && srcH < f32(pc.H) && srcW >= -1.0 && srcW < f32(pc.W) && (bitcast<u32>(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (bitcast<u32>(srcW) & 0x7FFFFFFFu) < 0x7F800000u) {
     let h0 = i32(floor(srcH)); let h1 = h0 + 1; let w0 = i32(floor(srcW)); let w1 = w0 + 1; let lh = srcH - f32(h0); let lw = srcW - f32(w0);
     let in00 = h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W; let in01 = h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W;
     let in10 = h1 >= 0 && h1 < pc.H && w0 >= 0 && w0 < pc.W; let in11 = h1 >= 0 && h1 < pc.H && w1 >= 0 && w1 < pc.W;
@@ -510,7 +512,9 @@ struct P { batch: i32, H: i32, W: i32, C: i32, outH: i32, outW: i32 };
   let ow = idx % pc.outW; var tmp = idx / pc.outW; let oh = tmp % pc.outH; tmp = tmp / pc.outH; let c = tmp % pc.C; let b = tmp / pc.C;
   let gridBase = ((b * pc.outH + oh) * pc.outW + ow) * 2; let gx = grid[gridBase]; let gy = grid[gridBase + 1];
   let srcH = (gy + 1.0) * 0.5 * f32(pc.H - 1); let srcW = (gx + 1.0) * 0.5 * f32(pc.W - 1);
-  if (srcH <= -1.0 || srcH >= f32(pc.H) || srcW <= -1.0 || srcW >= f32(pc.W)) { return; }
+  // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+  // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+  if (!(srcH >= -1.0 && srcH < f32(pc.H) && srcW >= -1.0 && srcW < f32(pc.W) && (bitcast<u32>(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (bitcast<u32>(srcW) & 0x7FFFFFFFu) < 0x7F800000u)) { return; }
   let h0 = i32(floor(srcH)); let h1 = h0 + 1; let w0 = i32(floor(srcW)); let w1 = w0 + 1; let lh = srcH - f32(h0); let lw = srcW - f32(w0); let g = gradOut[idx];
   if (h0 >= 0 && h0 < pc.H && w0 >= 0 && w0 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w0, g*(1.0-lh)*(1.0-lw)); }
   if (h0 >= 0 && h0 < pc.H && w1 >= 0 && w1 < pc.W) { p210_atomicAddF(&gradIn, ((b*pc.C+c)*pc.H+h0)*pc.W+w1, g*(1.0-lh)*lw); }
@@ -562,20 +566,31 @@ struct P { outerSize: i32, srcDim: i32, dstDim: i32, innerSize: i32, mode: i32 }
   }
 }";
 
+    // torch.sort's order as one strict total order, as CUDA's parity210_sorts_before (#1131): padding (index < 0) after
+    // every real element; NaN after every number ascending and before every number descending; equal values by
+    // original index (stable). NaN is tested on its bits, since WGSL lets an implementation assume finite floats.
     public static string BitonicStep => @"
 @group(0) @binding(0) var<storage, read_write> values : array<f32>;
 @group(0) @binding(1) var<storage, read_write> indices : array<f32>;
 struct P { rowLen: i32, k: i32, j: i32, numRows: i32, descending: i32 };
 @group(0) @binding(2) var<uniform> pc : P;
+fn is_nan_bits(v: f32) -> bool { return (bitcast<u32>(v) & 0x7FFFFFFFu) > 0x7F800000u; }
+fn sorts_before(va: f32, ia: f32, vb: f32, ib: f32, descending: bool) -> bool {
+  let pa = ia < 0.0; let pb = ib < 0.0;
+  if (pa != pb) { return pb; }
+  if (pa) { return false; }
+  let na = is_nan_bits(va); let nb = is_nan_bits(vb);
+  if (na != nb) { return select(nb, na, descending); }
+  if (!na && va != vb) { return select((va < vb), (va > vb), descending); }
+  return ia < ib;
+}
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let g = i32(gid.x); if (g >= pc.numRows * pc.rowLen) { return; } let i = g % pc.rowLen; let ixj = i ^ pc.j; if (ixj <= i) { return; }
   let base = (g / pc.rowLen) * pc.rowLen; let a = values[base + i]; let b = values[base + ixj];
-  let ua = bitcast<u32>(a); let ub = bitcast<u32>(b);
-  let ka = select(a, bitcast<f32>(0x7F800000u), ((ua >> 23u) & 0xFFu) == 0xFFu && (ua & 0x7FFFFFu) != 0u);
-  let kb = select(b, bitcast<f32>(0x7F800000u), ((ub >> 23u) & 0xFFu) == 0xFFu && (ub & 0x7FFFFFu) != 0u);
-  var up = (i & pc.k) == 0; if (pc.descending != 0) { up = !up; }
-  let doSwap = select(ka < kb, ka > kb, up);
-  if (doSwap) { values[base + i] = b; values[base + ixj] = a; let t = indices[base + i]; indices[base + i] = indices[base + ixj]; indices[base + ixj] = t; }
+  let ia = indices[base + i]; let ib = indices[base + ixj];
+  let desc = pc.descending != 0;
+  let doSwap = select(sorts_before(a, ia, b, ib, desc), sorts_before(b, ib, a, ia, desc), (i & pc.k) == 0);
+  if (doSwap) { values[base + i] = b; values[base + ixj] = a; indices[base + i] = ib; indices[base + ixj] = ia; }
 }";
 
     // RWKV-7 ""Goose"" generalized delta rule (arXiv:2503.14456 Eq. 17). Sbuf holds, per (b,h), the

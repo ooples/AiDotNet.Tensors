@@ -76,6 +76,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     // of a flat buffer shares one state), or this storage while it has no host array yet (GPU-resident lazy).
     private object HostSyncKey()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // An EMPTY backing (a GPU-resident storage before its host array exists) reports the shared
         // Array.Empty<T>() instance: keying by it would make every such storage share one state.
         if (_cachedArray is { Length: > 0 }) return _cachedArray;
@@ -309,6 +310,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal void MaterializeBacking(T[] data)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _memory = data;
         _cachedArray = data;
         // _logicalLength stays the same
@@ -387,6 +389,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual T[] ToArray()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         return _memory.ToArray();
     }
@@ -420,6 +423,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal ReadOnlySpan<T> AsSpanUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         return _memory.Span;
     }
@@ -479,6 +483,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// <summary><see cref="AsWritableSpan"/> without the escape mark; see <see cref="AsSpanUnmarked"/>.</summary>
     internal Span<T> AsWritableSpanUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
         EnsureMaterialized();
         return _memory.Span;
@@ -572,6 +577,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal bool TryGetBackingArrayIdentity(out T[]? array, out int offset)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Memory<T>.Empty is backed by the process-wide Array.Empty<T>() singleton. A
         // zero-allocation GPU vector therefore has an implementation array, but it does
         // not yet have a host backing store. Exposing that singleton as cache identity
@@ -625,6 +631,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[] GetDataArrayUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
         EnsureMaterialized();
 
@@ -657,6 +664,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     internal ReadOnlyMemory<T> AsMemory()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
         // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
         ResultOwner?.MarkEscaped();
@@ -667,6 +675,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// <summary><see cref="AsMemory"/> without the escape mark; see <see cref="AsWritableMemoryUnmarked"/>.</summary>
     internal ReadOnlyMemory<T> AsMemoryUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         return _memory;
     }
@@ -688,6 +697,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal Memory<T> AsWritableMemoryUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
         EnsureMaterialized();
         return _memory;
@@ -695,6 +705,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
 
     internal Memory<T> AsWritableMemory()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
         // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
         ResultOwner?.MarkEscaped();
@@ -713,6 +724,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual VectorBase<T> Clone()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         return CreateInstance(_memory.ToArray());
     }
@@ -765,6 +777,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public VectorBase<T> GetSubVector(int startIndex, int length)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (startIndex < 0 || startIndex > this.Length)
             throw new ArgumentOutOfRangeException(nameof(startIndex), "Start index must be between 0 and the vector length (inclusive).");
         if (length < 0 || startIndex + length > this.Length)
@@ -873,6 +886,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual T Sum()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         return _numOps.Sum(_memory.Span);
     }
@@ -889,6 +903,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual T L2Norm()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         var span = _memory.Span;
         T sumOfSquares = _numOps.Dot(span, span);
@@ -911,6 +926,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     [MethodImpl(Hot)]
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, TResult> function)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         var result = CreateInstance<TResult>(Length);
         var span = _memory.Span;
@@ -937,6 +953,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     [MethodImpl(Hot)]
     public virtual VectorBase<TResult> Transform<TResult>(Func<T, int, TResult> function)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         var result = CreateInstance<TResult>(Length);
         var span = _memory.Span;
@@ -1038,6 +1055,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual VectorBase<T> Add(VectorBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
@@ -1062,6 +1080,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void AddInPlace(VectorBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         _beforeWrite?.Invoke();
         if (Length != other.Length)
@@ -1105,6 +1124,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Add(VectorBase<T> other, Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
@@ -1155,6 +1175,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual VectorBase<T> Subtract(VectorBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
@@ -1178,6 +1199,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void SubtractInPlace(VectorBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         _beforeWrite?.Invoke();
         if (Length != other.Length)
@@ -1219,6 +1241,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Subtract(VectorBase<T> other, Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
@@ -1268,6 +1291,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual VectorBase<T> Multiply(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = CreateInstance(Length);
         EnsureMaterialized();
         _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
@@ -1285,6 +1309,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void MultiplyInPlace(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
 #if NET5_0_OR_GREATER
         var arr = _cachedArray;
@@ -1319,6 +1344,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Multiply(T scalar, Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (destination.Length < Length)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
@@ -1366,6 +1392,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual VectorBase<T> Divide(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = CreateInstance(Length);
         EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
@@ -1381,6 +1408,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void DivideInPlace(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _beforeWrite?.Invoke();
         EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, _memory.Span);
@@ -1397,6 +1425,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Divide(T scalar, Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (destination.Length < Length)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 

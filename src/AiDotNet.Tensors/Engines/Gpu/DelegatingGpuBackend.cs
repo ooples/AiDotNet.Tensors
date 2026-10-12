@@ -1,4 +1,4 @@
-﻿using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.Engines.Gpu;
@@ -865,6 +865,7 @@ public class DelegatingGpuBackend : IDirectGpuBackend
 
     /// <inheritdoc/>
     public virtual void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer) => Inner.UploadIntBufferInPlace(data, buffer);
+    public virtual void UploadBufferInPlace(float[] data, IGpuBuffer buffer) => Inner.UploadBufferInPlace(data, buffer);
 
     #endregion
 

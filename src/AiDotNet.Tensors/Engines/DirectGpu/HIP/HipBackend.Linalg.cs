@@ -4,13 +4,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 public sealed partial class HipBackend : ILinalgBackend
 {
+    /// <inheritdoc/>
+    /// <remarks>The linalg module is compiled with the backend; a rejected compile leaves it unset.</remarks>
+    public bool LinalgKernelsReady => _linalgModule != IntPtr.Zero;
+
+    /// <inheritdoc/>
+    /// <remarks>The Eigh kernel provisions 64 x 64 workgroup arrays.</remarks>
+    public int LinalgEighMaxN => 64;
+
     private IntPtr ResolveLinalgKernel(string name)
     {
         if (_linalgModule == IntPtr.Zero)
             throw new InvalidOperationException(
                 "Linalg HIP module was not compiled (hipRTC rejected source?). Falling back to CPU reference.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         return kernel;
     }
 

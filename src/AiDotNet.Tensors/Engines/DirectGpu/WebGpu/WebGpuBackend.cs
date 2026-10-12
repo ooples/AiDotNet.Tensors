@@ -179,6 +179,22 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.WebGpu);
     }
 
+    /// <inheritdoc/>
+    public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        ThrowIfNotInitialized();
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is not WebGpuBuffer webGpuBuffer)
+            throw new ArgumentException("Buffer is not a WebGpuBuffer.", nameof(buffer));
+        if (data.Length > webGpuBuffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({webGpuBuffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+        var bytes = new byte[data.Length * sizeof(float)];
+        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+        webGpuBuffer.CopyBytesFrom(bytes);
+        GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.WebGpu);
+    }
+
     /// <param name="elementCount">Number of float elements.</param>
     /// <returns>A new GPU buffer.</returns>
     public IGpuBuffer AllocateBuffer(int elementCount)
@@ -1186,7 +1202,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
         if (!_initialized)
         {
-            throw new InvalidOperationException("WebGPU backend not initialized. Call InitializeAsync() first.");
+            throw new GpuCapabilityUnavailableException("WebGPU backend not initialized. Call InitializeAsync() first.");
         }
     }
 

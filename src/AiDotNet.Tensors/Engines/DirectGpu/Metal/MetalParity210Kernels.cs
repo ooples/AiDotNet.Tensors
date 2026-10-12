@@ -1088,7 +1088,9 @@ kernel void parity210_gridsample_backward_input(
     int ow = idx % outW; int tmp = idx / outW; int oh = tmp % outH; tmp /= outH; int c = tmp % C; int b = tmp / C;
     int gridBase = ((b*outH + oh)*outW + ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1); float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
-    if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
+    // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+    // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+    if (!(srcH >= -1.0f && srcH < (float)H && srcW >= -1.0f && srcW < (float)W && (as_type<uint>(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (as_type<uint>(srcW) & 0x7FFFFFFFu) < 0x7F800000u)) return;
     int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
     float lh = srcH - (float)h0; float lw = srcW - (float)w0; float g = gradOut[idx];
     if (h0>=0 && h0<H && w0>=0 && w0<W) atomic_fetch_add_explicit(&gradIn[((b*C+c)*H+h0)*W+w0], g*(1.0f-lh)*(1.0f-lw), memory_order_relaxed);
@@ -1114,7 +1116,9 @@ kernel void parity210_gridsample_backward_grid(
     int gridBase = ((b*outH+oh)*outW+ow)*2; float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy+1.0f)*0.5f*(float)(H-1); float srcW = (gx+1.0f)*0.5f*(float)(W-1);
     float gradGx = 0.0f; float gradGy = 0.0f;
-    if (!(srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W)) {
+    // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+    // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+    if (srcH >= -1.0f && srcH < (float)H && srcW >= -1.0f && srcW < (float)W && (as_type<uint>(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (as_type<uint>(srcW) & 0x7FFFFFFFu) < 0x7F800000u) {
         int h0 = (int)floor(srcH); int h1 = h0+1; int w0 = (int)floor(srcW); int w1 = w0+1;
         float lh = srcH-(float)h0; float lw = srcW-(float)w0;
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
@@ -1267,6 +1271,18 @@ kernel void parity210_histc(
     float bw=(mx-mn)/(float)bins; int b=(int)((x-mn)/bw); if (b>=bins) b=bins-1; if (b<0) b=0; atomic_fetch_add_explicit(&hist[b], 1.0f, memory_order_relaxed);
 }
 
+// torch.sort's order as one strict total order, as CUDA's parity210_sorts_before (#1131): padding (index < 0) after
+// every real element; NaN after every number ascending and before every number descending; equal values by original
+// index (stable). NaN is tested on its bits, since Metal compiles with fast math.
+inline int parity210_sorts_before(float va, float ia, float vb, float ib, int descending) {
+    int pa = ia < 0.0f, pb = ib < 0.0f;
+    if (pa != pb) return pb;
+    if (pa) return 0;
+    int na = (as_type<uint>(va) & 0x7FFFFFFFu) > 0x7F800000u, nb = (as_type<uint>(vb) & 0x7FFFFFFFu) > 0x7F800000u;
+    if (na != nb) return descending ? na : nb;
+    if (!na && va != vb) return descending ? (va > vb) : (va < vb);
+    return ia < ib;
+}
 kernel void parity210_bitonic_step(
     device float* values [[buffer(0)]],
     device float* indices [[buffer(1)]],
@@ -1277,11 +1293,10 @@ kernel void parity210_bitonic_step(
     constant int& descending [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     int gi = (int)gid; if (gi>=numRows*rowLen) return; int i=gi%rowLen; int ixj=i^j; if (ixj<=i) return;
-    int base=(gi/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj];
-    uint ua=as_type<uint>(a), ub=as_type<uint>(b);
-    float ka=(((ua>>23)&0xFFu)==0xFFu&&(ua&0x7FFFFFu)!=0u)?INFINITY:a; float kb=(((ub>>23)&0xFFu)==0xFFu&&(ub&0x7FFFFFu)!=0u)?INFINITY:b;
-    int up=((i&k)==0); if (descending!=0) up=!up; int doSwap=up?(ka>kb):(ka<kb);
-    if (doSwap) { values[base+i]=b; values[base+ixj]=a; float t=indices[base+i]; indices[base+i]=indices[base+ixj]; indices[base+ixj]=t; }
+    int base=(gi/rowLen)*rowLen; float a=values[base+i], b=values[base+ixj]; float ia=indices[base+i], ib=indices[base+ixj];
+    int up=((i&k)==0);
+    int doSwap = up ? parity210_sorts_before(b, ib, a, ia, descending) : parity210_sorts_before(a, ia, b, ib, descending);
+    if (doSwap) { values[base+i]=b; values[base+ixj]=a; indices[base+i]=ib; indices[base+ixj]=ia; }
 }
 
 kernel void parity210_copy_rows(

@@ -159,14 +159,14 @@ public sealed unsafe partial class VulkanBackend
     private void EnsureInitialized()
     {
         if (!_initialized || _disposed)
-            throw new InvalidOperationException("Vulkan backend not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan backend not initialized.");
     }
 
     private void UploadToBuffer(float[] data, IGpuBuffer buffer)
     {
         var vb = AsVulkan(buffer);
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         // Pad data to buffer.Size to avoid writing stale staging contents for partial uploads
         if (data.Length < vb.Size)
         {
@@ -243,8 +243,12 @@ public sealed unsafe partial class VulkanBackend
         if (size > input.Size)
             throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer length ({input.Size}).");
         using var result = AllocateBuffer(1);
-        GlslUnaryOp(VulkanGlslKernels.ScalarReduce, input, result, 1,
-            new uint[] { (uint)size, operation }, 2 * sizeof(uint));
+        // ScalarReduce is ONE invocation over the whole buffer. A long sum goes through the split row sum instead.
+        if (operation == 0 && SplitsRowSum(1, size))
+            SumAxis(input, result, 1, size);
+        else
+            GlslUnaryOp(VulkanGlslKernels.ScalarReduce, input, result, 1,
+                new uint[] { (uint)size, operation }, 2 * sizeof(uint));
         return DownloadBuffer(result)[0];
     }
 
@@ -258,7 +262,7 @@ public sealed unsafe partial class VulkanBackend
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         // Issue #285: per-allocation cap check before VkBuffer creation.
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Vulkan);
@@ -279,7 +283,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         var vb = AsVulkan(buffer);
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         var result = new float[vb.Size];
@@ -294,7 +298,7 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
         var vb = AsVulkan(buffer);
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         vb.Staging.ReadData(destination);
@@ -309,7 +313,7 @@ public sealed unsafe partial class VulkanBackend
         if (byteCount > vb.SizeInBytes)
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({vb.SizeInBytes}).", nameof(byteCount));
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.Vulkan);
 
         var result = new byte[byteCount];
@@ -330,7 +334,7 @@ public sealed unsafe partial class VulkanBackend
         if (data.LongLength > vb.SizeInBytes)
             throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({vb.SizeInBytes} bytes).", nameof(data));
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         if (data.Length == 0)
             return;
         GpuLaunchProbe.OnUpload(data, sizeof(byte), GpuBackendType.Vulkan);
@@ -355,7 +359,7 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentOutOfRangeException(nameof(size), $"Destination offset ({destOffset}) + size ({size}) exceeds destination buffer length ({destination.Size}).");
 
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan transfer manager not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan transfer manager not initialized.");
         if (source is not VulkanGpuBuffer src || destination is not VulkanGpuBuffer dst)
             throw new ArgumentException("Buffers must be VulkanGpuBuffer instances.");
 
@@ -386,7 +390,7 @@ public sealed unsafe partial class VulkanBackend
         for (int i = 0; i < data.Length; i++)
             floatData[i] = Int32BitsToSingleCompat(data[i]);
         if (_transfer is null)
-            throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         return VulkanGpuBuffer.Create(floatData, _transfer);
     }
 
@@ -1064,8 +1068,48 @@ void main() {
     public float Max(IGpuBuffer A, int size) => ResidentScalarReduce(A, size, 1);
     public float Min(IGpuBuffer A, int size) => ResidentScalarReduce(A, size, 2);
 
+    // How many row sums took the split path (#1157): lets tests assert the dispatch, not only the result.
+    private long _splitRowSumLaunches;
+    internal long SplitRowSumLaunches => System.Threading.Interlocked.Read(ref _splitRowSumLaunches);
+
+    // Rows at least this long are split into chunks (the threshold CUDA uses, #1150) ...
+    internal const int SplitRowMinReduce = 64 * 1024;
+
+    // ... of at least this many elements, 32 per invocation of a 256-invocation workgroup ...
+    internal const int SplitRowChunkMin = 8 * 1024;
+
+    // ... with at most this many workgroups in the dispatch (the specification guarantees 65,535 per dimension).
+    internal const int SplitRowMaxGroups = 16 * 1024;
+
+    /// <summary>Off runs every row sum on the unsplit kernel; benchmarks compare the two.</summary>
+    internal bool SplitRowSumsEnabled { get; set; } = true;
+
+    private bool SplitsRowSum(int outerSize, int reduceSize)
+        => reduceSize >= SplitRowMinReduce && outerSize > 0 && outerSize <= SplitRowMaxGroups / 2 && IsGlslCompilerAvailable
+           && !_batchMode && SplitRowSumsEnabled;
+
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        // The row kernel below gives a row ONE invocation that walks every element, so a full reduction (one row)
+        // ran on a single thread of the device. A long row is split into chunks, each summed by a whole workgroup
+        // into a partial, and the partials are reduced by this same method. Not inside a batch: a batch only records
+        // dispatches, and the partial buffer would be released before the recorded ones run.
+        if (SplitsRowSum(outerSize, reduceSize))
+        {
+            // Ceilings in 64 bits: reduceSize can be close to int.MaxValue.
+            int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SplitRowChunkMin - 1) / SplitRowChunkMin,
+                SplitRowMaxGroups / outerSize));
+            int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+            chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+            int groups = checked(outerSize * chunks);
+            using var partial = AllocateBuffer(groups);
+            GlslUnaryOp(VulkanGlslKernels.SumAxisChunks, A, partial, groups * VulkanKernels.WorkgroupSize,
+                new uint[] { (uint)outerSize, (uint)reduceSize, (uint)chunks, (uint)chunkLen }, 4 * sizeof(uint));
+            System.Threading.Interlocked.Increment(ref _splitRowSumLaunches);
+            SumAxis(partial, B, outerSize, chunks);
+            return;
+        }
+
         GlslUnaryOp(VulkanGlslKernels.SumAxis, A, B, outerSize,
             new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
     }
@@ -1091,6 +1135,7 @@ void main() {
 
     public void Synchronize()
     {
+        // Waits for everything submitted without waiting, then for the device (WaitIdle does both).
         if (_initialized && !_disposed)
             _device.WaitIdle();
     }

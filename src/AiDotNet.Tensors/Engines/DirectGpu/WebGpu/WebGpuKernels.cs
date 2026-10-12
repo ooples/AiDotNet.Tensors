@@ -189,7 +189,7 @@ fn pow_scalar(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let is_odd = (abs_exponent - 2.0 * floor(abs_exponent * 0.5)) == 1.0;
                 B[idx] = select(magnitude, -magnitude, is_odd);
             } else {
-                B[idx] = bitcast<f32>(0x7fc00000u);
+                B[idx] = wgsl_f32_bits(0x7fc00000u);
             }
         } else {
             B[idx] = pow(x, exponent);
@@ -3406,6 +3406,79 @@ fn rms_norm(@builtin(global_invocation_id) gid: vec3<u32>,
     /// <summary>
     /// Statistics kernels: argmax, argmin along axis.
     /// </summary>
+    /// <summary>
+    /// #1157: row sums with a workgroup per row (sum_axis_rows) and the few-long-rows split (sum_axis_rows_split, the
+    /// CUDA #1150 split). One 1-D workgroup index per row, or per (chunk, row) as row * chunks + chunk; a fixed
+    /// workgroup-memory tree, so the order is deterministic.
+    /// </summary>
+    public const string SumAxisRowsSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct Params {
+    outer_size: u32,
+    reduce_size: u32,
+    chunks: u32,
+    chunk_len: u32,
+}
+@group(0) @binding(2) var<uniform> params: Params;
+
+var<workgroup> scratch: array<f32, 256>;
+
+fn tree_sum(lid: u32) {
+    var s: u32 = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (lid < s) { scratch[lid] = scratch[lid] + scratch[lid + s]; }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+}
+
+@compute @workgroup_size(256)
+fn sum_axis_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let row = wg.x;
+    let lid = lid3.x;
+    var sum: f32 = 0.0;
+    if (row < params.outer_size) {
+        let base = row * params.reduce_size;
+        var i: u32 = lid;
+        loop {
+            if (i >= params.reduce_size) { break; }
+            sum = sum + input[base + i];
+            i = i + 256u;
+        }
+    }
+    scratch[lid] = sum;
+    workgroupBarrier();
+    tree_sum(lid);
+    if (lid == 0u && row < params.outer_size) { output[row] = scratch[0]; }
+}
+
+@compute @workgroup_size(256)
+fn sum_axis_rows_split(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let chunk = wg.x % params.chunks;
+    let row = wg.x / params.chunks;
+    let lid = lid3.x;
+    var sum: f32 = 0.0;
+    if (row < params.outer_size) {
+        let start = chunk * params.chunk_len;
+        let end = min(start + params.chunk_len, params.reduce_size);
+        let base = row * params.reduce_size;
+        var i: u32 = start + lid;
+        loop {
+            if (i >= end) { break; }
+            sum = sum + input[base + i];
+            i = i + 256u;
+        }
+    }
+    scratch[lid] = sum;
+    workgroupBarrier();
+    tree_sum(lid);
+    if (lid == 0u && row < params.outer_size) { output[row * params.chunks + chunk] = scratch[0]; }
+}
+";
+
     public const string StatisticsSource = @"
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -4795,6 +4868,8 @@ fn grid_sample(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g_idx = (n * params.param4 + spatial) * 2u;
     let sx = (input_b[g_idx] + 1.0) * 0.5 * f32(params.param3 - 1u);
     let sy = (input_b[g_idx + 1u] + 1.0) * 0.5 * f32(params.param2 - 1u);
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule); on the bits, as WGSL may assume finite floats.
+    if ((bitcast<u32>(sx) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(sy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) { output[idx] = 0.0; return; }
     let x0 = i32(floor(sx)); let y0 = i32(floor(sy));
     let fx = sx - f32(x0); let fy = sy - f32(y0);
     let in_base = (n * params.param1 + c) * params.param2 * params.param3;
@@ -6170,7 +6245,7 @@ struct QParams { M: u32, K: u32, N: u32, groupSize: u32, scaleCount: u32 }
 
 fn decode_e4m3(raw: u32) -> f32 {
     let r = raw & 0xFFu;
-    if ((r & 0x7Fu) == 0x7Fu) { return bitcast<f32>(0x7FC00000u); }
+    if ((r & 0x7Fu) == 0x7Fu) { return wgsl_f32_bits(0x7FC00000u); }
     if ((r & 0x7Fu) == 0u) { return 0.0; }
     let sign = (r & 0x80u) >> 7u;
     let exp4 = (r & 0x78u) >> 3u;
@@ -6480,8 +6555,8 @@ fn enforce_2x4_sparsity(@builtin(global_invocation_id) gid: vec3<u32>) {
         vals[i] = A[base_idx + i];
         abs_v[i] = abs(vals[i]);
     }
-    for (var pass: u32 = 0u; pass < 3u; pass = pass + 1u) {
-        for (var j: u32 = 0u; j < 3u - pass; j = j + 1u) {
+    for (var sweep: u32 = 0u; sweep < 3u; sweep = sweep + 1u) {
+        for (var j: u32 = 0u; j < 3u - sweep; j = j + 1u) {
             if (abs_v[j] < abs_v[j + 1u]) {
                 let tv = abs_v[j]; abs_v[j] = abs_v[j + 1u]; abs_v[j + 1u] = tv;
                 let ti = idxs[j]; idxs[j] = idxs[j + 1u]; idxs[j + 1u] = ti;
@@ -7076,10 +7151,10 @@ fn cross_entropy_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (b >= params.batch_size) { return; }
     let target_i = bitcast<i32>(targets[b]);
     if (target_i < 0 || u32(target_i) >= params.num_classes) {
-        output[b] = bitcast<f32>(0x7fc00000u);
+        output[b] = wgsl_f32_bits(0x7fc00000u);
         return;
     }
-    let target = u32(target_i);
+    let tgt = u32(target_i);
     let base = b * params.num_classes;
     var max_val: f32 = -3.402823e+38;
     for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) {
@@ -7089,7 +7164,7 @@ fn cross_entropy_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var c: u32 = 0u; c < params.num_classes; c = c + 1u) {
         sum_exp = sum_exp + exp(predictions[base + c] - max_val);
     }
-    output[b] = -(predictions[base + target] - max_val - log(sum_exp));
+    output[b] = -(predictions[base + tgt] - max_val - log(sum_exp));
 }
 ";
 
@@ -7706,8 +7781,8 @@ fn one_hot_encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= total) { return; }
     let b = idx / params.num_classes;
     let c = idx % params.num_classes;
-    let target = bitcast<u32>(bitcast<i32>(targets[b]));
-    one_hot[idx] = select(0.0, 1.0, c == target);
+    let tgt = bitcast<u32>(bitcast<i32>(targets[b]));
+    one_hot[idx] = select(0.0, 1.0, c == tgt);
 }
 ";
 
@@ -8483,6 +8558,9 @@ fn grid_sample_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Apply padding mode to coordinates with Jacobian
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule); on the bits, as WGSL may assume finite floats.
+    if ((bitcast<u32>(ix) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(iy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) { gsb_grad_grid[grid_idx] = 0.0; gsb_grad_grid[grid_idx + 1u] = 0.0; return; }
+
     let pad_x = gsb_apply_padding(ix, gsb_p.in_width);
     let pad_y = gsb_apply_padding(iy, gsb_p.in_height);
     ix = pad_x.x; iy = pad_y.x;
@@ -9177,6 +9255,8 @@ fn grid_sample_ext(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gy = input_b[g_idx + 1u];
     var px = grid_to_pixel(gx, params.in_width, params.align_corners);
     var py = grid_to_pixel(gy, params.in_height, params.align_corners);
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule); on the bits, as WGSL may assume finite floats.
+    if ((bitcast<u32>(px) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(py) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) { output[idx] = 0.0; return; }
     px = apply_padding(px, params.in_width, params.padding_mode, params.align_corners);
     py = apply_padding(py, params.in_height, params.padding_mode, params.align_corners);
     let x0 = i32(floor(px));
@@ -10584,16 +10664,15 @@ fn huber_4buf_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     public const string GruCellBackwardGatesSource = @"
 @group(0) @binding(0) var<storage, read> gcbg_grad_h: array<f32>;
-@group(0) @binding(1) var<storage, read> gcbg_gate_r: array<f32>;
-@group(0) @binding(2) var<storage, read> gcbg_gate_z: array<f32>;
-@group(0) @binding(3) var<storage, read> gcbg_gate_n: array<f32>;
-@group(0) @binding(4) var<storage, read> gcbg_prev_h: array<f32>;
-@group(0) @binding(5) var<storage, read> gcbg_weights_hh: array<f32>;
-@group(0) @binding(6) var<storage, read_write> gcbg_grad_r: array<f32>;
-@group(0) @binding(7) var<storage, read_write> gcbg_grad_z: array<f32>;
-@group(0) @binding(8) var<storage, read_write> gcbg_grad_n: array<f32>;
+// The r, z, n gates packed (gcbg_gates = r|z|n, each batch * hidden): 7 storage buffers, within WebGPU's 8.
+@group(0) @binding(1) var<storage, read> gcbg_gates: array<f32>;
+@group(0) @binding(2) var<storage, read> gcbg_prev_h: array<f32>;
+@group(0) @binding(3) var<storage, read> gcbg_weights_hh: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gcbg_grad_r: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gcbg_grad_z: array<f32>;
+@group(0) @binding(6) var<storage, read_write> gcbg_grad_n: array<f32>;
 struct GruCellBackwardFullParams { batch: u32, hidden: u32 }
-@group(0) @binding(9) var<uniform> gcbg_params: GruCellBackwardFullParams;
+@group(0) @binding(7) var<uniform> gcbg_params: GruCellBackwardFullParams;
 
 @compute @workgroup_size(256)
 fn gru_cell_backward_gates(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -10602,9 +10681,9 @@ fn gru_cell_backward_gates(@builtin(global_invocation_id) gid: vec3<u32>) {
     let batch = idx / gcbg_params.hidden;
     let h = idx % gcbg_params.hidden;
     let dh = gcbg_grad_h[idx];
-    let r = gcbg_gate_r[idx];
-    let z = gcbg_gate_z[idx];
-    let n = gcbg_gate_n[idx];
+    let r = gcbg_gates[idx];
+    let z = gcbg_gates[gcbg_params.batch*gcbg_params.hidden+idx];
+    let n = gcbg_gates[2u*gcbg_params.batch*gcbg_params.hidden+idx];
     let dn = dh * (1.0 - z) * (1.0 - n * n);
     let dz = dh * (gcbg_prev_h[idx] - n) * z * (1.0 - z);
     var n_hidden: f32 = 0.0;

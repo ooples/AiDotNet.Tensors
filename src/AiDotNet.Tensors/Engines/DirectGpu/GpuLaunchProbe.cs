@@ -354,6 +354,31 @@ internal static class GpuLaunchProbe
             ? $"{operation}: guard or route declined"
             : $"{operation}: {reason.GetType().Name}";
         _fallbacks.AddOrUpdate(key, 1, static (_, count) => count + 1);
+        if (s_fallbackLogPath is not null && reason is not null)
+            AppendFallbackLog(operation, reason);
+    }
+
+    // AIDOTNET_GPU_FALLBACK_LOG=<file>: append "operation <TAB> exception type <TAB> first message line" for every
+    // recorded fallback, so a whole test suite or workload yields the list of capability gaps it hit (#1165).
+    // Diagnostic only and best effort: a failed write never affects the operation.
+    private static readonly string? s_fallbackLogPath =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GPU_FALLBACK_LOG") is { Length: > 0 } logPath ? logPath : null;
+    private static readonly object s_fallbackLogLock = new();
+
+    private static void AppendFallbackLog(string operation, System.Exception reason)
+    {
+        try
+        {
+            string message = reason.Message ?? string.Empty;
+            int newline = message.IndexOfAny(new[] { (char)13, (char)10 });
+            if (newline >= 0) message = message.Substring(0, newline);
+            if (message.Length > 240) message = message.Substring(0, 240);
+            string line = operation + (char)9 + reason.GetType().Name + (char)9 + message + System.Environment.NewLine;
+            lock (s_fallbackLogLock)
+                System.IO.File.AppendAllText(s_fallbackLogPath!, line);
+        }
+        catch (System.IO.IOException) { }
+        catch (System.UnauthorizedAccessException) { }
     }
 
     /// <summary>Zeroes launches AND misses before a measured region. Returns the pre-reset launch count.</summary>

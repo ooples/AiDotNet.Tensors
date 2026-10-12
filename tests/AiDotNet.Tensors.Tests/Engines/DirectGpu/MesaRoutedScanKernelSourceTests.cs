@@ -27,7 +27,8 @@ public sealed class MesaRoutedScanKernelSourceTests
     [Theory]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanRecurrenceKernels", "MesaScan", "RoutedDiagonalSsmScan", "isActive")]
 #if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
-    [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuRecurrenceKernels", "MesaScan", "RoutedDiagonalSsmScan", "active")]
+    // `active` is a reserved word in WGSL (Dawn rejects it), so the WebGPU kernel names the mask value isActive too.
+    [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuRecurrenceKernels", "MesaScan", "RoutedDiagonalSsmScan", "isActive")]
 #endif
     public void ShaderSources_ContainWoodburyAndMaskedRecurrence(string typeName,string mesaMember,string routedMember,string maskVariable)
     {

@@ -22,7 +22,7 @@ public sealed partial class CudaBackend : IRectSliceKernels
     public unsafe void RectSlice(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length, bool scatter)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("CUDA backend is not available.");
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (full is null) throw new ArgumentNullException(nameof(full));
         if (slice is null) throw new ArgumentNullException(nameof(slice));
         if (fullShape is null) throw new ArgumentNullException(nameof(fullShape));
@@ -32,7 +32,7 @@ public sealed partial class CudaBackend : IRectSliceKernels
         if (rank < 1 || rank > RectSliceLimits.MaxRank || start.Length != rank || length.Length != rank)
             throw new ArgumentException($"RectSlice supports rank 1..{RectSliceLimits.MaxRank} with matching start/length.");
         if (!_kernelCache.TryGetValue("rect_slice_nd", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: rect_slice_nd");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: rect_slice_nd");
 
         var meta = new RectSliceMeta { Rank = rank };
         int total = 1, stride = 1;

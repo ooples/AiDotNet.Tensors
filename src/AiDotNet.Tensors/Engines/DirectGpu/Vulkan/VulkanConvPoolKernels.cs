@@ -1033,4 +1033,44 @@ void main() {
     }
     gradMask[idx] = sum;
 }";
+
+    // ---- Variants for a call that leaves an optional buffer out ----
+    // Each kernel above declares the binding of its optional operand (pooling's argmax indices, a bias, a
+    // modulation mask). A call without that operand used to allocate a device buffer of the operand's full size,
+    // fill it with the neutral value and bind it. These variants are the same source with the binding gone and
+    // the neutral value written in, so such a call allocates nothing.
+
+    public static readonly string MaxPool2DNoIndices = WithoutBinding(MaxPool2D, 2, "indices[outIdx] = maxIdx;", "");
+    public static readonly string MaxPool3DNoIndices = WithoutBinding(MaxPool3D, 2, "indices[outIdx] = maxIdx;", "");
+    public static readonly string LocallyConnectedConv2DNoBias = WithoutBinding(LocallyConnectedConv2D, 2, "bias[oc]", "0.0");
+    public static readonly string DeformableConv2DNoMask = WithoutBinding(DeformableConv2D, 3, "mask[mIx]", "1.0");
+    public static readonly string DeformableConv2DBackwardInputNoMask = WithoutBinding(DeformableConv2DBackwardInput, 3, "mask[mIx]", "1.0");
+    public static readonly string DeformableConv2DBackwardWeightsNoMask = WithoutBinding(DeformableConv2DBackwardWeights, 3, "mask[mIx]", "1.0");
+    public static readonly string DeformableConv2DBackwardOffsetNoMask = WithoutBinding(DeformableConv2DBackwardOffset, 4, "mask[mIx]", "1.0");
+
+    /// <summary>
+    /// Derives the variant of <paramref name="source"/> without storage binding <paramref name="binding"/>: its
+    /// declaration is removed, the bindings after it move down by one, and every <paramref name="use"/> of it
+    /// becomes <paramref name="replacement"/>.
+    /// </summary>
+    internal static string WithoutBinding(string source, int binding, string use, string replacement)
+    {
+        string marker = "layout(set=0, binding=" + binding.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
+        int start = source.IndexOf(marker, System.StringComparison.Ordinal);
+        if (start < 0) throw new System.ArgumentException("The source declares no binding " + binding + ".", nameof(source));
+        int end = source.IndexOf(';', start);
+        end = source.IndexOf(';', end + 1); // the block's closing "};"
+        if (end < 0) throw new System.ArgumentException("Binding " + binding + " is not a complete block.", nameof(source));
+        string result = source.Remove(start, end + 1 - start);
+        for (int later = binding + 1; ; later++)
+        {
+            string from = "layout(set=0, binding=" + later.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
+            if (result.IndexOf(from, System.StringComparison.Ordinal) < 0) break;
+            result = result.Replace(from,
+                "layout(set=0, binding=" + (later - 1).ToString(System.Globalization.CultureInfo.InvariantCulture) + ")");
+        }
+        if (result.IndexOf(use, System.StringComparison.Ordinal) < 0)
+            throw new System.ArgumentException("The source never uses '" + use + "'.", nameof(use));
+        return result.Replace(use, replacement);
+    }
 }

@@ -33,10 +33,16 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
     /// runs the same code as HIP, OpenCL and Metal: each pointer parameter becomes a storage buffer of the same name
     /// (read-only when const), each scalar a push constant in order, and the float builtins their GLSL names.
     /// </summary>
-    public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(BatchExecutionCudaKernels.SolverSource);
+    public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(
+        BatchExecutionCudaKernels.SolverSource + BatchExecutionCudaKernels.AttentionSource + BatchExecutionCudaKernels.LstmSource);
 
     private static Dictionary<string, string> TranslateSolvers(string cuda)
     {
+        // The math names map on the whole source, so the #define bodies copied verbatim below are translated too.
+        cuda = Regex.Replace(cuda, @"\b(sqrt|fabs|fmax|exp|log|tanh)f\(",
+            m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
+            RegexOptions.None, RegexTimeout);
+        cuda = cuda.Replace("__int_as_float(", "intBitsToFloat(");
         var defines = new StringBuilder();
         foreach (Match d in Regex.Matches(cuda, @"^#define [^\n]*\n", RegexOptions.Multiline, RegexTimeout)) defines.Append(d.Value);
         var kernels = Regex.Matches(cuda, @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\) \{",
@@ -48,8 +54,8 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             int end = k + 1 < kernels.Count ? kernels[k + 1].Index : cuda.Length;
             string body = cuda.Substring(kernel.Index + kernel.Length, end - kernel.Index - kernel.Length)
                 .Replace("__uint_as_float(", "uintBitsToFloat(");
-            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax)f\(",
-                m => m.Groups[1].Value == "sqrt" ? "sqrt(" : m.Groups[1].Value == "fabs" ? "abs(" : "max(",
+            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax|exp|log|tanh)f\(",
+                m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
                 RegexOptions.None, RegexTimeout);
             var buffers = new List<string>();
             var push = new StringBuilder();
@@ -57,8 +63,15 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             {
                 string p = Regex.Replace(raw.Trim(), @"\s+", " ", RegexOptions.None, RegexTimeout);
                 Match pointer = Regex.Match(p, @"^(const )?(float|int)\* (\w+)$", RegexOptions.None, RegexTimeout);
+                // A buffer a solver writes is declared volatile. These kernels factor in place: they write an element
+                // and read it back through a different index expression later in the same invocation (a pivot swap,
+                // then the next column's pivot search). NVIDIA's Vulkan compiler reused a value read before the swap:
+                // la_ldl_factor compared the next pivot candidate against the previous pivot and chose a different
+                // pivot from every other backend (RTX 3080; the same source is right on CUDA and OpenCL, and with
+                // shaderc's optimizer off the result was the same, so it is the driver). volatile makes every read
+                // go to memory.
                 if (pointer.Success)
-                    buffers.Add((pointer.Groups[1].Success ? "r:" : "rw:") + pointer.Groups[3].Value + ":" + pointer.Groups[2].Value);
+                    buffers.Add((pointer.Groups[1].Success ? "r:" : "rwv:") + pointer.Groups[3].Value + ":" + pointer.Groups[2].Value);
                 else if (Regex.IsMatch(p, @"^int \w+$", RegexOptions.None, RegexTimeout))
                     push.Append(p).Append("; ");
                 else
@@ -69,14 +82,17 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
         }
         return result;
     }
-    /// <summary>Buffer specs are "r:name", "w:name" or "rw:name", bound to bindings 0..n-1 in order.</summary>
+    /// <summary>
+    /// Buffer specs are "r:name", "w:name", "rw:name" or "rwv:name" (read-write and volatile), bound to bindings
+    /// 0..n-1 in order.
+    /// </summary>
     private static string Shader(string[] buffers, string push, string body)
     {
         var sb = new StringBuilder("#version 450\nlayout(local_size_x = 256) in;\n");
         for (int i = 0; i < buffers.Length; i++)
         {
             string[] parts = buffers[i].Split(':');
-            string access = parts[0] == "r" ? "readonly " : parts[0] == "w" ? "writeonly " : "";
+            string access = parts[0] == "r" ? "readonly " : parts[0] == "w" ? "writeonly " : parts[0] == "rwv" ? "volatile " : "";
             sb.Append("layout(set = 0, binding = ").Append(i).Append(") ").Append(access)
               .Append("buffer Buf").Append(i).Append(" { ").Append(parts.Length > 2 ? parts[2] : "float").Append(" ")
               .Append(parts[1]).Append("[]; };\n");

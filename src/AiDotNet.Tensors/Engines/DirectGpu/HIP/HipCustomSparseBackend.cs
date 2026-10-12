@@ -41,7 +41,7 @@ internal static class HipCustomSparseBackend
         float[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP custom-kernel SpMM backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP custom-kernel SpMM backend is not available.");
 
         using var backend = CreateBackend();
 
@@ -86,7 +86,7 @@ internal static class HipCustomSparseBackend
         float[] x, float[] y, int innerK)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP custom-kernel SDDMM backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP custom-kernel SDDMM backend is not available.");
 
         using var backend = CreateBackend();
 
@@ -127,7 +127,7 @@ internal static class HipCustomSparseBackend
         double[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP custom-kernel SpMM backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP custom-kernel SpMM backend is not available.");
 
         using var backend = CreateBackend();
 

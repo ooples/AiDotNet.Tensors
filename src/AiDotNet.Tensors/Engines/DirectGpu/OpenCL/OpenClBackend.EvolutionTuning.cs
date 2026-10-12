@@ -63,7 +63,7 @@ public sealed partial class OpenClBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         if (_context is null || _dynamicGemm is null || !IsAvailable)
-            throw new InvalidOperationException("OpenCL is not available for evolutionary GEMM tuning.");
+            throw new GpuCapabilityUnavailableException("OpenCL is not available for evolutionary GEMM tuning.");
 
         GpuCapabilities capabilities = CreateEvolutionCapabilities();
         var orchestrator = new GemmAutoTuner();
@@ -168,7 +168,7 @@ public sealed partial class OpenClBackend
     private GpuCapabilities CreateEvolutionCapabilities()
     {
         DirectOpenClContext context = _context ??
-            throw new InvalidOperationException("OpenCL context not available.");
+            throw new GpuCapabilityUnavailableException("OpenCL context not available.");
         return GpuCapabilities.Detect(
             ComputeUnits,
             GlobalMemoryBytes,
@@ -183,7 +183,7 @@ public sealed partial class OpenClBackend
     private KernelTuningDeviceFingerprint CreateOpenClTuningFingerprint()
     {
         if (_context is null)
-            throw new InvalidOperationException("OpenCL context not available.");
+            throw new GpuCapabilityUnavailableException("OpenCL context not available.");
         KernelTuningDeviceKind kind = ParseTuningDeviceKind(DeviceVendor);
         string boardName = string.IsNullOrWhiteSpace(_context.DeviceBoardName)
             ? DeviceName

@@ -55,7 +55,7 @@ public sealed class WebGpuShaderModule : IDisposable
             return moduleId;
         }
 
-        moduleId = WebGpuNativeBindings.CreateShaderModule(wgslSource);
+        moduleId = WebGpuNativeBindings.CreateShaderModule(WebGpuShaderPrelude.Prepare(wgslSource));
         if (moduleId < 0)
         {
             throw new InvalidOperationException($"Failed to create shader module '{name}'");

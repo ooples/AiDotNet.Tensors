@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void MatMulTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
             if (_context == null)
-                throw new InvalidOperationException("OpenCL context not available");
+                throw new GpuCapabilityUnavailableException("OpenCL context not available");
             TransposedAGemmArgs.Validate(A, B, C, M, N, K);
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;

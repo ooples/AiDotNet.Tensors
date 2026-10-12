@@ -35,6 +35,10 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         Environment.GetEnvironmentVariable("AIDOTNET_VULKAN_BUFFER_POOL") != "0";
 
     private static int s_poolBudgetSet;
+    private static long s_driverAllocations;
+
+    /// <summary>Buffers created through the driver (pool misses) since the process started.</summary>
+    internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
 
     /// <inheritdoc/>
     int IPoolableGpuBuffer.Capacity => Size;
@@ -66,6 +70,17 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     /// <summary>Frees of Vulkan buffers collected without Dispose, run by the next allocation.</summary>
     internal static readonly DeviceFreeQueue PendingFrees = new();
+
+    /// <summary>
+    /// Releases <paramref name="lastBuffers"/>, then frees every queued and parked buffer. The order matters: a pooled
+    /// buffer released after the drain is parked again and outlives the device. The backend calls this on dispose.
+    /// </summary>
+    internal static void ReleaseAndDrain(params IGpuBuffer?[] lastBuffers)
+    {
+        foreach (var buffer in lastBuffers) buffer?.Dispose();
+        PendingFrees.Drain();
+        Pool.DrainAll();
+    }
 
     /// <inheritdoc/>
     public int Size { get; }
@@ -123,9 +138,22 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         if (PoolingEnabled && Pool.TryRent(size, out var pooled) &&
             pooled is not null)
             return new VulkanGpuBuffer(pooled.Storage, pooled.Staging, size);
+        if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss())
+        {
+            PendingFrees.Drain();
+            if (Pool.TryRent(size, out pooled) && pooled is not null)
+                return new VulkanGpuBuffer(pooled.Storage, pooled.Staging, size);
+        }
+        System.Threading.Interlocked.Increment(ref s_driverAllocations);
         // Out of memory: the parked buffers are the first thing to give back.
         return DeviceMemoryReclaim.AllocateWithRetry(() => CreateCore(size), ex => ex is GpuOutOfMemoryException,
-            () => { PendingFrees.Drain(); Pool.DrainAll(); });
+            () =>
+            {
+                // Buffers whose release is waiting on an unfinished submission are memory this allocation can use.
+                VulkanDevice.Instance.WaitForPendingSubmissions();
+                PendingFrees.Drain();
+                Pool.DrainAll();
+            });
     }
 
     private static VulkanGpuBuffer CreateCore(int size)
@@ -195,14 +223,33 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     {
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
         GC.SuppressFinalize(this);
+        ReleaseWhenIdle(this);
+    }
+
+    // A dispatch submitted without waiting may still read or write this buffer. Parking it now would let the next
+    // allocation of its size take it, and upload into it, before that dispatch runs; destroying it now would pull
+    // the memory from under the dispatch. So the release waits for the last submission that bound it (#1191).
+    private static void ReleaseWhenIdle(VulkanGpuBuffer buffer)
+    {
+        long serial = buffer.Storage.LastSubmissionSerial;
+        if (serial == 0)
+        {
+            ReleaseNow(buffer);
+            return;
+        }
+        VulkanDevice.Instance.ReleaseAfterSubmission(serial, () => ReleaseNow(buffer));
+    }
+
+    private static void ReleaseNow(VulkanGpuBuffer buffer)
+    {
         if (PoolingEnabled)
         {
             EnsurePoolBudget();
-            Pool.Return(this); // releases it when the pool is full
+            Pool.Return(buffer); // releases it when the pool is full
             return;
         }
-        Storage.Dispose();
-        Staging.Dispose();
+        buffer.Storage.Dispose();
+        buffer.Staging.Dispose();
     }
 
     // An undisposed buffer (a result nothing references any more) frees its device memory through the queue.
@@ -216,12 +263,10 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // thread.
         PendingFrees.Enqueue(() =>
         {
-            if (!PoolingEnabled) { storage.Dispose(); staging.Dispose(); return; }
             var parked = new VulkanGpuBuffer(storage, staging, size);
             System.Threading.Volatile.Write(ref parked._disposed, 1);
             GC.SuppressFinalize(parked);
-            EnsurePoolBudget();
-            Pool.Return(parked);
+            ReleaseWhenIdle(parked);
         });
     }
 }
