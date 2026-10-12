@@ -130,3 +130,18 @@ public class TorchParityCreationVulkanDeviceTests : TorchParityCreationDeviceTes
 {
     public TorchParityCreationVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }
+
+[Collection("DirectGpuSerial")]
+public class TorchParityCreationHipDeviceTests : TorchParityCreationDeviceTestsBase, IClassFixture<HipTensorEngineTestFixture>
+{
+    public TorchParityCreationHipDeviceTests(HipTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+#if NET7_0_OR_GREATER
+/// <summary>The FP32 kernels Metal and WebGPU run, as WGSL on Dawn (#1125, #1128).</summary>
+[Collection("DirectGpuSerial")]
+public class TorchParityCreationDawnDeviceTests : TorchParityCreationDeviceTestsBase, IClassFixture<DawnTorchParityFixture>
+{
+    public TorchParityCreationDawnDeviceTests(DawnTorchParityFixture fixture) : base(fixture) { }
+}
+#endif

@@ -356,9 +356,9 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         int typeCode, IGpuBuffer flag)
     {
         if (n <= 0) return;
-        RequireCapacity(a, 2 * n, nameof(a), "2n (int64 words)");
-        RequireCapacity(b, 2 * n, nameof(b), "2n (int64 words)");
-        RequireCapacity(output, 2 * n, nameof(output), "2n (int64 words)");
+        RequireCapacity(a, 2L * n, nameof(a), "2n (int64 words)");
+        RequireCapacity(b, 2L * n, nameof(b), "2n (int64 words)");
+        RequireCapacity(output, 2L * n, nameof(output), "2n (int64 words)");
         RequireCapacity(flag, 2, nameof(flag), "2 (64-bit flag)");
         IntPtr int64Kernel = ParityKernel("parity_int64_binary");
         using var _ = PushContext();
@@ -371,8 +371,8 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityInt64Not(IGpuBuffer input, IGpuBuffer output, int n, int typeCode)
     {
         if (n <= 0) return;
-        RequireCapacity(input, 2 * n, nameof(input), "2n (int64 words)");
-        RequireCapacity(output, 2 * n, nameof(output), "2n (int64 words)");
+        RequireCapacity(input, 2L * n, nameof(input), "2n (int64 words)");
+        RequireCapacity(output, 2L * n, nameof(output), "2n (int64 words)");
         IntPtr int64NotKernel = ParityKernel("parity_int64_not");
         using var _ = PushContext();
         IntPtr pa = input.Handle, py = output.Handle;
@@ -441,6 +441,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
     unsafe void ITorchParityElementwiseBackend.TorchParityNonzeroStaticScatter(IGpuBuffer input, IGpuBuffer positions, IGpuBuffer output,
         int n, int size, int[] shape)
     {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
         if (n <= 0) return;
         RequireCapacity(input, n, nameof(input), "n");
         RequireCapacity(positions, n, nameof(positions), "n");
