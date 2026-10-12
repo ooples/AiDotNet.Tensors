@@ -1224,6 +1224,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         // Dispose GLSL compiler
         _glslCompiler?.Dispose();
 
+        _parityFlagSlots?.Dispose();
+        _parityFlagSlots = null;
+
         // Dispose transfer
         _transfer?.Dispose();
 
