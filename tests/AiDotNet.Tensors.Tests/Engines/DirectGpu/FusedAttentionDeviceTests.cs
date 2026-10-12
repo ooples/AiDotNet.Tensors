@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// #1141: the fused device attention (weightless SDPA and MultiHeadAttentionCore) equals the CPU fused kernels in its
 /// output and its Q / K / V gradients -- masks (broadcast, with fully masked rows), causal masking (top-left for SDPA,
 /// bottom-right for the attention core), soft-cap, unequal query / key lengths -- runs without a host fallback, and is
-/// deterministic.
+/// bit-reproducible under DeterministicReductions (the default backward adds dQ with atomics).
 /// </summary>
 [Collection("VulkanGlobalState")]
 public class FusedAttentionDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
@@ -136,18 +136,76 @@ public class FusedAttentionDeviceTests : IClassFixture<DirectGpuTensorEngineTest
         finally { DirectGpuTensorEngine.ThrowOnGpuKernelFallback = saved; }
     }
 
+    // The default backward adds dQ with atomics (one fused pass, as torch's default); DeterministicReductions selects
+    // the two-pass kernels, whose every sum has a fixed order (torch.use_deterministic_algorithms).
     [SkippableFact]
-    public void Sdpa_RunsOnDevice_AndIsDeterministic()
+    public void Sdpa_DeterministicReductions_IsBitReproducible_AndTheDefaultMatchesIt()
     {
         var gpu = GpuOrSkip();
         var q = Random(21, 1, 4, 129, 64); var k = Random(22, 1, 4, 129, 64); var v = Random(23, 1, 4, 129, 64); var w = Random(24, 1, 4, 129, 64);
-        GpuLaunchProbe.Reset();
-        var first = Step(gpu, (x, y, z) => gpu.ScaledDotProductAttention(x, y, z, null, null, true, 0.0), q, k, v, w);
-        Assert.Empty(GpuLaunchProbe.Fallbacks);
-        var second = Step(gpu, (x, y, z) => gpu.ScaledDotProductAttention(x, y, z, null, null, true, 0.0), q, k, v, w);
-        Assert.Equal(first.O, second.O);
-        Assert.Equal(first.DQ, second.DQ);
-        Assert.Equal(first.DK, second.DK);
-        Assert.Equal(first.DV, second.DV);
+        Tensor<float> F(Tensor<float> x, Tensor<float> y, Tensor<float> z) => gpu.ScaledDotProductAttention(x, y, z, null, null, true, 0.0);
+        bool saved = AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions;
+        try
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = true;
+            GpuLaunchProbe.Reset();
+            var first = Step(gpu, F, q, k, v, w);
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+            GpuLaunchProbe.Reset();
+            var second = Step(gpu, F, q, k, v, w);
+            long twoPassLaunches = GpuLaunchProbe.Count;
+            Assert.Equal(first.O, second.O);
+            Assert.Equal(first.DQ, second.DQ);
+            Assert.Equal(first.DK, second.DK);
+            Assert.Equal(first.DV, second.DV);
+
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = false;
+            GpuLaunchProbe.Reset();
+            var fused = Step(gpu, F, q, k, v, w);
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+            // Same step, one launch fewer: delta + fused instead of delta + kv pass + q pass.
+            Assert.Equal(twoPassLaunches - 1, GpuLaunchProbe.Count);
+            Assert.Equal(first.O, fused.O);     // the forward is shared
+            Assert.Equal(first.DK, fused.DK);   // dK / dV: same per-key sums in the same order
+            Assert.Equal(first.DV, fused.DV);
+            AssertClose("fused dQ", first.DQ, fused.DQ, 1e-5f);
+        }
+        finally { AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = saved; }
+    }
+
+    // dK and dV are written, not accumulated, even with no query rows: both backward paths must overwrite them with
+    // zeros (no query reaches any key), never leave the caller's buffer contents behind.
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Backward_WithNoQueryRows_WritesZeroKeyAndValueGradients(bool deterministic)
+    {
+        var gpu = (DirectGpuTensorEngine)GpuOrSkip();
+        if (gpu.GetBackend() is not { } backend || backend is not IFusedAttentionBackend fused)
+            throw new InvalidOperationException("GpuOrSkip returned an engine without a fused-attention backend.");
+        const int b = 1, h = 2, sk = 70, d = 16;   // 70 keys: two fused key blocks, one of them partial
+        int keyElements = b * h * sk * d;
+        var stale = Enumerable.Repeat(float.NaN, keyElements).ToArray();
+        var p = new FusedAttentionParams
+        {
+            B = b, H = h, Sq = 0, Sk = sk,
+            Kb = h * sk * d, Kh = sk * d, Kr = d,
+            Vb = h * sk * d, Vh = sk * d, Vr = d,
+            Scale = 0.25f,
+        };
+        bool saved = AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions;
+        try
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = deterministic;
+            using var empty = backend.AllocateBuffer(1);   // q, o, dO, lse and dQ have no elements
+            using var k = backend.AllocateBuffer(Random(31, keyElements).ToArray());
+            using var v = backend.AllocateBuffer(Random(32, keyElements).ToArray());
+            using var dK = backend.AllocateBuffer(stale);
+            using var dV = backend.AllocateBuffer(stale);
+            fused.FusedAttentionBackward(empty, k, v, empty, empty, empty, null, empty, dK, dV, p, d);
+            Assert.All(backend.DownloadBuffer(dK), x => Assert.Equal(0f, x));
+            Assert.All(backend.DownloadBuffer(dV), x => Assert.Equal(0f, x));
+        }
+        finally { AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = saved; }
     }
 }
