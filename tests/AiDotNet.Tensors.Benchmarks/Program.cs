@@ -1642,6 +1642,57 @@ class Program
             return;
         }
 
+        // Vulkan dispatches submitted without waiting against submit-and-wait (#1191)
+        if (args[0] == "--vulkan-submit")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.ModeOverride =
+                AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelMode.Off;
+            foreach (var (rows, cols) in new[] { (64, 64), (256, 256), (1024, 1024) })
+            {
+                int n = rows * cols;
+                var data = new float[n];
+                var rng = new Random(5);
+                for (int i = 0; i < n; i++) data[i] = (float)rng.NextDouble();
+                using var a = vb.AllocateBuffer(data);
+                using var b = vb.AllocateBuffer(n);
+                // chain: `ops` softmax calls ping-ponging between two buffers, then one wait for all of them
+                // read:  the same calls, each followed by a download of its 1-row result (a host read per op)
+                double Median(bool deferred, int ops, bool readEach)
+                {
+                    vb.SubmitsWithoutWaiting = deferred;
+                    var samples = new double[9];
+                    for (int s = -2; s < samples.Length; s++)
+                    {
+                        vb.Synchronize();
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < ops; i++)
+                        {
+                            if ((i & 1) == 0) vb.Softmax(a, b, rows, cols); else vb.Softmax(b, a, rows, cols);
+                            if (readEach) vb.Sum(b, 16);
+                        }
+                        vb.Synchronize();
+                        if (s >= 0) samples[s] = sw.Elapsed.TotalMilliseconds * 1000 / ops;
+                    }
+                    Array.Sort(samples);
+                    return samples[4];
+                }
+                foreach (int ops in new[] { 1, 8, 64 })
+                {
+                    // Interleaved: waited, unwaited, waited, unwaited.
+                    double w1 = Median(false, ops, false), d1 = Median(true, ops, false), w2 = Median(false, ops, false), d2 = Median(true, ops, false);
+                    Console.WriteLine($"VKSUBMIT {rows}x{cols} chain of {ops}: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/op, not waited {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/op");
+                }
+                {
+                    double w1 = Median(false, 16, true), d1 = Median(true, 16, true), w2 = Median(false, 16, true), d2 = Median(true, 16, true);
+                    Console.WriteLine($"VKSUBMIT {rows}x{cols} op + host read, 16 times: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/pair, not waited {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/pair");
+                }
+            }
+            vb.SubmitsWithoutWaiting = true;
+            return;
+        }
+
         // Cost of finding an already-built Vulkan pipeline, which every dispatch pays
         if (args[0] == "--vulkan-pipeline-lookup")
         {
