@@ -32,17 +32,17 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// values stores 100 values instead of 1,000,000. It works with all the same training
 /// tools (optimizers, gradient tape) as a regular tensor.</para>
 /// </remarks>
-public class SparseTensor<T> : Tensor<T>
+public partial class SparseTensor<T> : Tensor<T>
 {
     /// <summary>
     /// Gets the number of rows in the logical matrix.
     /// </summary>
-    public int Rows { get; }
+    public int Rows { get; private set; }
 
     /// <summary>
     /// Gets the number of columns in the logical matrix.
     /// </summary>
-    public int Columns { get; }
+    public int Columns { get; private set; }
 
     /// <summary>
     /// Gets the sparse storage format (COO, CSR, or CSC).
@@ -53,25 +53,25 @@ public class SparseTensor<T> : Tensor<T>
     /// Row indices for COO format, or row indices for CSC format.
     /// Empty for CSR format.
     /// </summary>
-    public int[] RowIndices { get; }
+    public int[] RowIndices { get; private set; }
 
     /// <summary>
     /// Column indices for COO format, or column indices for CSR format.
     /// Empty for CSC format.
     /// </summary>
-    public int[] ColumnIndices { get; }
+    public int[] ColumnIndices { get; private set; }
 
     /// <summary>
     /// Row pointers for CSR format. Length = Rows + 1.
     /// Empty for COO and CSC formats.
     /// </summary>
-    public int[] RowPointers { get; }
+    public int[] RowPointers { get; private set; }
 
     /// <summary>
     /// Column pointers for CSC format. Length = Columns + 1.
     /// Empty for COO and CSR formats.
     /// </summary>
-    public int[] ColumnPointers { get; }
+    public int[] ColumnPointers { get; private set; }
 
     /// <summary>
     /// Block-row dimension for BSR/BSC formats; 0 for COO/CSR/CSC. The

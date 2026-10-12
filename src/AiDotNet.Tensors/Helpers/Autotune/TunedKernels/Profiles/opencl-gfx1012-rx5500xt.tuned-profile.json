@@ -1,0 +1,174 @@
+{
+  "schemaVersion": 1,
+  "device": "opencl:Advanced Micro Devices, Inc.:gfx1012*",
+  "entries": [
+    {
+      "op": "Softmax",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes16",
+      "speedup": 1.366
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "opencl.softmax.group",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.softmax.group",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "opencl.softmax.group",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "opencl.softmax_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_forward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_forward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_forward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes8",
+      "speedup": 1.206
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "opencl.layernorm_backward.group",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 10.628
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 4.599
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows8",
+      "speedup": 6.26
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 6.773
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:32x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:128x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x1x28x28x16x3x3x1x1x1x1x1x1x28x28",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "opencl.conv2d.generic",
+      "speedup": 1
+    }
+  ]
+}
