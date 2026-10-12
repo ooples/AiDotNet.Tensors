@@ -201,45 +201,17 @@ internal static class MathOperators
     }
 
     /// <summary>
-    /// Composes the Abramowitz-Stegun 7.1.26 erf approximation from engine
-    /// primitives (max error ~1.5e-7, well below our 1e-4 parity tolerance).
-    /// Shared between the ONNX Erf translator and the exact-mode Gelu
-    /// translator so both produce identical numerics for the same input.
+    /// erf(x) = 1 − erfc(x) from the engine's erfc, which is accurate to double precision (Cody 1969) and
+    /// differentiable. Shared between the ONNX Erf translator and the exact-mode Gelu translator so both produce
+    /// identical numerics for the same input.
     /// </summary>
     internal static Tensor<T> ComposeErf<T>(AiDotNet.Tensors.Engines.IEngine engine, Tensor<T> x) where T : unmanaged
     {
         var ops = MathHelper.GetNumericOperations<T>();
-        Tensor<T> MakeScalar(double value, int[] shape)
-        {
-            var t = new Tensor<T>(shape);
-            var s = t.AsWritableSpan();
-            var v = ops.FromDouble(value);
-            for (int i = 0; i < s.Length; i++) s[i] = v;
-            return t;
-        }
-        const double P = 0.3275911;
-        const double A1 = 0.254829592, A2 = -0.284496736, A3 = 1.421413741;
-        const double A4 = -1.453152027, A5 = 1.061405429;
-        int[] coefficientShape = x.Rank == 0 ? Array.Empty<int>() : new[] { 1 };
-        var absX = engine.TensorAbs(x);
-        var pAbsX = engine.TensorMultiply(absX, MakeScalar(P, coefficientShape));
-        var onePlusPAbsX = engine.TensorAdd(pAbsX, MakeScalar(1.0, coefficientShape));
-        var ones = MakeScalar(1.0, x._shape);
-        var t = engine.TensorDivide(ones, onePlusPAbsX);
-        var poly = engine.TensorAdd(
-            engine.TensorMultiply(t, MakeScalar(A5, coefficientShape)),
-            MakeScalar(A4, coefficientShape));
-        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A3, coefficientShape));
-        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A2, coefficientShape));
-        poly = engine.TensorAdd(engine.TensorMultiply(poly, t), MakeScalar(A1, coefficientShape));
-        poly = engine.TensorMultiply(poly, t);
-        var negXsq = engine.TensorNegate(engine.TensorMultiply(x, x));
-        var expNegXsq = engine.TensorExp(negXsq);
-        var polyExp = engine.TensorMultiply(poly, expNegXsq);
-        var erfMag = engine.TensorSubtract(ones, polyExp);
-        var epsAbsX = engine.TensorAdd(absX, MakeScalar(1e-30, coefficientShape));
-        var sign = engine.TensorDivide(x, epsAbsX);
-        return engine.TensorMultiply(sign, erfMag);
+        var ones = new Tensor<T>(x._shape);
+        var span = ones.AsWritableSpan();
+        for (int i = 0; i < span.Length; i++) span[i] = ops.One;
+        return engine.TensorSubtract(ones, engine.TensorErfc(x));
     }
 
     /// <summary>

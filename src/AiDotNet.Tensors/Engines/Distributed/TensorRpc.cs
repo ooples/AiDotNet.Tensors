@@ -161,7 +161,9 @@ internal sealed class InProcessRpcRegistry
         // with the remote rank's internal buffers.
         if (result is null) return null!;
         var resultCopy = new Tensor<T>((int[])result._shape.Clone());
-        result.AsSpan().CopyTo(resultCopy.AsWritableSpan());
+        using var resultKeep1 = new KeepAliveScope(result);
+        using var resultCopyKeep1 = new KeepAliveScope(resultCopy);
+        result.AsSpanUnmarked().CopyTo(resultCopy.AsWritableSpanUnmarked());
         return resultCopy;
     }
 

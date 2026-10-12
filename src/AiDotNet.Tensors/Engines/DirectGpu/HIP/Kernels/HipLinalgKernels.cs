@@ -11,7 +11,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
         {
             "parity211_cholesky",
             "parity211_lu_factor",
-            "parity211_qr_reduced",
             "parity211_eigh",
         };
 

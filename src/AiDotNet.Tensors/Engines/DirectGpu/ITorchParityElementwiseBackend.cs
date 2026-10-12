@@ -17,10 +17,10 @@ internal enum TorchParityBinaryOp { Fmax, Fmin, Heaviside, GreaterEqual, LessEqu
 /// a backend without it keeps the recorded host fallback (<c>GpuLaunchProbe.OnFallback</c>).
 /// </summary>
 /// <remarks>
-/// Implemented by the CUDA and Vulkan backends (Vulkan computes in double and int64, so a device without the
-/// shaderFloat64 / shaderInt64 features keeps the host fallback for the kernels that need them). Not yet implemented,
-/// each tracked by its own follow-up issue: HIP (#1124), Metal (#1125), OpenCL (#1126) and WebGPU (#1128). Until then
-/// those backends compute these ops on the host.
+/// Implemented by the CUDA, OpenCL (#1126) and Vulkan backends (Vulkan computes in double and int64, so a device without
+/// the shaderFloat64 / shaderInt64 features keeps the host fallback for the kernels that need them). Not yet
+/// implemented, each tracked by its own follow-up issue: HIP (#1124), Metal (#1125) and WebGPU (#1128). Until then those
+/// backends compute these ops on the host.
 /// </remarks>
 internal interface ITorchParityElementwiseBackend
 {

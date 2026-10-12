@@ -301,6 +301,12 @@ public sealed class MetalCommandQueue : IDisposable
     /// </summary>
     /// <param name="encoder">The compute encoder.</param>
     /// <param name="pipelineState">The pipeline state to set.</param>
+    /// <summary>The pipeline this thread last bound, which the next dispatch journals (#996).</summary>
+    [ThreadStatic]
+    private static IntPtr _boundPipeline;
+
+    private static string DescribeBoundPipeline() => "metal-pipeline@0x" + _boundPipeline.ToString("x");
+
     public static void SetPipelineState(IntPtr encoder, IntPtr pipelineState)
     {
         if (encoder == IntPtr.Zero || pipelineState == IntPtr.Zero)
@@ -309,6 +315,7 @@ public sealed class MetalCommandQueue : IDisposable
         }
 
         SendMessageVoid(encoder, Selectors.SetComputePipelineState, pipelineState);
+        _boundPipeline = pipelineState;
     }
 
     /// <summary>
@@ -394,6 +401,13 @@ public sealed class MetalCommandQueue : IDisposable
         }
 
         // Use the dispatch selector with MTLSize structs
+        long local = (long)(threadsPerThreadgroup.Width * threadsPerThreadgroup.Height * threadsPerThreadgroup.Depth);
+        long global = (long)(threadgroups.Width * threadgroups.Height * threadgroups.Depth) * local;
+        if (_boundPipeline != IntPtr.Zero)
+            GpuKernelDiagnostics.ValidateLaunch(DescribeBoundPipeline(), handleIsValid: true, stagedArgCount: 0,
+                declaredArgCount: -1, globalSize: global, localSize: local);
+        GpuKernelDiagnostics.RecordLaunchByHandle(_boundPipeline, global, local, 0);
+
         SendMessageDispatch(encoder, Selectors.DispatchThreadgroups, threadgroups, threadsPerThreadgroup);
     }
 
@@ -410,6 +424,8 @@ public sealed class MetalCommandQueue : IDisposable
             return;
         }
 
+        GpuKernelDiagnostics.RecordLaunchByHandle(_boundPipeline, (long)(threads.Width * threads.Height * threads.Depth),
+            (long)(threadsPerThreadgroup.Width * threadsPerThreadgroup.Height * threadsPerThreadgroup.Depth), 0);
         SendMessageDispatch(encoder, Selectors.DispatchThreads, threads, threadsPerThreadgroup);
     }
 
@@ -734,11 +750,11 @@ public readonly struct ScopedComputeEncoder : IDisposable
     }
 
     /// <summary>
-    /// Sets a buffer at the specified index with zero offset.
+    /// Sets a buffer at the specified index, at its byte offset (nonzero only for a view).
     /// </summary>
     public void SetBuffer(MetalGpuBuffer buffer, int index)
     {
-        MetalCommandQueue.SetBuffer(_encoder, buffer.Handle, 0, (ulong)index);
+        MetalCommandQueue.SetBuffer(_encoder, buffer.Handle, (ulong)buffer.ByteOffset, (ulong)index);
     }
 
     /// <summary>

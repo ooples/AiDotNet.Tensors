@@ -106,8 +106,10 @@ public sealed class WeightNorm<T> : IParametrization<T>
         int outer = initialV._shape[dim];
         int inner = initialV._shape[1 - dim];
         G = new Tensor<T>(new[] { outer });
-        var src = initialV.AsSpan();
-        var gSpan = G.AsWritableSpan();
+        using var srcLease = initialV.Lease();
+        var src = srcLease.Span;
+        using var gSpanLease = G.LeaseWritable();
+        var gSpan = gSpanLease.Span;
         for (int o = 0; o < outer; o++)
         {
             double n = 0;
@@ -133,9 +135,12 @@ public sealed class WeightNorm<T> : IParametrization<T>
             throw new InvalidOperationException(
                 $"WeightNorm: G length {G.Length} doesn't match raw axis {Dim} length {outer}.");
         var output = new Tensor<T>((int[])raw._shape.Clone());
-        var src = raw.AsSpan();
-        var dst = output.AsWritableSpan();
-        var gSpan = G.AsSpan();
+        using var srcLease = raw.Lease();
+        var src = srcLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
+        using var gSpanLease = G.Lease();
+        var gSpan = gSpanLease.Span;
         for (int o = 0; o < outer; o++)
         {
             double n = 0;
@@ -179,7 +184,8 @@ public sealed class SpectralNorm<T> : IParametrization<T>
         _engine = new CpuEngine();
         var ops = MathHelper.GetNumericOperations<T>();
         _u = new Tensor<T>(new[] { outFeatures });
-        var span = _u.AsWritableSpan();
+        using var spanLease = _u.LeaseWritable();
+        var span = spanLease.Span;
         // Init u to a fixed vector (1, 0, …, 0) — converges from any
         // non-orthogonal start. Deterministic for tests.
         span[0] = ops.One;
@@ -215,16 +221,20 @@ public sealed class SpectralNorm<T> : IParametrization<T>
 
         // Top singular value σ = uᵀWv (one inner product after the loop).
         double sigma = 0;
-        var rawSpan = raw.AsSpan();
-        var uSpan = u.AsSpan();
-        var vSpan = v.AsSpan();
+        using var rawSpanLease = raw.Lease();
+        var rawSpan = rawSpanLease.Span;
+        using var uSpanLease = u.Lease();
+        var uSpan = uSpanLease.Span;
+        using var vSpanLease = v.Lease();
+        var vSpan = vSpanLease.Span;
         for (int o = 0; o < outF; o++)
             for (int i = 0; i < inF; i++)
                 sigma += ops.ToDouble(uSpan[o]) * ops.ToDouble(rawSpan[o * inF + i]) * ops.ToDouble(vSpan[i]);
 
         if (sigma < 1e-12) sigma = 1.0;
         var output = new Tensor<T>((int[])raw._shape.Clone());
-        var dst = output.AsWritableSpan();
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < dst.Length; i++)
             dst[i] = ops.FromDouble(ops.ToDouble(rawSpan[i]) / sigma);
         return output;
@@ -233,9 +243,12 @@ public sealed class SpectralNorm<T> : IParametrization<T>
     private static Tensor<T> MatVec(Tensor<T> M, Tensor<T> v, Interfaces.INumericOperations<T> ops, int outDim, int inDim)
     {
         var output = new Tensor<T>(new[] { outDim });
-        var Mspan = M.AsSpan();
-        var vSpan = v.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var MspanLease = M.Lease();
+        var Mspan = MspanLease.Span;
+        using var vSpanLease = v.Lease();
+        var vSpan = vSpanLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int r = 0; r < outDim; r++)
         {
             double acc = 0;
@@ -248,7 +261,8 @@ public sealed class SpectralNorm<T> : IParametrization<T>
 
     private static void NormalizeInPlace(Tensor<T> t, Interfaces.INumericOperations<T> ops)
     {
-        var span = t.AsWritableSpan();
+        using var spanLease = t.LeaseWritable();
+        var span = spanLease.Span;
         double n = 0;
         for (int i = 0; i < span.Length; i++)
         {
@@ -278,8 +292,10 @@ public sealed class OrthogonalParametrization<T> : IParametrization<T>
 
         // Skew-symmetrize: A = (raw − rawᵀ) / 2.
         var A = new Tensor<T>(new[] { n, n });
-        var aSpan = A.AsWritableSpan();
-        var src = raw.AsSpan();
+        using var aSpanLease = A.LeaseWritable();
+        var aSpan = aSpanLease.Span;
+        using var srcLease = raw.Lease();
+        var src = srcLease.Span;
         for (int r = 0; r < n; r++)
             for (int c = 0; c < n; c++)
             {
@@ -305,7 +321,8 @@ public sealed class OrthogonalParametrization<T> : IParametrization<T>
         // Result X = (I + A)^(-1) · (I − A) is orthogonal.
         var X = SolveGeneral(iPlusA, iMinusA, n);
         var output = new Tensor<T>(new[] { n, n });
-        var dst = output.AsWritableSpan();
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < X.Length; i++) dst[i] = ops.FromDouble(X[i]);
         return output;
     }

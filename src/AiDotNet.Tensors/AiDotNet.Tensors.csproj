@@ -32,6 +32,14 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
+  <!-- Backend parity gate (TENS0001-TENS0005): every GPU capability must exist natively on all six
+       DirectGpu backends. Build-only; the analyzer is not shipped to package consumers. Known gaps are
+       listed with tracking issues in BackendParityBaseline.txt, which may only shrink. -->
+  <ItemGroup>
+    <ProjectReference Include="..\AiDotNet.Tensors.Analyzers\AiDotNet.Tensors.Analyzers.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <AdditionalFiles Include="BackendParityBaseline.txt" />
+  </ItemGroup>
   <ItemGroup Condition="'$(UseLocalEvolution)' == 'true'">
     <ProjectReference Include="$(EvolutionProjectPath)" />
   </ItemGroup>

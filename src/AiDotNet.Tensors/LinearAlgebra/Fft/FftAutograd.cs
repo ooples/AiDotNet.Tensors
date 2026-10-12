@@ -125,8 +125,10 @@ internal static class FftAutograd
         int K = n / 2 + 1;
         // Copy so we don't mutate the gradient tensor in place.
         var result = new Tensor<T>((int[])packed._shape.Clone());
-        var src = packed.GetDataArray();
-        var dst = result.GetDataArray();
+        using var srcLease = packed.LeaseArray();
+        var src = srcLease.Array;
+        using var dstLease = result.LeaseArray();
+        var dst = dstLease.Array;
         int last = packed.Shape[packed.Rank - 1];
         int batch = packed.Length / last;
         bool evenN = n % 2 == 0;
@@ -319,8 +321,10 @@ internal static class FftAutograd
     {
         var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>((int[])packed._shape.Clone());
-        var src = packed.GetDataArray();
-        var dst = result.GetDataArray();
+        using var srcLease = packed.LeaseArray();
+        var src = srcLease.Array;
+        using var dstLease = result.LeaseArray();
+        var dst = dstLease.Array;
         int last = packed.Shape[packed.Rank - 1];
         int batch = packed.Length / last;
         for (int b = 0; b < batch; b++)

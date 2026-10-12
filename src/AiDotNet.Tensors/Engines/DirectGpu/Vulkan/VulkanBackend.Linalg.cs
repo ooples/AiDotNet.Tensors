@@ -28,15 +28,11 @@ public sealed unsafe partial class VulkanBackend : ILinalgBackend
             dispatchSize: batchCount * 256, pc, sizeof(uint) * 3u);
     }
 
+    /// <summary>Householder, as the CPU and torch.linalg.qr: Gram-Schmidt would force R's diagonal positive (#1142).</summary>
     public void LinalgQrReduced(
         IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
         int batchCount, int m, int n)
-    {
-        if (batchCount <= 0 || m <= 0 || n <= 0) return;
-        uint[] pc = { (uint)batchCount, (uint)m, (uint)n };
-        GlslBinaryOp3(VulkanLinalgKernels.QrReduced, input, q, r,
-            dispatchSize: batchCount * 256, pc, sizeof(uint) * 3u);
-    }
+        => PortableExtendedLinalg.QrReduced(this, LaunchSolver, input, q, r, batchCount, m, n);
 
     public void LinalgEigh(
         IGpuBuffer input, IGpuBuffer eigenvalues, IGpuBuffer eigenvectors,
