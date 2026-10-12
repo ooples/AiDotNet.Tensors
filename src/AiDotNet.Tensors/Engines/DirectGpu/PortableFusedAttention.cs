@@ -18,7 +18,7 @@ internal static class PortableFusedAttention
             ? (int)value
             : throw new NotSupportedException($"fused attention: stride {name} = {value} does not fit the portable kernels' int32 indexing.");
 
-    // The int32 arguments every fa_p_ kernel reads, in AttentionSource's order, carried as float bit patterns.
+    // The scalars every fa_p_ kernel reads, in AttentionSource's order (scale and soft-cap as float bits), carried in a float buffer.
     private static IGpuBuffer Meta(IDirectGpuBackend backend, in FusedAttentionParams p, int headDim)
     {
         int[] values =
@@ -30,6 +30,7 @@ internal static class PortableFusedAttention
             Narrow(p.Ob, "o batch"), Narrow(p.Oh, "o head"), Narrow(p.Or, "o row"),
             Narrow(p.Mb, "mask batch"), Narrow(p.Mh, "mask head"), Narrow(p.Mi, "mask row"), Narrow(p.Mj, "mask column"),
             p.Causal, p.CausalOffset, p.HasMask,
+            BitConverter.ToInt32(BitConverter.GetBytes(p.Scale), 0), BitConverter.ToInt32(BitConverter.GetBytes(p.Softcap), 0),
         };
         var words = new float[K.FaMetaCount];
         for (int i = 0; i < values.Length; i++) words[i] = BitConverter.ToSingle(BitConverter.GetBytes(values[i]), 0);
@@ -51,11 +52,10 @@ internal static class PortableFusedAttention
         int rows = checked(p.B * p.H * p.Sq);
         int elements = Elements(rows, headDim);
         using var meta = Meta(backend, p, headDim);
-        using var fp = backend.AllocateBuffer(new[] { p.Scale, p.Softcap });
         // Without a mask the kernels never read it (has-mask is 0); the metadata buffer stands in for the binding.
         var maskBuffer = mask ?? meta;
-        launch(K.FaLse, rows, q, k, meta, fp, maskBuffer, lse, rows);
-        launch(K.FaOut, elements, q, k, v, meta, fp, maskBuffer, lse, o, elements);
+        launch(K.FaLse, rows, q, k, meta, maskBuffer, lse, rows);
+        launch(K.FaOut, elements, q, k, v, meta, maskBuffer, lse, o, elements);
     }
 
     public static void Backward(IDirectGpuBackend backend, PortableGenericFft.Launcher launch, IGpuBuffer q, IGpuBuffer k,
@@ -66,19 +66,21 @@ internal static class PortableFusedAttention
         int rows = checked(p.B * p.H * p.Sq);
         int keys = checked(p.B * p.H * p.Sk);
         using var meta = Meta(backend, p, headDim);
-        using var fp = backend.AllocateBuffer(new[] { p.Scale, p.Softcap });
-        using var delta = backend.AllocateBuffer(Math.Max(1, rows));
+        // lse in [0, rows), delta in [rows, 2 rows): one binding for both keeps every kernel within 8 storage buffers.
+        using var stats = backend.AllocateBuffer(Math.Max(1, 2 * rows));
         var maskBuffer = mask ?? meta;
         if (rows > 0)
         {
-            launch(K.FaDelta, rows, o, dO, meta, delta, rows);
+            backend.Copy(lse, 0, stats, 0, rows);
+            launch(K.FaDelta, rows, o, dO, meta, stats, rows);
             int elements = Elements(rows, headDim);
-            launch(K.FaDq, elements, q, k, v, dO, lse, delta, meta, fp, maskBuffer, dQ, elements);
+            launch(K.FaDq, elements, q, k, v, dO, stats, meta, maskBuffer, dQ, elements);
         }
         if (keys > 0)
         {
             int elements = Elements(keys, headDim);
-            launch(K.FaDkv, elements, q, k, v, dO, lse, delta, meta, fp, maskBuffer, dK, dV, elements);
+            launch(K.FaDk, elements, q, k, v, dO, stats, meta, maskBuffer, dK, elements);
+            launch(K.FaDv, elements, q, k, dO, stats, meta, maskBuffer, dV, elements);
         }
     }
 }
