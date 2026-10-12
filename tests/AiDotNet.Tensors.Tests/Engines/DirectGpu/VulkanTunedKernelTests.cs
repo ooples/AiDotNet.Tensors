@@ -24,6 +24,8 @@ public sealed class VulkanTunedKernelTests
     {
         (1, 1), (3, 5), (7, 8), (9, 16), (17, 31), (33, 32), (31, 33), (5, 64), (65, 65), (11, 100),
         (129, 257), (3, 511), (2, 1024), (2048, 64), (8192, 32),
+        // around the whole-workgroup lane count, and rows wider than any narrower count is offered
+        (3, 255), (2, 256), (5, 4097), (1, 20000),
     };
 
     private static float[] Values(int count, int seed, float scale = 1f)
@@ -281,6 +283,49 @@ public sealed class VulkanTunedKernelTests
     }
 
     [SkippableFact]
+    public void AWideRow_IsOfferedTheWholeWorkgroupVariant_AndNoNarrowerOne()
+    {
+        var backend = RequireBackend();
+        // 4,096 columns: more than 64 per lane for 8, 16 and 32 lanes, so only the 256-lane variant is offered.
+        var wide = Applicable(backend.SoftmaxSlot, TunedShape.Of2(TunedKernelDType.Float32, 64, 4096)).Select(c => c.Id).ToArray();
+        Assert.Contains("generated.softmax.lanes256", wide);
+        Assert.DoesNotContain(wide, id => id.StartsWith("generated.", StringComparison.Ordinal) && id != "generated.softmax.lanes256");
+        // No width is too wide for it.
+        Assert.Contains("generated.softmax.lanes256",
+            Applicable(backend.SoftmaxSlot, TunedShape.Of2(TunedKernelDType.Float32, 1, 100_000)).Select(c => c.Id));
+        foreach (var slotIds in new[] { backend.SoftmaxBackwardSlot.CandidateIds, backend.LayerNormSlot.CandidateIds, backend.LayerNormBackwardSlot.CandidateIds })
+            Assert.Contains(slotIds, id => id.EndsWith(".lanes256", StringComparison.Ordinal));
+    }
+
+    [SkippableFact]
+    public void TimingHarness_MeasuresMoreTimeForMoreWork()
+    {
+        var backend = RequireBackend();
+        const int rows = 4096, n = 256;
+        float[] x = Values(rows * n, 5, 3f);
+        using var input = backend.AllocateBuffer(x);
+        using var output = backend.AllocateBuffer(x.Length);
+        var reference = backend.SoftmaxSlot.Candidate("vulkan.softmax.thread_per_row") ?? throw new InvalidOperationException("reference missing");
+        var args = new TunedSoftmaxArgs(input, output, rows, n);
+        void Run() => reference.Execute(args);
+        backend.MeasureTunedKernelMilliseconds(Run, 2); // warm the pipeline
+        // Medians over several samples: one sample of either can be disturbed by another process on the device.
+        double Median(int repetitions)
+        {
+            var samples = new double[7];
+            for (int i = 0; i < samples.Length; i++) samples[i] = backend.MeasureTunedKernelMilliseconds(Run, repetitions);
+            Array.Sort(samples);
+            return samples[samples.Length / 2];
+        }
+        double one = Median(1), sixteen = Median(16);
+        Assert.True(one > 0, $"one run measured {one} ms");
+        Assert.True(sixteen > 4 * one, $"16 runs measured {sixteen} ms against {one} ms for one");
+        // A device without timestamp queries is timed on the host clock; either way the unit is milliseconds.
+        if (backend.TunedKernelTimingUsesDeviceClock)
+            Assert.True(sixteen < 60_000, "device timestamps are in milliseconds");
+    }
+
+    [SkippableFact]
     public void PublicSoftmax_ThroughTheRegistry_MatchesTheReferenceAndCachesADecision()
     {
         var backend = RequireBackend();
@@ -293,7 +338,10 @@ public sealed class VulkanTunedKernelTests
         try
         {
             // A shape no shipped profile covers: the registry must measure it, and the in-place call must not.
+            // The slot belongs to the process-wide backend, and test classes outside this collection run softmax on
+            // it at the same time, so only the decision for this test's own shape is asserted.
             const int rows = 8192, n = 48;
+            var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
             float[] x = Values(rows * n, 99, 5f);
             using var input = backend.AllocateBuffer(x);
             using var viaRegistry = backend.AllocateBuffer(x.Length);
@@ -302,7 +350,7 @@ public sealed class VulkanTunedKernelTests
             (backend.SoftmaxSlot.Candidate("vulkan.softmax.thread_per_row") ?? throw new InvalidOperationException("reference missing")).Execute(new TunedSoftmaxArgs(input, viaReference, rows, n));
             backend.Synchronize();
             AssertClose(backend.DownloadBuffer(viaReference), backend.DownloadBuffer(viaRegistry), x.Length, "registry softmax");
-            var decision = Assert.Single(backend.SoftmaxSlot.CachedDecisions);
+            var decision = Assert.Single(backend.SoftmaxSlot.CachedDecisions, d => d.Shape.Equals(shape));
             Assert.Equal(TunedKernelOp.Softmax, decision.Op);
 
             // In place: the registry must not measure (a second in-place run would corrupt the data) and the result
@@ -312,7 +360,7 @@ public sealed class VulkanTunedKernelTests
             backend.Softmax(inPlace, inPlace, rows, n);
             backend.Synchronize();
             AssertClose(backend.DownloadBuffer(viaReference), backend.DownloadBuffer(inPlace), x.Length, "in-place softmax");
-            Assert.Empty(backend.SoftmaxSlot.CachedDecisions);
+            Assert.DoesNotContain(backend.SoftmaxSlot.CachedDecisions, d => d.Shape.Equals(shape));
         }
         finally
         {
@@ -343,7 +391,8 @@ public sealed class VulkanTunedKernelTests
             // Thread-scoped: transfers other test classes make in parallel do not land in it.
             using var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin();
             backend.Softmax(input, output, rows, n);
-            var reason = Assert.Single(backend.SoftmaxSlot.CachedDecisions).Reason;
+            var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
+            var reason = Assert.Single(backend.SoftmaxSlot.CachedDecisions, d => d.Shape.Equals(shape)).Reason;
             Assert.True(reason == TunedKernelDecisionReason.Tuned || reason == TunedKernelDecisionReason.ReferenceWon, $"measured decision expected, got {reason}");
             Assert.True(GpuLaunchProbe.TuningReadbacks > tuningBefore, "the gate snapshots candidate outputs, so tuning must read back");
             Assert.Equal(0, scope.Downloads);

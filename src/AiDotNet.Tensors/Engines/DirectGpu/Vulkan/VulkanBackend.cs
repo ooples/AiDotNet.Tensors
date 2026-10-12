@@ -1257,6 +1257,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pipeline.Dispose();
         }
         _glslPipelineCache.Clear();
+        DisposeTunedKernelResources();
+        _unusedBindingBuffer?.Dispose();
+        _unusedBindingBuffer = null;
         _glslPipelineBySource.Clear();
         _glslPipelineByInstance.Clear();
 

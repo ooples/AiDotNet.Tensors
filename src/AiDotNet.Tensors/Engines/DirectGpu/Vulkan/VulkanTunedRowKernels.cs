@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// GLSL instances of the registry's row-wise and column-wise variants (CUDA: CudaTunedRowKernels; OpenCL:
 /// OpenClTunedRowKernels), one compute shader per (op, lane count). Vulkan's established kernels give each row ONE
 /// invocation (softmax, softmax backward, the normalization phases) or each column one invocation looping over every
-/// row (the affine gradients); these give a row <c>L</c> lanes (8, 16 or 32 of a 256-invocation group) or a 32-column
+/// row (the affine gradients); these give a row <c>L</c> lanes (8, 16 or 32 of a 256-invocation group, or all 256) or a 32-column
 /// tile <c>R</c> row lanes, and the registry measures which wins per shape class.
 /// </summary>
 /// <remarks>
@@ -20,7 +20,14 @@ internal static class VulkanTunedRowKernels
     internal const int GroupSize = 256;
 
     /// <summary>Lane counts each row-kernel family is instantiated for.</summary>
-    internal static readonly int[] RowLanes = { 8, 16, 32 };
+    internal static readonly int[] RowLanes = { 8, 16, 32, 256 };
+
+    /// <summary>
+    /// Whether a row of <paramref name="n"/> columns is worth offering to the <paramref name="lanes"/>-lane variant:
+    /// a lane walks n / lanes columns, so a narrow lane count is not offered rows where each lane would still walk
+    /// more than 64. The widest count (a whole workgroup per row) has no such limit; it is the one for the widest rows.
+    /// </summary>
+    internal static bool RowLanesFit(int n, int lanes) => lanes == GroupSize || n <= 64 * lanes;
 
     /// <summary>Row-lane counts the column-reduction family is instantiated for.</summary>
     internal static readonly int[] ColumnRowLanes = { 8, 32 };

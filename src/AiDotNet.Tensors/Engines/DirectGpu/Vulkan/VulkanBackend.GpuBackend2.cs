@@ -749,6 +749,22 @@ void main() {
 
     #region Normalization Operations
 
+    // One float that no kernel reads or writes. The normalization kernels declare every binding any of their modes
+    // uses, so a mode that leaves some untouched (the running statistics outside batch norm, RMSNorm's beta, saved
+    // mean and gradBeta) still needs a buffer bound there. A buffer allocated per call for that is also returned
+    // to the pool before a batch's recorded dispatch runs; this one lives as long as the backend.
+    private IGpuBuffer? _unusedBindingBuffer;
+    private readonly object _unusedBindingLock = new();
+
+    private IGpuBuffer UnusedBinding
+    {
+        get
+        {
+            if (_unusedBindingBuffer is { } b) return b;
+            lock (_unusedBindingLock) return _unusedBindingBuffer ??= AllocateBuffer(1);
+        }
+    }
+
     private bool DispatchNormalizationForward(IGpuBuffer[] buffers, int threads, uint[] pushConstants)
     {
         GlslNaryOp(VulkanGlslKernels.NormalizationForward, buffers, threads, pushConstants);
@@ -818,10 +834,8 @@ void main() {
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
         EnsureInitialized();
-        using var groupRunningMeanDummy = AllocateBuffer(1);
-        using var groupRunningVarianceDummy = AllocateBuffer(1);
         if (DispatchNormalizationForward(
-            new[] { input, output, gamma, beta, groupRunningMeanDummy, groupRunningVarianceDummy, saveMean, saveInvVar }, batch * numGroups,
+            new[] { input, output, gamma, beta, UnusedBinding, UnusedBinding, saveMean, saveInvVar }, batch * numGroups,
             new[] { 2u, (uint)batch, (uint)channels, (uint)spatialSize, (uint)numGroups, FloatBits(epsilon), 0u, 1u }))
             return;
     }
@@ -848,12 +862,8 @@ void main() {
         int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        using var rmsBetaDummy = AllocateBuffer(1);
-        using var rmsRunningMeanDummy = AllocateBuffer(1);
-        using var rmsRunningVarianceDummy = AllocateBuffer(1);
-        using var rmsSavedMeanDummy = AllocateBuffer(Math.Max(1, batchSize));
         if (DispatchNormalizationForward(
-            new[] { input, output, gamma, rmsBetaDummy, rmsRunningMeanDummy, rmsRunningVarianceDummy, rmsSavedMeanDummy, saveRms }, batchSize,
+            new[] { input, output, gamma, UnusedBinding, UnusedBinding, UnusedBinding, UnusedBinding, saveRms }, batchSize,
             new[] { 3u, (uint)batchSize, (uint)normalizedSize, 1u, 1u, FloatBits(epsilon), 0u, 1u }))
             return;
     }
@@ -862,9 +872,7 @@ void main() {
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        using var rmsSavedMeanDummy = AllocateBuffer(Math.Max(1, batchSize));
-        using var rmsGradBetaDummy = AllocateBuffer(Math.Max(1, normalizedSize));
-        var rmsBuffers = new[] { gradOutput, input, gamma, rmsSavedMeanDummy, saveRms, gradInput, gradGamma, rmsGradBetaDummy };
+        var rmsBuffers = new[] { gradOutput, input, gamma, UnusedBinding, saveRms, gradInput, gradGamma, UnusedBinding };
         GlslNaryOp(VulkanGlslKernels.NormalizationBackward, rmsBuffers, batchSize,
             new[] { 3u, 0u, (uint)batchSize, (uint)normalizedSize, 1u });
         // The gamma gradient is a column reduction served by the registry (#1115).
