@@ -34,7 +34,10 @@ public static class IEngineOpInventory
 
     private static bool IsTensorProducing(MethodInfo method) =>
         ProducesTensor(method.ReturnType) ||
-        method.GetParameters().Any(parameter => parameter.IsOut && ProducesTensor(parameter.ParameterType));
+        method.GetParameters().Any(parameter => parameter.IsOut && ProducesTensor(parameter.ParameterType)) ||
+        // An in-place op (torch op_) produces its result in the tensor it overwrites, its first argument.
+        (method.ReturnType == typeof(void) && method.Name.EndsWith("InPlace", System.StringComparison.Ordinal) &&
+         method.GetParameters() is { Length: > 0 } ps && ProducesTensor(ps[0].ParameterType));
 
     /// <summary>A return type "produces a tensor" if it is a bare <c>Tensor&lt;T&gt;</c>, an ARRAY of
     /// them (<c>Tensor&lt;T&gt;[]</c>), or a tuple carrying at least one — so multi-output ops like
