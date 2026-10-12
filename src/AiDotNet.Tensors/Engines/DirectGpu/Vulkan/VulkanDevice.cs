@@ -811,7 +811,7 @@ public sealed unsafe class VulkanDevice : IDisposable
     {
         if (!_initialized || _disposed)
         {
-            throw new InvalidOperationException("Vulkan device not initialized.");
+            throw new GpuCapabilityUnavailableException("Vulkan device not initialized.");
         }
 
         // Managed thread IDs can be reused after a thread exits, but this is safe:

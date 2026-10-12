@@ -323,14 +323,9 @@ public class OptimizerKernelsTests
     [Fact]
     public void AdamInPlace_AllocatesFarLessThanNaiveReferenceImpl()
     {
-        // Same approach as SgdInPlace_AllocatesFarLessThanNaivePattern:
-        // measure fused vs naive on identical workload and assert a
-        // relative reduction. Robust to coverage instrumentation that
-        // inflates GC.GetTotalAllocatedBytes by per-call instrumentation
-        // probes (CI's coverlet sees ~340 KB/call where local sees 33
-        // bytes/call). The actual kernel is zero-allocation by static
-        // analysis (Memory.Pin is a stack struct, AVX2 writes through
-        // pinned pointers).
+        // Same approach as SgdInPlace_AllocatesFarLessThanNaivePattern: the fused kernel's allocation on the
+        // calling thread against MaxFusedBytesPerCall (see there for why it is not a ratio against the naive path,
+        // which is still measured and printed).
         const int Hidden = 768;
         const int Iters = 100;
         var rng = new Random(7);
@@ -363,27 +358,27 @@ public class OptimizerKernelsTests
 
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 #if NET5_0_OR_GREATER
-        long naiveStart = GC.GetTotalAllocatedBytes(precise: true);
+        long naiveStart = GC.GetAllocatedBytesForCurrentThread();
 #else
         long naiveStart = GC.GetTotalMemory(forceFullCollection: false);
 #endif
         for (int i = 0; i < Iters; i++) NaiveAdam(20 + i);
 #if NET5_0_OR_GREATER
-        long naiveEnd = GC.GetTotalAllocatedBytes(precise: true);
+        long naiveEnd = GC.GetAllocatedBytesForCurrentThread();
 #else
         long naiveEnd = GC.GetTotalMemory(forceFullCollection: false);
 #endif
 
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 #if NET5_0_OR_GREATER
-        long fusedStart = GC.GetTotalAllocatedBytes(precise: true);
+        long fusedStart = GC.GetAllocatedBytesForCurrentThread();
 #else
         long fusedStart = GC.GetTotalMemory(forceFullCollection: false);
 #endif
         for (int i = 0; i < Iters; i++)
             OptimizerKernels.AdamInPlace(pFused, g, mFused, vFused, 1e-3f, 0.9f, 0.999f, 1e-8f, 20 + i);
 #if NET5_0_OR_GREATER
-        long fusedEnd = GC.GetTotalAllocatedBytes(precise: true);
+        long fusedEnd = GC.GetAllocatedBytesForCurrentThread();
 #else
         long fusedEnd = GC.GetTotalMemory(forceFullCollection: false);
 #endif
@@ -399,13 +394,24 @@ public class OptimizerKernelsTests
         // fundamentally unreliable. Diagnostic line above stays so
         // the value is visible during local runs on either framework.
 #if NET5_0_OR_GREATER
-        Assert.True(fusedBytes * 10 < naiveBytes || fusedBytes == 0,
-            $"AdamInPlace ({fusedBytes} bytes) is not sufficiently less than the naive path "
-            + $"({naiveBytes} bytes). Expected 10× reduction at minimum.");
+        Assert.True(fusedBytes / Iters <= MaxFusedBytesPerCall,
+            $"AdamInPlace allocated {fusedBytes / Iters} bytes per call on the calling thread "
+            + $"(limit {MaxFusedBytesPerCall}); the naive path allocated {naiveBytes / Iters}.");
 #endif
     }
 
     private static readonly CpuEngine engine_local = new();
+
+    // What an in-place optimizer kernel may allocate per call on the thread that calls it. The kernels write
+    // through pinned spans and allocate no result; the allowance covers a parallel loop's delegate and state.
+    //
+    // These two tests used to compare PROCESS-wide allocation (GC.GetTotalAllocatedBytes) of the fused kernel
+    // against a naive tensor-per-step implementation and require a 10x reduction. Both halves stopped holding:
+    // the process-wide counter includes whatever every other test class allocates in parallel during the loop
+    // (CI measured the zero-allocation SGD kernel at 70 KB per call), and since undisposed result buffers are
+    // recycled (#1118) the naive path itself allocates about 31 KB per call instead of megabytes, so there is no
+    // 10x left to find. The calling thread's own counter measures the kernel and nothing else.
+    private const long MaxFusedBytesPerCall = 4096;
 
     // Reference Adam implementation — straight transcription of the
     // canonical update for cross-checking the SIMD kernel. Never the
@@ -455,25 +461,11 @@ public class OptimizerKernelsTests
     [Fact]
     public void SgdInPlace_AllocatesFarLessThanNaivePattern()
     {
-        // The kernel itself is zero-allocation (verified by static
-        // analysis of OptimizerKernels.cs: only Memory<T>.Pin which is
-        // a stack-only struct on net5+, and the AVX2 SIMD kernel which
-        // writes through raw pointers). But on CI we can't measure
-        // "kernel-only" allocation directly: code-coverage probes,
-        // xUnit infrastructure, and JIT tier-up all show up under
-        // GC.GetTotalAllocatedBytes. An absolute budget like
-        // "≤ 1024 bytes/call" passes locally (33 bytes/call) but
-        // fails on the ubuntu-24.04 CI runner with coverage enabled
-        // (43000 bytes/call from coverlet probes).
-        //
-        // Honest assertion: SgdInPlace must allocate substantially
-        // LESS than the naive TensorMultiplyScalar + TensorSubtractInPlace
-        // pattern. Both paths see identical coverage overhead, so the
-        // relative reduction is preserved across environments. The
-        // naive path allocates a fresh Tensor<float>[Hidden*Hidden]
-        // every call (~2.4 MB at ViT-Base shape) on top of the
-        // coverage noise; the fused path doesn't. 10× ratio is the
-        // floor — actual ratio is far higher on real workloads.
+        // The kernel allocates no result: it writes through pinned spans. The assertion is on what the CALLING
+        // THREAD allocates per call (see MaxFusedBytesPerCall). An earlier absolute budget failed on CI because it
+        // read the process-wide counter, which includes every test running in parallel; the ratio against the
+        // naive pattern that replaced it stopped holding once the naive pattern's result buffers were recycled.
+        // The naive pattern is still run and printed for comparison.
         const int Hidden = 768;
         const int Iters = 100;
         var pNaive = MakeRandom<float>(Hidden * Hidden, new Random(7));
@@ -495,7 +487,7 @@ public class OptimizerKernelsTests
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 
 #if NET5_0_OR_GREATER
-        long naiveStart = GC.GetTotalAllocatedBytes(precise: true);
+        long naiveStart = GC.GetAllocatedBytesForCurrentThread();
 #else
         long naiveStart = GC.GetTotalMemory(forceFullCollection: false);
 #endif
@@ -505,7 +497,7 @@ public class OptimizerKernelsTests
             engine.TensorSubtractInPlace(pNaive, update);
         }
 #if NET5_0_OR_GREATER
-        long naiveEnd = GC.GetTotalAllocatedBytes(precise: true);
+        long naiveEnd = GC.GetAllocatedBytesForCurrentThread();
 #else
         long naiveEnd = GC.GetTotalMemory(forceFullCollection: false);
 #endif
@@ -513,7 +505,7 @@ public class OptimizerKernelsTests
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
 
 #if NET5_0_OR_GREATER
-        long fusedStart = GC.GetTotalAllocatedBytes(precise: true);
+        long fusedStart = GC.GetAllocatedBytesForCurrentThread();
 #else
         long fusedStart = GC.GetTotalMemory(forceFullCollection: false);
 #endif
@@ -522,7 +514,7 @@ public class OptimizerKernelsTests
             OptimizerKernels.SgdInPlace(pFused, g, lr);
         }
 #if NET5_0_OR_GREATER
-        long fusedEnd = GC.GetTotalAllocatedBytes(precise: true);
+        long fusedEnd = GC.GetAllocatedBytesForCurrentThread();
 #else
         long fusedEnd = GC.GetTotalMemory(forceFullCollection: false);
 #endif
@@ -535,16 +527,13 @@ public class OptimizerKernelsTests
         _output.WriteLine($"Fused path : {fusedBytes} bytes over {Iters} iters = {perCallFused} bytes/call");
         _output.WriteLine($"Reduction  : {(naiveBytes > 0 ? (double)naiveBytes / Math.Max(fusedBytes, 1) : 0):F1}×");
 
-        // The fused path should allocate at most 1/10th of what the
-        // naive path does — relative assertion robust to coverage,
-        // tier-up, and other env-specific allocation noise.
         // PR #322 review #9, #15: only assert on monotonic byte counter
         // (net5+). net471 falls back to GC.GetTotalMemory which is
         // not monotonic and produces unreliable subtraction results.
 #if NET5_0_OR_GREATER
-        Assert.True(fusedBytes * 10 < naiveBytes || fusedBytes == 0,
-            $"SgdInPlace ({fusedBytes} bytes) is not sufficiently less than the naive path "
-            + $"({naiveBytes} bytes). Expected 10× reduction at minimum.");
+        Assert.True(perCallFused <= MaxFusedBytesPerCall,
+            $"SgdInPlace allocated {perCallFused} bytes per call on the calling thread "
+            + $"(limit {MaxFusedBytesPerCall}); the naive path allocated {perCallNaive}.");
 #endif
     }
 

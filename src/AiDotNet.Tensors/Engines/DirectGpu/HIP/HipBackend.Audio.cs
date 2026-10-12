@@ -6,9 +6,9 @@ public sealed partial class HipBackend : IAudioBackend
     private IntPtr ResolveAudioKernel(string name)
     {
         if (_audioModule == IntPtr.Zero)
-            throw new InvalidOperationException("Audio HIP module was not compiled.");
+            throw new GpuCapabilityUnavailableException("Audio HIP module was not compiled.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         return kernel;
     }
 

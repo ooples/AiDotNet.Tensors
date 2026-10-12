@@ -13,7 +13,7 @@ public sealed partial class MetalBackend
     {
         if (threads <= 0) return true;
         if (library == System.IntPtr.Zero)
-            throw new InvalidOperationException($"Metal {libName} kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException($"Metal {libName} kernels are unavailable.");
         foreach (var b in buffers)
         {
             if (b is not MetalGpuBuffer)

@@ -280,7 +280,7 @@ public sealed partial class MetalBackend
         if (A is not MetalGpuBuffer input || B is not MetalGpuBuffer output)
             throw new ArgumentException("Buffers must be MetalGpuBuffer.");
         if (_residentLibrary == IntPtr.Zero)
-            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("Metal resident kernels are unavailable.");
         var pipeline = GetPipeline("Resident", _residentLibrary, "clip_by_norm_serial");
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);

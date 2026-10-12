@@ -1392,8 +1392,7 @@ public partial class DirectGpuTensorEngine
             var mm = TensorMatMul(a, b);
             return TensorAddScaled(mm, input, alpha, beta);
         }
-        catch (Exception)
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorAddMM", capabilityGap);
             // Any shape/dtype/GPU error: defer to the correct, fully-validated CPU path.
             return base.TensorAddMM(input, a, b, alpha, beta);
         }
@@ -1417,7 +1416,7 @@ public partial class DirectGpuTensorEngine
             return base.TensorMatMul2DWithPrePackedB(a, b, prePackedB);
 
         try { return TensorMatMul(a, b); }
-        catch (Exception) { return base.TensorMatMul2DWithPrePackedB(a, b, prePackedB); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorMatMul2DWithPrePackedB", capabilityGap); return base.TensorMatMul2DWithPrePackedB(a, b, prePackedB); }
     }
 
     /// <inheritdoc/>
@@ -1442,8 +1441,7 @@ public partial class DirectGpuTensorEngine
             if (span.Length != 1) return base.TensorVecDot(a, b);
             return span[0];
         }
-        catch (Exception)
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorVecDot", capabilityGap);
             return base.TensorVecDot(a, b);
         }
     }
@@ -1492,8 +1490,7 @@ public partial class DirectGpuTensorEngine
 
             return MultiplyChainOnGpu(matrices, split, 0, nM - 1);
         }
-        catch (Exception)
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorMultiDot", capabilityGap);
             return base.TensorMultiDot(matrices);
         }
     }
@@ -1552,8 +1549,7 @@ public partial class DirectGpuTensorEngine
             ownershipTransferred = true;
             return result;
         }
-        catch (Exception)
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BatchNormInference", capabilityGap);
             if (!ownershipTransferred) bufOut.Dispose();
             return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon);
         }
@@ -1595,7 +1591,7 @@ public partial class DirectGpuTensorEngine
             for (int i = 0; i < rb - 1; i++) outShape[ra - 1 + i] = b._shape[i];
             return r2.Reshape(outShape);
         }
-        catch (Exception) { return base.TensorInner(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorInner", capabilityGap); return base.TensorInner(a, b); }
     }
 
     /// <inheritdoc/>
@@ -1662,7 +1658,7 @@ public partial class DirectGpuTensorEngine
             foreach (var bx in freeB) outShape[oi++] = b._shape[bx];
             return r2.Reshape(outShape);
         }
-        catch (Exception) { return base.TensorDot(a, b, axesA, axesB); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorDot", capabilityGap); return base.TensorDot(a, b, axesA, axesB); }
     }
 
     private static bool IsIdentityPerm(int[] perm)
@@ -1851,7 +1847,7 @@ public partial class DirectGpuTensorEngine
             perm[axis2] = axis1;
             return TensorPermute(tensor, perm);
         }
-        catch (Exception) { return base.TensorSwapAxes(tensor, axis1, axis2); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSwapAxes", capabilityGap); return base.TensorSwapAxes(tensor, axis1, axis2); }
     }
 
     /// <inheritdoc/>
@@ -1882,7 +1878,7 @@ public partial class DirectGpuTensorEngine
             if (w < rank) perm[w++] = source;
             return TensorPermute(tensor, perm);
         }
-        catch (Exception) { return base.TensorMoveDim(tensor, source, destination); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorMoveDim", capabilityGap); return base.TensorMoveDim(tensor, source, destination); }
     }
 
     /// <inheritdoc/>
@@ -1935,7 +1931,7 @@ public partial class DirectGpuTensorEngine
             }
             return result;
         }
-        catch (Exception) { return base.TensorRot90(tensor, k, axes); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorRot90", capabilityGap); return base.TensorRot90(tensor, k, axes); }
     }
 
     /// <inheritdoc/>
@@ -1974,7 +1970,7 @@ public partial class DirectGpuTensorEngine
             }
             return result;
         }
-        catch (Exception) { return base.TensorTensorSplit(tensor, indices, dim); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorTensorSplit", capabilityGap); return base.TensorTensorSplit(tensor, indices, dim); }
     }
 
     /// <inheritdoc/>
@@ -2012,7 +2008,7 @@ public partial class DirectGpuTensorEngine
             }
             return result;
         }
-        catch (Exception) { return base.TensorSplit(tensor, numSplits, axis); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSplit", capabilityGap); return base.TensorSplit(tensor, numSplits, axis); }
     }
 
     /// <inheritdoc/>
@@ -2043,7 +2039,7 @@ public partial class DirectGpuTensorEngine
             }
             return result;
         }
-        catch (Exception) { return base.TensorUnstack(tensor, axis); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorUnstack", capabilityGap); return base.TensorUnstack(tensor, axis); }
     }
 
     // ----- Category D: elementwise (wiring existing backend kernels) -----
@@ -2073,7 +2069,7 @@ public partial class DirectGpuTensorEngine
                 Autodiff.BackwardFunctions<T>.ClampMinBackward, savedState: new[] { (object?)min ?? throw new InvalidOperationException("Clamp min must not be null") });
             return result;
         }
-        catch (Exception) { return base.TensorClampMin(tensor, min); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorClampMin", capabilityGap); return base.TensorClampMin(tensor, min); }
     }
 
     /// <inheritdoc/>
@@ -2095,7 +2091,7 @@ public partial class DirectGpuTensorEngine
                 Autodiff.BackwardFunctions<T>.ClampMaxBackward, savedState: new[] { (object?)max ?? throw new InvalidOperationException("Clamp max must not be null") });
             return result;
         }
-        catch (Exception) { return base.TensorClampMax(tensor, max); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorClampMax", capabilityGap); return base.TensorClampMax(tensor, max); }
     }
 
     // ----- Category C: gather / scatter (wiring existing backend kernels) -----
@@ -2334,7 +2330,7 @@ public partial class DirectGpuTensorEngine
                 savedState: new object[] { dim < 0 ? dim + x1.Rank : dim, eps });
             return cosRes;
         }
-        catch (Exception) { return base.TensorCosineSimilarity(x1, x2, dim, eps); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCosineSimilarity", capabilityGap); return base.TensorCosineSimilarity(x1, x2, dim, eps); }
     }
 
     private static bool ShapesEqual(int[] a, int[] b)
@@ -2383,7 +2379,7 @@ public partial class DirectGpuTensorEngine
                 backend.Divide(dot, denominator, output, 1);
             });
         }
-        catch { return base.TensorCosineSimilarityLoss(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ShapesEqual", capabilityGap); return base.TensorCosineSimilarityLoss(a, b); }
     }
 
     Tensor<T> IEngine.TensorEmbeddingLookupFromFloatIndices<T>(Tensor<T> embeddings, Tensor<T> floatIndices)
@@ -2702,7 +2698,7 @@ public partial class DirectGpuTensorEngine
                 backend.Subtract(normSum, twiceDot, output, outputLength);
             });
         }
-        catch { return base.PairwiseDistanceSquared(x, y); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.PairwiseDistanceSquared(x, y); }
     }
 
     Tensor<T> IEngine.ReduceMaxBackward<T>(Tensor<T> gradOutput, int[] maxIndices, int[] inputShape)
@@ -2736,7 +2732,7 @@ public partial class DirectGpuTensorEngine
                 }
             });
         }
-        catch { return base.ReduceMaxBackward(gradOutput, maxIndices, inputShape); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.ReduceMaxBackward(gradOutput, maxIndices, inputShape); }
     }
 
     Tensor<T> IEngine.ReduceLogVarianceBackward<T>(
@@ -2787,7 +2783,7 @@ public partial class DirectGpuTensorEngine
                         output, input.Length, 1);
                 });
         }
-        catch { return base.ReduceLogVarianceBackward(gradOutput, input, mean, variance, axes); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.ReduceLogVarianceBackward(gradOutput, input, mean, variance, axes); }
     }
 
     Tensor<T> IEngine.ReduceVarianceBackward<T>(
@@ -3011,7 +3007,7 @@ public partial class DirectGpuTensorEngine
                 new[] { input, centers, epsilons }, BackwardFunctions<T>.RBFKernelBackward, rbfSaved);
             return rbfResult;
         }
-        catch { return base.RBFKernel(input, centers, epsilons); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.RBFKernel(input, centers, epsilons); }
     }
 
     (Tensor<T> gradInput, Tensor<T> gradCenters, Tensor<T> gradEpsilons) IEngine.RBFKernelBackward<T>(
@@ -3205,7 +3201,7 @@ public partial class DirectGpuTensorEngine
                 BackwardFunctions<T>.Upsample3DBackward, new object[] { scaleD, scaleH, scaleW });
             return up3dResult;
         }
-        catch { return base.Upsample3D(input, scaleD, scaleH, scaleW); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.Upsample3D(input, scaleD, scaleH, scaleW); }
     }
 
     Tensor<T> IEngine.Upsample3DBackward<T>(
@@ -3258,7 +3254,7 @@ public partial class DirectGpuTensorEngine
                 }
             });
         }
-        catch { return base.Upsample3DBackward(gradOutput, inputShape, scaleD, scaleH, scaleW); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.Upsample3DBackward(gradOutput, inputShape, scaleD, scaleH, scaleW); }
     }
 
     Tensor<T> IEngine.PositionalEncoding<T>(Tensor<T> positions, int numFrequencies)
@@ -3353,7 +3349,7 @@ public partial class DirectGpuTensorEngine
                     }
                 });
         }
-        catch { return base.PositionalEncoding(positions, numFrequencies); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.PositionalEncoding(positions, numFrequencies); }
     }
 
     Tensor<T> IEngine.PositionalEncodingBackward<T>(
@@ -3465,7 +3461,7 @@ public partial class DirectGpuTensorEngine
                     }
                 });
         }
-        catch { return base.PositionalEncodingBackward(positions, encodedGradient, numFrequencies); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.PositionalEncodingBackward(positions, encodedGradient, numFrequencies); }
     }
 
     Tensor<T> IEngine.Sparsemax<T>(Tensor<T> input, int axis)
@@ -3661,7 +3657,7 @@ public partial class DirectGpuTensorEngine
             outShape[d] = nWindows; outShape[rank] = size;
             return new Tensor<T>(arr, outShape);
         }
-        catch (Exception) { return base.TensorUnfold(tensor, dim, size, step); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorUnfold", capabilityGap); return base.TensorUnfold(tensor, dim, size, step); }
     }
 
     // ----- Misc reductions / construction -----
@@ -3683,7 +3679,7 @@ public partial class DirectGpuTensorEngine
             backend.SumAxis(bufMask.Buffer, count.Buffer, 1, n);
             return (int)System.Math.Round(DownloadScalar(backend, count.Buffer));
         }
-        catch (Exception) { return base.TensorCountNonzero(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCountNonzero", capabilityGap); return base.TensorCountNonzero(tensor); }
     }
 
     /// <inheritdoc/>
@@ -3714,7 +3710,7 @@ public partial class DirectGpuTensorEngine
                 return (T)(object)DownloadScalar(backend, sortedValues.Buffer, medianIndex);
             }
         }
-        catch (Exception) { return base.TensorNanMedian(input); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorNanMedian", capabilityGap); return base.TensorNanMedian(input); }
     }
 
     /// <inheritdoc/>
@@ -3754,7 +3750,7 @@ public partial class DirectGpuTensorEngine
                 BackwardFunctions<T>.BlockDiagBackward);
             return res;
         }
-        catch (Exception) { return base.TensorBlockDiag(matrices); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBlockDiag", capabilityGap); return base.TensorBlockDiag(matrices); }
     }
 
     /// <inheritdoc/>
@@ -3799,7 +3795,7 @@ public partial class DirectGpuTensorEngine
                 BackwardFunctions<T>.CartesianProdBackward);
             return res;
         }
-        catch (Exception) { return base.TensorCartesianProd(tensors); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCartesianProd", capabilityGap); return base.TensorCartesianProd(tensors); }
     }
 
     /// <inheritdoc/>
@@ -3823,7 +3819,7 @@ public partial class DirectGpuTensorEngine
                 backend.Histc(bufIn.Buffer, output, n, bins, mn, mx);
             });
         }
-        catch (Exception) { return base.TensorHistogram(input, bins, min, max); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorHistogram", capabilityGap); return base.TensorHistogram(input, bins, min, max); }
     }
 
     // ----- Stream-compaction family -----
@@ -3916,7 +3912,7 @@ public partial class DirectGpuTensorEngine
                 }
             }
         }
-        catch (Exception) { return base.TensorUnique(input, sorted); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorUnique", capabilityGap); return base.TensorUnique(input, sorted); }
     }
 
     /// <inheritdoc/>
@@ -4230,7 +4226,7 @@ public partial class DirectGpuTensorEngine
             var indicesT = new Tensor<int>(indicesArr, (int[])input._shape.Clone());
             return (valuesT, indicesT);
         }
-        catch (Exception) { return base.TensorSort(input, axis, descending); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvertNumericIndicesToInt32", capabilityGap); return base.TensorSort(input, axis, descending); }
     }
 
     /// <inheritdoc/>
@@ -4294,7 +4290,7 @@ public partial class DirectGpuTensorEngine
                 }
             }
         }
-        catch { return base.TensorTopK(tensor, k, axis, out indices); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorArgsort", capabilityGap); return base.TensorTopK(tensor, k, axis, out indices); }
     }
 
     (Tensor<T> values, Tensor<int> indices) IEngine.TopK<T>(
@@ -4334,7 +4330,7 @@ public partial class DirectGpuTensorEngine
             using (sortedIndices)
                 return (T)(object)DownloadScalar(backend, sortedValues.Buffer, (L - 1) / 2);
         }
-        catch (Exception) { return base.TensorMedian(input); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorMedian", capabilityGap); return base.TensorMedian(input); }
     }
 
     /// <inheritdoc/>
@@ -4359,7 +4355,7 @@ public partial class DirectGpuTensorEngine
                 return ((T)(object)value, index);
             }
         }
-        catch (Exception) { return base.TensorKthvalue(input, k); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorMedian", capabilityGap); return base.TensorKthvalue(input, k); }
     }
 
     /// <inheritdoc/>
@@ -4423,7 +4419,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
             return new Tensor<T>(arr, (int[])indices._shape.Clone());
         }
-        catch (Exception) { return base.TensorTakeAlongDim(tensor, indices, dim); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorTakeAlongDim", capabilityGap); return base.TensorTakeAlongDim(tensor, indices, dim); }
     }
 
     /// <inheritdoc/>
@@ -4449,7 +4445,7 @@ public partial class DirectGpuTensorEngine
             bufOut.RelinquishOwnership();
             return result;
         }
-        catch (Exception) { return base.TensorSearchSorted(sortedSequence, values, right); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSearchSorted", capabilityGap); return base.TensorSearchSorted(sortedSequence, values, right); }
     }
 
     /// <inheritdoc/>
@@ -4582,7 +4578,7 @@ public partial class DirectGpuTensorEngine
             }
             return result;
         }
-        catch (Exception) { return base.TensorMeshgrid(tensors, indexing); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorMeshgrid", capabilityGap); return base.TensorMeshgrid(tensors, indexing); }
     }
 
     /// <inheritdoc/>
@@ -4606,7 +4602,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufOut, outN);
             return new Tensor<T>(arr, new[] { am * bp, an * bq });
         }
-        catch (Exception) { return base.TensorKron(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorKron", capabilityGap); return base.TensorKron(a, b); }
     }
 
     /// <inheritdoc/>
@@ -4630,7 +4626,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufHist, bins);
             return new Tensor<T>(arr, new[] { bins });
         }
-        catch (Exception) { return base.TensorHistc(input, bins, min, max); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorHistc", capabilityGap); return base.TensorHistc(input, bins, min, max); }
     }
 
     /// <inheritdoc/>
@@ -4656,7 +4652,7 @@ public partial class DirectGpuTensorEngine
                 BackwardFunctions<T>.PDistBackward, savedState: new object[] { p });
             return res;
         }
-        catch (Exception) { return base.TensorPDist(input, p); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorPDist", capabilityGap); return base.TensorPDist(input, p); }
     }
 
     /// <inheritdoc/>
@@ -4689,7 +4685,7 @@ public partial class DirectGpuTensorEngine
                 BackwardFunctions<T>.CDistBackward, savedState: new object[] { p });
             return res;
         }
-        catch (Exception) { return base.TensorCDist(x1, x2, p); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCDist", capabilityGap); return base.TensorCDist(x1, x2, p); }
     }
 
     /// <inheritdoc/>
@@ -4921,7 +4917,7 @@ public partial class DirectGpuTensorEngine
             }
             return scatterResult;
         }
-        catch (Exception) { return base.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorScatterReduce", capabilityGap); return base.TensorScatterReduce(tensor, dim, indices, source, mode, includeSelf); }
     }
 
     /// <inheritdoc/>
@@ -5597,7 +5593,7 @@ public partial class DirectGpuTensorEngine
                 savedState: new object[] { d, start, length });
             return sliceResult;
         }
-        catch (Exception) { return base.TensorSliceScatter(tensor, source, dim, start, length); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSliceScatter", capabilityGap); return base.TensorSliceScatter(tensor, source, dim, start, length); }
     }
 
     /// <inheritdoc/>
@@ -5644,7 +5640,7 @@ public partial class DirectGpuTensorEngine
                 savedState: new object[] { d, ix });
             return selResult;
         }
-        catch (Exception) { return base.TensorSelectScatter(tensor, source, dim, index); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSelectScatter", capabilityGap); return base.TensorSelectScatter(tensor, source, dim, index); }
     }
 
     /// <inheritdoc/>
@@ -5864,7 +5860,7 @@ public partial class DirectGpuTensorEngine
             return DispatchDeferredGpuOp<int>(backend, N * 4, new[] { N, 4 }, output =>
                 backend.MasksToBoxes(bufIn.Buffer, output, N, H, W));
         }
-        catch (Exception) { return base.MasksToBoxes(masks); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MasksToBoxes", capabilityGap); return base.MasksToBoxes(masks); }
     }
 
     /// <inheritdoc/>
@@ -5896,7 +5892,7 @@ public partial class DirectGpuTensorEngine
                     bufMins.Buffer, bufMaxs.Buffer, n, d);
             });
         }
-        catch (Exception) { return base.TensorHistogramDD(samples, bins, mins, maxs); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorHistogramDD", capabilityGap); return base.TensorHistogramDD(samples, bins, mins, maxs); }
     }
 
     /// <inheritdoc/>
@@ -6052,7 +6048,7 @@ public partial class DirectGpuTensorEngine
             bufResult.RelinquishOwnership();
             return result;
         }
-        catch (Exception) { return base.TimeStretch(waveform, rate, nFft, hopLength); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TimeStretch", capabilityGap); return base.TimeStretch(waveform, rate, nFft, hopLength); }
     }
 
     /// <inheritdoc/>
@@ -6156,7 +6152,7 @@ public partial class DirectGpuTensorEngine
                 if (!phaseHandedOff) { bufPhase.Dispose(); }
             }
         }
-        catch (Exception) { return base.Spectrogram(waveform, nFft, hopLength, winLength, window); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Spectrogram", capabilityGap); return base.Spectrogram(waveform, nFft, hopLength, winLength, window); }
     }
 
     /// <summary>
@@ -6258,7 +6254,7 @@ public partial class DirectGpuTensorEngine
                 if (!phaseHandedOff) { bufPhase.Dispose(); }
             }
         }
-        catch (Exception) { return base.StftPhase(waveform, nFft, hopLength, winLength, window); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("StftPhase", capabilityGap); return base.StftPhase(waveform, nFft, hopLength, winLength, window); }
     }
 
     // The 3-argument backward entry points are the adjoint of the 3-argument (narrow) GridSample
@@ -6431,7 +6427,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufOut, n);
             return new Tensor<T>(arr, (int[])x._shape.Clone());
         }
-        catch (Exception) { return base.TensorZeta(x, q); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorZeta", capabilityGap); return base.TensorZeta(x, q); }
     }
 
     /// <inheritdoc/>
@@ -6450,7 +6446,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufOut, len);
             return new Tensor<T>(arr, (int[])tensor._shape.Clone());
         }
-        catch (Exception) { return base.TensorPolygamma(n, tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorPolygamma", capabilityGap); return base.TensorPolygamma(n, tensor); }
     }
 
     /// <inheritdoc/>
@@ -6572,7 +6568,7 @@ public partial class DirectGpuTensorEngine
                 BackwardFunctions<T>.NextAfterBackward);
             return res;
         }
-        catch (Exception) { return base.TensorNextAfter(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorNextAfter", capabilityGap); return base.TensorNextAfter(a, b); }
     }
 
     /// <inheritdoc/>
@@ -6599,7 +6595,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufOut, n);
             return new Tensor<T>(arr, (int[])a._shape.Clone());
         }
-        catch (Exception) { return base.TensorCross(a, b, dim); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorCross", capabilityGap); return base.TensorCross(a, b, dim); }
     }
 
     /// <inheritdoc/>
@@ -6671,7 +6667,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufOut, n);
             return new Tensor<T>(arr, (int[])x._shape.Clone());
         }
-        catch (Exception) { return base.TensorLdexp(x, exp); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorLdexp", capabilityGap); return base.TensorLdexp(x, exp); }
     }
 
     // ----- Category D: Tensor<Bit> comparison predicates -----
@@ -6704,7 +6700,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<Bit>(backend, bufOut, n);
             return new Tensor<Bit>(arr, (int[])a._shape.Clone());
         }
-        catch (Exception) { return fallback(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("LogicalBinaryGpu", capabilityGap); return fallback(a, b); }
     }
 
     /// <inheritdoc/>
@@ -6729,7 +6725,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<Bit>(backend, bufOut, n);
             return new Tensor<Bit>(arr, (int[])a._shape.Clone());
         }
-        catch (Exception) { return base.TensorLogicalNot(a); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorLogicalNot", capabilityGap); return base.TensorLogicalNot(a); }
     }
 
     // Deferred (GPU-RESIDENT) variant of PackMask: keeps the float-0/1 mask on the device as a
@@ -6761,7 +6757,7 @@ public partial class DirectGpuTensorEngine
             backend.Equal(bufA.Buffer, bufB.Buffer, bufOut.Buffer, n);
             return PackMaskResident(backend, bufOut, a._shape, n, invert: false);
         }
-        catch (Exception) { return base.TensorEq(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorEq", capabilityGap); return base.TensorEq(a, b); }
     }
 
     /// <inheritdoc/>
@@ -6781,7 +6777,7 @@ public partial class DirectGpuTensorEngine
             backend.NotEqualScalar(bufA.Buffer, bufOut.Buffer, s, n);
             return PackMaskResident(backend, bufOut, a._shape, n, invert: true);
         }
-        catch (Exception) { return base.TensorEqScalar(a, scalar); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorEqScalar", capabilityGap); return base.TensorEqScalar(a, scalar); }
     }
 
     // IEEE classification predicates via the new ClassifyFloat backend kernel (bit-pattern based, so it
@@ -6815,7 +6811,7 @@ public partial class DirectGpuTensorEngine
             if (max is not null) cur = TensorMin(cur, max);   // upper bound: min(x, max)
             return cur;
         }
-        catch (Exception) { return base.TensorClampTensor(tensor, min, max); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorClampTensor", capabilityGap); return base.TensorClampTensor(tensor, min, max); }
     }
 
     /// <inheritdoc/>
@@ -6846,7 +6842,7 @@ public partial class DirectGpuTensorEngine
             float minMask = -backend.DownloadBuffer(bufMin.Buffer)[0];
             return minMask > 0.5f;   // mask is 0/1; min==1 iff every element matched
         }
-        catch (Exception) { return base.TensorEqual(a, b); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorEqual", capabilityGap); return base.TensorEqual(a, b); }
     }
 
     /// <inheritdoc/>
@@ -6861,7 +6857,7 @@ public partial class DirectGpuTensorEngine
             var maskBuf = AllocCloseMask(backend, a, b, rtol, atol, equalNan, out int n);
             return PackMaskResident(backend, maskBuf, a._shape, n, invert: false);
         }
-        catch (Exception) { return base.TensorIsClose(a, b, rtol, atol, equalNan); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorIsClose", capabilityGap); return base.TensorIsClose(a, b, rtol, atol, equalNan); }
     }
 
     /// <inheritdoc/>
@@ -6883,7 +6879,7 @@ public partial class DirectGpuTensorEngine
             float minMask = -backend.DownloadBuffer(bufMin.Buffer)[0];
             return minMask > 0.5f;
         }
-        catch (Exception) { return base.TensorAllClose(a, b, rtol, atol, equalNan); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorAllClose", capabilityGap); return base.TensorAllClose(a, b, rtol, atol, equalNan); }
     }
 
     // Builds the CPU-equivalent <= tolerance mask entirely on-device. Exact equality handles the
@@ -6939,7 +6935,7 @@ public partial class DirectGpuTensorEngine
             backend.ClassifyFloat(bufA.Buffer, bufOut.Buffer, mode, n);
             return PackMaskResident(backend, bufOut, tensor._shape, n, invert: false);
         }
-        catch (Exception) { return fallback(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ClassifyToBit", capabilityGap); return fallback(tensor); }
     }
 
     // ----- Category B: composite forwards -----
@@ -6978,7 +6974,7 @@ public partial class DirectGpuTensorEngine
             bufOut.RelinquishOwnership();
             return result;
         }
-        catch (Exception) { return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("FusedHierarchicalSoftmax", capabilityGap); return base.FusedHierarchicalSoftmax(input, nodeWeights, numClasses); }
     }
 
     /// <inheritdoc/>
@@ -7008,7 +7004,7 @@ public partial class DirectGpuTensorEngine
             bufOut.RelinquishOwnership();
             return result;
         }
-        catch (Exception) { return base.FusedLinearMaxout(input, weights, bias, numPieces); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("FusedLinearMaxout", capabilityGap); return base.FusedLinearMaxout(input, weights, bias, numPieces); }
     }
 
     /// <inheritdoc/>
@@ -7065,8 +7061,7 @@ public partial class DirectGpuTensorEngine
             var arr = FinishGpuOp<T>(backend, bufOut, total);
             return new Tensor<T>(arr, new[] { batch, seqLen, modelDim });
         }
-        catch (Exception)
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Rwkv7SequenceForward", capabilityGap);
             return base.Rwkv7SequenceForward(rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads);
         }
     }
@@ -7594,8 +7589,7 @@ public partial class DirectGpuTensorEngine
             if (s_mhaDiag) MhaDiag(tapeActive);   // PR #638 diag: count tape-active vs tapeless MHA calls
             return result;
         }
-        catch (Exception)
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MultiHeadAttentionForward", capabilityGap);
             return base.MultiHeadAttentionForward(input, qWeight, kWeight, vWeight, outWeight, numHeads, mask);
         }
     }
@@ -7636,8 +7630,7 @@ public partial class DirectGpuTensorEngine
             }
             return cur;
         }
-        catch (Exception)
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MlpForward", capabilityGap);
             return base.MlpForward(input, weights, biases, hiddenActivation, outputActivation,
                 hiddenActivationParams, outputActivationParams);
         }
@@ -7687,7 +7680,7 @@ public partial class DirectGpuTensorEngine
             }
             return cur;
         }
-        catch (Exception) { return base.TensorBroadcastTo(input, targetShape); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBroadcastTo", capabilityGap); return base.TensorBroadcastTo(input, targetShape); }
     }
 
     // ----- Category E: full min/max reduction -----
@@ -7721,7 +7714,7 @@ public partial class DirectGpuTensorEngine
             float minV = -backend.DownloadBuffer(bufNegMax.Buffer)[0];
             return ((T)(object)minV, (T)(object)maxV);
         }
-        catch (Exception) { return base.TensorAminmax(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBroadcastTo", capabilityGap); return base.TensorAminmax(tensor); }
     }
 
     /// <inheritdoc/>
@@ -7746,7 +7739,7 @@ public partial class DirectGpuTensorEngine
             var sum = ReduceSum(diag, null, false);
             return sum.AsSpan()[0];
         }
-        catch (Exception) { return base.TensorTrace(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorTrace", capabilityGap); return base.TensorTrace(tensor); }
     }
 
     private Tensor<T> PermuteResidentGpu<T>(IDirectGpuBackend backend, Tensor<T> tensor, int[] axes,
@@ -7813,7 +7806,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.MaxPool3D(input, poolSize, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("PermuteResidentGpu", capabilityGap); return base.MaxPool3D(input, poolSize, stride, padding); }
     }
 
     /// <inheritdoc/>
@@ -7873,7 +7866,7 @@ public partial class DirectGpuTensorEngine
                 new object[] { attentionWeights, (double)scaleForBackward });
             return result;
         }
-        catch { return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("PermuteResidentGpu", capabilityGap); return base.ScaledDotProductAttention(query, key, value, mask, scale, out attentionWeights); }
     }
 
     /// <inheritdoc/>
@@ -7940,8 +7933,7 @@ public partial class DirectGpuTensorEngine
             gradValueBuffer.RelinquishOwnership();
             return gradOutput;
         }
-        catch
-        {
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("PermuteResidentGpu", capabilityGap);
             return base.ScaledDotProductAttentionBackward(gradOutput, query, key, value,
                 attentionWeights, scale, out gradQuery, out gradKey, out gradValue);
         }
@@ -9250,7 +9242,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch { return base.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride); }
     }
 
     // #775: MaxPool3D with indices. backend.MaxPool3D writes the SPATIAL flat argmax (id*inH*inW+ih*inW+iw)
@@ -9315,7 +9307,7 @@ public partial class DirectGpuTensorEngine
             }
             finally { idxBuf.Dispose(); }
         }
-        catch { return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.MaxPool3DWithIndices(input, poolSize, stride, out maxIndices); }
     }
 
     // #775: AvgPool3D (NCDHW, no-padding). Scalar overload routes to the int[] one through the interface
@@ -9357,7 +9349,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.AvgPool3D(input, poolSize, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.AvgPool3D(input, poolSize, stride, padding); }
     }
 
     // #775: AvgPool3D backward (NCDHW, no-padding). The avgpool3d_backward kernel parallelizes over input
@@ -9388,7 +9380,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch { return base.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding); }
     }
 
     // #775: ConvTranspose2D backward w.r.t. input. Backend kernel gathers per gradInput element (1D over
@@ -9419,7 +9411,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch { return base.ConvTranspose2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
     }
 
     // #775: ConvTranspose2D backward w.r.t. the kernel. Backend zeroes gradKernel + atomic-accumulates.
@@ -9450,7 +9442,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch { return base.ConvTranspose2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }
 
     // #775: Conv3D backward w.r.t. input (no dilation). weights=[outC,inC,kD,kH,kW]; inputShape=[N,inC,D,H,W];
@@ -9482,7 +9474,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch { return base.Conv3DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.Conv3DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation); }
     }
 
     // #775: Conv3D backward w.r.t. weights (no dilation). kernelShape=[outC,inC,kD,kH,kW]; input=[N,inC,D,H,W].
@@ -9514,7 +9506,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch { return base.Conv3DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.Conv3DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation); }
     }
 
     // #775: Conv1D backward == Conv2D backward with a singleton height (exactly how CpuEngine implements
@@ -9576,7 +9568,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch { return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.DepthwiseConv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
     }
 
     Tensor<T> IEngine.DepthwiseConv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape, int[] stride, int[] padding)
@@ -9603,7 +9595,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch { return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.DepthwiseConv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }
 
     // #775: DepthwiseConv1D backward == 2D with a singleton height (mirrors CpuEngine). Route to the 2D path.
@@ -9658,7 +9650,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.TensorTrilinearInterpolate(grid, positions); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorTrilinearInterpolate(grid, positions); }
     }
 
     // #775: trilinear-interpolate backward w.r.t. the grid -> gradGrid [D,H,W,C], via the gather-form kernel.
@@ -9683,7 +9675,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradGridBuf.Dispose(); throw; }
         }
-        catch { return base.TensorTrilinearInterpolateBackward(gradOutput, grid, positions); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorTrilinearInterpolateBackward(gradOutput, grid, positions); }
     }
 
     // #775: ConvTranspose3D forward on the new conv_transpose3d kernel. weights=[inC,outC,kD,kH,kW];
@@ -9717,7 +9709,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.ConvTranspose3D(input, kernel, stride, padding, outputPadding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose3D(input, kernel, stride, padding, outputPadding); }
     }
 
     // #775: ConvTranspose3D backward w.r.t. input. weights=[inC,outC,kD,kH,kW]; inputShape=[N,inC,iD,iH,iW];
@@ -9747,7 +9739,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradInBuf.Dispose(); throw; }
         }
-        catch { return base.ConvTranspose3DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose3DBackwardInput(gradOutput, kernel, inputShape, stride, padding); }
     }
 
     // #775: ConvTranspose3D backward w.r.t. weights. kernelShape=[inC,outC,kD,kH,kW]; input=[N,inC,iD,iH,iW].
@@ -9776,7 +9768,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gradKBuf.Dispose(); throw; }
         }
-        catch { return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.ConvTranspose3DBackwardKernel(gradOutput, input, kernelShape, stride, padding); }
     }
 
     // #775: SpiralConv (mesh conv) on the new spiral_conv kernel. vertexFeatures=[V,inC],
@@ -9808,7 +9800,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.SpiralConv(vertexFeatures, spiralIndices, weights, biases); }
     }
 
     // #775: SpiralConv backward w.r.t. vertex features on the spiral_conv_backward_input kernel.
@@ -9837,7 +9829,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.SpiralConvBackwardInput(outputGradient, spiralIndices, weights, inputChannels); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.SpiralConvBackwardInput(outputGradient, spiralIndices, weights, inputChannels); }
     }
 
     // #775: SpiralConv backward w.r.t. weights on the spiral_conv_backward_weights kernel.
@@ -9867,7 +9859,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.SpiralConvBackwardWeights(outputGradient, vertexFeatures, spiralIndices); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.SpiralConvBackwardWeights(outputGradient, vertexFeatures, spiralIndices); }
     }
 
     // #775: SpiralConv backward w.r.t. bias = sum of outputGradient[V,outC] over vertices -> [outC].
@@ -9917,7 +9909,7 @@ public partial class DirectGpuTensorEngine
             var dw = e.TensorMatMul(diffused, e.TensorTranspose(weights));
             return e.TensorAdd(dw, biases);
         }
-        catch { return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime); }
     }
 
     // #775: AffineGrid (spatial-transformer sampling grid). theta [batch,2,3] -> grid
@@ -9954,7 +9946,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { gridBuf.Dispose(); throw; }
         }
-        catch { return base.AffineGrid(theta, outputHeight, outputWidth); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.AffineGrid(theta, outputHeight, outputWidth); }
     }
 
     // NOTE: PairwiseDistanceSquared was reverted to the CPU base. Its GPU compose (even a single
@@ -9983,7 +9975,7 @@ public partial class DirectGpuTensorEngine
             }
             return base.TensorCosh(tensor);
         }
-        catch { return base.TensorCosh(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorCosh(tensor); }
     }
 
     // #775: TensorSinh on the existing backend.Sinh (sinh_vector) unary kernel — same as TensorCosh.
@@ -10005,7 +9997,7 @@ public partial class DirectGpuTensorEngine
             }
             return base.TensorSinh(tensor);
         }
-        catch { return base.TensorSinh(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorSinh(tensor); }
     }
 
     // #775: TensorReciprocal on the existing backend.Reciprocal (reciprocal_vector = 1/x) unary kernel.
@@ -10020,7 +10012,7 @@ public partial class DirectGpuTensorEngine
                 return new Tensor<T>(result, tensor.Shape._dims);
             return base.TensorReciprocal(tensor);
         }
-        catch { return base.TensorReciprocal(tensor); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool3DBackwardWithTensorIndices", capabilityGap); return base.TensorReciprocal(tensor); }
     }
 
     /// <inheritdoc/>
@@ -10283,7 +10275,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.ComputeGaussianCovariance(rotations, scales); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Scalar", capabilityGap); return base.ComputeGaussianCovariance(rotations, scales); }
     }
 
     // #775: spherical-harmonics color eval on the new spherical_harmonics kernel. shCoefficients
@@ -10316,7 +10308,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Scalar", capabilityGap); return base.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree); }
     }
 
     // #775: SH backward w.r.t. coefficients on the spherical_harmonics_backward kernel -> shGrad
@@ -10351,7 +10343,7 @@ public partial class DirectGpuTensorEngine
             }
             catch { outBuf.Dispose(); throw; }
         }
-        catch { return base.EvaluateSphericalHarmonicsBackward(shCoefficients, viewDirections, degree, outputGradient); }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Scalar", capabilityGap); return base.EvaluateSphericalHarmonicsBackward(shCoefficients, viewDirections, degree, outputGradient); }
     }
 
     // #775: GNN scatter-add (index_add) along dim 0 on the new scatter_add_rows kernel (gather over the
