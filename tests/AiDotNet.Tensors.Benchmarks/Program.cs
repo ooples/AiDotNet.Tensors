@@ -1597,6 +1597,44 @@ class Program
             return;
         }
 
+        // Vulkan row sums: the split path against the one-invocation-per-row kernel (#1157)
+        if (args[0] == "--vulkan-sum-axis")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            foreach (var (rows, cols) in new[] { (1, 65_536), (1, 1_000_000), (1, 33_554_432), (4, 1_000_000), (64, 100_000), (2048, 70_000) })
+            {
+                long total = (long)rows * cols;
+                if (total > 150_000_000) continue;
+                var data = new float[total];
+                var rng = new Random(3);
+                for (int i = 0; i < data.Length; i++) data[i] = rng.Next(-7, 9);
+                using var input = vb.AllocateBuffer(data);
+                using var output = vb.AllocateBuffer(rows);
+                double Median(bool split)
+                {
+                    vb.SplitRowSumsEnabled = split;
+                    int calls = total > 4_000_000 ? 3 : 20;
+                    for (int i = 0; i < 2; i++) vb.SumAxis(input, output, rows, cols);
+                    var samples = new double[9];
+                    for (int s = 0; s < samples.Length; s++)
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < calls; i++) vb.SumAxis(input, output, rows, cols);
+                        samples[s] = sw.Elapsed.TotalMilliseconds / calls;
+                    }
+                    Array.Sort(samples);
+                    Console.WriteLine($"VKSUM {rows}x{cols} {(split ? "split  " : "unsplit")}: median {samples[4]:F3} ms (min {samples[0]:F3}, max {samples[8]:F3})");
+                    return samples[4];
+                }
+                // Interleaved: unsplit, split, unsplit, split.
+                double u1 = Median(false), s1 = Median(true), u2 = Median(false), s2 = Median(true);
+                vb.SplitRowSumsEnabled = true;
+                Console.WriteLine($"VKSUM {rows}x{cols} speedup {Math.Min(u1, u2) / Math.Max(s1, s2):F1}x to {Math.Max(u1, u2) / Math.Min(s1, s2):F1}x");
+            }
+            return;
+        }
+
         // Cost of finding an already-built Vulkan pipeline, which every dispatch pays
         if (args[0] == "--vulkan-pipeline-lookup")
         {
