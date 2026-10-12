@@ -176,24 +176,22 @@ struct P { batch: i32, seqLen: i32, innerDim: i32, stateDim: i32 };
 
     public const string ComplexDiagonalSsmScan = @"
 @group(0) @binding(0) var<storage, read> X: array<f32>;
-@group(0) @binding(1) var<storage, read> Ar: array<f32>;
-@group(0) @binding(2) var<storage, read> Ai: array<f32>;
-@group(0) @binding(3) var<storage, read> Br: array<f32>;
-@group(0) @binding(4) var<storage, read> Bi: array<f32>;
-@group(0) @binding(5) var<storage, read> Cr: array<f32>;
-@group(0) @binding(6) var<storage, read> Ci: array<f32>;
-@group(0) @binding(7) var<storage, read> D: array<f32>;
-@group(0) @binding(8) var<storage, read_write> outp: array<f32>;
+// Real and imaginary halves packed per map (Apk = Ar|Ai, Bpk = Br|Bi, Cpk = Cr|Ci): 6 storage buffers, within WebGPU's 8.
+@group(0) @binding(1) var<storage, read> Apk: array<f32>;
+@group(0) @binding(2) var<storage, read> Bpk: array<f32>;
+@group(0) @binding(3) var<storage, read> Cpk: array<f32>;
+@group(0) @binding(4) var<storage, read> D: array<f32>;
+@group(0) @binding(5) var<storage, read_write> outp: array<f32>;
 struct P { batch:i32, time:i32, groups:i32, width:i32, state:i32 };
-@group(0) @binding(9) var<uniform> p:P;
+@group(0) @binding(6) var<uniform> p:P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>) {
     let gid=i32(id.x); let G=p.groups; let T=p.time; let W=p.width; let S=p.state;
     if(gid>=p.batch*G){return;} let b=gid/G; let g=gid%G; var hr:array<f32,256>;var hi:array<f32,256>;
     for(var n:i32=0;n<S;n=n+1){hr[n]=0.0;hi[n]=0.0;}
     for(var t:i32=0;t<T;t=t+1){let xb=((b*T+t)*G+g)*W;
-        for(var n:i32=0;n<S;n=n+1){let a=g*S+n;let bm=(g*S+n)*W;let orr=hr[n];let oi=hi[n];var nr=Ar[a]*orr-Ai[a]*oi;var ni=Ar[a]*oi+Ai[a]*orr;
-            for(var w:i32=0;w<W;w=w+1){let xv=X[xb+w];nr=nr+Br[bm+w]*xv;ni=ni+Bi[bm+w]*xv;}hr[n]=nr;hi[n]=ni;}
-        for(var w:i32=0;w<W;w=w+1){let cm=(g*W+w)*S;var y=D[g*W+w]*X[xb+w];for(var n:i32=0;n<S;n=n+1){y=y+Cr[cm+n]*hr[n]-Ci[cm+n]*hi[n];}outp[xb+w]=y;}
+        for(var n:i32=0;n<S;n=n+1){let a=g*S+n;let bm=(g*S+n)*W;let orr=hr[n];let oi=hi[n];var nr=Apk[a]*orr-Apk[p.groups*p.state+a]*oi;var ni=Apk[a]*oi+Apk[p.groups*p.state+a]*orr;
+            for(var w:i32=0;w<W;w=w+1){let xv=X[xb+w];nr=nr+Bpk[bm+w]*xv;ni=ni+Bpk[p.groups*p.state*p.width+bm+w]*xv;}hr[n]=nr;hi[n]=ni;}
+        for(var w:i32=0;w<W;w=w+1){let cm=(g*W+w)*S;var y=D[g*W+w]*X[xb+w];for(var n:i32=0;n<S;n=n+1){y=y+Cpk[cm+n]*hr[n]-Cpk[p.groups*p.width*p.state+cm+n]*hi[n];}outp[xb+w]=y;}
     }
 }";
 
@@ -233,9 +231,9 @@ struct P { batch:i32,time:i32,model:i32,heads:i32,headDim:i32 };
 @group(0) @binding(6) var<storage,read_write> output:array<f32>;@group(0) @binding(7) var<storage,read_write> hState:array<f32>;
 struct P{batch:i32,time:i32,model:i32,experts:i32,state:i32};@group(0) @binding(8) var<uniform> p:P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>){let be=i32(id.x);if(be>=p.batch*p.experts){return;}let b=be/p.experts;let e=be%p.experts;let hb=be*p.state;
- for(var s:i32=0;s<p.state;s=s+1){hState[hb+s]=0.0;}for(var t:i32=0;t<p.time;t=t+1){let xb=(b*p.time+t)*p.model;let mi=(b*p.time+t)*p.experts+e;let active=mask[mi];
-  for(var s:i32=0;s<p.state;s=s+1){var next=A[e*p.state+s]*hState[hb+s];let bb=(e*p.state+s)*p.model;for(var d:i32=0;d<p.model;d=d+1){next=next+B[bb+d]*X[xb+d];}hState[hb+s]=active*next;}
-  let yb=((b*p.time+t)*p.experts+e)*p.model;for(var d:i32=0;d<p.model;d=d+1){var y=D[e*p.model+d]*X[xb+d];let cb=(e*p.model+d)*p.state;for(var s:i32=0;s<p.state;s=s+1){y=y+C[cb+s]*hState[hb+s];}output[yb+d]=active*y;}}
+ for(var s:i32=0;s<p.state;s=s+1){hState[hb+s]=0.0;}for(var t:i32=0;t<p.time;t=t+1){let xb=(b*p.time+t)*p.model;let mi=(b*p.time+t)*p.experts+e;let isActive=mask[mi];
+  for(var s:i32=0;s<p.state;s=s+1){var next=A[e*p.state+s]*hState[hb+s];let bb=(e*p.state+s)*p.model;for(var d:i32=0;d<p.model;d=d+1){next=next+B[bb+d]*X[xb+d];}hState[hb+s]=isActive*next;}
+  let yb=((b*p.time+t)*p.experts+e)*p.model;for(var d:i32=0;d<p.model;d=d+1){var y=D[e*p.model+d]*X[xb+d];let cb=(e*p.model+d)*p.state;for(var s:i32=0;s<p.state;s=s+1){y=y+C[cb+s]*hState[hb+s];}output[yb+d]=isActive*y;}}
 }";
 
     public const string Mamba2Ssd = @"
@@ -288,7 +286,7 @@ struct P { N: i32, d: i32, vocab: i32 };
 @group(0) @binding(0) var<storage, read> hidden: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read> target: array<f32>;
+@group(0) @binding(3) var<storage, read> tgt: array<f32>;
 @group(0) @binding(4) var<storage, read_write> rowLoss: array<f32>;
 struct P { N: i32, d: i32, vocab: i32 };
 @group(0) @binding(5) var<uniform> p: P;
@@ -302,7 +300,7 @@ struct P { N: i32, d: i32, vocab: i32 };
     var sumExp: f32 = 0.0;
     for (var vv: i32 = 0; vv < VC; vv = vv+1) { var s = bias[vv]; for (var j: i32 = 0; j < D; j = j+1) { s = s + hidden[hRow+j]*weight[j*VC+vv]; } sumExp = sumExp + exp(s - mx); }
     let lse = mx + log(sumExp); var rl: f32 = 0.0;
-    for (var vv: i32 = 0; vv < VC; vv = vv+1) { var s = bias[vv]; for (var j: i32 = 0; j < D; j = j+1) { s = s + hidden[hRow+j]*weight[j*VC+vv]; } rl = rl + target[tRow+vv]*(s - lse); }
+    for (var vv: i32 = 0; vv < VC; vv = vv+1) { var s = bias[vv]; for (var j: i32 = 0; j < D; j = j+1) { s = s + hidden[hRow+j]*weight[j*VC+vv]; } rl = rl + tgt[tRow+vv]*(s - lse); }
     rowLoss[r] = -rl;
 }";
 
@@ -333,17 +331,16 @@ struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 }
 
     public const string GlaBackward = @"
 @group(0) @binding(0) var<storage, read> dOut: array<f32>;
-@group(0) @binding(1) var<storage, read> Q: array<f32>;
-@group(0) @binding(2) var<storage, read> K: array<f32>;
-@group(0) @binding(3) var<storage, read> Vd: array<f32>;
-@group(0) @binding(4) var<storage, read> G: array<f32>;
-@group(0) @binding(5) var<storage, read> Straj: array<f32>;
-@group(0) @binding(6) var<storage, read_write> dQ: array<atomic<u32>>;
-@group(0) @binding(7) var<storage, read_write> dK: array<atomic<u32>>;
-@group(0) @binding(8) var<storage, read_write> dV: array<f32>;
-@group(0) @binding(9) var<storage, read_write> dG: array<atomic<u32>>;
+// QKpk = Q|K and GSpk = G|Straj, each packed: 8 storage buffers, WebGPU's guaranteed per-stage limit.
+@group(0) @binding(1) var<storage, read> QKpk: array<f32>;
+@group(0) @binding(2) var<storage, read> Vd: array<f32>;
+@group(0) @binding(3) var<storage, read> GSpk: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dQ: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> dK: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> dV: array<f32>;
+@group(0) @binding(7) var<storage, read_write> dG: array<atomic<u32>>;
 struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
-@group(0) @binding(10) var<uniform> p: P;
+@group(0) @binding(8) var<uniform> p: P;
 fn addDQ(idx: i32, val: f32) { var old = atomicLoad(&dQ[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dQ[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
 fn addDK(idx: i32, val: f32) { var old = atomicLoad(&dK[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dK[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
 fn addDG(idx: i32, val: f32) { var old = atomicLoad(&dG[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dG[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
@@ -355,13 +352,13 @@ fn addDG(idx: i32, val: f32) { var old = atomicLoad(&dG[idx]); loop { let nv = b
     var dSrow: array<f32, 256>;
     for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
     for (var t: i32 = SL-1; t >= 0; t = t-1) {
-        let baseOff = (b*SL+t)*MD + hOff; let gOff = (b*SL+t)*NH + h; let g = G[gOff];
+        let baseOff = (b*SL+t)*MD + hOff; let gOff = (b*SL+t)*NH + h; let g = GSpk[gOff];
         let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
         let sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
         let dOutVal = dOut[baseOff+di];
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let sval = Straj[trajBase+ki]; addDQ(baseOff+ki, dOutVal*sval); dSrow[ki] = dSrow[ki] + dOutVal*Q[baseOff+ki]; }
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let sval = GSpk[p.batch*p.seqLen*p.numHeads+trajBase+ki]; addDQ(baseOff+ki, dOutVal*sval); dSrow[ki] = dSrow[ki] + dOutVal*QKpk[baseOff+ki]; }
         let vd = Vd[baseOff+di]; var dg: f32 = 0.0; var dVacc: f32 = 0.0;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let dStv = dSrow[ki]; var sprev: f32 = 0.0; if (t > 0) { sprev = Straj[sprevBase+ki]; } dg = dg + dStv*sprev; addDK(baseOff+ki, dStv*vd); dVacc = dVacc + dStv*K[baseOff+ki]; }
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let dStv = dSrow[ki]; var sprev: f32 = 0.0; if (t > 0) { sprev = GSpk[p.batch*p.seqLen*p.numHeads+sprevBase+ki]; } dg = dg + dStv*sprev; addDK(baseOff+ki, dStv*vd); dVacc = dVacc + dStv*QKpk[p.batch*p.seqLen*p.modelDim+baseOff+ki]; }
         dV[baseOff+di] = dVacc;
         addDG(gOff, dg);
         for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = dSrow[ki] * g; }

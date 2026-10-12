@@ -54,7 +54,7 @@ fn p210_i0(x: f32) -> f32 {
     let ax = abs(x);
     // Asymptotic branch is exp(ax)/sqrt(ax); at ax=+inf that's inf/inf=NaN.
     // WGSL has no isinf(); abs > f32::MAX flags +/-inf.
-    if (ax > 3.4028234e38) { return 1.0 / 0.0; }
+    if (ax > 3.4028234e38) { return wgsl_f32_bits(0x7F800000u); }
     if (ax < 3.75) {
         var y = x / 3.75;
         y = y * y;
@@ -71,7 +71,7 @@ fn p210_i0(x: f32) -> f32 {
 fn p210_i1(x: f32) -> f32 {
     let ax = abs(x);
     // I1 is odd: I1(+inf) = +inf, I1(-inf) = -inf.  Avoid exp/sqrt NaN.
-    if (ax > 3.4028234e38) { if (x < 0.0) { return -1.0 / 0.0; } else { return 1.0 / 0.0; } }
+    if (ax > 3.4028234e38) { if (x < 0.0) { return wgsl_f32_bits(0xFF800000u); } else { return wgsl_f32_bits(0x7F800000u); } }
     var ans : f32;
     if (ax < 3.75) {
         var y = x / 3.75; y = y * y;
@@ -322,9 +322,9 @@ struct P { outerSize: i32, idxAxis: i32, innerSize: i32, srcAxis: i32 };
     let tmp = gid / p.innerSize;
     let i = tmp % p.idxAxis;
     let outer = tmp / p.idxAxis;
-    let target = idx[gid];
-    let srcIdx = (outer * p.srcAxis + target) * p.innerSize + inner;
-    if (target >= 0 && target < p.srcAxis) { o[gid] = a[srcIdx]; } else { o[gid] = 0.0; }
+    let tgt = idx[gid];
+    let srcIdx = (outer * p.srcAxis + tgt) * p.innerSize + inner;
+    if (tgt >= 0 && tgt < p.srcAxis) { o[gid] = a[srcIdx]; } else { o[gid] = 0.0; }
 }
 ";
 
@@ -342,9 +342,9 @@ struct P { outerSize: i32, dstAxis: i32, innerSize: i32, idxLen: i32 };
     let tmp = gid / p.innerSize;
     let i = tmp % p.idxLen;
     let outer = tmp / p.idxLen;
-    let target = idx[i];
-    if (target < 0 || target >= p.dstAxis) { return; }
-    o[(outer * p.dstAxis + target) * p.innerSize + inner] =
+    let tgt = idx[i];
+    if (tgt < 0 || tgt >= p.dstAxis) { return; }
+    o[(outer * p.dstAxis + tgt) * p.innerSize + inner] =
         src[(outer * p.idxLen + i) * p.innerSize + inner];
 }
 ";
@@ -362,9 +362,9 @@ struct P { outerSize: i32, dstAxis: i32, innerSize: i32, idxLen: i32, fillValue:
     let tmp = gid / p.innerSize;
     let i = tmp % p.idxLen;
     let outer = tmp / p.idxLen;
-    let target = idx[i];
-    if (target < 0 || target >= p.dstAxis) { return; }
-    o[(outer * p.dstAxis + target) * p.innerSize + inner] = p.fillValue;
+    let tgt = idx[i];
+    if (tgt < 0 || tgt >= p.dstAxis) { return; }
+    o[(outer * p.dstAxis + tgt) * p.innerSize + inner] = p.fillValue;
 }
 ";
 
@@ -384,10 +384,10 @@ struct P { size: i32 };
     let ax = abs(a[gid]); let bx = abs(b[gid]);
     let axInf = ax > 3.4028234e38;
     let bxInf = bx > 3.4028234e38;
-    if (axInf || bxInf) { o[gid] = 1.0 / 0.0; return; }
+    if (axInf || bxInf) { o[gid] = wgsl_f32_bits(0x7F800000u); return; }
     let axNaN = !(ax == ax);
     let bxNaN = !(bx == bx);
-    if (axNaN || bxNaN) { o[gid] = 0.0 / 0.0; return; }
+    if (axNaN || bxNaN) { o[gid] = wgsl_f32_bits(0x7FC00000u); return; }
     let hi = max(ax, bx); let lo = min(ax, bx);
     if (hi == 0.0) { o[gid] = 0.0; return; }
     let r = lo / hi;
@@ -422,7 +422,7 @@ struct P { size: i32 };
     if (gid >= p.size) { return; }
     let bv = b[gid];
     // torch.fmod(x, 0) = NaN for fp; WGSL has no NAN literal so 0.0/0.0.
-    if (bv == 0.0) { o[gid] = 0.0 / 0.0; return; }
+    if (bv == 0.0) { o[gid] = wgsl_f32_bits(0x7FC00000u); return; }
     let av = a[gid];
     let q = trunc(av / bv);
     o[gid] = av - q * bv;
@@ -439,7 +439,7 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let av = a[gid]; let bv = b[gid];
-    if (bv == 0.0) { o[gid] = 0.0 / 0.0; return; }
+    if (bv == 0.0) { o[gid] = wgsl_f32_bits(0x7FC00000u); return; }
     let q = floor(av / bv);
     o[gid] = av - q * bv;
 }
@@ -467,7 +467,7 @@ struct P { size: i32 };
             return;
         }
         // Non-integer exponent on negative base -> NaN (matches pytorch).
-        o[gid] = 0.0 / 0.0;
+        o[gid] = wgsl_f32_bits(0x7FC00000u);
         return;
     }
     o[gid] = pow(x, y);
@@ -560,10 +560,10 @@ struct P { size: i32 };
     if (gid >= p.size) { return; }
     let y = a[gid];
     // Domain: [-1, 1].  Exact +/-1 -> +/-infinity; anything strictly outside is NaN.
-    // WGSL has no INF / NaN literals so we construct them via 1.0/0.0 and 0.0/0.0.
-    if (y == 1.0) { o[gid] = 1.0 / 0.0; return; }
-    if (y == -1.0) { o[gid] = -1.0 / 0.0; return; }
-    if (y < -1.0 || y > 1.0) { o[gid] = 0.0 / 0.0; return; }
+    // WGSL has no INF / NaN literals so we construct them via wgsl_f32_bits(0x7F800000u) and 0.0/0.0.
+    if (y == 1.0) { o[gid] = wgsl_f32_bits(0x7F800000u); return; }
+    if (y == -1.0) { o[gid] = wgsl_f32_bits(0xFF800000u); return; }
+    if (y < -1.0 || y > 1.0) { o[gid] = wgsl_f32_bits(0x7FC00000u); return; }
     let ln = log(1.0 - y * y);
     let ac = 0.147;
     let pi : f32 = 3.14159265358979;
@@ -604,7 +604,7 @@ struct P { size: i32 };
     // Reflection for x <= 0 (avoids log of non-positive in asymptotic tail).
     // psi(x) = psi(1-x) - pi * cot(pi*x); poles at non-positive integers.
     if (x <= 0.0) {
-        if (x == floor(x)) { o[gid] = 0.0 / 0.0; return; }
+        if (x == floor(x)) { o[gid] = wgsl_f32_bits(0x7FC00000u); return; }
         let sp = sin(pi * x);
         result = -pi * cos(pi * x) / sp;
         x = 1.0 - x;

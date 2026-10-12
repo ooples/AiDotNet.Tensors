@@ -96,8 +96,8 @@ struct P { numVectors: i32, numCentroids: i32, dim: i32, metric: i32 };
     if (i >= p.numVectors) { return; }
     let vOff = i * p.dim;
     var best : i32 = 0;
-    var bestScore : f32 = bitcast<f32>(0x7f800000u);   // +inf (WorstScore for L2)
-    if (p.metric == 1) { bestScore = bitcast<f32>(0xff800000u); }  // -inf (WorstScore for IP)
+    var bestScore : f32 = wgsl_f32_bits(0x7f800000u);   // +inf (WorstScore for L2)
+    if (p.metric == 1) { bestScore = wgsl_f32_bits(0xff800000u); }  // -inf (WorstScore for IP)
     for (var c : i32 = 0; c < p.numCentroids; c = c + 1) {
         let cOff = c * p.dim;
         var score : f32 = 0.0;
