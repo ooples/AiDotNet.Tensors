@@ -1,3 +1,4 @@
+#if NET7_0_OR_GREATER
 // Copyright (c) AiDotNet. All rights reserved.
 // WebGPU IFusedAttentionBackend (#1179): the portable fused attention over the shared fa_p_ kernels.
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -17,3 +18,4 @@ public sealed partial class WebGpuBackend : IFusedAttentionBackend
         IGpuBuffer lse, IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim)
         => P.Backward(this, LaunchBatch, q, k, v, o, dO, lse, mask, dQ, dK, dV, p, headDim);
 }
+#endif

@@ -12,17 +12,17 @@ internal static partial class BatchExecutionCudaKernels
     // (q * scale) . k, an optional soft-cap cap * tanh(s / cap), causal masking j <= i + offset, an optional int32 mask
     // (0 masks) through its own strides, lse = -inf for a row with no allowed key. One thread per output element, scores
     // recomputed rather than tiled, so the source carries no per-thread arrays, atomics or helper functions and
-    // translates mechanically to OpenCL, Metal and GLSL. Every integer argument travels in the meta buffer (a GLSL push
+    // translates mechanically to OpenCL, Metal and GLSL. Every integer argument travels in the fam buffer (a GLSL push
     // block holds 128 bytes, too few for the strides): B H Sq Sk D, q k v o strides (batch, head, row), mask strides
     // (batch, head, row, column), causal, causal offset, has-mask; fp holds scale and soft-cap.
     internal const string AttentionSource = @"
-#define FA_META int H = meta[1]; int Sq = meta[2]; int Sk = meta[3]; int D = meta[4]; int qb = meta[5]; int qh = meta[6]; int qr = meta[7]; int kb = meta[8]; int kh = meta[9]; int kr = meta[10]; int vb = meta[11]; int vh = meta[12]; int vr = meta[13]; int ob = meta[14]; int oh = meta[15]; int orw = meta[16]; int mb = meta[17]; int mh = meta[18]; int mi = meta[19]; int mj = meta[20]; int causal = meta[21]; int coff = meta[22]; int hasMask = meta[23];
+#define FA_META int H = fam[1]; int Sq = fam[2]; int Sk = fam[3]; int D = fam[4]; int qb = fam[5]; int qh = fam[6]; int qr = fam[7]; int kb = fam[8]; int kh = fam[9]; int kr = fam[10]; int vb = fam[11]; int vh = fam[12]; int vr = fam[13]; int ob = fam[14]; int oh = fam[15]; int orw = fam[16]; int mb = fam[17]; int mh = fam[18]; int mi = fam[19]; int mj = fam[20]; int causal = fam[21]; int coff = fam[22]; int hasMask = fam[23];
 #define FA_ALLOWED(I, J) (!(causal != 0 && (J) > (I) + coff) && !(hasMask != 0 && mask[b * mb + h * mh + (I) * mi + (J) * mj] == 0))
 #define FA_SCORE(I, J, S) { S = 0.0f; for (int fa_d = 0; fa_d < D; fa_d++) S += (q[b * qb + h * qh + (I) * qr + fa_d] * scale) * k[b * kb + h * kh + (J) * kr + fa_d]; }
 #define FA_CAP(S, SL) { SL = 1.0f; if (cap > 0.0f) { float fa_t = tanhf(S / cap); SL = 1.0f - fa_t * fa_t; S = cap * fa_t; } }
 #define FA_DP(I, J, DP) { DP = 0.0f; for (int fa_e = 0; fa_e < D; fa_e++) DP += dout[b * ob + h * oh + (I) * orw + fa_e] * v[b * vb + h * vh + (J) * vr + fa_e]; }
 
-extern ""C"" __global__ __launch_bounds__(256) void fa_p_lse(const float* q, const float* k, const int* meta, const float* fp, const int* mask, float* lse, int total) {
+extern ""C"" __global__ __launch_bounds__(256) void fa_p_lse(const float* q, const float* k, const int* fam, const float* fp, const int* mask, float* lse, int total) {
     int t = bx_gid(); if (t >= total) return;
     FA_META
     float scale = fp[0]; float cap = fp[1];
@@ -44,7 +44,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fa_p_lse(const float* q, con
     lse[t] = m + logf(l);
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fa_p_out(const float* q, const float* k, const float* v, const int* meta, const float* fp, const int* mask, const float* lse, float* o, int total) {
+extern ""C"" __global__ __launch_bounds__(256) void fa_p_out(const float* q, const float* k, const float* v, const int* fam, const float* fp, const int* mask, const float* lse, float* o, int total) {
     int t = bx_gid(); if (t >= total) return;
     FA_META
     float scale = fp[0]; float cap = fp[1];
@@ -60,7 +60,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fa_p_out(const float* q, con
     o[b * ob + h * oh + i * orw + e] = acc;
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fa_p_delta(const float* o, const float* dout, const int* meta, float* delta, int total) {
+extern ""C"" __global__ __launch_bounds__(256) void fa_p_delta(const float* o, const float* dout, const int* fam, float* delta, int total) {
     int t = bx_gid(); if (t >= total) return;
     FA_META
     int i = t % Sq; int bh = t / Sq; int b = bh / H; int h = bh % H;
@@ -69,7 +69,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fa_p_delta(const float* o, c
     delta[t] = acc;
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fa_p_dq(const float* q, const float* k, const float* v, const float* dout, const float* lse, const float* delta, const int* meta, const float* fp, const int* mask, float* dq, int total) {
+extern ""C"" __global__ __launch_bounds__(256) void fa_p_dq(const float* q, const float* k, const float* v, const float* dout, const float* lse, const float* delta, const int* fam, const float* fp, const int* mask, float* dq, int total) {
     int t = bx_gid(); if (t >= total) return;
     FA_META
     float scale = fp[0]; float cap = fp[1];
@@ -87,7 +87,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fa_p_dq(const float* q, cons
     dq[b * qb + h * qh + i * qr + e] = acc * scale;
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void fa_p_dkv(const float* q, const float* k, const float* v, const float* dout, const float* lse, const float* delta, const int* meta, const float* fp, const int* mask, float* dk, float* dv, int total) {
+extern ""C"" __global__ __launch_bounds__(256) void fa_p_dkv(const float* q, const float* k, const float* v, const float* dout, const float* lse, const float* delta, const int* fam, const float* fp, const int* mask, float* dk, float* dv, int total) {
     int t = bx_gid(); if (t >= total) return;
     FA_META
     float scale = fp[0]; float cap = fp[1];

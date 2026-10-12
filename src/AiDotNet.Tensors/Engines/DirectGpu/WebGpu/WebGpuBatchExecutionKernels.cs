@@ -772,6 +772,125 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
         }
     }
 }");
+    // #1179 fused attention: line-for-line ports of BatchExecutionCudaKernels.AttentionSource (WGSL reserves "meta",
+    // hence "fam" for the metadata buffer on every port). -inf is tested on its bits, since WGSL lets an implementation
+    // assume floats are finite.
+    private const string FaLoad = @"
+struct Fa { H: i32, Sq: i32, Sk: i32, D: i32, qb: i32, qh: i32, qr: i32, kb: i32, kh: i32, kr: i32, vb: i32, vh: i32,
+    vr: i32, ob: i32, oh: i32, orw: i32, mb: i32, mh: i32, mi: i32, mj: i32, causal: i32, coff: i32, hasMask: i32 }
+fn fa_load() -> Fa {
+    return Fa(fam[1], fam[2], fam[3], fam[4], fam[5], fam[6], fam[7], fam[8], fam[9], fam[10], fam[11], fam[12], fam[13],
+        fam[14], fam[15], fam[16], fam[17], fam[18], fam[19], fam[20], fam[21], fam[22], fam[23]);
+}
+fn fa_neg_inf() -> f32 { let bits = 0xff800000u; return bitcast<f32>(bits); }
+fn fa_has_keys(lr: f32) -> bool { return bitcast<u32>(lr) != 0xff800000u; }
+";
+
+    private const string FaScore = @"
+fn fa_allowed(f: Fa, b: i32, h: i32, i: i32, j: i32) -> bool {
+    if (f.causal != 0 && j > i + f.coff) { return false; }
+    if (f.hasMask != 0 && mask[b * f.mb + h * f.mh + i * f.mi + j * f.mj] == 0) { return false; }
+    return true;
+}
+// The capped score and d(capped) / d(raw).
+fn fa_score(f: Fa, b: i32, h: i32, i: i32, j: i32) -> vec2<f32> {
+    let scale = fp[0]; let cap = fp[1];
+    var s = 0.0;
+    for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
+    if (cap > 0.0) { let t = tanh(s / cap); return vec2<f32>(cap * t, 1.0 - t * t); }
+    return vec2<f32>(s, 1.0);
+}
+";
+
+    private const string FaDp = @"
+fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
+    var dp = 0.0;
+    for (var e = 0; e < f.D; e++) { dp += dout[b * f.ob + h * f.oh + i * f.orw + e] * v[b * f.vb + h * f.vh + j * f.vr + e]; }
+    return dp;
+}
+";
+
+    public static readonly string FaLse = Shader(new[] { "r:q", "r:k", "r:fam:i32", "r:fp", "r:mask:i32", "rw:lse" }, "total: i32",
+        FaLoad + FaScore + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let qi = i % f.Sq; let bh = i / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    var m = 0.0; var seen = false;
+    for (var j = 0; j < f.Sk; j++) {
+        if (!fa_allowed(f, b, h, qi, j)) { continue; }
+        let s = fa_score(f, b, h, qi, j).x;
+        if (!seen || s > m) { m = s; }
+        seen = true;
+    }
+    if (!seen) { lse[i] = fa_neg_inf(); return; }
+    var l = 0.0;
+    for (var j = 0; j < f.Sk; j++) {
+        if (!fa_allowed(f, b, h, qi, j)) { continue; }
+        l += exp(fa_score(f, b, h, qi, j).x - m);
+    }
+    lse[i] = m + log(l);
+}");
+
+    public static readonly string FaOut = Shader(new[] { "r:q", "r:k", "r:v", "r:fam:i32", "r:fp", "r:mask:i32", "r:lse", "rw:o" },
+        "total: i32", FaLoad + FaScore + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let e = i % f.D; let r = i / f.D; let qi = r % f.Sq; let bh = r / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    let lr = lse[r]; var acc = 0.0;
+    if (fa_has_keys(lr)) {
+        for (var j = 0; j < f.Sk; j++) {
+            if (!fa_allowed(f, b, h, qi, j)) { continue; }
+            acc += exp(fa_score(f, b, h, qi, j).x - lr) * v[b * f.vb + h * f.vh + j * f.vr + e];
+        }
+    }
+    o[b * f.ob + h * f.oh + qi * f.orw + e] = acc;
+}");
+
+    public static readonly string FaDelta = Shader(new[] { "r:o", "r:dout", "r:fam:i32", "rw:delta" }, "total: i32", FaLoad + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let qi = i % f.Sq; let bh = i / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    var acc = 0.0;
+    for (var e = 0; e < f.D; e++) { acc += dout[b * f.ob + h * f.oh + qi * f.orw + e] * o[b * f.ob + h * f.oh + qi * f.orw + e]; }
+    delta[i] = acc;
+}");
+
+    public static readonly string FaDq = Shader(
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:lse", "r:delta", "r:fam:i32", "r:fp", "r:mask:i32", "rw:dq" }, "total: i32",
+        FaLoad + FaScore + FaDp + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let e = i % f.D; let r = i / f.D; let qi = r % f.Sq; let bh = r / f.Sq; let b = bh / f.H; let h = bh % f.H;
+    let lr = lse[r]; var acc = 0.0;
+    if (fa_has_keys(lr)) {
+        let dl = delta[r];
+        for (var j = 0; j < f.Sk; j++) {
+            if (!fa_allowed(f, b, h, qi, j)) { continue; }
+            let s = fa_score(f, b, h, qi, j);
+            acc += exp(s.x - lr) * (fa_dp(f, b, h, qi, j) - dl) * s.y * k[b * f.kb + h * f.kh + j * f.kr + e];
+        }
+    }
+    dq[b * f.qb + h * f.qh + qi * f.qr + e] = acc * fp[0];
+}");
+
+    public static readonly string FaDkv = Shader(
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:lse", "r:delta", "r:fam:i32", "r:fp", "r:mask:i32", "rw:dk", "rw:dv" },
+        "total: i32", FaLoad + FaScore + FaDp + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let e = i % f.D; let r = i / f.D; let j = r % f.Sk; let bh = r / f.Sk; let b = bh / f.H; let h = bh % f.H;
+    var ak = 0.0; var av = 0.0;
+    for (var qi = 0; qi < f.Sq; qi++) {
+        let lr = lse[bh * f.Sq + qi];
+        if (!fa_has_keys(lr) || !fa_allowed(f, b, h, qi, j)) { continue; }
+        let s = fa_score(f, b, h, qi, j);
+        let pr = exp(s.x - lr);
+        av += pr * dout[b * f.ob + h * f.oh + qi * f.orw + e];
+        ak += pr * (fa_dp(f, b, h, qi, j) - delta[bh * f.Sq + qi]) * s.y * q[b * f.qb + h * f.qh + qi * f.qr + e] * fp[0];
+    }
+    dk[b * f.kb + h * f.kh + j * f.kr + e] = ak;
+    dv[b * f.vb + h * f.vh + j * f.vr + e] = av;
+}");
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
@@ -795,6 +914,8 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
         [BatchExecutionCudaKernels.LaCholeskyBackwardLower] = LaCholeskyBackwardLower,
         [BatchExecutionCudaKernels.LaSolveBackwardVector] = LaSolveBackwardVector, [BatchExecutionCudaKernels.LaSvdReduced] = LaSvdReduced,
         [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
+        [BatchExecutionCudaKernels.FaLse] = FaLse, [BatchExecutionCudaKernels.FaOut] = FaOut, [BatchExecutionCudaKernels.FaDelta] = FaDelta,
+        [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDkv] = FaDkv,
     };
 }
 #endif

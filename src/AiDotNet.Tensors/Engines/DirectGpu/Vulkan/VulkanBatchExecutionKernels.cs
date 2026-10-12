@@ -38,6 +38,10 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
 
     private static Dictionary<string, string> TranslateSolvers(string cuda)
     {
+        // The math names map on the whole source, so the #define bodies copied verbatim below are translated too.
+        cuda = Regex.Replace(cuda, @"\b(sqrt|fabs|fmax|exp|log|tanh)f\(",
+            m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
+            RegexOptions.None, RegexTimeout);
         var defines = new StringBuilder();
         foreach (Match d in Regex.Matches(cuda, @"^#define [^\n]*\n", RegexOptions.Multiline, RegexTimeout)) defines.Append(d.Value);
         var kernels = Regex.Matches(cuda, @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\) \{",
