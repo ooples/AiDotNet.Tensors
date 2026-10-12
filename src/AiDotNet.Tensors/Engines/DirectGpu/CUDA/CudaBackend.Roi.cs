@@ -8,9 +8,9 @@ public sealed partial class CudaBackend : IRoiBackend
     private IntPtr ResolveRoiKernel(string name)
     {
         if (_roiModule == IntPtr.Zero)
-            throw new InvalidOperationException("RoI CUDA module was not compiled.");
+            throw new GpuCapabilityUnavailableException("RoI CUDA module was not compiled.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         return kernel;
     }
 

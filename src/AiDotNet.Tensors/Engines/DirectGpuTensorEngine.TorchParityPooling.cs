@@ -113,8 +113,7 @@ public partial class DirectGpuTensorEngine
             var outShape = x._shape.Take(x.Rank - dims).Concat(plan.OutputSize).ToArray();
             return Reshape(reduced, outShape);
         }
-        catch (Exception ex)
-        {
+        catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback(opName, ex);
             return null;
         }

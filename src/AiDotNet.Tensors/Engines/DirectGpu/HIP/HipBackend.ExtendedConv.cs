@@ -12,7 +12,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
     {
         if (numGaussians <= 0) return;
         if (!_kernelCache.TryGetValue("gaussian_covariance", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: gaussian_covariance");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gaussian_covariance");
         uint gridDim = (uint)((numGaussians + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr r = rotations.Handle, s = scales.Handle, c = covariances.Handle;
         int ng = numGaussians;
@@ -28,7 +28,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(numPoints * numChannels);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spherical_harmonics", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: spherical_harmonics");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: spherical_harmonics");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr sh = shCoefficients.Handle, vd = viewDirections.Handle, o = output.Handle;
         int np = numPoints, bc = basisCount, nc = numChannels, deg = degree, bd = broadcastDir;
@@ -46,7 +46,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(numPoints * basisCount * numChannels);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spherical_harmonics_backward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: spherical_harmonics_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: spherical_harmonics_backward");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr sh = shCoefficients.Handle, vd = viewDirections.Handle, og = outputGradient.Handle, sg = shGrad.Handle;
         int np = numPoints, bc = basisCount, nc = numChannels, deg = degree, bd = broadcastDir;
@@ -76,7 +76,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
     {
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pa = a.Handle, pb = b.Handle, pc = c.Handle;
         int vN = n, vInC = inC, vH = h, vW = w, vM = m, vOH = outH, vOW = outW, vKH = kH, vKW = kW;
@@ -98,7 +98,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
     {
         if (batch * channels * outDepth <= 0) return;
         if (!_kernelCache.TryGetValue("avgpool3d", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: avgpool3d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: avgpool3d");
         const int blockSize = 8;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
@@ -125,7 +125,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
     {
         if (batch * channels * inDepth <= 0) return;
         if (!_kernelCache.TryGetValue("avgpool3d_backward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: avgpool3d_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: avgpool3d_backward");
         const int blockSize = 8;
         uint gridX = (uint)((inWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((inHeight + blockSize - 1) / blockSize);
@@ -164,7 +164,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(batch * channels * outHeight * outWidth);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("adaptive_max_pool2d", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: adaptive_max_pool2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adaptive_max_pool2d");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr i = input.Handle, o = output.Handle;
         int vB = batch, vC = channels, vIH = inHeight, vIW = inWidth, vOH = outHeight, vOW = outWidth;
@@ -181,7 +181,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(p * c);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("trilinear_interpolate", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: trilinear_interpolate");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: trilinear_interpolate");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr g = grid.Handle, pos = positions.Handle, o = output.Handle;
         int dd = d, hh = h, ww = w, cc = c, pp = p;
@@ -199,7 +199,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(d * h * w * c);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("trilinear_interpolate_backward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: trilinear_interpolate_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: trilinear_interpolate_backward");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr go = gradOutput.Handle, pos = positions.Handle, gg = gradGrid.Handle;
         int dd = d, hh = h, ww = w, cc = c, pp = p;
@@ -238,7 +238,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(v * outC);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spiral_conv", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: spiral_conv");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: spiral_conv");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr vf = vertexFeatures.Handle, si = spiralIndices.Handle, w = weights.Handle, b = biases.Handle, o = output.Handle;
         int vv = v, vInC = inC, vSL = spiralLength, vOutC = outC;
@@ -255,7 +255,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(v * inC);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spiral_conv_backward_input", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: spiral_conv_backward_input");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: spiral_conv_backward_input");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr go = gradOutput.Handle, si = spiralIndices.Handle, w = weights.Handle, gvf = gradVertexFeatures.Handle;
         int vv = v, vInC = inC, vSL = spiralLength, vOutC = outC;
@@ -272,7 +272,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
         int total = checked(outC * inC * spiralLength);
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("spiral_conv_backward_weights", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: spiral_conv_backward_weights");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: spiral_conv_backward_weights");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr go = gradOutput.Handle, vf = vertexFeatures.Handle, si = spiralIndices.Handle, gw = gradWeights.Handle;
         int vv = v, vInC = inC, vSL = spiralLength, vOutC = outC;
@@ -290,7 +290,7 @@ public sealed partial class HipBackend : ITrilinearInterpolationKernels, IConvTr
     {
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr pa = a.Handle, pb = b.Handle, pc = c.Handle;
         int vN = n, vInC = inC, vID = iD, vIH = iH, vIW = iW, vOutC = outC, vOutD = outD, vOutH = outH, vOutW = outW;

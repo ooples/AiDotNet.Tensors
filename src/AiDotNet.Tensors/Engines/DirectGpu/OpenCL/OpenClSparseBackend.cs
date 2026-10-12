@@ -58,7 +58,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             float[] b, int rows, int cols, int n)
         {
             if (!IsAvailable)
-                throw new InvalidOperationException("OpenCL SpMM backend is not available.");
+                throw new GpuCapabilityUnavailableException("OpenCL SpMM backend is not available.");
 
             var backend = GetOrCreate();
             var output = new float[rows * n];
@@ -105,7 +105,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             float[] x, float[] y, int innerK)
         {
             if (!IsAvailable)
-                throw new InvalidOperationException("OpenCL SDDMM backend is not available.");
+                throw new GpuCapabilityUnavailableException("OpenCL SDDMM backend is not available.");
 
             int nnz = rowIndices.Length;
             var output = new float[nnz];

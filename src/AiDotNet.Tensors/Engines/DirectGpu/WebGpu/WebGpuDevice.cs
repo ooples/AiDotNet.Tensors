@@ -262,7 +262,7 @@ public sealed class WebGpuDevice : IDisposable
 
         if (!_initialized)
         {
-            throw new InvalidOperationException("WebGPU device not initialized. Call InitializeAsync() first.");
+            throw new GpuCapabilityUnavailableException("WebGPU device not initialized. Call InitializeAsync() first.");
         }
     }
 

@@ -1186,7 +1186,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
         if (!_initialized)
         {
-            throw new InvalidOperationException("WebGPU backend not initialized. Call InitializeAsync() first.");
+            throw new GpuCapabilityUnavailableException("WebGPU backend not initialized. Call InitializeAsync() first.");
         }
     }
 

@@ -50,7 +50,7 @@ internal static class CuSparseBackend
         float[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("cuSPARSE backend is not available.");
+            throw new GpuCapabilityUnavailableException("cuSPARSE backend is not available.");
 
         var backend = CudaBackend.CreateOrThrow();
         var output = new float[rows * n];

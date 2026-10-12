@@ -13,7 +13,7 @@ public sealed partial class CudaBackend : ILinalgBackend
             throw new InvalidOperationException(
                 "Linalg CUDA module was not compiled (older toolkit or NVRTC failure). Falling back to CPU reference.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"CUDA kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {name}");
         return kernel;
     }
 

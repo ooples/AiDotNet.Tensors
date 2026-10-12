@@ -249,7 +249,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                     newStream.Dispose();
                 }
             }
-            return _defaultStream ?? throw new InvalidOperationException("Backend not available");
+            return _defaultStream ?? throw new GpuCapabilityUnavailableException("Backend not available");
         }
     }
 
@@ -1020,7 +1020,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         GpuKernelGuards.Attention(heads, headDim, blockSize, seqLen, nameof(PagedAttentionDecode));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecode));
         if (!_kernelCache.TryGetValue("paged_attention_decode", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_decode");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: paged_attention_decode");
         var output = AllocateBuffer(heads * headDim);
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
@@ -1041,7 +1041,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, heads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefill));
         if (!_kernelCache.TryGetValue("paged_attention_prefill", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: paged_attention_prefill");
         var output = AllocateBuffer(numQueries * heads * headDim);
         int totalItems = numQueries * heads;
         uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -1063,7 +1063,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         GpuKernelGuards.Gqa(heads, kvHeads, nameof(PagedAttentionDecodeGqa));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, seqLen, 1, nameof(PagedAttentionDecodeGqa));
         if (!_kernelCache.TryGetValue("paged_attention_decode_gqa", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_decode_gqa");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: paged_attention_decode_gqa");
         var output = AllocateBuffer(heads * headDim);
         uint grid = (uint)(((long)heads + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr qPtr = q.Handle, kPtr = kcache.Handle, vPtr = vcache.Handle, btPtr = blockTable.Handle, oPtr = output.Handle;
@@ -1085,7 +1085,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (startPos < 0) throw new ArgumentOutOfRangeException(nameof(startPos));
         GpuKernelGuards.PagedAttentionBuffers(q, kcache, vcache, blockTable, heads, kvHeads, headDim, blockSize, checked(startPos + numQueries), numQueries, nameof(PagedAttentionPrefillGqa));
         if (!_kernelCache.TryGetValue("paged_attention_prefill_gqa", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: paged_attention_prefill_gqa");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: paged_attention_prefill_gqa");
         var output = AllocateBuffer(numQueries * heads * headDim);
         int totalItems = numQueries * heads;
         uint grid = (uint)(((long)totalItems + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -1105,9 +1105,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int heads, int kvHeads, int headDim, int seqLen, float scale, int splits = 0)
     {
         if (!_kernelCache.TryGetValue("flash_decode_partial", out var partKernel))
-            throw new InvalidOperationException("HIP kernel not found: flash_decode_partial");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: flash_decode_partial");
         if (!_kernelCache.TryGetValue("flash_decode_reduce", out var reduceKernel))
-            throw new InvalidOperationException("HIP kernel not found: flash_decode_reduce");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: flash_decode_reduce");
         GpuKernelGuards.FlashDecode(heads, kvHeads, headDim, seqLen, nameof(FlashDecode));
         GpuKernelGuards.Capacity(q, (long)heads * headDim, nameof(q), nameof(FlashDecode));
         GpuKernelGuards.Capacity(k, (long)seqLen * kvHeads * headDim, nameof(k), nameof(FlashDecode));
@@ -1186,7 +1186,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int M, int K, int N, int groupSize, int scaleCount)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         var output = AllocateBuffer(M * N);
         uint grid = (uint)(((long)M * N + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = act.Handle, wPtr = weights.Handle, sPtr = scales.Handle, oPtr = output.Handle;
@@ -1358,7 +1358,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private unsafe void ExecuteFusedGemmOnStream(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output, int M, int N, int K, IntPtr stream, bool synchronize)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException($"HIP fused kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP fused kernel not found: {kernelName}");
 
         // 128x128 CTA tile with 16x16 thread block (8x8 register blocking per thread)
         const int BM = 128;
@@ -1820,7 +1820,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException("Batch count must be positive", nameof(batchCount));
 
         if (!_kernelCache.TryGetValue("batched_gemm", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: batched_gemm");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: batched_gemm");
 
             {
             IntPtr _p0 = A.Handle;
@@ -1970,7 +1970,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var output = AllocateBuffer(M * N);
 
         if (!_kernelCache.TryGetValue("gemm_bias_leaky_relu", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: gemm_bias_leaky_relu");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gemm_bias_leaky_relu");
 
         const int BM = 128;
         const int BN = 128;
@@ -2006,7 +2006,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private unsafe void BiasAddInPlace(IGpuBuffer output, IGpuBuffer bias, int M, int N)
     {
         if (!_kernelCache.TryGetValue("bias_add", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: bias_add");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: bias_add");
 
             {
             IntPtr _p0 = output.Handle;
@@ -2030,7 +2030,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
     {
         if (!_kernelCache.TryGetValue("bias_add", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: bias_add");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: bias_add");
 
         // Copy A to C only when they are different buffers (bias_add is in-place)
         if (A.Handle != C.Handle)
@@ -2065,7 +2065,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
         if (!_kernelCache.TryGetValue("conv2d_bias_add", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv2d_bias_add");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv2d_bias_add");
 
             {
             IntPtr _p0 = output.Handle;
@@ -2146,7 +2146,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("scale_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: scale_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: scale_vector");
 
             {
             IntPtr _p0 = A.Handle;
@@ -2179,7 +2179,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException(
                 $"ScaleByDeviceScalar requires a scalar buffer with at least {sizeof(float)} bytes.", nameof(scalar));
         if (!_kernelCache.TryGetValue("scale_by_device_scalar", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: scale_by_device_scalar");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: scale_by_device_scalar");
         IntPtr bufPtr = buffer.Handle;
         IntPtr scalarPtr = scalar.Handle;
         int n = size;
@@ -2203,7 +2203,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (count > dst.Size) throw new ArgumentOutOfRangeException(nameof(count));
 
         if (!_kernelCache.TryGetValue("strided_gather", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: strided_gather");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: strided_gather");
 
         IntPtr srcPtr = src.Handle;
         IntPtr dstPtr = dst.Handle;
@@ -2224,7 +2224,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (count > src.Size) throw new ArgumentOutOfRangeException(nameof(count));
 
         if (!_kernelCache.TryGetValue("strided_scatter", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: strided_scatter");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: strided_scatter");
 
         IntPtr srcPtr = src.Handle;
         IntPtr dstPtr = dst.Handle;
@@ -2240,7 +2240,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         // Power uses same pattern as Scale
         if (!_kernelCache.TryGetValue("power_scalar", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: power_scalar");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: power_scalar");
 
         LaunchScalarOp(krnl, A, B, exponent, size);
     }
@@ -2276,7 +2276,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Exp2(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("exp2_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: exp2_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: exp2_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2284,7 +2284,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("exp10_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: exp10_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: exp10_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2292,7 +2292,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void ExpM1(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("expm1_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: expm1_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: expm1_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2305,7 +2305,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("log2_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: log2_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: log2_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2313,7 +2313,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Log1P(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("log1p_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: log1p_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: log1p_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2326,7 +2326,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Sign(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("sign_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sign_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sign_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2381,7 +2381,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue(kernelName, out var krnl))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         LaunchUnaryOp(krnl, A, B, size);
     }
 
@@ -2398,7 +2398,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("leaky_relu", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: leaky_relu");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: leaky_relu");
 
             {
             IntPtr _p0 = A.Handle;
@@ -2419,7 +2419,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void LeakyReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("leaky_relu_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: leaky_relu_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: leaky_relu_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2442,7 +2442,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Elu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("elu", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: elu");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: elu");
 
             {
             IntPtr _p0 = A.Handle;
@@ -2463,7 +2463,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void EluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer output, IGpuBuffer gradInput, float alpha, int size)
     {
         if (!_kernelCache.TryGetValue("elu_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: elu_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: elu_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2493,7 +2493,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SwishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("swish_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: swish_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: swish_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2521,7 +2521,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Mish(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("mish_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: mish_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mish_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2529,7 +2529,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Softplus(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("softplus_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: softplus_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: softplus_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2537,7 +2537,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Hardswish(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("hardswish_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hardswish_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hardswish_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2545,7 +2545,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Selu(IGpuBuffer A, IGpuBuffer B, float alpha, float scale, int size)
     {
         if (!_kernelCache.TryGetValue("selu_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: selu_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: selu_vector");
 
             {
             IntPtr _p0 = A.Handle;
@@ -2567,7 +2567,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Hardsigmoid(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("hardsigmoid_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hardsigmoid_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hardsigmoid_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -2575,7 +2575,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Hardtanh(IGpuBuffer A, IGpuBuffer B, float minVal, float maxVal, int size)
     {
         if (!_kernelCache.TryGetValue("hardtanh_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hardtanh_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hardtanh_vector");
 
             {
             IntPtr _p0 = A.Handle;
@@ -2603,7 +2603,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void MishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("mish_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: mish_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mish_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2625,7 +2625,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SoftplusBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("softplus_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: softplus_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: softplus_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2647,7 +2647,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void HardswishBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("hardswish_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hardswish_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hardswish_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2669,7 +2669,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float alpha, float scale, int size)
     {
         if (!_kernelCache.TryGetValue("selu_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: selu_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: selu_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2693,7 +2693,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void HardsigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("hardsigmoid_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hardsigmoid_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hardsigmoid_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2715,7 +2715,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void HardtanhBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float minVal, float maxVal, int size)
     {
         if (!_kernelCache.TryGetValue("hardtanh_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hardtanh_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hardtanh_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -2738,7 +2738,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
     {
-        if (!_kernelCache.TryGetValue("relu6", out var krnl)) throw new InvalidOperationException("HIP kernel not found: relu6");
+        if (!_kernelCache.TryGetValue("relu6", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: relu6");
         IntPtr _p0 = A.Handle; IntPtr _p1 = B.Handle;
         void** args = stackalloc void*[3]; args[0] = &_p0; args[1] = &_p1; args[2] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2747,7 +2747,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        if (!_kernelCache.TryGetValue("relu6_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: relu6_backward");
+        if (!_kernelCache.TryGetValue("relu6_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: relu6_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradInput.Handle;
         void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2756,7 +2756,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void PRelu(IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer output, int size, int alphaSize)
     {
-        if (!_kernelCache.TryGetValue("prelu", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu");
+        if (!_kernelCache.TryGetValue("prelu", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: prelu");
         IntPtr _p0 = input.Handle; IntPtr _p1 = alpha.Handle; IntPtr _p2 = output.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size; args[4] = &alphaSize;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2765,7 +2765,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void PReluBackwardInput(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer alpha, IGpuBuffer gradInput, int size, int alphaSize)
     {
-        if (!_kernelCache.TryGetValue("prelu_backward_input", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu_backward_input");
+        if (!_kernelCache.TryGetValue("prelu_backward_input", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: prelu_backward_input");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = alpha.Handle; IntPtr _p3 = gradInput.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &alphaSize;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2781,20 +2781,20 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: per-alpha-channel thread scans size in strided order.
             if (!_kernelCache.TryGetValue("prelu_backward_alpha_deterministic", out var krnlD))
-                throw new InvalidOperationException("HIP kernel not found: prelu_backward_alpha_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: prelu_backward_alpha_deterministic");
             uint gridD = (uint)((alphaSize + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel(krnlD, gridD, DefaultBlockSize, args); Synchronize();
             return;
         }
 
-        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var krnl)) throw new InvalidOperationException("HIP kernel not found: prelu_backward_alpha");
+        if (!_kernelCache.TryGetValue("prelu_backward_alpha", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: prelu_backward_alpha");
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
     }
 
     public unsafe void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size)
     {
-        if (!_kernelCache.TryGetValue("rrelu", out var krnl)) throw new InvalidOperationException("HIP kernel not found: rrelu");
+        if (!_kernelCache.TryGetValue("rrelu", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: rrelu");
         IntPtr _p0 = input.Handle; IntPtr _p1 = noise.Handle; IntPtr _p2 = output.Handle;
         void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2803,7 +2803,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size)
     {
-        if (!_kernelCache.TryGetValue("rrelu_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: rrelu_backward");
+        if (!_kernelCache.TryGetValue("rrelu_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: rrelu_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = noise.Handle; IntPtr _p3 = gradInput.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2812,7 +2812,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
     {
-        if (!_kernelCache.TryGetValue("threshold_forward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: threshold_forward");
+        if (!_kernelCache.TryGetValue("threshold_forward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: threshold_forward");
         IntPtr _p0 = input.Handle; IntPtr _p1 = output.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &threshold; args[3] = &value; args[4] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2821,7 +2821,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
-        if (!_kernelCache.TryGetValue("threshold_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: threshold_backward");
+        if (!_kernelCache.TryGetValue("threshold_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: threshold_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradInput.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &threshold; args[4] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2830,7 +2830,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
-        if (!_kernelCache.TryGetValue("reciprocal_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: reciprocal_backward");
+        if (!_kernelCache.TryGetValue("reciprocal_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: reciprocal_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = input.Handle; IntPtr _p2 = gradInput.Handle;
         void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2839,7 +2839,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("var_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: var_backward");
+        if (!_kernelCache.TryGetValue("var_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: var_backward");
         int total = outerSize * reduceSize;
         IntPtr _p0 = gradOutput.Handle, _p1 = input.Handle, _p2 = mean.Handle, _p3 = gradInput.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &outerSize; args[5] = &reduceSize;
@@ -2849,7 +2849,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void StdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer std, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("std_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: std_backward");
+        if (!_kernelCache.TryGetValue("std_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: std_backward");
         int total = outerSize * reduceSize;
         IntPtr _p0 = gradOutput.Handle, _p1 = input.Handle, _p2 = mean.Handle, _p3 = std.Handle, _p4 = gradInput.Handle;
         void** args = stackalloc void*[7]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &_p4; args[5] = &outerSize; args[6] = &reduceSize;
@@ -2859,7 +2859,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void MaskedFillBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size)
     {
-        if (!_kernelCache.TryGetValue("masked_fill_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: masked_fill_backward");
+        if (!_kernelCache.TryGetValue("masked_fill_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: masked_fill_backward");
         IntPtr _p0 = gradOutput.Handle, _p1 = mask.Handle, _p2 = gradInput.Handle;
         void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2868,7 +2868,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void WhereBackward(IGpuBuffer gradOutput, IGpuBuffer condition, IGpuBuffer gradX, IGpuBuffer gradY, int size)
     {
-        if (!_kernelCache.TryGetValue("where_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: where_backward");
+        if (!_kernelCache.TryGetValue("where_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: where_backward");
         IntPtr _p0 = gradOutput.Handle, _p1 = condition.Handle, _p2 = gradX.Handle, _p3 = gradY.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2877,7 +2877,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void NormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer norm, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("norm_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: norm_backward");
+        if (!_kernelCache.TryGetValue("norm_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: norm_backward");
         int total = outerSize * reduceSize;
         IntPtr _p0 = gradOutput.Handle, _p1 = input.Handle, _p2 = norm.Handle, _p3 = gradInput.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &outerSize; args[5] = &reduceSize;
@@ -2887,7 +2887,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void LogSumExpBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer lse, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("logsumexp_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: logsumexp_backward");
+        if (!_kernelCache.TryGetValue("logsumexp_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: logsumexp_backward");
         int total = outerSize * reduceSize;
         IntPtr _p0 = gradOutput.Handle, _p1 = input.Handle, _p2 = lse.Handle, _p3 = gradInput.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &outerSize; args[5] = &reduceSize;
@@ -2897,7 +2897,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void AvgPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
     {
-        if (!_kernelCache.TryGetValue("avg_pool1d", out var krnl)) throw new InvalidOperationException("HIP kernel not found: avg_pool1d");
+        if (!_kernelCache.TryGetValue("avg_pool1d", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: avg_pool1d");
         int total = checked((int)((long)batch * channels * outLength));
         IntPtr _p0 = input.Handle, _p1 = output.Handle;
         void** args = stackalloc void*[8]; args[0] = &_p0; args[1] = &_p1; args[2] = &batch; args[3] = &channels; args[4] = &inLength; args[5] = &outLength; args[6] = &kernelSize; args[7] = &stride;
@@ -2907,7 +2907,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
     {
-        if (!_kernelCache.TryGetValue("max_pool1d", out var krnl)) throw new InvalidOperationException("HIP kernel not found: max_pool1d");
+        if (!_kernelCache.TryGetValue("max_pool1d", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: max_pool1d");
         int total = checked((int)((long)batch * channels * outLength));
         IntPtr _p0 = input.Handle, _p1 = output.Handle;
         void** args = stackalloc void*[8]; args[0] = &_p0; args[1] = &_p1; args[2] = &batch; args[3] = &channels; args[4] = &inLength; args[5] = &outLength; args[6] = &kernelSize; args[7] = &stride;
@@ -2917,7 +2917,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void BilinearUpsample2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inH, int inW, int outH, int outW)
     {
-        if (!_kernelCache.TryGetValue("bilinear_upsample2d", out var krnl)) throw new InvalidOperationException("HIP kernel not found: bilinear_upsample2d");
+        if (!_kernelCache.TryGetValue("bilinear_upsample2d", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: bilinear_upsample2d");
         int total = checked((int)((long)batch * channels * outH * outW));
         IntPtr _p0 = input.Handle, _p1 = output.Handle;
         void** args = stackalloc void*[8]; args[0] = &_p0; args[1] = &_p1; args[2] = &batch; args[3] = &channels; args[4] = &inH; args[5] = &inW; args[6] = &outH; args[7] = &outW;
@@ -2935,7 +2935,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: per (dstRow, col) output cell deterministic variant.
             if (!_kernelCache.TryGetValue("scatter_mean_activation_deterministic", out var k1d))
-                throw new InvalidOperationException("HIP kernel not found: scatter_mean_activation_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: scatter_mean_activation_deterministic");
             void** a1d = stackalloc void*[7];
             a1d[0] = &sPtr; a1d[1] = &idxPtr; a1d[2] = &oPtr; a1d[3] = &cPtr;
             a1d[4] = &sourceSize; a1d[5] = &outputSize; a1d[6] = &featureSize;
@@ -2946,12 +2946,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
         else
         {
-            if (!_kernelCache.TryGetValue("scatter_mean", out var k1)) throw new InvalidOperationException("HIP kernel not found: scatter_mean");
+            if (!_kernelCache.TryGetValue("scatter_mean", out var k1)) throw new GpuCapabilityUnavailableException("HIP kernel not found: scatter_mean");
             void** a1 = stackalloc void*[6]; a1[0] = &sPtr; a1[1] = &idxPtr; a1[2] = &oPtr; a1[3] = &cPtr; a1[4] = &sourceSize; a1[5] = &featureSize;
             LaunchKernel(k1, (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, a1);
         }
 
-        if (!_kernelCache.TryGetValue("scatter_mean_divide", out var k2)) throw new InvalidOperationException("HIP kernel not found: scatter_mean_divide");
+        if (!_kernelCache.TryGetValue("scatter_mean_divide", out var k2)) throw new GpuCapabilityUnavailableException("HIP kernel not found: scatter_mean_divide");
         // scatter_mean_divide expects flat output element count (kernel guards
         // `idx < outputSize` and indexes `output[idx]`), so pass outputSize *
         // featureSize as the flat element count. Pre-existing bug surfaced by
@@ -2964,7 +2964,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void L1Loss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
-        if (!_kernelCache.TryGetValue("l1_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: l1_loss");
+        if (!_kernelCache.TryGetValue("l1_loss", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: l1_loss");
         IntPtr _p0 = predictions.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &batchSize; args[4] = &numFeatures;
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2973,7 +2973,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void HuberLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures, float delta)
     {
-        if (!_kernelCache.TryGetValue("huber_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: huber_loss");
+        if (!_kernelCache.TryGetValue("huber_loss", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: huber_loss");
         IntPtr _p0 = predictions.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &batchSize; args[4] = &numFeatures; args[5] = &delta;
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2982,7 +2982,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void BceWithLogitsLoss(IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer loss, int size)
     {
-        if (!_kernelCache.TryGetValue("bce_with_logits_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: bce_with_logits_loss");
+        if (!_kernelCache.TryGetValue("bce_with_logits_loss", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: bce_with_logits_loss");
         IntPtr _p0 = logits.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
         void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -2991,7 +2991,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void NllLoss(IGpuBuffer logProbs, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
     {
-        if (!_kernelCache.TryGetValue("nll_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: nll_loss");
+        if (!_kernelCache.TryGetValue("nll_loss", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: nll_loss");
         IntPtr _p0 = logProbs.Handle; IntPtr _p1 = targets.Handle; IntPtr _p2 = loss.Handle;
         void** args = stackalloc void*[5]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &batchSize; args[4] = &numClasses;
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3000,7 +3000,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void KlDivLoss(IGpuBuffer input, IGpuBuffer target, IGpuBuffer loss, int size)
     {
-        if (!_kernelCache.TryGetValue("kl_div_loss", out var krnl)) throw new InvalidOperationException("HIP kernel not found: kl_div_loss");
+        if (!_kernelCache.TryGetValue("kl_div_loss", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: kl_div_loss");
         IntPtr _p0 = input.Handle; IntPtr _p1 = target.Handle; IntPtr _p2 = loss.Handle;
         void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &size;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3009,7 +3009,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void MseLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        if (!_kernelCache.TryGetValue("mse_loss_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: mse_loss_backward");
+        if (!_kernelCache.TryGetValue("mse_loss_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: mse_loss_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = predictions.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3018,7 +3018,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void L1LossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        if (!_kernelCache.TryGetValue("l1_loss_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: l1_loss_backward");
+        if (!_kernelCache.TryGetValue("l1_loss_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: l1_loss_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = predictions.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3027,7 +3027,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void HuberLossBackward(IGpuBuffer gradOutput, IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN, float delta)
     {
-        if (!_kernelCache.TryGetValue("huber_loss_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: huber_loss_backward");
+        if (!_kernelCache.TryGetValue("huber_loss_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: huber_loss_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = predictions.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
         void** args = stackalloc void*[7]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN; args[6] = &delta;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3036,7 +3036,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void BceWithLogitsBackward(IGpuBuffer gradOutput, IGpuBuffer logits, IGpuBuffer targets, IGpuBuffer gradInput, int size, float invN)
     {
-        if (!_kernelCache.TryGetValue("bce_with_logits_backward", out var krnl)) throw new InvalidOperationException("HIP kernel not found: bce_with_logits_backward");
+        if (!_kernelCache.TryGetValue("bce_with_logits_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: bce_with_logits_backward");
         IntPtr _p0 = gradOutput.Handle; IntPtr _p1 = logits.Handle; IntPtr _p2 = targets.Handle; IntPtr _p3 = gradInput.Handle;
         void** args = stackalloc void*[6]; args[0] = &_p0; args[1] = &_p1; args[2] = &_p2; args[3] = &_p3; args[4] = &size; args[5] = &invN;
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -3073,7 +3073,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchFusedLinear(string kernelName, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures)
     {
-        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         int total = batchSize * outFeatures;
         IntPtr iPtr = input.Handle, wPtr = weight.Handle, bPtr = bias.Handle, oPtr = output.Handle;
         void** args = stackalloc void*[7]; args[0] = &iPtr; args[1] = &wPtr; args[2] = &bPtr; args[3] = &oPtr;
@@ -3083,7 +3083,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchIoU(string kernelName, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer loss, int numBoxes)
     {
-        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         IntPtr pPtr = predicted.Handle, tPtr = target.Handle, lPtr = loss.Handle;
         void** args = stackalloc void*[4]; args[0] = &pPtr; args[1] = &tPtr; args[2] = &lPtr; args[3] = &numBoxes;
         LaunchKernel(krnl, (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
@@ -3091,7 +3091,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private unsafe void LaunchIoUBackward(string kernelName, IGpuBuffer gradOutput, IGpuBuffer predicted, IGpuBuffer target, IGpuBuffer gradPredicted, int numBoxes)
     {
-        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+        if (!_kernelCache.TryGetValue(kernelName, out var krnl)) throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         IntPtr goPtr = gradOutput.Handle, pPtr = predicted.Handle, tPtr = target.Handle, gpPtr = gradPredicted.Handle;
         void** args = stackalloc void*[5]; args[0] = &goPtr; args[1] = &pPtr; args[2] = &tPtr; args[3] = &gpPtr; args[4] = &numBoxes;
         LaunchKernel(krnl, (uint)((numBoxes + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args); Synchronize();
@@ -3103,7 +3103,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         // Kernel 1: grad_input
         if (!_kernelCache.TryGetValue(gradInputKernel, out var giKernel))
-            throw new InvalidOperationException($"HIP kernel not found: {gradInputKernel}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {gradInputKernel}");
         int totalIn = batchSize * inFeatures;
         IntPtr goPtr = gradOutput.Handle, wPtr = weight.Handle, sPtr = saved.Handle, giPtr = gradInput.Handle;
         void** argsGI = stackalloc void*[7];
@@ -3113,7 +3113,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Kernel 2: weight gradient
         if (!_kernelCache.TryGetValue("fused_linear_weight_grad", out var wgKernel))
-            throw new InvalidOperationException("HIP kernel not found: fused_linear_weight_grad");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fused_linear_weight_grad");
         int totalW = inFeatures * outFeatures;
         IntPtr iPtr = input.Handle, gwPtr = gradWeight.Handle;
         void** argsWG = stackalloc void*[8];
@@ -3123,7 +3123,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Kernel 3: bias gradient
         if (!_kernelCache.TryGetValue("fused_linear_bias_grad", out var bgKernel))
-            throw new InvalidOperationException("HIP kernel not found: fused_linear_bias_grad");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fused_linear_bias_grad");
         IntPtr gbPtr = gradBias.Handle;
         void** argsBG = stackalloc void*[6];
         argsBG[0] = &goPtr; argsBG[1] = &sPtr; argsBG[2] = &gbPtr;
@@ -3139,7 +3139,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Sin(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("sin_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sin_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sin_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3147,7 +3147,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Cos(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("cos_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: cos_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: cos_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3155,7 +3155,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Tan(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("tan_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: tan_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: tan_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3163,7 +3163,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Asin(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("asin_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: asin_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: asin_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3171,7 +3171,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Acos(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("acos_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: acos_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: acos_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3179,7 +3179,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Atan(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("atan_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: atan_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: atan_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3191,7 +3191,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Sinh(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("sinh_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sinh_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sinh_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3199,7 +3199,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Cosh(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("cosh_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: cosh_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: cosh_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3207,7 +3207,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Asinh(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("asinh_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: asinh_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: asinh_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3215,7 +3215,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Acosh(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("acosh_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: acosh_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: acosh_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3223,7 +3223,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Atanh(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("atanh_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: atanh_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: atanh_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3235,7 +3235,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Reciprocal(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("reciprocal_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: reciprocal_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: reciprocal_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3243,7 +3243,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Cbrt(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("cbrt_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: cbrt_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: cbrt_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3251,7 +3251,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Log10(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("log10_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: log10_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: log10_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3264,7 +3264,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Floor(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("floor_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: floor_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: floor_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3272,7 +3272,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Ceiling(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("ceil_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: ceil_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: ceil_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3280,7 +3280,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Round(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("round_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: round_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: round_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3288,7 +3288,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Truncate(IGpuBuffer A, IGpuBuffer B, int size)
     {
         if (!_kernelCache.TryGetValue("trunc_vector", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: trunc_vector");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: trunc_vector");
 
         LaunchUnaryOp(krnl, A, B, size);
     }
@@ -3298,7 +3298,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
         if (!_kernelCache.TryGetValue("softmax", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: softmax");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: softmax");
 
         // 1 block per batch element, 256 threads cooperate on parallel reduction
         // Shared memory: ceil(256/64) = 4 wavefronts * sizeof(float) = 16 bytes
@@ -3323,7 +3323,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
         if (!_kernelCache.TryGetValue("squash", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: squash");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: squash");
 
             {
             IntPtr _p0 = input.Handle;
@@ -3345,7 +3345,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SquashBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int numCapsules, int capsuleDim, float epsilon)
     {
         if (!_kernelCache.TryGetValue("squash_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: squash_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: squash_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -3370,7 +3370,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputCapsules, int inputDim, int outputCapsules, int outputDim)
     {
         if (!_kernelCache.TryGetValue("capsule_predictions", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: capsule_predictions");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: capsule_predictions");
 
         IntPtr inPtr = input.Handle, wPtr = weights.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[8];
@@ -3385,7 +3385,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputCapsules, int inputDim, int numCapsules, int capsuleDim)
     {
         if (!_kernelCache.TryGetValue("capsule_transform", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: capsule_transform");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: capsule_transform");
 
         IntPtr inPtr = input.Handle, wPtr = weights.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[8];
@@ -3400,7 +3400,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
         if (!_kernelCache.TryGetValue("capsule_weighted_sum", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: capsule_weighted_sum");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: capsule_weighted_sum");
 
         IntPtr cPtr = coupling.Handle, pPtr = predictions.Handle, outPtr = output.Handle;
         void** args = stackalloc void*[7];
@@ -3414,7 +3414,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputCapsules, int outputCapsules, int capsuleDim)
     {
         if (!_kernelCache.TryGetValue("capsule_agreement", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: capsule_agreement");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: capsule_agreement");
 
         IntPtr pPtr = predictions.Handle, outPtr = output.Handle, agPtr = agreement.Handle;
         void** args = stackalloc void*[7];
@@ -3427,7 +3427,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
         if (!_kernelCache.TryGetValue("tile_batch", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: tile_batch");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: tile_batch");
 
         int totalSize = repeats * innerSize;
             {
@@ -3449,7 +3449,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
     {
         if (!_kernelCache.TryGetValue("tile_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: tile_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: tile_axis");
 
         int totalSize = outerSize * axisSize * repeats * innerSize;
             {
@@ -3474,7 +3474,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int channels, int inH, int inW, int scale)
     {
         if (!_kernelCache.TryGetValue("pixel_shuffle", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: pixel_shuffle");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: pixel_shuffle");
         IntPtr inputPtr = input.Handle, outputPtr = output.Handle;
         void** args = stackalloc void*[7];
         args[0] = &inputPtr; args[1] = &outputPtr; args[2] = &batch; args[3] = &channels;
@@ -3488,7 +3488,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int channels, int inH, int inW, int scale)
     {
         if (!_kernelCache.TryGetValue("pixel_shuffle_backward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: pixel_shuffle_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: pixel_shuffle_backward");
         IntPtr outputPtr = gradOutput.Handle, inputPtr = gradInput.Handle;
         void** args = stackalloc void*[7];
         args[0] = &outputPtr; args[1] = &inputPtr; args[2] = &batch; args[3] = &channels;
@@ -3546,7 +3546,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
         if (!_kernelCache.TryGetValue("enforce_2x4_sparsity", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: enforce_2x4_sparsity");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: enforce_2x4_sparsity");
         int totalGroups = checked(M * (K / 4));
         IntPtr dense = denseInput.Handle, values = sparseValues.Handle, indices = sparseIndices.Handle;
         void** args = stackalloc void*[5];
@@ -3560,7 +3560,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
         if (!_kernelCache.TryGetValue("decompress_2x4_sparse", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: decompress_2x4_sparse");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: decompress_2x4_sparse");
         int totalGroups = checked(M * (K / 4));
         IntPtr values = sparseValues.Handle, indices = sparseIndices.Handle, dense = denseOutput.Handle;
         void** args = stackalloc void*[5];
@@ -3578,7 +3578,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
         if (!_kernelCache.TryGetValue("sparse_gemm_2x4", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: sparse_gemm_2x4");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sparse_gemm_2x4");
         IntPtr values = sparseAValues.Handle, indices = sparseAIndices.Handle, b = B.Handle, c = C.Handle;
         void** args = stackalloc void*[9];
         args[0] = &values; args[1] = &indices; args[2] = &b; args[3] = &c;
@@ -3596,7 +3596,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException("K must be divisible by 4 for 2:4 sparsity", nameof(K));
 
         if (!_kernelCache.TryGetValue("sparse_gemm_bias_relu", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: sparse_gemm_bias_relu");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sparse_gemm_bias_relu");
         var output = AllocateBuffer(checked(M * N));
         IntPtr values = sparseAValues.Handle, indices = sparseAIndices.Handle, b = B.Handle, biasPointer = bias.Handle, c = output.Handle;
         void** args = stackalloc void*[8];
@@ -3619,10 +3619,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: csr_spmm");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm");
 
         // Launch configuration: rows x ceil(N/blockSize) grid
         int gridX = M;
@@ -3652,11 +3652,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int nnz, int innerK)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
         if (nnz == 0) return;
 
         if (!_kernelCache.TryGetValue("sddmm", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: sddmm");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sddmm");
 
         int gridX = (nnz + DefaultBlockSize - 1) / DefaultBlockSize;
 
@@ -3706,10 +3706,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: csr_spmm_warp");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm_warp");
 
         // One warp (32 lanes) per row; DefaultBlockSize threads/block => 8 warps/block.
         int gridX = (M * 32 + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -3739,10 +3739,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm_double", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: csr_spmm_double");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm_double");
 
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -3769,10 +3769,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int M, int K, int N, int nnz)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_spmm_bias", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: csr_spmm_bias");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm_bias");
 
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -3799,10 +3799,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int numNodes, int numEdges, int features)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("zero_buffer", out var zeroKernel))
-            throw new InvalidOperationException("HIP kernel not found: zero_buffer");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: zero_buffer");
 
         // First zero the output buffer
         int outputSize = numNodes * features;
@@ -3822,7 +3822,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             ? "scatter_add_edges_deterministic"
             : "scatter_add_edges";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: " + kernelName);
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: " + kernelName);
 
         // Deterministic variant: gridX = numNodes (one thread per target node).
         // Atomic variant: gridX = numEdges (one thread per edge).
@@ -3843,10 +3843,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int M, int K, int N)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_segmented_max", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: csr_segmented_max");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_segmented_max");
 
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -3869,10 +3869,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int M, int K, int N)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_segmented_min", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: csr_segmented_min");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_segmented_min");
 
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -3896,10 +3896,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float epsilon = 1e-8f)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("csr_segmented_stddev", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: csr_segmented_stddev");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_segmented_stddev");
 
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -4103,7 +4103,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public float Sum(IGpuBuffer A, int size)
     {
         if (!_kernelCache.TryGetValue("reduce_sum", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: reduce_sum");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: reduce_sum");
 
         return ReduceToScalar(krnl, A, size);
     }
@@ -4111,7 +4111,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public float Max(IGpuBuffer A, int size)
     {
         if (!_kernelCache.TryGetValue("reduce_max", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: reduce_max");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: reduce_max");
 
         return ReduceToScalar(krnl, A, size);
     }
@@ -4119,7 +4119,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public float Min(IGpuBuffer A, int size)
     {
         if (!_kernelCache.TryGetValue("reduce_min", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: reduce_min");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: reduce_min");
 
         return ReduceToScalar(krnl, A, size);
     }
@@ -4206,7 +4206,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("sum_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sum_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sum_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -4288,7 +4288,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Fallback: direct convolution
         if (!_kernelCache.TryGetValue("conv2d_direct", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv2d_direct");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv2d_direct");
 
         {
             var args = new IntPtr[]
@@ -4313,7 +4313,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int dilationH, int dilationW)
     {
         if (!_kernelCache.TryGetValue("conv2d_backward_input", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv2d_backward_input");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv2d_backward_input");
 
             {
             var pGradOut = gradOutput.Handle;
@@ -4356,7 +4356,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int dilationH, int dilationW)
     {
         if (!_kernelCache.TryGetValue("conv2d_backward_kernel", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv2d_backward_kernel");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv2d_backward_kernel");
 
             {
             var pInput = input.Handle;
@@ -4427,7 +4427,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (unfoldOutH <= 0 || unfoldOutW <= 0) throw new ArgumentException($"Invalid Unfold output dimensions {unfoldOutH}x{unfoldOutW}.");
 
         if (!_kernelCache.TryGetValue("im2col", out var im2colKernel))
-            throw new InvalidOperationException("HIP kernel not found: im2col");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: im2col");
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -4455,7 +4455,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (strideH <= 0 || strideW <= 0) throw new ArgumentException("Stride must be positive.");
 
         if (!_kernelCache.TryGetValue("col2im", out var col2imKernel))
-            throw new InvalidOperationException("HIP kernel not found: col2im");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: col2im");
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -4489,7 +4489,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int dilationD, int dilationH, int dilationW)
     {
         if (!_kernelCache.TryGetValue("conv3d_direct", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv3d_direct");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv3d_direct");
 
             {
             var pInput = input.Handle;
@@ -4539,7 +4539,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int strideH, int strideW, int padH, int padW)
     {
         if (!_kernelCache.TryGetValue("depthwise_conv2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: depthwise_conv2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: depthwise_conv2d");
 
             {
             var pInput = input.Handle;
@@ -4580,7 +4580,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int outputPadH, int outputPadW)
     {
         if (!_kernelCache.TryGetValue("conv_transpose2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv_transpose2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv_transpose2d");
 
             {
             var pInput = input.Handle;
@@ -4623,7 +4623,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int outputPadH, int outputPadW)
     {
         if (!_kernelCache.TryGetValue("conv_transpose2d_backward_input", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv_transpose2d_backward_input");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv_transpose2d_backward_input");
 
         int totalInput = batch * inChannels * inHeight * inWidth;
             {
@@ -4666,7 +4666,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int outputPadH, int outputPadW)
     {
         if (!_kernelCache.TryGetValue("conv_transpose2d_backward_kernel", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: conv_transpose2d_backward_kernel");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv_transpose2d_backward_kernel");
 
         int totalKernel = inChannels * outChannels * kernelH * kernelW;
             {
@@ -4712,7 +4712,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int strideH, int strideW, int padH, int padW)
     {
         if (!_kernelCache.TryGetValue("maxpool2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: maxpool2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool2d");
 
             {
             var pInput = input.Handle;
@@ -4766,7 +4766,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: deterministic per-input-cell parallelization.
             if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var krnlD))
-                throw new InvalidOperationException("HIP kernel not found: maxpool2d_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool2d_backward_deterministic");
             uint gDX = (uint)((inWidth + 15) / 16);
             uint gDY = (uint)((inHeight + 15) / 16);
             uint gDZ = (uint)(batch * channels);
@@ -4776,7 +4776,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("maxpool2d_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: maxpool2d_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool2d_backward");
         uint gridX = (uint)((outWidth + 15) / 16);
         uint gridY = (uint)((outHeight + 15) / 16);
         uint gridZ = (uint)(batch * channels);
@@ -4792,7 +4792,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         bool countIncludePad)
     {
         if (!_kernelCache.TryGetValue("avgpool2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: avgpool2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: avgpool2d");
 
             {
             int countPadInt = countIncludePad ? 1 : 0;
@@ -4833,7 +4833,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         bool countIncludePad)
     {
         if (!_kernelCache.TryGetValue("avgpool2d_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: avgpool2d_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: avgpool2d_backward");
 
             {
             int countPadInt = countIncludePad ? 1 : 0;
@@ -4869,7 +4869,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GlobalAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int height, int width)
     {
         if (!_kernelCache.TryGetValue("global_avgpool2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: global_avgpool2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: global_avgpool2d");
 
             {
             IntPtr _p0 = input.Handle;
@@ -4902,7 +4902,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GlobalMaxPool2D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices, int batch, int channels, int height, int width)
     {
         if (!_kernelCache.TryGetValue("global_maxpool2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: global_maxpool2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: global_maxpool2d");
 
         int saveIndices = indices is not null ? 1 : 0;
         IntPtr indicesPtr = indices?.Handle ?? IntPtr.Zero;
@@ -4930,7 +4930,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GlobalAvgPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int height, int width)
     {
         if (!_kernelCache.TryGetValue("global_avgpool2d_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: global_avgpool2d_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: global_avgpool2d_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -4970,7 +4970,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             ? "global_maxpool2d_backward_deterministic"
             : "global_maxpool2d_backward";
         if (!_kernelCache.TryGetValue(kernelName, out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: " + kernelName);
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: " + kernelName);
 
         LaunchKernel(krnl, grid, DefaultBlockSize, args);
         Synchronize();
@@ -4979,7 +4979,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void AdaptiveAvgPool2D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
     {
         if (!_kernelCache.TryGetValue("adaptive_avgpool2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adaptive_avgpool2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adaptive_avgpool2d");
 
             {
             IntPtr _p0 = input.Handle;
@@ -5011,7 +5011,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int strideD, int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("maxpool3d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: maxpool3d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool3d");
 
         int saveIndices = indices is not null ? 1 : 0;
         IntPtr indicesPtr = indices?.Handle ?? IntPtr.Zero;
@@ -5066,7 +5066,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: per-input-cell parallelization.
             if (!_kernelCache.TryGetValue("maxpool3d_backward_deterministic", out var krnlD))
-                throw new InvalidOperationException("HIP kernel not found: maxpool3d_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool3d_backward_deterministic");
             uint gDX = (uint)((inWidth + 7) / 8);
             uint gDY = (uint)((inHeight + 7) / 8);
             uint gDZ = (uint)(batch * channels * inDepth);
@@ -5076,7 +5076,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("maxpool3d_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: maxpool3d_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: maxpool3d_backward");
         uint gridX = (uint)((outWidth + 7) / 8);
         uint gridY = (uint)((outHeight + 7) / 8);
         uint gridZ = (uint)(batch * channels * outDepth);
@@ -5090,7 +5090,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int scaleD, int scaleH, int scaleW)
     {
         if (!_kernelCache.TryGetValue("nearest_upsample3d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: nearest_upsample3d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: nearest_upsample3d");
 
         int outDepth = inDepth * scaleD;
         int outHeight = inHeight * scaleH;
@@ -5137,7 +5137,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: per-input-cell scan of scale-cube output cells.
             if (!_kernelCache.TryGetValue("nearest_upsample3d_backward_deterministic", out var krnlD))
-                throw new InvalidOperationException("HIP kernel not found: nearest_upsample3d_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: nearest_upsample3d_backward_deterministic");
             uint gDX = (uint)((inWidth + 7) / 8);
             uint gDY = (uint)((inHeight + 7) / 8);
             uint gDZ = (uint)(batch * channels * inDepth);
@@ -5147,7 +5147,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("nearest_upsample3d_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: nearest_upsample3d_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: nearest_upsample3d_backward");
         int outDepth = inDepth * scaleD;
         int outHeight = inHeight * scaleH;
         int outWidth = inWidth * scaleW;
@@ -5167,7 +5167,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
         if (!_kernelCache.TryGetValue("batchnorm_forward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: batchnorm_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: batchnorm_forward");
 
             {
             int trainingInt = training ? 1 : 0;
@@ -5251,7 +5251,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int channels, int spatialSize, float epsilon)
     {
         if (!_kernelCache.TryGetValue("batchnorm_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: batchnorm_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: batchnorm_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -5287,7 +5287,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
         if (!_kernelCache.TryGetValue("layernorm_forward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: layernorm_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: layernorm_forward");
 
             {
             IntPtr _p0 = input.Handle;
@@ -5320,7 +5320,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         // First pass: compute gradInput
         if (!_kernelCache.TryGetValue("layernorm_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: layernorm_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: layernorm_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -5382,7 +5382,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
         if (!_kernelCache.TryGetValue("groupnorm_forward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: groupnorm_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: groupnorm_forward");
 
             {
             IntPtr _p0 = input.Handle;
@@ -5415,7 +5415,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int channels, int spatialSize, float epsilon)
     {
         if (!_kernelCache.TryGetValue("instancenorm_forward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: instancenorm_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: instancenorm_forward");
 
             {
             IntPtr _p0 = input.Handle;
@@ -5449,7 +5449,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int channels, int spatialSize, float epsilon)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         // Validate input dimensions
         long expectedInputSize = (long)batch * channels * spatialSize;
@@ -5478,7 +5478,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (!_kernelCache.TryGetValue("instancenorm_backward_sums", out var sumsKernel) ||
             !_kernelCache.TryGetValue("instancenorm_backward", out var backwardKernel))
-            throw new InvalidOperationException("HIP InstanceNormBackward kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("HIP InstanceNormBackward kernels are unavailable.");
 
         {
             // Allocate temporary buffers for intermediate sums
@@ -5615,7 +5615,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int normalizedSize, float epsilon)
     {
         if (!_kernelCache.TryGetValue("rmsnorm_forward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: rmsnorm_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rmsnorm_forward");
 
             {
             IntPtr _p0 = input.Handle;
@@ -5642,7 +5642,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
         if (!_kernelCache.TryGetValue("rmsnorm_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: rmsnorm_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rmsnorm_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -5670,7 +5670,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Compute gradGamma
         if (!_kernelCache.TryGetValue("rmsnorm_grad_gamma", out var krnl2))
-            throw new InvalidOperationException("HIP kernel not found: rmsnorm_grad_gamma");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rmsnorm_grad_gamma");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -5700,7 +5700,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (size <= 0) return;
         if (!_kernelCache.TryGetValue("dropout_dotnet_random_serial", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: dropout_dotnet_random_serial");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: dropout_dotnet_random_serial");
         bool sharedOutputs = ReferenceEquals(output, mask);
         bool maskAliasesInput = ReferenceEquals(mask, input);
         using var outputTemporary = sharedOutputs ? AllocateBuffer(size) : null;
@@ -5720,7 +5720,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void DropoutBackward(IGpuBuffer gradOutput, IGpuBuffer mask, IGpuBuffer gradInput, int size, float dropoutRate)
     {
         if (!_kernelCache.TryGetValue("dropout_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: dropout_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: dropout_backward");
 
         float scale = 1.0f / (1.0f - dropoutRate);
             {
@@ -5775,7 +5775,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Embedding(IGpuBuffer indices, IGpuBuffer embeddingTable, IGpuBuffer output, int numIndices, int embeddingDim)
     {
         if (!_kernelCache.TryGetValue("embedding_forward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: embedding_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: embedding_forward");
 
             {
             IntPtr _p0 = indices.Handle;
@@ -5806,7 +5806,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Issue #382: atomicAdd in embedding_backward is FP-non-deterministic
             // across runs. Route to the atomic-free variant — one thread per (v, d).
             if (!_kernelCache.TryGetValue("embedding_backward_deterministic", out var krnlD))
-                throw new InvalidOperationException("HIP kernel not found: embedding_backward_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: embedding_backward_deterministic");
 
             void** argsD = stackalloc void*[6];
             argsD[0] = &_p0;
@@ -5824,7 +5824,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("embedding_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: embedding_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: embedding_backward");
 
         void** args = stackalloc void*[5];
         args[0] = &_p0;
@@ -5921,7 +5921,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: locally_connected_conv2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: locally_connected_conv2d");
 
             {
             var pInput = input.Handle;
@@ -5968,7 +5968,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d_backward_input", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: locally_connected_conv2d_backward_input");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: locally_connected_conv2d_backward_input");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -6005,7 +6005,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int strideH, int strideW)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d_backward_weights", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: locally_connected_conv2d_backward_weights");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: locally_connected_conv2d_backward_weights");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -6039,7 +6039,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int outChannels, int outHeight, int outWidth)
     {
         if (!_kernelCache.TryGetValue("locally_connected_conv2d_backward_bias", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: locally_connected_conv2d_backward_bias");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: locally_connected_conv2d_backward_bias");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -6072,7 +6072,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: deformable_conv2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: deformable_conv2d");
 
             {
             var pInput = input.Handle;
@@ -6126,7 +6126,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_input", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: deformable_conv2d_backward_input");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: deformable_conv2d_backward_input");
 
             {
             var pGradOutput = gradOutput.Handle;
@@ -6179,7 +6179,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_weights", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: deformable_conv2d_backward_weights");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: deformable_conv2d_backward_weights");
 
             {
             var pGradOutput = gradOutput.Handle;
@@ -6233,7 +6233,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_offset", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: deformable_conv2d_backward_offset");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: deformable_conv2d_backward_offset");
 
             {
             var pGradOutput = gradOutput.Handle;
@@ -6290,7 +6290,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int groups, int deformGroups)
     {
         if (!_kernelCache.TryGetValue("deformable_conv2d_backward_mask", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: deformable_conv2d_backward_mask");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: deformable_conv2d_backward_mask");
 
             {
             var pGradOutput = gradOutput.Handle;
@@ -6347,7 +6347,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (batch <= 0 || numHeads <= 0 || seqQ <= 0 || seqK <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "Attention dimensions must be positive.");
         if (!_kernelCache.TryGetValue("scaled_dot_product_attention", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: scaled_dot_product_attention");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: scaled_dot_product_attention");
 
         // numKVHeads <= 0 means MHA (K/V have numHeads); >0 enables Grouped-Query Attention where each KV head is
         // shared by numHeads/numKVHeads query heads and the K/V buffers are sized [batch * numKVHeads * seqK * headDim].
@@ -6406,7 +6406,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if ((headDim & 1) != 0)
             throw new ArgumentException("RoPE requires an even head dimension.", nameof(headDim));
         if (!_kernelCache.TryGetValue("rope_interleaved", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: rope_interleaved");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rope_interleaved");
         int total = checked(rows * headDim);
         if (input.Size < total || output.Size < total)
             throw new ArgumentException("RoPE input/output buffers are smaller than rows * headDim.");
@@ -6488,7 +6488,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer? attentionBias = null, int biasBatchStride = 0)
     {
         if (!_kernelCache.TryGetValue("flash_attention_v2", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: flash_attention_v2");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: flash_attention_v2");
 
         int causalFlag = isCausal ? 1 : 0;
         int hasBias = attentionBias is not null ? 1 : 0;
@@ -6549,7 +6549,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: split into atomic-free gradq + gradkv kernels.
             if (!_kernelCache.TryGetValue("flash_attention_backward_gradq_deterministic", out var krnlQ))
-                throw new InvalidOperationException("HIP kernel not found: flash_attention_backward_gradq_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: flash_attention_backward_gradq_deterministic");
             void** argsQ = stackalloc void*[17];
             argsQ[0] = &_p0;
             argsQ[1] = &_p1;
@@ -6574,7 +6574,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             LaunchKernel2D(krnlQ, gQX, gQY, 64, 1, argsQ);
 
             if (!_kernelCache.TryGetValue("flash_attention_backward_gradkv_deterministic", out var krnlKV))
-                throw new InvalidOperationException("HIP kernel not found: flash_attention_backward_gradkv_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: flash_attention_backward_gradkv_deterministic");
             void** argsKV = stackalloc void*[18];
             argsKV[0] = &_p0;
             argsKV[1] = &_p1;
@@ -6604,7 +6604,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("flash_attention_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: flash_attention_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: flash_attention_backward");
 
         void** args = stackalloc void*[19];
         args[0] = &_p0;
@@ -6639,7 +6639,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batch, int numQHeads, int numKVHeads, int seqQ, int seqK, int headDim, float scale, bool isCausal)
     {
         if (!_kernelCache.TryGetValue("grouped_query_attention", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: grouped_query_attention");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: grouped_query_attention");
 
         int queriesPerKV = numQHeads / numKVHeads;
         int causalFlag = isCausal ? 1 : 0;
@@ -6711,7 +6711,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: split into atomic-free gradq + gradkv kernels.
             if (!_kernelCache.TryGetValue("grouped_query_attention_backward_gradq_deterministic", out var kQg))
-                throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward_gradq_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: grouped_query_attention_backward_gradq_deterministic");
             void** argsQg = stackalloc void*[14];
             argsQg[0] = &_p0;
             argsQg[1] = &_p1;
@@ -6732,7 +6732,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             LaunchKernel2D(kQg, gqX, gqY, 64, 1, argsQg);
 
             if (!_kernelCache.TryGetValue("grouped_query_attention_backward_gradkv_deterministic", out var kKVg))
-                throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward_gradkv_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: grouped_query_attention_backward_gradkv_deterministic");
             void** argsKVg = stackalloc void*[15];
             argsKVg[0] = &_p0;
             argsKVg[1] = &_p1;
@@ -6758,7 +6758,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("grouped_query_attention_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: grouped_query_attention_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: grouped_query_attention_backward");
 
         void** args = stackalloc void*[16];
         args[0] = &_p0;
@@ -6792,7 +6792,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Transpose(IGpuBuffer A, IGpuBuffer B, int rows, int cols)
     {
         if (!_kernelCache.TryGetValue("transpose_2d", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: transpose_2d");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: transpose_2d");
 
             {
             IntPtr _p0 = A.Handle;
@@ -6814,7 +6814,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void BatchedTranspose(IGpuBuffer A, IGpuBuffer B, int batch, int rows, int cols)
     {
         if (!_kernelCache.TryGetValue("batched_transpose", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: batched_transpose");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: batched_transpose");
 
             {
             IntPtr _p0 = A.Handle;
@@ -6845,7 +6845,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("permute_general", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: permute_general");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: permute_general");
 
         int totalSize = 1;
         for (int i = 0; i < ndims; i++) totalSize *= shape[i];
@@ -6904,7 +6904,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Fill(IGpuBuffer buffer, float value, int size)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         // For zero, use hipMemset (efficient for 0 bytes = 0.0f in IEEE 754)
         if (value == 0.0f)
@@ -6918,7 +6918,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // For non-zero values, use the fill_buffer kernel
         if (!_kernelCache.TryGetValue("fill_buffer", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: fill_buffer");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fill_buffer");
 
         int grid = (size + DefaultBlockSize - 1) / DefaultBlockSize;
         var dstHandle = ((HipGpuBuffer)buffer).Handle;
@@ -6953,10 +6953,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Copy2DStrided(IGpuBuffer source, IGpuBuffer destination, int numRows, int srcCols, int destTotalCols, int destColOffset)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("copy_2d_strided", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: copy_2d_strided");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: copy_2d_strided");
 
         int gridX = (srcCols + DefaultBlockSize - 1) / DefaultBlockSize;
         int gridY = numRows;
@@ -6994,10 +6994,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: nearest_neighbor_upsample");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: nearest_neighbor_upsample");
 
         int outHeight = height * scaleFactor;
         int outWidth = width * scaleFactor;
@@ -7039,14 +7039,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void NearestNeighborUpsampleBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batchChannels, int height, int width, int scaleFactor)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
 
         // Calculate input size - kernel iterates over input elements, not output elements
         // This avoids race conditions by having each thread write to a unique input location
         int inputSize = batchChannels * height * width;
 
         if (!_kernelCache.TryGetValue("nearest_neighbor_upsample_backward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: nearest_neighbor_upsample_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: nearest_neighbor_upsample_backward");
 
         // Grid size based on input elements (each thread handles one input element)
         int grid = (inputSize + DefaultBlockSize - 1) / DefaultBlockSize;
@@ -7088,7 +7088,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("relu_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: relu_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: relu_backward");
 
         LaunchUnaryOp(krnl, gradOutput.Handle, input.Handle, gradInput.Handle, size);
     }
@@ -7096,7 +7096,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SigmoidBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("sigmoid_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sigmoid_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sigmoid_backward");
 
         LaunchUnaryOp(krnl, gradOutput.Handle, output.Handle, gradInput.Handle, size);
     }
@@ -7104,7 +7104,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void TanhBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("tanh_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: tanh_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: tanh_backward");
 
         LaunchUnaryOp(krnl, gradOutput.Handle, output.Handle, gradInput.Handle, size);
     }
@@ -7112,7 +7112,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GeluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("gelu_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: gelu_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gelu_backward");
 
         LaunchUnaryOp(krnl, gradOutput.Handle, input.Handle, gradInput.Handle, size);
     }
@@ -7120,7 +7120,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
         if (!_kernelCache.TryGetValue("softmax_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: softmax_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: softmax_backward");
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -7182,7 +7182,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe float CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int batchSize, int numClasses)
     {
         if (!_kernelCache.TryGetValue("cross_entropy_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: cross_entropy_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: cross_entropy_loss");
 
         using var lossBuffer = AllocateBuffer(batchSize);
 
@@ -7209,7 +7209,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void CrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int batchSize, int numClasses)
     {
         if (!_kernelCache.TryGetValue("cross_entropy_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: cross_entropy_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: cross_entropy_backward");
 
         int total = batchSize * numClasses;
             {
@@ -7233,7 +7233,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe float BinaryCrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         if (!_kernelCache.TryGetValue("bce_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: bce_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: bce_loss");
 
         using var lossBuffer = AllocateBuffer(size);
 
@@ -7259,7 +7259,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void BinaryCrossEntropyBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("bce_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: bce_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: bce_backward");
 
         LaunchUnaryOp(krnl, predictions.Handle, targets.Handle, gradInput.Handle, size);
     }
@@ -7267,7 +7267,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe float MseLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
         if (!_kernelCache.TryGetValue("mse_loss_elementwise", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: mse_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mse_loss");
 
         using var lossBuffer = AllocateBuffer(size);
 
@@ -7293,7 +7293,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void MseBackward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size)
     {
         if (!_kernelCache.TryGetValue("mse_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: mse_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mse_backward");
 
         LaunchUnaryOp(krnl, predictions.Handle, targets.Handle, gradInput.Handle, size);
     }
@@ -7301,7 +7301,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe float SmoothL1Loss(IGpuBuffer predictions, IGpuBuffer targets, int size, float beta)
     {
         if (!_kernelCache.TryGetValue("smooth_l1_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: smooth_l1_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: smooth_l1_loss");
 
         using var lossBuffer = AllocateBuffer(size);
 
@@ -7328,7 +7328,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void SmoothL1Backward(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer gradInput, int size, float beta)
     {
         if (!_kernelCache.TryGetValue("smooth_l1_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: smooth_l1_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: smooth_l1_backward");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7357,7 +7357,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (embeddingDim <= 0) throw new ArgumentOutOfRangeException(nameof(embeddingDim), "Embedding dimension must be positive.");
 
         if (!_kernelCache.TryGetValue("triplet_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: triplet_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: triplet_loss");
 
         using var lossBuffer = AllocateBuffer(batchSize);
             {
@@ -7397,7 +7397,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (embeddingDim <= 0) throw new ArgumentOutOfRangeException(nameof(embeddingDim), "Embedding dimension must be positive.");
 
         if (!_kernelCache.TryGetValue("triplet_loss_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: triplet_loss_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: triplet_loss_backward");
 
             {
             IntPtr _p0 = anchor.Handle;
@@ -7431,7 +7431,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("huber_loss_elementwise", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: huber_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: huber_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7460,7 +7460,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("huber_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: huber_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: huber_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7486,7 +7486,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("focal_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: focal_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: focal_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7518,7 +7518,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("focal_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: focal_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: focal_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7547,7 +7547,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("mae_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: mae_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mae_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7575,7 +7575,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("mae_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: mae_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mae_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7600,7 +7600,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("log_cosh_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: log_cosh_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: log_cosh_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7628,7 +7628,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("log_cosh_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: log_cosh_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: log_cosh_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7653,7 +7653,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("quantile_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: quantile_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: quantile_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7682,7 +7682,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("quantile_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: quantile_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: quantile_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7708,7 +7708,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("hinge_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hinge_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hinge_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7736,7 +7736,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("hinge_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: hinge_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hinge_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7761,7 +7761,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("squared_hinge_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: squared_hinge_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: squared_hinge_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7789,7 +7789,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("squared_hinge_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: squared_hinge_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: squared_hinge_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7814,7 +7814,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("poisson_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: poisson_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: poisson_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7844,7 +7844,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("poisson_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: poisson_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: poisson_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7871,7 +7871,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("exponential_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: exponential_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: exponential_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7899,7 +7899,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("exponential_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: exponential_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: exponential_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7924,7 +7924,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("modified_huber_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: modified_huber_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: modified_huber_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -7952,7 +7952,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("modified_huber_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: modified_huber_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: modified_huber_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -7977,7 +7977,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("categorical_cross_entropy_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: categorical_cross_entropy_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: categorical_cross_entropy_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -8007,7 +8007,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("categorical_cross_entropy_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: categorical_cross_entropy_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: categorical_cross_entropy_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -8034,7 +8034,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("charbonnier_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: charbonnier_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: charbonnier_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -8063,7 +8063,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("charbonnier_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: charbonnier_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: charbonnier_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -8089,7 +8089,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (!_kernelCache.TryGetValue("elastic_net_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: elastic_net_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: elastic_net_loss");
 
         using var outputBuffer = AllocateBuffer(size);
             {
@@ -8119,7 +8119,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         if (gradInput is null) throw new ArgumentNullException(nameof(gradInput));
         if (!_kernelCache.TryGetValue("elastic_net_gradient", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: elastic_net_gradient");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: elastic_net_gradient");
 
             {
             IntPtr _p0 = predictions.Handle;
@@ -8147,7 +8147,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (other is null) throw new ArgumentNullException(nameof(other));
         if (labels is null) throw new ArgumentNullException(nameof(labels));
         if (!_kernelCache.TryGetValue("contrastive_loss", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: contrastive_loss");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: contrastive_loss");
 
         using var outputBuffer = AllocateBuffer(batchSize);
             {
@@ -8183,7 +8183,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (gradAnchor is null) throw new ArgumentNullException(nameof(gradAnchor));
         if (gradOther is null) throw new ArgumentNullException(nameof(gradOther));
         if (!_kernelCache.TryGetValue("contrastive_loss_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: contrastive_loss_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: contrastive_loss_backward");
 
         int totalSize = batchSize * embeddingDim;
             {
@@ -8216,7 +8216,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Clamp(IGpuBuffer A, IGpuBuffer B, float min, float max, int size)
     {
         if (!_kernelCache.TryGetValue("clamp", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: clamp");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: clamp");
 
             {
             IntPtr _p0 = A.Handle;
@@ -8238,7 +8238,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe float L2Norm(IGpuBuffer A, int size)
     {
         if (!_kernelCache.TryGetValue("l2_norm_squared", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: l2_norm_squared");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: l2_norm_squared");
 
         using var squaredBuffer = AllocateBuffer(size);
         LaunchElementwiseOp(krnl, A.Handle, squaredBuffer.Handle, size);
@@ -8254,9 +8254,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ClipByNorm(IGpuBuffer A, IGpuBuffer B, float maxNorm, int size)
     {
         if (!_kernelCache.TryGetValue("l2_norm_squared", out var squareKernel))
-            throw new InvalidOperationException("HIP kernel not found: l2_norm_squared");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: l2_norm_squared");
         if (!_kernelCache.TryGetValue("clip_by_norm_from_squared_sum", out var clipKernel))
-            throw new InvalidOperationException("HIP kernel not found: clip_by_norm_from_squared_sum");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: clip_by_norm_from_squared_sum");
         using var squared = AllocateBuffer(size);
         using var squaredSum = AllocateBuffer(1);
         LaunchElementwiseOp(squareKernel, A.Handle, squared.Handle, size);
@@ -8287,7 +8287,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
 
         if (!_kernelCache.TryGetValue("lerp_fused", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: lerp_fused");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: lerp_fused");
 
             {
             IntPtr _p0 = a.Handle;
@@ -8319,7 +8319,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
 
         if (!_kernelCache.TryGetValue("add_scaled", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: add_scaled");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: add_scaled");
 
             {
             IntPtr _p0 = a.Handle;
@@ -8353,7 +8353,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         SumAxis(input, mean, 1, size);
         Scale(mean, mean, 1.0f / size, 1);
         if (!_kernelCache.TryGetValue("squared_deviation_from_mean", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: squared_deviation_from_mean");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: squared_deviation_from_mean");
         IntPtr inputPointer = input.Handle, meanPointer = mean.Handle, outputPointer = squaredDeviations.Handle;
         void** args = stackalloc void*[4];
         args[0] = &inputPointer; args[1] = &meanPointer; args[2] = &outputPointer; args[3] = &size;
@@ -8366,7 +8366,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ScatterAdd(IGpuBuffer source, IGpuBuffer indices, IGpuBuffer destination, int sourceSize, int destSize)
     {
         if (!_kernelCache.TryGetValue("scatter_add_accumulate_deterministic", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: scatter_add_accumulate_deterministic");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: scatter_add_accumulate_deterministic");
         IntPtr sourcePointer = source.Handle, indexPointer = indices.Handle, destinationPointer = destination.Handle;
         void** args = stackalloc void*[5];
         args[0] = &sourcePointer; args[1] = &indexPointer; args[2] = &destinationPointer;
@@ -8396,7 +8396,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("greater_than", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: greater_than");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: greater_than");
 
         LaunchBinaryOp(krnl, A, B, C, size);
     }
@@ -8404,7 +8404,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void LessThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("less_than", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: less_than");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: less_than");
 
         LaunchBinaryOp(krnl, A, B, C, size);
     }
@@ -8812,7 +8812,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("equals", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: equals");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: equals");
 
         LaunchBinaryOp(krnl, A, B, C, size);
     }
@@ -8820,7 +8820,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (!_kernelCache.TryGetValue("where_cond", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: where_cond");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: where_cond");
 
             {
             IntPtr _p0 = condition.Handle;
@@ -8844,7 +8844,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void NotEqualScalar(IGpuBuffer A, IGpuBuffer C, float scalar, int size)
     {
         if (!_kernelCache.TryGetValue("not_equal_scalar", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: not_equal_scalar");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: not_equal_scalar");
 
             {
             IntPtr _p0 = A.Handle;
@@ -8906,7 +8906,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue(kernelName, out var krnl))
-            throw new InvalidOperationException($"HIP kernel not found: {kernelName}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {kernelName}");
         LaunchBinaryOp(krnl, A, B, C, size);
     }
 
@@ -8917,7 +8917,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void MeanAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("sum_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sum_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sum_axis");
 
         // First sum, then divide
             {
@@ -8942,7 +8942,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("compute_mean_var", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: compute_mean_var");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: compute_mean_var");
 
             {
             IntPtr _p0 = A.Handle;
@@ -8965,7 +8965,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("argmax_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: argmax_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: argmax_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -8986,7 +8986,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("argmin_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: argmin_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: argmin_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -9007,7 +9007,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("max_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: max_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: max_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -9028,7 +9028,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void TopK(IGpuBuffer A, IGpuBuffer values, IGpuBuffer indices, int outerSize, int reduceSize, int k, bool sorted = true)
     {
         if (!_kernelCache.TryGetValue("topk", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: topk");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: topk");
 
             {
             IntPtr _p0 = A.Handle;
@@ -9056,7 +9056,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void AffineGrid(IGpuBuffer theta, IGpuBuffer grid, int batch, int outputHeight, int outputWidth)
     {
         if (!_kernelCache.TryGetValue("affine_grid", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: affine_grid");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: affine_grid");
 
             {
             IntPtr _p0 = theta.Handle;
@@ -9083,7 +9083,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int paddingMode = 0, bool alignCorners = false)
     {
         if (!_kernelCache.TryGetValue("grid_sample", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: grid_sample");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: grid_sample");
 
             {
             IntPtr _p0 = input.Handle;
@@ -9127,7 +9127,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: split into gradGrid (per output pos) + gradInput (per input cell).
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_grid_deterministic", out var krnlG))
-                throw new InvalidOperationException("HIP kernel not found: grid_sample_backward_grad_grid_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: grid_sample_backward_grad_grid_deterministic");
 
             void** argsG = stackalloc void*[12];
             argsG[0] = &_p0;
@@ -9148,7 +9148,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             LaunchKernel3D(krnlG, gGX, gGY, gGZ, 16, 16, 1, argsG);
 
             if (!_kernelCache.TryGetValue("grid_sample_backward_grad_input_deterministic", out var krnlI))
-                throw new InvalidOperationException("HIP kernel not found: grid_sample_backward_grad_input_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: grid_sample_backward_grad_input_deterministic");
 
             void** argsI = stackalloc void*[11];
             argsI[0] = &_p0;
@@ -9171,7 +9171,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         if (!_kernelCache.TryGetValue("grid_sample_backward", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: grid_sample_backward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: grid_sample_backward");
 
         void** args = stackalloc void*[13];
         args[0] = &_p0;
@@ -9197,7 +9197,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
         if (!_kernelCache.TryGetValue("broadcast_multiply_last_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: broadcast_multiply_last_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: broadcast_multiply_last_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -9221,7 +9221,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void BroadcastMultiplyFirstAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
         if (!_kernelCache.TryGetValue("broadcast_multiply_first_axis", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: broadcast_multiply_first_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: broadcast_multiply_first_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -9262,7 +9262,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         IntPtr bitRevKernel = GetRequiredFftKernel("bit_reverse_permutation");
         IntPtr butterflyKernel = GetRequiredFftKernel("fft_butterfly");
@@ -9358,7 +9358,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void RFFT(IGpuBuffer input, IGpuBuffer outputReal, IGpuBuffer outputImag, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         // Allocate temporary buffers for full complex FFT
         using var tempReal = AllocateBuffer(n);
@@ -9403,7 +9403,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         // Allocate temporary buffers for full complex FFT
         using var tempReal = AllocateBuffer(n);
@@ -9442,7 +9442,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         IntPtr bitRevKernel = GetRequiredFftKernel("batched_bit_reverse");
         IntPtr butterflyKernel = GetRequiredFftKernel("batched_fft_butterfly");
@@ -9541,7 +9541,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         IntPtr rowsBitRevKernel = GetRequiredFftKernel("fft_rows_bit_reverse");
         IntPtr rowsButterflyKernel = GetRequiredFftKernel("fft_rows_butterfly");
@@ -9717,10 +9717,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ApplyWindow(IGpuBuffer input, IGpuBuffer window, IGpuBuffer output, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         if (!_kernelCache.TryGetValue("apply_window", out var kernel))
-            throw new InvalidOperationException("apply_window kernel not found");
+            throw new GpuCapabilityUnavailableException("apply_window kernel not found");
 
         uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -9746,10 +9746,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ComplexMagnitude(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer magnitude, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         if (!_kernelCache.TryGetValue("complex_magnitude", out var kernel))
-            throw new InvalidOperationException("complex_magnitude kernel not found");
+            throw new GpuCapabilityUnavailableException("complex_magnitude kernel not found");
 
         uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -9775,10 +9775,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ComplexPhase(IGpuBuffer real, IGpuBuffer imag, IGpuBuffer phase, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         if (!_kernelCache.TryGetValue("complex_phase", out var kernel))
-            throw new InvalidOperationException("complex_phase kernel not found");
+            throw new GpuCapabilityUnavailableException("complex_phase kernel not found");
 
         uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -9804,10 +9804,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void PolarToComplex(IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer real, IGpuBuffer imag, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         if (!_kernelCache.TryGetValue("polar_to_complex", out var kernel))
-            throw new InvalidOperationException("polar_to_complex kernel not found");
+            throw new GpuCapabilityUnavailableException("polar_to_complex kernel not found");
 
         uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -9835,10 +9835,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ApplyMelFilterbank(IGpuBuffer powerSpec, IGpuBuffer filterbank, IGpuBuffer melSpec, int numFrames, int numFreqs, int nMels)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         if (!_kernelCache.TryGetValue("apply_mel_filterbank", out var kernel))
-            throw new InvalidOperationException("apply_mel_filterbank kernel not found");
+            throw new GpuCapabilityUnavailableException("apply_mel_filterbank kernel not found");
 
         uint gridX = (uint)numFrames;
         uint gridY = (uint)((nMels + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -9867,10 +9867,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         if (!_kernelCache.TryGetValue("power_to_db", out var kernel))
-            throw new InvalidOperationException("power_to_db kernel not found");
+            throw new GpuCapabilityUnavailableException("power_to_db kernel not found");
 
         uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -9896,10 +9896,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void DbToPower(IGpuBuffer db, IGpuBuffer power, int n, float refValue)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP backend not available");
+            throw new GpuCapabilityUnavailableException("HIP backend not available");
 
         if (!_kernelCache.TryGetValue("db_to_power", out var kernel))
-            throw new InvalidOperationException("db_to_power kernel not found");
+            throw new GpuCapabilityUnavailableException("db_to_power kernel not found");
 
         uint gridSize = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -10317,7 +10317,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: argmax_axis");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: argmax_axis");
 
         IntPtr inputPtr = A.Handle;
         IntPtr indicesPtr = indices.Handle;
@@ -10330,7 +10330,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)
     {
         if (!_kernelCache.TryGetValue("generate_random_uniform", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: generate_random_uniform");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: generate_random_uniform");
 
         IntPtr outputPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -10343,7 +10343,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer output, int size, uint threshold, float scale, uint seed)
     {
         if (!_kernelCache.TryGetValue("stateless_dropout_mask", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: stateless_dropout_mask");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: stateless_dropout_mask");
 
         IntPtr outputPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -10359,7 +10359,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void GenerateRandomNormal(IGpuBuffer output, int size, float mean, float stdDev, ulong seed)
     {
         if (!_kernelCache.TryGetValue("generate_random_normal", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: generate_random_normal");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: generate_random_normal");
 
         IntPtr outputPtr = output.Handle;
         void** args = stackalloc void*[5];
@@ -10377,7 +10377,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void RbfForward(IGpuBuffer input, IGpuBuffer centers, IGpuBuffer epsilons, IGpuBuffer output, int batchSize, int numCenters, int inputDim)
     {
         if (!_kernelCache.TryGetValue("rbf_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: rbf_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rbf_forward");
 
         IntPtr inputPtr = input.Handle, centersPtr = centers.Handle;
         IntPtr epsilonsPtr = epsilons.Handle, outputPtr = output.Handle;
@@ -10392,7 +10392,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float ltpRate, float ltdRate, float homeostasisRate, float minWeight, float maxWeight, int numPre, int numPost)
     {
         if (!_kernelCache.TryGetValue("stdp_update", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: stdp_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: stdp_update");
 
         IntPtr wPtr = weights.Handle, preTPtr = preTrace.Handle, postTPtr = postTrace.Handle;
         IntPtr preSPtr = preSpike.Handle, postSPtr = postSpike.Handle;
@@ -10409,7 +10409,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void UpdateTraces(IGpuBuffer traces, IGpuBuffer spikes, IGpuBuffer input, float decay, float threshold, int size)
     {
         if (!_kernelCache.TryGetValue("update_traces", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: update_traces");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: update_traces");
 
         IntPtr tracesPtr = traces.Handle, spikesPtr = spikes.Handle, inputPtr = input.Handle;
         void** args = stackalloc void*[6];
@@ -10424,7 +10424,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void PoincareProject(IGpuBuffer input, IGpuBuffer output, int batchSize, int dim, float curvature, float epsilon = 1e-5f)
     {
         if (!_kernelCache.TryGetValue("poincare_project", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: poincare_project");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: poincare_project");
 
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
             {
@@ -10447,7 +10447,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void MobiusAdd(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         if (!_kernelCache.TryGetValue("mobius_add", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: mobius_add");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mobius_add");
 
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
             {
@@ -10471,7 +10471,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void PoincareExpMap(IGpuBuffer basePoint, IGpuBuffer tangentVec, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         if (!_kernelCache.TryGetValue("poincare_exp_map", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: poincare_exp_map");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: poincare_exp_map");
 
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
             {
@@ -10495,7 +10495,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void PoincareDistance(IGpuBuffer x, IGpuBuffer y, IGpuBuffer output, int batchSize, int dim, float curvature)
     {
         if (!_kernelCache.TryGetValue("poincare_distance", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: poincare_distance");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: poincare_distance");
 
         uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
             {
@@ -10520,7 +10520,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures, float curvature, float epsilon)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_euclidean_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_euclidean_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hyperbolic_linear_euclidean_forward");
 
         int totalThreads = batchSize * outputFeatures;
         uint grid = (uint)((totalThreads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10552,7 +10552,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_input", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_backward_input");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hyperbolic_linear_backward_input");
 
         int totalThreads = batchSize * inputFeatures;
         uint grid = (uint)((totalThreads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10582,7 +10582,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_weights", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_backward_weights");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hyperbolic_linear_backward_weights");
 
         int totalThreads = outputFeatures * inputFeatures;
         uint grid = (uint)((totalThreads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10610,7 +10610,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures, float curvature)
     {
         if (!_kernelCache.TryGetValue("hyperbolic_linear_backward_biases", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: hyperbolic_linear_backward_biases");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: hyperbolic_linear_backward_biases");
 
         // Bias gradients: one per output feature (not outputFeatures * inputFeatures)
         int totalThreads = outputFeatures;
@@ -10641,7 +10641,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void OctonionMultiply(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
         if (!_kernelCache.TryGetValue("octonion_multiply", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: octonion_multiply");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: octonion_multiply");
 
         uint grid = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
             {
@@ -10663,7 +10663,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void OctonionAdd(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int count)
     {
         if (!_kernelCache.TryGetValue("octonion_add", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: octonion_add");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: octonion_add");
 
         int totalElements = count * 8;
         uint grid = (uint)((totalElements + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10687,7 +10687,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: octonion_linear_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: octonion_linear_forward");
 
         int totalThreads = batchSize * outputFeatures;
         uint grid = (uint)((totalThreads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10715,7 +10715,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_backward_input", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: octonion_linear_backward_input");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: octonion_linear_backward_input");
 
         int totalThreads = batchSize * inputFeatures;
         uint grid = (uint)((totalThreads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10743,7 +10743,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_backward_weights", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: octonion_linear_backward_weights");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: octonion_linear_backward_weights");
 
         int totalThreads = outputFeatures * inputFeatures;
         uint grid = (uint)((totalThreads + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10769,7 +10769,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_backward_biases", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: octonion_linear_backward_biases");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: octonion_linear_backward_biases");
 
         uint grid = (uint)((outputFeatures + DefaultBlockSize - 1) / DefaultBlockSize);
             {
@@ -10799,7 +10799,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int batchSize, int inputFeatures, int outputFeatures)
     {
         if (!_kernelCache.TryGetValue("octonion_linear_forward_fused_relu", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: octonion_linear_forward_fused_relu");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: octonion_linear_forward_fused_relu");
 
         int totalOutputs = batchSize * outputFeatures;
         uint grid = (uint)((totalOutputs + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10830,7 +10830,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (numPairs * 2 > a.Size || numPairs * 2 > b.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are a={a.Size}, b={b.Size}, out={output.Size}.");
         if (!_kernelCache.TryGetValue("complex_multiply", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: complex_multiply");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: complex_multiply");
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         {
             IntPtr _p0 = a.Handle, _p1 = b.Handle, _p2 = output.Handle;
@@ -10846,7 +10846,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (numPairs * 2 > input.Size || numPairs * 2 > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) requires {numPairs * 2} elements but buffer sizes are in={input.Size}, out={output.Size}.");
         if (!_kernelCache.TryGetValue("complex_conjugate", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: complex_conjugate");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: complex_conjugate");
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         {
             IntPtr _p0 = input.Handle, _p1 = output.Handle;
@@ -10864,7 +10864,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (numPairs > output.Size)
             throw new ArgumentException($"numPairs ({numPairs}) exceeds output buffer size ({output.Size}).");
         if (!_kernelCache.TryGetValue("complex_magnitude_interleaved", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: complex_magnitude_interleaved");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: complex_magnitude_interleaved");
         uint grid = (uint)((numPairs + DefaultBlockSize - 1) / DefaultBlockSize);
         {
             IntPtr _p0 = input.Handle, _p1 = output.Handle;
@@ -10881,7 +10881,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void QuantumMeasurement(IGpuBuffer realPart, IGpuBuffer imagPart, IGpuBuffer probabilities, int batchSize, int stateSize)
     {
         if (!_kernelCache.TryGetValue("quantum_measurement", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: quantum_measurement");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: quantum_measurement");
 
         int totalElements = batchSize * stateSize;
         uint grid = (uint)((totalElements + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10905,7 +10905,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void NormalizeProbabilities(IGpuBuffer probabilities, int batchSize, int stateSize)
     {
         if (!_kernelCache.TryGetValue("normalize_probabilities", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: normalize_probabilities");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: normalize_probabilities");
 
         uint sharedMemSize = (uint)(DefaultBlockSize * sizeof(float));
             {
@@ -10925,7 +10925,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer outReal, IGpuBuffer outImag, int batchSize, int dim)
     {
         if (!_kernelCache.TryGetValue("complex_matvec", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: complex_matvec");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: complex_matvec");
 
         int totalElements = batchSize * dim;
         uint grid = (uint)((totalElements + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -10956,7 +10956,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IGpuBuffer angles, int numQubits, int batchSize)
     {
         if (!_kernelCache.TryGetValue("quantum_rotation", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: quantum_rotation");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: quantum_rotation");
 
             {
             IntPtr _p0 = stateReal.Handle;
@@ -10982,7 +10982,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void MeasurementForward(IGpuBuffer input, IGpuBuffer output, int batchSize, int stateSize)
     {
         if (!_kernelCache.TryGetValue("measurement_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: measurement_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: measurement_forward");
 
         uint sharedMemSize = (uint)(DefaultBlockSize * sizeof(float));
             {
@@ -11012,7 +11012,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("lstm_forward_sequence", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: lstm_forward_sequence");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: lstm_forward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
         if (hiddenSize > MaxRnnBlockSize)
@@ -11099,7 +11099,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("lstm_backward_sequence", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: lstm_backward_sequence");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: lstm_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
         if (hiddenSize > MaxRnnBlockSize)
@@ -11168,7 +11168,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("gru_forward_sequence", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: gru_forward_sequence");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gru_forward_sequence");
 
         // The forward kernel uses __syncthreads() which only synchronizes within a block.
         // If hiddenSize > MaxRnnBlockSize, threads within a batch would span multiple blocks,
@@ -11227,7 +11227,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
         if (!_kernelCache.TryGetValue("gru_backward_sequence", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: gru_backward_sequence");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gru_backward_sequence");
 
         // Validate hiddenSize fits in a block for correct synchronization
         if (hiddenSize > MaxRnnBlockSize)
@@ -11301,7 +11301,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Step 1: Call gru_cell_backward_unified to compute gate gradients and partial gradPrevH
         if (!_kernelCache.TryGetValue("gru_cell_backward_unified", out var cellBackwardKernel))
-            throw new InvalidOperationException("HIP kernel not found: gru_cell_backward_unified");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gru_cell_backward_unified");
 
             {
             IntPtr _p0 = gradH.Handle;
@@ -11335,7 +11335,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         // Step 2: Call gru_backward_prevh_unified to compute full gradPrevH using all gate gradients
         if (!_kernelCache.TryGetValue("gru_backward_prevh_unified", out var prevhKernel))
-            throw new InvalidOperationException("HIP kernel not found: gru_backward_prevh_unified");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: gru_backward_prevh_unified");
 
             {
             IntPtr _p0 = gradGateR.Handle;
@@ -11619,7 +11619,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float momentum, float weightDecay, int size)
     {
         if (!_kernelCache.TryGetValue("sgd_momentum_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sgd_momentum_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sgd_momentum_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11646,7 +11646,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float weightDecay, int size)
     {
         if (!_kernelCache.TryGetValue("sgd_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: sgd_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: sgd_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11670,7 +11670,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         if (!_kernelCache.TryGetValue("adam_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adam_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adam_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11702,7 +11702,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         if (!_kernelCache.TryGetValue("adamw_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adamw_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adamw_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11733,7 +11733,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         if (!_kernelCache.TryGetValue("adam_bf16_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adam_bf16_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adam_bf16_update");
 
             {
             IntPtr _p0 = param.Handle;
@@ -11763,7 +11763,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         if (!_kernelCache.TryGetValue("adamw_bf16_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adamw_bf16_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adamw_bf16_update");
 
             {
             IntPtr _p0 = param.Handle;
@@ -11796,7 +11796,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int blockSize, int paramLength, int numBlocks)
     {
         if (!_kernelCache.TryGetValue("adam8bit_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adam8bit_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adam8bit_update");
 
             {
             IntPtr _p0 = param.Handle;
@@ -11834,7 +11834,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float rho, float epsilon, float weightDecay, int size)
     {
         if (!_kernelCache.TryGetValue("rmsprop_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: rmsprop_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: rmsprop_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11862,7 +11862,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float epsilon, float weightDecay, int size)
     {
         if (!_kernelCache.TryGetValue("adagrad_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adagrad_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adagrad_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11889,7 +11889,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float momentum, float weightDecay, int size)
     {
         if (!_kernelCache.TryGetValue("nag_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: nag_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: nag_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11916,7 +11916,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
     {
         if (!_kernelCache.TryGetValue("lars_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: lars_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: lars_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11953,7 +11953,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float rho, float epsilon, float weightDecay, int size)
     {
         if (!_kernelCache.TryGetValue("adadelta_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adadelta_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adadelta_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -11982,7 +11982,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         if (!_kernelCache.TryGetValue("amsgrad_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: amsgrad_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: amsgrad_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -12016,7 +12016,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         if (!_kernelCache.TryGetValue("adamax_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: adamax_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: adamax_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -12048,7 +12048,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float weightDecay, int size)
     {
         if (!_kernelCache.TryGetValue("lion_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: lion_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: lion_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -12076,7 +12076,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
         if (!_kernelCache.TryGetValue("nadam_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: nadam_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: nadam_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -12108,7 +12108,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float l1Reg, float l2Reg, float beta, int size)
     {
         if (!_kernelCache.TryGetValue("ftrl_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: ftrl_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: ftrl_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -12138,7 +12138,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         float learningRate, float l1Strength, int size)
     {
         if (!_kernelCache.TryGetValue("proximal_l1_update", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: proximal_l1_update");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: proximal_l1_update");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)param).Handle;
@@ -12161,7 +12161,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ConvertToFp16(IGpuBuffer input, IGpuBuffer output, int size)
     {
         if (!_kernelCache.TryGetValue("convert_fp32_to_fp16", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: convert_fp32_to_fp16. FP16 conversion requires a proper GPU kernel.");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: convert_fp32_to_fp16. FP16 conversion requires a proper GPU kernel.");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)input).Handle;
@@ -12182,7 +12182,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void ConvertToFp32(IGpuBuffer input, IGpuBuffer output, int size)
     {
         if (!_kernelCache.TryGetValue("convert_fp16_to_fp32", out var krnl))
-            throw new InvalidOperationException("HIP kernel not found: convert_fp16_to_fp32. FP32 conversion requires a proper GPU kernel.");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: convert_fp16_to_fp32. FP32 conversion requires a proper GPU kernel.");
 
             {
             IntPtr _p0 = ((HipGpuBuffer)input).Handle;
@@ -12200,7 +12200,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     #endregion
-// Fused kernel dispatch methods    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { LaunchFusedAxis("reduce_mean", i, o, 1, sz); }    public unsafe void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if(!_kernelCache.TryGetValue("clip_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: clip_kernel"); using var _=PushContext(); IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&op;a[2]=&mn;a[3]=&mx;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { LaunchFusedScalar("pow_scalar", i, o, ex, sz); }    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { LaunchFusedUnary("frac_kernel", i, o, sz); }    public unsafe void EyeKernel(IGpuBuffer o, int n) { if(!_kernelCache.TryGetValue("eye_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: eye_kernel"); using var _=PushContext(); IntPtr op=o.Handle; void** a=stackalloc void*[2]; a[0]=&op;a[1]=&n; LaunchKernel(k,(uint)((n*n+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { if(!_kernelCache.TryGetValue("one_hot_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: one_hot_kernel"); using var _=PushContext(); IntPtr ip=idx.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&bs;a[3]=&nc; LaunchKernel(k,(uint)((bs*nc+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { if(!_kernelCache.TryGetValue("masked_fill_kernel",out var k))throw new InvalidOperationException("HIP kernel not found: masked_fill_kernel"); using var _=PushContext(); IntPtr ip=i.Handle,mp=m.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&mp;a[2]=&op;a[3]=&fv;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void EqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { LaunchFusedBinary("equals_kernel", a1, b1, o, sz); }    public void NotEqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { LaunchFusedBinary("not_equals_kernel", a1, b1, o, sz); }    public unsafe void OuterProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int M, int N) { if(!_kernelCache.TryGetValue("outer_product",out var k))throw new InvalidOperationException("HIP kernel not found: outer_product"); using var _=PushContext(); IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&M;a[4]=&N; LaunchKernel(k,(uint)((M*N+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void BatchDotProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int bs, int dim) { if(!_kernelCache.TryGetValue("batch_dot_product",out var k))throw new InvalidOperationException("HIP kernel not found: batch_dot_product"); using var _=PushContext(); IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&bs;a[4]=&dim; LaunchKernel(k,(uint)((bs+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("glu_forward", i, o, os, hd); }    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("geglu_forward", i, o, os, hd); }    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("reglu_forward", i, o, os, hd); }    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("swiglu_forward", i, o, os, hd); }    public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { LaunchFusedBinary("bce_loss", p, t, l, sz); }
+// Fused kernel dispatch methods    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { LaunchFusedAxis("reduce_mean", i, o, 1, sz); }    public unsafe void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if(!_kernelCache.TryGetValue("clip_kernel",out var k))throw new GpuCapabilityUnavailableException("HIP kernel not found: clip_kernel"); using var _=PushContext(); IntPtr ip=i.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&op;a[2]=&mn;a[3]=&mx;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { LaunchFusedScalar("pow_scalar", i, o, ex, sz); }    public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { LaunchFusedUnary("frac_kernel", i, o, sz); }    public unsafe void EyeKernel(IGpuBuffer o, int n) { if(!_kernelCache.TryGetValue("eye_kernel",out var k))throw new GpuCapabilityUnavailableException("HIP kernel not found: eye_kernel"); using var _=PushContext(); IntPtr op=o.Handle; void** a=stackalloc void*[2]; a[0]=&op;a[1]=&n; LaunchKernel(k,(uint)((n*n+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { if(!_kernelCache.TryGetValue("one_hot_kernel",out var k))throw new GpuCapabilityUnavailableException("HIP kernel not found: one_hot_kernel"); using var _=PushContext(); IntPtr ip=idx.Handle,op=o.Handle; void** a=stackalloc void*[4]; a[0]=&ip;a[1]=&op;a[2]=&bs;a[3]=&nc; LaunchKernel(k,(uint)((bs*nc+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { if(!_kernelCache.TryGetValue("masked_fill_kernel",out var k))throw new GpuCapabilityUnavailableException("HIP kernel not found: masked_fill_kernel"); using var _=PushContext(); IntPtr ip=i.Handle,mp=m.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ip;a[1]=&mp;a[2]=&op;a[3]=&fv;a[4]=&sz; LaunchKernel(k,(uint)((sz+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void EqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { LaunchFusedBinary("equals_kernel", a1, b1, o, sz); }    public void NotEqualsKernel(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int sz) { LaunchFusedBinary("not_equals_kernel", a1, b1, o, sz); }    public unsafe void OuterProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int M, int N) { if(!_kernelCache.TryGetValue("outer_product",out var k))throw new GpuCapabilityUnavailableException("HIP kernel not found: outer_product"); using var _=PushContext(); IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&M;a[4]=&N; LaunchKernel(k,(uint)((M*N+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public unsafe void BatchDotProduct(IGpuBuffer a1, IGpuBuffer b1, IGpuBuffer o, int bs, int dim) { if(!_kernelCache.TryGetValue("batch_dot_product",out var k))throw new GpuCapabilityUnavailableException("HIP kernel not found: batch_dot_product"); using var _=PushContext(); IntPtr ap=a1.Handle,bp=b1.Handle,op=o.Handle; void** a=stackalloc void*[5]; a[0]=&ap;a[1]=&bp;a[2]=&op;a[3]=&bs;a[4]=&dim; LaunchKernel(k,(uint)((bs+DefaultBlockSize-1)/DefaultBlockSize),DefaultBlockSize,a); }    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("glu_forward", i, o, os, hd); }    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("geglu_forward", i, o, os, hd); }    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("reglu_forward", i, o, os, hd); }    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { LaunchFusedAxis("swiglu_forward", i, o, os, hd); }    public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { LaunchFusedBinary("bce_loss", p, t, l, sz); }
 
     /// <inheritdoc/>
     public void SpectralFilter(IGpuBuffer inputReal, IGpuBuffer filterReal, IGpuBuffer filterImag,
@@ -12261,7 +12261,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (n <= 0) return;
         if (!_kernelCache.TryGetValue("atan2_elementwise", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: atan2_elementwise");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: atan2_elementwise");
         IntPtr ip = imag.Handle, rp = real.Handle, op = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &ip; args[1] = &rp; args[2] = &op; args[3] = &n;
@@ -12273,7 +12273,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (rows <= 0 || cols <= 0) return;
         if (!_kernelCache.TryGetValue("normalize_rows_fused", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: normalize_rows_fused");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: normalize_rows_fused");
         IntPtr ip = input.Handle, op = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &ip; args[1] = &op; args[2] = &rows; args[3] = &cols;
@@ -12294,7 +12294,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("analytic_signal_mask", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: analytic_signal_mask");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: analytic_signal_mask");
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
         void** args = stackalloc void*[8];
         args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
@@ -12311,7 +12311,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("bispectrum_gather", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: bispectrum_gather");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: bispectrum_gather");
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
         void** args = stackalloc void*[6];
         args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
@@ -12328,7 +12328,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("trispectrum_gather", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: trispectrum_gather");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: trispectrum_gather");
         IntPtr srP = specReal.Handle, siP = specImag.Handle, orP = outReal.Handle, oiP = outImag.Handle;
         void** args = stackalloc void*[7];
         args[0] = &srP; args[1] = &siP; args[2] = &orP; args[3] = &oiP;
@@ -12341,7 +12341,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (total <= 0) return;
         if (!_kernelCache.TryGetValue("cavity_bounce_inplace", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: cavity_bounce_inplace");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: cavity_bounce_inplace");
         IntPtr wr = workReal.Handle, wi = workImag.Handle;
         void** args = stackalloc void*[4];
         args[0] = &wr; args[1] = &wi; args[2] = &total; args[3] = &invN;
@@ -12357,7 +12357,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("wideband_log_bin_pool", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: wideband_log_bin_pool");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: wideband_log_bin_pool");
         IntPtr mp = magBuf.Handle, op = output.Handle;
         void** args = stackalloc void*[6];
         args[0] = &mp; args[1] = &op;
@@ -12374,7 +12374,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
         if (!_kernelCache.TryGetValue("mel_filterbank_apply", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: mel_filterbank_apply");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mel_filterbank_apply");
         IntPtr ps = powerSpec.Handle, mf = melFilters.Handle, me = melEnergy.Handle;
         void** args = stackalloc void*[6];
         args[0] = &ps; args[1] = &mf; args[2] = &me;
@@ -12387,7 +12387,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (n <= 0) return;
         if (!_kernelCache.TryGetValue("mfcc_log1p", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: mfcc_log1p");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: mfcc_log1p");
         IntPtr ip = input.Handle, op = output.Handle;
         void** args = stackalloc void*[3];
         args[0] = &ip; args[1] = &op; args[2] = &n;
@@ -12415,14 +12415,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             // Issue #382: per-(b, bin) parallelization; uses statically-sized __shared__ in kernel.
             if (!_kernelCache.TryGetValue("pac_phase_bin_mi_deterministic", out var krnlD))
-                throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi_deterministic");
+                throw new GpuCapabilityUnavailableException("HIP kernel not found: pac_phase_bin_mi_deterministic");
             // block size = NUM_PHASE_BINS = 18 (one thread per bin)
             LaunchKernelWithSharedMem(krnlD, (uint)batch, 18, 0, argList);
             return;
         }
 
         if (!_kernelCache.TryGetValue("pac_phase_bin_mi", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: pac_phase_bin_mi");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: pac_phase_bin_mi");
         LaunchKernelWithSharedMem(kernel, (uint)batch, 256, (uint)(2 * 18 * sizeof(float)), argList);
     }
 }
