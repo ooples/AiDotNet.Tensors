@@ -117,3 +117,12 @@ public class TorchParityIntegerHipDeviceTests : TorchParityIntegerDeviceTestsBas
 {
     public TorchParityIntegerHipDeviceTests(HipTensorEngineTestFixture fixture) : base(fixture) { }
 }
+
+#if NET7_0_OR_GREATER
+/// <summary>The FP32 kernels Metal and WebGPU run, as WGSL on Dawn (#1125, #1128).</summary>
+[Collection("DirectGpuSerial")]
+public class TorchParityIntegerDawnDeviceTests : TorchParityIntegerDeviceTestsBase, IClassFixture<DawnTorchParityFixture>
+{
+    public TorchParityIntegerDawnDeviceTests(DawnTorchParityFixture fixture) : base(fixture) { }
+}
+#endif

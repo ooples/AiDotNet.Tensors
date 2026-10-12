@@ -92,4 +92,85 @@ internal static class PortableTorchParity
         RequireCapacity(output, n, nameof(output), "n");
         launch("tp_polynomial", n, x, degree, output, n, kind, shifted ? 1 : 0);
     }
+
+    /// <summary>A double as the float pair hi + lo the kernels take for values they must keep to double precision.</summary>
+    private static (float Hi, float Lo) Split(double value)
+    {
+        float hi = (float)value;
+        if (float.IsInfinity(hi) || float.IsNaN(hi)) return (hi, 0f);
+        return (hi, (float)(value - hi));
+    }
+
+    public static void Range(PortableGenericFft.Launcher launch, IGpuBuffer output, int n, double start, double span, double denominator)
+    {
+        if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
+        var (s0, s1) = Split(start); var (p0, p1) = Split(span); var (d0, d1) = Split(denominator);
+        launch("tp_range", n, output, n, s0, s1, p0, p1, d0, d1);
+    }
+
+    public static void Logspace(PortableGenericFft.Launcher launch, IGpuBuffer output, int n, double start, double span,
+        double denominator, double logBase, bool single)
+    {
+        if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
+        var (s0, s1) = Split(start); var (p0, p1) = Split(span); var (d0, d1) = Split(denominator);
+        var (l0, l1) = Split(Math.Log(logBase));
+        launch("tp_logspace", n, output, n, s0, s1, p0, p1, d0, d1, l0, l1, single ? 1 : 0);
+    }
+
+    public static void Window(PortableGenericFft.Launcher launch, IGpuBuffer output, int n, int kind, int m, double alpha, double beta)
+    {
+        if (n <= 0) return;
+        RequireCapacity(output, n, nameof(output), "n");
+        launch("tp_window", n, output, n, kind, m, (float)alpha, (float)beta);
+    }
+
+    public static void TriIndices(PortableGenericFft.Launcher launch, IGpuBuffer output, int row, int col, int offset, bool lower, int total)
+    {
+        if (row <= 0 || total <= 0) return;
+        RequireCapacity(output, 2L * total, nameof(output), "2*total");
+        launch("tp_tri_indices", row, output, row, col, offset, lower ? 1 : 0, total);
+    }
+
+    public static void Diagflat(PortableGenericFft.Launcher launch, IGpuBuffer input, IGpuBuffer output, int n, int size, int offset)
+    {
+        if (size <= 0) return;
+        int total = checked(size * size);
+        RequireCapacity(output, total, nameof(output), "size*size");
+        RequireCapacity(input, n, nameof(input), "n");
+        launch("tp_diagflat", total, input, output, total, size, offset, n);
+    }
+
+    public static void DiagonalScatter(IDirectGpuBackend backend, PortableGenericFft.Launcher launch, IGpuBuffer src, IGpuBuffer output,
+        int count, int[] otherExtents, int[] otherStrides, int stride1, int stride2, int start1, int start2, int diagonal)
+    {
+        if (otherExtents is null) throw new ArgumentNullException(nameof(otherExtents));
+        if (otherStrides is null) throw new ArgumentNullException(nameof(otherStrides));
+        if (otherStrides.Length != otherExtents.Length)
+            throw new ArgumentException("otherStrides must hold one stride per other axis.", nameof(otherStrides));
+        if (count <= 0) return;
+        if (otherExtents.Length > 8) throw new ArgumentOutOfRangeException(nameof(otherExtents), "at most 8 other axes.");
+        if (diagonal <= 0) throw new ArgumentOutOfRangeException(nameof(diagonal));
+        RequireCapacity(src, count, nameof(src), "count");
+        long furthest = (long)(diagonal - 1 + start1) * stride1 + (long)(diagonal - 1 + start2) * stride2;
+        for (int k = 0; k < otherExtents.Length; k++) furthest += (long)(otherExtents[k] - 1) * otherStrides[k];
+        RequireCapacity(output, furthest + 1, nameof(output), "furthest diagonal offset + 1");
+        var geometry = new int[22];
+        geometry[0] = otherExtents.Length;
+        for (int k = 0; k < otherExtents.Length; k++) { geometry[1 + k] = otherExtents[k]; geometry[9 + k] = otherStrides[k]; }
+        geometry[17] = stride1; geometry[18] = stride2; geometry[19] = start1; geometry[20] = start2; geometry[21] = diagonal;
+        using var g = backend.AllocateIntBuffer(geometry);
+        launch("tp_diagonal_scatter", count, src, output, g, count);
+    }
+
+    public static void QuantileRows(PortableGenericFft.Launcher launch, IGpuBuffer sorted, IGpuBuffer output, int rows, int length,
+        double q, int mode, bool ignoreNan)
+    {
+        if (rows <= 0) return;
+        RequireCapacity(sorted, (long)rows * length, nameof(sorted), "rows*length");
+        RequireCapacity(output, rows, nameof(output), "rows");
+        var (q0, q1) = Split(q);
+        launch("tp_quantile_rows", rows, sorted, output, rows, length, q0, q1, mode, ignoreNan ? 1 : 0);
+    }
 }

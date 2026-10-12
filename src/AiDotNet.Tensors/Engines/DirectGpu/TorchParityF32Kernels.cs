@@ -680,7 +680,7 @@ __device__ __forceinline__ float tp_igamma_continued_fraction(float a, float x)
                   .Append("(const float* x, float* y, int n, float p0, float p1)\n{\n    int t = bx_gid();\n    if (t >= n) { return; }\n    float v = x[t];\n    ")
                   .Append(body).Append("\n}\n\n");
             }
-            return sb.Append(BinaryAndPolynomial).ToString();
+            return sb.Append(BinaryAndPolynomial).Append(Generators).ToString();
         }
     }
 
@@ -817,4 +817,182 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_polynomial(const float* x
     y[t] = current.x + current.y;
 }
 ";
+
+    // Generators. A double the host holds travels as a float pair hi + lo (PortableTorchParity.Split), so arange and
+    // logspace keep the CPU's double positions; everything else rounds once to float, as the CPU's FromDoubles does.
+    private const string Generators = @"
+extern ""C"" __global__ __launch_bounds__(256) void tp_range(float* y, int n, float startHi, float startLo, float spanHi, float spanLo, float denHi, float denLo)
+{
+    int t = bx_gid();
+    if (t >= n) { return; }
+    float2 v = tp_df_add(make_float2(startHi, startLo), tp_df_div(tp_df_mul(tp_df((float)t), make_float2(spanHi, spanLo)), make_float2(denHi, denLo)));
+    y[t] = v.x + v.y;
 }
+
+// e^r for |r| <= ln2 / 2 by its Taylor series (float-exact to the last bit at this range).
+__device__ __forceinline__ float tp_exp_small(float r)
+{
+    float term = 1.0f;
+    float sum = 1.0f;
+    for (int k = 1; k < 12; k++)
+    {
+        term = term * r / (float)k;
+        sum = sum + term;
+    }
+    return sum;
+}
+
+// base^e = 2^n e^r with e ln(base) = n ln2 + r reduced in double-float, so the result keeps float's last bit where
+// the GPU's pow (exp2 of e log2 base, each to ~1e-6) does not. lnBase arrives as hi + lo from the host's double.
+extern ""C"" __global__ __launch_bounds__(256) void tp_logspace(float* y, int n, float startHi, float startLo, float spanHi, float spanLo, float denHi, float denLo, float lnBaseHi, float lnBaseLo, int single)
+{
+    int t = bx_gid();
+    if (t >= n) { return; }
+    float2 e = make_float2(startHi, startLo);
+    if (single == 0) { e = tp_df_add(e, tp_df_div(tp_df_mul(tp_df((float)t), make_float2(spanHi, spanLo)), make_float2(denHi, denLo))); }
+    float2 l = tp_df_mul(e, make_float2(lnBaseHi, lnBaseLo));
+    if (l.x > 89.0f) { y[t] = tp_inf(); return; }
+    if (l.x < -104.0f) { y[t] = 0.0f; return; }
+    float turns = rintf(l.x / 0.6931471805599453f);
+    float2 r = tp_df_add(l, tp_df_neg(tp_df_mul(tp_df(turns), make_float2(0.6931471824645996f, -1.904654323148236e-9f))));
+    y[t] = ldexpf(tp_exp_small(r.x + r.y), (int)turns);
+}
+
+// Windows over t = i / (m - 1): 0 Hann, 1 Hamming(alpha, beta), 2 Blackman, 3 Bartlett, 4 Kaiser(beta = alpha).
+extern ""C"" __global__ __launch_bounds__(256) void tp_window(float* y, int n, int kind, int m, float alpha, float beta)
+{
+    int t = bx_gid();
+    if (t >= n) { return; }
+    if (n == 1) { y[t] = 1.0f; return; }
+    float u = (float)t / (float)(m - 1);
+    float v = 0.0f;
+    if (kind == 0) { v = 0.5f - 0.5f * cosf(6.283185307179586f * u); }
+    else if (kind == 1) { v = alpha - beta * cosf(6.283185307179586f * u); }
+    else if (kind == 2) { v = 0.42f - 0.5f * cosf(6.283185307179586f * u) + 0.08f * cosf(12.566370614359172f * u); }
+    else if (kind == 3) { v = 1.0f - fabsf(2.0f * u - 1.0f); }
+    else
+    {
+        float r = 2.0f * u - 1.0f;
+        // I0(a s) / I0(a) = e^(a (s - 1)) I0e(a s) / I0e(a), with a (s - 1) = -a r^2 / (1 + s): no cancellation, where
+        // e^(a s - a) from two large exponents would multiply float's error by a.
+        float s = sqrtf(fmaxf(0.0f, 1.0f - r * r));
+        float a = fabsf(alpha);
+        v = expf(-a * r * r / (1.0f + s)) * tp_bessel_i_scaled(0, a * s) / tp_bessel_i_scaled(0, a);
+    }
+    y[t] = v;
+}
+
+// The first and last column a tril / triu row keeps.
+__device__ __forceinline__ int tp_tri_lo(int r, int col, int offset, int lower)
+{
+    int edge = r + offset;
+    if (lower != 0) { return 0; }
+    if (edge > 0) { return edge; }
+    return 0;
+}
+
+__device__ __forceinline__ int tp_tri_hi(int r, int col, int offset, int lower)
+{
+    int edge = r + offset;
+    if (lower != 0)
+    {
+        if (edge < col - 1) { return edge; }
+        return col - 1;
+    }
+    return col - 1;
+}
+
+// tril / triu indices as a [2, total] tensor, one thread per row.
+extern ""C"" __global__ __launch_bounds__(256) void tp_tri_indices(float* y, int row, int col, int offset, int lower, int total)
+{
+    int t = bx_gid();
+    if (t >= row) { return; }
+    int at = 0;
+    for (int r = 0; r < t; r++)
+    {
+        int lo = tp_tri_lo(r, col, offset, lower);
+        int hi = tp_tri_hi(r, col, offset, lower);
+        if (hi >= lo) { at = at + hi - lo + 1; }
+    }
+    int lo = tp_tri_lo(t, col, offset, lower);
+    int hi = tp_tri_hi(t, col, offset, lower);
+    for (int j = lo; j <= hi; j++)
+    {
+        y[at] = (float)t;
+        y[total + at] = (float)j;
+        at = at + 1;
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void tp_diagflat(const float* x, float* y, int total, int size, int offset, int n)
+{
+    int t = bx_gid();
+    if (t >= total) { return; }
+    int r = t / size;
+    int c = t % size;
+    int k = -1;
+    if (offset >= 0) { if (c - r == offset) { k = r; } }
+    else { if (r - c == -offset) { k = c; } }
+    if (k >= 0 && k < n) { y[t] = x[k]; } else { y[t] = 0.0f; }
+}
+
+// diagonal_scatter: g[0] other rank, g[1..8] other extents, g[9..16] other strides, g[17..21] stride1, stride2,
+// start1, start2, diagonal.
+extern ""C"" __global__ __launch_bounds__(256) void tp_diagonal_scatter(const float* src, float* y, const int* g, int count)
+{
+    int t = bx_gid();
+    if (t >= count) { return; }
+    int diagonal = g[21];
+    int o = t / diagonal;
+    int d = t % diagonal;
+    int base = 0;
+    int rest = o;
+    for (int j = g[0] - 1; j >= 0; j--)
+    {
+        base = base + (rest % g[1 + j]) * g[9 + j];
+        rest = rest / g[1 + j];
+    }
+    y[base + (d + g[19]) * g[17] + (d + g[20]) * g[18]] = src[t];
+}
+
+// quantile over sorted rows (ascending, NaN last). mode: 0 linear, 1 lower, 2 higher, 3 nearest (ties to even),
+// 4 midpoint. The position q (count - 1) is formed in double-float from q's hi + lo, so its floor, ceiling and ties
+// match the CPU's double.
+extern ""C"" __global__ __launch_bounds__(256) void tp_quantile_rows(const float* sorted, float* y, int rows, int length, float qHi, float qLo, int mode, int ignoreNan)
+{
+    int r = bx_gid();
+    if (r >= rows) { return; }
+    int baseRow = r * length;
+    int lo = 0;
+    int hi = length;
+    while (lo < hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (tp_isnan(sorted[baseRow + mid])) { hi = mid; } else { lo = mid + 1; }
+    }
+    int count = lo;
+    if (count == 0 || (count < length && ignoreNan == 0)) { y[r] = tp_nan(); return; }
+    float2 position = tp_df_mul(make_float2(qHi, qLo), tp_df((float)(count - 1)));
+    float below = floorf(position.x);
+    if (position.x == below && position.y < 0.0f) { below = below - 1.0f; }
+    float above = ceilf(position.x);
+    if (position.x == above && position.y > 0.0f) { above = above + 1.0f; }
+    float w = (position.x - below) + position.y;
+    if (mode == 1) { above = below; w = 0.0f; }
+    else if (mode == 2) { below = above; w = 0.0f; }
+    else if (mode == 3)
+    {
+        float nearest = below;
+        if (w > 0.5f) { nearest = below + 1.0f; }
+        else if (w == 0.5f && below - 2.0f * floorf(below / 2.0f) != 0.0f) { nearest = below + 1.0f; }
+        below = nearest;
+        above = nearest;
+        w = 0.0f;
+    }
+    else if (mode == 4)
+    {
+        if (below == above) { w = 0.0f; } else { w = 0.5f; }
+    }
+    y[r] = (1.0f - w) * sorted[baseRow + (int)below] + w * sorted[baseRow + (int)above];
+}
+";}

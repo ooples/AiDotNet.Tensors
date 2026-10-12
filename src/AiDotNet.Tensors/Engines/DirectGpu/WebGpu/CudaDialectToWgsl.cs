@@ -137,6 +137,7 @@ internal static class CudaDialectToWgsl
         s = Regex.Replace(s, @"\b(exp|log|sqrt|floor|ceil|tanh|sin|cos|tan|atan|atan2|trunc|pow)f\(", "$1(", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\bfabsf\(", "abs(", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\bfmaf\(", "fma(", RegexOptions.None, Timeout);
+        s = Regex.Replace(s, @"\b(ldexp|fmax|fmin)f\(", m => m.Groups[1].Value == "ldexp" ? "ldexp(" : m.Groups[1].Value == "fmax" ? "max(" : "min(", RegexOptions.None, Timeout);
         s = s.Replace("make_float2(", "vec2<f32>(");
         s = Regex.Replace(s, @"\brintf\(", "round(", RegexOptions.None, Timeout);   // both round half to even
         s = s.Replace("__float_as_uint(", "bitcast<u32>(").Replace("__float_as_int(", "bitcast<i32>(")

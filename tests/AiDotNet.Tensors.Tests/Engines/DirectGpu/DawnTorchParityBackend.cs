@@ -31,19 +31,19 @@ internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParit
     public void TorchParityPolynomial(int kind, bool shifted, IGpuBuffer x, IGpuBuffer degree, IGpuBuffer output, int n)
         => PortableTorchParity.Polynomial(_launch, kind, shifted, x, degree, output, n);
     public void TorchParityRange(IGpuBuffer output, int n, double start, double span, double denominator)
-        => _hostParity.TorchParityRange(output, n, start, span, denominator);
+        => PortableTorchParity.Range(_launch, output, n, start, span, denominator);
     public void TorchParityLogspace(IGpuBuffer output, int n, double start, double span, double denominator, double logBase, bool single)
-        => _hostParity.TorchParityLogspace(output, n, start, span, denominator, logBase, single);
+        => PortableTorchParity.Logspace(_launch, output, n, start, span, denominator, logBase, single);
     public void TorchParityWindow(IGpuBuffer output, int n, int kind, int m, double alpha, double beta)
-        => _hostParity.TorchParityWindow(output, n, kind, m, alpha, beta);
+        => PortableTorchParity.Window(_launch, output, n, kind, m, alpha, beta);
     public void TorchParityTriIndices(IGpuBuffer output, int row, int col, int offset, bool lower, int total)
-        => _hostParity.TorchParityTriIndices(output, row, col, offset, lower, total);
+        => PortableTorchParity.TriIndices(_launch, output, row, col, offset, lower, total);
     public void TorchParityDiagflat(IGpuBuffer input, IGpuBuffer output, int n, int size, int offset)
-        => _hostParity.TorchParityDiagflat(input, output, n, size, offset);
+        => PortableTorchParity.Diagflat(_launch, input, output, n, size, offset);
     public void TorchParityDiagonalScatter(IGpuBuffer src, IGpuBuffer output, int count, int[] otherExtents, int[] otherStrides, int stride1, int stride2, int start1, int start2, int diagonal)
-        => _hostParity.TorchParityDiagonalScatter(src, output, count, otherExtents, otherStrides, stride1, stride2, start1, start2, diagonal);
+        => PortableTorchParity.DiagonalScatter(Inner, _launch, src, output, count, otherExtents, otherStrides, stride1, stride2, start1, start2, diagonal);
     public void TorchParityQuantileRows(IGpuBuffer sorted, IGpuBuffer output, int rows, int length, double q, int mode, bool ignoreNan)
-        => _hostParity.TorchParityQuantileRows(sorted, output, rows, length, q, mode, ignoreNan);
+        => PortableTorchParity.QuantileRows(_launch, sorted, output, rows, length, q, mode, ignoreNan);
     public void TorchParityFlagReset(IGpuBuffer flag)
         => _hostParity.TorchParityFlagReset(flag);
     public void TorchParitySample(IGpuBuffer output, int n, int kind, double a, double b, ulong seed)
