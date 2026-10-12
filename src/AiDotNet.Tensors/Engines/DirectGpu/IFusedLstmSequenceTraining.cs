@@ -7,10 +7,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// weights and the bias, for any hidden size up to <see cref="MaxFusedLstmHidden"/>.
 /// </summary>
 /// <remarks>
-/// Declared only by backends verified against a CPU forward + BPTT reference (LstmSequenceBackendParityTests):
-/// CUDA, HIP, OpenCL and Vulkan. Metal and WebGPU are left out until their kernels are checked on hardware; there the
-/// engine keeps the per-timestep ops, which give the same gradients with more launches. Tracked per backend: Metal in
-/// #1107, WebGPU in #1108.
+/// Declared by every backend after checking against a CPU forward + BPTT reference (LstmSequenceBackendParityTests).
+/// CUDA, HIP, OpenCL and Vulkan run their own sequence kernels. Metal and WebGPU run the shared lstm_p_ kernels
+/// (PortableLstmSequence, #1107 / #1108); the test runs that same source on OpenCL, Vulkan and HIP as well.
 /// </remarks>
 internal interface IFusedLstmSequenceTraining
 {

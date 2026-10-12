@@ -7,6 +7,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 public sealed partial class HipBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
+    /// <remarks>HIP keeps its power-of-two FFT kernel.</remarks>
+    bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
+
     public void AdamMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
