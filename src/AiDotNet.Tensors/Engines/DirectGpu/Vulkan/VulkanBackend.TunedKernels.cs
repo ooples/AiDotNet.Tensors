@@ -63,8 +63,11 @@ public sealed unsafe partial class VulkanBackend
                 _tuneQueryPoolUnavailable = true;
             }
 
+            _device.WaitForPendingSubmissions();
             long start = Stopwatch.GetTimestamp();
             for (int i = 0; i < repetitions; i++) run();
+            // The runs are submitted without waiting; the clock stops when they have executed.
+            _device.WaitForPendingSubmissions();
             return (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
         }
     }

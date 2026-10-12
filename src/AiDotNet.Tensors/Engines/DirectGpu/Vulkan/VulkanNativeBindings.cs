@@ -1091,6 +1091,18 @@ public static unsafe class VulkanNativeBindings
             vkDestroyFence_Linux(device, fence, pAllocator);
     }
 
+    [DllImport(VulkanWindows, EntryPoint = "vkGetFenceStatus")]
+    private static extern int vkGetFenceStatus_Windows(IntPtr device, IntPtr fence);
+
+    [DllImport(VulkanLinux, EntryPoint = "vkGetFenceStatus")]
+    private static extern int vkGetFenceStatus_Linux(IntPtr device, IntPtr fence);
+
+    /// <summary>VK_SUCCESS when the fence has signalled, VK_NOT_READY when it has not. Does not wait.</summary>
+    public static int vkGetFenceStatus(IntPtr device, IntPtr fence)
+        => RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? vkGetFenceStatus_Windows(device, fence)
+            : vkGetFenceStatus_Linux(device, fence);
+
     [DllImport(VulkanWindows, EntryPoint = "vkWaitForFences")]
     private static extern int vkWaitForFences_Windows(IntPtr device, uint fenceCount, IntPtr* pFences, uint waitAll, ulong timeout);
 

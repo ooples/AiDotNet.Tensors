@@ -1135,6 +1135,7 @@ void main() {
 
     public void Synchronize()
     {
+        // Waits for everything submitted without waiting, then for the device (WaitIdle does both).
         if (_initialized && !_disposed)
             _device.WaitIdle();
     }
