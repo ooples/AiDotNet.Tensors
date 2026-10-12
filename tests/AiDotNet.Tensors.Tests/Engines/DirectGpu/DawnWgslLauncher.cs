@@ -139,9 +139,22 @@ for await (const line of rl) {
             switch (arg)
             {
                 case IGpuBuffer buffer:
-                    float[] data = host.DownloadBuffer(buffer);
-                    var bytes = new byte[data.Length * 4];
-                    Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+                    byte[] bytes;
+                    if (buffer.SizeInBytes != (long)buffer.Size * sizeof(float))
+                    {
+                        // A byte buffer (FP16 or int8 operands): its Size is a byte count, and the host reads it
+                        // through its own call. The shader binds it as 32-bit words, so the copy is padded to a
+                        // whole word; the kernels mask every element out of its word and never use the padding.
+                        byte[] raw = host.DownloadByteBuffer(buffer, checked((int)buffer.SizeInBytes));
+                        bytes = new byte[(raw.Length + 3) / 4 * 4];
+                        Buffer.BlockCopy(raw, 0, bytes, 0, raw.Length);
+                    }
+                    else
+                    {
+                        float[] data = host.DownloadBuffer(buffer);
+                        bytes = new byte[data.Length * 4];
+                        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+                    }
                     buffers.Add(buffer);
                     encoded.Add(Convert.ToBase64String(bytes));
                     break;

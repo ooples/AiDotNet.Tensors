@@ -1,7 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-// No FP16-native activation kernels here: every capability reports false, so the engine keeps activations in FP32.
+// No FP16-native activation kernels here apart from the direct convolution: every other capability reports false,
+// so the engine keeps activations in FP32.
 // The operations still work: PortableFp16Activation widens, runs the FP32 kernel and narrows back.
 public sealed unsafe partial class VulkanBackend : IFp16ActivationBackend
 {
@@ -11,7 +12,8 @@ public sealed unsafe partial class VulkanBackend : IFp16ActivationBackend
 
     bool IFp16ActivationBackend.Fp16BroadcastAddChannelAvailable => false;
 
-    bool IFp16ActivationBackend.Fp16DirectConvAvailable => false;
+    // The one FP16 kernel this backend has of its own (#682); see VulkanBackend.HalfPrecision.cs.
+    bool IFp16ActivationBackend.Fp16DirectConvAvailable => Fp16DirectConvAvailable;
 
     bool IFp16ActivationBackend.Fp16GroupNormSwishAvailable => false;
 
@@ -54,7 +56,12 @@ public sealed unsafe partial class VulkanBackend : IFp16ActivationBackend
         => ConvertToFp32(input, output, size);
 
     void IFp16ActivationBackend.Conv2dDirectFp16Hw(IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
-        => PortableFp16Activation.Conv2dHalfWeights(this, input, weightsHalf, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    {
+        if (Fp16DirectConvAvailable)
+            Conv2dDirectFp16Hw(input, weightsHalf, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        else
+            PortableFp16Activation.Conv2dHalfWeights(this, input, weightsHalf, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
 
     void IFp16ActivationBackend.UnfoldKNFp16FromFp16(IGpuBuffer inputHalf, IGpuBuffer outputHalf, int batch, int channels, int height, int width, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => PortableFp16Activation.UnfoldKN(this, inputHalf, outputHalf, batch, channels, height, width, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
