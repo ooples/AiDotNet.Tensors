@@ -206,7 +206,7 @@ public class VulkanTorchParityMathTests
                 Assert.Equal(0x07230203u, spirv![0]);   // SPIR-V magic number
                 count++;
             }
-            // One per unary and binary op, plus the 33 other kernels (31, and the two int64 ones for #1135).
+            // One per unary and binary op, plus the 33 other kernels.
             Assert.Equal(Enum.GetValues(typeof(TorchParityUnaryOp)).Length + Enum.GetValues(typeof(TorchParityBinaryOp)).Length + 33, count);
             Assert.NotNull(compiler.CompileToSpirv(VulkanTorchParityElementwiseKernels.DoubleProbe("d_exp(x)", special: false)));
         }

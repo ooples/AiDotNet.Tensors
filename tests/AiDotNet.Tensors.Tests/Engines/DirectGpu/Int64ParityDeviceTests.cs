@@ -184,6 +184,7 @@ public abstract class Int64ParityDeviceTestsBase
     }
 }
 
+/// <summary>The cases above on the machine's default DirectGpu backend.</summary>
 [Collection("VulkanGlobalState")]
 public class Int64ParityDeviceTests : Int64ParityDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
 {
