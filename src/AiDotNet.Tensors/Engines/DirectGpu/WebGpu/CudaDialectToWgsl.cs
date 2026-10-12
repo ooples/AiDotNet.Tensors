@@ -30,13 +30,19 @@ internal static class CudaDialectToWgsl
 
     private static readonly Regex KernelHeader = new(
         @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
+    private static readonly Regex ConstTable = new(@"__device__ const float (\w+)\[(\d+)\] = \{([^}]*)\};", RegexOptions.None, Timeout);
+
     private static readonly Regex HelperHeader = new(
-        @"__device__ __forceinline__ (float|int|unsigned int|bool|void) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
+        @"__device__ __forceinline__ (float2|float|int|unsigned int|bool|void) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
 
     /// <summary>Kernel name to its WGSL module.</summary>
     public static Dictionary<string, string> Translate(string source)
     {
         var helpers = new StringBuilder();
+        // Constant tables: __device__ const float NAME[N] = { ... };  ->  const NAME = array<f32, N>(...);
+        foreach (Match table in ConstTable.Matches(source))
+            helpers.Append("const ").Append(table.Groups[1].Value).Append(" = array<f32, ").Append(table.Groups[2].Value).Append(">(")
+                .Append(Regex.Replace(table.Groups[3].Value, @"(\d)f\b", "$1", RegexOptions.None, Timeout).Trim()).Append(");\n");
         var kernels = new List<(string Name, string Params, string Body)>();
         int at = 0;
         while (true)
@@ -103,7 +109,7 @@ internal static class CudaDialectToWgsl
         {
             string p = raw.Trim();
             if (p.Length == 0) continue;
-            var m = Regex.Match(p, @"^(float|int|unsigned int|bool) (\w+)$", RegexOptions.None, Timeout);
+            var m = Regex.Match(p, @"^(float2|float|int|unsigned int|bool) (\w+)$", RegexOptions.None, Timeout);
             if (!m.Success) throw new System.InvalidOperationException($"Untranslatable helper parameter '{p}'.");
             parts.Add(m.Groups[2].Value + ": " + Type(m.Groups[1].Value));
         }
@@ -113,6 +119,7 @@ internal static class CudaDialectToWgsl
     private static string Type(string c) => c switch
     {
         "float" => "f32",
+        "float2" => "vec2<f32>",
         "int" => "i32",
         "unsigned int" => "u32",
         "bool" => "bool",
@@ -125,10 +132,12 @@ internal static class CudaDialectToWgsl
         s = Regex.Replace(s, @"(?<![\w.])(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?f\b", "$1$2", RegexOptions.None, Timeout);
         s = Casts(s);
         s = Regex.Replace(s, @"\bfor \((float|int|unsigned int) (\w+) =", m => $"for (var {m.Groups[2].Value}: {Type(m.Groups[1].Value)} =", RegexOptions.None, Timeout);
-        s = Regex.Replace(s, @"(?m)^(\s*)(?:const )?(float|int|unsigned int|bool) (\w+)\s*(=|;)",
+        s = Regex.Replace(s, @"(?m)(?<=^|[;{}])(\s*)(?:const )?(float2|float|int|unsigned int|bool) (\w+)\s*(=|;)",
             m => $"{m.Groups[1].Value}var {m.Groups[3].Value}: {Type(m.Groups[2].Value)} {m.Groups[4].Value}", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\b(exp|log|sqrt|floor|ceil|tanh|sin|cos|tan|atan|atan2|trunc|pow)f\(", "$1(", RegexOptions.None, Timeout);
         s = Regex.Replace(s, @"\bfabsf\(", "abs(", RegexOptions.None, Timeout);
+        s = Regex.Replace(s, @"\bfmaf\(", "fma(", RegexOptions.None, Timeout);
+        s = s.Replace("make_float2(", "vec2<f32>(");
         s = Regex.Replace(s, @"\brintf\(", "round(", RegexOptions.None, Timeout);   // both round half to even
         s = s.Replace("__float_as_uint(", "bitcast<u32>(").Replace("__float_as_int(", "bitcast<i32>(")
              .Replace("__int_as_float(", "bitcast<f32>(")
@@ -158,6 +167,7 @@ internal static class CudaDialectToWgsl
             {
                 end = start;
                 while (end < s.Length && (char.IsLetterOrDigit(s[end]) || s[end] == '_' || s[end] == '.')) end++;
+                if (end < s.Length && s[end] == '(') end = MatchingParen(s, end) + 1;   // a call: (int)ceilf(x)
                 while (end < s.Length && s[end] == '[') end = MatchingBracket(s, end) + 1;
             }
             string operand = Casts(s.Substring(start, end - start));

@@ -78,11 +78,13 @@ for await (const line of rl) {
 ";
 
     private readonly Process _node;
+    private readonly IReadOnlyDictionary<string, string>? _modules;
 
-    private DawnWgslLauncher(Process node) => _node = node;
+    private DawnWgslLauncher(Process node, IReadOnlyDictionary<string, string>? modules) { _node = node; _modules = modules; }
 
     /// <summary>A launcher, or null when AIDOTNET_WEBGPU_NODE_DIR is not set up.</summary>
-    public static DawnWgslLauncher? TryCreate()
+    /// <param name="modules">Kernel name to WGSL module; null runs the batch-execution ports.</param>
+    public static DawnWgslLauncher? TryCreate(IReadOnlyDictionary<string, string>? modules = null)
     {
         string? dir = Environment.GetEnvironmentVariable("AIDOTNET_WEBGPU_NODE_DIR");
         if (string.IsNullOrEmpty(dir) || !Directory.Exists(Path.Combine(dir, "node_modules", "webgpu"))) return null;
@@ -97,7 +99,7 @@ for await (const line of rl) {
             UseShellExecute = false,
         };
         var node = Process.Start(start);
-        return node is null ? null : new DawnWgslLauncher(node);
+        return node is null ? null : new DawnWgslLauncher(node, modules);
     }
 
     /// <summary>A <see cref="PortableGenericFft.Launcher"/> that runs each launch's WGSL port on Dawn.</summary>
@@ -106,9 +108,11 @@ for await (const line of rl) {
     private void Launch(IDirectGpuBackend host, string name, int threads, object[] args)
     {
         if (threads <= 0) return;
-        if (!WebGpuBatchExecutionKernels.ByKernelName.TryGetValue(name, out var source))
+        string? source = null;
+        if (!(_modules?.TryGetValue(name, out source) ?? false) && !WebGpuBatchExecutionKernels.ByKernelName.TryGetValue(name, out source))
             throw new InvalidOperationException($"No WGSL port for {name}.");
-        string code = WebGpuShaderPrelude.Prepare(source);
+        string code = WebGpuShaderPrelude.Prepare(source ?? "");
+        AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnLaunch();   // device work, as a backend's own launch counts it
         var writable = new HashSet<int>();
         foreach (Match m in Binding.Matches(code))
             if (m.Groups[2].Value == "read_write") writable.Add(int.Parse(m.Groups[1].Value));
