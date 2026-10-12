@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private DirectOpenClKernel GetRoiKernel(string name)
         {
             if (!_kernelCache.TryGetValue(name, out var k))
-                throw new InvalidOperationException($"OpenCL RoI kernel not found: {name}.");
+                throw new GpuCapabilityUnavailableException($"OpenCL RoI kernel not found: {name}.");
             return k;
         }
         private static int RoundUpRoi(int v) => ((v + RoiLocalSize - 1) / RoiLocalSize) * RoiLocalSize;

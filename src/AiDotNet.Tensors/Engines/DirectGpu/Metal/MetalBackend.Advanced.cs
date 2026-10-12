@@ -10,7 +10,7 @@ public sealed partial class MetalBackend
     {
         if (threads <= 0) return;
         if (_residentLibrary == IntPtr.Zero)
-            throw new InvalidOperationException("Metal resident kernels are unavailable.");
+            throw new GpuCapabilityUnavailableException("Metal resident kernels are unavailable.");
 
         var pipeline = GetPipeline("Resident", _residentLibrary, kernelName);
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(threads);

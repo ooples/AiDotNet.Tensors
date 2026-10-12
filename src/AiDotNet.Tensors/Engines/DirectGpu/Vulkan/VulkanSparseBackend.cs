@@ -52,7 +52,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
             float[] b, int rows, int cols, int n)
         {
             if (!IsAvailable)
-                throw new InvalidOperationException("Vulkan SpMM backend is not available.");
+                throw new GpuCapabilityUnavailableException("Vulkan SpMM backend is not available.");
 
             var backend = GetOrCreate();
             var output = new float[rows * n];
@@ -99,7 +99,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
             float[] x, float[] y, int innerK)
         {
             if (!IsAvailable)
-                throw new InvalidOperationException("Vulkan SDDMM backend is not available.");
+                throw new GpuCapabilityUnavailableException("Vulkan SDDMM backend is not available.");
 
             int nnz = rowIndices.Length;
             var output = new float[nnz];

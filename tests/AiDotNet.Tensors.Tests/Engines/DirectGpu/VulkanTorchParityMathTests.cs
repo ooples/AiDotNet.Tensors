@@ -98,6 +98,12 @@ public class VulkanTorchParityMathTests
     [MemberData(nameof(ElementaryCases))]
     public void ElementaryFunction_AgreesWithDotNet(string name, string expression, string inputKind, double maxUlps)
     {
+#if NETFRAMEWORK
+        // .NET Framework's Math.Sin / Math.Cos are not correctly reduced: 5 ulp off at ~785, ~1e11 ulp at multiples of π
+        // (where the true result is near 0), and past ~1e19 they return the argument itself, so they cannot be the
+        // reference. The device kernel is the same on every target, and the .NET (Core) run checks it.
+        Skip.If(name == "sin" || name == "cos", ".NET Framework's Math.Sin/Cos are not correctly reduced; checked on .NET instead.");
+#endif
         var backend = BackendOrSkip();
         Func<double, double> reference = name switch
         {

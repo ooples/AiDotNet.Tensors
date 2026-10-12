@@ -69,6 +69,23 @@ public sealed class ResultBufferTrackerTests
     }
 
     [Fact]
+    public void RawAccess_ReleasesTheTrackingEntryAtOnce()
+    {
+        // An escaped array can never be reused, so the tracker must not keep holding it: it used to stay (dead, held
+        // strongly) until a rent of its size scanned it or a trim ran.
+        var source = Source();
+        var result = source.Multiply(2.0);
+        Assert.NotNull(result.ResultOwner);
+        long escapedBefore = ResultBufferTracker.EscapedArrays;
+        int trackedBefore = ResultBufferTracker.TrackedCount;
+        _ = result.AsSpan()[0];
+        Assert.Equal(trackedBefore - 1, ResultBufferTracker.TrackedCount);
+        Assert.True(ResultBufferTracker.EscapedArrays > escapedBefore);
+        Assert.Null(ResultBufferTracker.Find(result.AsSpanUnmarkedArray()));
+        GC.KeepAlive(result);
+    }
+
+    [Fact]
     public void RawAccess_KeepsTheArrayFromEverBeingReused()
     {
         var source = Source();

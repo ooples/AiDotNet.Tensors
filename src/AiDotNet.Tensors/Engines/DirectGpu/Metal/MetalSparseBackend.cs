@@ -60,7 +60,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
             float[] b, int rows, int cols, int n)
         {
             if (!IsAvailable)
-                throw new InvalidOperationException("Metal SpMM backend is not available.");
+                throw new GpuCapabilityUnavailableException("Metal SpMM backend is not available.");
 
             var backend = GetOrCreate();
             var output = new float[rows * n];
@@ -109,7 +109,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
             float[] x, float[] y, int innerK)
         {
             if (!IsAvailable)
-                throw new InvalidOperationException("Metal SDDMM backend is not available.");
+                throw new GpuCapabilityUnavailableException("Metal SDDMM backend is not available.");
 
             int nnz = rowIndices.Length;
             var output = new float[nnz];
