@@ -34,11 +34,20 @@ public sealed class MetalGpuBuffer : IGpuBuffer
     private IntPtr _buffer;
     private bool _disposed;
     private readonly object _lock = new();
+    private readonly long _byteOffset;
+    // A view keeps its parent reachable, so the parent's finalizer cannot release memory the view still addresses.
+    private readonly MetalGpuBuffer? _viewParent;
 
     /// <summary>
     /// Gets the native Metal buffer handle.
     /// </summary>
     public IntPtr Handle => _buffer;
+
+    /// <summary>Byte offset of this buffer's first element in <see cref="Handle"/>: zero except for a view.</summary>
+    public long ByteOffset => _byteOffset;
+
+    /// <summary>True when this buffer is a view into another buffer's memory (see <see cref="IGpuBufferViews"/>).</summary>
+    internal bool IsView => _viewParent is not null;
 
     /// <summary>
     /// Gets the number of float elements in the buffer.
@@ -79,7 +88,8 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             {
                 return IntPtr.Zero;
             }
-            return SendMessage(_buffer, Selectors.Contents);
+            IntPtr contents = SendMessage(_buffer, Selectors.Contents);
+            return contents == IntPtr.Zero ? IntPtr.Zero : IntPtr.Add(contents, checked((int)_byteOffset));
         }
     }
 
@@ -168,6 +178,25 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         }
     }
 
+    /// <summary>
+    /// A view of <paramref name="elementCount"/> floats starting <paramref name="elementOffset"/> floats into
+    /// <paramref name="parent"/>: the same MTLBuffer bound at a byte offset. The view retains the MTLBuffer, so its
+    /// own release is balanced and the memory stays valid while either object is alive.
+    /// </summary>
+    internal MetalGpuBuffer(MetalGpuBuffer parent, int elementOffset, int elementCount)
+    {
+        if (parent is null) throw new ArgumentNullException(nameof(parent));
+        if (elementOffset < 0 || elementCount <= 0 || (long)elementOffset + elementCount > parent.Size)
+            throw new ArgumentOutOfRangeException(nameof(elementOffset));
+        if (parent.Handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(MetalGpuBuffer));
+        _buffer = parent.Handle;
+        _device = parent._device;
+        _viewParent = parent;
+        _byteOffset = parent._byteOffset + (long)elementOffset * sizeof(float);
+        Size = elementCount;
+        StorageMode = parent.StorageMode;
+        Retain(_buffer);
+    }
     /// <summary>
     /// Creates a wrapper around an existing Metal buffer handle.
     /// </summary>
@@ -498,7 +527,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
 
         // Call [MTLBuffer didModifyRange:NSMakeRange(offset, count)]
         var range = new MetalNativeBindings.NSRange(
-            (ulong)(offset * sizeof(float)),
+            (ulong)(_byteOffset + (long)offset * sizeof(float)),
             (ulong)(count * sizeof(float)));
         MetalNativeBindings.SendMessageNSRange(
             _buffer, MetalNativeBindings.Selectors.DidModifyRange, range);

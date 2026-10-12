@@ -144,7 +144,9 @@ public sealed class MultiSlotFusedStep<T> : IDisposable
             var fresh = freshSlotData[i];
             if (fresh.Length != slot.Length)
                 return false;
-            fresh.AsSpan().CopyTo(slot.AsWritableSpan());
+            using var freshKeep1 = new KeepAliveScope(fresh);
+            using var slotKeep1 = new KeepAliveScope(slot);
+            fresh.AsSpanUnmarked().CopyTo(slot.AsWritableSpanUnmarked());
         }
 
         // Cache the (already-deduplicated) parameter list. The caller

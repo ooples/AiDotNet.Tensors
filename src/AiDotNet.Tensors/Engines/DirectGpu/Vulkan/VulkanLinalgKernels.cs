@@ -136,103 +136,6 @@ void main() {
 }";
 
         // ═══════════════════════════════════════════════════════════════════
-        // QR REDUCED (simplified: identity Q for trivial cases; full Householder
-        // via in-place reflector application). Vulkan spec requires all control
-        // flow to be well-defined so we use an iteration cap.
-        // ═══════════════════════════════════════════════════════════════════
-        // Modified Gram–Schmidt. See CudaLinalgKernels for the algorithm derivation;
-        // this mirrors it in GLSL compute. Writes Q and R directly — no in-place
-        // working buffer needed, so both the ""tall-rows stale"" and ""Q column-only""
-        // bugs of the earlier Householder kernel are structurally eliminated.
-        public static string QrReduced => Header + @"
-layout(set = 0, binding = 0) readonly buffer A { float a[]; };
-layout(set = 0, binding = 1) buffer Q { float q[]; };
-layout(set = 0, binding = 2) buffer R { float r[]; };
-layout(push_constant) uniform P { int batchCount; int m; int n; };
-shared float sScalar;
-shared float partials[256];
-
-void main() {
-    uint b = gl_WorkGroupID.x;
-    if (int(b) >= batchCount) return;
-    uint tid = gl_LocalInvocationID.x;
-    uint blockSize = gl_WorkGroupSize.x;
-    int k = min(m, n);
-
-    uint aOff = b * uint(m * n);
-    uint qOff = b * uint(m * k);
-    uint rOff = b * uint(k * n);
-
-    // Zero R.
-    for (uint idx = tid; idx < uint(k * n); idx += blockSize) r[rOff + idx] = 0.0;
-    barrier();
-
-    // Stage 1: MGS on columns 0..k-1.
-    for (int j = 0; j < k; ++j) {
-        for (uint i = tid; i < uint(m); i += blockSize) q[qOff + i * uint(k) + uint(j)] = a[aOff + i * uint(n) + uint(j)];
-        barrier();
-
-        for (int p = 0; p < j; ++p) {
-            float partial = 0.0;
-            for (uint i = tid; i < uint(m); i += blockSize)
-                partial += q[qOff + i * uint(k) + uint(p)] * q[qOff + i * uint(k) + uint(j)];
-            partials[tid] = partial;
-            barrier();
-            for (uint s = blockSize / 2u; s > 0u; s >>= 1) {
-                if (tid < s) partials[tid] += partials[tid + s];
-                barrier();
-            }
-            if (tid == 0u) { sScalar = partials[0]; r[rOff + uint(p * n + j)] = sScalar; }
-            barrier();
-            float rp = sScalar;
-            for (uint i = tid; i < uint(m); i += blockSize)
-                q[qOff + i * uint(k) + uint(j)] -= rp * q[qOff + i * uint(k) + uint(p)];
-            barrier();
-        }
-
-        float partialN = 0.0;
-        for (uint i = tid; i < uint(m); i += blockSize) {
-            float vi = q[qOff + i * uint(k) + uint(j)];
-            partialN += vi * vi;
-        }
-        partials[tid] = partialN;
-        barrier();
-        for (uint s = blockSize / 2u; s > 0u; s >>= 1) {
-            if (tid < s) partials[tid] += partials[tid + s];
-            barrier();
-        }
-        if (tid == 0u) { sScalar = sqrt(partials[0]); r[rOff + uint(j * n + j)] = sScalar; }
-        barrier();
-
-        float norm = sScalar;
-        if (norm > 1e-30) {
-            float invNorm = 1.0 / norm;
-            for (uint i = tid; i < uint(m); i += blockSize) q[qOff + i * uint(k) + uint(j)] *= invNorm;
-        } else {
-            for (uint i = tid; i < uint(m); i += blockSize) q[qOff + i * uint(k) + uint(j)] = 0.0;
-        }
-        barrier();
-    }
-
-    // Stage 2: fill R[:, c] for c >= k via Qᵀ · A[:, c].
-    for (int c = k; c < n; ++c) {
-        for (int p = 0; p < k; ++p) {
-            float partial = 0.0;
-            for (uint i = tid; i < uint(m); i += blockSize)
-                partial += q[qOff + i * uint(k) + uint(p)] * a[aOff + i * uint(n) + uint(c)];
-            partials[tid] = partial;
-            barrier();
-            for (uint s = blockSize / 2u; s > 0u; s >>= 1) {
-                if (tid < s) partials[tid] += partials[tid + s];
-                barrier();
-            }
-            if (tid == 0u) r[rOff + uint(p * n + c)] = partials[0];
-            barrier();
-        }
-    }
-}";
-
-        // ═══════════════════════════════════════════════════════════════════
         // EIGH (symmetric cyclic Jacobi; n ≤ 64 for shared-memory budget)
         // ═══════════════════════════════════════════════════════════════════
         public static string Eigh => Header + @"
@@ -332,7 +235,6 @@ void main() {
         {
             ("parity211_cholesky", Cholesky),
             ("parity211_lu_factor", LuFactor),
-            ("parity211_qr_reduced", QrReduced),
             ("parity211_eigh", Eigh),
         };
     }

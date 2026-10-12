@@ -137,7 +137,8 @@ public sealed class CuRand : IDeviceRng
 
             unsafe
             {
-                fixed (float* hostPtr = output.AsWritableSpan())
+                using var outputKeep1 = new KeepAliveScope(output);
+                fixed (float* hostPtr = output.AsWritableSpanUnmarked())
                 {
                     if (CudaNativeBindings.cuMemcpyDtoH((IntPtr)hostPtr, dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
                 }
@@ -186,7 +187,8 @@ public sealed class CuRand : IDeviceRng
 
             unsafe
             {
-                fixed (double* hostPtr = output.AsWritableSpan())
+                using var outputKeep2 = new KeepAliveScope(output);
+                fixed (double* hostPtr = output.AsWritableSpanUnmarked())
                 {
                     if (CudaNativeBindings.cuMemcpyDtoH((IntPtr)hostPtr, dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
                 }

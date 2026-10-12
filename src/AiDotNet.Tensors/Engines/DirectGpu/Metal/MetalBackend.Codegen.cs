@@ -63,6 +63,7 @@ public sealed partial class MetalBackend
         string libraryName = CreateCodegenLibraryName(sourceKernel);
         MetalPipelineState pipeline = _shaderLibrary.GetOrCreatePipelineState(
             libraryName, sourceKernel.Source, sourceKernel.EntryPoint);
+        GpuKernelDiagnostics.RegisterKernelName(pipeline.Handle, sourceKernel.EntryPoint);
         var dispatch = pipeline.Calculate1DDispatch(elementCount);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);

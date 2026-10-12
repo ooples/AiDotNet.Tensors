@@ -57,21 +57,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.Execute1D(batchCount * local, local);
         }
 
+        /// <summary>Householder, as the CPU and torch.linalg.qr: Gram-Schmidt would force R's diagonal positive (#1142).</summary>
         public void LinalgQrReduced(
             IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
             int batchCount, int m, int n)
-        {
-            if (batchCount <= 0 || m <= 0 || n <= 0) return;
-            var k = GetLinalgKernel("parity211_qr_reduced");
-            k.SetArg(0, BufHandle(input));
-            k.SetArg(1, BufHandle(q));
-            k.SetArg(2, BufHandle(r));
-            k.SetArg(3, batchCount);
-            k.SetArg(4, m);
-            k.SetArg(5, n);
-            int local = LinalgLocal(Math.Max(m, n));
-            k.Execute1D(batchCount * local, local);
-        }
+            => PortableExtendedLinalg.QrReduced(this, LaunchBatch, input, q, r, batchCount, m, n);
 
         public void LinalgEigh(
             IGpuBuffer input, IGpuBuffer eigenvalues, IGpuBuffer eigenvectors,

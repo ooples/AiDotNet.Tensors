@@ -140,9 +140,17 @@ internal static class ThreadLocalTensorCache<T>
     /// </remarks>
 #if NET5_0_OR_GREATER
     internal static T[] RentOrAllocateExact(int size)
-        => TryRent(size) ?? (RuntimeHelpers.IsReferenceOrContainsReferences<T>()
+    {
+        var cached = TryRent(size);
+        if (cached is not null) return cached;
+        // A large miss takes the array of a result nobody disposed, once that result is gone (ResultBufferTracker):
+        // reusing one costs the arithmetic only, where a fresh large array is page-faulted in and zeroed by the OS.
+        if (ResultBufferTracker.Qualifies<T>(size) && ResultBufferTracker.TakeFree<T>(size) is { } free)
+            return free;
+        return RuntimeHelpers.IsReferenceOrContainsReferences<T>()
             ? new T[size]
-            : GC.AllocateUninitializedArray<T>(size));
+            : GC.AllocateUninitializedArray<T>(size);
+    }
 #endif
 
     /// <summary>
@@ -155,8 +163,10 @@ internal static class ThreadLocalTensorCache<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryReturn(T[] array)
     {
-        // The array's owner is gone and the next rent hands it to another tensor: drop device copies keyed by it.
+        // The array's owner is gone and the next rent hands it to another tensor: drop device copies keyed by it, and
+        // its tracking entry, so a result that still held the array can never also hand it back later.
         PooledArrayRecycling.Notify(array);
+        ResultBufferTracker.Untrack(array);
         _cache ??= new Dictionary<int, Bucket>();
 
         int size = array.Length;

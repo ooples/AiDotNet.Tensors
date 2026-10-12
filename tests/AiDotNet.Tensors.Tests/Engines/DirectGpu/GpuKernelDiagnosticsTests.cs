@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 #if !NETFRAMEWORK
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
@@ -343,16 +344,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
                 var backend = engine.GetBackend();
                 Skip.If(backend is null, "No direct GPU backend is available on this host.");
 
-                // OpenCL, CUDA and HIP all journal now (CUDA/HIP via their native-launch choke
-                // point). This still targets OpenCL because it is the backend this host actually
-                // has, so the assertion below is exercised rather than skipped; Metal, Vulkan and
-                // WebGpu remain unjournalled (Issue #996) and would fail here for a reason that has
-                // nothing to do with the diagnostic being broken.
-                Skip.If(
-                    backend is not AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend,
-                    "This test targets the OpenCL journalling path (CUDA and HIP journal via their native-launch "
-                        + "choke point; Metal, Vulkan and WebGpu are not yet journalled - Issue #996). "
-                        + $"This host selected {backend!.GetType().Name}.");
+                // Every backend the engine can select (CUDA, OpenCL, HIP) journals its launches (#996).
 
                 // The journal is STATIC, so a non-empty journal proves nothing — another test in
                 // this class fills it. What must be true is that this launch ADVANCES it.
@@ -372,6 +364,55 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
                     "backend.Sum did not add a journal entry: the newest entry is unchanged at "
                         + $"'{newestAfter}'. A launch that is not journalled is invisible after a crash.");
             }
+        }
+
+        /// <summary>
+        /// #996: every backend journals its launches, not just the one the engine selects. Each available backend
+        /// runs one kernel directly, and the newest journal entry must name that kernel.
+        /// </summary>
+        [SkippableFact]
+        public void EveryAvailableBackendJournalsItsLaunches()
+        {
+            var probes = new List<(string Name, Func<IDirectGpuBackend?> Create, string Kernel)>
+            {
+                ("OpenCL", () => new AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend(), "scalar_minus_tensor"),
+                ("HIP", () => new AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend(), "bx_scalar"),
+                ("CUDA", () => new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend(), "scalar_minus_tensor"),
+                ("Vulkan", () =>
+                {
+                    var vulkan = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+                    return vulkan.Initialize() && vulkan.IsGlslCompilerAvailable ? vulkan : null;
+                }, "ScalarMinusTensor"),
+            };
+            int covered = 0;
+            foreach (var (name, create, kernel) in probes)
+            {
+                IDirectGpuBackend? backend;
+                try { backend = create(); }
+                catch (DllNotFoundException) { continue; }
+                catch (EntryPointNotFoundException) { continue; }
+                catch (PlatformNotSupportedException) { continue; }
+                if (backend is null || !backend.IsAvailable) { (backend as IDisposable)?.Dispose(); continue; }
+                try
+                {
+                    var batch = Assert.IsAssignableFrom<IGpuBatchExecution>(backend);
+                    using var input = backend.AllocateBuffer(new float[] { 1, 2, 3, 4 });
+                    using var output = backend.AllocateBuffer(4);
+                    batch.ScalarMinusTensor(input, output, 1f, 4);
+                    backend.Synchronize();
+                    var journal = GpuKernelDiagnostics.RecentLaunches();
+                    Assert.NotEmpty(journal);
+                    string newest = journal[journal.Count - 1];
+                    Assert.True(newest.Contains(kernel, StringComparison.Ordinal),
+                        $"{name}: ScalarMinusTensor launched, but the newest journal entry is '{newest}'.");
+                    covered++;
+                }
+                finally
+                {
+                    if (!(backend is AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend)) (backend as IDisposable)?.Dispose();
+                }
+            }
+            Skip.If(covered == 0, "No GPU backend is available on this host.");
         }
     }
 }

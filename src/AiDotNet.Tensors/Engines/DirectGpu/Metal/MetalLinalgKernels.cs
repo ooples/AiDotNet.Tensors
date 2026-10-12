@@ -11,7 +11,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
         {
             "parity211_cholesky",
             "parity211_lu_factor",
-            "parity211_qr_reduced",
             "parity211_eigh",
         };
 
@@ -139,99 +138,6 @@ kernel void parity211_lu_factor(
             LUb[i * n + c] -= LUb[i * n + j] * LUb[j * n + c];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-// QR FACTORIZATION (Modified Gram–Schmidt, reduced). See CudaLinalgKernels
-// for the algorithm derivation; this mirrors it in Metal Shading Language.
-// ═════════════════════════════════════════════════════════════════════════
-kernel void parity211_qr_reduced(
-    device const float* A [[buffer(0)]],
-    device float* Q [[buffer(1)]],
-    device float* R [[buffer(2)]],
-    constant int& batchCount [[buffer(3)]],
-    constant int& m [[buffer(4)]],
-    constant int& n [[buffer(5)]],
-    uint b [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint blockSize [[threads_per_threadgroup]],
-    threadgroup float& sScalar [[threadgroup(0)]])
-{
-    if ((int)b >= batchCount) return;
-    int k = min(m, n);
-    device const float* Ab = A + b * m * n;
-    device float* Qb = Q + b * m * k;
-    device float* Rb = R + b * k * n;
-
-    threadgroup float partials[1024];
-
-    // Zero R.
-    for (int idx = tid; idx < k * n; idx += blockSize) Rb[idx] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // Stage 1: MGS on columns 0..k-1.
-    for (int j = 0; j < k; ++j) {
-        for (int i = tid; i < m; i += blockSize) Qb[i * k + j] = Ab[i * n + j];
-        threadgroup_barrier(mem_flags::mem_device);
-
-        for (int p = 0; p < j; ++p) {
-            float partial = 0.0f;
-            for (int i = tid; i < m; i += blockSize)
-                partial += Qb[i * k + p] * Qb[i * k + j];
-            partials[tid] = partial;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int s = (int)blockSize / 2; s > 0; s >>= 1) {
-                if ((int)tid < s) partials[tid] += partials[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (tid == 0) { sScalar = partials[0]; Rb[p * n + j] = sScalar; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float rp = sScalar;
-            for (int i = tid; i < m; i += blockSize)
-                Qb[i * k + j] -= rp * Qb[i * k + p];
-            threadgroup_barrier(mem_flags::mem_device);
-        }
-
-        float partialN = 0.0f;
-        for (int i = tid; i < m; i += blockSize) {
-            float vi = Qb[i * k + j];
-            partialN += vi * vi;
-        }
-        partials[tid] = partialN;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int s = (int)blockSize / 2; s > 0; s >>= 1) {
-            if ((int)tid < s) partials[tid] += partials[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tid == 0) { sScalar = sqrt(partials[0]); Rb[j * n + j] = sScalar; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float norm = sScalar;
-        if (norm > 1e-30f) {
-            float invNorm = 1.0f / norm;
-            for (int i = tid; i < m; i += blockSize) Qb[i * k + j] *= invNorm;
-        } else {
-            for (int i = tid; i < m; i += blockSize) Qb[i * k + j] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-    }
-
-    // Stage 2: fill R[:, c] for c >= k via Qᵀ · A[:, c].
-    for (int c = k; c < n; ++c) {
-        for (int p = 0; p < k; ++p) {
-            float partial = 0.0f;
-            for (int i = tid; i < m; i += blockSize)
-                partial += Qb[i * k + p] * Ab[i * n + c];
-            partials[tid] = partial;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int s = (int)blockSize / 2; s > 0; s >>= 1) {
-                if ((int)tid < s) partials[tid] += partials[tid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (tid == 0) Rb[p * n + c] = partials[0];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
     }
 }
 

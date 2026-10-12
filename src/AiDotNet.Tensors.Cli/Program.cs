@@ -450,7 +450,7 @@ internal static class Program
             // Quantisation only applies to F32 source tensors.
             if (entry.Dtype == AiDotNet.Tensors.Serialization.Safetensors.SafetensorsDtype.F32 && quant != "F32")
             {
-                var floats = r.ReadTensor<float>(kv.Key).AsSpan();
+                var floats = r.ReadTensor<float>(kv.Key).ToArray(); // public copy-out: raw views are internal
                 switch (quant)
                 {
                     case "Q4_0":
@@ -517,7 +517,7 @@ internal static class Program
             switch (t.DtypeStorage)
             {
                 case "FloatStorage":
-                    var floats = AiDotNet.Tensors.Serialization.Pickle.PtReader.ToTensor<float>(t).AsSpan();
+                    var floats = AiDotNet.Tensors.Serialization.Pickle.PtReader.ToTensor<float>(t).ToArray(); // public copy-out
                     switch (quant)
                     {
                         case "F32":

@@ -8,6 +8,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// each keeps the GPU-resident reshape-plus-broadcast route until its native
 /// specialization clears the oracle.
 /// </summary>
+[BackendSpecificRoute("CUDA direct-PTX specialization of the fused meshgrid; every backend runs the operation natively",
+    nameof(IMeshgridBackend.Meshgrid2DPair))]
 internal interface IDirectPtxVisionBackend
 {
     bool CanDirectPtxMeshgrid2D(int n0, int n1, bool xy);

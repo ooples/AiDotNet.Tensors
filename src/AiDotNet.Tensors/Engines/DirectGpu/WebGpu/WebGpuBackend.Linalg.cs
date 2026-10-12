@@ -21,9 +21,10 @@ public sealed partial class WebGpuBackend : ILinalgBackend
         int batchCount, int m, int n)
         => LinalgLuFactorAsync(input, output, pivots, batchCount, m, n).GetAwaiter().GetResult();
 
+    // Householder, as the CPU and torch.linalg.qr: Gram-Schmidt would force R's diagonal positive (#1142).
     void ILinalgBackend.LinalgQrReduced(IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
         int batchCount, int m, int n)
-        => LinalgQrReducedAsync(input, q, r, batchCount, m, n).GetAwaiter().GetResult();
+        => PortableExtendedLinalg.QrReduced(this, LaunchBatch, input, q, r, batchCount, m, n);
 
     void ILinalgBackend.LinalgEigh(IGpuBuffer input, IGpuBuffer eigenvalues, IGpuBuffer eigenvectors,
         int batchCount, int n)
@@ -56,21 +57,6 @@ public sealed partial class WebGpuBackend : ILinalgBackend
             UniformInts(batchCount, m, n),
             WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bind = new WebGpuBindGroup(pipelineId, AsWgpu(input), AsWgpu(output), AsWgpu(pivots));
-        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bind.BindGroupId, uniforms.BufferId, batchCount, 1, 1);
-        await WebGpuNativeBindings.SubmitAndWaitAsync();
-    }
-
-    public async Task LinalgQrReducedAsync(
-        IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
-        int batchCount, int m, int n)
-    {
-        if (batchCount <= 0 || m <= 0 || n <= 0) return;
-        var pipelineId = await GetOrCreatePipelineAsync(
-            LinalgModuleKey + ":QrReduced", WebGpuLinalgKernels.QrReduced, "main");
-        using var uniforms = new WebGpuBuffer(
-            UniformInts(batchCount, m, n),
-            WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
-        using var bind = new WebGpuBindGroup(pipelineId, AsWgpu(input), AsWgpu(q), AsWgpu(r));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bind.BindGroupId, uniforms.BufferId, batchCount, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }

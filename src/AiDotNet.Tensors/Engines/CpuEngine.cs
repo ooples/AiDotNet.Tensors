@@ -147,7 +147,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Check for division by zero before calling TensorPrimitivesHelper
         var numOps = MathHelper.GetNumericOperations<T>();
-        var bArray = b.GetDataArray();
+        using var bArrayLease = b.LeaseArray();
+        var bArray = bArrayLease.Array;
         for (int i = 0; i < b.Length; i++)
         {
             if (numOps.Equals(bArray[i], numOps.Zero))
@@ -289,7 +290,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Exp2(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep1 = new KeepAliveScope(floatVec);
+            using var resultKeep1 = new KeepAliveScope(result);
+            Exp2(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -298,7 +301,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Exp2(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep1 = new KeepAliveScope(doubleVec);
+            using var resultKeep2 = new KeepAliveScope(result);
+            Exp2(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -325,7 +330,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Exp10(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep2 = new KeepAliveScope(floatVec);
+            using var resultKeep3 = new KeepAliveScope(result);
+            Exp10(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -334,7 +341,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Exp10(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep2 = new KeepAliveScope(doubleVec);
+            using var resultKeep4 = new KeepAliveScope(result);
+            Exp10(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -389,7 +398,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: bypass generic dispatch + Span overhead
         if (typeof(T) == typeof(float))
         {
-            T[] arr = vector.GetDataArray();
+            using var arrLease = vector.LeaseArray();
+            T[] arr = arrLease.Array;
             float[] fArr = Unsafe.As<T[], float[]>(ref arr);
             float result;
             fixed (float* ptr = fArr)
@@ -441,8 +451,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         T result = numOps.Zero;
 
-        var aSpan = a.AsSpan();
-        var bSpan = b.AsSpan();
+        using var aSpanLease = a.Lease();
+        var aSpan = aSpanLease.Span;
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
         int len = a.Length;
         int bLen = b.Length;
 
@@ -468,7 +480,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: bypass generic dispatch + Span overhead
         if (typeof(T) == typeof(float))
         {
-            T[] arr = vector.GetDataArray();
+            using var arrLease = vector.LeaseArray();
+            T[] arr = arrLease.Array;
             float[] fArr = Unsafe.As<T[], float[]>(ref arr);
             float result;
             fixed (float* ptr = fArr)
@@ -480,7 +493,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            T[] arr = vector.GetDataArray();
+            using var arrLease = vector.LeaseArray();
+            T[] arr = arrLease.Array;
             double[] dArr = Unsafe.As<T[], double[]>(ref arr);
             double result = SimdKernels.Sum(new ReadOnlySpan<double>(dArr, 0, vector.Length)) / vector.Length;
             return Unsafe.As<double, T>(ref result);
@@ -588,7 +602,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Pin via _memory to correctly handle sliced Vector.Wrap(array, offset, length)
         if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
         {
-            if (source._cachedArray is float[] srcF && result._cachedArray is float[] dstF)
+            if (source.CachedArrayEscaping is float[] srcF && result.CachedArrayEscaping is float[] dstF)
             {
                 fixed (float* pSrc = srcF)
                 fixed (float* pDst = dstF)
@@ -605,7 +619,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path: AVX2 VGATHERQPD (4 doubles per instruction)
         if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd && CpuParallelSettings.EnableAvx2Gather)
         {
-            if (source._cachedArray is double[] srcD && result._cachedArray is double[] dstD)
+            if (source.CachedArrayEscaping is double[] srcD && result.CachedArrayEscaping is double[] dstD)
             {
                 fixed (double* pSrc = srcD)
                 fixed (double* pDst = dstD)
@@ -647,7 +661,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Pin via _memory to correctly handle sliced Vector.Wrap(array, offset, length)
         if (typeof(T) == typeof(float) && CpuParallelSettings.EnableSimd)
         {
-            if (source._cachedArray is float[] srcF && destination._cachedArray is float[] dstF)
+            if (source.CachedArrayEscaping is float[] srcF && destination.CachedArrayEscaping is float[] dstF)
             {
                 fixed (float* pSrc = srcF)
                 fixed (float* pDst = dstF)
@@ -664,7 +678,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path: unrolled scatter
         if (typeof(T) == typeof(double) && CpuParallelSettings.EnableSimd)
         {
-            if (source._cachedArray is double[] srcD && destination._cachedArray is double[] dstD)
+            if (source.CachedArrayEscaping is double[] srcD && destination.CachedArrayEscaping is double[] dstD)
             {
                 fixed (double* pSrc = srcD)
                 fixed (double* pDst = dstD)
@@ -869,13 +883,16 @@ public partial class CpuEngine : ITensorLevelEngine
         // For float and double, use SIMD-accelerated operators
         if (typeof(T) == typeof(float))
         {
-            T[] inputData = vector.GetDataArray();
+            using var inputDataLease = vector.LeaseArray();
+            T[] inputData = inputDataLease.Array;
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as float[] since we know T is float
             float[] floatInput = Unsafe.As<float[]>(inputData);
             float[] floatOutput = Unsafe.As<float[]>(outputData);
 
+            using var floatInputKeep1 = new KeepAliveScope(floatInput);
+            using var floatOutputKeep1 = new KeepAliveScope(floatOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<SinOperatorFloat>(
                 floatInput.AsSpan(),
                 floatOutput.AsSpan());
@@ -889,13 +906,16 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            T[] inputData = vector.GetDataArray();
+            using var inputDataLease = vector.LeaseArray();
+            T[] inputData = inputDataLease.Array;
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as double[] since we know T is double
             double[] doubleInput = Unsafe.As<double[]>(inputData);
             double[] doubleOutput = Unsafe.As<double[]>(outputData);
 
+            using var doubleInputKeep1 = new KeepAliveScope(doubleInput);
+            using var doubleOutputKeep1 = new KeepAliveScope(doubleOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<SinOperatorDouble>(
                 doubleInput.AsSpan(),
                 doubleOutput.AsSpan());
@@ -929,13 +949,16 @@ public partial class CpuEngine : ITensorLevelEngine
         // For float and double, use SIMD-accelerated operators
         if (typeof(T) == typeof(float))
         {
-            T[] inputData = vector.GetDataArray();
+            using var inputDataLease = vector.LeaseArray();
+            T[] inputData = inputDataLease.Array;
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as float[] since we know T is float
             float[] floatInput = Unsafe.As<float[]>(inputData);
             float[] floatOutput = Unsafe.As<float[]>(outputData);
 
+            using var floatInputKeep2 = new KeepAliveScope(floatInput);
+            using var floatOutputKeep2 = new KeepAliveScope(floatOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<CosOperatorFloat>(
                 floatInput.AsSpan(),
                 floatOutput.AsSpan());
@@ -949,13 +972,16 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            T[] inputData = vector.GetDataArray();
+            using var inputDataLease = vector.LeaseArray();
+            T[] inputData = inputDataLease.Array;
             T[] outputData = new T[vector.Length];
 
             // Reinterpret T[] as double[] since we know T is double
             double[] doubleInput = Unsafe.As<double[]>(inputData);
             double[] doubleOutput = Unsafe.As<double[]>(outputData);
 
+            using var doubleInputKeep2 = new KeepAliveScope(doubleInput);
+            using var doubleOutputKeep2 = new KeepAliveScope(doubleOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<CosOperatorDouble>(
                 doubleInput.AsSpan(),
                 doubleOutput.AsSpan());
@@ -1109,7 +1135,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Asin(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep3 = new KeepAliveScope(floatVec);
+            using var resultKeep5 = new KeepAliveScope(result);
+            Asin(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1118,7 +1146,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Asin(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep3 = new KeepAliveScope(doubleVec);
+            using var resultKeep6 = new KeepAliveScope(result);
+            Asin(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1160,7 +1190,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Acos(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep4 = new KeepAliveScope(floatVec);
+            using var resultKeep7 = new KeepAliveScope(result);
+            Acos(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1169,7 +1201,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Acos(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep4 = new KeepAliveScope(doubleVec);
+            using var resultKeep8 = new KeepAliveScope(result);
+            Acos(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1211,7 +1245,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Atan(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep5 = new KeepAliveScope(floatVec);
+            using var resultKeep9 = new KeepAliveScope(result);
+            Atan(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1220,7 +1256,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Atan(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep5 = new KeepAliveScope(doubleVec);
+            using var resultKeep10 = new KeepAliveScope(result);
+            Atan(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1822,8 +1860,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
 
         var result = new Matrix<T>(a.Length, b.Length);
-        var aArray = a.GetDataArray();
-        var bArray = b.GetDataArray();
+        using var aArrayLease = a.LeaseArray();
+        var aArray = aArrayLease.Array;
+        using var bArrayLease = b.LeaseArray();
+        var bArray = bArrayLease.Array;
 
         // Use SIMD-optimized TensorPrimitives for float type. Single rented
         // scratch buffer reused across rows — earlier passes allocated a
@@ -2116,13 +2156,17 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = (Tensor<float>)(object)tensor;
             var dstF = (Tensor<float>)(object)result;
-            Simd.NchwcReorder.ToNchwc(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+            using var srcFKeep1 = new KeepAliveScope(srcF);
+            using var dstFKeep1 = new KeepAliveScope(dstF);
+            Simd.NchwcReorder.ToNchwc(srcF.AsSpanUnmarked(), dstF.AsWritableSpanUnmarked(), n, c, h, w, cBlock);
         }
         else
         {
             // Generic scalar reorder — same index math as the float path.
-            var src = tensor.AsSpan();
-            var dst = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             int hw = h * w;
             int outerC = c / cBlock;
             for (int ni = 0; ni < n; ni++)
@@ -2188,12 +2232,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = (Tensor<float>)(object)tensor;
             var dstF = (Tensor<float>)(object)result;
-            Simd.NchwcReorder.ToNchw(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+            using var srcFKeep2 = new KeepAliveScope(srcF);
+            using var dstFKeep2 = new KeepAliveScope(dstF);
+            Simd.NchwcReorder.ToNchw(srcF.AsSpanUnmarked(), dstF.AsWritableSpanUnmarked(), n, c, h, w, cBlock);
         }
         else
         {
-            var src = tensor.AsSpan();
-            var dst = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             int hw = h * w;
             int outerC = c / cBlock;
             for (int ni = 0; ni < n; ni++)
@@ -2246,17 +2294,29 @@ public partial class CpuEngine : ITensorLevelEngine
             dstF.Layout = x.Layout;
             if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
             {
+                using var xfKeep1 = new KeepAliveScope(xf);
+                using var gammaFKeep1 = new KeepAliveScope(gammaF);
+                using var betaFKeep1 = new KeepAliveScope(betaF);
+                using var meanFKeep1 = new KeepAliveScope(meanF);
+                using var varFKeep1 = new KeepAliveScope(varF);
+                using var dstFKeep3 = new KeepAliveScope(dstF);
                 Simd.NchwcBatchNorm.RunNchwc8(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    dstF.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    dstF.AsWritableSpanUnmarked(), N, C, H, W);
             }
             else
             {
+                using var xfKeep2 = new KeepAliveScope(xf);
+                using var gammaFKeep2 = new KeepAliveScope(gammaF);
+                using var betaFKeep2 = new KeepAliveScope(betaF);
+                using var meanFKeep2 = new KeepAliveScope(meanF);
+                using var varFKeep2 = new KeepAliveScope(varF);
+                using var dstFKeep4 = new KeepAliveScope(dstF);
                 Simd.NchwcBatchNorm.RunNchw(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    dstF.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    dstF.AsWritableSpanUnmarked(), N, C, H, W);
             }
             return;
         }
@@ -2271,12 +2331,18 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int Cd = x._shape[1], Hd = x._shape[2], Wd = x._shape[3], Nd = x._shape[0];
             int spatialD = Hd * Wd;
-            var inD = (double[])(object)x.GetDataArray();
-            var gammaD = (double[])(object)gamma.GetDataArray();
-            var betaD  = (double[])(object)beta.GetDataArray();
-            var meanD  = (double[])(object)mean.GetDataArray();
-            var varD   = (double[])(object)variance.GetDataArray();
-            var outD   = (double[])(object)output.GetDataArray();
+            using var inDLease = x.LeaseArray();
+            var inD = (double[])(object)inDLease.Array;
+            using var gammaDLease = gamma.LeaseArray();
+            var gammaD = (double[])(object)gammaDLease.Array;
+            using var betaDLease = beta.LeaseArray();
+            var betaD = (double[])(object)betaDLease.Array;
+            using var meanDLease = mean.LeaseArray();
+            var meanD = (double[])(object)meanDLease.Array;
+            using var varDLease = variance.LeaseArray();
+            var varD = (double[])(object)varDLease.Array;
+            using var outDLease = output.LeaseArray();
+            var outD = (double[])(object)outDLease.Array;
             output.Layout = x.Layout;
 
             var scaleD = new double[Cd];
@@ -2305,10 +2371,14 @@ public partial class CpuEngine : ITensorLevelEngine
         T eps = numOps.FromDouble(epsilon);
         int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
         int spatial = hh * ww;
-        var gData = gamma.GetDataArray();
-        var bData = beta.GetDataArray();
-        var mData = mean.GetDataArray();
-        var vData = variance.GetDataArray();
+        using var gDataLease = gamma.LeaseArray();
+        var gData = gDataLease.Array;
+        using var bDataLease = beta.LeaseArray();
+        var bData = bDataLease.Array;
+        using var mDataLease = mean.LeaseArray();
+        var mData = mDataLease.Array;
+        using var vDataLease = variance.LeaseArray();
+        var vData = vDataLease.Array;
         var scaleArr = new T[cc];
         var biasArr = new T[cc];
         for (int c = 0; c < cc; c++)
@@ -2318,8 +2388,10 @@ public partial class CpuEngine : ITensorLevelEngine
             biasArr[c] = numOps.Subtract(bData[c], numOps.Multiply(s, mData[c]));
         }
         output.Layout = x.Layout;
-        var inSpan = x.AsSpan();
-        var outSpan = output.AsWritableSpan();
+        using var inSpanLease = x.Lease();
+        var inSpan = inSpanLease.Span;
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
         for (int ni = 0; ni < nn; ni++)
         {
             for (int c = 0; c < cc; c++)
@@ -2575,17 +2647,29 @@ public partial class CpuEngine : ITensorLevelEngine
             var result = new Tensor<float>(x._shape) { Layout = x.Layout };
             if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
             {
+                using var xfKeep3 = new KeepAliveScope(xf);
+                using var gammaFKeep3 = new KeepAliveScope(gammaF);
+                using var betaFKeep3 = new KeepAliveScope(betaF);
+                using var meanFKeep3 = new KeepAliveScope(meanF);
+                using var varFKeep3 = new KeepAliveScope(varF);
+                using var resultKeep11 = new KeepAliveScope(result);
                 Simd.NchwcBatchNorm.RunNchwc8(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    result.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    result.AsWritableSpanUnmarked(), N, C, H, W);
             }
             else if (x.Layout == LinearAlgebra.TensorLayout.Nchw)
             {
+                using var xfKeep4 = new KeepAliveScope(xf);
+                using var gammaFKeep4 = new KeepAliveScope(gammaF);
+                using var betaFKeep4 = new KeepAliveScope(betaF);
+                using var meanFKeep4 = new KeepAliveScope(meanF);
+                using var varFKeep4 = new KeepAliveScope(varF);
+                using var resultKeep12 = new KeepAliveScope(result);
                 Simd.NchwcBatchNorm.RunNchw(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    result.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    result.AsWritableSpanUnmarked(), N, C, H, W);
             }
             else
             {
@@ -2595,11 +2679,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 // and produce garbage. Unpack to plain NCHW first, then run
                 // the generic NCHW kernel, and mark the result as Nchw.
                 var unpackedT = new Tensor<float>(new[] { N, C, H, W }) { Layout = LinearAlgebra.TensorLayout.Nchw };
-                Simd.NchwcReorder.ToNchw(xf.AsSpan(), unpackedT.AsWritableSpan(), N, C, H, W, Simd.NchwcConv2D.CBlock);
+                using var xfKeep5 = new KeepAliveScope(xf);
+                using var unpackedTKeep1 = new KeepAliveScope(unpackedT);
+                Simd.NchwcReorder.ToNchw(xf.AsSpanUnmarked(), unpackedT.AsWritableSpanUnmarked(), N, C, H, W, Simd.NchwcConv2D.CBlock);
+                using var unpackedTKeep2 = new KeepAliveScope(unpackedT);
+                using var gammaFKeep5 = new KeepAliveScope(gammaF);
+                using var betaFKeep5 = new KeepAliveScope(betaF);
+                using var meanFKeep5 = new KeepAliveScope(meanF);
+                using var varFKeep5 = new KeepAliveScope(varF);
+                using var resultKeep13 = new KeepAliveScope(result);
                 Simd.NchwcBatchNorm.RunNchw(
-                    unpackedT.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    result.AsWritableSpan(), N, C, H, W);
+                    unpackedT.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    result.AsWritableSpanUnmarked(), N, C, H, W);
                 result.Layout = LinearAlgebra.TensorLayout.Nchw;
             }
             return (Tensor<T>)(object)result;
@@ -2613,13 +2705,19 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int cc = x._shape[1], hh = x._shape[2], ww = x._shape[3], nn = x._shape[0];
             int spatial = hh * ww;
-            var inSpanD = ((Tensor<double>)(object)x).AsSpan();
-            var gDataD = ((Tensor<double>)(object)gamma).AsSpan();
-            var bDataD = ((Tensor<double>)(object)beta).AsSpan();
-            var mDataD = ((Tensor<double>)(object)mean).AsSpan();
-            var vDataD = ((Tensor<double>)(object)variance).AsSpan();
+            using var inSpanDLease = ((Tensor<double>)(object)x).Lease();
+            var inSpanD = inSpanDLease.Span;
+            using var gDataDLease = ((Tensor<double>)(object)gamma).Lease();
+            var gDataD = gDataDLease.Span;
+            using var bDataDLease = ((Tensor<double>)(object)beta).Lease();
+            var bDataD = bDataDLease.Span;
+            using var mDataDLease = ((Tensor<double>)(object)mean).Lease();
+            var mDataD = mDataDLease.Span;
+            using var vDataDLease = ((Tensor<double>)(object)variance).Lease();
+            var vDataD = vDataDLease.Span;
             var outTD = new Tensor<double>(x._shape) { Layout = x.Layout };
-            var outSpanD = outTD.AsWritableSpan();
+            using var outSpanDLease = outTD.LeaseWritable();
+            var outSpanD = outSpanDLease.Span;
             var scaleArrD = new double[cc];
             var biasArrD = new double[cc];
             for (int c = 0; c < cc; c++)
@@ -2646,10 +2744,14 @@ public partial class CpuEngine : ITensorLevelEngine
         T eps = numOps.FromDouble(epsilon);
         int ccG = x._shape[1], hhG = x._shape[2], wwG = x._shape[3], nnG = x._shape[0];
         int spatialG = hhG * wwG;
-        var gData = gamma.GetDataArray();
-        var bData = beta.GetDataArray();
-        var mData = mean.GetDataArray();
-        var vData = variance.GetDataArray();
+        using var gDataLease = gamma.LeaseArray();
+        var gData = gDataLease.Array;
+        using var bDataLease = beta.LeaseArray();
+        var bData = bDataLease.Array;
+        using var mDataLease = mean.LeaseArray();
+        var mData = mDataLease.Array;
+        using var vDataLease = variance.LeaseArray();
+        var vData = vDataLease.Array;
         var scaleArr = new T[ccG];
         var biasArr = new T[ccG];
         for (int c = 0; c < ccG; c++)
@@ -2659,8 +2761,10 @@ public partial class CpuEngine : ITensorLevelEngine
             biasArr[c] = numOps.Subtract(bData[c], numOps.Multiply(s, mData[c]));
         }
         var outT = new Tensor<T>(x._shape) { Layout = x.Layout };
-        var inSpan = x.AsSpan();
-        var outSpan = outT.AsWritableSpan();
+        using var inSpanLease = x.Lease();
+        var inSpan = inSpanLease.Span;
+        using var outSpanLease = outT.LeaseWritable();
+        var outSpan = outSpanLease.Span;
         for (int ni = 0; ni < nnG; ni++)
         {
             for (int c = 0; c < ccG; c++)
@@ -2806,7 +2910,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Get raw storage arrays (NOT GetDataArray which copies for views)
                 var aArr = a._storage.GetDataArray();
                 var bArr = b._storage.GetDataArray();
-                var rArr = result.GetDataArray();
+                using var rArrLease = result.LeaseArray();
+                var rArr = rArrLease.Array;
                 var aFloat = new ReadOnlySpan<float>((float[])(object)aArr).Slice(a._storageOffset);
                 var bFloat = new ReadOnlySpan<float>((float[])(object)bArr).Slice(b._storageOffset);
                 var cFloat = new Span<float>((float[])(object)rArr);
@@ -2858,7 +2963,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var aArrD = a._storage.GetDataArray();
                 var bArrD = b._storage.GetDataArray();
-                var rArrD = result.GetDataArray();
+                using var rArrDLease = result.LeaseArray();
+                var rArrD = rArrDLease.Array;
                 var aSpanD = new ReadOnlySpan<double>((double[])(object)aArrD, a._storageOffset, m * k);
                 var bSpanD = new ReadOnlySpan<double>((double[])(object)bArrD, b._storageOffset, k * n);
                 var cSpanD = new Span<double>((double[])(object)rArrD, 0, m * n);
@@ -2871,7 +2977,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // Generic fallback: stride-aware scalar matmul (raw storage for stride access)
             var aDataArr = a._storage.GetDataArray();
             var bDataArr = b._storage.GetDataArray();
-            var rDataArr = result.GetDataArray();
+            using var rDataArrLease = result.LeaseArray();
+            var rDataArr = rDataArrLease.Array;
             int aOff = a._storageOffset, bOff = b._storageOffset;
             int aStride0 = a._strides[0], aStride1 = a._strides[1];
             int bStride0 = b._strides[0], bStride1 = b._strides[1];
@@ -2903,7 +3010,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // COW Stage 2 (#624): a/b are read-only operands — non-privatizing read keeps a clone O(1).
         var aData = a.GetReadOnlyDataArray();
         var bData = b.GetReadOnlyDataArray();
-        var rData = result.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
 
         // Handle ND case with batch dimensions (N >= 3)
         int matrixSizeA = m * k;
@@ -3127,9 +3235,12 @@ public partial class CpuEngine : ITensorLevelEngine
             // FMA on net8+). Beats TensorPrimitives by 1.0-1.04× on every
             // tracked DiT-XL shape — same kernel family that beat MKL on
             // the iter18c sweep.
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var aDataKeep1 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep1 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep1 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3145,9 +3256,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house: pin logical memory and call SimdKernels.VectorAddUnsafe(double*).
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var aDataKeep2 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep2 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep2 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3179,7 +3293,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep1 = new KeepAliveScope(a);
+            using var bKeep1 = new KeepAliveScope(b);
+            using var resultKeep14 = new KeepAliveScope(result);
+            numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorAdd", result, a, b, BackwardFunctions<T>.AddBackward);
@@ -3247,8 +3364,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep3 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep3 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -3274,8 +3393,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // VectorAddUnsafe pattern, dgemm-equivalent throughput on AVX2.
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep4 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep4 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -3302,7 +3423,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        using var aKeep2 = new KeepAliveScope(a);
+        using var bKeep2 = new KeepAliveScope(b);
+        numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), a.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -3329,9 +3452,12 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var aDataKeep5 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep5 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep1 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3342,9 +3468,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var aDataKeep6 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep6 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep2 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3353,7 +3482,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Add(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep3 = new KeepAliveScope(a);
+            using var bKeep3 = new KeepAliveScope(b);
+            using var destinationKeep1 = new KeepAliveScope(destination);
+            numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -3416,9 +3548,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numeric = MathHelper.GetNumericOperations<T>();
-            var inputSpan = input.ReadOnlyData.Span;
-            var biasSpan = bias.ReadOnlyData.Span;
-            var resultSpan = result.Data.Span;
+            using var inputDataKeep1 = new KeepAliveScope(input);
+            var inputSpan = input.ReadOnlyDataUnmarked.Span;
+            using var biasDataKeep1 = new KeepAliveScope(bias);
+            var biasSpan = bias.ReadOnlyDataUnmarked.Span;
+            using var resultDataKeep3 = new KeepAliveScope(result);
+            var resultSpan = result.DataUnmarked.Span;
             for (int batch = 0; batch < batchCount; batch++)
             {
                 for (int channel = 0; channel < channelCount; channel++)
@@ -3580,9 +3715,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var aSpan = a.AsSpan();
-        var bSpan = b.AsSpan();
-        var rSpan = r.AsWritableSpan();
+        using var aSpanLease = a.Lease();
+        var aSpan = aSpanLease.Span;
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
+        using var rSpanLease = r.LeaseWritable();
+        var rSpan = rSpanLease.Span;
         for (int t = 0; t < numTiles; t++)
         {
             int off = t * tile;
@@ -3706,9 +3844,12 @@ public partial class CpuEngine : ITensorLevelEngine
             if (cols == bCols)
             {
                 var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-                var af = (float[])(object)a.GetDataArray();
-                var bf = (float[])(object)b.GetDataArray();
-                var rf = (float[])(object)res.GetDataArray();
+                using var afLease = a.LeaseArray();
+                var af = (float[])(object)afLease.Array;
+                using var bfLease = b.LeaseArray();
+                var bf = (float[])(object)bfLease.Array;
+                using var rfLease = res.LeaseArray();
+                var rf = (float[])(object)rfLease.Array;
                 for (int r = 0; r < rows; r++)
                 {
                     int off = r * cols;
@@ -4231,8 +4372,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var aSpan = a.Data.Span;
-        var bSpan = b.ReadOnlyData.Span;
+        using var aDataKeep1 = new KeepAliveScope(a);
+        var aSpan = a.DataUnmarked.Span;
+        using var bDataKeep7 = new KeepAliveScope(b);
+        var bSpan = b.ReadOnlyDataUnmarked.Span;
 
         // Fast path: same shape — no broadcasting needed
         if (ShapesMatch(a._shape, b._shape))
@@ -4303,7 +4446,8 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"In-place broadcast add cannot resize its target: {FormatShape(a._shape)} " +
                 $"+= {FormatShape(b._shape)} broadcasts to {FormatShape(result._shape)}.", nameof(b));
-        result.Data.Span.CopyTo(aSpan);
+        using var resultDataKeep4 = new KeepAliveScope(result);
+        result.DataUnmarked.Span.CopyTo(aSpan);
     }
 
     /// <summary>
@@ -4413,10 +4557,14 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Input and affine parameters are read-only. Pinning through Data would
             // privatize every COW peer during compiled GroupNorm replay.
-            using var pinIn = input.ReadOnlyData.Pin();
-            using var pinOut = output.Data.Pin();
-            using var pinGamma = gamma.ReadOnlyData.Pin();
-            using var pinBeta = beta.ReadOnlyData.Pin();
+            using var inputDataKeep2 = new KeepAliveScope(input);
+            using var pinIn = input.ReadOnlyDataUnmarked.Pin();
+            using var outputDataKeep1 = new KeepAliveScope(output);
+            using var pinOut = output.DataUnmarked.Pin();
+            using var gammaDataKeep1 = new KeepAliveScope(gamma);
+            using var pinGamma = gamma.ReadOnlyDataUnmarked.Pin();
+            using var betaDataKeep1 = new KeepAliveScope(beta);
+            using var pinBeta = beta.ReadOnlyDataUnmarked.Pin();
             unsafe
             {
                 float epsF = (float)epsilon;
@@ -4444,7 +4592,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetReadOnlyDataArray();
         var gammaData = gamma.GetReadOnlyDataArray();
         var betaData = beta.GetReadOnlyDataArray();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         var meanData = new T[batch * numGroups];
         var varData = new T[batch * numGroups];
 
@@ -4529,7 +4678,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // output = GroupNorm(a + b)
         // Step 1: Add a + b directly into output (zero alloc)
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), output.AsWritableSpan());
+        using var aKeep4 = new KeepAliveScope(a);
+        using var bKeep4 = new KeepAliveScope(b);
+        using var outputKeep1 = new KeepAliveScope(output);
+        numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), output.AsWritableSpanUnmarked());
         // Step 2: GroupNorm in-place on output via GroupNormInto
         GroupNormInto(output, output, numGroups, gamma, beta, epsilon, out _, out _);
     }
@@ -4559,10 +4711,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         // Swish uses ArrayPool internally for the sigmoid buffer (no GC allocation)
+        using var tensorKeep1 = new KeepAliveScope(tensor);
         if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
             SwishInto(tensor, tensor); // fused, parallel, alias-safe kernel (see SwishBlocked)
         else
-            numOps.Swish(tensor.AsSpan(), tensor.AsWritableSpan());
+            numOps.Swish(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4575,8 +4728,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             // Fused sigmoid*x in two SIMD passes using unsafe pointers (no ArrayPool)
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep1 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep3 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -4589,16 +4744,22 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Fused swish = x * sigmoid(x), fanned across cores for large activations (#653 — parity
             // with the float path; the double path was a serial straggler).
-            var srcMemD = AsDoubleMemory(input.Data);
-            var dstMemD = AsDoubleMemory(destination.Data);
+            using var inputDataKeep2 = new KeepAliveScope(input);
+            var srcMemD = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep4 = new KeepAliveScope(destination);
+            var dstMemD = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrcD = srcMemD.Pin();
             using var pinDstD = dstMemD.Pin();
             ParallelSwish((double*)pinSrcD.Pointer, (double*)pinDstD.Pointer, input.Length);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
-        numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep1 = new KeepAliveScope(input);
+        using var destinationKeep2 = new KeepAliveScope(destination);
+        numOps.Sigmoid(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
+        using var inputKeep2 = new KeepAliveScope(input);
+        using var destinationKeep3 = new KeepAliveScope(destination);
+        numOps.Multiply(input.AsSpanUnmarked(), destination.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -4625,7 +4786,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.GELU(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep2 = new KeepAliveScope(tensor);
+        numOps.GELU(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4649,16 +4811,20 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep3 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep5 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.GELUUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep4 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep6 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.GELUUnsafe);
@@ -4666,7 +4832,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.GELU(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep3 = new KeepAliveScope(input);
+            using var destinationKeep4 = new KeepAliveScope(destination);
+            numOps.GELU(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -4694,7 +4862,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Tanh(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep3 = new KeepAliveScope(tensor);
+        numOps.Tanh(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4710,16 +4879,20 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep5 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep7 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, Simd.SimdKernels.TanhUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep6 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep8 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length, Simd.SimdKernels.TanhUnsafe);
@@ -4727,7 +4900,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Tanh(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep4 = new KeepAliveScope(input);
+            using var destinationKeep5 = new KeepAliveScope(destination);
+            numOps.Tanh(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -4755,7 +4930,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Mish(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep4 = new KeepAliveScope(tensor);
+        numOps.Mish(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4767,8 +4943,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep7 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep9 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.MishUnsafe);
@@ -4779,13 +4957,17 @@ public partial class CpuEngine : ITensorLevelEngine
             // SIMD double-precision Mish via the Span overload (no unsafe ptr
             // variant exists for double Mish yet — same elementwise cost
             // class either way).
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep8 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep10 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             Simd.SimdKernels.Mish(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Mish(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep5 = new KeepAliveScope(input);
+        using var destinationKeep6 = new KeepAliveScope(destination);
+        numOps.Mish(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -4812,7 +4994,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.LeakyReLU(tensor.AsSpan(), alpha, tensor.AsWritableSpan());
+        using var tensorKeep5 = new KeepAliveScope(tensor);
+        numOps.LeakyReLU(tensor.AsSpanUnmarked(), alpha, tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4828,8 +5011,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep9 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep11 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float alphaF = (float)MathHelper.GetNumericOperations<T>().ToDouble(alpha);
@@ -4837,15 +5022,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep10 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep12 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             double alphaD = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
             Simd.SimdKernels.LeakyReLU(srcSpan, alphaD, dstSpan);
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.LeakyReLU(input.AsSpan(), alpha, destination.AsWritableSpan());
+            using var inputKeep6 = new KeepAliveScope(input);
+            using var destinationKeep7 = new KeepAliveScope(destination);
+            numOps.LeakyReLU(input.AsSpanUnmarked(), alpha, destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -4877,7 +5066,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // SIMD-blocked fallback (see TensorMatMul2D for rationale).
             // MultiplyBlocked accumulates, so pre-zero the destination.
             var numOps = MathHelper.GetNumericOperations<T>();
-            destination.AsWritableSpan().Clear();
+            using var destinationKeep8 = new KeepAliveScope(destination);
+            destination.AsWritableSpanUnmarked().Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
                 numOps, a.Data, b.Data, destination.Data,
                 m, n, p, n, p, p);
@@ -4913,7 +5103,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
         var result = TensorMatMul(a, b);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        using var resultDataKeep5 = new KeepAliveScope(result);
+        using var destinationDataKeep13 = new KeepAliveScope(destination);
+        result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
     }
 
     /// <inheritdoc/>
@@ -4962,11 +5154,13 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int d = axis + 1; d < rank; d++) inner *= destination._shape[d];
         int destinationRow = axisTotal * inner;
 
-        var dst = destination.AsWritableSpan();
+        using var dstLease = destination.LeaseWritable();
+        var dst = dstLease.Span;
         int columnOffset = 0;
         foreach (var tensor in tensors)
         {
-            var src = tensor.IsContiguous ? tensor.AsSpan() : tensor.Contiguous().AsSpan();
+            using var tensorKeep6 = new KeepAliveScope(tensor);
+            var src = tensor.IsContiguous ? tensor.AsSpanUnmarked() : tensor.Contiguous().AsSpan();
             int slab = tensor._shape[axis] * inner;
             for (int o = 0; o < outer; o++)
             {
@@ -5006,8 +5200,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // General ND permutation: map each destination coord back to source
         var srcShape = input._shape;
-        var srcSpan = input.AsSpan();
-        var dstSpan = destination.AsWritableSpan();
+        using var srcSpanLease = input.Lease();
+        var srcSpan = srcSpanLease.Span;
+        using var dstSpanLease = destination.LeaseWritable();
+        var dstSpan = dstSpanLease.Span;
         int rank = srcShape.Length;
 
         var srcStrides = new int[rank];
@@ -5068,8 +5264,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
-            using var pinIn = input.Data.Pin();
-            using var pinOut = destination.Data.Pin();
+            using var inputDataKeep11 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var destinationDataKeep14 = new KeepAliveScope(destination);
+            using var pinOut = destination.DataUnmarked.Pin();
             unsafe
             {
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
@@ -5085,8 +5283,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // across rows for cache locality and core saturation.
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
-            using var pinIn = input.Data.Pin();
-            using var pinOut = destination.Data.Pin();
+            using var inputDataKeep12 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var destinationDataKeep15 = new KeepAliveScope(destination);
+            using var pinOut = destination.DataUnmarked.Pin();
             unsafe
             {
                 double* pIn = (double*)pinIn.Pointer;
@@ -5123,7 +5323,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = Softmax(input, axis);
         try
         {
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep6 = new KeepAliveScope(result);
+            using var destinationDataKeep16 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5147,7 +5349,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorLogSoftmax(input, axis);
         try
         {
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep7 = new KeepAliveScope(result);
+            using var destinationDataKeep17 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5237,7 +5441,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = ScaledDotProductAttention(query, key, value, mask: null, scale: scaleVal, out var weights);
         try
         {
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep8 = new KeepAliveScope(result);
+            using var destinationDataKeep18 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5321,7 +5527,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorBroadcastMultiply(a, b);
-        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        using var resultDataKeep9 = new KeepAliveScope(result);
+        using var destinationDataKeep19 = new KeepAliveScope(destination);
+        try { result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
         finally { TensorAllocator.Return(result); }
     }
 
@@ -5353,7 +5561,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorBroadcastAdd(a, b);
-        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        using var resultDataKeep10 = new KeepAliveScope(result);
+        using var destinationDataKeep20 = new KeepAliveScope(destination);
+        try { result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
         finally { TensorAllocator.Return(result); }
     }
 
@@ -5375,12 +5585,15 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         if (a.IsContiguous)
         {
-            numOps.AddScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
+            using var aKeep5 = new KeepAliveScope(a);
+            using var destinationKeep9 = new KeepAliveScope(destination);
+            numOps.AddScalar(a.AsSpanUnmarked(), scalar, destination.AsWritableSpanUnmarked());
         }
         else
         {
             var src = a._storage.GetDataArray();
-            var dst = destination.GetDataArray();
+            using var dstLease = destination.LeaseArray();
+            var dst = dstLease.Array;
             for (int i = 0; i < a.Length; i++) dst[i] = numOps.Add(src[a.LogicalToStorageIndex(i)], scalar);
         }
     }
@@ -5425,9 +5638,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var aDataKeep7 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep8 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep21 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5435,9 +5651,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var aDataKeep8 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep9 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep22 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5446,7 +5665,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Subtract(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep6 = new KeepAliveScope(a);
+            using var bKeep5 = new KeepAliveScope(b);
+            using var destinationKeep10 = new KeepAliveScope(destination);
+            numOps.Subtract(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -5462,9 +5684,12 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var aDataKeep9 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep10 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep23 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5472,9 +5697,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var aDataKeep10 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep11 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep24 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5483,7 +5711,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Divide(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep7 = new KeepAliveScope(a);
+            using var bKeep6 = new KeepAliveScope(b);
+            using var destinationKeep11 = new KeepAliveScope(destination);
+            numOps.Divide(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -5495,8 +5726,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep13 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep25 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.ExpUnsafe);
@@ -5504,15 +5737,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep14 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep26 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.ExpUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep7 = new KeepAliveScope(input);
+        using var destinationKeep12 = new KeepAliveScope(destination);
+        numOps.Exp(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Log into pre-allocated destination. Uses VML/SVML with parallel chunking.</summary>
@@ -5525,8 +5762,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep15 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep27 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.LogUnsafe);
@@ -5534,15 +5773,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep16 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep28 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.LogUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Log(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep8 = new KeepAliveScope(input);
+        using var destinationKeep13 = new KeepAliveScope(destination);
+        numOps.Log(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Sqrt into pre-allocated destination. Zero allocation. Uses AVX SIMD for float.</summary>
@@ -5553,8 +5796,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep17 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep29 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.SqrtUnsafe);
@@ -5563,13 +5808,17 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double))
         {
             // SIMD double sqrt via Span overload (no unsafe ptr variant in SimdKernels).
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep18 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep30 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             SimdKernels.Sqrt(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sqrt(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep9 = new KeepAliveScope(input);
+        using var destinationKeep14 = new KeepAliveScope(destination);
+        numOps.Sqrt(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Abs into pre-allocated destination. Zero allocation. Uses AVX SIMD for float.</summary>
@@ -5580,8 +5829,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep19 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep31 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.AbsUnsafe);
@@ -5589,15 +5840,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep20 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep32 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, SimdKernels.AbsUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Abs(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep10 = new KeepAliveScope(input);
+        using var destinationKeep15 = new KeepAliveScope(destination);
+        numOps.Abs(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Sin into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
@@ -5608,27 +5863,35 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep21 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep33 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
             {
-                var fSrc = (float[])(object)input.GetDataArray();
-                var fDst = (float[])(object)destination.GetDataArray();
+                using var fSrcLease = input.LeaseArray();
+                var fSrc = (float[])(object)fSrcLease.Array;
+                using var fDstLease = destination.LeaseArray();
+                var fDst = (float[])(object)fDstLease.Array;
                 for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
             }
             return;
         }
         if (typeof(T) == typeof(double))
         {
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep22 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep34 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             SimdKernels.Sin(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sin(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep11 = new KeepAliveScope(input);
+        using var destinationKeep16 = new KeepAliveScope(destination);
+        numOps.Sin(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Cos into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
@@ -5639,27 +5902,35 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep23 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep35 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
             {
-                var fSrc = (float[])(object)input.GetDataArray();
-                var fDst = (float[])(object)destination.GetDataArray();
+                using var fSrcLease = input.LeaseArray();
+                var fSrc = (float[])(object)fSrcLease.Array;
+                using var fDstLease = destination.LeaseArray();
+                var fDst = (float[])(object)fDstLease.Array;
                 for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
             }
             return;
         }
         if (typeof(T) == typeof(double))
         {
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep24 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep36 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             SimdKernels.Cos(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Cos(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep12 = new KeepAliveScope(input);
+        using var destinationKeep17 = new KeepAliveScope(destination);
+        numOps.Cos(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -5689,12 +5960,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // Chain pairwise additions using span-based numOps: result = t0 + t1 + t2 + ...
         // First: result = tensors[0] + tensors[1]
         var result = AutoTensorCache.RentOrAllocate<T>(referenceShape);
-        numOps.Add(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
+        using var resultKeep15 = new KeepAliveScope(result);
+        numOps.Add(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpanUnmarked());
 
         // Accumulate remaining tensors into result
         for (int t = 2; t < tensors.Length; t++)
         {
-            numOps.Add(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
+            using var resultKeep16 = new KeepAliveScope(result);
+            numOps.Add(result.AsSpanUnmarked(), tensors[t].AsSpan(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordIfActive("TensorAddMany", result, tensors, BackwardFunctions<T>.AddManyBackward);
@@ -5790,9 +6063,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house SIMD: pin logical memory, then use JIT or
             // VectorSubtractUnsafe (4× unrolled AVX2/AVX-512 with FMA).
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var aDataKeep11 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep12 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep11 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5806,9 +6082,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house: pin logical memory and call VectorSubtractUnsafe(double*).
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var aDataKeep12 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep13 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep12 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5840,7 +6119,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep8 = new KeepAliveScope(a);
+            using var bKeep7 = new KeepAliveScope(b);
+            using var resultKeep17 = new KeepAliveScope(result);
+            numOps.Subtract(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorSubtract", result, a, b, BackwardFunctions<T>.SubtractBackward);
@@ -5926,9 +6208,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var aDataKeep13 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep14 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep13 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5941,9 +6226,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var aDataKeep14 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep15 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep14 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5975,7 +6263,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep9 = new KeepAliveScope(a);
+            using var bKeep8 = new KeepAliveScope(b);
+            using var resultKeep18 = new KeepAliveScope(result);
+            numOps.Multiply(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorMultiply", result, a, b, BackwardFunctions<T>.MultiplyBackward);
@@ -6033,8 +6324,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep15 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep16 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -6057,8 +6350,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            using var aDataKeep16 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep17 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -6085,7 +6380,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        using var aKeep10 = new KeepAliveScope(a);
+        using var bKeep9 = new KeepAliveScope(b);
+        numOps.Multiply(a.AsSpanUnmarked(), b.AsSpanUnmarked(), a.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -6112,9 +6409,12 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var aDataKeep17 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep18 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep37 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6122,9 +6422,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var aDataKeep18 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep19 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var destinationDataKeep38 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6133,7 +6436,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Multiply(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep11 = new KeepAliveScope(a);
+            using var bKeep10 = new KeepAliveScope(b);
+            using var destinationKeep18 = new KeepAliveScope(destination);
+            numOps.Multiply(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -6181,8 +6487,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            using var aDataKeep2 = new KeepAliveScope(a);
+            var aMem = AsFloatMemory(a.DataUnmarked);
+            using var bDataKeep1 = new KeepAliveScope(b);
+            var bMem = AsFloatMemory(b.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -6195,8 +6503,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            using var aDataKeep3 = new KeepAliveScope(a);
+            var aMem = AsDoubleMemory(a.DataUnmarked);
+            using var bDataKeep2 = new KeepAliveScope(b);
+            var bMem = AsDoubleMemory(b.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -6223,7 +6533,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        using var aKeep12 = new KeepAliveScope(a);
+        using var bKeep11 = new KeepAliveScope(b);
+        numOps.Subtract(a.AsSpanUnmarked(), b.AsSpanUnmarked(), a.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -6263,7 +6575,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             float scalarF = (float)(object)scalar!;
-            var aMem = AsFloatMemory(a.Data);
+            using var aDataKeep4 = new KeepAliveScope(a);
+            var aMem = AsFloatMemory(a.DataUnmarked);
             using var pinA = aMem.Pin();
             float* pA = (float*)pinA.Pointer;
 
@@ -6291,7 +6604,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double))
         {
             double scalarD = (double)(object)scalar!;
-            var aMem = AsDoubleMemory(a.Data);
+            using var aDataKeep5 = new KeepAliveScope(a);
+            var aMem = AsDoubleMemory(a.DataUnmarked);
             using var pinA = aMem.Pin();
             double* pA = (double*)pinA.Pointer;
 
@@ -6317,7 +6631,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback: vectorized numOps
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.MultiplyScalar(a.AsSpan(), scalar, a.AsWritableSpan());
+        using var aKeep13 = new KeepAliveScope(a);
+        numOps.MultiplyScalar(a.AsSpanUnmarked(), scalar, a.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -6355,8 +6670,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             float scalarF = (float)(object)scalar!;
-            var aMem = AsFloatMemory(a.Data);
-            var dMem = AsFloatMemory(destination.Data);
+            using var aDataKeep6 = new KeepAliveScope(a);
+            var aMem = AsFloatMemory(a.DataUnmarked);
+            using var destinationDataKeep39 = new KeepAliveScope(destination);
+            var dMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinD = dMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -6386,8 +6703,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double))
         {
             double scalarD = (double)(object)scalar!;
-            var aMem = AsDoubleMemory(a.Data);
-            var dMem = AsDoubleMemory(destination.Data);
+            using var aDataKeep7 = new KeepAliveScope(a);
+            var aMem = AsDoubleMemory(a.DataUnmarked);
+            using var destinationDataKeep40 = new KeepAliveScope(destination);
+            var dMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinD = dMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -6415,7 +6734,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback: vectorized numOps
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.MultiplyScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
+        using var aKeep14 = new KeepAliveScope(a);
+        using var destinationKeep19 = new KeepAliveScope(destination);
+        numOps.MultiplyScalar(a.AsSpanUnmarked(), scalar, destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -6443,11 +6764,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Chain pairwise multiplications: result = t0 * t1 * t2 * ...
         var result = AutoTensorCache.RentOrAllocate<T>(referenceShape);
-        numOps.Multiply(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
+        using var resultKeep19 = new KeepAliveScope(result);
+        numOps.Multiply(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpanUnmarked());
 
         for (int t = 2; t < tensors.Length; t++)
         {
-            numOps.Multiply(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
+            using var resultKeep20 = new KeepAliveScope(result);
+            numOps.Multiply(result.AsSpanUnmarked(), tensors[t].AsSpan(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordIfActive("TensorMultiplyMany", result, tensors, BackwardFunctions<T>.MultiplyManyBackward);
@@ -6488,12 +6811,15 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (tensor.IsContiguous)
         {
-            numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
+            using var tensorKeep7 = new KeepAliveScope(tensor);
+            using var resultKeep21 = new KeepAliveScope(result);
+            numOps.MultiplyScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked());
         }
         else
         {
             var src = tensor._storage.GetDataArray();
-            var dst = result.GetDataArray();
+            using var dstLease = result.LeaseArray();
+            var dst = dstLease.Array;
             for (int i = 0; i < tensor.Length; i++)
                 dst[i] = numOps.Multiply(src[tensor.LogicalToStorageIndex(i)], scalar);
         }
@@ -6556,7 +6882,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         if (eng is DirectGpuTensorEngine dGpu && dGpu.TryBinaryResidentInto(output, capturedA, capturedB,
                                 static (be, ia, ib, o, n) => be.Divide(ia, ib, o, n), "Divide"))
                             return;
-                        MathHelper.GetNumericOperations<T>().Divide(capturedA.AsSpan(), capturedB.AsSpan(), output.AsWritableSpan());
+                        using var capturedAKeep1 = new KeepAliveScope(capturedA);
+                        using var capturedBKeep1 = new KeepAliveScope(capturedB);
+                        using var outputKeep2 = new KeepAliveScope(output);
+                        MathHelper.GetNumericOperations<T>().Divide(capturedA.AsSpanUnmarked(), capturedB.AsSpanUnmarked(), output.AsWritableSpanUnmarked());
                         output.IncrementVersion();
                     },
                     BackwardFunctions<T>.DivideBackward);
@@ -6578,9 +6907,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var aDataKeep19 = new KeepAliveScope(a);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep20 = new KeepAliveScope(b);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep15 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6593,9 +6925,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
-            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var aDataKeep20 = new KeepAliveScope(a);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyDataUnmarked);
+            using var bDataKeep21 = new KeepAliveScope(b);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyDataUnmarked);
+            using var resultDataKeep16 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6627,7 +6962,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep15 = new KeepAliveScope(a);
+            using var bKeep12 = new KeepAliveScope(b);
+            using var resultKeep22 = new KeepAliveScope(result);
+            numOps.Divide(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorDivide", result, a, b, BackwardFunctions<T>.DivideBackward);
@@ -6649,8 +6987,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Equals(src[i], value) ? numOps.One : numOps.Zero;
@@ -6676,9 +7016,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
-        var srcA = a.AsSpan();
-        var srcB = b.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcALease = a.Lease();
+        var srcA = srcALease.Span;
+        using var srcBLease = b.Lease();
+        var srcB = srcBLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < srcA.Length; i++)
             dest[i] = numOps.Equals(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
@@ -6698,8 +7041,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = !numOps.Equals(src[i], value) ? numOps.One : numOps.Zero;
@@ -6725,9 +7070,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
-        var srcA = a.AsSpan();
-        var srcB = b.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcALease = a.Lease();
+        var srcA = srcALease.Span;
+        using var srcBLease = b.Lease();
+        var srcB = srcBLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < srcA.Length; i++)
             dest[i] = !numOps.Equals(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
@@ -6753,9 +7101,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
-        var srcA = a.AsSpan();
-        var srcB = b.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcALease = a.Lease();
+        var srcA = srcALease.Span;
+        using var srcBLease = b.Lease();
+        var srcB = srcBLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < srcA.Length; i++)
             dest[i] = numOps.GreaterThan(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
@@ -6775,8 +7126,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.GreaterThan(src[i], value) ? numOps.One : numOps.Zero;
@@ -6802,9 +7155,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
-        var srcA = a.AsSpan();
-        var srcB = b.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcALease = a.Lease();
+        var srcA = srcALease.Span;
+        using var srcBLease = b.Lease();
+        var srcB = srcBLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < srcA.Length; i++)
             dest[i] = numOps.LessThan(srcA[i], srcB[i]) ? numOps.One : numOps.Zero;
@@ -6824,8 +7180,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.LessThan(src[i], value) ? numOps.One : numOps.Zero;
@@ -6869,8 +7227,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var iMem = AsFloatMemory(tensor.Data);
-            var rMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep1 = new KeepAliveScope(tensor);
+            var iMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep17 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             float* pI = (float*)pinI.Pointer;
@@ -6882,8 +7242,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // In-house Vector256<double> Log via FastLogDouble256, dispatched
             // across the persistent thread pool. Closes the Log_Double gap
             // (was 16× behind libtorch's MKL-routed log).
-            var iMem = AsDoubleMemory(tensor.Data);
-            var rMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep2 = new KeepAliveScope(tensor);
+            var iMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep18 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             double* pI = (double*)pinI.Pointer;
@@ -6893,7 +7255,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep8 = new KeepAliveScope(tensor);
+            using var resultKeep23 = new KeepAliveScope(result);
+            numOps.Log(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorLog", result, tensorOrig, BackwardFunctions<T>.LogBackward);
@@ -6934,8 +7298,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var iMem = AsFloatMemory(tensor.Data);
-            var rMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep3 = new KeepAliveScope(tensor);
+            var iMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep19 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             float* pI = (float*)pinI.Pointer;
@@ -6946,8 +7312,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house Vector256<double> Exp via FastExpDouble256, parallel-dispatched.
             // No external library fallback (zero-dependency policy).
-            var iMem = AsDoubleMemory(tensor.Data);
-            var rMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep4 = new KeepAliveScope(tensor);
+            var iMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep20 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             double* pI = (double*)pinI.Pointer;
@@ -6957,7 +7325,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep9 = new KeepAliveScope(tensor);
+            using var resultKeep24 = new KeepAliveScope(result);
+            numOps.Exp(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorExp", result, tensorOrig, BackwardFunctions<T>.ExpBackward);
@@ -6999,8 +7369,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var iMem = AsFloatMemory(tensor.Data);
-            var rMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep5 = new KeepAliveScope(tensor);
+            var iMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep21 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             float* pI = (float*)pinI.Pointer;
@@ -7010,7 +7382,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep10 = new KeepAliveScope(tensor);
+            using var resultKeep25 = new KeepAliveScope(result);
+            numOps.Sqrt(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorSqrt", result, tensorOrig, BackwardFunctions<T>.SqrtBackward);
@@ -7079,7 +7453,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep11 = new KeepAliveScope(tensor);
+            using var resultKeep26 = new KeepAliveScope(result);
+            numOps.Abs(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorAbs", result, tensorOrig, BackwardFunctions<T>.AbsBackward);
@@ -7104,7 +7480,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // During CUDA-graph capture the GPU engine keeps this resident (no AsSpan download → CUDA-900).
                         if (eng is DirectGpuTensorEngine gpu && gpu.TensorNegateIntoResident(output, captured)) return;
-                        MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan());
+                        using var capturedKeep1 = new KeepAliveScope(captured);
+                        using var outputKeep3 = new KeepAliveScope(output);
+                        MathHelper.GetNumericOperations<T>().Negate(captured.AsSpanUnmarked(), output.AsWritableSpanUnmarked());
                     },
                     BackwardFunctions<T>.NegateBackward);
             }
@@ -7118,7 +7496,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
+        using var tensorKeep12 = new KeepAliveScope(tensor);
+        using var resultKeep27 = new KeepAliveScope(result);
+        numOps.Negate(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
 
         DifferentiableOps.RecordUnary("TensorNegate", result, tensorOrig, BackwardFunctions<T>.NegateBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorNegate", result, eng => eng.TensorNegate(c)); }
@@ -7164,7 +7544,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Copy data to a new tensor with no tape connection.
         // Intentionally does NOT call DifferentiableOps.Record — this is the whole point.
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        tensor.AsSpan().CopyTo(result.AsWritableSpan());
+        using var tensorKeep13 = new KeepAliveScope(tensor);
+        using var resultKeep28 = new KeepAliveScope(result);
+        tensor.AsSpanUnmarked().CopyTo(result.AsWritableSpanUnmarked());
         // Transparent inference tracing has the same forward-dependency contract as
         // GraphMode, while remaining outside the autodiff tape.
         { var c = tracedInput; AutoTracer.RecordOp("StopGradient", result, eng => eng.StopGradient(c)); }
@@ -7210,8 +7592,10 @@ public partial class CpuEngine : ITensorLevelEngine
             if (fExp == 2.0f)
             {
                 // x^2 = x * x — use SIMD multiply
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep6 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep22 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinSrc.Pointer, (float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7232,8 +7616,10 @@ public partial class CpuEngine : ITensorLevelEngine
             if (dExp == 2.0)
             {
                 // x^2 = x * x — used by every L2 regularization / squared-error loss term.
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep7 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep23 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinSrc.Pointer, (double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7244,8 +7630,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Power(src[i], exponent);
@@ -7272,9 +7660,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(bases._shape);
-        var srcB = bases.AsSpan();
-        var srcE = exponents.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcBLease = bases.Lease();
+        var srcB = srcBLease.Span;
+        using var srcELease = exponents.Lease();
+        var srcE = srcELease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < srcB.Length; i++)
             dest[i] = numOps.Power(srcB[i], srcE[i]);
@@ -7299,8 +7690,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep8 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep24 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.FloorUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7310,8 +7703,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep9 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep25 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.FloorUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7320,8 +7715,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var src = tensor.AsSpan();
-            var dest = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var destLease = result.LeaseWritable();
+            var dest = destLease.Span;
             for (int i = 0; i < src.Length; i++)
                 dest[i] = numOps.Floor(src[i]);
         }
@@ -7345,8 +7742,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep10 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep26 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CeilingUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7356,8 +7755,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep11 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep27 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CeilingUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7366,8 +7767,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var src = tensor.AsSpan();
-            var dest = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var destLease = result.LeaseWritable();
+            var dest = destLease.Span;
             for (int i = 0; i < src.Length; i++)
                 dest[i] = numOps.Ceiling(src[i]);
         }
@@ -7392,8 +7795,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep12 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep28 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.RoundUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7403,8 +7808,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep13 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep29 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.RoundUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7413,8 +7820,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var src = tensor.AsSpan();
-            var dest = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var destLease = result.LeaseWritable();
+            var dest = destLease.Span;
             for (int i = 0; i < src.Length; i++)
                 dest[i] = numOps.FromDouble(Math.Round(numOps.ToDouble(src[i])));
         }
@@ -7443,8 +7852,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Frac(src[i]);
@@ -7485,14 +7896,18 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep14 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep30 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
                 {
-                    var fSrc = (float[])(object)tensor.GetDataArray();
-                    var fDst = (float[])(object)result.GetDataArray();
+                    using var fSrcLease = tensor.LeaseArray();
+                    var fSrc = (float[])(object)fSrcLease.Array;
+                    using var fDstLease = result.LeaseArray();
+                    var fDst = (float[])(object)fDstLease.Array;
                     for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
                 }
             }
@@ -7500,7 +7915,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep14 = new KeepAliveScope(tensor);
+            using var resultKeep29 = new KeepAliveScope(result);
+            numOps.Sin(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Sin", result, tensorOrig,
@@ -7540,14 +7957,18 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep15 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep31 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
                 {
-                    var fSrc = (float[])(object)tensor.GetDataArray();
-                    var fDst = (float[])(object)result.GetDataArray();
+                    using var fSrcLease = tensor.LeaseArray();
+                    var fSrc = (float[])(object)fSrcLease.Array;
+                    using var fDstLease = result.LeaseArray();
+                    var fDst = (float[])(object)fDstLease.Array;
                     for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
                 }
             }
@@ -7555,7 +7976,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep15 = new KeepAliveScope(tensor);
+            using var resultKeep30 = new KeepAliveScope(result);
+            numOps.Cos(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Cos", result, tensorOrig,
@@ -7599,9 +8022,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var gridSrc = grid; var posSrc = positions;
         if (!grid.IsContiguous) grid = grid.Contiguous();
         if (!positions.IsContiguous) positions = positions.Contiguous();
-        var gridData = grid.GetDataArray();
-        var posData = positions.GetDataArray();
-        var resData = result.GetDataArray();
+        using var gridDataLease = grid.LeaseArray();
+        var gridData = gridDataLease.Array;
+        using var posDataLease = positions.LeaseArray();
+        var posData = posDataLease.Array;
+        using var resDataLease = result.LeaseArray();
+        var resData = resDataLease.Array;
         int lD = depth, lH = height, lW = width, lC = channels;
 
         if (typeof(T) == typeof(double))
@@ -7804,7 +8230,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // written by exactly one thread, so this sum is race-free; snapshot
         // Values into an array so the parallel combine indexes a stable set.
         int totalElements = gradLen;
-        var gradGridData = gradGrid.GetDataArray();
+        using var gradGridDataLease = gradGrid.LeaseArray();
+        var gradGridData = gradGridDataLease.Array;
         var allLocals = System.Linq.Enumerable.ToArray(threadLocalGrads.Values);
         CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, i =>
         {
@@ -7843,8 +8270,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.Power(src[i], exponent);
@@ -7889,9 +8318,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsFloatMemory(a.Data);
-                var srcMemB = AsFloatMemory(b.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var aDataKeep8 = new KeepAliveScope(a);
+                var srcMemA = AsFloatMemory(a.DataUnmarked);
+                using var bDataKeep3 = new KeepAliveScope(b);
+                var srcMemB = AsFloatMemory(b.DataUnmarked);
+                using var resultDataKeep32 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -7902,9 +8334,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsDoubleMemory(a.Data);
-                var srcMemB = AsDoubleMemory(b.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var aDataKeep9 = new KeepAliveScope(a);
+                var srcMemA = AsDoubleMemory(a.DataUnmarked);
+                using var bDataKeep4 = new KeepAliveScope(b);
+                var srcMemB = AsDoubleMemory(b.DataUnmarked);
+                using var resultDataKeep33 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -7914,9 +8349,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var srcA = a.AsSpan();
-            var srcB = b.AsSpan();
-            var dest = result.AsWritableSpan();
+            using var srcALease = a.Lease();
+            var srcA = srcALease.Span;
+            using var srcBLease = b.Lease();
+            var srcB = srcBLease.Span;
+            using var destLease = result.LeaseWritable();
+            var dest = destLease.Span;
             for (int i = 0; i < srcA.Length; i++)
                 dest[i] = numOps.GreaterThan(srcA[i], srcB[i]) ? srcA[i] : srcB[i];
         }
@@ -7935,8 +8373,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
         {
@@ -7986,9 +8426,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsFloatMemory(a.Data);
-                var srcMemB = AsFloatMemory(b.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var aDataKeep10 = new KeepAliveScope(a);
+                var srcMemA = AsFloatMemory(a.DataUnmarked);
+                using var bDataKeep5 = new KeepAliveScope(b);
+                var srcMemB = AsFloatMemory(b.DataUnmarked);
+                using var resultDataKeep34 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -7999,9 +8442,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsDoubleMemory(a.Data);
-                var srcMemB = AsDoubleMemory(b.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var aDataKeep11 = new KeepAliveScope(a);
+                var srcMemA = AsDoubleMemory(a.DataUnmarked);
+                using var bDataKeep6 = new KeepAliveScope(b);
+                var srcMemB = AsDoubleMemory(b.DataUnmarked);
+                using var resultDataKeep35 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -8010,9 +8456,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var srcA = a.AsSpan();
-            var srcB = b.AsSpan();
-            var dest = result.AsWritableSpan();
+            using var srcALease = a.Lease();
+            var srcA = srcALease.Span;
+            using var srcBLease = b.Lease();
+            var srcB = srcBLease.Span;
+            using var destLease = result.LeaseWritable();
+            var dest = destLease.Span;
             for (int i = 0; i < srcA.Length; i++)
                 dest[i] = numOps.LessThan(srcA[i], srcB[i]) ? srcA[i] : srcB[i];
         }
@@ -8031,8 +8480,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var src = tensor.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
         {
@@ -8080,8 +8531,10 @@ public partial class CpuEngine : ITensorLevelEngine
             float fMax = max is not null ? (float)(object)max : float.MaxValue;
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep16 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep36 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.ClampUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, fMin, fMax);
@@ -8089,8 +8542,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var src = tensor.AsSpan();
-            var dest = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var destLease = result.LeaseWritable();
+            var dest = destLease.Span;
             for (int i = 0; i < src.Length; i++)
             {
                 var val = src[i];
@@ -8130,7 +8585,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: bypass generic dispatch + Span overhead
         if (typeof(T) == typeof(float))
         {
-            T[] arr = tensor.GetDataArray();
+            using var arrLease = tensor.LeaseArray();
+            T[] arr = arrLease.Array;
             float[] fArr = Unsafe.As<T[], float[]>(ref arr);
             int length = tensor.Length;
             float result;
@@ -8384,7 +8840,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 else outShape.Add(tensor._shape[d]);
             }
             var result = AutoTensorCache.RentOrAllocate<T>(outShape.ToArray());
-            var rArr = result.GetDataArray();
+            using var rArrLease = result.LeaseArray();
+            var rArr = rArrLease.Array;
             var srcArr = tensor._storage.GetDataArray();
 
             for (int o = 0; o < outerSize; o++)
@@ -8439,14 +8896,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int axis = normalizedAxes[0];
             int rows = tensor._shape[0], cols = tensor._shape[1];
-            var srcArr = (float[])(object)tensor.GetDataArray();
+            using var srcArrLease = tensor.LeaseArray();
+            var srcArr = (float[])(object)srcArrLease.Array;
 
             if (axis == 0)
             {
                 // Sum along rows → output [1, cols] or [cols]
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var rArr = (float[])(object)fastResult.GetDataArray();
+                using var rArrLease = fastResult.LeaseArray();
+                var rArr = (float[])(object)rArrLease.Array;
                 ReduceSum2DColumns(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
@@ -8457,7 +8916,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Sum along cols → output [rows, 1] or [rows]
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var rArr = (float[])(object)fastResult.GetDataArray();
+                using var rArrLease = fastResult.LeaseArray();
+                var rArr = (float[])(object)rArrLease.Array;
                 ReduceSum2DRows(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
@@ -8472,13 +8932,15 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int axis = normalizedAxes[0];
             int rows = tensor._shape[0], cols = tensor._shape[1];
-            var srcArr = (double[])(object)tensor.GetDataArray();
+            using var srcArrLease = tensor.LeaseArray();
+            var srcArr = (double[])(object)srcArrLease.Array;
 
             if (axis == 0)
             {
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var rArr = (double[])(object)fastResult.GetDataArray();
+                using var rArrLease = fastResult.LeaseArray();
+                var rArr = (double[])(object)rArrLease.Array;
                 ReduceSum2DColumns(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
@@ -8488,7 +8950,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var rArr = (double[])(object)fastResult.GetDataArray();
+                using var rArrLease = fastResult.LeaseArray();
+                var rArr = (double[])(object)rArrLease.Array;
                 ReduceSum2DRows(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
@@ -8582,7 +9045,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var fArr = (float[])(object)tensor.GetDataArray();
+            using var fArrLease = tensor.LeaseArray();
+            var fArr = (float[])(object)fArrLease.Array;
             int length = tensor.Length;
             fixed (float* ptr = fArr)
             {
@@ -8604,7 +9068,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // _storageOffset, so contiguous-but-offset views would read the
             // wrong elements. tensor was already Contiguous()-materialized
             // above when not contiguous, so .Data is the right span here.
-            var span = AsDoubleMemory(tensor.Data).Span;
+            using var tensorDataKeep17 = new KeepAliveScope(tensor);
+            var span = AsDoubleMemory(tensor.DataUnmarked).Span;
             if (span.Length > tensor.Length) span = span[..tensor.Length];
             fixed (double* ptr = span)
             {
@@ -8716,7 +9181,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: direct Pin + SumUnsafe (avoids TensorSum's GCHandle overhead)
         if (typeof(T) == typeof(float) && tensor.IsContiguous)
         {
-            var mem = AsFloatMemory(tensor.Data);
+            using var tensorDataKeep18 = new KeepAliveScope(tensor);
+            var mem = AsFloatMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, tensor.Length);
             float result = fSum / tensor.Length;
@@ -8730,7 +9196,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // that didn't honor _storageOffset.
         if (typeof(T) == typeof(double) && tensor.IsContiguous)
         {
-            var span = AsDoubleMemory(tensor.Data).Span;
+            using var tensorDataKeep19 = new KeepAliveScope(tensor);
+            var span = AsDoubleMemory(tensor.DataUnmarked).Span;
             if (span.Length > tensor.Length) span = span[..tensor.Length];
             double dSum = SimdKernels.Sum(span);
             double result = dSum / tensor.Length;
@@ -9222,7 +9689,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Float fast path: direct array access with specialized inner loops
-        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
+        // The arrays feed only the synchronous kernels below; the scopes keep input and result alive while they do.
+        using var maxPoolInputKeep = new KeepAliveScope(input);
+        using var maxPoolResultKeep = new KeepAliveScope(result);
+        if (typeof(T) == typeof(float) && input.GetDataArrayUnmarked() is float[] inArr && result.GetDataArrayUnmarked() is float[] outArr)
         {
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
@@ -9256,7 +9726,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // 3x3 maxpool over 1×64×112×112 hits this op once per train iter
         // backward + forward; the generic numOps path was paying ~9
         // GreaterThan + 9 ToDouble / output cell.
-        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && result.GetDataArray() is double[] outArrD)
+        if (typeof(T) == typeof(double) && input.GetDataArrayUnmarked() is double[] inArrD && result.GetDataArrayUnmarked() is double[] outArrD)
         {
             int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
             int psD = poolSize, stD = stride, pdD = padding;
@@ -9294,8 +9764,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback
-        var inputData = input.GetDataArray();
-        var outputData = result.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
@@ -9371,7 +9843,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Float fast paths
-        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        using var inputArrayKeep9706 = new KeepAliveScope(input);
+        using var outputArrayKeep9706 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(float) && input.GetDataArrayUnmarked() is float[] inArr && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int bc = batch * channels;
             int ps = poolSize, st = stride, pd = padding;
@@ -9385,7 +9859,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path: direct double arithmetic with batch×channel parallelism,
         // bypassing the per-element numOps virtual dispatch. Mirrors the allocating
         // MaxPool2D's double path that VGG / ResNet / DenseNet hit on every pool layer.
-        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        using var inputArrayKeep9720 = new KeepAliveScope(input);
+        using var outputArrayKeep9720 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(double) && input.GetDataArrayUnmarked() is double[] inArrD && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
             int psD = poolSize, stD = stride, pdD = padding;
@@ -9422,8 +9898,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback
-        var inputData = input.GetDataArray();
-        var outputData = output.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, idx =>
         {
             int b = idx / channels, c = idx % channels;
@@ -9489,7 +9967,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Float fast path
-        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && output.GetDataArray() is float[] outArr)
+        using var inputArrayKeep9826 = new KeepAliveScope(input);
+        using var outputArrayKeep9826 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(float) && input.GetDataArrayUnmarked() is float[] inArr && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
@@ -9538,7 +10018,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // parallel partition, but without the per-element numOps virtual dispatch.
         // Used by ResNet's global-average-pool final step and by GAP blocks in
         // various CV architectures running fp64.
-        if (typeof(T) == typeof(double) && input.GetDataArray() is double[] inArrD && output.GetDataArray() is double[] outArrD)
+        using var inputArrayKeep9875 = new KeepAliveScope(input);
+        using var outputArrayKeep9875 = new KeepAliveScope(output);
+        if (typeof(T) == typeof(double) && input.GetDataArrayUnmarked() is double[] inArrD && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
@@ -9575,8 +10057,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback
-        var inputData = input.GetDataArray();
-        var outputData = output.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, idx =>
         {
             int b = idx / channels, c = idx % channels;
@@ -9994,9 +10478,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 var dInput  = (Tensor<double>)(object)input;
                 var dKernel = (Tensor<double>)(object)kernel;
                 var dResult = (Tensor<double>)(object)result;
-                using var pinIn = dInput.Data.Pin();
-                using var pinK  = dKernel.Data.Pin();
-                using var pinO  = dResult.Data.Pin();
+                using var dInputDataKeep1 = new KeepAliveScope(dInput);
+                using var pinIn = dInput.DataUnmarked.Pin();
+                using var dKernelDataKeep1 = new KeepAliveScope(dKernel);
+                using var pinK  = dKernel.DataUnmarked.Pin();
+                using var dResultDataKeep1 = new KeepAliveScope(dResult);
+                using var pinO  = dResult.DataUnmarked.Pin();
                 unsafe
                 {
                     Helpers.SimdConvHelper.Conv2DDirectDouble(
@@ -10185,9 +10672,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 // No outer Span.Clear() — the per-oc direct kernels (and the
                 // GEMM-based Conv1x1Stride1Double via Dgemm's c.Clear()) own
                 // initialization of every byte they write.
-                using var pinIn = dInput.Data.Pin();
-                using var pinK  = dKernel.Data.Pin();
-                using var pinO  = dOutput.Data.Pin();
+                using var dInputDataKeep2 = new KeepAliveScope(dInput);
+                using var pinIn = dInput.DataUnmarked.Pin();
+                using var dKernelDataKeep2 = new KeepAliveScope(dKernel);
+                using var pinK  = dKernel.DataUnmarked.Pin();
+                using var dOutputDataKeep1 = new KeepAliveScope(dOutput);
+                using var pinO  = dOutput.DataUnmarked.Pin();
                 unsafe
                 {
                     Helpers.SimdConvHelper.Conv2DDirectDouble(
@@ -10451,9 +10941,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (FusedConvHelper.ShouldUseFusedConv(kernelHeight, kernelWidth, stride, stride,
             outputHeight, outputWidth, inChannels, outChannels))
         {
-            var inputSpan = input.AsSpan();
-            var kernelSpan = kernel.AsSpan();
-            var outputSpan = result.Data.Span;
+            using var inputSpanLease = input.Lease();
+            var inputSpan = inputSpanLease.Span;
+            using var kernelSpanLease = kernel.Lease();
+            var kernelSpan = kernelSpanLease.Span;
+            using var resultDataKeep37 = new KeepAliveScope(result);
+            var outputSpan = result.DataUnmarked.Span;
 
             FusedConvHelper.Conv2DFused(
                 inputSpan, kernelSpan, outputSpan,
@@ -10468,9 +10961,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // Strategy 3: Try Winograd for large 3x3 convolutions with stride=1, dilation=1
         if (WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth))
         {
-            var inputSpan = input.AsSpan();
-            var kernelSpan = kernel.AsSpan();
-            var outputSpan = result.Data.Span;
+            using var inputSpanLease = input.Lease();
+            var inputSpan = inputSpanLease.Span;
+            using var kernelSpanLease = kernel.Lease();
+            var kernelSpan = kernelSpanLease.Span;
+            using var resultDataKeep38 = new KeepAliveScope(result);
+            var outputSpan = result.DataUnmarked.Span;
 
             WinogradHelper.Conv2DWinograd(
                 inputSpan, kernelSpan, outputSpan,
@@ -10537,9 +11033,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int inputImage = inChannels * height * width;
         int outputImage = outChannels * colW;
-        using var pinIn = input.ReadOnlyData.Pin();
-        using var pinK = kernel.ReadOnlyData.Pin();
-        using var pinOut = result.Data.Pin();
+        using var inputDataKeep3 = new KeepAliveScope(input);
+        using var pinIn = input.ReadOnlyDataUnmarked.Pin();
+        using var kernelDataKeep1 = new KeepAliveScope(kernel);
+        using var pinK = kernel.ReadOnlyDataUnmarked.Pin();
+        using var resultDataKeep39 = new KeepAliveScope(result);
+        using var pinOut = result.DataUnmarked.Pin();
         nint pIn = (nint)pinIn.Pointer, pK = (nint)pinK.Pointer, pOut = (nint)pinOut.Pointer;
         long work = (long)batch * outChannels * colH * colW;
 
@@ -10587,9 +11086,12 @@ public partial class CpuEngine : ITensorLevelEngine
             return false;
         }
 
-        var inputSpan = input.AsSpan();
-        var kernelSpan = kernel.AsSpan();
-        var outputSpan = result.Data.Span;
+        using var inputSpanLease = input.Lease();
+        var inputSpan = inputSpanLease.Span;
+        using var kernelSpanLease = kernel.Lease();
+        var kernelSpan = kernelSpanLease.Span;
+        using var resultDataKeep40 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
 
         fixed (float* inputPtr = inputSpan)
         fixed (float* kernelPtr = kernelSpan)
@@ -10619,9 +11121,12 @@ public partial class CpuEngine : ITensorLevelEngine
             return false;
         }
 
-        var inputSpan = input.AsSpan();
-        var kernelSpan = kernel.AsSpan();
-        var outputSpan = result.Data.Span;
+        using var inputSpanLease = input.Lease();
+        var inputSpan = inputSpanLease.Span;
+        using var kernelSpanLease = kernel.Lease();
+        var kernelSpan = kernelSpanLease.Span;
+        using var resultDataKeep41 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         var biasSpan = epilogueBias is null ? default : epilogueBias.AsSpan();
 
         fixed (float* inputPtr = inputSpan)
@@ -10673,9 +11178,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // Allocate only one batch-slice worth of im2col buffer, not batch * colH * colW
         int sliceSize = colH * colW;
 
-        var inputSpan = input.AsSpan();
-        var kernelSpan = kernel.AsSpan();
-        var outputSpan = result.Data.Span;
+        using var inputSpanLease = input.Lease();
+        var inputSpan = inputSpanLease.Span;
+        using var kernelSpanLease = kernel.Lease();
+        var kernelSpan = kernelSpanLease.Span;
+        using var resultDataKeep42 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = inChannels * height * width;
 
 #if !NET471
@@ -10850,9 +11358,12 @@ public partial class CpuEngine : ITensorLevelEngine
         int ohRows = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / Math.Max(1, perRowFloats)));
         int maxNcBlock = checked(ohRows * outputWidth);
 
-        var inputSpan = input.AsSpan();
-        var kernelSpan = kernel.AsSpan();
-        var outputSpan = result.Data.Span;
+        using var inputSpanLease = input.Lease();
+        var inputSpan = inputSpanLease.Span;
+        using var kernelSpanLease = kernel.Lease();
+        var kernelSpan = kernelSpanLease.Span;
+        using var resultDataKeep43 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = checked(inChannels * height * width);
 
         var pool = System.Buffers.ArrayPool<float>.Shared;
@@ -10944,9 +11455,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // Allocate only one batch-slice worth of im2col buffer, not batch * colH * colW
         int sliceSize = colH * colW;
 
-        var inputSpan = input.AsSpan();
-        var kernelSpan = kernel.AsSpan();
-        var outputSpan = result.Data.Span;
+        using var inputSpanLease = input.Lease();
+        var inputSpan = inputSpanLease.Span;
+        using var kernelSpanLease = kernel.Lease();
+        var kernelSpan = kernelSpanLease.Span;
+        using var resultDataKeep44 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = inChannels * height * width;
 
         // 1×1 fast path (issue #251): when the kernel is 1×1 with stride=1,
@@ -11271,7 +11785,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(vector.Length);
-        numOps.ReLU(vector.AsSpan(), result.AsWritableSpan());
+        using var vectorKeep1 = new KeepAliveScope(vector);
+        using var resultKeep31 = new KeepAliveScope(result);
+        numOps.ReLU(vector.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -11307,7 +11823,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
-                var dstArr = resultS.GetDataArray();
+                using var dstArrLease = resultS.LeaseArray();
+                var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
@@ -11327,8 +11844,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // our own Padé-approximation SIMD kernel on Ryzen 9 3950X for
             // 1M-element inputs (measured 7325 µs vs 369 µs in BENCHMARK
             // RESULTS). Stay on the in-house path until that regresses.
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep20 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep45 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -11339,8 +11858,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house Vector256<double> Tanh via FastExpDouble256, parallel-dispatched.
             // No external library fallback (zero-dependency policy).
-            var srcMem = AsDoubleMemory(tensor.Data);
-            var dstMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep21 = new KeepAliveScope(tensor);
+            var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep46 = new KeepAliveScope(result);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -11350,7 +11871,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep16 = new KeepAliveScope(tensor);
+            using var resultKeep32 = new KeepAliveScope(result);
+            numOps.Tanh(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Tanh", result, tensor, BackwardFunctions<T>.TanhBackward);
@@ -11388,7 +11911,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
-                var dstArr = resultS.GetDataArray();
+                using var dstArrLease = resultS.LeaseArray();
+                var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
@@ -11411,8 +11935,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // par with our JIT-compiled Padé-3,3 approximation, but for
             // double precision it regresses 12× (530 µs → 6,121 µs in
             // BENCHMARK_RESULTS). Stay on the in-house path.
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep22 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep47 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -11437,8 +11963,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // the residual Sigmoid_Double gap to libtorch.
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(tensor.Data);
-            var dstMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep23 = new KeepAliveScope(tensor);
+            var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep48 = new KeepAliveScope(result);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -11451,7 +11979,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(tensor.AsSpan(), result.AsWritableSpan());
+        using var tensorKeep17 = new KeepAliveScope(tensor);
+        using var resultKeep33 = new KeepAliveScope(result);
+        numOps.Sigmoid(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
 
         DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
         { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
@@ -11556,7 +12086,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var mem = AsFloatMemory(tensor.Data);
+            using var tensorDataKeep24 = new KeepAliveScope(tensor);
+            var mem = AsFloatMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
@@ -11567,7 +12098,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast-path — the SIMD kernel exists, the dispatch didn't.
         if (typeof(T) == typeof(double))
         {
-            var mem = AsDoubleMemory(tensor.Data);
+            using var tensorDataKeep25 = new KeepAliveScope(tensor);
+            var mem = AsDoubleMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             double* p = (double*)pin.Pointer;
 
@@ -11595,7 +12127,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep18 = new KeepAliveScope(tensor);
+        numOps.Sigmoid(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -11616,16 +12149,20 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep25 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep41 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, CpuSigmoidKernel.Execute);
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep26 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep42 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length, Simd.SimdKernels.SigmoidUnsafe);
@@ -11633,7 +12170,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep13 = new KeepAliveScope(input);
+            using var destinationKeep20 = new KeepAliveScope(destination);
+            numOps.Sigmoid(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -11687,7 +12226,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
-                var dstArr = resultS.GetDataArray();
+                using var dstArrLease = resultS.LeaseArray();
+                var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
@@ -11699,6 +12239,9 @@ public partial class CpuEngine : ITensorLevelEngine
             tensor = tensor.Contiguous();
         }
 
+        // The input is read through its raw array below: hold it to the end of the method so a recycled result buffer
+        // cannot be handed out from under the kernel. The result is returned, so it is alive across its writes.
+        using var keepInput = new KeepAliveScope(tensor);
         // RentUninitialized — ReLU writes every element, no need to zero
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         int length = tensor.Length;
@@ -11709,8 +12252,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // offset so views don't copy. JIT path stays for the small
             // cases that already hit it; large cases use the Vector256
             // 4× unrolled max(0, x) implementation.
-            var srcArr = (float[])(object)tensor._storage.GetDataArray();
-            var dstArr = (float[])(object)result._storage.GetDataArray();
+            var srcArr = (float[])(object)tensor._storage.GetDataArrayUnmarked();
+            var dstArr = (float[])(object)result._storage.GetDataArrayUnmarked();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
             int reluChunks = ElementwiseChunks(length);
             if (reluChunks >= 2)
@@ -11743,8 +12286,8 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house ReLU(double) via SimdKernels.ReLUUnsafe(double*).
-            var srcArr = (double[])(object)tensor._storage.GetDataArray();
-            var dstArr = (double[])(object)result._storage.GetDataArray();
+            var srcArr = (double[])(object)tensor._storage.GetDataArrayUnmarked();
+            var dstArr = (double[])(object)result._storage.GetDataArrayUnmarked();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
             fixed (double* pSrcFix = srcArr, pDstFix = dstArr)
             {
@@ -11754,7 +12297,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.ReLU(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep19 = new KeepAliveScope(tensor);
+            using var resultKeep34 = new KeepAliveScope(result);
+            numOps.ReLU(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("ReLU", result, tensor, BackwardFunctions<T>.ReLUBackward);
@@ -11860,7 +12405,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var mem = AsFloatMemory(tensor.Data);
+            using var tensorDataKeep26 = new KeepAliveScope(tensor);
+            var mem = AsFloatMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
@@ -11874,7 +12420,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // hottest activation (every Conv/Dense forward pass calls this).
         if (typeof(T) == typeof(double))
         {
-            var mem = AsDoubleMemory(tensor.Data);
+            using var tensorDataKeep27 = new KeepAliveScope(tensor);
+            var mem = AsDoubleMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             double* p = (double*)pin.Pointer;
 
@@ -11883,7 +12430,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep20 = new KeepAliveScope(tensor);
+        numOps.ReLU(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -11904,8 +12452,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep27 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep43 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -11914,8 +12464,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep28 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep44 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -11925,7 +12477,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.ReLU(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep14 = new KeepAliveScope(input);
+            using var destinationKeep21 = new KeepAliveScope(destination);
+            numOps.ReLU(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -12001,7 +12555,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
-                var dstArr = resultS.GetDataArray();
+                using var dstArrLease = resultS.LeaseArray();
+                var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
@@ -12026,8 +12581,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep28 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep49 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -12043,8 +12600,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house Vector256<double> GELU via FastExpDouble256-routed tanh, parallel-dispatched.
             // Was single-threaded — 1M-element double GELU now scales across all cores.
-            var srcMem = AsDoubleMemory(tensor.Data);
-            var dstMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep29 = new KeepAliveScope(tensor);
+            var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep50 = new KeepAliveScope(result);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -12054,7 +12613,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep21 = new KeepAliveScope(tensor);
+            using var resultKeep35 = new KeepAliveScope(result);
+            numOps.GELU(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("GELU", result, tensor, BackwardFunctions<T>.GELUBackward);
@@ -12093,7 +12654,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
                 var srcRaw = tensor._storage.GetDataArray();
-                var dstArr = resultS.GetDataArray();
+                using var dstArrLease = resultS.LeaseArray();
+                var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
@@ -12109,8 +12671,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep30 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep51 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -12120,7 +12684,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep22 = new KeepAliveScope(tensor);
+            using var resultKeep36 = new KeepAliveScope(result);
+            numOps.Mish(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Mish", result, tensor, BackwardFunctions<T>.MishBackward);
@@ -12168,8 +12734,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep31 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep52 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             unsafe
@@ -12184,7 +12752,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep23 = new KeepAliveScope(tensor);
+            using var resultKeep37 = new KeepAliveScope(result);
+            numOps.Swish(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Swish", result, tensor, BackwardFunctions<T>.SwishBackward);
@@ -12242,8 +12812,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep32 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep53 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 ELUDispatch((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)alpha);
@@ -12252,8 +12824,11 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // SIMD double ELU via the Span overload (no double unsafe-ptr variant in SimdKernels), chunked as the float path.
-            var srcMem = (ReadOnlyMemory<double>)AsDoubleMemory(tensor.Data);
-            var dstMem = AsDoubleMemory(result.Data);
+            // The memory feeds only the synchronous loop below; the scopes keep both tensors alive while it runs.
+            using var eluTensorKeep = new KeepAliveScope(tensor);
+            using var eluResultKeep = new KeepAliveScope(result);
+            var srcMem = (ReadOnlyMemory<double>)AsDoubleMemory(tensor.DataUnmarked);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
             int length = tensor.Length, numChunks = ElementwiseChunks(length);
             if (numChunks < 2) SimdKernels.ELU(srcMem.Span, alpha, dstMem.Span);
             else
@@ -12271,7 +12846,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
+            using var tensorKeep24 = new KeepAliveScope(tensor);
+            using var resultKeep38 = new KeepAliveScope(result);
+            numOps.ELU(tensor.AsSpanUnmarked(), numOps.FromDouble(alpha), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("ELU", result, tensor, BackwardFunctions<T>.ELUBackward, new object[] { alpha });
@@ -12287,15 +12864,19 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep29 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep45 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, (float)alpha);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ELU(input.AsSpan(), numOps.FromDouble(alpha), destination.AsWritableSpan());
+        using var inputKeep15 = new KeepAliveScope(input);
+        using var destinationKeep22 = new KeepAliveScope(destination);
+        numOps.ELU(input.AsSpanUnmarked(), numOps.FromDouble(alpha), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -12344,8 +12925,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             float alphaF = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref alpha);
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep34 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep55 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -12376,7 +12959,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
+            using var tensorKeep25 = new KeepAliveScope(tensor);
+            using var resultKeep39 = new KeepAliveScope(result);
+            numOps.LeakyReLU(tensor.AsSpanUnmarked(), alpha, result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("LeakyReLU", result, tensor, BackwardFunctions<T>.LeakyReLUBackward, new object[] { negSlope });
@@ -12946,10 +13531,32 @@ public partial class CpuEngine : ITensorLevelEngine
         // Return a contiguous transposed copy for API compatibility.
         // The lazy graph path uses a more efficient execute delegate.
         Tensor<T> result;
-        using (DifferentiableOps.SuppressTensorViewRecording())
+#if NET5_0_OR_GREATER
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
         {
-            var view = tensor.Transpose();
-            result = view.Contiguous();
+            // Tiled SIMD transpose into a pooled result. Contiguous() of the strided view copied element by element
+            // (5.9 ms for 1024x1024 float) and read the source through a raw accessor, which kept large results from
+            // being recycled.
+            int rows = tensor._shape[0], cols = tensor._shape[1];
+            var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            result = TensorAllocator.RentUninitialized<T>(new[] { cols, rows });
+            using var sourceKeep = new KeepAliveScope(source);
+            using var resultKeep = new KeepAliveScope(result);
+            if (typeof(T) == typeof(float))
+                SimdTranspose.Transpose(
+                    ((Tensor<float>)(object)source).AsSpanUnmarked(), ((Tensor<float>)(object)result).AsWritableSpanUnmarked(), rows, cols);
+            else
+                SimdTranspose.Transpose(
+                    ((Tensor<double>)(object)source).AsSpanUnmarked(), ((Tensor<double>)(object)result).AsWritableSpanUnmarked(), rows, cols);
+        }
+        else
+#endif
+        {
+            using (DifferentiableOps.SuppressTensorViewRecording())
+            {
+                var view = tensor.Transpose();
+                result = view.Contiguous();
+            }
         }
         DifferentiableOps.RecordUnary("TensorTranspose", result, tensor, BackwardFunctions<T>.TransposeBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorTranspose", result, eng => eng.TensorTranspose(c)); }
@@ -13360,9 +13967,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // contract, which both allocates on every replay and gives the cached-B GEMM path a
         // different array identity on every call. Logical spans address pooled padding safely
         // without materializing an intermediate array.
-        ReadOnlySpan<float> aSpan = a.AsSpan();
-        ReadOnlySpan<float> bSpan = b.AsSpan();
-        Span<float> outputSpan = output.AsWritableSpan();
+        using var aSpanLease = a.Lease();
+        ReadOnlySpan<float> aSpan = aSpanLease.Span;
+        using var bSpanLease = b.Lease();
+        ReadOnlySpan<float> bSpan = bSpanLease.Span;
+        using var outputSpanLease = output.LeaseWritable();
+        Span<float> outputSpan = outputSpanLease.Span;
         float[]? liveB = b.GetReadOnlyLiveBackingArrayAllowingPaddingOrNull();
 
         // 2D × 2D — route through cached-B path (Path A: pre-pack weights)
@@ -13593,6 +14203,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // RentUninitialized: BLAS GEMM with beta=0 overwrites every element
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, p });
+        // The inputs are read through raw arrays and spans below: hold both to the end of the method so a recycled result
+        // buffer cannot be handed out from under the kernel. The result is returned, so it is alive across its writes.
+        using var keepA = new KeepAliveScope(a);
+        using var keepB = new KeepAliveScope(b);
 
 #if NET5_0_OR_GREATER
         // A streamed inference weight is stored in the quantized kernel layout [P,N]
@@ -13626,9 +14240,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (typeof(T) == typeof(float))
                 {
-                    var aArr = (float[])(object)a.GetReadOnlyDataArray();
-                    var bArr = (float[])(object)b.GetReadOnlyDataArray();
-                    var rArr = (float[])(object)result.GetDataArray();
+                    var aArr = (float[])(object)a.GetReadOnlyDataArrayUnmarked();
+                    var bArr = (float[])(object)b.GetReadOnlyDataArrayUnmarked();
+                    var rArr = (float[])(object)result.GetDataArrayUnmarked();
                     var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = handle };
                     Engines.BlasManaged.BlasManaged.Gemm<float>(
                         aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
@@ -13636,9 +14250,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    var aArr = (double[])(object)a.GetReadOnlyDataArray();
-                    var bArr = (double[])(object)b.GetReadOnlyDataArray();
-                    var rArr = (double[])(object)result.GetDataArray();
+                    var aArr = (double[])(object)a.GetReadOnlyDataArrayUnmarked();
+                    var bArr = (double[])(object)b.GetReadOnlyDataArrayUnmarked();
+                    var rArr = (double[])(object)result.GetDataArrayUnmarked();
                     var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = handle };
                     Engines.BlasManaged.BlasManaged.Gemm<double>(
                         aArr, n, false, bArr, p, false, rArr, p, m, p, n, opts);
@@ -13661,9 +14275,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Our JIT'd AVX2 GEMM (opt-in). C[m,p] = A[m,n]·B[n,p] ⇒ TryMultiply(M=m,N=p,K=n).
         if (_jitGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
-            var aJ = (float[])(object)a.GetReadOnlyDataArray();
-            var bJ = (float[])(object)b.GetReadOnlyDataArray();
-            var rJ = (float[])(object)result.GetDataArray();
+            var aJ = (float[])(object)a.GetReadOnlyDataArrayUnmarked();
+            var bJ = (float[])(object)b.GetReadOnlyDataArrayUnmarked();
+            var rJ = (float[])(object)result.GetDataArrayUnmarked();
             if (Simd.JitGemmAvx2.TryMultiply(aJ.AsSpan(0, m * n), bJ.AsSpan(0, n * p), rJ.AsSpan(0, m * p), m, p, n))
                 return result;
         }
@@ -13673,9 +14287,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // is unavailable (TrySgemm returns false without mutating C).
         if (_oneDnnGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
-            var aArrO = (float[])(object)a.GetReadOnlyDataArray();
-            var bArrO = (float[])(object)b.GetReadOnlyDataArray();
-            var rArrO = (float[])(object)result.GetDataArray();
+            var aArrO = (float[])(object)a.GetReadOnlyDataArrayUnmarked();
+            var bArrO = (float[])(object)b.GetReadOnlyDataArrayUnmarked();
+            var rArrO = (float[])(object)result.GetDataArrayUnmarked();
             unsafe
             {
                 fixed (float* pA = aArrO, pB = bArrO, pC = rArrO)
@@ -13696,9 +14310,9 @@ public partial class CpuEngine : ITensorLevelEngine
             // costing 1.61x through this wrapper vs the direct kernel (measured --ab-shortm: engine 184 vs
             // direct 296 GF with a GPU present; 377 vs 329 = no penalty with the copy gone). AsSpan is a no-op
             // on genuinely CPU-resident data and skips the per-call snapshot on CPU-resident-but-GPU-tagged.
-            var aArrF = ((Tensor<float>)(object)a).AsSpan();
-            var bArrF = ((Tensor<float>)(object)b).AsSpan();
-            var rArrF = (float[])(object)result.GetDataArray();
+            var aArrF = ((Tensor<float>)(object)a).AsSpanUnmarked();
+            var bArrF = ((Tensor<float>)(object)b).AsSpanUnmarked();
+            var rArrF = (float[])(object)result.GetDataArrayUnmarked();
             // #573 follow-up: above a row-count floor, route through BlasManaged.Gemm (the same
             // dispatcher the pre-packed path above uses) instead of the legacy full-trans
             // SimdGemm.Sgemm overload. With NO PackedB handle it still packs B fresh every call
@@ -13755,7 +14369,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // MatrixMultiplyHelper.MultiplyBlocked accumulates (c += a·b) and does
         // NOT clear the destination. Pre-clear result here so the accumulation
         // starts from zero and we get matmul (c = a·b), not c += a·b.
-        result.AsWritableSpan().Clear();
+        result.AsWritableSpanUnmarked().Clear();
         MatrixMultiplyHelper.MultiplyBlocked(
             numOps, a.ReadOnlyData, b.ReadOnlyData, result.Data, m, n, p, n, p, p);
 
@@ -13780,7 +14394,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (q8 is not null && q8.Rows == outputColumns && q8.K == k)
         {
             var input = (float[])(object)a.GetReadOnlyDataArray();
-            var output = (float[])(object)result.GetDataArray();
+            using var outputLease = result.LeaseArray();
+            var output = (float[])(object)outputLease.Array;
             Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
                 input, q8.Data, q8.Scales, output, rows, k, outputColumns);
             return true;
@@ -13790,7 +14405,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (q4 is not null && q4.Rows == outputColumns && q4.K == k)
         {
             var input = (float[])(object)a.GetReadOnlyDataArray();
-            var output = (float[])(object)result.GetDataArray();
+            using var outputLease = result.LeaseArray();
+            var output = (float[])(object)outputLease.Array;
             Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
                 input, q4.Data, q4.GroupScales, q4.GroupSize,
                 output, rows, k, outputColumns);
@@ -13845,7 +14461,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = (float[])(object)a.GetReadOnlyDataArray();
             var bArr = (float[])(object)b.GetReadOnlyDataArray();
-            var rArr = (float[])(object)result.GetDataArray();
+            using var rArrLease = result.LeaseArray();
+            var rArr = (float[])(object)rArrLease.Array;
             var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = prePackedB };
             Engines.BlasManaged.BlasManaged.Gemm<float>(
                 aArr, k, false, bArr, n, false, rArr, n, m, n, k, opts);
@@ -13855,7 +14472,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aArr = (double[])(object)a.GetReadOnlyDataArray();
             var bArr = (double[])(object)b.GetReadOnlyDataArray();
-            var rArr = (double[])(object)result.GetDataArray();
+            using var rArrLease = result.LeaseArray();
+            var rArr = (double[])(object)rArrLease.Array;
             var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = prePackedB };
             Engines.BlasManaged.BlasManaged.Gemm<double>(
                 aArr, k, false, bArr, n, false, rArr, n, m, n, k, opts);
@@ -14120,7 +14738,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // the slice since MultiplyBlocked accumulates. allowParallel:false
             // because we're already inside a Parallel.For over batch — letting
             // MultiplyBlocked spawn a second tier would oversubscribe.
-            result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
+            using var resultDataKeep56 = new KeepAliveScope(result);
+            result.DataUnmarked.Span.Slice(resultOffset, matrixSizeResult).Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
                 numOps, aData, bData, result.Data,
                 m, n, p, n, p, p,
@@ -14179,7 +14798,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var aData = a.GetReadOnlyDataArray();
         var bData = b.GetReadOnlyDataArray();
-        var rData = result.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
 
         // Phase 2D BERT-attention fix: for float, bypass
         // MatrixMultiplyHelper.TryGemm's per-slice validation + memory
@@ -14266,7 +14886,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // SIMD-blocked fallback (see TensorMatMul2D for rationale). Pre-zero
             // the slice since MultiplyBlocked accumulates. allowParallel:false
             // because we're already inside a Parallel.For over batch.
-            result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
+            using var resultDataKeep57 = new KeepAliveScope(result);
+            result.DataUnmarked.Span.Slice(resultOffset, matrixSizeResult).Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
                 numOps, aData, bData, result.Data,
                 m, n, p, n, p, p,
@@ -14375,7 +14996,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = preAllocatedOutput ?? TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
-        var outputData = result.GetDataArray();
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         // NCHWc fast path: when the caller pre-reordered input + kernel into
         // channel-packed layout (input.Layout == Nchwc8 and kernel's
@@ -15545,8 +16167,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback for non-float, non-double types
         var gradInput = new T[batch * inChannels * height * width];
-        var gradOutputData = gradOutput.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, gradInput.Length, idx =>
         {
@@ -15962,7 +16586,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+                using var tmpKeep1 = new KeepAliveScope(tmp);
+                using var destKeep1 = new KeepAliveScope(dest);
+                tmp.AsSpanUnmarked().CopyTo(dest.AsWritableSpanUnmarked());
             }
         }
         finally
@@ -16730,8 +17356,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback for non-float, non-double types
         var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, gradKernel.Length, idx =>
         {
@@ -17230,7 +17858,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+                using var tmpKeep2 = new KeepAliveScope(tmp);
+                using var destKeep2 = new KeepAliveScope(dest);
+                tmp.AsSpanUnmarked().CopyTo(dest.AsWritableSpanUnmarked());
             }
         }
         finally
@@ -17326,7 +17956,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var indices = new int[batch, channels, outputHeight, outputWidth, 2];
 
         var inputData = input.GetFlattenedData();
-        var outputData = result.GetDataArray();
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
@@ -17542,7 +18173,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
-        var gradInputData = result.GetDataArray();
+        using var gradInputDataLease = result.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
         var gradOutputData = gradOutput.GetFlattenedData();
 
         // Parallelize over (batch, channel) pairs. Each (b,c) scatters only into the
@@ -17642,7 +18274,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
-        var gradIn = result.GetDataArray();
+        using var gradInLease = result.LeaseArray();
+        var gradIn = gradInLease.Array;
         for (int i = 0; i < result.Length; i++) gradIn[i] = numOps.Zero;
         var gradOut = gradOutput.GetFlattenedData();
         var flatIndices = maxIndices.GetFlattenedData();
@@ -17838,7 +18471,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(outputShape);
         var indices = new int[result.Length];
         var inData = source.GetFlattenedData();
-        var outData = result.GetDataArray();
+        using var outDataLease = result.LeaseArray();
+        var outData = outDataLease.Array;
         int planeSize = height * width, outPlane = outputHeight * outputWidth;
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, p =>
         {
@@ -18009,7 +18643,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputWidth = gradOutput._shape[3];
 
         var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
-        var gradInputData = result.GetDataArray();
+        using var gradInputDataLease = result.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
         var gradOutputData = gradOutput.GetFlattenedData();
 
         // Each output cell spreads its gradient over the input cells its window READ (padded cells were never
@@ -19018,9 +19653,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Output length {output.Length} does not match expected {expectedOutLen} for shape [{batch},{outChannels},{outputHeight},{outputWidth}].",
                 nameof(output));
 
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var outputData = output.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         // BLAS GEMM + Col2Im fast path — TryConvTranspose2DWithGemm zeros its
         // output slice via Array.Clear (Im2ColHelper.cs:1185) before accumulating,
@@ -19116,7 +19754,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic numOps fallback: delegate to allocating ConvTranspose2D + copy.
         // Non-float/non-double T is a rare niche; the alloc-and-copy is acceptable here.
         var allocated = ConvTranspose2D(input, kernel, stride, padding, outputPadding);
-        allocated.AsSpan().CopyTo(output.AsWritableSpan());
+        using var allocatedKeep1 = new KeepAliveScope(allocated);
+        using var outputKeep4 = new KeepAliveScope(output);
+        allocated.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -19305,11 +19945,15 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
-        var outputData = result.GetDataArray();
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         // Parallel over batch * outChannels for maximum parallelism
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, result.Length, idx =>
@@ -19525,12 +20169,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int maskChans = numKernelPositions * deformGroups;
         var numOps = MathHelper.GetNumericOperations<T>();
 
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
-        var outputData = result.GetDataArray();
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, result.Length, idx =>
         {
@@ -19733,11 +20381,15 @@ public partial class CpuEngine : ITensorLevelEngine
         int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
 
         var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
-        var gradInputData = gradInput.GetDataArray();
+        using var gradInputDataLease = gradInput.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
         Array.Clear(gradInputData, 0, (int)gradInput.Length);
-        var gradOutputData = gradOutput.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
 
         // Parallelize over (batch, inChannel): each work item owns gradInput[b, icGlobal, :, :]
@@ -19812,11 +20464,15 @@ public partial class CpuEngine : ITensorLevelEngine
         int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
 
         var gradKernel = AutoTensorCache.RentOrAllocate<T>(kernelShape);
-        var gradKernelData = gradKernel.GetDataArray();
+        using var gradKernelDataLease = gradKernel.LeaseArray();
+        var gradKernelData = gradKernelDataLease.Array;
         Array.Clear(gradKernelData, 0, (int)gradKernel.Length);
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
 
         // Parallelize over output channels: each oc owns disjoint kernel rows -> no locks needed.
@@ -19894,12 +20550,17 @@ public partial class CpuEngine : ITensorLevelEngine
         int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
 
         var gradOffset = AutoTensorCache.RentOrAllocate<T>(offset._shape);
-        var gradOffsetData = gradOffset.GetDataArray();
+        using var gradOffsetDataLease = gradOffset.LeaseArray();
+        var gradOffsetData = gradOffsetDataLease.Array;
         Array.Clear(gradOffsetData, 0, (int)gradOffset.Length);
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
 
         // Parallelize over (batch, deformGroup): each owns a disjoint offset block -> no locks.
@@ -19985,12 +20646,17 @@ public partial class CpuEngine : ITensorLevelEngine
         int offChans = 2 * numKernelPositions * deformGroups, maskChans = numKernelPositions * deformGroups;
 
         var gradMask = AutoTensorCache.RentOrAllocate<T>(mask._shape);
-        var gradMaskData = gradMask.GetDataArray();
+        using var gradMaskDataLease = gradMask.LeaseArray();
+        var gradMaskData = gradMaskDataLease.Array;
         Array.Clear(gradMaskData, 0, (int)gradMask.Length);
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
 
         // Parallelize over (batch, deformGroup): each owns a disjoint mask block -> no locks.
         CpuParallelSettings.ParallelForOrSerial(0, batch * deformGroups,
@@ -20205,10 +20871,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
-        var gradInputData = gradInput.GetDataArray();
-        var gradOutputData = gradOutput.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradInputDataLease = gradInput.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
 
         // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
@@ -20486,10 +21156,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradKernel = AutoTensorCache.RentOrAllocate<T>(kernelShape);
-        var gradKernelData = gradKernel.GetDataArray();
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradKernelDataLease = gradKernel.LeaseArray();
+        var gradKernelData = gradKernelDataLease.Array;
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
 
         // Striped lock pool (no per-call allocation) — see _deformScatterLocks.
@@ -20620,11 +21294,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int numKernelPositions = kernelHeight * kernelWidth;
 
         var gradOffset = AutoTensorCache.RentOrAllocate<T>(offset._shape);
-        var gradOffsetData = gradOffset.GetDataArray();
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradOffsetDataLease = gradOffset.LeaseArray();
+        var gradOffsetData = gradOffsetDataLease.Array;
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
         var maskData = mask?.GetDataArray();
 
         CpuParallelSettings.ParallelForOrSerial(0, batch,
@@ -21059,11 +21738,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Mask shape: [batch, kernel_h*kernel_w, out_h, out_w]
         var gradMask = TensorAllocator.Rent<T>([batch, numKernelPositions, outputHeight, outputWidth]);
-        var gradMaskData = gradMask.GetDataArray();
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
-        var offsetData = offset.GetDataArray();
+        using var gradMaskDataLease = gradMask.LeaseArray();
+        var gradMaskData = gradMaskDataLease.Array;
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
+        using var offsetDataLease = offset.LeaseArray();
+        var offsetData = offsetDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch,
             (long)batch * outChannels * outputHeight * outputWidth, b =>
@@ -21158,9 +21842,12 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[2]},{gradOutput._shape[3]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
 
         var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
-        var gradInputData = gradInput.GetDataArray();
-        var gradOutputData = gradOutput.GetDataArray();
-        var gridData = grid.GetDataArray();
+        using var gradInputDataLease = gradInput.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var gridDataLease = grid.LeaseArray();
+        var gridData = gridDataLease.Array;
         for (int i = 0; i < gradInput.Length; i++) gradInputData[i] = numOps.Zero;
 
         // Parallel over batch — each task writes a DISJOINT gradInput[b] slice (NCHW), so no locks.
@@ -21242,10 +21929,14 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"gradOutput spatial dims [{gradOutput._shape[2]},{gradOutput._shape[3]}] must match grid spatial dims [{outHeight},{outWidth}].", nameof(gradOutput));
 
         var gradGrid = AutoTensorCache.RentOrAllocate<T>(grid._shape);
-        var gradGridData = gradGrid.GetDataArray();
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var gridData = grid.GetDataArray();
+        using var gradGridDataLease = gradGrid.LeaseArray();
+        var gradGridData = gradGridDataLease.Array;
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var gridDataLease = grid.LeaseArray();
+        var gridData = gridDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch, gradOutput.Length, b =>
         {
@@ -21408,7 +22099,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputDepth, outputHeight, outputWidth]);
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
-        var outputData = result.GetDataArray();
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         // Parallel over batch * outChannels for maximum parallelism
         CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, result.Length, idx =>
@@ -21532,7 +22224,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var kernelData = kernel.GetReadOnlyDataArray();
             allocatedResult = TensorAllocator.Rent<T>(
                 [batch, outChannels, outputDepth, outputHeight, outputWidth]);
-            var outputData = allocatedResult.GetDataArray();
+            using var outputDataLease = allocatedResult.LeaseArray();
+            var outputData = outputDataLease.Array;
             result = allocatedResult;
 
             for (int rowStart = 0; rowStart < rows; rowStart += tileCapacity)
@@ -21670,8 +22363,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var gradInputData = new T[batch * inChannels * depth * height * width];
-        var gradOutputData = gradOutput.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var kernelDataLease = kernel.LeaseArray();
+        var kernelData = kernelDataLease.Array;
 
         // Primitive fast paths for float/double. Parallel over (batch, inChannels)
         // pairs — each pair owns a disjoint gradInput slice, so direct writes
@@ -21880,8 +22575,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var gradKernelData = new T[outChannels * inChannels * kernelDepth * kernelHeight * kernelWidth];
-        var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
 
         // Primitive fast paths — each (oc, ic) pair owns a disjoint kernel slice.
         if (typeof(T) == typeof(float))
@@ -22477,8 +23174,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.GetDataArray();
-        var outputData = result.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         // Parallel over batch * channels
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
@@ -22564,7 +23263,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
         var inputData = input.GetFlattenedData();
-        var outputData = result.GetDataArray();
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
         var localMaxIndices = new int[batch, channels, outputDepth, outputHeight, outputWidth, 3];
 
         // Parallel over batch * channels
@@ -22754,7 +23454,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputDepth = gradOutput._shape[2];
         int outputHeight = gradOutput._shape[3];
         int outputWidth = gradOutput._shape[4];
-        var flatIndices = maxIndices.GetDataArray();
+        using var flatIndicesLease = maxIndices.LeaseArray();
+        var flatIndices = flatIndicesLease.Array;
         var coordinateIndices = new int[batch, channels, outputDepth, outputHeight, outputWidth, 3];
         int flat = 0;
         for (int b = 0; b < batch; b++)
@@ -22865,8 +23566,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputDepth, outputHeight, outputWidth]);
-        var inputData = input.GetDataArray();
-        var outputData = result.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var outputDataLease = result.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         // Parallel over batch * channels
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
@@ -23453,8 +24156,10 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("LocallyConnectedConv2D", input._shape); if (ac is not null) return ac.Execute(); }
 
         var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
-        var inputData = input.GetDataArray();
-        var weightsData = weights.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var weightsDataLease = weights.LeaseArray();
+        var weightsData = weightsDataLease.Array;
         var biasData = bias?.GetDataArray();
 
         CpuParallelSettings.ParallelForOrSerial(0, batch,
@@ -23738,8 +24443,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
             var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-            using var pinIn = input.Data.Pin();
-            using var pinOut = result.Data.Pin();
+            using var inputDataKeep30 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var resultDataKeep58 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
             unsafe
             {
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
@@ -23755,8 +24462,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
             var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-            using var pinIn = input.Data.Pin();
-            using var pinOut = result.Data.Pin();
+            using var inputDataKeep31 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var resultDataKeep59 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
             unsafe
             {
                 double* pIn = (double*)pinIn.Pointer;
@@ -23800,7 +24509,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
         var result2 = AutoTensorCache.RentOrAllocate<T>(input._shape);
-        var outputDataGeneric = result2.GetDataArray();
+        using var outputDataGenericLease = result2.LeaseArray();
+        var outputDataGeneric = outputDataGenericLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
@@ -24361,7 +25071,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Hard mode: create one-hot and use straight-through estimator
-        var softData = softResult.GetDataArray();
+        using var softDataLease = softResult.LeaseArray();
+        var softData = softDataLease.Array;
         var hardData = new T[softResult.Length];
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
@@ -24611,7 +25322,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var gradOutputData = gradOutput.GetFlattenedData();
         var inputData = input.GetFlattenedData();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         var shape = output._shape;
         var gradInputData = new T[output.Length];
 
@@ -24767,7 +25479,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = rank + axis;
 
         var gradOutputData = gradOutput.GetFlattenedData();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         var shape = output._shape;
         var gradInputData = new T[output.Length];
 
@@ -24930,7 +25643,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Get softmax gradient with respect to normalized input
         var normalizedTensor = TensorAllocator.Rent<T>(shape, normalizedData);
         var softmaxGrad = SoftmaxBackward(gradOutput, output, axis);
-        var softmaxGradData = softmaxGrad.GetDataArray();
+        using var softmaxGradDataLease = softmaxGrad.LeaseArray();
+        var softmaxGradData = softmaxGradDataLease.Array;
 
         // Chain rule through L2 normalization
         var gradInputData = new T[input.Length];
@@ -24970,9 +25684,12 @@ public partial class CpuEngine : ITensorLevelEngine
     private static Tensor<T> BatchStatisticOutput<T>(
         LazyTensorScope scope, Tensor<T> batchNormOutput, Tensor<T> refreshedStatistic, string opName)
     {
+        using var refreshedStatisticKeep1 = new KeepAliveScope(refreshedStatistic);
         var statistic = scope.RecordUnary(LazyNodeType.Custom, opName, batchNormOutput, refreshedStatistic._shape,
-            (eng, output) => refreshedStatistic.AsSpan().CopyTo(output.AsWritableSpan()));
-        refreshedStatistic.AsSpan().CopyTo(statistic.AsWritableSpan());
+            (eng, output) => refreshedStatistic.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked()));
+        using var refreshedStatisticKeep2 = new KeepAliveScope(refreshedStatistic);
+        using var statisticKeep1 = new KeepAliveScope(statistic);
+        refreshedStatistic.AsSpanUnmarked().CopyTo(statistic.AsWritableSpanUnmarked());
         return statistic;
     }
 
@@ -25063,7 +25780,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep1 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep1 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 Helpers.TensorAllocator.Return(eagerResult);
                 // Hand the batch statistics out as outputs OF this node. The replay above refreshes capturedMean /
                 // capturedVar as a side effect the plan cannot see, so a consumer reading them directly - the
@@ -25871,11 +26590,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int features = input._shape[1];
         T batchT = numOps.FromDouble(batch);
 
-        var gradOutputData = gradOutput.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
         var inputData = input.GetFlattenedData();
         var gammaData = gamma.GetReadOnlyDataArray();
-        var meanData = mean.GetDataArray();
-        var varData = variance.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
+        using var varDataLease = variance.LeaseArray();
+        var varData = varDataLease.Array;
 
         var gradGammaData = new T[features];
         var gradBetaData = new T[features];
@@ -26030,11 +26752,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int elementsPerChannel = batch * spatialSize;
         T elementsT = numOps.FromDouble(elementsPerChannel);
 
-        var gradOutputData = gradOutput.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
         var inputData = input.GetReadOnlyDataArray();
         var gammaData = gamma.GetReadOnlyDataArray();
-        var meanData = mean.GetDataArray();
-        var varData = variance.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
+        using var varDataLease = variance.LeaseArray();
+        var varData = varDataLease.Array;
 
         // Float fast path: direct float arithmetic avoids numOps virtual dispatch (4-8x faster)
         if (typeof(T) == typeof(float)
@@ -26418,11 +27143,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int spatialSize = height * width;
         T spatialT = numOps.FromDouble(spatialSize);
 
-        var gradOutputData = gradOutput.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
         var inputData = input.GetReadOnlyDataArray();
         var gammaData = gamma.GetReadOnlyDataArray();
-        var meanData = mean.GetDataArray();
-        var varData = variance.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
+        using var varDataLease = variance.LeaseArray();
+        var varData = varDataLease.Array;
 
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
@@ -26584,7 +27312,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         stateRef.Variance = freshVar;
                     },
                     BackwardFunctions<T>.LayerNormBackward, new object[] { stateRef, stateRef, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep2 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep2 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -26658,14 +27388,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Rent uninitialized output tensor — skips Array.Clear.
             var lnResultF = TensorAllocator.RentUninitialized<float>(input._shape);
-            var fOutput = lnResultF.GetDataArray();
+            using var fOutputLease = lnResultF.LeaseArray();
+            var fOutput = fOutputLease.Array;
             // Mean/variance are always returned as out params. They're
             // consumed by the backward pass; for inference the tensors are
             // thrown away but we still have to produce them. Use
             // RentUninitialized + direct write (small — batchSize floats).
             var meanTensorF = TensorAllocator.RentUninitialized<float>(batchShape);
             var varTensorF  = TensorAllocator.RentUninitialized<float>(batchShape);
-            var fMean = meanTensorF.GetDataArray();
+            using var fMeanLease = meanTensorF.LeaseArray();
+            var fMean = fMeanLease.Array;
             var fVar  = varTensorF .GetDataArray();
 
             ProcessBatchesSimd(fInput, fGamma, fBeta, fOutput, fMean, fVar,
@@ -26819,7 +27551,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var fInput  = input .GetReadOnlyDataArray();
         var fGamma  = gamma .GetReadOnlyDataArray();
         var fBeta   = beta  .GetReadOnlyDataArray();
-        var fOutput = output.GetDataArray();
+        using var fOutputLease = output.LeaseArray();
+        var fOutput = fOutputLease.Array;
         float fEps = (float)epsilon;
 
         var fMean = System.Buffers.ArrayPool<float>.Shared.Rent(batchSize);
@@ -26897,7 +27630,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var fInput = (float[])(object)input.GetReadOnlyDataArray();
             var fGamma = (float[])(object)gamma.GetReadOnlyDataArray();
             var fBeta = (float[])(object)beta.GetReadOnlyDataArray();
-            var fOutput = (float[])(object)destination.GetDataArray();
+            using var fOutputLease = destination.LeaseArray();
+            var fOutput = (float[])(object)fOutputLease.Array;
             var fMean = ArrayPool<float>.Shared.Rent(Math.Max(1, batchSize));
             var fVar = ArrayPool<float>.Shared.Rent(Math.Max(1, batchSize));
             try
@@ -26917,7 +27651,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             result = LayerNorm(input, gamma, beta, epsilon, out _, out _);
         }
-        result.AsSpan().CopyTo(destination.AsWritableSpan());
+        using var resultKeep40 = new KeepAliveScope(result);
+        using var destinationKeep23 = new KeepAliveScope(destination);
+        result.AsSpanUnmarked().CopyTo(destination.AsWritableSpanUnmarked());
     }
     [MethodImpl(Hot)]
     private static void ProcessBatchesSimd(
@@ -27412,8 +28148,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetFlattenedData();
         var inputData = input.GetFlattenedData();
         var gammaData = gamma.GetFlattenedData();
-        var meanData = mean.GetDataArray();
-        var varData = variance.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
+        using var varDataLease = variance.LeaseArray();
+        var varData = varDataLease.Array;
 
         // Issue #319 Phase 4: rent from the tensor pool instead of
         // allocating fresh T[] per call. gradGamma/gradBeta are
@@ -27426,9 +28164,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradGammaTensor = TensorAllocator.Rent<T>(gamma._shape);
         var gradBetaTensor = TensorAllocator.Rent<T>(gamma._shape);
         var gradInputTensor = TensorAllocator.RentUninitialized<T>(input._shape);
-        var gradGammaData = gradGammaTensor.GetDataArray();
-        var gradBetaData = gradBetaTensor.GetDataArray();
-        var gradInputData = gradInputTensor.GetDataArray();
+        using var gradGammaDataLease = gradGammaTensor.LeaseArray();
+        var gradGammaData = gradGammaDataLease.Array;
+        using var gradBetaDataLease = gradBetaTensor.LeaseArray();
+        var gradBetaData = gradBetaDataLease.Array;
+        using var gradInputDataLease = gradInputTensor.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
 
         // ────────────────────────────────────────────────────────────────────
         // Primitive fast paths: direct array access, no INumericOperations<T>
@@ -27455,39 +28196,10 @@ public partial class CpuEngine : ITensorLevelEngine
             float featureSizeF = fs;
             float invFeatureSizeF = 1f / featureSizeF;
 
-            // gradGamma / gradBeta: sum across batches. Left sequential to avoid
-            // cross-thread contention on the [featureSize] accumulators. For
-            // typical transformer LN (featureSize ≈ hidden dim ≈ 768–4096 and
-            // batchSize × seq ≈ 1k–4k), the sequential pass is memory-bound, not
-            // compute-bound, so threading doesn't help.
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
-                float m = fMean[b];
-                int f = 0;
-#if NET5_0_OR_GREATER
-                if (Vector256.IsHardwareAccelerated && fs >= 8)
-                {
-                    var vM = Vector256.Create(m);
-                    var vInvStd = Vector256.Create(invStd);
-                    for (; f + 8 <= fs; f += 8)
-                    {
-                        var go = Vector256.LoadUnsafe(ref fGradOut[off + f]);
-                        var norm = (Vector256.LoadUnsafe(ref fInput[off + f]) - vM) * vInvStd;
-                        (Vector256.LoadUnsafe(ref fGradGamma[f]) + go * norm).StoreUnsafe(ref fGradGamma[f]);
-                        (Vector256.LoadUnsafe(ref fGradBeta[f]) + go).StoreUnsafe(ref fGradBeta[f]);
-                    }
-                }
-#endif
-                for (; f < fs; f++)
-                {
-                    float go = fGradOut[off + f];
-                    float normalized = (fInput[off + f] - m) * invStd;
-                    fGradGamma[f] += go * normalized;
-                    fGradBeta[f] += go;
-                }
-            }
+            // gradGamma / gradBeta: sum across batches, split into feature-column ranges (each accumulated over the
+            // rows in order, so bit-identical to the whole-width loop at any thread count). One core cannot pull the
+            // memory bandwidth this pass needs; the serial loop left the rest of the machine idle.
+            LayerNormBackwardFloatAccumGammaBeta(fGradOut, fInput, fMean, fVar, fGradGamma, fGradBeta, batchSize, fs, fEps);
 
             // gradInput: per-batch two-pass (sum reductions, then per-element).
             // Safe to parallelize over batches since each batch writes to a
@@ -27798,6 +28510,213 @@ public partial class CpuEngine : ITensorLevelEngine
             output[off + f] = gamma[f] * ((input[off + f] - mS) * invStdS) + beta[f];
     }
 
+    // Rows per partial in the norm-backward gamma/beta accumulations. Each work item accumulates a fixed block of whole
+    // rows (contiguous reads across every column -- column strips read a sliver of each page and starved the
+    // prefetcher) into its own partial, and the partials are then summed per column in block order. The blocking does
+    // not depend on the thread count, so the result is bit-identical at any degree of parallelism; at or below one
+    // block it is the plain serial loop.
+    private const int NormRowBlock = 128;
+
+    private static void LayerNormBackwardFloatAccumGammaBeta(
+        float[] gradOut, float[] input, float[] mean, float[] variance,
+        float[] gradGamma, float[] gradBeta,
+        int rows, int fs, float eps)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1)
+        {
+            LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, gradGamma, 0, gradBeta, 0, 0, rows, fs, eps);
+            return;
+        }
+        var partial = System.Buffers.ArrayPool<float>.Shared.Rent(2 * blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                int gOff = blk * fs, bOff = (blocks + blk) * fs;
+                Array.Clear(partial, gOff, fs);
+                Array.Clear(partial, bOff, fs);
+                LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, partial, gOff, partial, bOff,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs, eps);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+            AccumulateAxisRows(partial, blocks * fs, fs, blocks, gradBeta, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(partial);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void LayerNormBackwardFloatAccumGammaBetaRows(
+        float[] gradOut, float[] input, float[] mean, float[] variance,
+        float[] gAcc, int gOff, float[] bAcc, int bOff,
+        int r0, int r1, int fs, float eps)
+    {
+        for (int b = r0; b < r1; b++)
+        {
+            int off = b * fs;
+            float invStd = 1f / MathF.Sqrt(variance[b] + eps);
+            float m = mean[b];
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= 8)
+            {
+                var vM = Vector256.Create(m);
+                var vInvStd = Vector256.Create(invStd);
+                for (; f + 8 <= fs; f += 8)
+                {
+                    var go = Vector256.LoadUnsafe(ref gradOut[off + f]);
+                    var norm = (Vector256.LoadUnsafe(ref input[off + f]) - vM) * vInvStd;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + go * norm).StoreUnsafe(ref gAcc[gOff + f]);
+                    (Vector256.LoadUnsafe(ref bAcc[bOff + f]) + go).StoreUnsafe(ref bAcc[bOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
+            {
+                float go = gradOut[off + f];
+                float normalized = (input[off + f] - m) * invStd;
+                gAcc[gOff + f] += go * normalized;
+                bAcc[bOff + f] += go;
+            }
+        }
+    }
+
+    private static void RmsNormBackwardAccumGamma(float[] gradOut, float[] input, float[] rms, float[] gradGamma, int rows, int fs)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1) { RmsNormBackwardAccumGammaRows(gradOut, input, rms, gradGamma, 0, 0, rows, fs); return; }
+        var partial = System.Buffers.ArrayPool<float>.Shared.Rent(blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                Array.Clear(partial, blk * fs, fs);
+                RmsNormBackwardAccumGammaRows(gradOut, input, rms, partial, blk * fs,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(partial);
+        }
+    }
+
+    // Vector multiply and add round exactly as the scalar tail (no fused multiply-add), so every column's bits are
+    // the same whether it falls in the SIMD body or the tail.
+    [MethodImpl(Hot)]
+    private static void RmsNormBackwardAccumGammaRows(float[] gradOut, float[] input, float[] rms, float[] gAcc, int gOff, int r0, int r1, int fs)
+    {
+        for (int b = r0; b < r1; b++)
+        {
+            int off = b * fs;
+            float invRms = 1f / rms[b];
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= Vector256<float>.Count)
+            {
+                var vInv = Vector256.Create(invRms);
+                for (; f + Vector256<float>.Count <= fs; f += Vector256<float>.Count)
+                {
+                    var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + Vector256.LoadUnsafe(ref gradOut[off + f]) * normalized)
+                        .StoreUnsafe(ref gAcc[gOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
+            {
+                float normalized = input[off + f] * invRms;
+                gAcc[gOff + f] += gradOut[off + f] * normalized;
+            }
+        }
+    }
+
+    private static void RmsNormBackwardAccumGamma(double[] gradOut, double[] input, double[] rms, double[] gradGamma, int rows, int fs)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1) { RmsNormBackwardAccumGammaRows(gradOut, input, rms, gradGamma, 0, 0, rows, fs); return; }
+        var partial = System.Buffers.ArrayPool<double>.Shared.Rent(blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                Array.Clear(partial, blk * fs, fs);
+                RmsNormBackwardAccumGammaRows(gradOut, input, rms, partial, blk * fs,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(partial);
+        }
+    }
+
+    // Vector multiply and add round exactly as the scalar tail (no fused multiply-add), so every column's bits are
+    // the same whether it falls in the SIMD body or the tail.
+    [MethodImpl(Hot)]
+    private static void RmsNormBackwardAccumGammaRows(double[] gradOut, double[] input, double[] rms, double[] gAcc, int gOff, int r0, int r1, int fs)
+    {
+        for (int b = r0; b < r1; b++)
+        {
+            int off = b * fs;
+            double invRms = 1.0 / rms[b];
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= Vector256<double>.Count)
+            {
+                var vInv = Vector256.Create(invRms);
+                for (; f + Vector256<double>.Count <= fs; f += Vector256<double>.Count)
+                {
+                    var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + Vector256.LoadUnsafe(ref gradOut[off + f]) * normalized)
+                        .StoreUnsafe(ref gAcc[gOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
+            {
+                double normalized = input[off + f] * invRms;
+                gAcc[gOff + f] += gradOut[off + f] * normalized;
+            }
+        }
+    }
+
+    private static void LayerNormBackwardDoubleAccumGammaBeta(
+        double[] gradOut, double[] input, double[] mean, double[] variance,
+        double[] gradGamma, double[] gradBeta,
+        int rows, int fs, double epsilon)
+    {
+        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        if (blocks <= 1)
+        {
+            LayerNormBackwardDoubleAccumGammaBetaRows(gradOut, input, mean, variance, gradGamma, 0, gradBeta, 0, 0, rows, fs, epsilon);
+            return;
+        }
+        var partial = System.Buffers.ArrayPool<double>.Shared.Rent(2 * blocks * fs);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            {
+                int gOff = blk * fs, bOff = (blocks + blk) * fs;
+                Array.Clear(partial, gOff, fs);
+                Array.Clear(partial, bOff, fs);
+                LayerNormBackwardDoubleAccumGammaBetaRows(gradOut, input, mean, variance, partial, gOff, partial, bOff,
+                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs, epsilon);
+            }, deterministicSafe: true);
+            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
+            AccumulateAxisRows(partial, blocks * fs, fs, blocks, gradBeta, 0, fs);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(partial);
+        }
+    }
+
     /// <summary>
     /// Stage 4 (#415): SIMD FP64 LayerNorm-backward gradGamma/gradBeta
     /// accumulation. Pass 1 of 2 — sequential over batches (gradGamma/Beta
@@ -27806,17 +28725,18 @@ public partial class CpuEngine : ITensorLevelEngine
     /// structure at CpuEngine.cs:19580.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void LayerNormBackwardDoubleAccumGammaBeta(
+    private static unsafe void LayerNormBackwardDoubleAccumGammaBetaRows(
         double[] gradOut, double[] input, double[] mean, double[] variance,
-        double[] gradGamma, double[] gradBeta,
-        int batchSize, int fs, double epsilon)
+        double[] gAcc, int gOff, double[] bAcc, int bOff,
+        int r0, int r1, int fs, double epsilon)
     {
 #if NET5_0_OR_GREATER
         if (System.Runtime.Intrinsics.X86.Fma.IsSupported && fs >= 16)
         {
-            fixed (double* pGO = gradOut, pI = input, pGG = gradGamma, pGB = gradBeta)
+            fixed (double* pGO = gradOut, pI = input, pGG0 = gAcc, pGB0 = bAcc)
             {
-                for (int b = 0; b < batchSize; b++)
+                double* pGG = pGG0 + gOff, pGB = pGB0 + bOff;
+                for (int b = r0; b < r1; b++)
                 {
                     int off = b * fs;
                     double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
@@ -27876,15 +28796,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         double goS = go[f];
                         double normalized = (ip[f] - m) * invStd;
-                        gradGamma[f] += goS * normalized;
-                        gradBeta[f] += goS;
+                        gAcc[gOff + f] += goS * normalized;
+                        bAcc[bOff + f] += goS;
                     }
                 }
             }
             return;
         }
 #endif
-        for (int b = 0; b < batchSize; b++)
+        for (int b = r0; b < r1; b++)
         {
             int off = b * fs;
             double invStd = 1.0 / Math.Sqrt(variance[b] + epsilon);
@@ -27893,8 +28813,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 double go = gradOut[off + f];
                 double normalized = (input[off + f] - m) * invStd;
-                gradGamma[f] += go * normalized;
-                gradBeta[f] += go;
+                gAcc[gOff + f] += go * normalized;
+                bAcc[bOff + f] += go;
             }
         }
     }
@@ -28107,7 +29027,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     // SavedState order per #178 fix above: numGroups must come first so
                     // GroupNormBackward reads savedState[0] as int (not as Tensor).
                     BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep3 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep3 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -28140,10 +29062,14 @@ public partial class CpuEngine : ITensorLevelEngine
             // Pin all memory to get float* pointers (works with both managed and NativeMemory).
             // COW Stage 2 (#624): input/gamma/beta are read-only — pin via the non-privatizing
             // ReadOnlyData so a cloned model's shared norm weights stay O(1); only pinOut writes.
-            using var pinIn = input.ReadOnlyData.Pin();
-            using var pinOut = result.Data.Pin();
-            using var pinGamma = gamma.ReadOnlyData.Pin();
-            using var pinBeta = beta.ReadOnlyData.Pin();
+            using var inputDataKeep4 = new KeepAliveScope(input);
+            using var pinIn = input.ReadOnlyDataUnmarked.Pin();
+            using var resultDataKeep60 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
+            using var gammaDataKeep2 = new KeepAliveScope(gamma);
+            using var pinGamma = gamma.ReadOnlyDataUnmarked.Pin();
+            using var betaDataKeep2 = new KeepAliveScope(beta);
+            using var pinBeta = beta.ReadOnlyDataUnmarked.Pin();
             unsafe
             {
                 GroupNormFloatPtr(
@@ -28175,7 +29101,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Write directly into the tensor's backing array — avoid the Rent().GetDataArray()
         // round-trip which can return an oversized pooled array.
         var output = AutoTensorCache.RentOrAllocate<T>(input._shape);
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
 
         // Fused mean + variance + normalize per batch*group
         CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, output.Length, idx =>
@@ -28232,6 +29159,233 @@ public partial class CpuEngine : ITensorLevelEngine
         return output;
     }
 
+    // GroupNorm backward, float. Work items are (batch, channel) -- a batch-1 diffusion feature map has tens to
+    // thousands of channels but only a handful of groups -- in two passes over the data, as before:
+    //  1. per (b, c), one read of the channel: its gamma/beta contributions and its share of the group's two
+    //     gradient sums;
+    //  2. per (b, c), the group's sums (its channels' shares added in channel order) and the channel's gradInput.
+    // gradGamma/gradBeta add each channel's per-batch contributions in batch order, the serial order. Every sum has a
+    // fixed order independent of the thread count, so the result is bit-identical at any degree of parallelism.
+    private static void GroupNormBackwardFloat(float[] gradOut, float[] input, float[] gamma, float[] mean, float[] variance,
+        float[] gradGamma, float[] gradBeta, float[] gradInput, int batch, int channels, int spatial, int numGroups, float eps)
+    {
+        int cpg = channels / numGroups;
+        int items = batch * channels;
+        // Per (b, c): [gamma contribution | beta contribution | sum(gamma*go) | sum(gamma*go*xhat)].
+        var stats = System.Buffers.ArrayPool<float>.Shared.Rent(4 * items);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardFloatChannelStats(gradOut, input, gamma, mean, variance, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+            for (int c = 0; c < channels; c++)
+            {
+                float gAcc = 0f, bAcc = 0f;
+                for (int bi = 0; bi < batch; bi++)
+                {
+                    gAcc += stats[bi * channels + c];
+                    bAcc += stats[items + bi * channels + c];
+                }
+                gradGamma[c] = gAcc;
+                gradBeta[c] = bAcc;
+            }
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardFloatChannelInput(gradOut, input, gamma, mean, variance, gradInput, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(stats);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardFloatChannelStats(float[] gradOut, float[] input, float[] gamma, float[] mean,
+        float[] variance, float[] stats, int items, int bc, int channels, int spatial, int numGroups, int cpg, float eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        float groupMean = mean[b * numGroups + g];
+        float invStd = 1f / MathF.Sqrt(variance[b * numGroups + g] + eps);
+        float gammaC = gamma[c];
+        int off = bc * spatial;
+        float gammaAcc = 0f, betaAcc = 0f, sumGrad = 0f, sumGradNorm = 0f;
+        int s = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && spatial >= 8)
+        {
+            var vMean = Vector256.Create(groupMean);
+            var vInvStd = Vector256.Create(invStd);
+            var vGamma = Vector256.Create(gammaC);
+            var accG = Vector256<float>.Zero;
+            var accB = Vector256<float>.Zero;
+            var accGrad = Vector256<float>.Zero;
+            var accGradNorm = Vector256<float>.Zero;
+            for (; s + 8 <= spatial; s += 8)
+            {
+                var go = Vector256.LoadUnsafe(ref gradOut[off + s]);
+                var norm = (Vector256.LoadUnsafe(ref input[off + s]) - vMean) * vInvStd;
+                var scaledGrad = vGamma * go;
+                accG += go * norm;
+                accB += go;
+                accGrad += scaledGrad;
+                accGradNorm += scaledGrad * norm;
+            }
+            gammaAcc = Vector256.Sum(accG);
+            betaAcc = Vector256.Sum(accB);
+            sumGrad = Vector256.Sum(accGrad);
+            sumGradNorm = Vector256.Sum(accGradNorm);
+        }
+#endif
+        for (; s < spatial; s++)
+        {
+            float go = gradOut[off + s];
+            float normalized = (input[off + s] - groupMean) * invStd;
+            float scaledGrad = gammaC * go;
+            gammaAcc += go * normalized;
+            betaAcc += go;
+            sumGrad += scaledGrad;
+            sumGradNorm += scaledGrad * normalized;
+        }
+        stats[bc] = gammaAcc;
+        stats[items + bc] = betaAcc;
+        stats[2 * items + bc] = sumGrad;
+        stats[3 * items + bc] = sumGradNorm;
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardFloatChannelInput(float[] gradOut, float[] input, float[] gamma, float[] mean,
+        float[] variance, float[] gradInput, float[] stats, int items, int bc, int channels, int spatial, int numGroups,
+        int cpg, float eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        float groupMean = mean[b * numGroups + g];
+        float invStd = 1f / MathF.Sqrt(variance[b * numGroups + g] + eps);
+        float sumGrad = 0f, sumGradNorm = 0f;
+        int first = b * channels + g * cpg;
+        for (int k = 0; k < cpg; k++)
+        {
+            sumGrad += stats[2 * items + first + k];
+            sumGradNorm += stats[3 * items + first + k];
+        }
+        float groupSizeF = (float)cpg * spatial;
+        float scale = invStd * (1f / groupSizeF);
+        float gammaC = gamma[c];
+        int off = bc * spatial;
+        int s = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && spatial >= 8)
+        {
+            var vMean = Vector256.Create(groupMean);
+            var vInvStd = Vector256.Create(invStd);
+            var vGamma = Vector256.Create(gammaC);
+            var vGroupSize = Vector256.Create(groupSizeF);
+            var vSumGrad = Vector256.Create(sumGrad);
+            var vSumGradNorm = Vector256.Create(sumGradNorm);
+            var vScale = Vector256.Create(scale);
+            for (; s + 8 <= spatial; s += 8)
+            {
+                var norm = (Vector256.LoadUnsafe(ref input[off + s]) - vMean) * vInvStd;
+                var gradNorm = vGamma * Vector256.LoadUnsafe(ref gradOut[off + s]);
+                var res = vScale * (vGroupSize * gradNorm - vSumGrad - norm * vSumGradNorm);
+                res.StoreUnsafe(ref gradInput[off + s]);
+            }
+        }
+#endif
+        for (; s < spatial; s++)
+        {
+            float normalized = (input[off + s] - groupMean) * invStd;
+            float gradNorm = gammaC * gradOut[off + s];
+            gradInput[off + s] = scale * (groupSizeF * gradNorm - sumGrad - normalized * sumGradNorm);
+        }
+    }
+
+    // GroupNorm backward, double: the same (batch, channel) passes as the float kernel, scalar arithmetic. The per-item
+    // bodies are static methods so their arrays are locals (a closure's captured fields kept the JIT from hoisting).
+    private static void GroupNormBackwardDouble(double[] gradOut, double[] input, double[] gamma, double[] mean, double[] variance,
+        double[] gradGamma, double[] gradBeta, double[] gradInput, int batch, int channels, int spatial, int numGroups, double eps)
+    {
+        int cpg = channels / numGroups;
+        int items = batch * channels;
+        var stats = System.Buffers.ArrayPool<double>.Shared.Rent(4 * items);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardDoubleChannelStats(gradOut, input, gamma, mean, variance, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+            for (int c = 0; c < channels; c++)
+            {
+                double gAcc = 0, bAcc = 0;
+                for (int bi = 0; bi < batch; bi++)
+                {
+                    gAcc += stats[bi * channels + c];
+                    bAcc += stats[items + bi * channels + c];
+                }
+                gradGamma[c] = gAcc;
+                gradBeta[c] = bAcc;
+            }
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardDoubleChannelInput(gradOut, input, gamma, mean, variance, gradInput, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(stats);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardDoubleChannelStats(double[] gradOut, double[] input, double[] gamma, double[] mean,
+        double[] variance, double[] stats, int items, int bc, int channels, int spatial, int numGroups, int cpg, double eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        double groupMean = mean[b * numGroups + g];
+        double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
+        double gammaC = gamma[c];
+        int off = bc * spatial;
+        double gammaAcc = 0, betaAcc = 0, sumGrad = 0, sumGradNorm = 0;
+        for (int s = 0; s < spatial; s++)
+        {
+            double go = gradOut[off + s];
+            double normalized = (input[off + s] - groupMean) * invStd;
+            double scaledGrad = gammaC * go;
+            gammaAcc += go * normalized;
+            betaAcc += go;
+            sumGrad += scaledGrad;
+            sumGradNorm += scaledGrad * normalized;
+        }
+        stats[bc] = gammaAcc;
+        stats[items + bc] = betaAcc;
+        stats[2 * items + bc] = sumGrad;
+        stats[3 * items + bc] = sumGradNorm;
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardDoubleChannelInput(double[] gradOut, double[] input, double[] gamma, double[] mean,
+        double[] variance, double[] gradInput, double[] stats, int items, int bc, int channels, int spatial, int numGroups,
+        int cpg, double eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        double groupMean = mean[b * numGroups + g];
+        double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
+        double sumGrad = 0, sumGradNorm = 0;
+        int first = b * channels + g * cpg;
+        for (int k = 0; k < cpg; k++)
+        {
+            sumGrad += stats[2 * items + first + k];
+            sumGradNorm += stats[3 * items + first + k];
+        }
+        double groupSizeD = (double)cpg * spatial;
+        double scale = invStd / groupSizeD;
+        double gammaC = gamma[c];
+        int off = bc * spatial;
+        for (int s = 0; s < spatial; s++)
+        {
+            double normalized = (input[off + s] - groupMean) * invStd;
+            double gradNorm = gammaC * gradOut[off + s];
+            gradInput[off + s] = scale * (groupSizeD * gradNorm - sumGrad - normalized * sumGradNorm);
+        }
+    }
+
     /// <inheritdoc/>
     public Tensor<T> GroupNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
@@ -28257,11 +29411,14 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int groupSize = channelsPerGroup * spatialSize;
 
-        var gradOutputData = gradOutput.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
         var inputData = input.GetFlattenedData();
         var gammaData = gamma.GetReadOnlyDataArray();
-        var meanData = mean.GetDataArray();
-        var varData = variance.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
+        using var varDataLease = variance.LeaseArray();
+        var varData = varDataLease.Array;
 
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
@@ -28287,148 +29444,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradBeta = (float[])(object)gradBetaData;
             var fGradInput = (float[])(object)gradInputData;
             float fEps = (float)epsilon;
-            float groupSizeF = groupSize;
-            float invGroupSizeF = 1f / groupSizeF;
 
-            // gradGamma / gradBeta: sum across (batch, spatial). Sequential
-            // across batches to avoid per-channel accumulator contention, but
-            // spatial inner loop runs on direct floats. We pre-compute invStd
-            // once per (b, g) to avoid recomputing inside the spatial loop.
-            for (int b = 0; b < batch; b++)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    float groupMean = fMean[b * numGroups + g];
-                    float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
-                    int startChannel = g * channelsPerGroup;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        float gammaAcc = 0f;
-                        float betaAcc = 0f;
-                        int s = 0;
-#if NET5_0_OR_GREATER
-                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
-                        {
-                            var vMean = Vector256.Create(groupMean);
-                            var vInvStd = Vector256.Create(invStd);
-                            var accG = Vector256<float>.Zero;
-                            var accB = Vector256<float>.Zero;
-                            for (; s + 8 <= spatialSize; s += 8)
-                            {
-                                var go = Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
-                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
-                                accG += go * norm;
-                                accB += go;
-                            }
-                            gammaAcc = Vector256.Sum(accG);
-                            betaAcc = Vector256.Sum(accB);
-                        }
-#endif
-                        for (; s < spatialSize; s++)
-                        {
-                            float go = fGradOut[chanOffset + s];
-                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
-                            gammaAcc += go * normalized;
-                            betaAcc += go;
-                        }
-                        fGradGamma[channel] += gammaAcc;
-                        fGradBeta[channel] += betaAcc;
-                    }
-                }
-            }
-
-            // gradInput: parallel over batch. Each batch writes a disjoint
-            // [b*channels*spatialSize, (b+1)*channels*spatialSize) slice.
-            [MethodImpl(Hot)]
-            void ProcessBatch(int b)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    float groupMean = fMean[b * numGroups + g];
-                    float invStd = 1f / MathF.Sqrt(fVar[b * numGroups + g] + fEps);
-                    int startChannel = g * channelsPerGroup;
-
-                    // Pass 1: sumGrad and sumGradNorm over the group.
-                    float sumGrad = 0f;
-                    float sumGradNorm = 0f;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        float gammaC = fGamma[channel];
-                        int s = 0;
-#if NET5_0_OR_GREATER
-                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
-                        {
-                            var vMean = Vector256.Create(groupMean);
-                            var vInvStd = Vector256.Create(invStd);
-                            var vGamma = Vector256.Create(gammaC);
-                            var accGrad = Vector256<float>.Zero;
-                            var accGradNorm = Vector256<float>.Zero;
-                            for (; s + 8 <= spatialSize; s += 8)
-                            {
-                                var scaledGrad = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
-                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
-                                accGrad += scaledGrad;
-                                accGradNorm += scaledGrad * norm;
-                            }
-                            sumGrad += Vector256.Sum(accGrad);
-                            sumGradNorm += Vector256.Sum(accGradNorm);
-                        }
-#endif
-                        for (; s < spatialSize; s++)
-                        {
-                            float scaledGrad = gammaC * fGradOut[chanOffset + s];
-                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
-                            sumGrad += scaledGrad;
-                            sumGradNorm += scaledGrad * normalized;
-                        }
-                    }
-
-                    // Pass 2: write gradInput.
-                    float scale = invStd * invGroupSizeF;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        float gammaC = fGamma[channel];
-                        int s = 0;
-#if NET5_0_OR_GREATER
-                        if (Vector256.IsHardwareAccelerated && spatialSize >= 8)
-                        {
-                            var vMean = Vector256.Create(groupMean);
-                            var vInvStd = Vector256.Create(invStd);
-                            var vGamma = Vector256.Create(gammaC);
-                            var vGroupSize = Vector256.Create(groupSizeF);
-                            var vSumGrad = Vector256.Create(sumGrad);
-                            var vSumGradNorm = Vector256.Create(sumGradNorm);
-                            var vScale = Vector256.Create(scale);
-                            for (; s + 8 <= spatialSize; s += 8)
-                            {
-                                var norm = (Vector256.LoadUnsafe(ref fInput[chanOffset + s]) - vMean) * vInvStd;
-                                var gradNorm = vGamma * Vector256.LoadUnsafe(ref fGradOut[chanOffset + s]);
-                                var res = vScale * (vGroupSize * gradNorm - vSumGrad - norm * vSumGradNorm);
-                                res.StoreUnsafe(ref fGradInput[chanOffset + s]);
-                            }
-                        }
-#endif
-                        for (; s < spatialSize; s++)
-                        {
-                            float normalized = (fInput[chanOffset + s] - groupMean) * invStd;
-                            float gradNorm = gammaC * fGradOut[chanOffset + s];
-                            float term1 = groupSizeF * gradNorm;
-                            float term3 = normalized * sumGradNorm;
-                            fGradInput[chanOffset + s] = scale * (term1 - sumGrad - term3);
-                        }
-                    }
-                }
-            }
-
-            // Batch typically small (1–16) for diffusion training, but each
-            // batch's work is large (channels × spatialSize). Always parallel.
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatch);
+            GroupNormBackwardFloat(fGradOut, fInput, fGamma, fMean, fVar, fGradGamma, fGradBeta, fGradInput,
+                batch, channels, spatialSize, numGroups, fEps);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -28440,79 +29458,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradGamma = (double[])(object)gradGammaData;
             var dGradBeta = (double[])(object)gradBetaData;
             var dGradInput = (double[])(object)gradInputData;
-            double groupSizeD = groupSize;
-            double invGroupSizeD = 1.0 / groupSizeD;
 
-            for (int b = 0; b < batch; b++)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    double groupMean = dMean[b * numGroups + g];
-                    double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
-                    int startChannel = g * channelsPerGroup;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        double gammaAcc = 0.0;
-                        double betaAcc = 0.0;
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            double go = dGradOut[chanOffset + s];
-                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
-                            gammaAcc += go * normalized;
-                            betaAcc += go;
-                        }
-                        dGradGamma[channel] += gammaAcc;
-                        dGradBeta[channel] += betaAcc;
-                    }
-                }
-            }
-
-            [MethodImpl(Hot)]
-            void ProcessBatchD(int b)
-            {
-                for (int g = 0; g < numGroups; g++)
-                {
-                    double groupMean = dMean[b * numGroups + g];
-                    double invStd = 1.0 / Math.Sqrt(dVar[b * numGroups + g] + epsilon);
-                    int startChannel = g * channelsPerGroup;
-
-                    double sumGrad = 0.0;
-                    double sumGradNorm = 0.0;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        double gammaC = dGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            double scaledGrad = gammaC * dGradOut[chanOffset + s];
-                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
-                            sumGrad += scaledGrad;
-                            sumGradNorm += scaledGrad * normalized;
-                        }
-                    }
-
-                    double scale = invStd * invGroupSizeD;
-                    for (int c = 0; c < channelsPerGroup; c++)
-                    {
-                        int channel = startChannel + c;
-                        int chanOffset = b * (channels * spatialSize) + channel * spatialSize;
-                        double gammaC = dGamma[channel];
-                        for (int s = 0; s < spatialSize; s++)
-                        {
-                            double normalized = (dInput[chanOffset + s] - groupMean) * invStd;
-                            double gradNorm = gammaC * dGradOut[chanOffset + s];
-                            double term1 = groupSizeD * gradNorm;
-                            double term3 = normalized * sumGradNorm;
-                            dGradInput[chanOffset + s] = scale * (term1 - sumGrad - term3);
-                        }
-                    }
-                }
-            }
-
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * channels * spatialSize, ProcessBatchD);
+            GroupNormBackwardDouble(dGradOut, dInput, dGamma, dMean, dVar, dGradGamma, dGradBeta, dGradInput,
+                batch, channels, spatialSize, numGroups, epsilon);
         }
         else
         {
@@ -28650,9 +29598,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // LLaMA-style decoder, so the generic path was a measurable inference tax.
         if (typeof(T) == typeof(float))
         {
-            var fIn = (float[])(object)src.GetDataArray();
-            var fCos = (float[])(object)cos.GetDataArray();
-            var fSin = (float[])(object)sin.GetDataArray();
+            using var fInLease = src.LeaseArray();
+            var fIn = (float[])(object)fInLease.Array;
+            using var fCosLease = cos.LeaseArray();
+            var fCos = (float[])(object)fCosLease.Array;
+            using var fSinLease = sin.LeaseArray();
+            var fSin = (float[])(object)fSinLease.Array;
             var fOut = (float[])(object)outArr;
             int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
             CpuParallelSettings.ParallelForOrSerial(0, rows, total, [MethodImpl(Hot)] (row) =>
@@ -28673,9 +29624,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var dIn = (double[])(object)src.GetDataArray();
-            var dCos = (double[])(object)cos.GetDataArray();
-            var dSin = (double[])(object)sin.GetDataArray();
+            using var dInLease = src.LeaseArray();
+            var dIn = (double[])(object)dInLease.Array;
+            using var dCosLease = cos.LeaseArray();
+            var dCos = (double[])(object)dCosLease.Array;
+            using var dSinLease = sin.LeaseArray();
+            var dSin = (double[])(object)dSinLease.Array;
             var dOut = (double[])(object)outArr;
             int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
             CpuParallelSettings.ParallelForOrSerial(0, rows, total, [MethodImpl(Hot)] (row) =>
@@ -28696,9 +29650,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var inSpan = src.AsSpan();
-            var cosSpan = cos.AsSpan();
-            var sinSpan = sin.AsSpan();
+            using var inSpanLease = src.Lease();
+            var inSpan = inSpanLease.Span;
+            using var cosSpanLease = cos.Lease();
+            var cosSpan = cosSpanLease.Span;
+            using var sinSpanLease = sin.Lease();
+            var sinSpan = sinSpanLease.Span;
             var numOps = MathHelper.GetNumericOperations<T>();
             for (int row = 0; row < rows; row++)
             {
@@ -28768,7 +29725,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshRms, capturedRms);
                     },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep4 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep4 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -28914,10 +29873,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (batchDims == 0) batchSize = 1;
 
         int featureSize = gamma.Length;
-        var gradOutputData = gradOutput.GetDataArray();
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
         var inputData = input.GetFlattenedData();
         var gammaData = gamma.GetReadOnlyDataArray();
-        var rmsData = rms.GetDataArray();
+        using var rmsDataLease = rms.LeaseArray();
+        var rmsData = rmsDataLease.Array;
         var gradGammaData = new T[featureSize];
         var gradInputData = new T[input.Length];
 
@@ -28937,16 +29898,8 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             float invFeatureSizeF = 1f / fs;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                float invRms = 1f / fRms[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    float normalized = fInput[off + f] * invRms;
-                    fGradGamma[f] += fGradOut[off + f] * normalized;
-                }
-            }
+            // gradGamma over feature-column ranges, each accumulated over the rows in order (bit-identical).
+            RmsNormBackwardAccumGamma(fGradOut, fInput, fRms, fGradGamma, batchSize, fs);
 
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {
@@ -28979,16 +29932,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             double invFeatureSizeD = 1.0 / fs;
 
-            for (int b = 0; b < batchSize; b++)
-            {
-                int off = b * fs;
-                double invRms = 1.0 / dRms[b];
-                for (int f = 0; f < fs; f++)
-                {
-                    double normalized = dInput[off + f] * invRms;
-                    dGradGamma[f] += dGradOut[off + f] * normalized;
-                }
-            }
+            RmsNormBackwardAccumGamma(dGradOut, dInput, dRms, dGradGamma, batchSize, fs);
 
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {
@@ -29158,7 +30102,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int batch = kv._shape[0], kvHeads = kv._shape[1], seq = kv._shape[2], headDim = kv._shape[3];
         int group = qHeads / kvHeads;
         var src = kv.IsContiguous ? kv : kv.Contiguous();
-        var srcSpan = src.AsSpan();
+        using var srcSpanLease = src.Lease();
+        var srcSpan = srcSpanLease.Span;
         int perHead = seq * headDim;
         var outArr = new T[batch * qHeads * perHead];
         for (int b = 0; b < batch; b++)
@@ -29470,7 +30415,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Compute output: weights @ V -> [batch, heads, seqQ, d_v]
         var outputData = new T[batch * heads * seqQ * d_v];
-        var valueData = value.GetDataArray();
+        using var valueDataLease = value.LeaseArray();
+        var valueData = valueDataLease.Array;
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * d_k, bh =>
         {
@@ -29502,10 +30448,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return resultGen;
     }
 
+    // Query rows per SDPA work item: the unit of the CPU attention fan-out. Fixed (not derived from the thread count),
+    // so the GEMM blocking -- and therefore every output bit -- is the same at any degree of parallelism.
+    private const int SdpaRowBlock = 64;
+
     /// <summary>
     /// BLAS-backed float-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
     /// Replaces the scalar virtual-dispatch triple-loop with two batched SGEMMs per head
-    /// (Q·K^T then P·V), parallelized across batch*heads. Expected to collapse the
+    /// (Q·K^T then P·V), parallelized across (head, query-row block). Expected to collapse the
     /// DiT-XL SDPA wall clock from tens of seconds to tens of milliseconds per forward
     /// pass (Issue #162).
     /// </summary>
@@ -29523,7 +30473,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int bhCount = batch * heads;
         var qf = query.GetFlattenedData();
         var kf = key.GetFlattenedData();
-        var vf = value.GetDataArray();
+        using var vfLease = value.LeaseArray();
+        var vf = vfLease.Array;
 
         // scoresData is internal scratch — reused between the QK^T and softmax
         // steps within each call and never escapes this method. Rent from
@@ -29547,22 +30498,38 @@ public partial class CpuEngine : ITensorLevelEngine
         float capF = (float)softcap;
         float invCapF = useSoftcap ? 1f / capF : 0f;
 
-        // Process each batch-head slice in parallel. Each slice is two independent
-        // SGEMMs separated by a softmax pass. The individual SGEMMs are sized well
-        // above BLAS's 4096-FMA threshold for typical MHA (seqQ*seqK*d_k = 4.7M for
-        // DiT-XL per-head), so each head's GEMM hits either MKL or our blocked AVX2
-        // kernel — not the scalar fallback.
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
+        // Work items are (head, block of SdpaRowBlock query rows): scores for the block's rows (Q rows · K^T), their
+        // softmax, then the block's output rows (P rows · V). A batch-1 forward has few heads -- 8 heads left 56 of
+        // 64 cores idle when the split was per head -- but many row blocks. Every item runs the same single-threaded
+        // SIMD GEMM on the same fixed blocks whatever the thread count, so the output is bit-identical at any degree
+        // of parallelism (the old per-head split switched between a multi-threaded BLAS call and a sequential kernel
+        // depending on whether the head loop happened to run in parallel).
+        int qBlocks = (seqQ + SdpaRowBlock - 1) / SdpaRowBlock;
+        int ktLen = bhCount * d_k * seqK;
+        var ktAll = System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, ktLen));
+        try
         {
+        // K^T per head, once: [d_k, seqK] so each block's scores GEMM reads K^T row-major.
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)ktLen, bh =>
+        {
+            int kOff = bh * seqK * d_k, tOff = bh * d_k * seqK;
+            for (int i = 0; i < seqK; i++)
+                for (int j = 0; j < d_k; j++)
+                    ktAll[tOff + j * seqK + i] = kf[kOff + i * d_k + j];
+        }, deterministicSafe: true);
+
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount * qBlocks, (long)bhCount * seqQ * seqK * (d_k + d_v), [MethodImpl(Hot)] (item) =>
+        {
+            int bh = item / qBlocks;
+            int i0 = (item % qBlocks) * SdpaRowBlock;
+            int rows = Math.Min(SdpaRowBlock, seqQ - i0);
             int b = bh / heads;
             int h = bh % heads;
 
             // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
             // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
             // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
-            // of indexing past its bounds. The MHA fast paths already did this; these generic
-            // SDPA workers did not, which is why the GQA causal path had to materialize a full
-            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            // of indexing past its bounds.
             int mskB = mask is null ? 1 : mask.Shape[0];
             int mskH = mask is null ? 1 : mask.Shape[1];
             int mskQ = mask is null ? 1 : mask.Shape[2];
@@ -29570,56 +30537,21 @@ public partial class CpuEngine : ITensorLevelEngine
             int mskb = BroadcastMaskIndex(b, mskB);
             int mskh = BroadcastMaskIndex(h, mskH);
 
-            int qOff = bh * seqQ * d_k;
-            int kOff = bh * seqK * d_k;
-            int sOff = bh * seqQ * seqK;
+            int qOff = bh * seqQ * d_k + i0 * d_k;
+            int sOff = bh * seqQ * seqK + i0 * seqK;
 
-            // ──── Step 1: scores = Q @ K^T, via BLAS TryGemmEx with transB=true.
-            // If TryGemmEx is unavailable (deterministic mode, MKL absent), fall back
-            // to pre-transposing K and calling SimdGemm.Sgemm.
-            //
-            // Nested-threading guard: this body runs inside ParallelForOrSerial over
-            // batch·heads. TryGemmEx routes to a MULTI-THREADED GEMM (native OpenBLAS
-            // cblas_sgemm, or the managed machine kernel). Invoking that from each of N
-            // parallel head-workers oversubscribes the box (N × innerThreads) and the
-            // native BLAS pool blocks in native sync — a [1,8,1024,64] forward then
-            // crawls for minutes. So when this thread is already a parallel worker
-            // (IsInParallelRegion) we force the single-threaded AVX2 SgemmSequential
-            // path below — mirroring the double path, which always uses a sequential
-            // inner GEMM for exactly this reason. When the head loop ran serially (few
-            // heads / small work) we keep the fast multi-threaded GEMM for the lone head.
-            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: seqK, k: d_k,
-                a: qf, aOffset: qOff, lda: d_k, transA: false,
-                b: kf, bOffset: kOff, ldb: d_k, transB: true,
-                c: scoresData, cOffset: sOff, ldc: seqK);
-            if (!gemmed)
-            {
-                // Manual K^T for this head, then SimdGemm (AVX2 blocked).
-                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                try
-                {
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_k; j++)
-                            kt[j * seqK + i] = kf[kOff + i * d_k + j];
-                    // SgemmSequential: we're already inside Parallel.For(bhCount), so
-                    // forcing the inner SIMD kernel to run sequential avoids
-                    // bhCount × maxThreads workers on (maxThreads) cores.
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        qf.AsSpan(qOff, seqQ * d_k),
-                        kt.AsSpan(0, d_k * seqK),
-                        scoresData.AsSpan(sOff, seqQ * seqK),
-                        seqQ, d_k, seqK);
-                }
-                finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
-            }
+            // ──── Step 1: the block's scores = Q[i0 .. i0+rows) @ K^T.
+            Engines.Simd.SimdGemm.SgemmSequential(
+                qf.AsSpan(qOff, rows * d_k),
+                ktAll.AsSpan(bh * d_k * seqK, d_k * seqK),
+                scoresData.AsSpan(sOff, rows * seqK),
+                rows, d_k, seqK);
 
-            // ──── Step 2: fused scale + mask + numerically-stable softmax,
-            // row-wise over the [seqQ, seqK] scores matrix for this head.
-            for (int i = 0; i < seqQ; i++)
+            // ──── Step 2: fused scale + mask + numerically-stable softmax, row-wise.
+            for (int r = 0; r < rows; r++)
             {
-                int rowOff = sOff + i * seqK;
+                int i = i0 + r;
+                int rowOff = sOff + r * seqK;
                 // First pass: scale in-place, mask, and find row max.
                 float maxVal = negInfF;
                 for (int j = 0; j < seqK; j++)
@@ -29631,11 +30563,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (v > maxVal) maxVal = v;
                     scoresData[rowOff + j] = v;
                 }
-                // Second pass: exp(v - max), sum.
-                // Edge case: if the entire row was masked out, maxVal is still -Infinity.
-                // (scores - (-Inf)) == +Inf; MathF.Exp(+Inf) == +Inf; normalizing produces
-                // NaN. Detect that case up front and emit an all-zero softmax row, which
-                // is the sensible behavior (no attention anywhere → no value flows).
+                // A fully masked row has maxVal = -Infinity: exp(v - max) would be NaN. No attention anywhere -> an
+                // all-zero softmax row (no value flows).
                 if (float.IsNegativeInfinity(maxVal))
                 {
                     for (int j = 0; j < seqK; j++)
@@ -29646,9 +30575,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 float sumExp = 0f;
                 for (int j = 0; j < seqK; j++)
                 {
-                    float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
-                    weightsData[rowOff + j] = e;
-                    sumExp += e;
+                    float ex = MathF.Exp(scoresData[rowOff + j] - maxVal);
+                    weightsData[rowOff + j] = ex;
+                    sumExp += ex;
                 }
                 // Third pass: normalize. Use 1/sumExp to turn N divides into N muls.
                 float inv = sumExp != 0f ? 1f / sumExp : 0f;
@@ -29656,26 +30585,18 @@ public partial class CpuEngine : ITensorLevelEngine
                     weightsData[rowOff + j] *= inv;
             }
 
-            // ──── Step 3: output = weights @ V, via BLAS (no transpose).
-            // Same nested-threading guard as Step 1: serial inner GEMM when this is a
-            // parallel head-worker, multi-threaded GEMM only when the head loop is serial.
-            int wOff = bh * seqQ * seqK;
-            int vOff = bh * seqK * d_v;
-            int oOff = bh * seqQ * d_v;
-            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: d_v, k: seqK,
-                a: weightsData, aOffset: wOff, lda: seqK, transA: false,
-                b: vf, bOffset: vOff, ldb: d_v, transB: false,
-                c: outputData, cOffset: oOff, ldc: d_v);
-            if (!gemmed2)
-            {
-                Engines.Simd.SimdGemm.SgemmSequential(
-                    weightsData.AsSpan(wOff, seqQ * seqK),
-                    vf.AsSpan(vOff, seqK * d_v),
-                    outputData.AsSpan(oOff, seqQ * d_v),
-                    seqQ, seqK, d_v);
-            }
-        });
+            // ──── Step 3: the block's output rows = weights[i0 .. i0+rows) @ V.
+            Engines.Simd.SimdGemm.SgemmSequential(
+                weightsData.AsSpan(sOff, rows * seqK),
+                vf.AsSpan(bh * seqK * d_v, seqK * d_v),
+                outputData.AsSpan(bh * seqQ * d_v + i0 * d_v, rows * d_v),
+                rows, seqK, d_v);
+        }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(ktAll, clearArray: false);
+        }
 
         // Return strongly typed Tensor<float> (no generic cast). Caller bridges
         // to the outer Tensor<T> via a single (Tensor<T>)(object) cast at the
@@ -29752,17 +30673,43 @@ public partial class CpuEngine : ITensorLevelEngine
 
         float scaleF = (float)scaleValue;
         float negInfF = float.NegativeInfinity;
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
+
+        // Work items are (head, block of SdpaRowBlock query rows), as in ScaledDotProductAttentionFloat: few heads no
+        // longer leave most cores idle, and every item runs the same single-threaded SIMD GEMM on the same fixed
+        // blocks, so the output is bit-identical at any degree of parallelism. K^T (and V, when its rows are strided)
+        // is packed once per head; a strided Q block is packed per item.
+        int qBlocks = (seqQ + SdpaRowBlock - 1) / SdpaRowBlock;
+        int ktLen = bhCount * d_k * seqK;
+        bool packV = vRowStride != d_v;
+        var ktAll = System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, ktLen));
+        var vPacked = packV ? System.Buffers.ArrayPool<float>.Shared.Rent(Math.Max(1, bhCount * seqK * d_v)) : null;
+        try
         {
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqK * (d_k + d_v), bh =>
+        {
+            int b = bh / heads, h = bh % heads;
+            int kOff = kBase + b * kBatchStride + h * kHeadStride, tOff = bh * d_k * seqK;
+            for (int i = 0; i < seqK; i++)
+                for (int j = 0; j < d_k; j++)
+                    ktAll[tOff + j * seqK + i] = kf[kOff + i * kRowStride + j];
+            if (vPacked != null)
+            {
+                int vOff = vBase + b * vBatchStride + h * vHeadStride, pOff = bh * seqK * d_v;
+                for (int i = 0; i < seqK; i++)
+                    Array.Copy(vf, vOff + i * vRowStride, vPacked, pOff + i * d_v, d_v);
+            }
+        }, deterministicSafe: true);
+
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount * qBlocks, (long)bhCount * seqQ * seqK * (d_k + d_v), [MethodImpl(Hot)] (item) =>
+        {
+            int bh = item / qBlocks;
+            int i0 = (item % qBlocks) * SdpaRowBlock;
+            int rows = Math.Min(SdpaRowBlock, seqQ - i0);
             int b = bh / heads;
             int h = bh % heads;
 
             // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
-            // [batch, heads, seq_q, seq_k]). A size-1 axis maps EVERY index to 0, so a shared
-            // mask such as [1, 1, seq, seq] or [batch, 1, seq, seq] is read correctly instead
-            // of indexing past its bounds. The MHA fast paths already did this; these generic
-            // SDPA workers did not, which is why the GQA causal path had to materialize a full
-            // batch*heads*seqQ*seqK bool plane purely to make it indexable.
+            // [batch, heads, seq_q, seq_k]); a size-1 axis maps every index to 0.
             int mskB = mask is null ? 1 : mask.Shape[0];
             int mskH = mask is null ? 1 : mask.Shape[1];
             int mskQ = mask is null ? 1 : mask.Shape[2];
@@ -29770,67 +30717,42 @@ public partial class CpuEngine : ITensorLevelEngine
             int mskb = BroadcastMaskIndex(b, mskB);
             int mskh = BroadcastMaskIndex(h, mskH);
             // Per-head storage offsets via the operands' (possibly permuted) strides.
-            int qOff = qBase + b * qBatchStride + h * qHeadStride;
-            int kOff = kBase + b * kBatchStride + h * kHeadStride;
-            int vOff = vBase + b * vBatchStride + h * vHeadStride;
-            int sOff = bh * seqQ * seqK;
-            int oOff = bh * seqQ * d_v;
+            int qOff = qBase + b * qBatchStride + h * qHeadStride + i0 * qRowStride;
+            int sOff = bh * seqQ * seqK + i0 * seqK;
+            int oOff = bh * seqQ * d_v + i0 * d_v;
 
-            // Nested-parallel guard: identical reasoning to ScaledDotProductAttentionFloat —
-            // force the single-threaded inner GEMM when this body is itself a parallel worker.
-            bool useSequentialGemm = CpuParallelSettings.IsInParallelRegion;
-
-            // Step 1: scores = Q @ K^T → scratch. Q is [seqQ,d_k] with leading dim qRowStride,
-            // K is [seqK,d_k] (used transposed) with leading dim kRowStride; the resolver
-            // guarantees the d_k dimension is unit-stride, which is all BLAS lda/ldb require.
-            bool gemmed = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: seqK, k: d_k,
-                a: qf, aOffset: qOff, lda: qRowStride, transA: false,
-                b: kf, bOffset: kOff, ldb: kRowStride, transB: true,
-                c: scratch, cOffset: sOff, ldc: seqK);
-            if (!gemmed)
+            // Step 1: the block's scores = Q[i0 .. i0+rows) @ K^T -> scratch. The d_k dimension is unit-stride (the
+            // resolver guarantees it); rows with a wider stride are packed first.
+            float[]? qPackRented = qRowStride != d_k ? System.Buffers.ArrayPool<float>.Shared.Rent(rows * d_k) : null;
+            try
             {
-                // SgemmSequential needs packed (row-major, leading dim == cols) inputs, so
-                // gather strided Q/K per-head slices into small reused buffers. kt holds K^T.
-                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(d_k * seqK);
-                float[]? qPackRented = qRowStride != d_k
-                    ? System.Buffers.ArrayPool<float>.Shared.Rent(seqQ * d_k) : null;
-                try
+                ReadOnlySpan<float> qSpan;
+                if (qPackRented != null)
                 {
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_k; j++)
-                            kt[j * seqK + i] = kf[kOff + i * kRowStride + j];
-
-                    ReadOnlySpan<float> qSpan;
-                    if (qPackRented != null)
-                    {
-                        for (int i = 0; i < seqQ; i++)
-                            for (int j = 0; j < d_k; j++)
-                                qPackRented[i * d_k + j] = qf[qOff + i * qRowStride + j];
-                        qSpan = qPackRented.AsSpan(0, seqQ * d_k);
-                    }
-                    else
-                    {
-                        qSpan = qf.AsSpan(qOff, seqQ * d_k);
-                    }
-
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        qSpan,
-                        kt.AsSpan(0, d_k * seqK),
-                        scratch.AsSpan(sOff, seqQ * seqK),
-                        seqQ, d_k, seqK);
+                    for (int r = 0; r < rows; r++)
+                        Array.Copy(qf, qOff + r * qRowStride, qPackRented, r * d_k, d_k);
+                    qSpan = qPackRented.AsSpan(0, rows * d_k);
                 }
-                finally
+                else
                 {
-                    System.Buffers.ArrayPool<float>.Shared.Return(kt);
-                    if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
+                    qSpan = qf.AsSpan(qOff, rows * d_k);
                 }
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    qSpan,
+                    ktAll.AsSpan(bh * d_k * seqK, d_k * seqK),
+                    scratch.AsSpan(sOff, rows * seqK),
+                    rows, d_k, seqK);
+            }
+            finally
+            {
+                if (qPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(qPackRented);
             }
 
             // Step 2: scale + mask + numerically-stable softmax, IN PLACE in scratch.
-            for (int i = 0; i < seqQ; i++)
+            for (int r = 0; r < rows; r++)
             {
-                int rowOff = sOff + i * seqK;
+                int i = i0 + r;
+                int rowOff = sOff + r * seqK;
                 float maxVal = negInfF;
                 for (int j = 0; j < seqK; j++)
                 {
@@ -29855,44 +30777,22 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int j = 0; j < seqK; j++) scratch[rowOff + j] *= inv;
             }
 
-            // Step 3: output = probs @ V → outBuf. V is [seqK,d_v] with leading dim vRowStride
-            // (resolver guarantees d_v unit-stride). TryGemmEx beta=0 SET / SgemmSequential
-            // self-clears, so outBuf needs no pre-zero.
-            bool gemmed2 = !useSequentialGemm && BlasProvider.TryGemmEx(
-                m: seqQ, n: d_v, k: seqK,
-                a: scratch, aOffset: sOff, lda: seqK, transA: false,
-                b: vf, bOffset: vOff, ldb: vRowStride, transB: false,
-                c: outBuf, cOffset: oOff, ldc: d_v);
-            if (!gemmed2)
-            {
-                ReadOnlySpan<float> vSpan;
-                float[]? vPackRented = null;
-                if (vRowStride != d_v)
-                {
-                    vPackRented = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * d_v);
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < d_v; j++)
-                            vPackRented[i * d_v + j] = vf[vOff + i * vRowStride + j];
-                    vSpan = vPackRented.AsSpan(0, seqK * d_v);
-                }
-                else
-                {
-                    vSpan = vf.AsSpan(vOff, seqK * d_v);
-                }
-                try
-                {
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        scratch.AsSpan(sOff, seqQ * seqK),
-                        vSpan,
-                        outBuf.AsSpan(oOff, seqQ * d_v),
-                        seqQ, seqK, d_v);
-                }
-                finally
-                {
-                    if (vPackRented != null) System.Buffers.ArrayPool<float>.Shared.Return(vPackRented);
-                }
-            }
-        });
+            // Step 3: the block's output rows = probs @ V -> outBuf (SgemmSequential overwrites, no pre-zero).
+            ReadOnlySpan<float> vSpan = vPacked != null
+                ? vPacked.AsSpan(bh * seqK * d_v, seqK * d_v)
+                : vf.AsSpan(vBase + b * vBatchStride + h * vHeadStride, seqK * d_v);
+            Engines.Simd.SimdGemm.SgemmSequential(
+                scratch.AsSpan(sOff, rows * seqK),
+                vSpan,
+                outBuf.AsSpan(oOff, rows * d_v),
+                rows, seqK, d_v);
+        }, deterministicSafe: true);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<float>.Shared.Return(ktAll, clearArray: false);
+            if (vPacked != null) System.Buffers.ArrayPool<float>.Shared.Return(vPacked, clearArray: false);
+        }
     }
 
     /// <summary>
@@ -30138,7 +31038,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var queryData = query.GetFlattenedData();
         var keyData = key.GetFlattenedData();
         var valueData = value.GetFlattenedData();
-        var weightsData = attentionWeights.GetDataArray();
+        using var weightsDataLease = attentionWeights.LeaseArray();
+        var weightsData = weightsDataLease.Array;
 
         var gradVData = new T[batch * heads * seqK * d_v];
         var gradQData = new T[batch * heads * seqQ * d_k];
@@ -30273,7 +31174,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var qF = query.GetFlattenedData();
         var kF = key.GetFlattenedData();
         var vF = value.GetFlattenedData();
-        var wF = attentionWeights.GetDataArray();
+        using var wFLease = attentionWeights.LeaseArray();
+        var wF = wFLease.Array;
 
         var gradQData = new float[batch * heads * seqQ * d_k];
         var gradKData = new float[batch * heads * seqK * d_k];
@@ -30454,7 +31356,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var qD = query.GetFlattenedData();
         var kD = key.GetFlattenedData();
         var vD = value.GetFlattenedData();
-        var wD = attentionWeights.GetDataArray();
+        using var wDLease = attentionWeights.LeaseArray();
+        var wD = wDLease.Array;
 
         var gradQData = new double[batch * heads * seqQ * d_k];
         var gradKData = new double[batch * heads * seqK * d_k];
@@ -30681,7 +31584,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 // that uses the returned tensor's data BEFORE plan.Step() sees
                 // the eager values (matches LayerNorm's eagerResult.AsSpan
                 // copy-into-lazy pattern).
-                eagerOutput.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerOutputKeep1 = new KeepAliveScope(eagerOutput);
+                using var lazyResultKeep5 = new KeepAliveScope(lazyResult);
+                eagerOutput.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -30811,9 +31716,12 @@ public partial class CpuEngine : ITensorLevelEngine
         const int BLOCK_Q = 64;
         const int BLOCK_KV = 64;
 
-        var queryData = query.GetDataArray();
-        var keyData = key.GetDataArray();
-        var valueData = value.GetDataArray();
+        using var queryDataLease = query.LeaseArray();
+        var queryData = queryDataLease.Array;
+        using var keyDataLease = key.LeaseArray();
+        var keyData = keyDataLease.Array;
+        using var valueDataLease = value.LeaseArray();
+        var valueData = valueDataLease.Array;
 
         // Output and statistics
         var outputData = new T[batch * heads * seqQ * headDim];
@@ -31004,7 +31912,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var qf = query.GetFlattenedData();
         var kf = key.GetFlattenedData();
-        var vf = value.GetDataArray();
+        using var vfLease = value.LeaseArray();
+        var vf = vfLease.Array;
         float[]? biasData = null;
         bool biasBroadcastBatch = false;
         if (attentionBias is not null)
@@ -31157,7 +32066,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var qd = query.GetFlattenedData();
         var kd = key.GetFlattenedData();
-        var vd = value.GetDataArray();
+        using var vdLease = value.LeaseArray();
+        var vd = vdLease.Array;
         double[]? biasData = null;
         bool biasBroadcastBatch = false;
         if (attentionBias is not null)
@@ -31379,12 +32289,18 @@ public partial class CpuEngine : ITensorLevelEngine
         const int BLOCK_Q = 64;
         const int BLOCK_KV = 64;
 
-        var queryData = query.GetDataArray();
-        var keyData = key.GetDataArray();
-        var valueData = value.GetDataArray();
-        var outputData = output.GetDataArray();
-        var gradOutData = gradOutput.GetDataArray();
-        var statsData = softmaxStats.GetDataArray();
+        using var queryDataLease = query.LeaseArray();
+        var queryData = queryDataLease.Array;
+        using var keyDataLease = key.LeaseArray();
+        var keyData = keyDataLease.Array;
+        using var valueDataLease = value.LeaseArray();
+        var valueData = valueDataLease.Array;
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
+        using var gradOutDataLease = gradOutput.LeaseArray();
+        var gradOutData = gradOutDataLease.Array;
+        using var statsDataLease = softmaxStats.LeaseArray();
+        var statsData = statsDataLease.Array;
 
         var gradQData = new T[batch * heads * seqQ * headDim];
         var gradKData = new T[batch * heads * seqK * headDim];
@@ -31894,9 +32810,12 @@ public partial class CpuEngine : ITensorLevelEngine
         T scaleFactor = numOps.FromDouble(scaleValue);
         T negInf = numOps.FromDouble(double.NegativeInfinity);
 
-        var queryData = query.GetDataArray();
-        var keyData = key.GetDataArray();
-        var valueData = value.GetDataArray();
+        using var queryDataLease = query.LeaseArray();
+        var queryData = queryDataLease.Array;
+        using var keyDataLease = key.LeaseArray();
+        var keyData = keyDataLease.Array;
+        using var valueDataLease = value.LeaseArray();
+        var valueData = valueDataLease.Array;
 
         var outputData = new T[batch * numQHeads * seqQ * headDim];
         var weightsData = new T[batch * numQHeads * seqQ * seqK];
@@ -32029,11 +32948,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
         T scaleFactor = numOps.FromDouble(scale);
 
-        var queryData = query.GetDataArray();
-        var keyData = key.GetDataArray();
-        var valueData = value.GetDataArray();
-        var weightsData = attentionWeights.GetDataArray();
-        var gradOutData = gradOutput.GetDataArray();
+        using var queryDataLease = query.LeaseArray();
+        var queryData = queryDataLease.Array;
+        using var keyDataLease = key.LeaseArray();
+        var keyData = keyDataLease.Array;
+        using var valueDataLease = value.LeaseArray();
+        var valueData = valueDataLease.Array;
+        using var weightsDataLease = attentionWeights.LeaseArray();
+        var weightsData = weightsDataLease.Array;
+        using var gradOutDataLease = gradOutput.LeaseArray();
+        var gradOutData = gradOutDataLease.Array;
 
         var gradQData = new T[batch * numQHeads * seqQ * headDim];
         var gradKData = new T[batch * numKVHeads * seqK * headDim];
@@ -32173,11 +33097,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int features = nodeFeatures._shape[2];
         int numEdges = edgeSourceIndices._shape[0];
 
-        var nodeData = nodeFeatures.AsSpan();
-        var srcIndices = edgeSourceIndices.AsSpan();
-        var tgtIndices = edgeTargetIndices.AsSpan();
-        var attnSrcData = attentionWeightSource.AsSpan();
-        var attnTgtData = attentionWeightTarget.AsSpan();
+        using var nodeDataLease = nodeFeatures.Lease();
+        var nodeData = nodeDataLease.Span;
+        using var srcIndicesLease = edgeSourceIndices.Lease();
+        var srcIndices = srcIndicesLease.Span;
+        using var tgtIndicesLease = edgeTargetIndices.Lease();
+        var tgtIndices = tgtIndicesLease.Span;
+        using var attnSrcDataLease = attentionWeightSource.Lease();
+        var attnSrcData = attnSrcDataLease.Span;
+        using var attnTgtDataLease = attentionWeightTarget.Lease();
+        var attnTgtData = attnTgtDataLease.Span;
 
         // Output tensors
         var outputData = new T[batchSize * numNodes * features];
@@ -32374,13 +33303,20 @@ public partial class CpuEngine : ITensorLevelEngine
         int features = nodeFeatures._shape[2];
         int numEdges = edgeSourceIndices._shape[0];
 
-        var nodeData = nodeFeatures.AsSpan();
-        var gradOutData = gradOutput.AsSpan();
-        var srcIndices = edgeSourceIndices.AsSpan();
-        var tgtIndices = edgeTargetIndices.AsSpan();
-        var attnSrcData = attentionWeightSource.AsSpan();
-        var attnTgtData = attentionWeightTarget.AsSpan();
-        var coeffsData = attentionCoeffs.AsSpan();
+        using var nodeDataLease = nodeFeatures.Lease();
+        var nodeData = nodeDataLease.Span;
+        using var gradOutDataLease = gradOutput.Lease();
+        var gradOutData = gradOutDataLease.Span;
+        using var srcIndicesLease = edgeSourceIndices.Lease();
+        var srcIndices = srcIndicesLease.Span;
+        using var tgtIndicesLease = edgeTargetIndices.Lease();
+        var tgtIndices = tgtIndicesLease.Span;
+        using var attnSrcDataLease = attentionWeightSource.Lease();
+        var attnSrcData = attnSrcDataLease.Span;
+        using var attnTgtDataLease = attentionWeightTarget.Lease();
+        var attnTgtData = attnTgtDataLease.Span;
+        using var coeffsDataLease = attentionCoeffs.Lease();
+        var coeffsData = coeffsDataLease.Span;
 
         T alpha = numOps.FromDouble(leakyReluAlpha);
 
@@ -32589,10 +33525,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 nameof(edgeTargetIndices));
         }
 
-        var nodeData = nodeFeatures.AsSpan();
-        var weightData = headWeights.AsSpan();
-        var attnSrcData = attentionWeightsSource.AsSpan();
-        var attnTgtData = attentionWeightsTarget.AsSpan();
+        using var nodeDataLease = nodeFeatures.Lease();
+        var nodeData = nodeDataLease.Span;
+        using var weightDataLease = headWeights.Lease();
+        var weightData = weightDataLease.Span;
+        using var attnSrcDataLease = attentionWeightsSource.Lease();
+        var attnSrcData = attnSrcDataLease.Span;
+        using var attnTgtDataLease = attentionWeightsTarget.Lease();
+        var attnTgtData = attnTgtDataLease.Span;
 
         int outFeatures = concatenate ? numHeads * headDim : headDim;
         var outputData = new T[batchSize * numNodes * outFeatures];
@@ -32645,8 +33585,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 leakyReluAlpha,
                 out var headCoeffs);
 
-            var headOutputData = headOutput.AsSpan();
-            var headCoeffsData = headCoeffs.AsSpan();
+            using var headOutputDataLease = headOutput.Lease();
+            var headOutputData = headOutputDataLease.Span;
+            using var headCoeffsDataLease = headCoeffs.Lease();
+            var headCoeffsData = headCoeffsDataLease.Span;
 
             // Store coefficients
             for (int b = 0; b < batchSize; b++)
@@ -32885,7 +33827,9 @@ public partial class CpuEngine : ITensorLevelEngine
                             DirectGpuTensorEngine.CopyResultInto(eng, freshCounts, capturedCounts);
                     },
                     BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, dim });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep5 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep6 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -33372,7 +34316,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int numGroups = maxIndex + 1;
 
         var gradOutData = gradOutput.GetFlattenedData();
-        var outData = output.GetDataArray();
+        using var outDataLease = output.LeaseArray();
+        var outData = outDataLease.Array;
         var gradInputData = new T[gradOutData.Length];
 
         int innerSize = 1;
@@ -33545,7 +34490,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         var normAxes = ValidateAndNormalizeAxes(capturedEffectiveAxes, inShape.Length);
                         var outShapeLocal = output._shape;
                         int outSize = output.Length;
-                        var outSpan = output.Data.Span;
+                        using var outputDataKeep2 = new KeepAliveScope(output);
+                        var outSpan = output.DataUnmarked.Span;
                         var idxArr = new int[outSize];
                         T minVal = numOps.MinValue;
                         for (int i = 0; i < outSize; i++) { outSpan[i] = minVal; idxArr[i] = -1; }
@@ -33605,7 +34551,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             if (typeof(T) == typeof(float) && input.IsContiguous)
             {
-                var fData = (float[])(object)input.GetDataArray();
+                using var fDataLease = input.LeaseArray();
+                var fData = (float[])(object)fDataLease.Array;
                 float maxVal = float.MinValue;
                 int maxIdx = 0;
                 for (int i = 0; i < input.Length; i++)
@@ -33785,7 +34732,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new T[inputSize];
         var gradOutputData = gradOutput.GetFlattenedData();
-        var relativeIndices = maxIndices.GetDataArray();
+        using var relativeIndicesLease = maxIndices.LeaseArray();
+        var relativeIndices = relativeIndicesLease.Array;
         var coordinates = new int[inputShape.Length];
         for (int output = 0; output < gradOutput.Length; output++)
         {
@@ -34060,7 +35008,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             if (typeof(T) == typeof(double))
             {
-                var dSpan = AsDoubleMemory(input.Data).Span;
+                using var inputDataKeep32 = new KeepAliveScope(input);
+                var dSpan = AsDoubleMemory(input.DataUnmarked).Span;
                 double dSum = SimdKernels.Sum(dSpan);
                 double dMean = dSum / input.Length;
                 var scalarResult = AutoTensorCache.RentOrAllocate<T>(FullReductionShape(input.Rank, keepDims));
@@ -34081,7 +35030,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 unsafe
                 {
-                    var mem = AsFloatMemory(input.Data);
+                    using var inputDataKeep33 = new KeepAliveScope(input);
+                    var mem = AsFloatMemory(input.DataUnmarked);
                     using var pin = mem.Pin();
                     float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, input.Length);
                     float fMean = fSum / input.Length;
@@ -34312,14 +35262,16 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && input.IsContiguous && axes.Length == 1 && input.Rank == 2)
         {
             int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
-            var fData = (float[])(object)input.GetDataArray();
+            using var fDataLease = input.LeaseArray();
+            var fData = (float[])(object)fDataLease.Array;
             int rows = input._shape[0], cols = input._shape[1];
 
             if (axis == 1) // variance along columns (per-row)
             {
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var fOut = (float[])(object)result.GetDataArray();
+                using var fOutLease = result.LeaseArray();
+                var fOut = (float[])(object)fOutLease.Array;
                 for (int r = 0; r < rows; r++)
                 {
                     int off = r * cols;
@@ -34336,7 +35288,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var fOut = (float[])(object)result.GetDataArray();
+                using var fOutLease = result.LeaseArray();
+                var fOut = (float[])(object)fOutLease.Array;
                 // AutoTensorCache.RentOrAllocate returns an UNINITIALIZED
                 // buffer (the cache reuses pooled arrays without zeroing).
                 // The variance accumulator below uses `+=` so it must start
@@ -34364,14 +35317,16 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double) && input.IsContiguous && axes.Length == 1 && input.Rank == 2)
         {
             int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
-            var dData = (double[])(object)input.GetDataArray();
+            using var dDataLease = input.LeaseArray();
+            var dData = (double[])(object)dDataLease.Array;
             int rows = input._shape[0], cols = input._shape[1];
 
             if (axis == 1) // variance along columns (per-row)
             {
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var dOut = (double[])(object)result.GetDataArray();
+                using var dOutLease = result.LeaseArray();
+                var dOut = (double[])(object)dOutLease.Array;
                 for (int r = 0; r < rows; r++)
                 {
                     int off = r * cols;
@@ -34388,7 +35343,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var dOut = (double[])(object)result.GetDataArray();
+                using var dOutLease = result.LeaseArray();
+                var dOut = (double[])(object)dOutLease.Array;
                 // Same rationale as the float axis==0 branch above —
                 // AutoTensorCache returns an uninitialized buffer and the
                 // accumulator below uses `+=`, so the logical region must
@@ -34411,7 +35367,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // First compute the mean
         var mean = ReduceMean(input, axes, keepDims: true);
-        var meanData = mean.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
         var meanShape = mean._shape;
 
         // Normalize axes
@@ -34543,7 +35500,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputShape = input._shape;
 
         var mean = ReduceMean(input, axes, keepDims: true);
-        var meanData = mean.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
         var meanShape = mean._shape;
         var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
 
@@ -34603,7 +35561,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
         var inputShape = input._shape;
-        var meanData = mean.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
         var meanShape = mean._shape;
         var gradOutputData = gradOutput.GetFlattenedData();
         var gradOutputShape = gradOutput._shape;
@@ -34664,7 +35623,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Compute variance first
         var variance = ReduceVariance(input, effectiveAxes, keepDims);
-        var varianceData = variance.GetDataArray();
+        using var varianceDataLease = variance.LeaseArray();
+        var varianceData = varianceDataLease.Array;
 
         // Apply log(variance + epsilon) into SEPARATE buffers.
         //
@@ -34720,9 +35680,11 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
         var inputShape = input._shape;
-        var meanData = mean.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
         var meanShape = mean._shape;
-        var varianceData = variance.GetDataArray();
+        using var varianceDataLease = variance.LeaseArray();
+        var varianceData = varianceDataLease.Array;
         var varianceShape = variance._shape;
         var gradOutputData = gradOutput.GetFlattenedData();
         var gradOutputShape = gradOutput._shape;
@@ -34856,9 +35818,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int newHeight = height * scaleH;
         int newWidth = width * scaleW;
 
+        using var inputArrayKeep35163 = new KeepAliveScope(input);
+        using var outputArrayKeep35164 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int h = height, w = width, sH = scaleH, sW = scaleW, nH = newHeight, nW = newWidth;
             Action<int> kernel = [MethodImpl(Hot)] (fb) =>
@@ -34885,7 +35849,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var inputData = input.GetFlattenedData();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         CpuParallelSettings.ParallelForOrSerial(0, flatBatch, output.Length, [MethodImpl(Hot)] (fb) =>
         {
             for (int oh = 0; oh < newHeight; oh++)
@@ -35105,9 +36070,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int newHeight = height * r;
         int newWidth = width * r;
 
+        using var inputArrayKeep35413 = new KeepAliveScope(input);
+        using var outputArrayKeep35414 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int totalBOC = batch * newChannels;
             int hh = height, ww = width, oH = newHeight, oW = newWidth, rr = r, ch = channels;
@@ -35145,7 +36112,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var inputData = input.GetFlattenedData();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         CpuParallelSettings.ParallelForOrSerial(0, batch * newChannels, output.Length, [MethodImpl(Hot)] (boc) =>
         {
             int b = boc / newChannels;
@@ -35301,8 +36269,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // map in plain double arithmetic, write via FromDouble — same numerics, no per-point virtual
         // dispatch. Mirrors AffineGrid3DImpl and the GridSample raw-array kernel in this engine.
         var ops = MathHelper.GetNumericOperations<T>();
-        var t = theta.AsSpan();
-        var g = grid.AsWritableSpan();
+        using var tLease = theta.Lease();
+        var t = tLease.Span;
+        using var gLease = grid.LeaseWritable();
+        var g = gLease.Span;
 
         for (int b = 0; b < batchSize; b++)
         {
@@ -35375,9 +36345,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var gridOrig = grid;
         if (!input.IsContiguous) input = input.Contiguous();
         if (!grid.IsContiguous) grid = grid.Contiguous();
-        var inData = input.GetDataArray();
-        var gridData = grid.GetDataArray();
-        var outData = output.GetDataArray();
+        using var inDataLease = input.LeaseArray();
+        var inData = inDataLease.Array;
+        using var gridDataLease = grid.LeaseArray();
+        var gridData = gridDataLease.Array;
+        using var outDataLease = output.LeaseArray();
+        var outData = outDataLease.Array;
         // torchvision / PyTorch DEFAULT convention: align_corners=false, padding_mode='zeros'.
         //   src = ((g + 1) * size - 1) / 2  ==  (g + 1) * (size / 2) - 0.5
         // This previously used (size - 1) / 2, which is the align_corners=TRUE mapping, and clamped
@@ -35570,8 +36543,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int colChannels = channels * kH * kW;
 
         var result = TensorAllocator.Rent<T>(new[] { batch, colChannels, colLength });
-        var inputData = input.GetDataArray();
-        var resultData = result.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         for (int b = 0; b < batch; b++)
         {
@@ -35667,8 +36642,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Column length {colLength} doesn't match expected {expectedColLength} for output {outH}x{outW} with kernel {kH}x{kW}, stride {sH}x{sW}, pad {pH}x{pW}.");
 
         var result = TensorAllocator.Rent<T>(new[] { batch, channels, outH, outW });
-        var inputData = input.GetDataArray();
-        var resultData = result.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         // Initialize to zero
         for (int i = 0; i < result.Length; i++)
@@ -35849,9 +36826,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (top < 0 || left < 0 || top + height > inputHeight || left + width > inputWidth)
             throw new ArgumentException("Crop region is out of bounds");
 
+        using var inputArrayKeep36152 = new KeepAliveScope(input);
+        using var outputArrayKeep36153 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int totalBC = batch * channels;
             int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
@@ -35870,9 +36849,11 @@ public partial class CpuEngine : ITensorLevelEngine
             CpuParallelSettings.ParallelForOrSerial(0, totalBC, (long)totalBC * oH * oW, kernel);
             return;
         }
+        using var inputArrayKeep36173 = new KeepAliveScope(input);
+        using var outputArrayKeep36174 = new KeepAliveScope(output);
         if (typeof(T) == typeof(double)
-            && input.GetDataArray() is double[] inArrD
-            && output.GetDataArray() is double[] outArrD)
+            && input.GetDataArrayUnmarked() is double[] inArrD
+            && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int totalBC = batch * channels;
             int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
@@ -35893,7 +36874,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var inputData = input.GetFlattenedData();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, [MethodImpl(Hot)] (bc) =>
         {
             int inBase = bc * inputHeight * inputWidth + top * inputWidth + left;
@@ -36017,9 +36999,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int batchSize = 1;
         for (int i = 0; i < rank - 2; i++) batchSize *= shape[i];
 
+        using var inputArrayKeep36321 = new KeepAliveScope(input);
+        using var outputArrayKeep36322 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             float padF = padValue is float fv ? fv : 0f;
             // Fast fill: Array.Clear if zero pad, scalar fill otherwise.
@@ -36047,9 +37031,11 @@ public partial class CpuEngine : ITensorLevelEngine
             CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * h * w, kernel);
             return;
         }
+        using var inputArrayKeep36351 = new KeepAliveScope(input);
+        using var outputArrayKeep36352 = new KeepAliveScope(output);
         if (typeof(T) == typeof(double)
-            && input.GetDataArray() is double[] inArrD
-            && output.GetDataArray() is double[] outArrD)
+            && input.GetDataArrayUnmarked() is double[] inArrD
+            && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             double padD = padValue is double dv ? dv : 0.0;
             if (padD == 0.0)
@@ -36078,7 +37064,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var inputData = input.GetFlattenedData();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         // Single fill of the whole output with padValue (Span<T>.Fill is
         // available across all target frameworks via System.Memory).
         outputData.AsSpan().Fill(padValue);
@@ -36261,7 +37248,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 int cgIn = t._shape[1] / cb;
                 int inImageStride = cgIn * H * W * cb;
                 var srcF = (Tensor<float>)(object)t;
-                var srcData = srcF.GetDataArray();
+                using var srcDataLease = srcF.LeaseArray();
+                var srcData = srcDataLease.Array;
                 int copyPerImage = cgIn * H * W * cb;
                 for (int n = 0; n < N; n++)
                 {
@@ -36316,7 +37304,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int axisOffset = 0;
         foreach (var tensor in tensors)
         {
-            var tensorData = tensor.GetDataArray();
+            using var tensorDataLease = tensor.LeaseArray();
+            var tensorData = tensorDataLease.Array;
             var tensorShape = tensor._shape;
 
             // Allocation-free odometer: output and input share rank; only the
@@ -36517,9 +37506,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "SparseCEGatherTrueClass", logP, new[] { B },
                     [MethodImpl(Hot)] (eng, output) =>
                     {
-                        var lp = capLogP.GetDataArray();
-                        var tg = capTarget.GetDataArray();          // LIVE target — re-read each replay
-                        var o = output.GetDataArray();
+                        using var lpLease = capLogP.LeaseArray();
+                        var lp = lpLease.Array;
+                        using var tgLease = capTarget.LeaseArray();
+                        var tg = tgLease.Array;          // LIVE target — re-read each replay
+                        using var oLease = output.LeaseArray();
+                        var o = oLease.Array;
                         for (int i = 0; i < capB; i++)
                         {
                             int c = (int)Math.Round((double)tg[i]);
@@ -36531,10 +37523,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var lpD = logP.GetDataArray();
-        var tgD = targetFloat.GetDataArray();
+        using var lpDLease = logP.LeaseArray();
+        var lpD = lpDLease.Array;
+        using var tgDLease = targetFloat.LeaseArray();
+        var tgD = tgDLease.Array;
         var res = new Tensor<float>(new[] { B });
-        var rD = res.GetDataArray();
+        using var rDLease = res.LeaseArray();
+        var rD = rDLease.Array;
         for (int i = 0; i < B; i++)
         {
             int c = (int)Math.Round((double)tgD[i]);
@@ -36630,7 +37625,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         // reject mutation; asking for write intent here made a pure gather fail
                         // after its first eviction. Keep only the destination writable.
                         var embDataLocal = capturedEmb.GetReadOnlyDataArray();
-                        var outDataLocal = output.GetDataArray();
+                        using var outDataLocalLease = output.LeaseArray();
+                        var outDataLocal = outDataLocalLease.Array;
                         for (int i = 0; i < n; i++)
                         {
                             long tokenIdxLong = idxSnap[i];
@@ -36651,7 +37647,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = new Tensor<TValue>(outputShape);
         var embData = embeddings.GetReadOnlyDataArray();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         var idxData = indices.GetReadOnlyDataArray();
 
         // For each index, copy the entire embedding row. Promote to long
@@ -36725,7 +37722,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var valuesData = (values.IsContiguous ? values : values.Contiguous()).GetReadOnlyDataArray();
         var classData = (classIndices.IsContiguous ? classIndices : classIndices.Contiguous()).GetReadOnlyDataArray();
         var result = new Tensor<T>(outputShape);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         for (int r = 0; r < rows; r++)
         {
             int c = ClassIndexOf(numOps.ToDouble(classData[r]), numClasses);
@@ -36838,7 +37836,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         // between fused and eager produces identical lookups).
                         var idxData = capturedFloatIdx.GetReadOnlyDataArray();
                         var embData = capturedEmb.GetReadOnlyDataArray();
-                        var outData = output.GetDataArray();
+                        using var outDataLease = output.LeaseArray();
+                        var outData = outDataLease.Array;
                         for (int i = 0; i < n; i++)
                         {
                             long tokenIdx = Convert.ToInt64(nops.ToDouble(idxData[i]));
@@ -36861,7 +37860,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // tape-registration + GPU paths in TensorEmbeddingLookup.
         var intIndices = new Tensor<int>(floatIndices._shape);
         var floatData = floatIndices.GetReadOnlyDataArray();
-        var intData = intIndices.GetDataArray();
+        using var intDataLease = intIndices.LeaseArray();
+        var intData = intDataLease.Array;
         var nopsEager = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < numIndices; i++)
             intData[i] = (int)Convert.ToInt64(nopsEager.ToDouble(floatData[i]));
@@ -36902,7 +37902,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<TValue>();
         var gradEmbeddings = new Tensor<TValue>(new[] { vocabSize, embeddingDim });
-        var gradEmbData = gradEmbeddings.GetDataArray();
+        using var gradEmbDataLease = gradEmbeddings.LeaseArray();
+        var gradEmbData = gradEmbDataLease.Array;
 
         var gradData = gradOutput.GetReadOnlyDataArray();
         var idxData = indices.GetReadOnlyDataArray();
@@ -37033,17 +38034,22 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradCenters = AutoTensorCache.RentOrAllocate<T>(centers._shape);
         var gradEpsilons = AutoTensorCache.RentOrAllocate<T>(epsilons._shape);
         // Zero pooled buffers — RentOrAllocate can return stale data from the cache
-        gradInput.AsWritableSpan().Clear();
+        using var gradInputKeep1 = new KeepAliveScope(gradInput);
+        gradInput.AsWritableSpanUnmarked().Clear();
         gradCenters.AsWritableSpan().Clear();
         gradEpsilons.AsWritableSpan().Clear();
 
         var inputData = input.GetFlattenedData();
         var centersData = centers.GetFlattenedData();
         var epsilonsData = epsilons.GetFlattenedData();
-        var outputData = output.GetDataArray();
-        var gradOutputData = gradOutput.GetDataArray();
-        var gradInputData = gradInput.GetDataArray();
-        var gradCentersData = gradCenters.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
+        using var gradOutputDataLease = gradOutput.LeaseArray();
+        var gradOutputData = gradOutputDataLease.Array;
+        using var gradInputDataLease = gradInput.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
+        using var gradCentersDataLease = gradCenters.LeaseArray();
+        var gradCentersData = gradCentersDataLease.Array;
 
         // For RBF: K = exp(-epsilon * ||x - c||Ã‚Â²)
         // dK/dx = K * (-epsilon) * 2 * (x - c) = -2 * epsilon * K * (x - c)
@@ -37128,7 +38134,8 @@ public partial class CpuEngine : ITensorLevelEngine
             innerSize *= tensor._shape[i];
 
         var tensorData = tensor.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         // Perform the repeat operation
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)result.Length, [MethodImpl(Hot)] (outer) =>
@@ -37190,8 +38197,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
-        var tensorData = tensor.GetDataArray();
-        var resultData = result.GetDataArray();
+        using var tensorDataLease = tensor.LeaseArray();
+        var tensorData = tensorDataLease.Array;
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         int srcLen = tensor.Length;
 
         // Fast path: only tiling along axis 0 (other axes multiply=1)
@@ -37271,7 +38280,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(length);
         int totalElements = length.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         CopySliceRuns(tensorData, tensor._shape, start, length, resultData, totalElements);
 
         // A tape is an immutable record of the FORWARD call. `start` and `length` are mutable
@@ -37402,8 +38412,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Create a copy of destination to avoid modifying the original
         var result = AutoTensorCache.RentOrAllocate<T>(destination._shape);
-        var destData = destination.GetDataArray();
-        var resultData = result.GetDataArray();
+        using var destDataLease = destination.LeaseArray();
+        var destData = destDataLease.Array;
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         Array.Copy(destData, resultData, destination.Length);
 
         int sourceTotal = source._shape.Aggregate(1, (a, b) => a * b);
@@ -37479,10 +38491,14 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(condition._shape);
-        var condSpan = condition.AsSpan();
-        var xSpan = x.AsSpan();
-        var ySpan = y.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var condSpanLease = condition.Lease();
+        var condSpan = condSpanLease.Span;
+        using var xSpanLease = x.Lease();
+        var xSpan = xSpanLease.Span;
+        using var ySpanLease = y.Lease();
+        var ySpan = ySpanLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < condSpan.Length; i++)
         {
@@ -37524,7 +38540,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // parameter with TensorCopy (FTRL, ASGD) therefore never updated pooled parameters at all. AsWritableSpan
         // slices the live storage at the view's offset, and the version bump tells caches the data changed.
         // Exactly source.Length elements are copied, never a (possibly over-allocated) backing array's length.
-        source.AsSpan().Slice(0, source.Length).CopyTo(destination.AsWritableSpan());
+        using var sourceKeep1 = new KeepAliveScope(source);
+        using var destinationKeep24 = new KeepAliveScope(destination);
+        source.AsSpanUnmarked().Slice(0, source.Length).CopyTo(destination.AsWritableSpanUnmarked());
         destination.IncrementVersion();
     }
 
@@ -37553,7 +38571,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var aData = a.GetFlattenedData();
         var bData = b.GetFlattenedData();
-        var rData = result.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, n, n, i =>
         {
@@ -37650,8 +38669,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // srcStrides[rank - 1] which is out of bounds.
         if (axes.Length == 0)
         {
+            using var outputDataKeep3 = new KeepAliveScope(output);
+            using var tensorDataKeep35 = new KeepAliveScope(tensor);
             if (output.Length > 0 && tensor.Length > 0)
-                output.Data.Span[0] = tensor.Data.Span[0];
+                output.DataUnmarked.Span[0] = tensor.DataUnmarked.Span[0];
             return;
         }
 
@@ -37729,8 +38750,10 @@ public partial class CpuEngine : ITensorLevelEngine
             permutedSrcStrides[i] = srcStrides[axes[i]];
 
         var dstShape = output._shape;
-        var srcSpan = tensor.Data.Span;
-        var dstSpan = output.Data.Span;
+        using var tensorDataKeep36 = new KeepAliveScope(tensor);
+        var srcSpan = tensor.DataUnmarked.Span;
+        using var outputDataKeep4 = new KeepAliveScope(output);
+        var dstSpan = output.DataUnmarked.Span;
 
         // For rank ≤ 4 (the diffusion / transformer hot path), unroll the
         // index walk into nested loops; for higher ranks, fall back to a
@@ -38003,7 +39026,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int srcAxisLen = indices.Length;
 
         var indicesData = indices.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         var updatesData = updates.GetFlattenedData();
 
         for (int outer = 0; outer < outerSize; outer++)
@@ -38081,7 +39105,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var rowSource = srcBacking ?? source.GetFlattenedData();
             int rowOff = srcBacking is null ? 0 : srcOff;
             var result = TensorAllocator.Rent<T>([numIndices, embeddingDim]);
-            var resultData = result.GetDataArray();
+            using var resultDataLease = result.LeaseArray();
+            var resultData = resultDataLease.Array;
             CpuParallelSettings.ParallelForOrSerial(0, numIndices, (long)numIndices * embeddingDim, i =>
             {
                 int idx = indicesData[i];
@@ -38185,8 +39210,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // scalar throughput on bandwidth-limited 1-D cumsum.
         if (typeof(T) == typeof(float) && tensor.Rank == 1)
         {
-            var src = (float[])(object)tensor.GetDataArray();
-            var dst = (float[])(object)result.GetDataArray();
+            using var srcLease = tensor.LeaseArray();
+            var src = (float[])(object)srcLease.Array;
+            using var dstLease = result.LeaseArray();
+            var dst = (float[])(object)dstLease.Array;
             Simd.ScanKernels.PrefixSumFloat(src, dst);
             DifferentiableOps.RecordUnary("TensorCumSum", result, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
             if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", result, eng => eng.TensorCumSum(c, ca)); }
@@ -38196,8 +39223,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Fp32 contiguous inner-most axis: run the SIMD scan per line.
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
-            var src = (float[])(object)tensor.GetDataArray();
-            var dst = (float[])(object)result.GetDataArray();
+            using var srcLease = tensor.LeaseArray();
+            var src = (float[])(object)srcLease.Array;
+            using var dstLease = result.LeaseArray();
+            var dst = (float[])(object)dstLease.Array;
             for (int outer = 0; outer < outerSize; outer++)
             {
                 int start = outer * axisSize;
@@ -38219,8 +39248,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // the add and saving the v-table indirection.
         if (typeof(T) == typeof(double) && tensor.Rank == 1)
         {
-            var srcD = (double[])(object)tensor.GetDataArray();
-            var dstD = (double[])(object)result.GetDataArray();
+            using var srcDLease = tensor.LeaseArray();
+            var srcD = (double[])(object)srcDLease.Array;
+            using var dstDLease = result.LeaseArray();
+            var dstD = (double[])(object)dstDLease.Array;
             double accD = 0.0;
             int len = tensor.Length;
             for (int i = 0; i < len; i++) { accD += srcD[i]; dstD[i] = accD; }
@@ -38230,8 +39261,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
-            var srcD = (double[])(object)tensor.GetDataArray();
-            var dstD = (double[])(object)result.GetDataArray();
+            using var srcDLease = tensor.LeaseArray();
+            var srcD = (double[])(object)srcDLease.Array;
+            using var dstDLease = result.LeaseArray();
+            var dstD = (double[])(object)dstDLease.Array;
             for (int outer = 0; outer < outerSize; outer++)
             {
                 int start = outer * axisSize;
@@ -38244,8 +39277,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var tensorData = tensor.GetDataArray();
-        var resultData = result.GetDataArray();
+        using var tensorDataLease = tensor.LeaseArray();
+        var tensorData = tensorDataLease.Array;
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         int totalWork = outerSize * innerSize;
         if (totalWork > 1)
@@ -38341,7 +39376,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         var tensor = new Tensor<T>(shape);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(tensor.AsWritableSpan());
+        using var tensorKeep26 = new KeepAliveScope(tensor);
+        rng.FillUniform(tensor.AsWritableSpanUnmarked());
         return tensor;
     }
 
@@ -38377,7 +39413,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (destination.IsContiguous)
         {
-            FillRandomNormal(destination.AsWritableSpan(), numOps, random, meanD, stdD);
+            using var destinationKeep25 = new KeepAliveScope(destination);
+            FillRandomNormal(destination.AsWritableSpanUnmarked(), numOps, random, meanD, stdD);
             return;
         }
 
@@ -38419,7 +39456,8 @@ public partial class CpuEngine : ITensorLevelEngine
             uint seedState = unchecked((uint)seed.Value);
             if (destination.IsContiguous)
             {
-                var output = destination.AsWritableSpan();
+                using var outputLease = destination.LeaseWritable();
+                var output = outputLease.Span;
                 if (typeof(T) == typeof(float))
                 {
                     float minF = (float)(object)min!;
@@ -38479,7 +39517,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (destination.IsContiguous)
         {
-            FillUniformRange(destination.AsWritableSpan(), numOps, random, minD, range);
+            using var destinationKeep26 = new KeepAliveScope(destination);
+            FillUniformRange(destination.AsWritableSpanUnmarked(), numOps, random, minD, range);
             return;
         }
 
@@ -38747,7 +39786,8 @@ public partial class CpuEngine : ITensorLevelEngine
         double dropoutRateD = numOps.ToDouble(dropoutRate);
         T zero = numOps.Zero;
 
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         if (seed.HasValue)
         {
@@ -38807,8 +39847,11 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
-        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
-        numOps.AddScalar(result.AsSpan(), scalar, result.AsWritableSpan());
+        using var tensorKeep27 = new KeepAliveScope(tensor);
+        using var resultKeep41 = new KeepAliveScope(result);
+        numOps.Negate(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        using var resultKeep42 = new KeepAliveScope(result);
+        numOps.AddScalar(result.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked());
 
         // d(scalar - x)/dx = -1, so gradient is negated
         DifferentiableOps.RecordUnary("ScalarMinusTensor", result, tensorOrig, BackwardFunctions<T>.NegateBackward);
@@ -38846,7 +39889,8 @@ public partial class CpuEngine : ITensorLevelEngine
         result.Fill(numOps.Zero);
 
         var diagData = diagonal.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         for (int i = 0; i < n; i++)
         {
@@ -38995,7 +40039,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        using var tensorKeep28 = new KeepAliveScope(tensor);
+        using var resultKeep43 = new KeepAliveScope(result);
+        if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorAddScalar", result, tensor, BackwardFunctions<T>.AddScalarBackward);
@@ -39025,7 +40071,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        using var tensorKeep29 = new KeepAliveScope(tensor);
+        using var resultKeep44 = new KeepAliveScope(result);
+        if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorSubtractScalar", result, tensor, BackwardFunctions<T>.SubtractScalarBackward);
@@ -39055,7 +40103,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        using var tensorKeep30 = new KeepAliveScope(tensor);
+        using var resultKeep45 = new KeepAliveScope(result);
+        if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Divide(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         if (scalar is not null)
@@ -39076,8 +40126,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // d/dx tanh(x) = 1 - tanh(x)^2: compute y*y then subtract from 1
         // Use span-based: result = 1 - y*y
-        var y = tanhOutput.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var yLease = tanhOutput.Lease();
+        var y = yLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
         numOps.Multiply(y, y, dest);       // dest = y^2
         numOps.Negate(dest, dest);          // dest = -y^2
         numOps.AddScalar(dest, numOps.One, dest); // dest = 1 - y^2
@@ -39097,11 +40149,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var temp = AutoTensorCache.RentOrAllocate<T>(sigmoidOutput._shape);
 
         // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
-        var y = sigmoidOutput.AsSpan();
-        var oneMinusY = temp.AsWritableSpan();
+        using var yLease = sigmoidOutput.Lease();
+        var y = yLease.Span;
+        using var oneMinusYLease = temp.LeaseWritable();
+        var oneMinusY = oneMinusYLease.Span;
+        using var resultKeep46 = new KeepAliveScope(result);
         numOps.Negate(y, oneMinusY);                     // oneMinusY = -y
         numOps.AddScalar(oneMinusY, numOps.One, oneMinusY); // oneMinusY = 1 - y
-        numOps.Multiply(y, oneMinusY, result.AsWritableSpan()); // result = y * (1-y)
+        numOps.Multiply(y, oneMinusY, result.AsWritableSpanUnmarked()); // result = y * (1-y)
 
         return result;
     }
@@ -39118,8 +40173,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int totalElements = input.Length;
 
         // ReLU derivative: 1 if x > 0, else 0
-        var src = input.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
         for (int i = 0; i < totalElements; i++)
         {
             dest[i] = numOps.ToDouble(src[i]) > 0 ? numOps.One : numOps.Zero;
@@ -39257,14 +40314,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int normAxis = axis < 0 ? tensor.Rank + axis : axis;
             int rows = tensor._shape[0], cols = tensor._shape[1];
-            var fSrc = (float[])(object)tensor.GetDataArray();
+            using var fSrcLease = tensor.LeaseArray();
+            var fSrc = (float[])(object)fSrcLease.Array;
 
             if (normAxis == 1)
             {
                 // Norm along cols → output [rows] or [rows,1]
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var fDst = (float[])(object)normResult.GetDataArray();
+                using var fDstLease = normResult.LeaseArray();
+                var fDst = (float[])(object)fDstLease.Array;
                 for (int r = 0; r < rows; r++)
                 {
                     float sumSq = 0f;
@@ -39286,7 +40345,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Norm along rows → output [cols] or [1,cols]
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var fDst = (float[])(object)normResult.GetDataArray();
+                using var fDstLease = normResult.LeaseArray();
+                var fDst = (float[])(object)fDstLease.Array;
                 Array.Clear(fDst, 0, cols);
                 for (int r = 0; r < rows; r++)
                 {
@@ -39311,13 +40371,15 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int normAxis = axis < 0 ? tensor.Rank + axis : axis;
             int rows = tensor._shape[0], cols = tensor._shape[1];
-            var dSrc = (double[])(object)tensor.GetDataArray();
+            using var dSrcLease = tensor.LeaseArray();
+            var dSrc = (double[])(object)dSrcLease.Array;
 
             if (normAxis == 1)
             {
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var dDst = (double[])(object)normResult.GetDataArray();
+                using var dDstLease = normResult.LeaseArray();
+                var dDst = (double[])(object)dDstLease.Array;
                 for (int r = 0; r < rows; r++)
                 {
                     double sumSq = 0.0;
@@ -39338,7 +40400,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var normResult = AutoTensorCache.RentOrAllocate<T>(outShape);
-                var dDst = (double[])(object)normResult.GetDataArray();
+                using var dDstLease = normResult.LeaseArray();
+                var dDst = (double[])(object)dDstLease.Array;
                 Array.Clear(dDst, 0, cols);
                 for (int r = 0; r < rows; r++)
                 {
@@ -39469,7 +40532,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var outShape = ConcatenateOutputShape(tensors, normalizedAxis);
             result = AutoTensorCache.RentOrAllocate<T>(outShape);
-            ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpan());
+            using var resultKeep47 = new KeepAliveScope(result);
+            ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpanUnmarked());
         }
         // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
         else if (axis == 0 && tensors.All(t => t.IsContiguous))
@@ -39481,11 +40545,13 @@ public partial class CpuEngine : ITensorLevelEngine
             outShape[0] = totalAxis0;
 
             result = AutoTensorCache.RentOrAllocate<T>(outShape);
-            var data = result.GetDataArray();
+            using var dataLease = result.LeaseArray();
+            var data = dataLease.Array;
             int offset = 0;
             foreach (var t in tensors)
             {
-                var src = t.GetDataArray();
+                using var srcLease = t.LeaseArray();
+                var src = srcLease.Array;
                 Array.Copy(src, 0, data, offset, t.Length);
                 offset += t.Length;
             }
@@ -39584,7 +40650,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int d = 0; d < rank; d++)
             if (outShape[d] != output._shape[d]) return false;
 
-        ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpan());
+        using var outputKeep6 = new KeepAliveScope(output);
+        ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpanUnmarked());
         output.IncrementVersion();
         return true;
     }
@@ -39664,14 +40731,16 @@ public partial class CpuEngine : ITensorLevelEngine
             int outImageStride = cgPerSplit * H * W * cb;
             int copyPerImage = outImageStride;
             var srcF = (Tensor<float>)(object)tensor;
-            var srcData = srcF.GetDataArray();
+            using var srcDataLease = srcF.LeaseArray();
+            var srcData = srcDataLease.Array;
             var packedResults = new Tensor<T>[numSplits];
             for (int i = 0; i < numSplits; i++)
             {
                 var splitShape = (int[])tensor._shape.Clone();
                 splitShape[1] = splitSize;
                 var dst = new Tensor<float>(splitShape) { Layout = LinearAlgebra.TensorLayout.Nchwc8 };
-                var dstData = dst.GetDataArray();
+                using var dstDataLease = dst.LeaseArray();
+                var dstData = dstDataLease.Array;
                 int srcCgStart = i * cgPerSplit;
                 for (int n = 0; n < N; n++)
                 {
@@ -39711,7 +40780,8 @@ public partial class CpuEngine : ITensorLevelEngine
         result.Fill(numOps.Zero);
 
         var idxData = indices.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         for (int i = 0; i < numIndices; i++)
         {
@@ -39751,7 +40821,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
         var tensorData = tensor.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, result.Length, flatIdx =>
         {
@@ -39806,7 +40877,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
         var tensorData = tensor.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, result.Length, flatIdx =>
         {
@@ -39858,9 +40930,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
-        var predSpan = predictions.AsSpan();
-        var targetSpan = targets.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var predSpanLease = predictions.Lease();
+        var predSpan = predSpanLease.Span;
+        using var targetSpanLease = targets.Lease();
+        var targetSpan = targetSpanLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         // #294 NumericFastPath wiring: bypass per-element
         // INumericOperations<T> dispatch for the float / double
@@ -39869,9 +40944,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // Pattern-match the underlying T[] arrays (T isn't constrained
         // to struct on this method, so MemoryMarshal.Cast<T,double>
         // doesn't compile).
-        var predArr = predictions.GetDataArray();
-        var targetArr = targets.GetDataArray();
-        var resultArr = result.GetDataArray();
+        using var predArrLease = predictions.LeaseArray();
+        var predArr = predArrLease.Array;
+        using var targetArrLease = targets.LeaseArray();
+        var targetArr = targetArrLease.Array;
+        using var resultArrLease = result.LeaseArray();
+        var resultArr = resultArrLease.Array;
         if (predArr is double[] pD && targetArr is double[] tD && resultArr is double[] dD)
         {
             double eps = (double)(object)epsilon!;
@@ -39947,18 +41025,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
-        var predSpan = predictions.AsSpan();
-        var targetSpan = targets.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var predSpanLease = predictions.Lease();
+        var predSpan = predSpanLease.Span;
+        using var targetSpanLease = targets.Lease();
+        var targetSpan = targetSpanLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         // #294 NumericFastPath wiring: the audit measured this exact
         // method at 4× speedup when the inner loop runs raw double
         // arithmetic instead of routing every op through INumericOperations<T>.
         // Fast-path the float / double primitives via array
         // pattern-match (T isn't constrained struct on this method).
-        var predArr = predictions.GetDataArray();
-        var targetArr = targets.GetDataArray();
-        var resultArr = result.GetDataArray();
+        using var predArrLease = predictions.LeaseArray();
+        var predArr = predArrLease.Array;
+        using var targetArrLease = targets.LeaseArray();
+        var targetArr = targetArrLease.Array;
+        using var resultArrLease = result.LeaseArray();
+        var resultArr = resultArrLease.Array;
         if (predArr is double[] pD && targetArr is double[] tD && resultArr is double[] dD)
         {
             double eps = (double)(object)epsilon!;
@@ -40045,10 +41129,14 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var X = TensorAllocator.Rent<T>([height, width]);
         var Y = TensorAllocator.Rent<T>([height, width]);
-        var xData = x.GetDataArray();
-        var yData = y.GetDataArray();
-        var XData = X.GetDataArray();
-        var YData = Y.GetDataArray();
+        using var xDataLease = x.LeaseArray();
+        var xData = xDataLease.Array;
+        using var yDataLease = y.LeaseArray();
+        var yData = yDataLease.Array;
+        using var XDataLease = X.LeaseArray();
+        var XData = XDataLease.Array;
+        using var YDataLease = Y.LeaseArray();
+        var YData = YDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, height, X.Length + Y.Length, [MethodImpl(Hot)] (row) =>
         {
@@ -40106,7 +41194,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var originalTensor = tensor;
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var tensorData = tensor.GetDataArray();
+        using var tensorDataLease = tensor.LeaseArray();
+        var tensorData = tensorDataLease.Array;
 
         // Generic N-D slice: select index along axis, producing rank-1 output.
         // stride = product(shape[axis+1:]) — contiguous elements per index along axis
@@ -40122,7 +41211,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int axisSize = tensor._shape[axis];
 
         var result = TensorAllocator.Rent<T>(outShape);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         if (outerCount > 64)
         {
@@ -40160,7 +41250,8 @@ public partial class CpuEngine : ITensorLevelEngine
         T divisor = numOps.FromDouble(count - 1);
         T step = numOps.Divide(range, divisor);
 
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         CpuParallelSettings.ParallelForOrSerial(0, count, result.Length, i =>
         {
             T value = numOps.Add(start, numOps.Multiply(numOps.FromDouble(i), step));
@@ -40222,7 +41313,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // COW Stage 2 (#624): a/b are read-only operands — non-privatizing read keeps a clone O(1).
         var aData = a.GetReadOnlyDataArray();
         var bData = b.GetReadOnlyDataArray();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch, result.Length, batchIdx =>
         {
@@ -40263,8 +41355,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!source.IsContiguous) source = source.Contiguous();
 
-        var dstData = destination.GetDataArray();
-        var srcData = source.GetDataArray();
+        using var dstDataLease = destination.LeaseArray();
+        var dstData = dstDataLease.Array;
+        using var srcDataLease = source.LeaseArray();
+        var srcData = srcDataLease.Array;
 
         // Generic N-D set-slice: write source into destination at [... , index, ...] along axis.
         // Same stride/outerCount algorithm as TensorSliceAxis but reversed (src→dst).
@@ -40353,8 +41447,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Use Pin() for NativeMemory compatibility
             var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-            using var pinIn = tensor.Data.Pin();
-            using var pinOut = result.Data.Pin();
+            using var tensorDataKeep37 = new KeepAliveScope(tensor);
+            using var pinIn = tensor.DataUnmarked.Pin();
+            using var resultDataKeep61 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
             unsafe
             {
                 LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
@@ -40371,8 +41467,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
             var resultD = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-            using var pinIn = tensor.Data.Pin();
-            using var pinOut = resultD.Data.Pin();
+            using var tensorDataKeep38 = new KeepAliveScope(tensor);
+            using var pinIn = tensor.DataUnmarked.Pin();
+            using var resultDDataKeep1 = new KeepAliveScope(resultD);
+            using var pinOut = resultD.DataUnmarked.Pin();
             unsafe
             {
                 double* pIn = (double*)pinIn.Pointer;
@@ -40607,7 +41705,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
             var indicesData = indices.GetFlattenedData();
             var tensorData = tensor.GetFlattenedData();
-            var resultData = result.GetDataArray();
+            using var resultDataLease = result.LeaseArray();
+            var resultData = resultDataLease.Array;
             CpuParallelSettings.ParallelForOrSerial(0, numIndices, result.Length, i =>
             {
                 int idx = indicesData[i];
@@ -40626,7 +41725,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var result = TensorAllocator.Rent<T>([rows, numIndices]);
             var indicesData = indices.GetFlattenedData();
             var tensorData = tensor.GetFlattenedData();
-            var resultData = result.GetDataArray();
+            using var resultDataLease = result.LeaseArray();
+            var resultData = resultDataLease.Array;
 
             CpuParallelSettings.ParallelForOrSerial(0, rows, result.Length, [MethodImpl(Hot)] (i) =>
             {
@@ -40693,7 +41793,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = axis; i < firstShape.Length; i++) newShape[i + 1] = firstShape[i];
 
         var result = AutoTensorCache.RentOrAllocate<T>(newShape);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         // Fast path: axis=0 with contiguous tensors — just Array.Copy sequentially
         if (axis == 0 && tensors.All(t => t.IsContiguous))
@@ -40773,7 +41874,8 @@ public partial class CpuEngine : ITensorLevelEngine
         try
         {
             var src = tensor.GetFlattenedData();
-            var dest = result.GetDataArray();
+            using var destLease = result.LeaseArray();
+            var dest = destLease.Array;
 
             for (int i = 0; i < tensor.Length; i++)
                 dest[i] = func(src[i]);
@@ -40817,8 +41919,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
         var result = tensor.Clone();
-        var maskSpan = mask.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var maskSpanLease = mask.Lease();
+        var maskSpan = maskSpanLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < maskSpan.Length; i++)
         {
@@ -40849,8 +41953,10 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         var result = tensor.Clone();
-        var maskSpan = mask.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var maskSpanLease = mask.Lease();
+        var maskSpan = maskSpanLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < maskSpan.Length; i++)
         {
@@ -40900,14 +42006,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var computeTensor = tensor.IsContiguous ? tensor : tensor.Contiguous();
         var computeMask = mask.IsContiguous ? mask : mask.Contiguous();
 
-        var src = computeTensor.AsSpan();
-        var maskSpan = computeMask.AsSpan();
+        using var srcLease = computeTensor.Lease();
+        var src = srcLease.Span;
+        using var maskSpanLease = computeMask.Lease();
+        var maskSpan = maskSpanLease.Span;
         // First pass: count true entries.
         int n = 0;
         for (int i = 0; i < maskSpan.Length; i++) if ((bool)maskSpan[i]) n++;
 
         var result = new Tensor<T>(new[] { n });
-        var dest = result.AsWritableSpan();
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
         // Second pass: copy selected elements in order.
         int w = 0;
         for (int i = 0; i < maskSpan.Length; i++)
@@ -40937,7 +42046,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var condData = condition.GetFlattenedData();
         var xData = x.GetFlattenedData();
         var yData = y.GetFlattenedData();
-        var rData = result.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, x.Length, x.Length, i =>
         {
@@ -40977,7 +42087,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var condData = condition.GetFlattenedData();
         var xData = x.GetFlattenedData();
         var yData = y.GetFlattenedData();
-        var rData = result.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, x.Length, x.Length, i =>
         {
@@ -41405,9 +42516,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // Same ||x-y||^2 = ||x||^2 + ||y||^2 - 2 x·y identity and same accumulation order (bit-exact).
         var xc = x.IsContiguous ? x : x.Contiguous();
         var yc = y.IsContiguous ? y : y.Contiguous();
-        var xData = xc.GetDataArray();
-        var yData = yc.GetDataArray();
-        var resData = result.GetDataArray();
+        using var xDataLease = xc.LeaseArray();
+        var xData = xDataLease.Array;
+        using var yDataLease = yc.LeaseArray();
+        var yData = yDataLease.Array;
+        using var resDataLease = result.LeaseArray();
+        var resData = resDataLease.Array;
 
         if (typeof(T) == typeof(double))
         {
@@ -41524,9 +42638,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var values = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var indices = new Tensor<int>(outputShape);
-        var inputData = input.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
         var valuesData = values.GetDataArray();
-        var indicesData = indices.GetDataArray();
+        using var indicesDataLease = indices.LeaseArray();
+        var indicesData = indicesDataLease.Array;
 
         // Calculate strides for axis iteration
         int outerSize = 1;
@@ -41582,7 +42698,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<int>(input._shape);
         var inputData = input.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         int axisSize = input._shape[axis];
         int outerSize = 1;
@@ -41662,7 +42779,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
         var indicesData = indices.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         int outerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
@@ -41708,7 +42826,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Create a copy of input
         var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var inputData = input.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         Array.Copy(inputData, resultData, input.Length);
 
         var indicesData = indices.GetFlattenedData();
@@ -41759,7 +42878,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Create a copy of input
         var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
         var inputData = input.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         Array.Copy(inputData, resultData, input.Length);
 
         var indicesData = indices.GetFlattenedData();
@@ -41822,8 +42942,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep39 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep62 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CoshUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -41831,16 +42953,20 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var dSrc = (double[])(object)tensor.GetDataArray();
-            var dDst = (double[])(object)result.GetDataArray();
+            using var dSrcLease = tensor.LeaseArray();
+            var dSrc = (double[])(object)dSrcLease.Array;
+            using var dDstLease = result.LeaseArray();
+            var dDst = (double[])(object)dDstLease.Array;
             for (int i = 0; i < length; i++)
                 dDst[i] = Math.Cosh(dSrc[i]);
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var srcSpan = tensor.AsSpan();
-            var dstSpan = result.AsWritableSpan();
+            using var srcSpanLease = tensor.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < length; i++)
                 dstSpan[i] = numOps.FromDouble(Math.Cosh(numOps.ToDouble(srcSpan[i])));
         }
@@ -41876,8 +43002,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep40 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep63 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SinhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -41885,16 +43013,20 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var dSrc = (double[])(object)tensor.GetDataArray();
-            var dDst = (double[])(object)result.GetDataArray();
+            using var dSrcLease = tensor.LeaseArray();
+            var dSrc = (double[])(object)dSrcLease.Array;
+            using var dDstLease = result.LeaseArray();
+            var dDst = (double[])(object)dDstLease.Array;
             for (int i = 0; i < length; i++)
                 dDst[i] = Math.Sinh(dSrc[i]);
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var srcSpan = tensor.AsSpan();
-            var dstSpan = result.AsWritableSpan();
+            using var srcSpanLease = tensor.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < length; i++)
                 dstSpan[i] = numOps.FromDouble(Math.Sinh(numOps.ToDouble(srcSpan[i])));
         }
@@ -42108,7 +43240,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     var int8Result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
                     var inA = (float[])(object)input.GetReadOnlyDataArray();
-                    var outA = (float[])(object)int8Result.GetDataArray();
+                    using var outALease = int8Result.LeaseArray();
+                    var outA = (float[])(object)outALease.Array;
                     Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
                         inA, q8.Data, q8.Scales, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
@@ -42129,8 +43262,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (q4 is not null && q4.Rows == N && q4.K == K)
                 {
                     var int4Result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
-                    var inA = (float[])(object)input.GetDataArray();
-                    var outA = (float[])(object)int4Result.GetDataArray();
+                    using var inALease = input.LeaseArray();
+                    var inA = (float[])(object)inALease.Array;
+                    using var outALease = int4Result.LeaseArray();
+                    var outA = (float[])(object)outALease.Array;
                     Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
                         inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
@@ -42149,7 +43284,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
                 var inArr = (float[])(object)input.GetReadOnlyDataArray();
                 var wArr = (float[])(object)weights.GetReadOnlyDataArray();
-                var outArr = (float[])(object)result.GetDataArray();
+                using var outArrLease = result.LeaseArray();
+                var outArr = (float[])(object)outArrLease.Array;
 
                 bool blasDone = false;
                 var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
@@ -42277,7 +43413,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, N });
                 var inArr = (double[])(object)input.GetReadOnlyDataArray();
                 var wArr = (double[])(object)weights.GetReadOnlyDataArray();
-                var outArr = (double[])(object)result.GetDataArray();
+                using var outArrLease = result.LeaseArray();
+                var outArr = (double[])(object)outArrLease.Array;
 
                 bool dBlasDone = false;
 #if NET5_0_OR_GREATER
@@ -42336,7 +43473,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var matMulResult = TensorMatMul(input, weights);
             if (bias != null || activation != FusedActivationType.None)
             {
-                var outArr = (float[])(object)matMulResult.GetDataArray();
+                using var outArrLease = matMulResult.LeaseArray();
+                var outArr = (float[])(object)outArrLease.Array;
                 var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
                 // matMulResult shape: [..batchDims.., M_rows, N]
                 // Collapse batch dims to treat as a single [M_total, N] for the epilogue.
@@ -42408,7 +43546,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (q8 is not null && q8.Rows == N && q8.K == K)
                 {
                     var inA = (float[])(object)input.GetReadOnlyDataArray();
-                    var outA = (float[])(object)destination.GetDataArray();
+                    using var outALease = destination.LeaseArray();
+                    var outA = (float[])(object)outALease.Array;
                     Simd.SimdGemm.SgemmWithInt8RowScaledCachedB(
                         inA, q8.Data, q8.Scales, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
@@ -42425,8 +43564,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 var q4 = weights.GetMaterializedStreamingInt4();
                 if (q4 is not null && q4.Rows == N && q4.K == K)
                 {
-                    var inA = (float[])(object)input.GetDataArray();
-                    var outA = (float[])(object)destination.GetDataArray();
+                    using var inALease = input.LeaseArray();
+                    var inA = (float[])(object)inALease.Array;
+                    using var outALease = destination.LeaseArray();
+                    var outA = (float[])(object)outALease.Array;
                     Simd.SimdGemm.SgemmWithInt4GroupScaledDispatch(
                         inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
@@ -42443,7 +43584,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var inArr = (float[])(object)input.GetReadOnlyDataArray();
                 var wArr = (float[])(object)weights.GetReadOnlyDataArray();
-                var outArr = (float[])(object)destination.GetDataArray();
+                using var outArrLease = destination.LeaseArray();
+                var outArr = (float[])(object)outArrLease.Array;
 
                 bool blasDone = false;
                 var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
@@ -42539,7 +43681,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var inArr = (double[])(object)input.GetReadOnlyDataArray();
                 var wArr = (double[])(object)weights.GetReadOnlyDataArray();
-                var outArr = (double[])(object)destination.GetDataArray();
+                using var outArrLease = destination.LeaseArray();
+                var outArr = (double[])(object)outArrLease.Array;
 
                 bool dBlasDone = false;
 #if NET5_0_OR_GREATER
@@ -42593,7 +43736,9 @@ public partial class CpuEngine : ITensorLevelEngine
             if (destination.Length != result.Length)
                 throw new ArgumentException(
                     $"Destination length ({destination.Length}) must equal FusedLinear result length ({result.Length}).");
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep64 = new KeepAliveScope(result);
+            using var destinationDataKeep46 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -42672,8 +43817,10 @@ public partial class CpuEngine : ITensorLevelEngine
         outShape[outShape.Length - 1] = units;
         var result = new Tensor<T>(outShape);
 
-        var pa = pre.GetDataArray();
-        var oa = result.GetDataArray();
+        using var paLease = pre.LeaseArray();
+        var pa = paLease.Array;
+        using var oaLease = result.LeaseArray();
+        var oa = oaLease.Array;
         var cmp = System.Collections.Generic.Comparer<T>.Default;
         for (int r = 0; r < rows; r++)
         {
@@ -42754,9 +43901,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(outShape);
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var xa = input.GetDataArray();
-        var wa = nodeWeights.GetDataArray();
-        var oa = result.GetDataArray();
+        using var xaLease = input.LeaseArray();
+        var xa = xaLease.Array;
+        using var waLease = nodeWeights.LeaseArray();
+        var wa = waLease.Array;
+        using var oaLease = result.LeaseArray();
+        var oa = oaLease.Array;
         var one = numOps.One;
         var gates = new T[treeDepth];
 
@@ -42915,7 +44065,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 || activation == FusedActivationType.ReLU))
         {
             int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
-            var outArr = (float[])(object)result.GetDataArray();
+            using var outArrLease = result.LeaseArray();
+            var outArr = (float[])(object)outArrLease.Array;
             var biasArr = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
             CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
             return result;
@@ -42935,7 +44086,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 || activation == FusedActivationType.ReLU))
         {
             int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
-            var outArr = (double[])(object)result.GetDataArray();
+            using var outArrLease = result.LeaseArray();
+            var outArr = (double[])(object)outArrLease.Array;
             var biasArr = bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null;
             CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
             return result;
@@ -43141,8 +44293,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-        var src = input.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
         {
@@ -43162,8 +44316,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-        var src = input.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         for (int i = 0; i < src.Length; i++)
             dest[i] = numOps.ToDouble(src[i]) > 0 ? numOps.One : alpha;
@@ -43178,8 +44334,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-        var src = input.AsSpan();
-        var dest = result.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var destLease = result.LeaseWritable();
+        var dest = destLease.Span;
 
         const double sqrtTwoOverPi = 0.7978845608028654; // sqrt(2/pi)
         const double coeff = 0.044715;
@@ -43301,25 +44459,47 @@ public partial class CpuEngine : ITensorLevelEngine
         var real = new Tensor<float>(componentShape);
         var imaginary = new Tensor<float>(componentShape);
         float[] source = input.GetFlattenedData();
-        float[] realData = real.GetDataArray();
-        float[] imaginaryData = imaginary.GetDataArray();
+        using var realDataLease = real.LeaseArray();
+        float[] realData = realDataLease.Array;
+        using var imaginaryDataLease = imaginary.LeaseArray();
+        float[] imaginaryData = imaginaryDataLease.Array;
         for (int i = 0; i < real.Length; i++)
         {
             realData[i] = source[2 * i];
             imaginaryData[i] = source[(2 * i) + 1];
         }
 
-        Tensor<float> outputReal;
-        Tensor<float> outputImaginary;
-        if (inverse)
-            IFFT(real, imaginary, out outputReal, out outputImaginary);
-        else
-            FFT(real, imaginary, out outputReal, out outputImaginary);
+        // FFTCore zero-pads a non-power-of-two length to the next power of two, which is a different transform; the
+        // generic contract is arbitrary length, so every row takes the exact n-point transform (Bluestein when needed).
+        var outputReal = new Tensor<float>(componentShape);
+        var outputImaginary = new Tensor<float>(componentShape);
+        float[] rowReal = outputReal.GetDataArray();
+        float[] rowImaginary = outputImaginary.GetDataArray();
+        float scale = inverse ? 1f / n : 1f;
+        for (int row = 0; row < real.Length / n; row++)
+        {
+            var re = new Vector<float>(n);
+            var im = new Vector<float>(n);
+            for (int k = 0; k < n; k++)
+            {
+                re[k] = realData[row * n + k];
+                im[k] = imaginaryData[row * n + k];
+            }
+            var (transformedReal, transformedImaginary) = UnnormalizedTransform(re, im, inverse);
+            for (int k = 0; k < n; k++)
+            {
+                rowReal[row * n + k] = transformedReal[k] * scale;
+                rowImaginary[row * n + k] = transformedImaginary[k] * scale;
+            }
+        }
 
         var result = new Tensor<float>((int[])input._shape.Clone());
-        float[] destination = result.GetDataArray();
-        float[] outputRealData = outputReal.GetDataArray();
-        float[] outputImaginaryData = outputImaginary.GetDataArray();
+        using var destinationLease = result.LeaseArray();
+        float[] destination = destinationLease.Array;
+        using var outputRealDataLease = outputReal.LeaseArray();
+        float[] outputRealData = outputRealDataLease.Array;
+        using var outputImaginaryDataLease = outputImaginary.LeaseArray();
+        float[] outputImaginaryData = outputImaginaryDataLease.Array;
         for (int i = 0; i < outputReal.Length; i++)
         {
             destination[2 * i] = outputRealData[i];
@@ -43394,7 +44574,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         // Handle batched input
         int batchSize = input.Length / n;
@@ -43503,7 +44684,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         // Handle batched input
         int batchSize = input.Length / (numFreqs * 2);
@@ -43590,8 +44772,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
         var inputRealData = inputReal.GetFlattenedData();
         var inputImagData = inputImag.GetFlattenedData();
-        var outRealData = outReal.GetDataArray();
-        var outImagData = outImag.GetDataArray();
+        using var outRealDataLease = outReal.LeaseArray();
+        var outRealData = outRealDataLease.Array;
+        using var outImagDataLease = outImag.LeaseArray();
+        var outImagData = outImagDataLease.Array;
 
         int batchSize = inputReal.Length / n;
 
@@ -43653,8 +44837,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
         var inputRealData = inputReal.GetFlattenedData();
         var inputImagData = inputImag.GetFlattenedData();
-        var outRealData = outReal.GetDataArray();
-        var outImagData = outImag.GetDataArray();
+        using var outRealDataLease = outReal.LeaseArray();
+        var outRealData = outRealDataLease.Array;
+        using var outImagDataLease = outImag.LeaseArray();
+        var outImagData = outImagDataLease.Array;
 
         int batchSize = inputReal.Length / n;
         T scale = numOps.FromDouble(1.0 / n);
@@ -43720,10 +44906,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // Create local variables to use in lambda (out params can't be captured)
         var outReal = AutoTensorCache.RentOrAllocate<T>(inputReal._shape);
         var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
-        var tempRealData = tempReal.GetDataArray();
-        var tempImagData = tempImag.GetDataArray();
-        var outRealData = outReal.GetDataArray();
-        var outImagData = outImag.GetDataArray();
+        using var tempRealDataLease = tempReal.LeaseArray();
+        var tempRealData = tempRealDataLease.Array;
+        using var tempImagDataLease = tempImag.LeaseArray();
+        var tempImagData = tempImagDataLease.Array;
+        using var outRealDataLease = outReal.LeaseArray();
+        var outRealData = outRealDataLease.Array;
+        using var outImagDataLease = outImag.LeaseArray();
+        var outImagData = outImagDataLease.Array;
 
         // FFT along rows (second-to-last dimension)
         int batchSize = inputReal.Length / (height * width);
@@ -43791,10 +44981,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var outImag = AutoTensorCache.RentOrAllocate<T>(inputImag._shape);
         var inputRealData = inputReal.GetFlattenedData();
         var inputImagData = inputImag.GetFlattenedData();
-        var tempRealData = tempReal.GetDataArray();
-        var tempImagData = tempImag.GetDataArray();
-        var outRealData = outReal.GetDataArray();
-        var outImagData = outImag.GetDataArray();
+        using var tempRealDataLease = tempReal.LeaseArray();
+        var tempRealData = tempRealDataLease.Array;
+        using var tempImagDataLease = tempImag.LeaseArray();
+        var tempImagData = tempImagDataLease.Array;
+        using var outRealDataLease = outReal.LeaseArray();
+        var outRealData = outRealDataLease.Array;
+        using var outImagDataLease = outImag.LeaseArray();
+        var outImagData = outImagDataLease.Array;
 
         int batchSize = inputReal.Length / (height * width);
         T scale = numOps.FromDouble(1.0 / (height * width));
@@ -43906,8 +45100,10 @@ public partial class CpuEngine : ITensorLevelEngine
             var paddedShape = input.Shape.ToArray();
             paddedShape[^1] = signalLength + 2 * padAmount;
             paddedInput = AutoTensorCache.RentOrAllocate<T>(paddedShape);
-            var inputData = input.GetDataArray();
-            var paddedData = paddedInput.GetDataArray();
+            using var inputDataLease = input.LeaseArray();
+            var inputData = inputDataLease.Array;
+            using var paddedDataLease = paddedInput.LeaseArray();
+            var paddedData = paddedDataLease.Array;
 
             int batchSize = input.Length / signalLength;
             for (int b = 0; b < batchSize; b++)
@@ -43961,10 +45157,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // Create local variables to use in lambda (out params can't be captured)
         var magOut = AutoTensorCache.RentOrAllocate<T>(newShape);
         var phOut = AutoTensorCache.RentOrAllocate<T>(newShape);
-        var paddedInputData = paddedInput.GetDataArray();
-        var windowData = window.GetDataArray();
-        var magOutData = magOut.GetDataArray();
-        var phOutData = phOut.GetDataArray();
+        using var paddedInputDataLease = paddedInput.LeaseArray();
+        var paddedInputData = paddedInputDataLease.Array;
+        using var windowDataLease = window.LeaseArray();
+        var windowData = windowDataLease.Array;
+        using var magOutDataLease = magOut.LeaseArray();
+        var magOutData = magOutDataLease.Array;
+        using var phOutDataLease = phOut.LeaseArray();
+        var phOutData = phOutDataLease.Array;
 
         int batchSizeStft = paddedInput.Length / signalLength;
 
@@ -44063,11 +45263,16 @@ public partial class CpuEngine : ITensorLevelEngine
         outputShape = outputShape.Length > 0 ? outputShape.Append(outputLength).ToArray() : new[] { outputLength };
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var windowSum = AutoTensorCache.RentOrAllocate<T>(outputShape);
-        var magData = magnitude.GetDataArray();
-        var phaseData = phase.GetDataArray();
-        var windowData = window.GetDataArray();
-        var resultData = result.GetDataArray();
-        var windowSumData = windowSum.GetDataArray();
+        using var magDataLease = magnitude.LeaseArray();
+        var magData = magDataLease.Array;
+        using var phaseDataLease = phase.LeaseArray();
+        var phaseData = phaseDataLease.Array;
+        using var windowDataLease = window.LeaseArray();
+        var windowData = windowDataLease.Array;
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
+        using var windowSumDataLease = windowSum.LeaseArray();
+        var windowSumData = windowSumDataLease.Array;
 
         // ZERO the accumulators. Both are overlap-ADD targets (resultData[idx] += ...,
         // windowSumData[idx] += ...), but AutoTensorCache.RentOrAllocate hands back POOLED memory
@@ -44242,9 +45447,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var melShape = magnitude.Shape.ToArray();
         melShape[^2] = nMels;
         var melSpec = AutoTensorCache.RentOrAllocate<T>(melShape);
-        var melFilterData = melFilterbank.GetDataArray();
-        var powerSpecData = powerSpec.GetDataArray();
-        var melSpecData = melSpec.GetDataArray();
+        using var melFilterDataLease = melFilterbank.LeaseArray();
+        var melFilterData = melFilterDataLease.Array;
+        using var powerSpecDataLease = powerSpec.LeaseArray();
+        var powerSpecData = powerSpecDataLease.Array;
+        using var melSpecDataLease = melSpec.LeaseArray();
+        var melSpecData = melSpecDataLease.Array;
 
         for (int batchIdx = 0; batchIdx < batchSize; batchIdx++)
         {
@@ -44280,7 +45488,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (powerToDb)
         {
             linearMel = new Tensor<T>(melShape);
-            var linearMelData = linearMel.GetDataArray();
+            using var linearMelDataLease = linearMel.LeaseArray();
+            var linearMelData = linearMelDataLease.Array;
             Array.Copy(melSpecData, linearMelData, melSpec.Length);
         }
         else
@@ -44378,8 +45587,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // Apply momentum for faster convergence
             if (previousPhase != null && momentum > 0)
             {
-                var newPhaseData = newPhase.GetDataArray();
-                var prevPhaseData = previousPhase.GetDataArray();
+                using var newPhaseDataLease = newPhase.LeaseArray();
+                var newPhaseData = newPhaseDataLease.Array;
+                using var prevPhaseDataLease = previousPhase.LeaseArray();
+                var prevPhaseData = prevPhaseDataLease.Array;
                 phaseData = phase.GetDataArray();
                 for (int i = 0; i < phase.Length; i++)
                 {
@@ -44764,8 +45975,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(input.Data);
-                var dstMem = AsFloatMemory(softplusResult.Data);
+                using var inputDataKeep34 = new KeepAliveScope(input);
+                var srcMem = AsFloatMemory(input.DataUnmarked);
+                using var softplusResultDataKeep1 = new KeepAliveScope(softplusResult);
+                var dstMem = AsFloatMemory(softplusResult.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SoftplusUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -44774,8 +45987,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var srcSpan = input.AsSpan();
-            var dstSpan = softplusResult.AsWritableSpan();
+            using var srcSpanLease = input.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var dstSpanLease = softplusResult.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < length; i++)
             {
                 double x = numOps.ToDouble(srcSpan[i]);
@@ -44815,8 +46030,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(input.Data);
-                var dstMem = AsFloatMemory(hardSwishResult.Data);
+                using var inputDataKeep35 = new KeepAliveScope(input);
+                var srcMem = AsFloatMemory(input.DataUnmarked);
+                using var hardSwishResultDataKeep1 = new KeepAliveScope(hardSwishResult);
+                var dstMem = AsFloatMemory(hardSwishResult.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.HardSwishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -44825,8 +46042,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var srcSpan = input.AsSpan();
-            var dstSpan = hardSwishResult.AsWritableSpan();
+            using var srcSpanLease = input.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var dstSpanLease = hardSwishResult.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < length; i++)
             {
                 double x = numOps.ToDouble(srcSpan[i]);
@@ -44881,8 +46100,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             float scale = (float)gradOutput.UniformFillValue.Value;
             var resultTensor = AutoTensorCache.RentOrAllocate<T>(input._shape);
-            var iArr = (float[])(object)input.GetDataArray();
-            var rArr = (float[])(object)resultTensor.GetDataArray();
+            using var iArrLease = input.LeaseArray();
+            var iArr = (float[])(object)iArrLease.Array;
+            using var rArrLease = resultTensor.LeaseArray();
+            var rArr = (float[])(object)rArrLease.Array;
             ParallelElementwiseChunks(length, (start, count) =>
             {
                 fixed (float* pI = iArr, pR = rArr)
@@ -44899,9 +46120,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var gArr = (float[])(object)gradOutput.GetDataArray();
-            var iArr = (float[])(object)input.GetDataArray();
-            var rArr = (float[])(object)resultTensor2.GetDataArray();
+            using var gArrLease = gradOutput.LeaseArray();
+            var gArr = (float[])(object)gArrLease.Array;
+            using var iArrLease = input.LeaseArray();
+            var iArr = (float[])(object)iArrLease.Array;
+            using var rArrLease = resultTensor2.LeaseArray();
+            var rArr = (float[])(object)rArrLease.Array;
             ParallelElementwiseChunks(length, (start, count) =>
             {
                 fixed (float* pG = gArr, pI = iArr, pR = rArr)
@@ -44911,9 +46135,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // Double SIMD backward (AVX2: 4 doubles per vector)
-            var gMem = AsDoubleMemory(gradOutput.Data);
-            var iMem = AsDoubleMemory(input.Data);
-            var rMem = AsDoubleMemory(resultTensor2.Data);
+            using var gradOutputDataKeep1 = new KeepAliveScope(gradOutput);
+            var gMem = AsDoubleMemory(gradOutput.DataUnmarked);
+            using var inputDataKeep36 = new KeepAliveScope(input);
+            var iMem = AsDoubleMemory(input.DataUnmarked);
+            using var resultTensor2DataKeep1 = new KeepAliveScope(resultTensor2);
+            var rMem = AsDoubleMemory(resultTensor2.DataUnmarked);
             using var pinG = gMem.Pin();
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
@@ -44926,9 +46153,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var gradData = gradOutput.GetDataArray();
-            var inputData = input.GetDataArray();
-            var resultData = resultTensor2.GetDataArray();
+            using var gradDataLease = gradOutput.LeaseArray();
+            var gradData = gradDataLease.Array;
+            using var inputDataLease = input.LeaseArray();
+            var inputData = inputDataLease.Array;
+            using var resultDataLease = resultTensor2.LeaseArray();
+            var resultData = resultDataLease.Array;
             for (int i = 0; i < length; i++)
             {
                 double inputVal = numOps.ToDouble(inputData[i]);
@@ -44953,7 +46183,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
-        var outData = output.GetDataArray();
+        using var outDataLease = output.LeaseArray();
+        var outData = outDataLease.Array;
         int length = gradOutput.Length;
         var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
@@ -44964,7 +46195,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradData is float[] gF && outData is float[] oF)
         {
             var resultTensor = TensorAllocator.RentUninitialized<float>(gradOutput._shape);
-            var resultArr = resultTensor.GetDataArray();
+            using var resultArrLease = resultTensor.LeaseArray();
+            var resultArr = resultArrLease.Array;
             // Bound by the LOGICAL length — gF/oF can be pool-over-allocated (longer than the tensor's
             // logical Length) while resultArr is sized to `length`; iterating to grad.Length would write
             // past resultArr (unchecked AVX store -> AccessViolation). See TanhBackward for the mechanism.
@@ -44977,8 +46209,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var resultTensor = AutoTensorCache.RentOrAllocate<T>(gradOutput._shape);
             var gArr = (double[])(object)gradOutput.GetFlattenedData();
-            var oArr = (double[])(object)output.GetDataArray();
-            var rArr = (double[])(object)resultTensor.GetDataArray();
+            using var oArrLease = output.LeaseArray();
+            var oArr = (double[])(object)oArrLease.Array;
+            using var rArrLease = resultTensor.LeaseArray();
+            var rArr = (double[])(object)rArrLease.Array;
             unsafe
             {
                 fixed (double* pG = gArr, pO = oArr, pR = rArr)
@@ -45016,9 +46250,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<float>(a._shape);
-        using var pinA = a.ReadOnlyData.Pin();
-        using var pinB = b.ReadOnlyData.Pin();
-        using var pinR = result.Data.Pin();
+        using var aDataKeep21 = new KeepAliveScope(a);
+        using var pinA = a.ReadOnlyDataUnmarked.Pin();
+        using var bDataKeep22 = new KeepAliveScope(b);
+        using var pinB = b.ReadOnlyDataUnmarked.Pin();
+        using var resultDataKeep65 = new KeepAliveScope(result);
+        using var pinR = result.DataUnmarked.Pin();
         nint pa = (nint)pinA.Pointer, pb = (nint)pinB.Pointer, pr = (nint)pinR.Pointer;
         int length = result.Length;
         int chunks = CpuParallelSettings.ElementwiseChunkCount(length);
@@ -45140,7 +46377,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
-        var outData = output.GetDataArray();
+        using var outDataLease = output.LeaseArray();
+        var outData = outDataLease.Array;
         int length = gradOutput.Length;
         var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
@@ -45151,7 +46389,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradData is float[] gF && outData is float[] oF)
         {
             var resultTensor = TensorAllocator.RentUninitialized<float>(gradOutput._shape);
-            var resultArr = resultTensor.GetDataArray();
+            using var resultArrLease = resultTensor.LeaseArray();
+            var resultArr = resultArrLease.Array;
             // Bound by the LOGICAL length: gF/oF come from GetFlattenedData/GetDataArray, which
             // can hand back a pool-OVER-ALLOCATED backing array (physically longer than the tensor's
             // logical Length — see VectorBase.GetDataArray returning the full segment.Array at offset 0).
@@ -45166,8 +46405,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var resultTensor = AutoTensorCache.RentOrAllocate<T>(gradOutput._shape);
             var gArr = (double[])(object)gradOutput.GetFlattenedData();
-            var oArr = (double[])(object)output.GetDataArray();
-            var rArr = (double[])(object)resultTensor.GetDataArray();
+            using var oArrLease = output.LeaseArray();
+            var oArr = (double[])(object)oArrLease.Array;
+            using var rArrLease = resultTensor.LeaseArray();
+            var rArr = (double[])(object)rArrLease.Array;
             unsafe
             {
                 fixed (double* pG = gArr, pO = oArr, pR = rArr)
@@ -45250,9 +46491,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var gMem = AsFloatMemory(gradOutput.Data);
-            var iMem = AsFloatMemory(input.Data);
-            var rMem = AsFloatMemory(resultTensor.Data);
+            using var gradOutputDataKeep2 = new KeepAliveScope(gradOutput);
+            var gMem = AsFloatMemory(gradOutput.DataUnmarked);
+            using var inputDataKeep37 = new KeepAliveScope(input);
+            var iMem = AsFloatMemory(input.DataUnmarked);
+            using var resultTensorDataKeep1 = new KeepAliveScope(resultTensor);
+            var rMem = AsFloatMemory(resultTensor.DataUnmarked);
             using var pinG = gMem.Pin();
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
@@ -45266,9 +46510,12 @@ public partial class CpuEngine : ITensorLevelEngine
             // Stage 4 (#415): SIMD FP64 path — Vector256<double> with
             // FastExpDouble256-based tanh. Same accuracy envelope as the
             // forward GELU SIMD kernel.
-            var gArr = (double[])(object)gradOutput.GetDataArray();
-            var iArr = (double[])(object)input.GetDataArray();
-            var rArr = (double[])(object)resultTensor.GetDataArray();
+            using var gArrLease = gradOutput.LeaseArray();
+            var gArr = (double[])(object)gArrLease.Array;
+            using var iArrLease = input.LeaseArray();
+            var iArr = (double[])(object)iArrLease.Array;
+            using var rArrLease = resultTensor.LeaseArray();
+            var rArr = (double[])(object)rArrLease.Array;
             fixed (double* pG = gArr, pI = iArr, pR = rArr)
             {
                 SimdKernels.GeluBackwardDouble(pG, pI, pR, length);
@@ -45278,9 +46525,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             const double sqrtTwoPi = 0.7978845608028654;
             const double coeff = 0.044715;
-            var gradData = gradOutput.GetDataArray();
-            var inputData = input.GetDataArray();
-            var resultData = resultTensor.GetDataArray();
+            using var gradDataLease = gradOutput.LeaseArray();
+            var gradData = gradDataLease.Array;
+            using var inputDataLease = input.LeaseArray();
+            var inputData = inputDataLease.Array;
+            using var resultDataLease = resultTensor.LeaseArray();
+            var resultData = resultDataLease.Array;
             for (int i = 0; i < length; i++)
             {
                 double x = numOps.ToDouble(inputData[i]);
@@ -45300,8 +46550,10 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> LeakyReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, double negativeSlope)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
+        using var gradDataLease = gradOutput.LeaseArray();
+        var gradData = gradDataLease.Array;
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
         var result = new T[gradOutput.Length];
         int length = gradOutput.Length;
         var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -45345,8 +46597,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
 
         // #294 NumericFastPath: bypass per-element ToDouble/FromDouble
         // for the float / double primitives. Same audit-driven pattern
@@ -45408,8 +46662,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
 
         // #294 NumericFastPath: float / double primitive fast paths.
         if (gData is float[] gF && iData is float[] iF && result is float[] rF)
@@ -45456,8 +46712,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
         // softplus' = sigmoid(x) = 1/(1+exp(-x)). Float path had no primitive fast path at all
         // (full per-element NumOps box/dispatch) — add float (vectorized, FastExp256 ~1e-6 rel
         // err) + double primitive paths.
@@ -45499,8 +46757,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
@@ -45517,8 +46777,10 @@ public partial class CpuEngine : ITensorLevelEngine
         const double scale = 1.0507009873554805;
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
@@ -45533,8 +46795,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
 
         if (typeof(T) == typeof(float))
         {
@@ -45564,8 +46828,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
@@ -45579,9 +46845,12 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
-        var oData = output.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
+        using var oDataLease = output.LeaseArray();
+        var oData = oDataLease.Array;
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
@@ -45598,8 +46867,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
@@ -45614,8 +46885,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // d/dx(1/x) = -1/x^2 = -(1/x)^2 = -output^2
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
-        var gData = gradOutput.GetDataArray();
-        var oData = output.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var oDataLease = output.LeaseArray();
+        var oData = oDataLease.Array;
         for (int i = 0; i < result.Length; i++)
         {
             double o = numOps.ToDouble(oData[i]);
@@ -45630,9 +46903,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var xGrad = new T[input.Length];
         var aGrad = new T[alpha.Length];
-        var gData = gradOutput.GetDataArray();
-        var xData = input.GetDataArray();
-        var aData = alpha.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var xDataLease = input.LeaseArray();
+        var xData = xDataLease.Array;
+        using var aDataLease = alpha.LeaseArray();
+        var aData = aDataLease.Array;
         int alphaSize = alpha.Length;
         // For NCHW layout, alpha is per-channel: index = (i / spatialSize) % channels
         int spatialSize = input.Rank >= 4
@@ -45659,9 +46935,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input.Length;
         var result = new T[n];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
-        var mData = mean.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
+        using var mDataLease = mean.LeaseArray();
+        var mData = mDataLease.Array;
         double gOut = numOps.ToDouble(gData[0]);
         double m = numOps.ToDouble(mData[0]);
         for (int i = 0; i < n; i++)
@@ -45680,10 +46959,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = input.Length;
         var result = new T[n];
-        var gData = gradOutput.GetDataArray();
-        var iData = input.GetDataArray();
-        var mData = mean.GetDataArray();
-        var sData = std.GetDataArray();
+        using var gDataLease = gradOutput.LeaseArray();
+        var gData = gDataLease.Array;
+        using var iDataLease = input.LeaseArray();
+        var iData = iDataLease.Array;
+        using var mDataLease = mean.LeaseArray();
+        var mData = mDataLease.Array;
+        using var sDataLease = std.LeaseArray();
+        var sData = sDataLease.Array;
         double gOut = numOps.ToDouble(gData[0]);
         double m = numOps.ToDouble(mData[0]);
         double s = Math.Max(numOps.ToDouble(sData[0]), 1e-8);
@@ -45739,7 +47022,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedINVar);
                     },
                     BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep6 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep7 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -45843,11 +47128,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int spatialSize = 1;
         for (int i = 2; i < input.Rank; i++) spatialSize *= input._shape[i];
 
-        var gradOutData = gradOutput.GetDataArray();
+        using var gradOutDataLease = gradOutput.LeaseArray();
+        var gradOutData = gradOutDataLease.Array;
         var inputData = input.GetFlattenedData();
         var gammaData = gamma.GetReadOnlyDataArray();
-        var meanData = mean.GetDataArray();
-        var varData = variance.GetDataArray();
+        using var meanDataLease = mean.LeaseArray();
+        var meanData = meanDataLease.Array;
+        using var varDataLease = variance.LeaseArray();
+        var varData = varDataLease.Array;
         var gradInputData = new T[input.Length];
         var gradGammaData = new T[channels];
         var gradBetaData = new T[channels];
@@ -45954,7 +47242,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshMask, capturedMask);
                     },
                     BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep7 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep8 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -45966,16 +47256,20 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (!training || dropoutRate <= 0)
         {
-            input.AsSpan().CopyTo(dropResult.AsWritableSpan());
+            using var inputKeep16 = new KeepAliveScope(input);
+            using var dropResultKeep1 = new KeepAliveScope(dropResult);
+            input.AsSpanUnmarked().CopyTo(dropResult.AsWritableSpanUnmarked());
             if (typeof(T) == typeof(float))
             {
-                var mArr = (float[])(object)mask.GetDataArray();
+                using var mArrLease = mask.LeaseArray();
+                var mArr = (float[])(object)mArrLease.Array;
                 for (int i = 0; i < mask.Length; i++) mArr[i] = 1.0f;
             }
             else
             {
                 var numOps = MathHelper.GetNumericOperations<T>();
-                var mSpan = mask.AsWritableSpan();
+                using var mSpanLease = mask.LeaseWritable();
+                var mSpan = mSpanLease.Span;
                 for (int i = 0; i < mSpan.Length; i++) mSpan[i] = numOps.One;
             }
         }
@@ -45983,9 +47277,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
             float fScale = (float)(1.0 / (1.0 - dropoutRate));
-            var inArr = (float[])(object)input.GetDataArray();
-            var outArr = (float[])(object)dropResult.GetDataArray();
-            var mArr = (float[])(object)mask.GetDataArray();
+            using var inArrLease = input.LeaseArray();
+            var inArr = (float[])(object)inArrLease.Array;
+            using var outArrLease = dropResult.LeaseArray();
+            var outArr = (float[])(object)outArrLease.Array;
+            using var mArrLease = mask.LeaseArray();
+            var mArr = (float[])(object)mArrLease.Array;
             for (int i = 0; i < input.Length; i++)
             {
                 if (rand.NextDouble() >= dropoutRate)
@@ -46004,9 +47301,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
             double dScale = 1.0 / (1.0 - dropoutRate);
-            var inArr = (double[])(object)input.GetDataArray();
-            var outArr = (double[])(object)dropResult.GetDataArray();
-            var mArr = (double[])(object)mask.GetDataArray();
+            using var inArrLease = input.LeaseArray();
+            var inArr = (double[])(object)inArrLease.Array;
+            using var outArrLease = dropResult.LeaseArray();
+            var outArr = (double[])(object)outArrLease.Array;
+            using var mArrLease = mask.LeaseArray();
+            var mArr = (double[])(object)mArrLease.Array;
             for (int i = 0; i < input.Length; i++)
             {
                 if (rand.NextDouble() >= dropoutRate)
@@ -46026,9 +47326,12 @@ public partial class CpuEngine : ITensorLevelEngine
             var numOps = MathHelper.GetNumericOperations<T>();
             var rand = RandomHelper.CreateSeededRandom((int)(DateTime.UtcNow.Ticks % int.MaxValue));
             double scale = 1.0 / (1.0 - dropoutRate);
-            var inSpan = input.AsSpan();
-            var outSpan = dropResult.AsWritableSpan();
-            var mSpan = mask.AsWritableSpan();
+            using var inSpanLease = input.Lease();
+            var inSpan = inSpanLease.Span;
+            using var outSpanLease = dropResult.LeaseWritable();
+            var outSpan = outSpanLease.Span;
+            using var mSpanLease = mask.LeaseWritable();
+            var mSpan = mSpanLease.Span;
             for (int i = 0; i < input.Length; i++)
             {
                 if (rand.NextDouble() >= dropoutRate)
@@ -46069,7 +47372,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
-        var maskData = mask.GetDataArray();
+        using var maskDataLease = mask.LeaseArray();
+        var maskData = maskDataLease.Array;
         var resultData = new T[gradOutput.Length];
 
         for (int i = 0; i < gradOutput.Length; i++)
@@ -46128,7 +47432,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // through the non-privatizing accessor so a cloned model's shared table stays O(1).
         var tableData = embeddingTable.GetReadOnlyDataArray();
         var indicesData = indices.GetReadOnlyDataArray();
-        var resultData = embResult.GetDataArray();
+        using var resultDataLease = embResult.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         for (int i = 0; i < numIndices; i++)
         {
@@ -46341,8 +47646,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // MSE = mean((pred - target)^2) = (dot(diff, diff)) / N
         // Use span-based subtract + dot product instead of ToArray + ToDouble per element
         var diff = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
-        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), diff.AsWritableSpan());
-        T sumSq = numOps.Dot(diff.AsSpan(), diff.AsSpan());
+        using var diffKeep1 = new KeepAliveScope(diff);
+        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), diff.AsWritableSpanUnmarked());
+        using var diffKeep2 = new KeepAliveScope(diff);
+        T sumSq = numOps.Dot(diff.AsSpanUnmarked(), diff.AsSpanUnmarked());
 
         return numOps.Divide(sumSq, numOps.FromDouble(predictions.Length));
     }
@@ -46358,9 +47665,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // grad = 2 * (pred - target) / N
         var result = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
-        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), result.AsWritableSpan());
+        using var resultKeep48 = new KeepAliveScope(result);
+        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), result.AsWritableSpanUnmarked());
         T scale = numOps.FromDouble(2.0 / predictions.Length);
-        numOps.MultiplyScalar(result.AsSpan(), scale, result.AsWritableSpan());
+        using var resultKeep49 = new KeepAliveScope(result);
+        numOps.MultiplyScalar(result.AsSpanUnmarked(), scale, result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -46579,9 +47888,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
+            using var inputArrayKeep47152 = new KeepAliveScope(input);
+            using var outputArrayKeep47153 = new KeepAliveScope(output);
             if (typeof(T) == typeof(float)
-                && input.GetDataArray() is float[] inArrG
-                && output.GetDataArray() is float[] outArrG)
+                && input.GetDataArrayUnmarked() is float[] inArrG
+                && output.GetDataArrayUnmarked() is float[] outArrG)
             {
                 int totalChannelsG = batch * channels;
                 int spatialG = inHeight * inWidth;
@@ -46614,7 +47925,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback.
         var inputData = input.GetFlattenedData();
-        var outputData = output.GetDataArray();
+        using var outputDataLease = output.LeaseArray();
+        var outputData = outputDataLease.Array;
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, idx =>
         {
             int inputBaseOffset = idx * inHeight * inWidth;
@@ -46677,7 +47989,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
@@ -46956,7 +48269,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // std = sqrt(variance)
         var variance = ReduceVariance(input, axes, keepDims);
-        var varianceData = variance.GetDataArray();
+        using var varianceDataLease = variance.LeaseArray();
+        var varianceData = varianceDataLease.Array;
         var resultData = new T[variance.Length];
 
         for (int i = 0; i < variance.Length; i++)
@@ -47003,7 +48317,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var aData = a.GetFlattenedData();
         var bData = b.GetFlattenedData();
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         // Keep the float path identical to the resident GPU kernels: round b-a once,
         // then perform a correctly-rounded fused t*(b-a)+a.
@@ -47080,7 +48395,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var aData = a.GetFlattenedData();
         var bData = b.GetFlattenedData();
-        var rData = result.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
 
         if (typeof(T) == typeof(float))
         {
@@ -47368,8 +48684,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: fused diff^2 sum in a single pass, no intermediate allocations
         if (typeof(T) == typeof(float) && predictions.IsContiguous && targets.IsContiguous)
         {
-            var pArr = (float[])(object)predictions.GetDataArray();
-            var tArr = (float[])(object)targets.GetDataArray();
+            using var pArrLease = predictions.LeaseArray();
+            var pArr = (float[])(object)pArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (float[])(object)tArrLease.Array;
             int len = predictions.Length;
             float sumSq = 0f;
             for (int i = 0; i < len; i++)
@@ -47386,8 +48704,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path: same fused single-pass diff² sum.
         if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
         {
-            var pArr = (double[])(object)predictions.GetDataArray();
-            var tArr = (double[])(object)targets.GetDataArray();
+            using var pArrLease = predictions.LeaseArray();
+            var pArr = (double[])(object)pArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (double[])(object)tArrLease.Array;
             int len = predictions.Length;
             double sumSq = 0.0;
             for (int i = 0; i < len; i++)
@@ -47438,8 +48758,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: fused single-pass sum(|p - t|) / n
         if (typeof(T) == typeof(float) && predictions.IsContiguous && targets.IsContiguous)
         {
-            var pArr = (float[])(object)predictions.GetDataArray();
-            var tArr = (float[])(object)targets.GetDataArray();
+            using var pArrLease = predictions.LeaseArray();
+            var pArr = (float[])(object)pArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (float[])(object)tArrLease.Array;
             int len = predictions.Length;
             float sumAbs = 0f;
             for (int i = 0; i < len; i++)
@@ -47453,8 +48775,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path
         if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
         {
-            var pArr = (double[])(object)predictions.GetDataArray();
-            var tArr = (double[])(object)targets.GetDataArray();
+            using var pArrLease = predictions.LeaseArray();
+            var pArr = (double[])(object)pArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (double[])(object)tArrLease.Array;
             int len = predictions.Length;
             double sumAbs = 0.0;
             for (int i = 0; i < len; i++)
@@ -47503,8 +48827,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: fused Huber loss over contiguous arrays.
         if (typeof(T) == typeof(float) && predictions.IsContiguous && targets.IsContiguous)
         {
-            var pArr = (float[])(object)predictions.GetDataArray();
-            var tArr = (float[])(object)targets.GetDataArray();
+            using var pArrLease = predictions.LeaseArray();
+            var pArr = (float[])(object)pArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (float[])(object)tArrLease.Array;
             int len = predictions.Length;
             float deltaF = (float)delta;
             float halfDelta = 0.5f * deltaF;
@@ -47525,8 +48851,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path
         if (typeof(T) == typeof(double) && predictions.IsContiguous && targets.IsContiguous)
         {
-            var pArr = (double[])(object)predictions.GetDataArray();
-            var tArr = (double[])(object)targets.GetDataArray();
+            using var pArrLease = predictions.LeaseArray();
+            var pArr = (double[])(object)pArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (double[])(object)tArrLease.Array;
             int len = predictions.Length;
             double halfDelta = 0.5 * delta;
             double sum = 0.0;
@@ -47584,8 +48912,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: fused stable BCE.
         if (typeof(T) == typeof(float) && logits.IsContiguous && targets.IsContiguous)
         {
-            var lArr = (float[])(object)logits.GetDataArray();
-            var tArr = (float[])(object)targets.GetDataArray();
+            using var lArrLease = logits.LeaseArray();
+            var lArr = (float[])(object)lArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (float[])(object)tArrLease.Array;
             int len = logits.Length;
             float sumF = 0f;
             for (int i = 0; i < len; i++)
@@ -47605,8 +48935,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast path: same numerically stable form, inline arithmetic.
         if (typeof(T) == typeof(double) && logits.IsContiguous && targets.IsContiguous)
         {
-            var lArr = (double[])(object)logits.GetDataArray();
-            var tArr = (double[])(object)targets.GetDataArray();
+            using var lArrLease = logits.LeaseArray();
+            var lArr = (double[])(object)lArrLease.Array;
+            using var tArrLease = targets.LeaseArray();
+            var tArr = (double[])(object)tArrLease.Array;
             int len = logits.Length;
             double sumD = 0.0;
             for (int i = 0; i < len; i++)
@@ -47671,8 +49003,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!logits.IsContiguous) logits = logits.Contiguous();
         var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
-        var logitData = logits.GetDataArray();
-        var targetData = targets.GetDataArray();
+        using var logitDataLease = logits.LeaseArray();
+        var logitData = logitDataLease.Array;
+        using var targetDataLease = targets.LeaseArray();
+        var targetData = targetDataLease.Array;
 
         for (int b = 0; b < batchSize; b++)
         {
@@ -47813,8 +49147,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep41 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep66 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -47824,8 +49160,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             const double alpha = 1.6732632423543772;
             const double scale = 1.0507009873554805;
-            var dSrc = (double[])(object)tensor.GetDataArray();
-            var dDst = (double[])(object)result.GetDataArray();
+            using var dSrcLease = tensor.LeaseArray();
+            var dSrc = (double[])(object)dSrcLease.Array;
+            using var dDstLease = result.LeaseArray();
+            var dDst = (double[])(object)dDstLease.Array;
             for (int i = 0; i < tensor.Length; i++)
             {
                 double x = dSrc[i];
@@ -47837,8 +49175,10 @@ public partial class CpuEngine : ITensorLevelEngine
             var numOps = MathHelper.GetNumericOperations<T>();
             const double alpha = 1.6732632423543772;
             const double scale = 1.0507009873554805;
-            var srcSpan = tensor.AsSpan();
-            var dstSpan = result.AsWritableSpan();
+            using var srcSpanLease = tensor.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < tensor.Length; i++)
             {
                 double x = numOps.ToDouble(srcSpan[i]);
@@ -47875,8 +49215,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep42 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep67 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.HardSigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -47887,8 +49229,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var dSrc = (double[])(object)tensor.GetDataArray();
-            var dDst = (double[])(object)result.GetDataArray();
+            using var dSrcLease = tensor.LeaseArray();
+            var dSrc = (double[])(object)dSrcLease.Array;
+            using var dDstLease = result.LeaseArray();
+            var dDst = (double[])(object)dDstLease.Array;
             for (int i = 0; i < tensor.Length; i++)
                 dDst[i] = Math.Max(0.0, Math.Min(1.0, dSrc[i] / 6.0 + 0.5));
             DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
@@ -47930,23 +49274,29 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = tensor.Length;
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
+            using var fSrcLease = tensor.LeaseArray();
+            var fSrc = (float[])(object)fSrcLease.Array;
+            using var fDstLease = result.LeaseArray();
+            var fDst = (float[])(object)fDstLease.Array;
             for (int i = 0; i < length; i++)
                 fDst[i] = MathF.Max(0f, MathF.Min(6f, fSrc[i]));
         }
         else if (typeof(T) == typeof(double))
         {
-            var dSrc = (double[])(object)tensor.GetDataArray();
-            var dDst = (double[])(object)result.GetDataArray();
+            using var dSrcLease = tensor.LeaseArray();
+            var dSrc = (double[])(object)dSrcLease.Array;
+            using var dDstLease = result.LeaseArray();
+            var dDst = (double[])(object)dDstLease.Array;
             for (int i = 0; i < length; i++)
                 dDst[i] = Math.Max(0.0, Math.Min(6.0, dSrc[i]));
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var srcSpan = tensor.AsSpan();
-            var dstSpan = result.AsWritableSpan();
+            using var srcSpanLease = tensor.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < length; i++)
             {
                 double x = numOps.ToDouble(srcSpan[i]);
@@ -47988,9 +49338,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var fSrc = (float[])(object)tensor.GetDataArray();
-            var fAlpha = (float[])(object)alpha.GetDataArray();
-            var fDst = (float[])(object)result.GetDataArray();
+            using var fSrcLease = tensor.LeaseArray();
+            var fSrc = (float[])(object)fSrcLease.Array;
+            using var fAlphaLease = alpha.LeaseArray();
+            var fAlpha = (float[])(object)fAlphaLease.Array;
+            using var fDstLease = result.LeaseArray();
+            var fDst = (float[])(object)fDstLease.Array;
             if (channels == tensor.Length)
             {
                 // Element-wise alpha (1D case)
@@ -48008,9 +49361,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var dSrc = (double[])(object)tensor.GetDataArray();
-            var dAlpha = (double[])(object)alpha.GetDataArray();
-            var dDst = (double[])(object)result.GetDataArray();
+            using var dSrcLease = tensor.LeaseArray();
+            var dSrc = (double[])(object)dSrcLease.Array;
+            using var dAlphaLease = alpha.LeaseArray();
+            var dAlpha = (double[])(object)dAlphaLease.Array;
+            using var dDstLease = result.LeaseArray();
+            var dDst = (double[])(object)dDstLease.Array;
             if (channels == tensor.Length)
             {
                 for (int i = 0; i < tensor.Length; i++)
@@ -48028,9 +49384,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var srcSpan = tensor.AsSpan();
-            var alphaSpan = alpha.AsSpan();
-            var dstSpan = result.AsWritableSpan();
+            using var srcSpanLease = tensor.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var alphaSpanLease = alpha.Lease();
+            var alphaSpan = alphaSpanLease.Span;
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < tensor.Length; i++)
             {
                 double x = numOps.ToDouble(srcSpan[i]);
@@ -48170,8 +49529,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep43 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep68 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.ReciprocalUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -48180,8 +49541,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var src = tensor.AsSpan();
-            var dst = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             for (int i = 0; i < src.Length; i++)
                 dst[i] = numOps.Divide(numOps.One, src[i]);
         }
@@ -48214,8 +49577,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep44 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep69 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SignUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -48224,8 +49589,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var src = tensor.AsSpan();
-            var dst = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             for (int i = 0; i < src.Length; i++)
                 dst[i] = numOps.FromDouble(Math.Sign(numOps.ToDouble(src[i])));
         }
@@ -48339,8 +49706,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && rank == 2 && padding.Length >= 4 && tensor.IsContiguous)
         {
             float fVal = value is not null ? (float)(object)value : 0f;
-            var srcArr = (float[])(object)tensor.GetDataArray();
-            var dstArr = (float[])(object)result.GetDataArray();
+            using var srcArrLease = tensor.LeaseArray();
+            var srcArr = (float[])(object)srcArrLease.Array;
+            using var dstArrLease = result.LeaseArray();
+            var dstArr = (float[])(object)dstArrLease.Array;
             int srcRows = tensor._shape[0], srcCols = tensor._shape[1];
             int padLeft = padding[0], padRight = padding[1];
             int padTop = padding[2], padBottom = padding[3];
@@ -48359,8 +49728,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && rank == 2 && padding.Length >= 4 && tensor.IsContiguous)
         {
             double dVal = value is not null ? (double)(object)value : 0.0;
-            var srcArr = (double[])(object)tensor.GetDataArray();
-            var dstArr = (double[])(object)result.GetDataArray();
+            using var srcArrLease = tensor.LeaseArray();
+            var srcArr = (double[])(object)srcArrLease.Array;
+            using var dstArrLease = result.LeaseArray();
+            var dstArr = (double[])(object)dstArrLease.Array;
             int srcRows = tensor._shape[0], srcCols = tensor._shape[1];
             int padLeft = padding[0];
             int padTop = padding[2];
@@ -48431,9 +49802,11 @@ public partial class CpuEngine : ITensorLevelEngine
             fwArr[ow] = Math.Max(0.0, srcW - w0); // clamp to >= 0 (see fhArr above): PyTorch align_corners=False.
         }
 
+        using var inputArrayKeep49045 = new KeepAliveScope(input);
+        using var outputArrayKeep49046 = new KeepAliveScope(output);
         if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+            && input.GetDataArrayUnmarked() is float[] inArr
+            && output.GetDataArrayUnmarked() is float[] outArr)
         {
             int total = n * c;
             int hh = h, ww = w, oH = outH, oW = outW;
@@ -48471,9 +49844,11 @@ public partial class CpuEngine : ITensorLevelEngine
             CpuParallelSettings.LightweightParallel(total, bilinearWork, kernel);
             return;
         }
+        using var inputArrayKeep49085 = new KeepAliveScope(input);
+        using var outputArrayKeep49086 = new KeepAliveScope(output);
         if (typeof(T) == typeof(double)
-            && input.GetDataArray() is double[] inArrD
-            && output.GetDataArray() is double[] outArrD)
+            && input.GetDataArrayUnmarked() is double[] inArrD
+            && output.GetDataArrayUnmarked() is double[] outArrD)
         {
             int total = n * c;
             int hh = h, ww = w, oH = outH, oW = outW;
@@ -48513,7 +49888,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var inData = input.GetFlattenedData();
-        var outData = output.GetDataArray();
+        using var outDataLease = output.LeaseArray();
+        var outData = outDataLease.Array;
         int totalBC = n * c;
         CpuParallelSettings.ParallelForOrSerial(0, totalBC, output.Length, bc =>
         {
@@ -48603,7 +49979,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outW = (width - kernelSize) / stride + 1;
         var result = TensorAllocator.Rent<T>([batch, channels, outW]);
         var inData = input.GetFlattenedData();
-        var outData = result.GetDataArray();
+        using var outDataLease = result.LeaseArray();
+        var outData = outDataLease.Array;
 
         for (int b = 0; b < batch; b++)
             for (int c = 0; c < channels; c++)
@@ -48647,7 +50024,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([batch, channels, outW]);
         var indices = new int[batch * channels * outW];
         var inData = input.GetFlattenedData();
-        var outData = result.GetDataArray();
+        using var outDataLease = result.LeaseArray();
+        var outData = outDataLease.Array;
 
         for (int b = 0; b < batch; b++)
             for (int c = 0; c < channels; c++)
@@ -48993,7 +50371,8 @@ public partial class CpuEngine : ITensorLevelEngine
     private static void CopyTensorRegion<T>(Tensor<T> src, Tensor<T> dst, int[] padding, int rank)
     {
         var srcData = src.GetFlattenedData();
-        var dstData = dst.GetDataArray();
+        using var dstDataLease = dst.LeaseArray();
+        var dstData = dstDataLease.Array;
         var srcShape = src._shape;
         var dstShape = dst._shape;
 
@@ -50000,8 +51379,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // "Blittable FFT fast path" comment near NativeFFTInPlace for rationale.
         if ((typeof(T) == typeof(double) || typeof(T) == typeof(float)) && input.IsContiguous)
         {
-            var inSpan = input.AsSpan();
-            var outSpan = result.AsWritableSpan();
+            using var inSpanLease = input.Lease();
+            var inSpan = inSpanLease.Span;
+            using var outSpanLease = result.LeaseWritable();
+            var outSpan = outSpanLease.Span;
             var scratch = RentFftBlittableScratch(2 * fftSize);
             bool isDouble = typeof(T) == typeof(double);
             for (int b = 0; b < batchCount; b++)
@@ -50447,8 +51828,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // Reinterpret the underlying DataVector spans as double spans (layout-identical when T=double).
             // Zero allocations, zero copy passes — SIMD kernel reads/writes the tensor memory directly.
             int n = rows * cols;
-            var srcData = input.DataVector.AsSpan();
-            var dstData = result.AsWritableSpan();
+            using var srcDataLease = input.DataVector.Lease();
+            var srcData = srcDataLease.Span;
+            using var dstDataLease = result.LeaseWritable();
+            var dstData = dstDataLease.Span;
             ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
             ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
             var srcD = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
@@ -50461,8 +51844,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             int n = rows * cols;
-            var srcData = input.DataVector.AsSpan();
-            var dstData = result.AsWritableSpan();
+            using var srcDataLease = input.DataVector.Lease();
+            var srcData = srcDataLease.Span;
+            using var dstDataLease = result.LeaseWritable();
+            var dstData = dstDataLease.Span;
             ref T srcHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(srcData);
             ref T dstHead = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(dstData);
             var srcF = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
@@ -50477,8 +51862,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // net471 fallback: no MemoryMarshal.CreateSpan. Use temp buffer path.
             int n = rows * cols;
-            var srcData = input.DataVector.AsSpan();
-            var dstData = result.AsWritableSpan();
+            using var srcDataLease = input.DataVector.Lease();
+            var srcData = srcDataLease.Span;
+            using var dstDataLease = result.LeaseWritable();
+            var dstData = dstDataLease.Span;
             var srcD = new double[n];
             var dstD = new double[n];
             for (int i = 0; i < n; i++)
@@ -50494,8 +51881,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             int n = rows * cols;
-            var srcData = input.DataVector.AsSpan();
-            var dstData = result.AsWritableSpan();
+            using var srcDataLease = input.DataVector.Lease();
+            var srcData = srcDataLease.Span;
+            using var dstDataLease = result.LeaseWritable();
+            var dstData = dstDataLease.Span;
             var srcF = new float[n];
             var dstF = new float[n];
             for (int i = 0; i < n; i++)
@@ -50672,14 +52061,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcD = new double[n];
             var dstD = new double[n];
-            var srcSpan = input.DataVector.AsSpan();
+            using var srcSpanLease = input.DataVector.Lease();
+            var srcSpan = srcSpanLease.Span;
             for (int i = 0; i < n; i++)
             {
                 ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
                 srcD[i] = System.Runtime.CompilerServices.Unsafe.As<T, double>(ref s);
             }
             Engines.Simd.SimdKernels.Tanh(srcD, dstD);
-            var dstSpan = result.AsWritableSpan();
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
             return result;
@@ -50688,14 +52079,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = new float[n];
             var dstF = new float[n];
-            var srcSpan = input.DataVector.AsSpan();
+            using var srcSpanLease = input.DataVector.Lease();
+            var srcSpan = srcSpanLease.Span;
             for (int i = 0; i < n; i++)
             {
                 ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
                 srcF[i] = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref s);
             }
             Engines.Simd.SimdKernels.Tanh(srcF, dstF);
-            var dstSpan = result.AsWritableSpan();
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
             return result;
@@ -50720,7 +52113,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = new float[n];
             var dstF = new float[n];
-            var srcSpan = input.DataVector.AsSpan();
+            using var srcSpanLease = input.DataVector.Lease();
+            var srcSpan = srcSpanLease.Span;
             for (int i = 0; i < n; i++)
             {
                 ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
@@ -50731,7 +52125,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 fixed (float* ip = srcF) fixed (float* op = dstF)
                     Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
             }
-            var dstSpan = result.AsWritableSpan();
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref dstF[i]);
             return result;
@@ -50740,7 +52135,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcD = new double[n];
             var dstD = new double[n];
-            var srcSpan = input.DataVector.AsSpan();
+            using var srcSpanLease = input.DataVector.Lease();
+            var srcSpan = srcSpanLease.Span;
             for (int i = 0; i < n; i++)
             {
                 ref T s = ref System.Runtime.CompilerServices.Unsafe.AsRef(in srcSpan[i]);
@@ -50751,7 +52147,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 fixed (double* ip = srcD) fixed (double* op = dstD)
                     Engines.Simd.SimdKernels.ExpUnsafe(ip, op, n);
             }
-            var dstSpan = result.AsWritableSpan();
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < n; i++)
                 dstSpan[i] = System.Runtime.CompilerServices.Unsafe.As<double, T>(ref dstD[i]);
             return result;
@@ -50787,9 +52184,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var iSpan = imag.DataVector.AsSpan();
-            var rSpan = real.DataVector.AsSpan();
-            var dstSpan = result.AsWritableSpan();
+            using var iSpanLease = imag.DataVector.Lease();
+            var iSpan = iSpanLease.Span;
+            using var rSpanLease = real.DataVector.Lease();
+            var rSpan = rSpanLease.Span;
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < n; i++)
             {
                 ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);
@@ -50803,9 +52203,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(float))
         {
-            var iSpan = imag.DataVector.AsSpan();
-            var rSpan = real.DataVector.AsSpan();
-            var dstSpan = result.AsWritableSpan();
+            using var iSpanLease = imag.DataVector.Lease();
+            var iSpan = iSpanLease.Span;
+            using var rSpanLease = real.DataVector.Lease();
+            var rSpan = rSpanLease.Span;
+            using var dstSpanLease = result.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < n; i++)
             {
                 ref T iRef = ref System.Runtime.CompilerServices.Unsafe.AsRef(in iSpan[i]);
@@ -51342,8 +52745,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // NativeComplexFFT fast path (unnormalized inverse kernel, then /fftSize).
         if ((typeof(T) == typeof(double) || typeof(T) == typeof(float)) && input.IsContiguous)
         {
-            var inSpan = input.AsSpan();
-            var outSpan = result.AsWritableSpan();
+            using var inSpanLease = input.Lease();
+            var inSpan = inSpanLease.Span;
+            using var outSpanLease = result.LeaseWritable();
+            var outSpan = outSpanLease.Span;
             var scratch = RentFftBlittableScratch(2 * fftSize);
             bool isDouble = typeof(T) == typeof(double);
             for (int b = 0; b < batchCount; b++)
@@ -52510,9 +53915,12 @@ public partial class CpuEngine : ITensorLevelEngine
         int outer = input.Length / sliceSize;
 
         var result = new Tensor<T>(input._shape);
-        var inData = input.GetDataArray();
-        var filtData = filter.GetDataArray();
-        var outData = result.GetDataArray();
+        using var inDataLease = input.LeaseArray();
+        var inData = inDataLease.Array;
+        using var filtDataLease = filter.LeaseArray();
+        var filtData = filtDataLease.Array;
+        using var outDataLease = result.LeaseArray();
+        var outData = outDataLease.Array;
 
         var work = SpectralScratch<T>.Work;
         if (work is null || work.Length < sliceSize) { work = new Complex<T>[sliceSize]; SpectralScratch<T>.Work = work; }
@@ -52652,8 +54060,10 @@ public partial class CpuEngine : ITensorLevelEngine
         newShape[rank - 1] = h;
 
         var result = new Tensor<Complex<T>>(newShape);
-        var srcArr = input.GetDataArray();
-        var dstArr = result.GetDataArray();
+        using var srcArrLease = input.LeaseArray();
+        var srcArr = srcArrLease.Array;
+        using var dstArrLease = result.LeaseArray();
+        var dstArr = dstArrLease.Array;
 
         for (int b = 0; b < batchSize; b++)
         {
@@ -52778,8 +54188,10 @@ public partial class CpuEngine : ITensorLevelEngine
             newShape[i] = input._shape[perm[i]];
 
         var result = new Tensor<T>(newShape);
-        var srcArr = input.GetDataArray();
-        var dstArr = result.GetDataArray();
+        using var srcArrLease = input.LeaseArray();
+        var srcArr = srcArrLease.Array;
+        using var dstArrLease = result.LeaseArray();
+        var dstArr = dstArrLease.Array;
 
         var srcStrides = new int[rank];
         srcStrides[rank - 1] = 1;
@@ -52821,8 +54233,10 @@ public partial class CpuEngine : ITensorLevelEngine
             newShape[i] = input._shape[perm[i]];
 
         var result = new Tensor<Complex<T>>(newShape);
-        var srcArr = input.GetDataArray();
-        var dstArr = result.GetDataArray();
+        using var srcArrLease = input.LeaseArray();
+        var srcArr = srcArrLease.Array;
+        using var dstArrLease = result.LeaseArray();
+        var dstArr = dstArrLease.Array;
 
         var srcStrides = new int[rank];
         srcStrides[rank - 1] = 1;

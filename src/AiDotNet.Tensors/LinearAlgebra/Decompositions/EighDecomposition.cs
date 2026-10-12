@@ -37,8 +37,10 @@ internal static class EighDecomposition
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
         var inData = input.Contiguous().GetDataArray();
-        var valData = eigvals.GetDataArray();
-        var vecData = eigvecs.GetDataArray();
+        using var valDataLease = eigvals.LeaseArray();
+        var valData = valDataLease.Array;
+        using var vecDataLease = eigvecs.LeaseArray();
+        var vecData = vecDataLease.Array;
         int matStride = n * n;
         int valStride = n;
 

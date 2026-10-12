@@ -159,7 +159,17 @@ public sealed class OpenClCommandQueue : IGpuStream
 
         try
         {
-            return QueryEventComplete(eventHandle);
+            // A marker completes only once the device reaches it, so it must be submitted and given a moment: checked
+            // straight after enqueueing it reads as pending even on a queue that drained long ago. Flush, then poll
+            // for at most a millisecond; anything still running after that is genuinely incomplete.
+            OpenClNativeBindings.Flush(_handle);
+            var deadline = System.Diagnostics.Stopwatch.GetTimestamp() + System.Diagnostics.Stopwatch.Frequency / 1000;
+            while (true)
+            {
+                if (QueryEventComplete(eventHandle)) return true;
+                if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) return false;
+                System.Threading.Thread.SpinWait(64);
+            }
         }
         finally
         {
