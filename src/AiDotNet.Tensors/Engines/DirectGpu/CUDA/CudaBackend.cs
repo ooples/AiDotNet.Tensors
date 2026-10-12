@@ -18404,8 +18404,25 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
         LaunchFusedAxis("normalize_l2", input, output, outerSize, innerSize);
     }
-    public void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_sum_backward", gradOutput, gradInput, outerSize, reduceSize);
-    public void ReduceMeanBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchFusedAxis("reduce_mean_backward", gradOutput, gradInput, outerSize, reduceSize);
+    // The backward kernels write one element per thread, so they need outerSize * reduceSize threads; LaunchFusedAxis
+    // launches one per row, which left every element past the first outerSize (rounded up to a block) unwritten.
+    public void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchAxisBackward("reduce_sum_backward", gradOutput, gradInput, outerSize, reduceSize);
+    public void ReduceMeanBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize) => LaunchAxisBackward("reduce_mean_backward", gradOutput, gradInput, outerSize, reduceSize);
+
+    private unsafe void LaunchAxisBackward(string kernelName, IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        long total = (long)outerSize * reduceSize;
+        if (total <= 0) return;
+        if (total > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(reduceSize), $"{kernelName}: {total} elements exceed the kernel's int indexing.");
+        using var _ = PushContext();
+        IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &goPtr; args[1] = &giPtr; args[2] = &outerSize; args[3] = &reduceSize;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
 
     public unsafe void ReduceMaxBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer maxValues, IGpuBuffer gradInput, int outerSize, int reduceSize)
     {
