@@ -1401,7 +1401,7 @@ class Program
         if (args[0] == "--vulkan-optional-binding")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             foreach (var (b, c, hw) in new[] { (1, 16, 32), (8, 64, 56), (32, 64, 112) })
             {
                 int o = hw / 2, total = b * c * o * o;
@@ -1431,9 +1431,10 @@ class Program
         if (args[0] == "--vulkan-pipeline-lookup")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             var method = typeof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend).GetMethod("GetOrCreateGlslPipeline",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                ?? throw new MissingMethodException(nameof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend), "GetOrCreateGlslPipeline");
             var lookup = (Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>)Delegate.CreateDelegate(
                 typeof(Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>), vb, method);
             foreach (var (name, get, bindings, push) in new (string, Func<string>, int, uint)[]
