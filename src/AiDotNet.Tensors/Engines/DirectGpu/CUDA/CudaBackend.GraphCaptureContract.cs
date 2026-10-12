@@ -6,4 +6,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed partial class CudaBackend : IGpuGraphCapture
 {
     bool IGpuGraphCapture.SupportsGraphCapture => IsAvailable;
+
+    bool IGpuGraphCapture.ContextIsLive => ContextIsLive;
 }

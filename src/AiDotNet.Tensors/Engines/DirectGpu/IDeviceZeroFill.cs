@@ -9,4 +9,7 @@ internal interface IDeviceZeroFill
 {
     /// <summary>Sets the first <paramref name="floatCount"/> floats of <paramref name="buffer"/> to +0.</summary>
     void ZeroBuffer(IGpuBuffer buffer, int floatCount);
+
+    /// <summary>Sets the first <paramref name="byteCount"/> bytes to zero (any element size).</summary>
+    void ZeroBytes(IGpuBuffer buffer, long byteCount);
 }

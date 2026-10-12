@@ -6,7 +6,11 @@ public sealed partial class MetalBackend : IGpuGraphCapture
 {
     bool IGpuGraphCapture.SupportsGraphCapture => false;
 
+    bool IGpuGraphCapture.ContextIsLive => IsAvailable;
+
     bool IGpuGraphCapture.IsStreamCapturing() => false;
+
+    int IGpuGraphCapture.StreamCaptureStatusRaw() => 0;
 
     System.IntPtr IGpuGraphCapture.CaptureGraph(System.Action launch)
     {

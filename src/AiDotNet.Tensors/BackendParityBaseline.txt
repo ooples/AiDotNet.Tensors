@@ -10,19 +10,6 @@ capability ITorchParityElementwiseBackend WebGpuBackend #1128
 
 // TENS0007: library code reaching a capability through a concrete backend class (#1154).
 cast AiDotNetEngine.TryRegisterGpuOffloadAllocator CudaBackend #1154
-cast CompiledInferencePlan.TryGetGraphBackend CudaBackend #1154
-cast CompiledTrainingPlan.ApplyL2Regularization CudaBackend #1154
-cast CompiledTrainingPlan.ConfigureOptimizerFloat CudaBackend #1154
-cast CompiledTrainingPlan.DeviceParametersLiveOn CudaBackend #1154
-cast CompiledTrainingPlan.InvalidateCapturedStepGraph CudaBackend #1154
-cast CompiledTrainingPlan.ResolveAuthoritativeGpuGradients CudaBackend #1154
-cast CompiledTrainingPlan.RollBackCaptureResidency CudaBackend #1154
-cast CompiledTrainingPlan.RunGpuStepBodyForCapture CudaBackend #1154
-cast CompiledTrainingPlan.StepCore CudaBackend #1154
-cast CompiledTrainingPlan.TryClipGradientsGlobalL2Gpu CudaBackend #1154
-cast CompiledTrainingPlan.TryMultiTensorFiniteness CudaBackend #1154
-cast CompiledTrainingPlan.UploadHostWrittenParameters CudaBackend #1154
-cast CompiledTrainingPlan.ZeroDeviceBuffer CudaBackend #1154
 cast DirectGpuEngine.TryExecuteFusedResidualBatchNormRelu CudaBackend #1154
 cast ExecutionStreamFactory.TryGetCudaStream CudaBackend #1154
 

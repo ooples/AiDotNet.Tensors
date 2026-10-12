@@ -11,4 +11,12 @@ public sealed partial class CudaBackend : IDeviceZeroFill
         if (floatCount <= 0) return;
         MemsetBuffer(buffer, 0, (long)floatCount * sizeof(float));
     }
+
+    /// <inheritdoc/>
+    void IDeviceZeroFill.ZeroBytes(IGpuBuffer buffer, long byteCount)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (byteCount <= 0) return;
+        MemsetBuffer(buffer, 0, byteCount);
+    }
 }

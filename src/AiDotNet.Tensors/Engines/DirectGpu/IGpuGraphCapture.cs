@@ -6,13 +6,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// reports <see cref="SupportsGraphCapture"/> false and returns <see cref="System.IntPtr.Zero"/> from
 /// <see cref="CaptureGraph"/>, which every caller already treats as "run eagerly".
 /// </summary>
-internal interface IGpuGraphCapture
+internal interface IGpuGraphCapture : IDirectGpuBackend
 {
     /// <summary>True when <see cref="CaptureGraph"/> can produce a replayable graph on this backend.</summary>
     bool SupportsGraphCapture { get; }
 
+    /// <summary>False once the device context is gone (backend disposed), so nothing can be read back.</summary>
+    bool ContextIsLive { get; }
+
     /// <summary>True while a capture is recording on the calling thread's stream.</summary>
     bool IsStreamCapturing();
+
+    /// <summary>The driver's raw capture status for diagnostics: 0 none, 1 active, 2 invalidated.</summary>
+    int StreamCaptureStatusRaw();
 
     /// <summary>Records <paramref name="launch"/>'s device work; a handle to replay, or zero when it cannot.</summary>
     System.IntPtr CaptureGraph(System.Action launch);
