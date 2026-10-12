@@ -120,6 +120,20 @@ public sealed partial class CudaBackend : IFusedAttentionBackend
             dargs[0] = &pg; dargs[1] = &po; dargs[2] = &pd; dargs[3] = &args0; dargs[4] = &d;
             LaunchKernel(deltaKernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, dargs);
         }
+        // Default: one fused pass with atomic dQ (as torch's default backward). DeterministicReductions keeps the
+        // two-pass kernels, whose every sum has a fixed order (torch.use_deterministic_algorithms).
+        if (!AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions)
+        {
+            if (p.Sq <= 0) return;
+            MemsetBuffer(dQ, 0, (long)p.B * p.H * p.Sq * headDim * sizeof(float));   // dQ covers q's elements exactly
+            if (p.Sk <= 0) return;
+            IntPtr fusedKernel = FusedAttentionKernel($"fa_backward_fused_d{headDim}");
+            void** fargs = stackalloc void*[11];
+            fargs[0] = &pq; fargs[1] = &pk; fargs[2] = &pv; fargs[3] = &pg; fargs[4] = &pl; fargs[5] = &pd;
+            fargs[6] = &pdq; fargs[7] = &pdk; fargs[8] = &pdv; fargs[9] = &pm; fargs[10] = &args0;
+            LaunchKernel2D(fusedKernel, (uint)((p.Sk + 63) / 64), (uint)(p.B * p.H), 128, 1, fargs);   // FA_FKB = 64 keys x 2
+            return;
+        }
         if (p.Sk > 0)
         {
             void** kargs = stackalloc void*[10];
