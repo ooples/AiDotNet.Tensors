@@ -87,12 +87,12 @@ fn categorical_sample(@builtin(global_invocation_id) gid: vec3u) {
         sum = cs_df_add(sum, cs_probabilities[offset + c]);
     }
 
-    let target = cs_df_mul(sum, u);
+    let tgt = cs_df_mul(sum, u);
     var cumulative = vec2<f32>(0.0, 0.0);
     var selected: u32 = cs_params.classes - 1u;
     for (var c: u32 = 0u; c < cs_params.classes; c = c + 1u) {
         cumulative = cs_df_add(cumulative, cs_probabilities[offset + c]);
-        if (cs_df_less(target, cumulative)) { selected = c; break; }
+        if (cs_df_less(tgt, cumulative)) { selected = c; break; }
     }
 
     for (var c: u32 = 0u; c < cs_params.classes; c = c + 1u) {
