@@ -39,6 +39,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 
     private object HostSyncKey()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // An EMPTY backing (a GPU-resident storage before its host array exists) reports the shared
         // Array.Empty<T>() instance: keying by it would make every such storage share one state.
         if (_cachedArray is { Length: > 0 }) return _cachedArray;
@@ -150,6 +151,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[] GetDataArrayUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // If a deferred GPU download is pending, materialize now: callers
         // of GetDataArray either read the data directly or pass it to code
         // that does (host-side serialization, base CPU ops, etc.). The
@@ -184,6 +186,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[]? GetBackingArrayUnsafe()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ResultOwner?.MarkEscaped(); // raw access: see AsSpan
         if (_cachedArray is not null)
             return _cachedArray;
@@ -204,6 +207,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal bool TryGetBackingArray(out T[] array)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ResultOwner?.MarkEscaped(); // raw access: see AsSpan
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
@@ -508,6 +512,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual MatrixBase<T> Slice(int startRow, int rowCount)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (startRow < 0 || startRow >= _rows)
             throw new ArgumentOutOfRangeException(nameof(startRow));
         if (rowCount < 1 || startRow + rowCount > _rows)
@@ -540,6 +545,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     [MethodImpl(Hot)]
     public virtual void SetColumn(int columnIndex, Vector<T> vector)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (columnIndex < 0 || columnIndex >= Columns)
             throw new ArgumentOutOfRangeException(nameof(columnIndex));
         if (vector.Length != Rows)
@@ -566,6 +572,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void SetRow(int rowIndex, Vector<T> vector)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (rowIndex < 0 || rowIndex >= Rows)
             throw new ArgumentOutOfRangeException(nameof(rowIndex));
         if (vector.Length != Columns)
@@ -604,6 +611,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual Vector<T> GetRow(int row)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ValidateIndices(row, 0);
         var result = VA.RentUninitialized<T>(_cols);
         var sourceRow = _memory.Span.Slice(row * _cols, _cols);
@@ -625,6 +633,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     [MethodImpl(Hot)]
     public virtual Vector<T> GetColumn(int col)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ValidateIndices(0, col);
         var result = VA.RentUninitialized<T>(_rows);
         var destSpan = result.AsWritableSpanUnmarked();
@@ -759,6 +768,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual T ElementWiseMultiplyAndSum(MatrixBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Rows != other.Rows || Columns != other.Columns)
         {
@@ -787,6 +797,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual MatrixBase<T> Add(MatrixBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for addition.");
@@ -823,6 +834,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual void AddInPlace(MatrixBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for addition.");
@@ -863,6 +875,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Add(MatrixBase<T> other, Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for addition.");
@@ -917,6 +930,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual MatrixBase<T> Subtract(MatrixBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
@@ -948,6 +962,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual void SubtractInPlace(MatrixBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
@@ -988,6 +1003,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Subtract(MatrixBase<T> other, Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_rows != other.Rows || _cols != other.Columns)
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
@@ -1043,6 +1059,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual MatrixBase<T> Multiply(MatrixBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (_cols != other.Rows)
             throw new ArgumentException("Number of columns in the first matrix must equal the number of rows in the second matrix.");
@@ -1227,6 +1244,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual VectorBase<T> Multiply(Vector<T> vector)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (_cols != vector.Length)
             throw new ArgumentException("Number of columns in the matrix must equal the length of the vector.");
 
@@ -1260,6 +1278,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 #endif
     public virtual MatrixBase<T> Multiply(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = CreateInstance(_rows, _cols);
         var dst = result.AsWritableSpanUnmarked();
         if (dst.Length >= ElementwiseParallelMinLength)
@@ -1306,6 +1325,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void MultiplyInPlace(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         MarkDirty();
 #if NET5_0_OR_GREATER
         var arr = _cachedArray;
@@ -1339,6 +1359,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Multiply(T scalar, Span<T> destination)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (destination.Length < _rows * _cols)
             throw new ArgumentException("Destination span is too small", nameof(destination));
 
@@ -1361,6 +1382,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     [MethodImpl(Hot)]
     public virtual MatrixBase<T> Transpose()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = CreateInstance(_cols, _rows);
         var resultSpan = result._memory.Span;
         var srcSpan = _memory.Span;
@@ -1511,6 +1533,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     [MethodImpl(Hot)]
     public virtual void TransposeInPlace()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (_rows != _cols)
             throw new InvalidOperationException("In-place transpose is only valid for square matrices.");
 
@@ -1641,6 +1664,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual MatrixBase<T> Clone()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = CreateInstance(_rows, _cols);
         // Use vectorized Copy operation to copy entire matrix at once
         _numOps.Copy(_memory.Span, result.AsWritableSpanUnmarked());
@@ -1711,6 +1735,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal ReadOnlySpan<T> AsSpanUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         SyncHostFromDevice();
         return _memory.Span;
     }
@@ -1769,6 +1794,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <summary><see cref="AsWritableSpan"/> without the escape mark; see <see cref="AsSpanUnmarked"/>.</summary>
     internal Span<T> AsWritableSpanUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         SyncHostFromDevice();
         MarkDirty();
         return _memory.Span;
@@ -1789,6 +1815,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     internal ReadOnlyMemory<T> AsMemory()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Memory is held + read later, so we have to materialize NOW; we
         // can't observe the read point of a stored Memory<T>.
         // Raw access: from here nothing guarantees this matrix outlives the caller's use of the data, so its array
@@ -1811,6 +1838,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Raw access: from here nothing guarantees this matrix outlives the caller's use of the data, so its array
         // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the matrix alive instead.
         ResultOwner?.MarkEscaped();
