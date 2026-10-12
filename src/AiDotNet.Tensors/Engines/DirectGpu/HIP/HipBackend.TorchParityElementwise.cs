@@ -62,7 +62,7 @@ public sealed partial class HipBackend : ITorchParityElementwiseBackend
         RequireCapacity(output, n, nameof(output), "n");
         string name = UnaryKernelName(op);
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         IntPtr x = input.Handle, y = output.Handle;
         void** args = stackalloc void*[5];
         args[0] = &x; args[1] = &y; args[2] = &n; args[3] = &p0; args[4] = &p1;
@@ -77,7 +77,7 @@ public sealed partial class HipBackend : ITorchParityElementwiseBackend
         RequireCapacity(degree, n, nameof(degree), "n");
         RequireCapacity(output, n, nameof(output), "n");
         if (!_kernelCache.TryGetValue("parity_polynomial", out var polynomialKernel))
-            throw new InvalidOperationException("HIP kernel not found: parity_polynomial");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: parity_polynomial");
         IntPtr px = x.Handle, pd = degree.Handle, py = output.Handle;
         int shift = shifted ? 1 : 0;
         void** args = stackalloc void*[6];
@@ -94,7 +94,7 @@ public sealed partial class HipBackend : ITorchParityElementwiseBackend
     }
 
     private IntPtr ParityKernel(string name)
-        => _kernelCache.TryGetValue(name, out var found) ? found : throw new InvalidOperationException($"HIP kernel not found: {name}");
+        => _kernelCache.TryGetValue(name, out var found) ? found : throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
 
     private static uint ParityGrid(int n) => (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
 
@@ -546,7 +546,7 @@ public sealed partial class HipBackend : ITorchParityElementwiseBackend
         RequireCapacity(output, n, nameof(output), "n");
         string name = BinaryKernelName(op);
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         IntPtr pa = a.Handle, pb = b.Handle, y = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &pa; args[1] = &pb; args[2] = &y; args[3] = &n;

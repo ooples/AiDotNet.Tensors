@@ -8,21 +8,45 @@ public sealed partial class MetalBackend : ITorchParityElementwiseBackend
     private const string TorchParityLibName = "TorchParityF32";
     private readonly object _torchParityLibraryLock = new object();
     private IntPtr _torchParityLibrary;
+    private Exception? _torchParityCompileFailure;
 
     private void LaunchTorchParity(string name, int threads, params object[] args)
     {
         if (threads <= 0) return;
         ThrowIfDisposed();
-        if (_torchParityLibrary == IntPtr.Zero)
+        MetalPipelineState pipe;
+        try
         {
-            lock (_torchParityLibraryLock)
+            if (_torchParityLibrary == IntPtr.Zero)
             {
-                if (_torchParityLibrary == IntPtr.Zero)
-                    _torchParityLibrary = _shaderLibrary.CompileLibrary(
-                        TorchParityLibName, MetalBatchExecutionKernels.TorchParitySource, requireStrictFloatingPoint: true);
+                lock (_torchParityLibraryLock)
+                {
+                    // A library that failed to compile stays unavailable: recompiling on every call would only fail again.
+                    if (_torchParityCompileFailure is not null)
+                        throw new GpuCapabilityUnavailableException("Metal PyTorch-parity kernels failed to compile.", _torchParityCompileFailure);
+                    if (_torchParityLibrary == IntPtr.Zero)
+                    {
+                        try
+                        {
+                            _torchParityLibrary = _shaderLibrary.CompileLibrary(
+                                TorchParityLibName, MetalBatchExecutionKernels.TorchParitySource, requireStrictFloatingPoint: true);
+                        }
+                        catch (InvalidOperationException ex)
+                        {
+                            _torchParityCompileFailure = ex;
+                            throw;
+                        }
+                    }
+                }
             }
+            pipe = GetPipeline(TorchParityLibName, _torchParityLibrary, name);
         }
-        var pipe = GetPipeline(TorchParityLibName, _torchParityLibrary, name);
+        catch (InvalidOperationException ex)
+        {
+            // #1203: a kernel this device cannot build is a missing capability (the engine falls back to the CPU), not a
+            // fault; the compiler's message travels as the inner exception.
+            throw new GpuCapabilityUnavailableException($"Metal PyTorch-parity kernel {name} is unavailable.", ex);
+        }
         using var enc = _commandQueue.CreateScopedComputeEncoder();
         enc.SetPipelineState(pipe.Handle);
         BindBatchArguments(in enc, name, args);
