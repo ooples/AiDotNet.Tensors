@@ -68,13 +68,22 @@ public sealed class ConvTranspose3DDeterminismAcrossThreadsTests : IDisposable
     // would never ask that question.
     private static readonly int[] ThreadBudgets = { 1, 2, 3, 4, 1, 4, 3, 2 };
 
+    // Below this much reported work a loop runs serially. Read from the executor, not copied: if the threshold
+    // is ever raised past these workloads the assertions below fail, where a copied constant would let the tests
+    // pass while running serially.
+    private static int ParallelGateElements => PersistentParallelExecutor.DefaultSerialGrainSize;
+
     [Fact]
     public void ConvTranspose3D_is_bit_identical_regardless_of_the_thread_budget()
     {
-        // 4 * 16 * 18^3 = 373,248 output elements, comfortably past the serial grain gate described on the
-        // gradient test below, so the parallel path is the one actually being measured.
-        var input = Fill(new[] { 4, 16, 16, 16, 16 }, seed: 777);
+        // 2 * 16 * 12^3 = 55,296 output elements: past the serial grain gate described on the gradient test
+        // below (32 * 1024), so the parallel path is the one actually being measured. It is no larger than that
+        // needs: at 4 * 16 * 18^3 this test ran the convolution eight times over 113M multiply-adds each and
+        // took 3 to 4 minutes on a CI runner under coverage, next to a watchdog that aborts the whole test run
+        // after 10 minutes without a test finishing.
+        var input = Fill(new[] { 2, 16, 10, 10, 10 }, seed: 777);
         var kernel = Fill(new[] { 16, 16, 3, 3, 3 }, seed: 778);
+        Assert.True(2 * 16 * 12 * 12 * 12 >= ParallelGateElements, "the output must clear the serial grain gate");
 
         float[]? baseline = null;
         foreach (var dop in ThreadBudgets)
@@ -101,10 +110,21 @@ public sealed class ConvTranspose3DDeterminismAcrossThreadsTests : IDisposable
         // this path reports is the gradient buffer's length. A smaller kernel never reaches the parallel gate
         // at all: it would report "deterministic" without having run in parallel even once — a dead control
         // that passes against the unfixed engine. 32*32*4*4*4 = 65,536 clears the gate; the 16*16*3*3*3 =
-        // 6,912 kernel used by the forward test above does NOT. Do not shrink these.
+        // 6,912 kernel used by the forward test above does NOT. Do not shrink the KERNEL.
+        //
+        // The spatial extent is not part of that gate and is kept small: at 12^3 input this test accumulated
+        // 226M products per run, eight runs, and took 5 to 8 minutes on a CI runner under coverage, long enough
+        // on a slow runner to trip the 10-minute hang watchdog and abort the whole test run. At 6^3 it is an
+        // eighth of that per batch entry, with the same kernel, the same task partition and the same reported work.
+        //
+        // THREE batch entries, not two. The defect merged one partial per (batch, input channel) task, and a
+        // kernel element belongs to one input channel, so it received exactly `batch` partials. With two, the
+        // merge is a + b against b + a, which is the same float in either order: the test could not have failed.
+        // Three is the smallest count where the order of the additions can change the result.
         var kernelShape = new[] { 32, 32, 4, 4, 4 };
-        var input = Fill(new[] { 2, 32, 12, 12, 12 }, seed: 779);
-        var gradOutput = Fill(new[] { 2, 32, 15, 15, 15 }, seed: 780);
+        Assert.True(32 * 32 * 4 * 4 * 4 >= ParallelGateElements, "the kernel gradient must clear the serial grain gate");
+        var input = Fill(new[] { 3, 32, 6, 6, 6 }, seed: 779);
+        var gradOutput = Fill(new[] { 3, 32, 9, 9, 9 }, seed: 780);
 
         float[]? baseline = null;
         foreach (var dop in ThreadBudgets)
