@@ -8,6 +8,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
+    /// <remarks>OpenCL keeps its power-of-two FFT kernel.</remarks>
+    bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
+
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
     /// the undefined-contents contract.

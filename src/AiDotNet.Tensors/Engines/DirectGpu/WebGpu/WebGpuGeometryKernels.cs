@@ -234,6 +234,13 @@ fn sample_safe(n: i32, y_in: i32, x_in: i32, c: i32) -> f32 {
         sy = ((gy + 1.0) * f32(p.H) - 1.0) * 0.5;
     }
 
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule). Tested on the bits, since WGSL
+    // lets an implementation assume floats are finite: |x| below 2147483520 (0x4EFFFFFF) has a smaller bit pattern.
+    if ((bitcast<u32>(sx) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (bitcast<u32>(sy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) {
+        for (var c : i32 = 0; c < p.C; c = c + 1) { output_[((n * p.C + c) * p.outH + oy) * p.outW + ox] = 0.0; }
+        return;
+    }
+
     if (p.mode == 1) {
         let nx = i32(round(sx)); let ny = i32(round(sy));
         for (var c : i32 = 0; c < p.C; c = c + 1) {

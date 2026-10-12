@@ -51,7 +51,15 @@ void main(){if(gl_GlobalInvocationID.x!=0u)return;float bc1=1.0-pow(beta1,float(
 ";
 
     public static string ConvertToFp16 => Header + @"
-layout(set=0,binding=0) readonly buffer Input { float inputData[]; };layout(set=0,binding=1) writeonly buffer Output { uint outputData[]; };layout(push_constant) uniform Params { uint size; };void main(){uint word=gl_GlobalInvocationID.x;if(word>=(size+1u)/2u)return;uint first=word*2u;float second=first+1u<size?inputData[first+1u]:0.0;outputData[word]=packHalf2x16(vec2(inputData[first],second));}
+layout(set=0,binding=0) readonly buffer Input { float inputData[]; };layout(set=0,binding=1) writeonly buffer Output { uint outputData[]; };layout(push_constant) uniform Params { uint size; };
+// IEEE half with round to nearest even, as CUDA's __float2half: packHalf2x16's rounding is implementation-defined
+// (AMD's Windows driver truncates).
+uint f32_to_f16_rne(float f){uint x=floatBitsToUint(f);uint sign=(x>>16)&0x8000u;uint e8=(x>>23)&0xFFu;uint m=x&0x7FFFFFu;
+if(e8==0xFFu)return sign|0x7C00u|(m!=0u?(0x200u|(m>>13)):0u);int e=int(e8)-112;if(e>=31)return sign|0x7C00u;
+if(e<=0){if(e<-10)return sign;m|=0x800000u;uint shift=uint(14-e);uint h=m>>shift;uint rem=m&((1u<<shift)-1u);uint half_=1u<<(shift-1u);
+if(rem>half_||(rem==half_&&(h&1u)!=0u))h++;return sign|h;}
+uint h=sign|(uint(e)<<10)|(m>>13);uint rem=m&0x1FFFu;if(rem>0x1000u||(rem==0x1000u&&(h&1u)!=0u))h++;return h;}
+void main(){uint word=gl_GlobalInvocationID.x;if(word>=(size+1u)/2u)return;uint first=word*2u;float second=first+1u<size?inputData[first+1u]:0.0;outputData[word]=f32_to_f16_rne(inputData[first])|(f32_to_f16_rne(second)<<16);}
 ";
 
     public static string ConvertToFp32 => Header + @"

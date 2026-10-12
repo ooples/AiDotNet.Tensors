@@ -119,9 +119,10 @@ public sealed class LstmSequenceBackendParityTests
                 $"{what}[{i}]: expected {expected[i]}, got {actual[i]}");
     }
 
-    private static void Check(IDirectGpuBackend backend)
+    // portable: the shared lstm_p_ kernels Metal and WebGPU run (PortableLstmSequence), launched through this backend.
+    private static void Check(IDirectGpuBackend backend, PortableGenericFft.Launcher? portable = null)
     {
-        int maxHidden = ((IFusedLstmSequenceTraining)backend).MaxFusedLstmHidden;
+        int maxHidden = portable is null ? ((IFusedLstmSequenceTraining)backend).MaxFusedLstmHidden : int.MaxValue;
         Assert.True(maxHidden >= 64, $"MaxFusedLstmHidden {maxHidden} is too small to be useful.");
         foreach (var (bN, tN, inN, hN) in Shapes)
         {
@@ -155,8 +156,12 @@ public sealed class LstmSequenceBackendParityTests
             using var allH = backend.AllocateBuffer(new float[(tN + 1) * bN * hN]);
             using var allC = backend.AllocateBuffer(new float[(tN + 1) * bN * hN]);
             using var gates = backend.AllocateBuffer(new float[tN * bN * hN * 4]);
-            backend.LstmForwardSequence(bx, h0, c0, bwih, bwhh, bbias, zeroBias, y, hFinal, cFinal, allH, allC, gates,
-                tN, bN, inN, hN);
+            if (portable is null)
+                backend.LstmForwardSequence(bx, h0, c0, bwih, bwhh, bbias, zeroBias, y, hFinal, cFinal, allH, allC, gates,
+                    tN, bN, inN, hN);
+            else
+                PortableLstmSequence.Forward(backend, portable, bx, h0, c0, bwih, bwhh, bbias, zeroBias, y, hFinal, cFinal,
+                    allH, allC, gates, tN, bN, inN, hN);
             AssertClose(r.Y, backend.DownloadBuffer(y), $"{shape} output");
 
             using var bgy = backend.AllocateBuffer(gy);
@@ -167,8 +172,13 @@ public sealed class LstmSequenceBackendParityTests
             using var gWhh = backend.AllocateBuffer(new float[4 * hN * hN]);
             using var gBias = backend.AllocateBuffer(new float[4 * hN]);
             using var gBiasHh = backend.AllocateBuffer(new float[4 * hN]);
-            backend.LstmBackwardSequence(bgy, allH, allC, gates, h0, c0, bwih, bwhh, bx,
-                gIn, gH0, gC0, gWih, gWhh, gBias, gBiasHh, tN, bN, inN, hN);
+            if (portable is null)
+                backend.LstmBackwardSequence(bgy, allH, allC, gates, h0, c0, bwih, bwhh, bx,
+                    gIn, gH0, gC0, gWih, gWhh, gBias, gBiasHh, tN, bN, inN, hN);
+            else
+                PortableLstmSequence.Backward(backend, portable, bgy, allH, allC, gates, bwih, bwhh, bx,
+                    gIn, gH0, gC0, gWih, gWhh, gBias, gBiasHh, tN, bN, inN, hN);
+            if (portable is not null) AssertClose(r.GBias, backend.DownloadBuffer(gBiasHh), $"{shape} gradBiasHh");
             AssertClose(r.GIn, backend.DownloadBuffer(gIn), $"{shape} gradInput");
             AssertClose(r.GWih, backend.DownloadBuffer(gWih), $"{shape} gradWih");
             AssertClose(r.GWhh, backend.DownloadBuffer(gWhh), $"{shape} gradWhh");
@@ -199,6 +209,38 @@ public sealed class LstmSequenceBackendParityTests
         using var backend = new HipBackend();
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
         Check(backend);
+    }
+
+    private static PortableGenericFft.Launcher Launcher(object backend, string method)
+    {
+        var info = backend.GetType().GetMethod(method, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(info);
+        return (PortableGenericFft.Launcher)Delegate.CreateDelegate(typeof(PortableGenericFft.Launcher), backend, info);
+    }
+
+    [SkippableFact]
+    public void OpenCl_PortableLstmSequence_MatchesCpu()
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        Check(backend, Launcher(backend, "LaunchBatch"));
+    }
+
+    [SkippableFact]
+    public void Vulkan_PortableLstmSequence_MatchesCpu()
+    {
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable,
+            "Vulkan with a GLSL compiler is not available.");
+        Check(backend, Launcher(backend, "LaunchSolver"));
+    }
+
+    [SkippableFact]
+    public void Hip_PortableLstmSequence_MatchesCpu()
+    {
+        using var backend = new HipBackend();
+        Skip.IfNot(backend.IsAvailable, "HIP is not available.");
+        Check(backend, Launcher(backend, "LaunchBatch"));
     }
 }
 #endif

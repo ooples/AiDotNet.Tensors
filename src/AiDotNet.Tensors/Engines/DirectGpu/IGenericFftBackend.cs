@@ -16,6 +16,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal interface IGenericFftBackend
 {
     /// <summary>
+    /// True when this backend routes power-of-two lengths through the generic FFT too; false when it keeps a dedicated
+    /// power-of-two kernel and uses the generic path only for the other lengths.
+    /// </summary>
+    bool PrefersGenericFftForPowerOfTwo { get; }
+
+    /// <summary>
     /// True when every kernel the transform needs for <paramref name="type"/> is compiled and the device can run it.
     /// The result is authoritative: a false answer is never worked around with a host copy.
     /// </summary>
