@@ -891,6 +891,110 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     dk[b * f.kb + h * f.kh + j * f.kr + e] = ak;
     dv[b * f.vb + h * f.vh + j * f.vr + e] = av;
 }");
+    // #1107 / #1108 fused LSTM: line-for-line ports of BatchExecutionCudaKernels.LstmSource.
+    private const string LstmSig = @"
+fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
+";
+
+    public static readonly string LstmGates = Shader(
+        new[] { "r:x", "r:wih", "r:whh", "r:bih", "r:bhh", "r:allH", "rw:gates" }, "t: i32, B: i32, T: i32, In: i32, H: i32",
+        LstmSig + Main + @"
+    let H = p.H; let In = p.In; let B = p.B;
+    if (i >= B * 4 * H) { return; }
+    let b = i / (4 * H); let row = i - b * 4 * H;
+    var s = bih[row] + bhh[row];
+    for (var k = 0; k < In; k++) { s += wih[row * In + k] * x[(b * p.T + p.t) * In + k]; }
+    for (var j = 0; j < H; j++) { s += whh[row * H + j] * allH[(p.t * B + b) * H + j]; }
+    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), tanh(s), row / H == 2);
+}");
+
+    public static readonly string LstmCell = Shader(
+        new[] { "r:gates", "rw:allC", "rw:allH", "rw:y" }, "t: i32, B: i32, T: i32, H: i32", Main + @"
+    let H = p.H; let B = p.B; let t = p.t;
+    if (i >= B * H) { return; }
+    let b = i / H; let h = i - b * H;
+    let gb = (t * B + b) * 4 * H;
+    let c = gates[gb + H + h] * allC[(t * B + b) * H + h] + gates[gb + h] * gates[gb + 2 * H + h];
+    let hv = gates[gb + 3 * H + h] * tanh(c);
+    allC[((t + 1) * B + b) * H + h] = c;
+    allH[((t + 1) * B + b) * H + h] = hv;
+    y[(b * p.T + t) * H + h] = hv;
+}");
+
+    public static readonly string LstmCellBackward = Shader(
+        new[] { "r:gy", "r:gates", "r:allC", "r:dh", "rw:dc", "rw:dpre" }, "t: i32, B: i32, T: i32, H: i32", Main + @"
+    let H = p.H; let B = p.B; let t = p.t;
+    if (i >= B * H) { return; }
+    let b = i / H; let h = i - b * H;
+    let gb = (t * B + b) * 4 * H;
+    let ig = gates[gb + h]; let fg = gates[gb + H + h]; let gg = gates[gb + 2 * H + h]; let og = gates[gb + 3 * H + h];
+    let tc = tanh(allC[((t + 1) * B + b) * H + h]);
+    let dhv = gy[(b * p.T + t) * H + h] + dh[i];
+    let dcv = dhv * og * (1.0 - tc * tc) + dc[i];
+    dpre[gb + h] = dcv * gg * ig * (1.0 - ig);
+    dpre[gb + H + h] = dcv * allC[(t * B + b) * H + h] * fg * (1.0 - fg);
+    dpre[gb + 2 * H + h] = dcv * ig * (1.0 - gg * gg);
+    dpre[gb + 3 * H + h] = dhv * tc * og * (1.0 - og);
+    dc[i] = dcv * fg;
+}");
+
+    public static readonly string LstmHiddenBackward = Shader(
+        new[] { "r:dpre", "r:whh", "rw:dh" }, "t: i32, B: i32, H: i32", Main + @"
+    let H = p.H; let B = p.B;
+    if (i >= B * H) { return; }
+    let b = i / H; let j = i - b * H;
+    let gb = (p.t * B + b) * 4 * H;
+    var s = 0.0;
+    for (var row = 0; row < 4 * H; row++) { s += dpre[gb + row] * whh[row * H + j]; }
+    dh[i] = s;
+}");
+
+    public static readonly string LstmInputGrad = Shader(
+        new[] { "r:dpre", "r:wih", "rw:gin" }, "B: i32, T: i32, In: i32, H: i32", Main + @"
+    let H = p.H; let In = p.In;
+    if (i >= p.B * p.T * In) { return; }
+    let k = i % In; let bt = i / In; let t = bt % p.T; let b = bt / p.T;
+    let gb = (t * p.B + b) * 4 * H;
+    var s = 0.0;
+    for (var row = 0; row < 4 * H; row++) { s += dpre[gb + row] * wih[row * In + k]; }
+    gin[i] = s;
+}");
+
+    public static readonly string LstmWeightIhGrad = Shader(
+        new[] { "r:dpre", "r:x", "rw:gwih" }, "B: i32, T: i32, In: i32, H: i32", Main + @"
+    let H = p.H; let In = p.In;
+    if (i >= 4 * H * In) { return; }
+    let row = i / In; let k = i - row * In;
+    var s = 0.0;
+    for (var t = 0; t < p.T; t++) {
+        for (var b = 0; b < p.B; b++) { s += dpre[(t * p.B + b) * 4 * H + row] * x[(b * p.T + t) * In + k]; }
+    }
+    gwih[i] = s;
+}");
+
+    public static readonly string LstmWeightHhGrad = Shader(
+        new[] { "r:dpre", "r:allH", "rw:gwhh" }, "B: i32, T: i32, H: i32", Main + @"
+    let H = p.H;
+    if (i >= 4 * H * H) { return; }
+    let row = i / H; let j = i - row * H;
+    var s = 0.0;
+    for (var t = 0; t < p.T; t++) {
+        for (var b = 0; b < p.B; b++) { s += dpre[(t * p.B + b) * 4 * H + row] * allH[(t * p.B + b) * H + j]; }
+    }
+    gwhh[i] = s;
+}");
+
+    public static readonly string LstmBiasGrad = Shader(
+        new[] { "r:dpre", "rw:gbih", "rw:gbhh" }, "B: i32, T: i32, H: i32", Main + @"
+    let H = p.H;
+    if (i >= 4 * H) { return; }
+    var s = 0.0;
+    for (var t = 0; t < p.T; t++) {
+        for (var b = 0; b < p.B; b++) { s += dpre[(t * p.B + b) * 4 * H + i]; }
+    }
+    gbih[i] = s;
+    gbhh[i] = s;
+}");
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
@@ -916,6 +1020,10 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
         [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
         [BatchExecutionCudaKernels.FaLse] = FaLse, [BatchExecutionCudaKernels.FaOut] = FaOut, [BatchExecutionCudaKernels.FaDelta] = FaDelta,
         [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDkv] = FaDkv,
+        [BatchExecutionCudaKernels.LstmGates] = LstmGates, [BatchExecutionCudaKernels.LstmCell] = LstmCell,
+        [BatchExecutionCudaKernels.LstmCellBackward] = LstmCellBackward, [BatchExecutionCudaKernels.LstmHiddenBackward] = LstmHiddenBackward,
+        [BatchExecutionCudaKernels.LstmInputGrad] = LstmInputGrad, [BatchExecutionCudaKernels.LstmWeightIhGrad] = LstmWeightIhGrad,
+        [BatchExecutionCudaKernels.LstmWeightHhGrad] = LstmWeightHhGrad, [BatchExecutionCudaKernels.LstmBiasGrad] = LstmBiasGrad,
     };
 }
 #endif
