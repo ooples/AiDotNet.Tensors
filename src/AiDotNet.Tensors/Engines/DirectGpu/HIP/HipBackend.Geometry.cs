@@ -12,7 +12,7 @@ public sealed partial class HipBackend : IGeometryBackend
             throw new InvalidOperationException(
                 "Geometry HIP module was not compiled. Falling back to CPU reference.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         return kernel;
     }
 

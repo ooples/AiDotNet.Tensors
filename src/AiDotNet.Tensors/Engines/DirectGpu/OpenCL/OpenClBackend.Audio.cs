@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private DirectOpenClKernel GetAudioKernel(string name)
         {
             if (!_kernelCache.TryGetValue(name, out var k))
-                throw new InvalidOperationException($"OpenCL audio kernel not found: {name}.");
+                throw new GpuCapabilityUnavailableException($"OpenCL audio kernel not found: {name}.");
             return k;
         }
         private static int RoundUpAudio(int v) => ((v + AudioLocalSize - 1) / AudioLocalSize) * AudioLocalSize;

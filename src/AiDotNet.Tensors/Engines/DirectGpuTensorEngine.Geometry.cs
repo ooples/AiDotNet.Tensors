@@ -47,7 +47,7 @@ public partial class DirectGpuTensorEngine
                     catch { outBuf.Dispose(); throw; }
                 }
             }
-            catch { }
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Interpolate", capabilityGap); }
         }
         return base.Interpolate(input, sizes, mode, alignCorners);
     }
@@ -216,7 +216,7 @@ public partial class DirectGpuTensorEngine
                     catch { outBuf.Dispose(); throw; }
                 }
             }
-            catch { }
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GridSample", capabilityGap); }
         }
         return base.GridSample(input, grid, mode, padding, alignCorners);
     }
@@ -246,7 +246,7 @@ public partial class DirectGpuTensorEngine
                     catch { gBuf.Dispose(); throw; }
                 }
             }
-            catch { }
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("AffineGrid3D", capabilityGap); }
         }
         return base.AffineGrid3D(theta, outputDepth, outputHeight, outputWidth, alignCorners);
     }

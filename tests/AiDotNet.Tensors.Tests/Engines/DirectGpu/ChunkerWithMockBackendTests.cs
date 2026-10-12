@@ -270,13 +270,10 @@ public class ChunkerWithMockBackendTests
     }
 
     [Fact]
-    public void TryRunUnaryChunked_OpThrows_FallsThroughToCpu()
+    public void TryRunUnaryChunked_OpLacksCapability_FallsThroughToCpu()
     {
-        // Per PR #288 review: a per-chunk dispatch failure (kernel error,
-        // download error, OOM-during-loop, etc.) should fall through to
-        // CPU rather than propagate and crash the training step. The op
-        // delegate throws on the second chunk; the chunker catches and
-        // returns null + emits a cpu_fallback_chunk_dispatch_error event.
+        // #1165: a chunk whose kernel the backend lacks (NotSupportedException) falls through to the CPU: the
+        // chunker returns null and emits its fallback event. A fault (below) propagates instead.
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
         using var engine = new DirectGpuTensorEngine();
@@ -291,7 +288,7 @@ public class ChunkerWithMockBackendTests
             {
                 state.UnaryOpCalls++;
                 if (state.UnaryOpCalls == 2)
-                    throw new InvalidOperationException("simulated kernel dispatch error");
+                    throw new GpuCapabilityUnavailableException("simulated missing kernel");
             },
             ex,
             out bool emitted);
@@ -302,7 +299,30 @@ public class ChunkerWithMockBackendTests
     }
 
     [Fact]
-    public void TryRunBinaryChunked_OpThrows_FallsThroughToCpu()
+    public void TryRunUnaryChunked_OpFaults_Propagates()
+    {
+        // #1165: a kernel fault is not turned into a silent CPU computation.
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        using var engine = new DirectGpuTensorEngine();
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        var thrown = Assert.Throws<InvalidOperationException>(() => engine.TryRunUnaryChunked<float>(backend, input,
+            (b, bIn, bOut, len) =>
+            {
+                state.UnaryOpCalls++;
+                if (state.UnaryOpCalls == 2)
+                    throw new InvalidOperationException("simulated kernel dispatch error");
+            },
+            ex,
+            out _));
+        Assert.Equal("simulated kernel dispatch error", thrown.Message);
+        Assert.Equal(2, state.UnaryOpCalls);
+    }
+
+    [Fact]
+    public void TryRunBinaryChunked_OpLacksCapability_FallsThroughToCpu()
     {
         var state = new MockBackendState { MaxBufferAllocBytes = 16 };
         var backend = MockDirectGpuBackend.Create(state);
@@ -319,13 +339,33 @@ public class ChunkerWithMockBackendTests
             {
                 state.BinaryOpCalls++;
                 if (state.BinaryOpCalls == 1)
-                    throw new InvalidOperationException("simulated dispatch error");
+                    throw new NotSupportedException("simulated missing kernel");
             },
             ex,
             out bool emitted);
 
         Assert.Null(result);
         Assert.True(emitted);
+    }
+
+    [Fact]
+    public void TryRunBinaryChunked_OpFaults_Propagates()
+    {
+        var state = new MockBackendState { MaxBufferAllocBytes = 16 };
+        var backend = MockDirectGpuBackend.Create(state);
+        using var engine = new DirectGpuTensorEngine();
+        var left = new Tensor<float>(new float[] { 1, 2, 3, 4, 5, 6, 7, 8 }, new[] { 8 });
+        var right = new Tensor<float>(new float[] { 10, 20, 30, 40, 50, 60, 70, 80 }, new[] { 8 });
+        var ex = new GpuBufferTooLargeException("Mock", 32, 16, "MockDevice");
+
+        Assert.Throws<InvalidOperationException>(() => engine.TryRunBinaryChunked<float>(backend, left, right,
+            (b, bA, bB, bC, len) =>
+            {
+                state.BinaryOpCalls++;
+                throw new InvalidOperationException("simulated dispatch error");
+            },
+            ex,
+            out _));
     }
 
     [Fact]

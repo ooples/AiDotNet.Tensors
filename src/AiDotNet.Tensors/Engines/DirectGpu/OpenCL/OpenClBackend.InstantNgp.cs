@@ -6,7 +6,7 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
     private DirectOpenClKernel GetInstantNgpKernel(string name)
     {
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"OpenCL Instant-NGP kernel not found: {name}.");
+            throw new GpuCapabilityUnavailableException($"OpenCL Instant-NGP kernel not found: {name}.");
         return kernel;
     }
 
