@@ -20,6 +20,9 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Tensor-level unary maths with their own backward (CpuEngine.ElementwiseExtra)
+        "TensorAcosh", "TensorAsinh", "TensorExp2", "TensorExpm1", "TensorLog10", "TensorLog1p", "TensorLog2",
+        "TensorRsqrt", "TensorTan", "TensorTrunc",
         // Activations and index-map ops with their own backward (CpuEngine.TorchMisc)
         "TensorCelu", "TensorHardtanh", "TensorLogSigmoid", "TensorSoftsign",
         "TensorRrelu", "TensorMsort", "TensorDiagflat", "TensorDiagonalScatter",
@@ -256,6 +259,8 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Scaled low-precision GEMMs: not differentiable, as torch's scaled_mm (CpuEngine.GroupedScaledMatMul)
+        "TensorScaledMatMul", "TensorScaledGroupedMatMul",
         // Random draws, nonzero_static and unique(dim): constants (CpuEngine.TorchRandom)
         "TensorBernoulli", "TensorBinomial", "TensorPoisson", "TensorUniform",
         "TensorCauchy", "TensorExponential", "TensorGeometric", "TensorLogNormal",
@@ -498,6 +503,8 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // Advanced indexing (TensorTake) and grouped GEMM (narrow / matmul / concat): composed from recorded ops
+        "TensorIndex", "TensorGroupedMatMul",
         // Composed from recorded ops (reparameterized normal, constant masks, reshape/permute, matmul, conv, scatter_reduce)
         "TensorNormal", "TensorAlphaDropout", "TensorFeatureAlphaDropout", "TensorChannelDropout",
         "TensorBilinear", "TensorChannelShuffle", "TensorPixelUnshuffle", "TensorLocalResponseNorm",
