@@ -25,8 +25,13 @@ internal sealed class ResultBufferOwner
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal void MarkEscaped()
     {
-        if (!State.Escaped && ResultBufferTracker.TraceEscapes) ResultBufferTracker.RecordEscape();
+        if (State.Escaped) return;
+        if (ResultBufferTracker.TraceEscapes) ResultBufferTracker.RecordEscape();
         State.Escaped = true;
+        // It can never be reused now, so stop tracking it: the tracker holds tracked arrays strongly, and an escaped one
+        // used to stay held (dead) until a rent of its size scanned it or a trim ran, which a run through many one-off
+        // shapes might never trigger before reaching the tracked-bytes cap.
+        ResultBufferTracker.ReleaseEscaped(State);
     }
 }
 
@@ -35,6 +40,9 @@ internal sealed class ResultBufferState
 {
     /// <summary>Raw access other than a lease reached the array; it must never be recycled.</summary>
     internal volatile bool Escaped;
+
+    /// <summary>The array this state's tracker entry holds, until the entry is released.</summary>
+    internal Array? TrackedArray;
 }
 
 /// <summary>
@@ -166,7 +174,7 @@ internal static class ResultBufferTracker
     internal static long TrackedBytes => Interlocked.Read(ref s_trackedBytes);
     internal static long InducedCollections;
     internal static long ReusedArrays;
-    /// <summary>Arrays whose results were collected but could not be reused because raw access escaped them.</summary>
+    /// <summary>Tracked arrays released because raw access escaped them (they are never reused).</summary>
     internal static long EscapedArrays;
 
     /// <summary>Whether an array of <paramref name="length"/> elements of <typeparamref name="T"/> is tracked.</summary>
@@ -188,7 +196,7 @@ internal static class ResultBufferTracker
         long bytes = (long)array.Length * Unsafe.SizeOf<T>();
         if (Interlocked.Read(ref s_trackedBytes) + bytes > HardCapBytes) return null;
 
-        var state = new ResultBufferState();
+        var state = new ResultBufferState { TrackedArray = array };
         var owner = new ResultBufferOwner(state);
         lock (s_lock)
         {
@@ -235,6 +243,20 @@ internal static class ResultBufferTracker
             // Never reuse it: from now on it is an ordinary array the GC owns.
             RemoveLocked(entry);
             return null;
+        }
+    }
+
+    /// <summary>Stops tracking the array behind <paramref name="state"/> once raw access escaped it.</summary>
+    internal static void ReleaseEscaped(ResultBufferState state)
+    {
+        lock (s_lock)
+        {
+            if (state.TrackedArray is { } array && s_byArray.TryGetValue(array, out var entry) && ReferenceEquals(entry.State, state))
+            {
+                RemoveLocked(entry);
+                Interlocked.Increment(ref EscapedArrays);
+            }
+            state.TrackedArray = null;
         }
     }
 
@@ -383,6 +405,7 @@ internal static class ResultBufferTracker
 
     private static void RemoveLocked(Entry entry)
     {
+        entry.State.TrackedArray = null;
         entry.Owner.Free();
         entry.Group.Remove(entry);
         if (entry.Group.Count == 0)
