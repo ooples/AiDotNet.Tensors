@@ -907,6 +907,78 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     dv[b * f.vb + h * f.vh + j * f.vr + e] = av;
 }");
 
+    // #974 fused decode-linear: line-for-line ports of BatchExecutionCudaKernels.DecodeLinearSource. dl_half is the
+    // DL_HALF macro: one FP16 value widened to f32 on its bit pattern (zero, subnormals, infinity and NaN included).
+    private const string DlCommon = @"
+fn dl_gelu(s: f32) -> f32 { return 0.5 * s * (1.0 + tanh(0.7978845608028654 * (s + 0.044715 * s * s * s))); }
+";
+
+    private const string DlHalf = @"
+fn dl_half(word: i32, slot: i32) -> f32 {
+    let b = (word >> (u32(slot) * 16u)) & 65535;
+    let e = (b >> 10u) & 31;
+    let m = b & 1023;
+    var v = 0.0;
+    if (e == 0) {
+        v = f32(m) * 5.9604644775390625e-8;
+    } else {
+        let exponent = select(e + 112, 255, e == 31);
+        v = bitcast<f32>((exponent << 23u) | (m << 13u));
+    }
+    if ((b & 32768) != 0) { v = -v; }
+    return v;
+}
+";
+
+    public static readonly string DlLinearGelu = Shader(new[] { "r:x", "r:w", "r:bias", "rw:y" }, "M: i32, K: i32, N: i32",
+        DlCommon + Main + @"
+    let K = p.K; let N = p.N;
+    if (i >= p.M * N) { return; }
+    let m = i / N; let n = i - m * N;
+    var s = 0.0;
+    for (var k = 0; k < K; k++) { s += x[m * K + k] * w[n * K + k]; }
+    s += bias[n];
+    y[i] = dl_gelu(s);
+}");
+
+    public static readonly string DlLinearGeluFp16 = Shader(new[] { "r:xh:i32", "r:wh:i32", "r:bias", "rw:y" }, "M: i32, K: i32, N: i32",
+        DlCommon + DlHalf + Main + @"
+    let K = p.K; let N = p.N;
+    if (i >= p.M * N) { return; }
+    let m = i / N; let n = i - m * N;
+    var s = 0.0;
+    for (var k = 0; k < K; k++) {
+        let xi = m * K + k; let wi = n * K + k;
+        s += dl_half(xh[xi >> 1u], xi & 1) * dl_half(wh[wi >> 1u], wi & 1);
+    }
+    s += bias[n];
+    y[i] = dl_gelu(s);
+}");
+
+    public static readonly string DlW8A8LinearGelu = Shader(
+        new[] { "r:x8:i32", "r:w8:i32", "r:actScale", "r:wScales", "r:bias", "rw:y" }, "K: i32, N: i32", DlCommon + Main + @"
+    let K = p.K;
+    if (i >= p.N) { return; }
+    var total = 0;
+    for (var k = 0; k < K; k++) {
+        var xi = (x8[k >> 2u] >> (u32(k & 3) * 8u)) & 255;
+        if (xi > 127) { xi -= 256; }
+        let j = i * K + k;
+        var wi = (w8[j >> 2u] >> (u32(j & 3) * 8u)) & 255;
+        if (wi > 127) { wi -= 256; }
+        total += xi * wi;
+    }
+    let s = f32(total) * actScale[0] * wScales[i] + bias[i];
+    y[i] = dl_gelu(s);
+}");
+
+    public static readonly string DlW8A8Epilogue = Shader(
+        new[] { "r:acc:i32", "r:actScale", "r:wScales", "r:bias", "rw:y" }, "N: i32", DlCommon + Main + @"
+    if (i >= p.N) { return; }
+    let s = f32(acc[i]) * actScale[0] * wScales[i] + bias[i];
+    y[i] = dl_gelu(s);
+}");
+
     // #1107 / #1108 fused LSTM: line-for-line ports of BatchExecutionCudaKernels.LstmSource.
     private const string LstmSig = @"
 fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
@@ -1040,6 +1112,8 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.LstmCellBackward] = LstmCellBackward, [BatchExecutionCudaKernels.LstmHiddenBackward] = LstmHiddenBackward,
         [BatchExecutionCudaKernels.LstmInputGrad] = LstmInputGrad, [BatchExecutionCudaKernels.LstmWeightIhGrad] = LstmWeightIhGrad,
         [BatchExecutionCudaKernels.LstmWeightHhGrad] = LstmWeightHhGrad, [BatchExecutionCudaKernels.LstmBiasGrad] = LstmBiasGrad,
+        [BatchExecutionCudaKernels.DlLinearGelu] = DlLinearGelu, [BatchExecutionCudaKernels.DlLinearGeluFp16] = DlLinearGeluFp16,
+        [BatchExecutionCudaKernels.DlW8A8LinearGelu] = DlW8A8LinearGelu, [BatchExecutionCudaKernels.DlW8A8Epilogue] = DlW8A8Epilogue,
     };
 }
 #endif

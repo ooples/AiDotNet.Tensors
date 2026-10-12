@@ -22,7 +22,7 @@ internal static partial class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource;
+    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + DecodeLinearSource;
 
     private const string CoreSource = @"
 #ifndef INFINITY
@@ -452,6 +452,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const un
         "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage",
         LaSymmetrize, LaLuSolve, LaLdlFactor, LaLdlSolve, LaSolveVector, LaTriangularSolveVector, LaCholeskyBackwardLower,
         LaSolveBackwardVector, LaSvdReduced, LaQrReduced, FaLse, FaOut, FaDelta, FaDq, FaDk, FaDv,
-        LstmGates, LstmCell, LstmCellBackward, LstmHiddenBackward, LstmInputGrad, LstmWeightIhGrad, LstmWeightHhGrad, LstmBiasGrad
+        LstmGates, LstmCell, LstmCellBackward, LstmHiddenBackward, LstmInputGrad, LstmWeightIhGrad, LstmWeightHhGrad, LstmBiasGrad,
+        DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue
     };
 }
