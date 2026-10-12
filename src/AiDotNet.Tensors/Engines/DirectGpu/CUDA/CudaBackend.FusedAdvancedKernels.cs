@@ -39,7 +39,7 @@ public sealed partial class CudaBackend
         }
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedLoRAForward));
         if (!_kernelCache.TryGetValue("fused_lora_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_lora_forward.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_lora_forward.");
         using var _ = PushContext();
 
         // Two-stage kernel: one block per batch row, threads cooperatively
@@ -72,7 +72,7 @@ public sealed partial class CudaBackend
             return;
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedDDIMStep));
         if (!_kernelCache.TryGetValue("fused_ddim_step", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_ddim_step.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_ddim_step.");
         // Reject zero-size dispatches (CUDA rejects 0-block grid) and the
         // alpha schedule values that would NaN-poison the output via
         // 1/sqrt(0) in the kernel.
@@ -108,7 +108,7 @@ public sealed partial class CudaBackend
     {
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedSparseLinear));
         if (!_kernelCache.TryGetValue("fused_sparse_linear", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: fused_sparse_linear.");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_sparse_linear.");
 
         // batchSize * outputFeatures wraps silently to a corrupt grid count
         // when the int product exceeds int.MaxValue. Promote to long, validate.

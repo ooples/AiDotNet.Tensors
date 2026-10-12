@@ -29,7 +29,7 @@ public sealed partial class HipBackend
     {
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedLoRAForward));
         if (!_kernelCache.TryGetValue("fused_lora_forward", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: fused_lora_forward");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fused_lora_forward");
 
         // Two-stage kernel: one block per batch row, dynamic shared memory
         // holds proj[rank]. See CudaFusedAdvancedKernels.cs for the design.
@@ -55,7 +55,7 @@ public sealed partial class HipBackend
     {
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedDDIMStep));
         if (!_kernelCache.TryGetValue("fused_ddim_step", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: fused_ddim_step");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fused_ddim_step");
         // size==0 → 0-block grid, which HIP rejects with hipErrorInvalidConfiguration.
         // alphaBarT must be > 0 because the kernel divides by sqrt(alphaBarT);
         // ᾱ=0 produces ±Inf coefficients that NaN-poison every element.
@@ -89,7 +89,7 @@ public sealed partial class HipBackend
     {
         EnsureFusedAdvancedKernelsAvailable(nameof(FusedSparseLinear));
         if (!_kernelCache.TryGetValue("fused_sparse_linear", out var kernel))
-            throw new InvalidOperationException("HIP kernel not found: fused_sparse_linear");
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: fused_sparse_linear");
 
         // Reject negative dims and 64-bit overflow before computing the grid.
         // Plain `int` multiplication for batchSize * outputFeatures wraps

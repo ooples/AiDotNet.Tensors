@@ -13,7 +13,7 @@ public sealed partial class HipBackend : IParity210Backend
             throw new InvalidOperationException(
                 "Parity-210 HIP module was not compiled (hipRTC rejected source?). Falling back to CPU reference.");
         if (!_kernelCache.TryGetValue(name, out var kernel))
-            throw new InvalidOperationException($"HIP kernel not found: {name}");
+            throw new GpuCapabilityUnavailableException($"HIP kernel not found: {name}");
         return kernel;
     }
 

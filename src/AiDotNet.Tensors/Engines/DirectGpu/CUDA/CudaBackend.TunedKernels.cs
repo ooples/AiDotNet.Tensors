@@ -379,7 +379,7 @@ public sealed partial class CudaBackend
     private unsafe void LaunchLayerNormReference(in CudaLayerNormArgs a)
     {
         if (!_kernelCache.TryGetValue("layernorm_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: layernorm_forward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: layernorm_forward");
         using var _ = PushContext();
         IntPtr inputPtr = a.Input.Handle, outputPtr = a.Output.Handle, gammaPtr = a.Gamma.Handle, betaPtr = a.Beta.Handle;
         IntPtr saveMeanPtr = a.SaveMean.Handle, saveInvVarPtr = a.SaveInvVar.Handle;
@@ -453,7 +453,7 @@ public sealed partial class CudaBackend
     private unsafe void LaunchLayerNormBackwardReference(in CudaNormBackwardArgs a)
     {
         if (!_kernelCache.TryGetValue("layernorm_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: layernorm_backward");
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: layernorm_backward");
         using var _ = PushContext();
         IntPtr gradOutputPtr = a.GradOutput.Handle, inputPtr = a.Input.Handle;
         IntPtr gammaPtr = Required(a.Gamma).Handle, saveMeanPtr = a.Stat0.Handle, saveInvVarPtr = Required(a.Stat1).Handle;
@@ -556,7 +556,7 @@ public sealed partial class CudaBackend
     private unsafe void LaunchColumnGradReference(string kernelName, bool rms, in CudaNormBackwardArgs a)
     {
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: " + kernelName);
         using var _ = PushContext();
         IntPtr g = a.GradOutput.Handle, x = a.Input.Handle, s0 = a.Stat0.Handle, o0 = a.Out0.Handle;
         int rows = a.Rows, n = a.N;

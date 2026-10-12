@@ -31,7 +31,7 @@ internal static class HipSparseBackend
         float[] b, int rows, int cols, int n)
     {
         if (!IsAvailable)
-            throw new InvalidOperationException("HIP rocSPARSE backend is not available.");
+            throw new GpuCapabilityUnavailableException("HIP rocSPARSE backend is not available.");
 
         using var backend = new HipBackend();
         if (!backend.IsAvailable)

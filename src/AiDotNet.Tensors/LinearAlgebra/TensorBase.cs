@@ -182,6 +182,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal StreamingInt8Weight? GetMaterializedStreamingInt8()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (StreamingInt8 is not null) return StreamingInt8;
         if (Lifetime == WeightLifetime.Streaming
             && StreamingPoolHandle >= 0
@@ -205,6 +206,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [MethodImpl(Hot)]
     private void DequantizeStreamingInt8()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var q = StreamingInt8;
         if (q is null) return;
         Vector<T> fresh;
@@ -269,6 +271,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal StreamingInt4Weight? GetMaterializedStreamingInt4()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (StreamingInt4 is not null) return StreamingInt4;
         if (Lifetime == WeightLifetime.Streaming
             && StreamingPoolHandle >= 0
@@ -290,6 +293,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [MethodImpl(Hot)]
     private void DequantizeStreamingInt4()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var q = StreamingInt4;
         if (q is null) return;
         Vector<T> fresh;
@@ -376,6 +380,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal void AliasStorageFromMmap(Vector<T> aliased, IDisposable owner, bool writable = false)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (aliased is null) throw new ArgumentNullException(nameof(aliased));
         if (owner is null) throw new ArgumentNullException(nameof(owner));
         if (!IsContiguous || _storageOffset != 0 || IsView)
@@ -479,6 +484,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [MethodImpl(Hot)]
     private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (source is null) throw new ArgumentNullException(nameof(source));
 
         // Shape equality: the user-facing `Length` of both tensors must match
@@ -598,6 +604,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// A failed soft drop leaves the original storage untouched for a later retry.</returns>
     internal bool TryDropStorageForStreaming(bool throwOnSharedRefcount = false)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!IsContiguous || _storageOffset != 0 || IsView)
             throw new InvalidOperationException(
                 "Streaming drop requires contiguous, non-view, zero-offset tensors. " +
@@ -717,6 +724,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// fast paths).</param>
     internal void RestoreStorageFromBytes(ReadOnlySpan<byte> bytes)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!IsContiguous || _storageOffset != 0 || IsView)
             throw new InvalidOperationException(
                 "Streaming restore requires contiguous, non-view, zero-offset tensors.");
@@ -1233,6 +1241,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal void ClearReleaseMarks()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var array = GetBackingArrayForCacheLookupUnsafe();
         if (array is not null) Helpers.HostSync.ClearReleased(array);
         Helpers.HostSync.ClearReleased(_data);
@@ -1240,6 +1249,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     public Engines.DirectGpu.IGpuBuffer? TryGetGpuBuffer()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero)
         {
             // A released step intermediate still names its old buffer object, which the pool may have re-rented to
@@ -1390,6 +1400,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </remarks>
     internal void AdoptFrom(TensorBase<T> source)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (ReferenceEquals(source, this)) return;
         if (IsSparse || source.IsSparse)
@@ -1419,6 +1430,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     private void AdoptStorageAndLayout(TensorBase<T> source)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         bool sameStorage = ReferenceEquals(_storage, source._storage);
         if (!sameStorage)
         {
@@ -1500,6 +1512,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </remarks>
     internal void IncrementVersion()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         _storage.IncrementGpuCacheVersionIfTracked();
         // A host-side mutation leaves the shared device copy stale, for every view of this vector. (Under inference
         // mode the version does not advance, which used to leave a stale device copy looking current.)
@@ -1969,6 +1982,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     private void MaterializeDeferredStorage()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         lock (_deferredLock)
         {
             // Re-check inside the lock: another thread may have finished while we waited.
@@ -2161,6 +2175,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal void ReplaceSparseLayout(int[] logicalShape, Vector<T>? values)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!IsSparse) throw new InvalidOperationException("Only a sparse tensor's layout is replaced this way.");
         ValidateShape(logicalShape);
         _shape = (int[])logicalShape.Clone();
@@ -2336,6 +2351,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [MethodImpl(Hot)]
     public virtual T[] ToArray()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         ThrowIfSparse();
         if (Length == 0) return Array.Empty<T>();
@@ -2397,6 +2413,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     public T GetFlat(int flatIndex)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         ThrowIfSparse();
         if (flatIndex < 0 || flatIndex >= Length)
@@ -2499,6 +2516,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private protected void EnsureMaterialized()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (LazySource is ILazyNode node && !node.IsRealized)
             node.Realize(node.RecordingEngine);
 
@@ -2537,6 +2555,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal ReadOnlySpan<T> AsSpan()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
 
         ThrowIfSparse();
@@ -2552,6 +2571,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary><see cref="AsSpan"/> without the escape mark, for leases (which keep this tensor alive).</summary>
     internal ReadOnlySpan<T> AsSpanUnmarked()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
 
         ThrowIfSparse();
@@ -3373,6 +3393,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     public virtual TensorBase<T> CloneDeepCopy()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Reads element values, so deferred storage has to exist first. The gate is a no-op
         // for every non-deferred, non-streamed tensor.
         EnsureMaterialized();
@@ -3648,6 +3669,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [MethodImpl(Hot)]
     public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Reads element values, so deferred storage has to exist first. The gate is a no-op
         // for every non-deferred, non-streamed tensor.
         EnsureMaterialized();
@@ -3896,6 +3918,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal bool TryGetContiguousSpan(out ReadOnlySpan<T> span)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         EnsureMaterialized();
         if (!IsContiguous)
         {
