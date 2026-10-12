@@ -37,13 +37,19 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
-        var convArgs = new VulkanConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth,
-            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
-        if (convArgs.OutputCount <= 0) return;
-        // Tuned-kernel registry seam (#1115): the invocation-per-output kernel is the reference; the generated
-        // channel-tile variants are chosen per shape class only after the correctness and paired timing gate.
-        if (Conv2DForwardSlot.TryExecute(convArgs.Shape(), convArgs)) return;
-        LaunchConv2DReference(convArgs);
+        try
+        {
+            // Registry dispatch (#1115): the direct shader or im2col + GEMM, chosen per shape class.
+            var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)) return;
+            int total = batch * outChannels * outHeight * outWidth;
+            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output)) return;
+        }
+        catch { throw; }
     }
 
     public void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -743,6 +749,7 @@ void main() {
 
     #region Normalization Operations
 
+
     // One float that no kernel reads or writes. The normalization kernels declare every binding any of their modes
     // uses, so a mode that leaves some untouched (the running statistics outside batch norm, RMSNorm's beta, saved
     // mean and gradBeta) still needs a buffer bound there. Allocating one per call cost about a millisecond each.
@@ -801,12 +808,9 @@ void main() {
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
-        if (batchSize <= 0) return;
-        var lnArgs = new VulkanLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar,
-            batchSize, normalizedSize, epsilon);
-        if (normalizedSize > 0 && LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), lnArgs))
-            return;
-        LaunchLayerNormReference(lnArgs);
+        var args = new TunedLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar, batchSize, normalizedSize, epsilon);
+        if (batchSize > 0 && normalizedSize > 0 && LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), args)) return;
+        LayerNormReference(args);
     }
 
     public void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -814,20 +818,16 @@ void main() {
         int batchSize, int normalizedSize, float epsilon)
     {
         EnsureInitialized();
+        // Two registry slots: the input gradient (row kernels) and the affine gradients (column reductions).
         bool rowsValid = batchSize > 0 && normalizedSize > 0;
-        var inputGradArgs = new VulkanNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar,
-            gradInput, null, batchSize, normalizedSize);
-        if (!(rowsValid && LayerNormBackwardSlot.TryExecute(RowShape(batchSize, normalizedSize), inputGradArgs)) &&
-            batchSize > 0)
-            LaunchLayerNormBackwardReference(inputGradArgs);
-
-        // gradGamma/gradBeta are a reduction ACROSS the rows. The established kernel gives each column one
-        // invocation looping over every row; the registry may select a generated column-tile reduction instead.
-        var paramArgs = new VulkanNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar,
-            gradGamma, gradBeta, batchSize, normalizedSize);
-        if (!(rowsValid && LayerNormGradParametersSlot.TryExecute(RowShape(batchSize, normalizedSize), paramArgs)) &&
-            normalizedSize > 0)
-            LaunchColumnGradReference(rms: false, paramArgs);
+        var inputGradArgs = new TunedNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, null,
+            batchSize, normalizedSize);
+        if (!(rowsValid && LayerNormBackwardSlot.TryExecute(RowShape(batchSize, normalizedSize), inputGradArgs)))
+            LayerNormBackwardInputReference(inputGradArgs);
+        var paramArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar, gradGamma, gradBeta,
+            batchSize, normalizedSize);
+        if (!(rowsValid && LayerNormGradParametersSlot.TryExecute(RowShape(batchSize, normalizedSize), paramArgs)))
+            ColumnGradReference(rms: false, paramArgs);
     }
 
     public void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -878,13 +878,10 @@ void main() {
         var rmsBuffers = new[] { gradOutput, input, gamma, unused, saveRms, gradInput, gradGamma, unused };
         GlslNaryOp(VulkanGlslKernels.NormalizationBackward, rmsBuffers, batchSize,
             new[] { 3u, 0u, (uint)batchSize, (uint)normalizedSize, 1u });
-
-        // gradGamma (a column reduction over rows) goes through the tuned-kernel registry.
-        var gammaArgs = new VulkanNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null,
-            batchSize, normalizedSize);
-        if (!(batchSize > 0 && normalizedSize > 0 &&
-              RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)) && normalizedSize > 0)
-            LaunchColumnGradReference(rms: true, gammaArgs);
+        // The gamma gradient is a column reduction served by the registry (#1115).
+        var gammaArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null, batchSize, normalizedSize);
+        if (!(batchSize > 0 && normalizedSize > 0 && RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)))
+            DispatchNormalizationBackward(rmsBuffers, normalizedSize, new[] { 3u, 1u, (uint)batchSize, (uint)normalizedSize, 1u });
     }
 
     #endregion

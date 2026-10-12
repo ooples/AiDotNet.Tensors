@@ -3228,18 +3228,17 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorAddInPlace", (e, x) => e.TensorAdd(x, ReferenceEquals(b, a) ? x : b)); return; }
+
         // Save input before mutation when tape is active (for backward pass)
-        Tensor<T>? savedA = null;
-        var tape = GradientTape<T>.Current;
-        if (tape is not null && tape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedA = a.Clone();
 
         // Increment version BEFORE mutation so prior tape entries detect the change
         a.IncrementVersion();
 
         // Stride-aware: in-place requires contiguous target; materialize source if needed
         if (!a.IsContiguous) throw new InvalidOperationException("In-place add requires contiguous target tensor.");
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -3261,7 +3260,6 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (OneDnnProvider.TryAdd(pB, pA, pA, length))
                 {
-                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
                     return;
                 }
             }
@@ -3269,7 +3267,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Strategy 2: SimdKernels, split across threads above the elementwise grain
             JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Add);
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
             return;
         }
 
@@ -3301,14 +3298,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorAddUnsafe(pB, pA, pA, length);
             }
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
-        if (savedA is not null)
-            DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
     }
 
     /// <summary>
@@ -4217,6 +4211,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorBroadcastAddInPlace", (e, x) => ((CpuEngine)e).TensorBroadcastAdd(x, ReferenceEquals(b, a) ? x : b)); return; }
+
         // A non-contiguous target (a transpose, a strided slice) used to be swapped for a contiguous
         // COPY here, so every kernel below added into the copy and the caller's tensor came back
         // unchanged — an in-place op that silently did nothing. Compute into a contiguous working
@@ -4553,6 +4551,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "SwishInPlace", static (e, x) => e.Swish(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4615,6 +4617,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
         }
+
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "GELUInPlace", static (e, x) => e.GELU(x)); return; }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -4681,6 +4687,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "TanhInPlace", static (e, x) => e.Tanh(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4738,6 +4748,10 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "MishInPlace", static (e, x) => e.Mish(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4790,6 +4804,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
         }
+
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "LeakyReLUInPlace", (e, x) => e.LeakyReLU(x, alpha)); return; }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -5998,15 +6016,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        Tensor<T>? savedA = null;
-        var mulTape = GradientTape<T>.Current;
-        if (mulTape is not null && mulTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedA = a.Clone();
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorMultiplyInPlace", (e, x) => e.TensorMultiply(x, ReferenceEquals(b, a) ? x : b)); return; }
+
 
         a.IncrementVersion();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place multiply requires contiguous target tensor.");
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -6029,14 +6046,12 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 if (OneDnnProvider.TryMultiply(pB, pA, pA, length))
                 {
-                    if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
                     return;
                 }
             }
 #endif
 
             JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Multiply);
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
             return;
         }
 
@@ -6066,14 +6081,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorMultiplyUnsafe(pB, pA, pA, length);
             }
-            if (savedA is not null) DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
-        if (savedA is not null)
-            DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
     }
 
     /// <summary>
@@ -6155,15 +6167,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        Tensor<T>? savedASub = null;
-        var subTape = GradientTape<T>.Current;
-        if (subTape is not null && subTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedASub = a.Clone();
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorSubtractInPlace", (e, x) => e.TensorSubtract(x, ReferenceEquals(b, a) ? x : b)); return; }
+
 
         a.IncrementVersion();
 
         if (!a.IsContiguous) throw new InvalidOperationException("In-place subtract requires contiguous target tensor.");
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
         int length = a.Length;
@@ -6179,7 +6190,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // No oneDNN subtract primitive — go straight to SIMD
             JitBinaryDispatch(pA, pB, pA, length, JitBinaryOp.Subtract);
-            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
             return;
         }
 
@@ -6209,14 +6219,11 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SimdKernels.VectorSubtractUnsafe(pA, pB, pA, length);
             }
-            if (savedASub is not null) DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
             return;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
-        if (savedASub is not null)
-            DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
     }
 
     /// <summary>
@@ -6245,6 +6252,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
         }
+
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorMultiplyScalarInPlace", (e, x) => e.TensorMultiplyScalar(x, scalar)); return; }
 
         int length = a.Length;
 
@@ -11471,13 +11482,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "SigmoidInPlace", static (e, x) => e.Sigmoid(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
@@ -11493,7 +11504,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (OneDnnProvider.TrySigmoid(ptr, tensor.Length))
                     {
                         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-                        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
                         return;
                     }
                 }
@@ -11502,7 +11512,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
         SigmoidParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #else
     public virtual void SigmoidInPlace<T>(Tensor<T> tensor)
@@ -11524,19 +11533,18 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "SigmoidInPlace", static (e, x) => e.Sigmoid(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
         SigmoidParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #endif
 
@@ -11778,13 +11786,13 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "ReLUInPlace", static (e, x) => e.ReLU(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
@@ -11800,7 +11808,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (OneDnnProvider.TryReLU(ptr, tensor.Length))
                     {
                         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-                        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
                         return;
                     }
                 }
@@ -11809,7 +11816,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
         ReLUParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #else
     public virtual void ReLUInPlace<T>(Tensor<T> tensor)
@@ -11831,19 +11837,18 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
+        // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, tensor, "ReLUInPlace", static (e, x) => e.ReLU(x)); return; }
+
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        Tensor<T>? savedInput = null;
-        var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
-            savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
 
         ReLUParallel(tensor);
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
-        if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #endif
 
@@ -37527,8 +37532,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public void TensorFill<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Filled through its own layout: filling tensor.Contiguous() filled a copy of a view and left the view, and
+        // every alias of its storage, unchanged.
         tensor.Fill(value);
     }
 

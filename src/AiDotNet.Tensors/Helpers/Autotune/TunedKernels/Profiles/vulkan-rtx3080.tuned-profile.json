@@ -6,35 +6,35 @@
       "op": "Conv2DForward",
       "shape": "f32:16x64x16x16x64x3x3x1x1x1x1x1x1x16x16",
       "deterministic": true,
-      "candidate": "glsl.conv2d.invocation_per_output",
+      "candidate": "vulkan.conv2d.direct",
       "speedup": 1
     },
     {
       "op": "Conv2DForward",
       "shape": "f32:32x3x32x32x16x3x3x1x1x1x1x1x1x32x32",
       "deterministic": true,
-      "candidate": "glsl.conv2d.invocation_per_output",
+      "candidate": "vulkan.conv2d.direct",
       "speedup": 1
     },
     {
       "op": "Conv2DForward",
       "shape": "f32:4x3x224x224x64x7x7x2x2x3x3x1x1x112x112",
       "deterministic": true,
-      "candidate": "glsl.conv2d.invocation_per_output",
+      "candidate": "vulkan.conv2d.direct",
       "speedup": 1
     },
     {
       "op": "Conv2DForward",
       "shape": "f32:64x1x28x28x16x3x3x1x1x1x1x1x1x28x28",
       "deterministic": true,
-      "candidate": "glsl.conv2d.invocation_per_output",
+      "candidate": "vulkan.conv2d.direct",
       "speedup": 1
     },
     {
       "op": "Conv2DForward",
       "shape": "f32:8x64x32x32x128x3x3x2x2x1x1x1x1x16x16",
       "deterministic": true,
-      "candidate": "glsl.conv2d.invocation_per_output",
+      "candidate": "vulkan.conv2d.direct",
       "speedup": 1
     },
     {
@@ -132,7 +132,7 @@
       "op": "LayerNormGradParameters",
       "shape": "f32:64x4096",
       "deterministic": true,
-      "candidate": "glsl.layernorm_grad_params.invocation_per_column",
+      "candidate": "vulkan.layernorm_grad_params.thread_per_column",
       "speedup": 1
     },
     {
@@ -146,7 +146,7 @@
       "op": "RmsNormGradGamma",
       "shape": "f32:64x4096",
       "deterministic": true,
-      "candidate": "glsl.rmsnorm_grad_gamma.invocation_per_column",
+      "candidate": "vulkan.rmsnorm_grad_gamma.thread_per_column",
       "speedup": 1
     },
     {

@@ -1,6 +1,3 @@
-// Copyright (c) AiDotNet. All rights reserved.
-// Tuned-kernel registry dispatch on Vulkan (#1115): slots, measurement harness and the device timestamp clock.
-
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -8,173 +5,35 @@ using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-/// <summary>Runs a candidate on arguments passed by reference.</summary>
-internal delegate void VulkanTunedKernelInvoker<TArgs>(in TArgs args) where TArgs : struct;
-
-/// <summary>A registry candidate backed by a delegate on the Vulkan backend.</summary>
-internal sealed class VulkanTunedKernelCandidate<TArgs> : ITunedKernelCandidate<TArgs> where TArgs : struct
-{
-    private readonly Func<TunedShape, bool> _applicable;
-    private readonly VulkanTunedKernelInvoker<TArgs> _execute;
-
-    internal VulkanTunedKernelCandidate(string id, TunedKernelOrigin origin, bool deterministic,
-        Func<TunedShape, bool> applicable, VulkanTunedKernelInvoker<TArgs> execute)
-    {
-        Id = id;
-        Origin = origin;
-        IsDeterministic = deterministic;
-        _applicable = applicable;
-        _execute = execute;
-    }
-
-    public string Id { get; }
-    public TunedKernelOrigin Origin { get; }
-    public bool IsDeterministic { get; }
-    public bool IsApplicable(in TunedShape shape) => _applicable(shape);
-    public void Execute(in TArgs args) => _execute(args);
-}
-
-/// <summary>Vulkan measurement services for one op family: host snapshots of outputs, device-timestamp timing.</summary>
-internal sealed class VulkanTunedKernelHarness<TArgs> : ITunedKernelHarness<TArgs> where TArgs : struct
-{
-    private readonly VulkanBackend _backend;
-    private readonly Func<TArgs, (IGpuBuffer Buffer, int Count)[]> _outputs;
-    private readonly Func<TArgs, bool> _aliased;
-
-    internal VulkanTunedKernelHarness(VulkanBackend backend, double relativeTolerance,
-        Func<TArgs, (IGpuBuffer Buffer, int Count)[]> outputs, Func<TArgs, bool> aliased)
-    {
-        _backend = backend;
-        RelativeTolerance = relativeTolerance;
-        _outputs = outputs;
-        _aliased = aliased;
-    }
-
-    public double RelativeTolerance { get; }
-
-    public bool CanMeasure(in TArgs args) => _backend.CanMeasureTunedKernels && !_aliased(args);
-
-    public void PoisonOutput(in TArgs args)
-    {
-        foreach (var o in _outputs(args)) _backend.Fill(o.Buffer, float.NaN, o.Count);
-    }
-
-    public float[] SnapshotOutput(in TArgs args)
-    {
-        var outs = _outputs(args);
-        int total = 0;
-        foreach (var o in outs) total += o.Count;
-        var result = new float[total];
-        int offset = 0;
-        foreach (var o in outs)
-        {
-            float[] host = _backend.DownloadBuffer(o.Buffer);
-            Array.Copy(host, 0, result, offset, o.Count);
-            offset += o.Count;
-        }
-        return result;
-    }
-
-    public double MeasureMilliseconds(ITunedKernelCandidate<TArgs> candidate, in TArgs args, int repetitions)
-    {
-        TArgs local = args;
-        return _backend.MeasureTunedKernelMilliseconds(() => candidate.Execute(local), repetitions);
-    }
-}
-
-/// <summary>Row softmax arguments.</summary>
-internal readonly struct VulkanSoftmaxArgs
-{
-    internal VulkanSoftmaxArgs(IGpuBuffer input, IGpuBuffer output, int rows, int n)
-    { Input = input; Output = output; Rows = rows; N = n; }
-    internal IGpuBuffer Input { get; }
-    internal IGpuBuffer Output { get; }
-    internal int Rows { get; }
-    internal int N { get; }
-}
-
-/// <summary>Row softmax backward arguments.</summary>
-internal readonly struct VulkanSoftmaxBackwardArgs
-{
-    internal VulkanSoftmaxBackwardArgs(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int rows, int n)
-    { GradOutput = gradOutput; Output = output; GradInput = gradInput; Rows = rows; N = n; }
-    internal IGpuBuffer GradOutput { get; }
-    internal IGpuBuffer Output { get; }
-    internal IGpuBuffer GradInput { get; }
-    internal int Rows { get; }
-    internal int N { get; }
-}
-
-/// <summary>LayerNorm forward arguments.</summary>
-internal readonly struct VulkanLayerNormArgs
-{
-    internal VulkanLayerNormArgs(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
-        IGpuBuffer saveMean, IGpuBuffer saveInvVar, int rows, int n, float epsilon)
-    {
-        Input = input; Output = output; Gamma = gamma; Beta = beta; SaveMean = saveMean; SaveInvVar = saveInvVar;
-        Rows = rows; N = n; Epsilon = epsilon;
-    }
-    internal IGpuBuffer Input { get; }
-    internal IGpuBuffer Output { get; }
-    internal IGpuBuffer Gamma { get; }
-    internal IGpuBuffer Beta { get; }
-    internal IGpuBuffer SaveMean { get; }
-    internal IGpuBuffer SaveInvVar { get; }
-    internal int Rows { get; }
-    internal int N { get; }
-    internal float Epsilon { get; }
-}
-
-/// <summary>Normalization backward arguments (LayerNorm input gradient and the affine column reductions).</summary>
-internal readonly struct VulkanNormBackwardArgs
-{
-    internal VulkanNormBackwardArgs(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer? gamma,
-        IGpuBuffer stat0, IGpuBuffer? stat1, IGpuBuffer out0, IGpuBuffer? out1, int rows, int n)
-    {
-        GradOutput = gradOutput; Input = input; Gamma = gamma; Stat0 = stat0; Stat1 = stat1; Out0 = out0; Out1 = out1;
-        Rows = rows; N = n;
-    }
-    internal IGpuBuffer GradOutput { get; }
-    internal IGpuBuffer Input { get; }
-    internal IGpuBuffer? Gamma { get; }
-    /// <summary>Mean (LayerNorm) or RMS (RMSNorm) per row.</summary>
-    internal IGpuBuffer Stat0 { get; }
-    /// <summary>Inverse standard deviation per row (LayerNorm only).</summary>
-    internal IGpuBuffer? Stat1 { get; }
-    /// <summary>Input gradient, or gradGamma for a column reduction.</summary>
-    internal IGpuBuffer Out0 { get; }
-    /// <summary>gradBeta for the LayerNorm column reduction.</summary>
-    internal IGpuBuffer? Out1 { get; }
-    internal int Rows { get; }
-    internal int N { get; }
-}
-
-/// <summary>
-/// The Vulkan backend's tuned-kernel slots: every op family below dispatches through
-/// <see cref="TunedKernelSlot{TArgs}"/>, with the established kernel as the reference and the generated variants of
-/// <see cref="VulkanTunedRowKernels"/> as candidates.
-/// </summary>
+// Tuned-kernel registry dispatch on Vulkan (#1115): softmax and its backward, LayerNorm forward / input gradient /
+// affine gradients and RMSNorm's gamma gradient run through TunedKernelSlots whose reference is the established
+// shader, with the generated VulkanTunedRowKernels variants as the alternatives (see OpenClBackend.TunedKernels).
 public sealed unsafe partial class VulkanBackend
 {
-    private const double RowOpTolerance = 1e-4;
-    private readonly object _tunedSlotsLock = new();
-    private readonly object _tuneTimingLock = new();
+    private const double TunedRowTolerance = 1e-4;
+
+    private readonly object _tunedSlotsLock = new object();
+    private readonly object _tuneTimingLock = new object();
     private IntPtr _tuneQueryPool;
     private bool _tuneQueryPoolUnavailable;
+    private TunedKernelSlot<TunedSoftmaxArgs>? _softmaxSlot;
+    private TunedKernelSlot<TunedSoftmaxBackwardArgs>? _softmaxBackwardSlot;
+    private TunedKernelSlot<TunedLayerNormArgs>? _layerNormSlot;
+    private TunedKernelSlot<TunedNormBackwardArgs>? _layerNormBackwardSlot;
+    private TunedKernelSlot<TunedNormBackwardArgs>? _layerNormGradParamsSlot;
+    private TunedKernelSlot<TunedNormBackwardArgs>? _rmsNormGradGammaSlot;
     private string? _tunedDeviceKey;
-    private TunedKernelSlot<VulkanSoftmaxArgs>? _softmaxSlot;
-    private TunedKernelSlot<VulkanSoftmaxBackwardArgs>? _softmaxBackwardSlot;
-    private TunedKernelSlot<VulkanLayerNormArgs>? _layerNormSlot;
-    private TunedKernelSlot<VulkanNormBackwardArgs>? _layerNormBackwardSlot;
-    private TunedKernelSlot<VulkanNormBackwardArgs>? _layerNormGradParamsSlot;
-    private TunedKernelSlot<VulkanNormBackwardArgs>? _rmsNormGradGammaSlot;
 
-    /// <summary>Device key used by the tuned-kernel registry: <c>vulkan:{device name}</c>.</summary>
-    internal string TunedDeviceKey => _tunedDeviceKey ??= "vulkan:" + DeviceName;
+    /// <summary>The registry device key, e.g. <c>vulkan:AMD Radeon RX 5500 XT</c>.</summary>
+    internal string TunedDeviceKey => _tunedDeviceKey ??= "vulkan:" + _device.DeviceName;
 
-    // A batch only records dispatches, so nothing run inside one can be snapshotted or timed.
-    internal bool CanMeasureTunedKernels =>
-        IsAvailable && !(_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId);
+    private static TunedShape RowShape(int rows, int n) => TunedShape.Of2(TunedKernelDType.Float32, rows, n);
+
+    // Outside batch mode every dispatch submits and waits, so host time over `repetitions` runs is the device time
+    // plus submission overhead, the same for every candidate compared. A batch would only record, so it is not measured.
+    // A batch only records dispatches, so nothing run inside one (on the batch's owner thread) can be snapshotted or timed.
+    private bool CanMeasureTunedKernels =>
+        IsAvailable && IsGlslCompilerAvailable && !(_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId);
 
     /// <summary>True when timing runs on the device's timestamp clock rather than the host's.</summary>
     internal bool TunedKernelTimingUsesDeviceClock
@@ -308,16 +167,24 @@ public sealed unsafe partial class VulkanBackend
         return available;
     }
 
-    private static bool Aliases(IGpuBuffer a, IGpuBuffer b) => ReferenceEquals(a, b) || a.Handle == b.Handle;
+    private BackendTunedKernelHarness<TArgs> Harness<TArgs>(Func<TArgs, (IGpuBuffer Buffer, int Count)[]> outputs,
+        Func<TArgs, bool> aliased) where TArgs : struct
+        => new BackendTunedKernelHarness<TArgs>(this, TunedRowTolerance, () => CanMeasureTunedKernels, MeasureTunedKernelMilliseconds,
+            outputs, aliased);
 
-    private static TunedShape RowShape(int rows, int n) => TunedShape.Of2(TunedKernelDType.Float32, rows, n);
+    private static int RowThreads(int rows, int lanes) => checked(rows * lanes);
 
-    private static IGpuBuffer Required(IGpuBuffer? buffer) =>
-        buffer ?? throw new InvalidOperationException("A required tuned-kernel buffer argument is missing.");
+    private static uint[] Push(params int[] values)
+    {
+        var words = new uint[values.Length];
+        for (int i = 0; i < values.Length; i++) words[i] = unchecked((uint)values[i]);
+        return words;
+    }
 
+    // A generated variant applies only where the GLSL compiler can build it.
     // ---------------------------------------------------------------- softmax
 
-    internal TunedKernelSlot<VulkanSoftmaxArgs> SoftmaxSlot
+    internal TunedKernelSlot<TunedSoftmaxArgs> SoftmaxSlot
     {
         get
         {
@@ -326,27 +193,22 @@ public sealed unsafe partial class VulkanBackend
             {
                 if (_softmaxSlot is null)
                 {
-                    var candidates = new List<ITunedKernelCandidate<VulkanSoftmaxArgs>>
+                    var candidates = new List<ITunedKernelCandidate<TunedSoftmaxArgs>>
                     {
-                        new VulkanTunedKernelCandidate<VulkanSoftmaxArgs>("glsl.softmax.invocation_per_row",
-                            TunedKernelOrigin.Builtin, true, _ => true,
-                            (in VulkanSoftmaxArgs a) => LaunchSoftmaxReference(a)),
+                        new DelegateTunedKernelCandidate<TunedSoftmaxArgs>("vulkan.softmax.thread_per_row", TunedKernelOrigin.Builtin, true,
+                            _ => true, (in TunedSoftmaxArgs a) => SoftmaxReference(a.Input, a.Output, a.Rows, a.N)),
                     };
                     foreach (int lanes in VulkanTunedRowKernels.RowLanes)
                     {
                         int l = lanes;
                         string source = VulkanTunedRowKernels.Softmax(l);
-                        candidates.Add(new VulkanTunedKernelCandidate<VulkanSoftmaxArgs>("generated.softmax.lanes" + l,
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxArgs>("generated.softmax.lanes" + l,
                             TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) &&
-                                     HasTunedPipeline(source, 2, 2 * sizeof(uint)),
-                            (in VulkanSoftmaxArgs a) => GlslUnaryOp(source, a.Input, a.Output, a.Rows * l,
-                                new[] { (uint)a.Rows, (uint)a.N }, 2 * sizeof(uint))));
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 2, 2 * sizeof(uint)),
+                            (in TunedSoftmaxArgs a) => GlslNaryOp(source, new[] { a.Input, a.Output }, RowThreads(a.Rows, l), Push(a.Rows, a.N))));
                     }
-                    _softmaxSlot = new TunedKernelSlot<VulkanSoftmaxArgs>(TunedKernelOp.Softmax, TunedDeviceKey,
-                        new VulkanTunedKernelHarness<VulkanSoftmaxArgs>(this, RowOpTolerance,
-                            a => new[] { (a.Output, a.Rows * a.N) },
-                            a => Aliases(a.Input, a.Output)),
+                    _softmaxSlot = new TunedKernelSlot<TunedSoftmaxArgs>(TunedKernelOp.Softmax, TunedDeviceKey,
+                        Harness<TunedSoftmaxArgs>(a => new[] { (a.Output, a.Rows * a.N) }, a => ReferenceEquals(a.Input, a.Output)),
                         () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
                 return _softmaxSlot;
@@ -354,13 +216,7 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
-    private void LaunchSoftmaxReference(in VulkanSoftmaxArgs a) =>
-        GlslUnaryOp(VulkanGlslKernels.SoftmaxRows, a.Input, a.Output, a.Rows,
-            new[] { (uint)a.Rows, (uint)a.N }, 2 * sizeof(uint));
-
-    // ---------------------------------------------------------------- softmax backward
-
-    internal TunedKernelSlot<VulkanSoftmaxBackwardArgs> SoftmaxBackwardSlot
+    internal TunedKernelSlot<TunedSoftmaxBackwardArgs> SoftmaxBackwardSlot
     {
         get
         {
@@ -369,28 +225,25 @@ public sealed unsafe partial class VulkanBackend
             {
                 if (_softmaxBackwardSlot is null)
                 {
-                    var candidates = new List<ITunedKernelCandidate<VulkanSoftmaxBackwardArgs>>
+                    var candidates = new List<ITunedKernelCandidate<TunedSoftmaxBackwardArgs>>
                     {
-                        new VulkanTunedKernelCandidate<VulkanSoftmaxBackwardArgs>("glsl.softmax_backward.invocation_per_row",
+                        new DelegateTunedKernelCandidate<TunedSoftmaxBackwardArgs>("vulkan.softmax_backward.thread_per_row",
                             TunedKernelOrigin.Builtin, true, _ => true,
-                            (in VulkanSoftmaxBackwardArgs a) => LaunchSoftmaxBackwardReference(a)),
+                            (in TunedSoftmaxBackwardArgs a) => SoftmaxBackwardReference(a.GradOutput, a.Output, a.GradInput, a.Rows, a.N)),
                     };
                     foreach (int lanes in VulkanTunedRowKernels.RowLanes)
                     {
                         int l = lanes;
                         string source = VulkanTunedRowKernels.SoftmaxBackward(l);
-                        candidates.Add(new VulkanTunedKernelCandidate<VulkanSoftmaxBackwardArgs>(
-                            "generated.softmax_backward.lanes" + l, TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) &&
-                                     HasTunedPipeline(source, 3, 2 * sizeof(uint)),
-                            (in VulkanSoftmaxBackwardArgs a) => GlslBinaryOp(source, a.GradOutput, a.Output, a.GradInput,
-                                a.Rows * l, new[] { (uint)a.Rows, (uint)a.N }, 2 * sizeof(uint))));
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxBackwardArgs>("generated.softmax_backward.lanes" + l,
+                            TunedKernelOrigin.Generated, true,
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 3, 2 * sizeof(uint)),
+                            (in TunedSoftmaxBackwardArgs a) => GlslNaryOp(source, new[] { a.GradOutput, a.Output, a.GradInput },
+                                RowThreads(a.Rows, l), Push(a.Rows, a.N))));
                     }
-                    _softmaxBackwardSlot = new TunedKernelSlot<VulkanSoftmaxBackwardArgs>(TunedKernelOp.SoftmaxBackward,
-                        TunedDeviceKey,
-                        new VulkanTunedKernelHarness<VulkanSoftmaxBackwardArgs>(this, RowOpTolerance,
-                            a => new[] { (a.GradInput, a.Rows * a.N) },
-                            a => Aliases(a.GradInput, a.GradOutput) || Aliases(a.GradInput, a.Output)),
+                    _softmaxBackwardSlot = new TunedKernelSlot<TunedSoftmaxBackwardArgs>(TunedKernelOp.SoftmaxBackward, TunedDeviceKey,
+                        Harness<TunedSoftmaxBackwardArgs>(a => new[] { (a.GradInput, a.Rows * a.N) },
+                            a => ReferenceEquals(a.GradInput, a.GradOutput) || ReferenceEquals(a.GradInput, a.Output)),
                         () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
                 return _softmaxBackwardSlot;
@@ -398,13 +251,9 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
-    private void LaunchSoftmaxBackwardReference(in VulkanSoftmaxBackwardArgs a) =>
-        GlslBinaryOp(VulkanGlslKernels.SoftmaxBackward, a.GradOutput, a.Output, a.GradInput,
-            a.Rows, new[] { (uint)a.Rows, (uint)a.N }, 2 * sizeof(uint));
+    // ---------------------------------------------------------------- LayerNorm
 
-    // ---------------------------------------------------------------- layer norm forward
-
-    internal TunedKernelSlot<VulkanLayerNormArgs> LayerNormSlot
+    internal TunedKernelSlot<TunedLayerNormArgs> LayerNormSlot
     {
         get
         {
@@ -413,28 +262,26 @@ public sealed unsafe partial class VulkanBackend
             {
                 if (_layerNormSlot is null)
                 {
-                    var candidates = new List<ITunedKernelCandidate<VulkanLayerNormArgs>>
+                    var candidates = new List<ITunedKernelCandidate<TunedLayerNormArgs>>
                     {
-                        new VulkanTunedKernelCandidate<VulkanLayerNormArgs>("glsl.layernorm_forward.invocation_per_row",
-                            TunedKernelOrigin.Builtin, true, _ => true,
-                            (in VulkanLayerNormArgs a) => LaunchLayerNormReference(a)),
+                        new DelegateTunedKernelCandidate<TunedLayerNormArgs>("vulkan.layernorm_forward.thread_per_row",
+                            TunedKernelOrigin.Builtin, true, _ => true, (in TunedLayerNormArgs a) => LayerNormReference(a)),
                     };
                     foreach (int lanes in VulkanTunedRowKernels.RowLanes)
                     {
                         int l = lanes;
-                        string source = VulkanTunedRowKernels.LayerNormForward(l);
-                        candidates.Add(new VulkanTunedKernelCandidate<VulkanLayerNormArgs>(
-                            "generated.layernorm_forward.lanes" + l, TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) &&
-                                     HasTunedPipeline(source, 6, 3 * sizeof(uint)),
-                            (in VulkanLayerNormArgs a) => GlslNaryOp(source,
-                                new[] { a.Input, a.Output, a.Gamma, a.Beta, a.SaveMean, a.SaveInvVar }, a.Rows * l,
-                                new[] { (uint)a.Rows, (uint)a.N, FloatBits(a.Epsilon) })));
+                        string source = VulkanTunedRowKernels.LayerNorm(l);
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedLayerNormArgs>("generated.layernorm_forward.lanes" + l,
+                            TunedKernelOrigin.Generated, true,
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 6, 3 * sizeof(uint)),
+                            (in TunedLayerNormArgs a) => GlslNaryOp(source,
+                                new[] { a.Input, a.Output, a.Gamma, a.Beta, a.SaveMean, a.SaveInvVar }, RowThreads(a.Rows, l),
+                                new[] { unchecked((uint)a.Rows), unchecked((uint)a.N), FloatBits(a.Epsilon) })));
                     }
-                    _layerNormSlot = new TunedKernelSlot<VulkanLayerNormArgs>(TunedKernelOp.LayerNorm, TunedDeviceKey,
-                        new VulkanTunedKernelHarness<VulkanLayerNormArgs>(this, RowOpTolerance,
+                    _layerNormSlot = new TunedKernelSlot<TunedLayerNormArgs>(TunedKernelOp.LayerNorm, TunedDeviceKey,
+                        Harness<TunedLayerNormArgs>(
                             a => new[] { (a.Output, a.Rows * a.N), (a.SaveMean, a.Rows), (a.SaveInvVar, a.Rows) },
-                            a => Aliases(a.Output, a.Input)),
+                            a => ReferenceEquals(a.Output, a.Input)),
                         () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
                 return _layerNormSlot;
@@ -442,17 +289,7 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
-    private void LaunchLayerNormReference(in VulkanLayerNormArgs a)
-    {
-        var unused = UnusedBinding;
-        DispatchNormalizationForward(
-            new[] { a.Input, a.Output, a.Gamma, a.Beta, unused, unused, a.SaveMean, a.SaveInvVar },
-            a.Rows, new[] { 1u, (uint)a.Rows, (uint)a.N, 1u, 1u, FloatBits(a.Epsilon), 0u, 1u });
-    }
-
-    // ---------------------------------------------------------------- layer norm backward (input gradient)
-
-    internal TunedKernelSlot<VulkanNormBackwardArgs> LayerNormBackwardSlot
+    internal TunedKernelSlot<TunedNormBackwardArgs> LayerNormBackwardSlot
     {
         get
         {
@@ -461,29 +298,25 @@ public sealed unsafe partial class VulkanBackend
             {
                 if (_layerNormBackwardSlot is null)
                 {
-                    var candidates = new List<ITunedKernelCandidate<VulkanNormBackwardArgs>>
+                    var candidates = new List<ITunedKernelCandidate<TunedNormBackwardArgs>>
                     {
-                        new VulkanTunedKernelCandidate<VulkanNormBackwardArgs>("glsl.layernorm_backward.invocation_per_row",
-                            TunedKernelOrigin.Builtin, true, _ => true,
-                            (in VulkanNormBackwardArgs a) => LaunchLayerNormBackwardReference(a)),
+                        new DelegateTunedKernelCandidate<TunedNormBackwardArgs>("vulkan.layernorm_backward.thread_per_row",
+                            TunedKernelOrigin.Builtin, true, _ => true, (in TunedNormBackwardArgs a) => LayerNormBackwardInputReference(a)),
                     };
                     foreach (int lanes in VulkanTunedRowKernels.RowLanes)
                     {
                         int l = lanes;
                         string source = VulkanTunedRowKernels.LayerNormBackward(l);
-                        candidates.Add(new VulkanTunedKernelCandidate<VulkanNormBackwardArgs>(
-                            "generated.layernorm_backward.lanes" + l, TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) &&
-                                     HasTunedPipeline(source, 6, 2 * sizeof(uint)),
-                            (in VulkanNormBackwardArgs a) => GlslNaryOp(source,
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>("generated.layernorm_backward.lanes" + l,
+                            TunedKernelOrigin.Generated, true,
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 6, 2 * sizeof(uint)),
+                            (in TunedNormBackwardArgs a) => GlslNaryOp(source,
                                 new[] { a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0 },
-                                a.Rows * l, new[] { (uint)a.Rows, (uint)a.N })));
+                                RowThreads(a.Rows, l), Push(a.Rows, a.N))));
                     }
-                    _layerNormBackwardSlot = new TunedKernelSlot<VulkanNormBackwardArgs>(TunedKernelOp.LayerNormBackward,
-                        TunedDeviceKey,
-                        new VulkanTunedKernelHarness<VulkanNormBackwardArgs>(this, RowOpTolerance,
-                            a => new[] { (a.Out0, a.Rows * a.N) },
-                            a => Aliases(a.Out0, a.GradOutput) || Aliases(a.Out0, a.Input)),
+                    _layerNormBackwardSlot = new TunedKernelSlot<TunedNormBackwardArgs>(TunedKernelOp.LayerNormBackward, TunedDeviceKey,
+                        Harness<TunedNormBackwardArgs>(a => new[] { (a.Out0, a.Rows * a.N) },
+                            a => ReferenceEquals(a.Out0, a.GradOutput) || ReferenceEquals(a.Out0, a.Input)),
                         () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
                 return _layerNormBackwardSlot;
@@ -491,83 +324,110 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
-    // The established kernel declares gradGamma/gradBeta bindings but its input-gradient operation never writes
-    // them; the input-gradient buffer stands in for both.
-    private void LaunchLayerNormBackwardReference(in VulkanNormBackwardArgs a) =>
-        GlslNaryOp(VulkanGlslKernels.NormalizationBackward,
-            new[] { a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0, a.Out0, a.Out0 },
-            a.Rows, new[] { 1u, 0u, (uint)a.Rows, (uint)a.N, 1u });
-
-    // ---------------------------------------------------------------- column reductions (affine gradients)
-
-    internal TunedKernelSlot<VulkanNormBackwardArgs> LayerNormGradParametersSlot
+    internal TunedKernelSlot<TunedNormBackwardArgs> LayerNormGradParametersSlot
     {
         get
         {
             if (_layerNormGradParamsSlot is { } s) return s;
             lock (_tunedSlotsLock)
-            {
-                _layerNormGradParamsSlot ??= CreateColumnGradSlot(TunedKernelOp.LayerNormGradParameters,
-                    "glsl.layernorm_grad_params.invocation_per_column", rms: false);
-                return _layerNormGradParamsSlot;
-            }
+                return _layerNormGradParamsSlot ??= CreateColumnGradSlot(TunedKernelOp.LayerNormGradParameters,
+                    "vulkan.layernorm_grad_params.thread_per_column", rms: false);
         }
     }
 
-    internal TunedKernelSlot<VulkanNormBackwardArgs> RmsNormGradGammaSlot
+    internal TunedKernelSlot<TunedNormBackwardArgs> RmsNormGradGammaSlot
     {
         get
         {
             if (_rmsNormGradGammaSlot is { } s) return s;
             lock (_tunedSlotsLock)
-            {
-                _rmsNormGradGammaSlot ??= CreateColumnGradSlot(TunedKernelOp.RmsNormGradGamma,
-                    "glsl.rmsnorm_grad_gamma.invocation_per_column", rms: true);
-                return _rmsNormGradGammaSlot;
-            }
+                return _rmsNormGradGammaSlot ??= CreateColumnGradSlot(TunedKernelOp.RmsNormGradGamma,
+                    "vulkan.rmsnorm_grad_gamma.thread_per_column", rms: true);
         }
     }
 
-    private TunedKernelSlot<VulkanNormBackwardArgs> CreateColumnGradSlot(TunedKernelOp op, string referenceId, bool rms)
+    private TunedKernelSlot<TunedNormBackwardArgs> CreateColumnGradSlot(TunedKernelOp op, string referenceId, bool rms)
     {
-        var candidates = new List<ITunedKernelCandidate<VulkanNormBackwardArgs>>
+        var candidates = new List<ITunedKernelCandidate<TunedNormBackwardArgs>>
         {
-            new VulkanTunedKernelCandidate<VulkanNormBackwardArgs>(referenceId, TunedKernelOrigin.Builtin, true, _ => true,
-                (in VulkanNormBackwardArgs a) => LaunchColumnGradReference(rms, a)),
+            new DelegateTunedKernelCandidate<TunedNormBackwardArgs>(referenceId, TunedKernelOrigin.Builtin, true, _ => true,
+                (in TunedNormBackwardArgs a) => ColumnGradReference(rms, a)),
         };
         foreach (int rowLanes in VulkanTunedRowKernels.ColumnRowLanes)
         {
             int r = rowLanes;
-            string source = rms ? VulkanTunedRowKernels.RmsNormGradGamma(r) : VulkanTunedRowKernels.LayerNormGradParameters(r);
-            int bindings = rms ? 4 : 6;
-            candidates.Add(new VulkanTunedKernelCandidate<VulkanNormBackwardArgs>(
+            string source = rms ? VulkanTunedRowKernels.RmsNormGradGamma(r) : VulkanTunedRowKernels.LayerNormGradParams(r);
+            candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>(
                 (rms ? "generated.rmsnorm_grad_gamma.rows" : "generated.layernorm_grad_params.rows") + r,
-                TunedKernelOrigin.Generated, true,
-                shape => (long)shape[1] * r <= int.MaxValue && HasTunedPipeline(source, bindings, 2 * sizeof(uint)),
-                (in VulkanNormBackwardArgs a) => GlslNaryOp(source,
-                    rms
+                TunedKernelOrigin.Generated, true, _ => HasTunedPipeline(source, rms ? 4 : 6, 2 * sizeof(uint)),
+                (in TunedNormBackwardArgs a) =>
+                {
+                    // One workgroup of 32 * R invocations per 32-column tile.
+                    int threads = checked(((a.N + 31) / 32) * 32 * r);
+                    var buffers = rms
                         ? new[] { a.GradOutput, a.Input, a.Stat0, a.Out0 }
-                        : new[] { a.GradOutput, a.Input, a.Stat0, Required(a.Stat1), a.Out0, Required(a.Out1) },
-                    a.N * r, new[] { (uint)a.Rows, (uint)a.N })));
+                        : new[] { a.GradOutput, a.Input, a.Stat0, Required(a.Stat1), a.Out0, Required(a.Out1) };
+                    GlslNaryOp(source, buffers, threads, Push(a.Rows, a.N), 32 * r);
+                }));
         }
-        return new TunedKernelSlot<VulkanNormBackwardArgs>(op, TunedDeviceKey,
-            new VulkanTunedKernelHarness<VulkanNormBackwardArgs>(this, RowOpTolerance,
+        return new TunedKernelSlot<TunedNormBackwardArgs>(op, TunedDeviceKey,
+            Harness<TunedNormBackwardArgs>(
                 a => rms ? new[] { (a.Out0, a.N) } : new[] { (a.Out0, a.N), (Required(a.Out1), a.N) },
-                a => Aliases(a.Out0, a.GradOutput) || Aliases(a.Out0, a.Input) ||
-                     (a.Out1 is { } o1 && (Aliases(o1, a.GradOutput) || Aliases(o1, a.Input)))),
+                a => ReferenceEquals(a.Out0, a.GradOutput) || ReferenceEquals(a.Out0, a.Input) ||
+                     (a.Out1 is { } o1 && (ReferenceEquals(o1, a.GradOutput) || ReferenceEquals(o1, a.Input)))),
             () => GpuDeterminism.IsActive, candidates.ToArray());
     }
 
-    // The established kernel's parameter-gradient operation reads gradOutput, input and the saved statistics and
-    // writes gradGamma (and gradBeta for LayerNorm). Its other bindings are declared but untouched there, so buffers
-    // already in the call stand in for them: the input for gamma, and gradGamma for the input gradient (and for
-    // RMSNorm's absent gradBeta and saved mean).
-    private void LaunchColumnGradReference(bool rms, in VulkanNormBackwardArgs a)
+    private static IGpuBuffer Required(IGpuBuffer? buffer)
+        => buffer ?? throw new InvalidOperationException("A required tuned-kernel buffer argument is missing.");
+
+    // ---------------------------------------------------------------- reference launches (the established shaders)
+
+    private void SoftmaxReference(IGpuBuffer input, IGpuBuffer output, int rows, int n)
+        => GlslUnaryOp(VulkanGlslKernels.SoftmaxRows, input, output, rows, new uint[] { (uint)rows, (uint)n }, 2 * sizeof(uint));
+
+    private void SoftmaxBackwardReference(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int rows, int n)
+        => GlslBinaryOp(VulkanGlslKernels.SoftmaxBackward, gradOutput, output, gradInput, rows,
+            new uint[] { (uint)rows, (uint)n }, 2 * sizeof(uint));
+
+    private void LayerNormReference(in TunedLayerNormArgs a)
     {
-        var buffers = rms
-            ? new[] { a.GradOutput, a.Input, a.Input, a.Stat0, a.Stat0, a.Out0, a.Out0, a.Out0 }
-            : new[] { a.GradOutput, a.Input, a.Input, a.Stat0, Required(a.Stat1), a.Out0, a.Out0, Required(a.Out1) };
-        GlslNaryOp(VulkanGlslKernels.NormalizationBackward, buffers, a.N,
-            new[] { rms ? 3u : 1u, 1u, (uint)a.Rows, (uint)a.N, 1u });
+        var unused = UnusedBinding;
+        DispatchNormalizationForward(
+            new[] { a.Input, a.Output, a.Gamma, a.Beta, unused, unused, a.SaveMean, a.SaveInvVar }, a.Rows,
+            new[] { 1u, (uint)a.Rows, (uint)a.N, 1u, 1u, FloatBits(a.Epsilon), 0u, 1u });
+    }
+
+    // NormalizationBackward (mode 1 LayerNorm, operation 0) writes only the input gradient; its gamma / beta bindings
+    // are unused there and take dummies.
+    private void LayerNormBackwardInputReference(in TunedNormBackwardArgs a)
+    {
+        using var gradGammaDummy = AllocateBuffer(1);
+        using var gradBetaDummy = AllocateBuffer(1);
+        GlslNaryOp(VulkanGlslKernels.NormalizationBackward,
+            new[] { a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0, gradGammaDummy, gradBetaDummy },
+            a.Rows, new[] { 1u, 0u, (uint)a.Rows, (uint)a.N, 1u });
+    }
+
+    // NormalizationBackward operation 1: the affine gradients, one invocation per column. LayerNorm (mode 1) writes
+    // gradGamma and gradBeta; RMSNorm (mode 3) writes gradGamma from the saved RMS in the scale binding.
+    private void ColumnGradReference(bool rms, in TunedNormBackwardArgs a)
+    {
+        if (rms)
+        {
+            using var savedMeanDummy = AllocateBuffer(Math.Max(1, a.Rows));
+            using var gammaDummy = AllocateBuffer(Math.Max(1, a.N));
+            using var gradInputDummy = AllocateBuffer(1);
+            using var gradBetaDummy = AllocateBuffer(Math.Max(1, a.N));
+            DispatchNormalizationBackward(
+                new[] { a.GradOutput, a.Input, gammaDummy, savedMeanDummy, a.Stat0, gradInputDummy, a.Out0, gradBetaDummy }, a.N,
+                new[] { 3u, 1u, (uint)a.Rows, (uint)a.N, 1u });
+            return;
+        }
+        using var gammaUnused = AllocateBuffer(Math.Max(1, a.N));
+        using var gradInputUnused = AllocateBuffer(1);
+        DispatchNormalizationBackward(
+            new[] { a.GradOutput, a.Input, gammaUnused, a.Stat0, Required(a.Stat1), gradInputUnused, a.Out0, Required(a.Out1) }, a.N,
+            new[] { 1u, 1u, (uint)a.Rows, (uint)a.N, 1u });
     }
 }

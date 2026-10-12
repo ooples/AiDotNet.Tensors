@@ -1,36 +1,31 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// Generated row/column/convolution kernel variants served through the tuned-kernel registry.
-
+// Generated row / column kernel variants for Vulkan (GLSL), served through the tuned-kernel registry (#1115).
 using System.Collections.Generic;
 using System.Globalization;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 /// <summary>
-/// Generates the registry's Vulkan kernel variants from ONE GLSL template per op, instantiated over a lane-count
-/// parameter. The established kernels map work to invocations in one fixed way whatever the shape: a single
-/// invocation per row walking every column (softmax, softmax backward, LayerNorm forward and input gradient), a
-/// single invocation per COLUMN walking every row (the affine-parameter gradients), or a single invocation per output
-/// element (convolution). These variants instead give each row <c>L</c> lanes that reduce through workgroup shared
-/// memory, give each workgroup a tile of columns with <c>R</c> row lanes, or compute <c>T</c> output channels of one
-/// output pixel per invocation so the input window is loaded once; the registry measures which wins per shape class.
+/// GLSL instances of the registry's row-wise and column-wise variants (CUDA: CudaTunedRowKernels; OpenCL:
+/// OpenClTunedRowKernels), one compute shader per (op, lane count). Vulkan's established kernels give each row ONE
+/// invocation (softmax, softmax backward, the normalization phases) or each column one invocation looping over every
+/// row (the affine gradients); these give a row <c>L</c> lanes (8, 16, 32 or all 256 of a 256-invocation group) or a 32-column
+/// tile <c>R</c> row lanes, and the registry measures which wins per shape class.
 /// </summary>
 /// <remarks>
-/// <para>Every variant is deterministic: reductions run in a fixed order with no atomics.</para>
-/// <para>A workgroup is 256 invocations in every variant, the size the rest of the backend's kernels use, and holds at
-/// most two 256-float shared arrays.</para>
-/// <para>Rows past the end keep executing every <c>barrier()</c> with neutral values: a barrier must be reached by the
-/// whole workgroup.</para>
+/// Reductions go through shared memory with CUDA's shuffle-down tree order (lane i adds lane i + o); every invocation
+/// reaches every barrier, inactive tail rows carrying neutral values. Fixed order, no atomics: deterministic.
 /// </remarks>
 internal static class VulkanTunedRowKernels
 {
-    /// <summary>Invocations per workgroup of every generated variant.</summary>
-    internal const int WorkgroupSize = 256;
+    internal const int GroupSize = 256;
+
+    private static string S(int value) => value.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>Lane counts each row-kernel family is instantiated for.</summary>
-    internal static readonly int[] RowLanes = { 8, 32, 256 };
+    internal static readonly int[] RowLanes = { 8, 16, 32, 256 };
 
-    /// <summary>Row-lane counts the column-reduction family is instantiated for (columns per tile = 256 / R).</summary>
+    /// <summary>Row-lane counts the column-reduction family is instantiated for.</summary>
     internal static readonly int[] ColumnRowLanes = { 8, 32 };
 
     /// <summary>Output channels per invocation the convolution family is instantiated for.</summary>
@@ -41,206 +36,182 @@ internal static class VulkanTunedRowKernels
     /// have work, and (below a whole workgroup per row) no lane walks more than 64 columns.
     /// </summary>
     internal static bool RowLanesFit(int lanes, int rows, int n) =>
-        n >= lanes / 4 && (lanes == WorkgroupSize || n <= 64 * lanes) && (long)rows * lanes <= int.MaxValue;
+        n >= lanes / 4 && (lanes == GroupSize || n <= 64 * lanes) && (long)rows * lanes <= int.MaxValue;
 
-    private static string S(int value) => value.ToString(CultureInfo.InvariantCulture);
-
-    private static string RowHeader(int lanes) => $@"#version 450
-layout(local_size_x = {S(WorkgroupSize)}) in;
-const uint L = {S(lanes)}u;
-";
-
-    // The preamble every row variant shares: which row and lane this invocation is. An inactive invocation (a row
-    // past the end) reads row 0 so its loads stay in bounds, and contributes neutral values.
-    private const string RowPreamble = @"
-    uint t = gl_LocalInvocationID.x;
-    uint lane = t % L;
-    uint row = gl_GlobalInvocationID.x / L;
-    bool live = row < rows;
-    uint offset = (live ? row : 0u) * cols;
-";
-
-    // Folds the L per-lane partials of every row in `array` and leaves the row's total in `target`. The trailing
-    // barrier lets the array be reused by the next reduction.
-    private static string Fold(string array, string target, string combine) => $@"
+    private const string Reductions = @"
+shared float scratch[256];
+float lane_sum(float v, int lid, int L)
+{
+    scratch[lid] = v;
     barrier();
-    for (uint o = L / 2u; o > 0u; o >>= 1u) {{
-        if (lane < o) {array}[t] = {string.Format(CultureInfo.InvariantCulture, combine, array + "[t]", array + "[t + o]")};
+    for (int o = L / 2; o > 0; o >>= 1)
+    {
+        if ((lid % L) < o) scratch[lid] += scratch[lid + o];
         barrier();
-    }}
-    {target} = {array}[t - lane];
+    }
+    float r = scratch[lid - lid % L];
     barrier();
+    return r;
+}
+float lane_max(float v, int lid, int L)
+{
+    scratch[lid] = v;
+    barrier();
+    for (int o = L / 2; o > 0; o >>= 1)
+    {
+        if ((lid % L) < o) scratch[lid] = max(scratch[lid], scratch[lid + o]);
+        barrier();
+    }
+    float r = scratch[lid - lid % L];
+    barrier();
+    return r;
+}
 ";
 
-    private const string Sum = "{0} + {1}";
-    private const string Max = "max({0}, {1})";
+    private static string RowHeader(int lanes, string bindings, string push) => "#version 450\nlayout(local_size_x = 256) in;\n"
+        + bindings + "layout(push_constant) uniform P { " + push + " } pc;\n" + Reductions
+        + "const int L = " + lanes.ToString(CultureInfo.InvariantCulture) + ";\n";
 
-    /// <summary>Row softmax, L lanes per row: max, sum of exp, exp / sum, as the established kernel.</summary>
-    internal static string Softmax(int lanes) => RowHeader(lanes) + @"
-layout(set = 0, binding = 0) readonly buffer A { float a[]; };
-layout(set = 0, binding = 1) writeonly buffer B { float b[]; };
-layout(push_constant) uniform Params { uint rows; uint cols; };
-shared float s0[" + S(WorkgroupSize) + @"];
-void main() {" + RowPreamble + @"
-    float m = -3.402823466e+38;
-    if (live) for (uint col = lane; col < cols; col += L) m = max(m, a[offset + col]);
-    s0[t] = m;
-    float rowMax;" + Fold("s0", "rowMax", Max) + @"
-    float e = 0.0;
-    if (live) for (uint col = lane; col < cols; col += L) e += exp(a[offset + col] - rowMax);
-    s0[t] = e;
-    float sum;" + Fold("s0", "sum", Sum) + @"
-    if (live) for (uint col = lane; col < cols; col += L) b[offset + col] = exp(a[offset + col] - rowMax) / sum;
+    internal static string Softmax(int lanes) => RowHeader(lanes, @"
+layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(std430, set = 0, binding = 1) buffer Y { float y[]; };
+", "int rows; int n;") + @"
+void main()
+{
+    int t = int(gl_GlobalInvocationID.x), lid = int(gl_LocalInvocationID.x);
+    int row = t / L, lane = t % L;
+    bool live = row < pc.rows;
+    int base = (live ? row : 0) * pc.n;
+    float m = uintBitsToFloat(0xFF800000u);
+    if (live) for (int f = lane; f < pc.n; f += L) m = max(m, x[base + f]);
+    m = lane_max(m, lid, L);
+    float s = 0.0;
+    if (live) for (int f = lane; f < pc.n; f += L) { float e = exp(x[base + f] - m); y[base + f] = e; s += e; }
+    s = lane_sum(s, lid, L);
+    float inv = (s > 0.0) ? (1.0 / s) : 1.0;
+    if (live) for (int f = lane; f < pc.n; f += L) y[base + f] *= inv;
 }";
 
-    /// <summary>Row softmax backward, L lanes per row: dx = y * (dy - sum(dy * y)).</summary>
-    internal static string SoftmaxBackward(int lanes) => RowHeader(lanes) + @"
-layout(set = 0, binding = 0) readonly buffer A { float a[]; };
-layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
-layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
-layout(push_constant) uniform Params { uint rows; uint cols; };
-shared float s0[" + S(WorkgroupSize) + @"];
-void main() {" + RowPreamble + @"
-    float d = 0.0;
-    if (live) for (uint col = lane; col < cols; col += L) d += a[offset + col] * bdata[offset + col];
-    s0[t] = d;
-    float rowDot;" + Fold("s0", "rowDot", Sum) + @"
-    if (live) for (uint col = lane; col < cols; col += L) {
-        uint idx = offset + col;
-        c[idx] = bdata[idx] * (a[idx] - rowDot);
-    }
+    internal static string SoftmaxBackward(int lanes) => RowHeader(lanes, @"
+layout(std430, set = 0, binding = 0) readonly buffer Dy { float dy[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Yv { float yv[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Dx { float dx[]; };
+", "int rows; int n;") + @"
+void main()
+{
+    int t = int(gl_GlobalInvocationID.x), lid = int(gl_LocalInvocationID.x);
+    int row = t / L, lane = t % L;
+    bool live = row < pc.rows;
+    int base = (live ? row : 0) * pc.n;
+    float dot = 0.0;
+    if (live) for (int f = lane; f < pc.n; f += L) dot += dy[base + f] * yv[base + f];
+    dot = lane_sum(dot, lid, L);
+    if (live) for (int f = lane; f < pc.n; f += L) dx[base + f] = yv[base + f] * (dy[base + f] - dot);
 }";
 
-    /// <summary>LayerNorm forward, L lanes per row: two-pass mean / variance, as the established kernel.</summary>
-    internal static string LayerNormForward(int lanes) => RowHeader(lanes) + @"
-layout(set = 0, binding = 0) readonly buffer Input { float inputData[]; };
-layout(set = 0, binding = 1) writeonly buffer Output { float outputData[]; };
-layout(set = 0, binding = 2) readonly buffer Gamma { float gammaData[]; };
-layout(set = 0, binding = 3) readonly buffer Beta { float betaData[]; };
-layout(set = 0, binding = 4) writeonly buffer SavedMean { float savedMeanData[]; };
-layout(set = 0, binding = 5) writeonly buffer SavedScale { float savedScaleData[]; };
-layout(push_constant) uniform Params { uint rows; uint cols; float epsilon; };
-shared float s0[" + S(WorkgroupSize) + @"];
-void main() {" + RowPreamble + @"
-    float p = 0.0;
-    if (live) for (uint i = lane; i < cols; i += L) p += inputData[offset + i];
-    s0[t] = p;
-    float mean;" + Fold("s0", "mean", Sum) + @"
-    mean /= float(cols);
+    internal static string LayerNorm(int lanes) => RowHeader(lanes, @"
+layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Y { float y[]; };
+layout(std430, set = 0, binding = 2) readonly buffer G { float gamma[]; };
+layout(std430, set = 0, binding = 3) readonly buffer B { float beta[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer M { float saveMean[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer I { float saveInvVar[]; };
+", "int rows; int n; float epsilon;") + @"
+void main()
+{
+    int t = int(gl_GlobalInvocationID.x), lid = int(gl_LocalInvocationID.x);
+    int row = t / L, lane = t % L;
+    bool live = row < pc.rows;
+    int base = (live ? row : 0) * pc.n;
+    float s = 0.0;
+    if (live) for (int i = lane; i < pc.n; i += L) s += x[base + i];
+    float mean = lane_sum(s, lid, L) / float(pc.n);
     float v = 0.0;
-    if (live) for (uint i = lane; i < cols; i += L) { float x = inputData[offset + i] - mean; v += x * x; }
-    s0[t] = v;
-    float variance;" + Fold("s0", "variance", Sum) + @"
-    variance /= float(cols);
-    float inv = 1.0 / sqrt(variance + epsilon);
+    if (live) for (int i = lane; i < pc.n; i += L) { float d = x[base + i] - mean; v += d * d; }
+    float invVar = inversesqrt(lane_sum(v, lid, L) / float(pc.n) + pc.epsilon);
     if (!live) return;
-    if (lane == 0u) { savedMeanData[row] = mean; savedScaleData[row] = inv; }
-    for (uint i = lane; i < cols; i += L)
-        outputData[offset + i] = gammaData[i] * (inputData[offset + i] - mean) * inv + betaData[i];
+    if (lane == 0) { saveMean[row] = mean; saveInvVar[row] = invVar; }
+    for (int i = lane; i < pc.n; i += L) y[base + i] = gamma[i] * ((x[base + i] - mean) * invVar) + beta[i];
 }";
 
-    /// <summary>LayerNorm backward (input gradient only), L lanes per row, same formula as the established kernel.</summary>
-    internal static string LayerNormBackward(int lanes) => RowHeader(lanes) + @"
-layout(set = 0, binding = 0) readonly buffer GradOutput { float go[]; };
-layout(set = 0, binding = 1) readonly buffer Input { float inputData[]; };
-layout(set = 0, binding = 2) readonly buffer Gamma { float gammaData[]; };
-layout(set = 0, binding = 3) readonly buffer SavedMean { float savedMeanData[]; };
-layout(set = 0, binding = 4) readonly buffer SavedScale { float savedScaleData[]; };
-layout(set = 0, binding = 5) writeonly buffer GradInput { float gi[]; };
-layout(push_constant) uniform Params { uint rows; uint cols; };
-shared float s0[" + S(WorkgroupSize) + @"];
-shared float s1[" + S(WorkgroupSize) + @"];
-void main() {" + RowPreamble + @"
-    uint r = live ? row : 0u;
-    float mean = savedMeanData[r], inv = savedScaleData[r];
-    float pg = 0.0, pgx = 0.0;
-    if (live) for (uint i = lane; i < cols; i += L) {
-        float xhat = (inputData[offset + i] - mean) * inv;
-        float g = go[offset + i] * gammaData[i];
-        pg += g;
-        pgx += g * xhat;
-    }
-    s0[t] = pg;
-    s1[t] = pgx;
-    barrier();
-    for (uint o = L / 2u; o > 0u; o >>= 1u) {
-        if (lane < o) { s0[t] = s0[t] + s0[t + o]; s1[t] = s1[t] + s1[t + o]; }
-        barrier();
-    }
-    float sumGrad = s0[t - lane], sumGradX = s1[t - lane];
+    internal static string LayerNormBackward(int lanes) => RowHeader(lanes, @"
+layout(std430, set = 0, binding = 0) readonly buffer Dy { float dy[]; };
+layout(std430, set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(std430, set = 0, binding = 2) readonly buffer G { float gamma[]; };
+layout(std430, set = 0, binding = 3) readonly buffer M { float saveMean[]; };
+layout(std430, set = 0, binding = 4) readonly buffer I { float saveInvVar[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer Dx { float dx[]; };
+", "int rows; int n;") + @"
+void main()
+{
+    int t = int(gl_GlobalInvocationID.x), lid = int(gl_LocalInvocationID.x);
+    int row = t / L, lane = t % L;
+    bool live = row < pc.rows;
+    int r = live ? row : 0;
+    int base = r * pc.n;
+    float mean = saveMean[r], invVar = saveInvVar[r];
+    float sumDy = 0.0, sumDyXmu = 0.0;
+    if (live) for (int i = lane; i < pc.n; i += L) { float d = dy[base + i] * gamma[i]; sumDy += d; sumDyXmu += d * (x[base + i] - mean); }
+    sumDy = lane_sum(sumDy, lid, L);
+    sumDyXmu = lane_sum(sumDyXmu, lid, L);
     if (!live) return;
-    for (uint i = lane; i < cols; i += L) {
-        float xhat = (inputData[offset + i] - mean) * inv;
-        gi[offset + i] = inv / float(cols) * (float(cols) * go[offset + i] * gammaData[i] - sumGrad - xhat * sumGradX);
+    for (int i = lane; i < pc.n; i += L)
+    {
+        float xmu = x[base + i] - mean;
+        float dxhat = dy[base + i] * gamma[i];
+        dx[base + i] = invVar * (dxhat - (sumDy + xmu * invVar * invVar * sumDyXmu) / float(pc.n));
     }
 }";
 
-    // Column reduction over rows for the affine-parameter gradients. A workgroup is C columns x R row lanes
-    // (C * R = 256); each row lane walks rows lane, lane + R, ... in order, then the R partials are folded in a
-    // fixed tree. No atomics.
-    private static string ColumnHeader(int rowLanes) => $@"#version 450
-layout(local_size_x = {S(WorkgroupSize)}) in;
-const uint R = {S(rowLanes)}u;
-const uint C = {S(WorkgroupSize / rowLanes)}u;
-";
-
-    private const string ColumnPreamble = @"
-    uint t = gl_LocalInvocationID.x;
-    uint cx = t % C, ry = t / C;
-    uint col = gl_WorkGroupID.x * C + cx;
-    bool live = col < cols;
-";
-
-    /// <summary>LayerNorm gradGamma / gradBeta: a column-tile reduction with R row lanes.</summary>
-    internal static string LayerNormGradParameters(int rowLanes) => ColumnHeader(rowLanes) + @"
-layout(set = 0, binding = 0) readonly buffer GradOutput { float go[]; };
-layout(set = 0, binding = 1) readonly buffer Input { float inputData[]; };
-layout(set = 0, binding = 2) readonly buffer SavedMean { float savedMeanData[]; };
-layout(set = 0, binding = 3) readonly buffer SavedScale { float savedScaleData[]; };
-layout(set = 0, binding = 4) writeonly buffer GradGamma { float gg[]; };
-layout(set = 0, binding = 5) writeonly buffer GradBeta { float gb[]; };
-layout(push_constant) uniform Params { uint rows; uint cols; };
-shared float s0[" + S(WorkgroupSize) + @"];
-shared float s1[" + S(WorkgroupSize) + @"];
-void main() {" + ColumnPreamble + @"
+    // A 32-column tile with R row lanes per workgroup (1-D groups of 32 * R: cx = lid % 32, ry = lid / 32).
+    private static string ColumnGrad(int rowLanes, bool rms) => "#version 450\nlayout(local_size_x = "
+        + (32 * rowLanes).ToString(CultureInfo.InvariantCulture) + ") in;\n"
+        + (rms ? @"
+layout(std430, set = 0, binding = 0) readonly buffer Dy { float dy[]; };
+layout(std430, set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(std430, set = 0, binding = 2) readonly buffer S0 { float stat0[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer O0 { float out0[]; };
+" : @"
+layout(std430, set = 0, binding = 0) readonly buffer Dy { float dy[]; };
+layout(std430, set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(std430, set = 0, binding = 2) readonly buffer S0 { float stat0[]; };
+layout(std430, set = 0, binding = 3) readonly buffer S1 { float stat1[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer O0 { float out0[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer O1 { float out1[]; };
+")
+        + "layout(push_constant) uniform P { int rows; int n; } pc;\nconst int R = " + rowLanes.ToString(CultureInfo.InvariantCulture) + ";\n"
+        + @"shared float s0[R * 33];
+shared float s1[R * 33];
+void main()
+{
+    int lid = int(gl_LocalInvocationID.x), cx = lid % 32, ry = lid / 32;
+    int col = int(gl_WorkGroupID.x) * 32 + cx;
     float a0 = 0.0, a1 = 0.0;
-    if (live) for (uint b0 = ry; b0 < rows; b0 += R) {
-        uint idx = b0 * cols + col;
-        a0 += go[idx] * (inputData[idx] - savedMeanData[b0]) * savedScaleData[b0];
-        a1 += go[idx];
+    if (col < pc.n)
+    {
+        for (int b = ry; b < pc.rows; b += R)
+        {
+            int idx = b * pc.n + col;
+            float g = dy[idx];
+" + (rms ? "            a0 += g * x[idx] * (1.0 / stat0[b]);\n"
+          : "            float normalized = (x[idx] - stat0[b]) * stat1[b];\n            a0 += g * normalized;\n            a1 += g;\n") + @"        }
     }
-    s0[t] = a0;
-    s1[t] = a1;
+    s0[ry * 33 + cx] = a0; s1[ry * 33 + cx] = a1;
     barrier();
-    for (uint h = R / 2u; h > 0u; h >>= 1u) {
-        if (ry < h) { s0[t] = s0[t] + s0[t + h * C]; s1[t] = s1[t] + s1[t + h * C]; }
+    for (int h = R / 2; h > 0; h >>= 1)
+    {
+        if (ry < h) { s0[ry * 33 + cx] += s0[(ry + h) * 33 + cx]; s1[ry * 33 + cx] += s1[(ry + h) * 33 + cx]; }
         barrier();
     }
-    if (ry == 0u && live) { gg[col] = s0[t]; gb[col] = s1[t]; }
+    if (ry == 0 && col < pc.n)
+    {
+        out0[col] = s0[cx];
+" + (rms ? string.Empty : "        out1[col] = s1[cx];\n") + @"    }
 }";
 
-    /// <summary>RMSNorm gradGamma: a column-tile reduction with R row lanes.</summary>
-    internal static string RmsNormGradGamma(int rowLanes) => ColumnHeader(rowLanes) + @"
-layout(set = 0, binding = 0) readonly buffer GradOutput { float go[]; };
-layout(set = 0, binding = 1) readonly buffer Input { float inputData[]; };
-layout(set = 0, binding = 2) readonly buffer SavedScale { float savedScaleData[]; };
-layout(set = 0, binding = 3) writeonly buffer GradGamma { float gg[]; };
-layout(push_constant) uniform Params { uint rows; uint cols; };
-shared float s0[" + S(WorkgroupSize) + @"];
-void main() {" + ColumnPreamble + @"
-    float a0 = 0.0;
-    if (live) for (uint b0 = ry; b0 < rows; b0 += R) {
-        uint idx = b0 * cols + col;
-        a0 += go[idx] * inputData[idx] / savedScaleData[b0];
-    }
-    s0[t] = a0;
-    barrier();
-    for (uint h = R / 2u; h > 0u; h >>= 1u) {
-        if (ry < h) s0[t] = s0[t] + s0[t + h * C];
-        barrier();
-    }
-    if (ry == 0u && live) gg[col] = s0[t];
-}";
+    internal static string LayerNormGradParams(int rowLanes) => ColumnGrad(rowLanes, rms: false);
+
+    internal static string RmsNormGradGamma(int rowLanes) => ColumnGrad(rowLanes, rms: true);
 
     /// <summary>
     /// Convolution forward computing T consecutive output channels of one output pixel per invocation: each input
@@ -248,7 +219,7 @@ void main() {" + ColumnPreamble + @"
     /// (ic, kh, kw) summation order.
     /// </summary>
     internal static string Conv2DChannelTile(int tile) => $@"#version 450
-layout(local_size_x = {S(WorkgroupSize)}) in;
+layout(local_size_x = {S(GroupSize)}) in;
 const int T = {S(tile)};
 " + @"
 layout(set=0, binding=0) readonly buffer B0 { float inp[]; };
@@ -288,7 +259,7 @@ void main() {
         outp[((b * outChannels + oc0 + j) * outHeight + oh) * outWidth + ow] = acc[j];
 }";
 
-    /// <summary>Every generated variant with its storage-buffer count and push-constant size in bytes.</summary>
+    /// <summary>Every generated variant with the binding count and push-constant size it is dispatched with.</summary>
     internal static IReadOnlyList<(string Name, string Source, int Bindings, uint PushSize)> All()
     {
         var list = new List<(string, string, int, uint)>();
@@ -296,12 +267,12 @@ void main() {
         {
             list.Add(("softmax.lanes" + S(l), Softmax(l), 2, 2 * sizeof(uint)));
             list.Add(("softmax_backward.lanes" + S(l), SoftmaxBackward(l), 3, 2 * sizeof(uint)));
-            list.Add(("layernorm_forward.lanes" + S(l), LayerNormForward(l), 6, 3 * sizeof(uint)));
+            list.Add(("layernorm_forward.lanes" + S(l), LayerNorm(l), 6, 3 * sizeof(uint)));
             list.Add(("layernorm_backward.lanes" + S(l), LayerNormBackward(l), 6, 2 * sizeof(uint)));
         }
         foreach (int r in ColumnRowLanes)
         {
-            list.Add(("layernorm_grad_params.rows" + S(r), LayerNormGradParameters(r), 6, 2 * sizeof(uint)));
+            list.Add(("layernorm_grad_params.rows" + S(r), LayerNormGradParams(r), 6, 2 * sizeof(uint)));
             list.Add(("rmsnorm_grad_gamma.rows" + S(r), RmsNormGradGamma(r), 4, 2 * sizeof(uint)));
         }
         foreach (int t in ConvChannelTiles)

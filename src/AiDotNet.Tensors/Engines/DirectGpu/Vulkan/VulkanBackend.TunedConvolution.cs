@@ -1,79 +1,43 @@
-// Copyright (c) AiDotNet. All rights reserved.
-// Convolution forward through the tuned-kernel registry on Vulkan (#1115).
-
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-/// <summary>2-D convolution arguments (NCHW input, [Cout, Cin, kH, kW] filter).</summary>
-internal readonly struct VulkanConv2DArgs
-{
-    internal VulkanConv2DArgs(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
-        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
-    {
-        Input = input; Kernel = kernel; Output = output;
-        Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
-        OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
-        KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW;
-        PadH = padH; PadW = padW; DilationH = dilationH; DilationW = dilationW;
-    }
-
-    internal IGpuBuffer Input { get; }
-    internal IGpuBuffer Kernel { get; }
-    internal IGpuBuffer Output { get; }
-    internal int Batch { get; }
-    internal int InChannels { get; }
-    internal int InHeight { get; }
-    internal int InWidth { get; }
-    internal int OutChannels { get; }
-    internal int OutHeight { get; }
-    internal int OutWidth { get; }
-    internal int KernelH { get; }
-    internal int KernelW { get; }
-    internal int StrideH { get; }
-    internal int StrideW { get; }
-    internal int PadH { get; }
-    internal int PadW { get; }
-    internal int DilationH { get; }
-    internal int DilationW { get; }
-
-    internal int OutputCount => Batch * OutChannels * OutHeight * OutWidth;
-
-    /// <summary>The kernel's push-constant block, in declaration order.</summary>
-    internal uint[] PushConstants() => new[]
-    {
-        (uint)Batch, (uint)InChannels, (uint)InHeight, (uint)InWidth,
-        (uint)OutChannels, (uint)OutHeight, (uint)OutWidth, (uint)KernelH, (uint)KernelW,
-        (uint)StrideH, (uint)StrideW, (uint)PadH, (uint)PadW, (uint)DilationH, (uint)DilationW,
-    };
-
-    /// <summary>Shape class: every geometric parameter (output extent follows from them).</summary>
-    internal unsafe TunedShape Shape()
-    {
-        int* d = stackalloc int[15];
-        d[0] = Batch; d[1] = InChannels; d[2] = InHeight; d[3] = InWidth; d[4] = OutChannels;
-        d[5] = KernelH; d[6] = KernelW; d[7] = StrideH; d[8] = StrideW; d[9] = PadH; d[10] = PadW;
-        d[11] = DilationH; d[12] = DilationW; d[13] = OutHeight; d[14] = OutWidth;
-        return TunedShape.Create(TunedKernelDType.Float32, new ReadOnlySpan<int>(d, 15));
-    }
-}
-
-/// <summary>
-/// Convolution forward through the tuned-kernel registry. The reference is the established kernel (one invocation
-/// per output element); the candidates compute several output channels of an output pixel per invocation, each
-/// selected per shape class only after the correctness and paired-timing gate.
-/// </summary>
+// Convolution forward through the tuned-kernel registry on Vulkan (#1115): the established direct shader as the
+// reference; im2col + GEMM and the generated channel-tile shaders as candidates (see CudaBackend.TunedConvolution).
 public sealed unsafe partial class VulkanBackend
 {
-    // The variants keep the reference's summation order; the tolerance only covers a driver contracting the
-    // multiply-add differently between the two shaders.
     private const double ConvolutionTolerance = 1e-4;
-    private TunedKernelSlot<VulkanConv2DArgs>? _conv2DForwardSlot;
+    private TunedKernelSlot<TunedConv2DArgs>? _conv2DForwardSlot;
 
-    internal TunedKernelSlot<VulkanConv2DArgs> Conv2DForwardSlot
+    // FP32 im2col to [P, B * L] (P = Cin*kH*kW, L = outH*outW): one invocation per (batch, output pixel). The batch
+    // sits inside each row so ONE GEMM covers every batch item.
+    private const string Im2ColShader = @"#version 450
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer C { float col[]; };
+layout(push_constant) uniform P { int batch; int channels; int height; int width; int kernelH; int kernelW; int strideH;
+    int strideW; int padH; int padW; int dilationH; int dilationW; int outH; int outW; } pc;
+void main()
+{
+    int idx = int(gl_GlobalInvocationID.x);
+    int l = pc.outH * pc.outW;
+    if (idx >= pc.batch * l) return;
+    int b = idx / l, s = idx % l, oh = s / pc.outW, ow = s % pc.outW;
+    int patchSize = pc.channels * pc.kernelH * pc.kernelW;
+    for (int c = 0; c < pc.channels; c++)
+        for (int kh = 0; kh < pc.kernelH; kh++)
+            for (int kw = 0; kw < pc.kernelW; kw++)
+            {
+                int ih = oh * pc.strideH - pc.padH + kh * pc.dilationH;
+                int iw = ow * pc.strideW - pc.padW + kw * pc.dilationW;
+                float v = (ih >= 0 && ih < pc.height && iw >= 0 && iw < pc.width) ? x[((b * pc.channels + c) * pc.height + ih) * pc.width + iw] : 0.0;
+                col[((c * pc.kernelH + kh) * pc.kernelW + kw) * (pc.batch * l) + b * l + s] = v;
+            }
+}";
+
+    internal TunedKernelSlot<TunedConv2DArgs> Conv2DForwardSlot
     {
         get
         {
@@ -82,29 +46,28 @@ public sealed unsafe partial class VulkanBackend
             {
                 if (_conv2DForwardSlot is null)
                 {
-                    var candidates = new List<ITunedKernelCandidate<VulkanConv2DArgs>>
+                    var candidates = new List<ITunedKernelCandidate<TunedConv2DArgs>>
                     {
-                        new VulkanTunedKernelCandidate<VulkanConv2DArgs>("glsl.conv2d.invocation_per_output",
-                            TunedKernelOrigin.Builtin, true, _ => true,
-                            (in VulkanConv2DArgs a) => LaunchConv2DReference(a)),
+                        new DelegateTunedKernelCandidate<TunedConv2DArgs>("vulkan.conv2d.direct", TunedKernelOrigin.Builtin, true,
+                            _ => true, (in TunedConv2DArgs a) => Conv2DDirectReference(a)),
+                        new DelegateTunedKernelCandidate<TunedConv2DArgs>("vulkan.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
+                            shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedPipeline(Im2ColShader, 2, 14 * sizeof(uint)),
+                            (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
                     };
                     foreach (int tile in VulkanTunedRowKernels.ConvChannelTiles)
                     {
                         int t = tile;
                         string source = VulkanTunedRowKernels.Conv2DChannelTile(t);
-                        candidates.Add(new VulkanTunedKernelCandidate<VulkanConv2DArgs>("generated.conv2d.channels" + t,
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedConv2DArgs>("generated.conv2d.channels" + t,
                             TunedKernelOrigin.Generated, true,
                             // shape[4] is the output channel count: a tile wider than it has nothing to share.
                             shape => shape[4] >= t && HasTunedPipeline(source, 3, 15 * sizeof(uint)),
-                            (in VulkanConv2DArgs a) => TryDispatchConvPoolGlsl(source, a.PushConstants(),
-                                a.Batch * ((a.OutChannels + t - 1) / t) * a.OutHeight * a.OutWidth,
-                                a.Input, a.Kernel, a.Output)));
+                            (in TunedConv2DArgs a) => Conv2DChannelTile(source, t, a)));
                     }
-                    _conv2DForwardSlot = new TunedKernelSlot<VulkanConv2DArgs>(TunedKernelOp.Conv2DForward,
-                        TunedDeviceKey,
-                        new VulkanTunedKernelHarness<VulkanConv2DArgs>(this, ConvolutionTolerance,
-                            a => new[] { (a.Output, a.OutputCount) },
-                            a => Aliases(a.Output, a.Input) || Aliases(a.Output, a.Kernel)),
+                    _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
+                        new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => CanMeasureTunedKernels,
+                            MeasureTunedKernelMilliseconds, a => new[] { (a.Output, a.OutputCount) },
+                            a => ReferenceEquals(a.Output, a.Input) || ReferenceEquals(a.Output, a.Kernel)),
                         () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
                 return _conv2DForwardSlot;
@@ -112,7 +75,44 @@ public sealed unsafe partial class VulkanBackend
         }
     }
 
-    private void LaunchConv2DReference(in VulkanConv2DArgs a) =>
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, a.PushConstants(), a.OutputCount,
-            a.Input, a.Kernel, a.Output);
+    private static uint[] ConvPush(in TunedConv2DArgs a) => new uint[]
+    {
+        (uint)a.Batch, (uint)a.InChannels, (uint)a.InHeight, (uint)a.InWidth, (uint)a.OutChannels, (uint)a.OutHeight,
+        (uint)a.OutWidth, (uint)a.KernelH, (uint)a.KernelW, (uint)a.StrideH, (uint)a.StrideW, (uint)a.PadH, (uint)a.PadW,
+        (uint)a.DilationH, (uint)a.DilationW,
+    };
+
+    private void Conv2DDirectReference(in TunedConv2DArgs a)
+    {
+        if (!TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, ConvPush(a), a.OutputCount, a.Input, a.Kernel, a.Output))
+            throw new InvalidOperationException("The Vulkan Conv2D shader is unavailable.");
+    }
+
+    // T output channels of one pixel per invocation: each input tap is read once for the whole tile.
+    private void Conv2DChannelTile(string source, int tile, in TunedConv2DArgs a)
+    {
+        int invocations = checked(a.Batch * ((a.OutChannels + tile - 1) / tile) * a.OutHeight * a.OutWidth);
+        if (!TryDispatchConvPoolGlsl(source, ConvPush(a), invocations, a.Input, a.Kernel, a.Output))
+            throw new InvalidOperationException("The Vulkan Conv2D channel-tile shader is unavailable.");
+    }
+
+    // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for B = 1).
+    private void Conv2DIm2ColGemm(in TunedConv2DArgs a)
+    {
+        int l = a.OutHeight * a.OutWidth, p = a.InChannels * a.KernelH * a.KernelW;
+        using var col = AllocateBuffer(checked(a.Batch * p * l));
+        GlslNaryOp(Im2ColShader, new[] { a.Input, col }, a.Batch * l, new uint[]
+        {
+            (uint)a.Batch, (uint)a.InChannels, (uint)a.InHeight, (uint)a.InWidth, (uint)a.KernelH, (uint)a.KernelW, (uint)a.StrideH,
+            (uint)a.StrideW, (uint)a.PadH, (uint)a.PadW, (uint)a.DilationH, (uint)a.DilationW, (uint)a.OutHeight, (uint)a.OutWidth,
+        });
+        if (a.Batch == 1)
+        {
+            Gemm(a.Kernel, col, a.Output, a.OutChannels, l, p);
+            return;
+        }
+        using var tmp = AllocateBuffer(checked(a.OutChannels * a.Batch * l));
+        Gemm(a.Kernel, col, tmp, a.OutChannels, a.Batch * l, p);
+        Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
+    }
 }
