@@ -287,14 +287,17 @@ public sealed class VulkanTunedKernelTests
     {
         var backend = RequireBackend();
         // 4,096 columns: more than 64 per lane for 8, 16 and 32 lanes, so only the 256-lane variant is offered.
-        var wide = Applicable(backend.SoftmaxSlot, TunedShape.Of2(TunedKernelDType.Float32, 64, 4096)).Select(c => c.Id).ToArray();
+        var wideShape = TunedShape.Of2(TunedKernelDType.Float32, 64, 4096);
+        var wide = Applicable(backend.SoftmaxSlot, wideShape).Select(c => c.Id).ToArray();
         Assert.Contains("generated.softmax.lanes256", wide);
         Assert.DoesNotContain(wide, id => id.StartsWith("generated.", StringComparison.Ordinal) && id != "generated.softmax.lanes256");
         // No width is too wide for it.
         Assert.Contains("generated.softmax.lanes256",
             Applicable(backend.SoftmaxSlot, TunedShape.Of2(TunedKernelDType.Float32, 1, 100_000)).Select(c => c.Id));
-        foreach (var slotIds in new[] { backend.SoftmaxBackwardSlot.CandidateIds, backend.LayerNormSlot.CandidateIds, backend.LayerNormBackwardSlot.CandidateIds })
-            Assert.Contains(slotIds, id => id.EndsWith(".lanes256", StringComparison.Ordinal));
+        // Each slot builds its own candidates with its own applicability test, so each is asked about the wide row.
+        Assert.Contains("generated.softmax_backward.lanes256", Applicable(backend.SoftmaxBackwardSlot, wideShape).Select(c => c.Id));
+        Assert.Contains("generated.layernorm_forward.lanes256", Applicable(backend.LayerNormSlot, wideShape).Select(c => c.Id));
+        Assert.Contains("generated.layernorm_backward.lanes256", Applicable(backend.LayerNormBackwardSlot, wideShape).Select(c => c.Id));
     }
 
     [SkippableFact]
