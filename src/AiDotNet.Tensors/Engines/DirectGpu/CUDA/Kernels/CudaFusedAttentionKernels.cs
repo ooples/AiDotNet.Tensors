@@ -17,6 +17,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// (2 threads per key row, half the head dimension each) that owns dK / dV, and a query-block pass (2 threads per query
 /// row) that owns dQ. Every reduction has a fixed order, so results do not depend on scheduling.
 /// Head dimension D (= value dimension) is a template parameter: 16, 32 and 64 are compiled.
+/// <para>
+/// The default backward (<c>fa_backward_fused_d*</c>) is a CUDA-only implementation of
+/// <see cref="IFusedAttentionBackend.FusedAttentionBackward"/>, not a new operation: it computes the same dQ, dK and dV
+/// as the two-pass kernels, which <c>DeterministicReductions</c> still selects. It needs a float atomic add on device
+/// memory for dQ. WGSL has none, and Vulkan and OpenCL offer one only through optional extensions, so it cannot be
+/// written once for every backend. The other five backends get the same interface method from per-element kernels
+/// that have no cross-block sums and need no atomics (#1179, implemented in #1181).
+/// </para>
 /// </summary>
 internal static class CudaFusedAttentionKernels
 {
@@ -25,6 +33,7 @@ internal static class CudaFusedAttentionKernels
         "fa_forward_d16", "fa_forward_d32", "fa_forward_d64",
         "fa_backward_kv_d16", "fa_backward_kv_d32", "fa_backward_kv_d64",
         "fa_backward_q_d16", "fa_backward_q_d32", "fa_backward_q_d64",
+        "fa_backward_fused_d16", "fa_backward_fused_d32", "fa_backward_fused_d64",
         "fa_backward_delta",
     };
 
@@ -36,6 +45,7 @@ internal static class CudaFusedAttentionKernels
 #define FA_KB 128       // key rows per backward-kv block (2 threads each: 256 threads)
 #define FA_QB 128       // query rows per backward-q block (2 threads each: 256 threads)
 #define FA_QT 32        // query rows per shared-memory tile in the backward-kv pass
+#define FA_FKB 64       // key rows per fused-backward block (2 threads each: 128 threads)
 // The two threads of a backward row own alternating 4-element chunks: element FA_EL(dd, half) for dd in [0, D / 2).
 // Their float4 shared-memory reads of one row then hit 8 distinct banks (no conflict) and each feeds 4 FMAs.
 #define FA_EL(dd, half) (8 * ((dd) >> 2) + 4 * (half) + ((dd) & 3))
@@ -368,6 +378,142 @@ __device__ void fa_backward_q(const float* __restrict__ q, const float* __restri
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Fused backward (the default; the two-pass kv / q kernels serve DeterministicReductions): grid (ceil(Sk / FA_FKB),
+// B * H), block FA_FKB * 2 threads. Each block owns dK / dV of its FA_FKB keys exactly as the kv pass, and per query
+// tile also stages dS in shared memory, multiplies it by the block's keys (dQ_tile = dS K, 4 x D/16 outputs per
+// thread) and adds that into dQ with atomics -- one per (row, column) per key block -- instead of a second pass that
+// recomputes the scores. dQ must be zero on entry. Summation order of dQ across key blocks is not fixed.
+// ---------------------------------------------------------------------------------------------------------------
+template <int D>
+__device__ void fa_backward_fused(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ dO, const float* __restrict__ lse, const float* __restrict__ delta,
+    float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dV, const int* __restrict__ mask, FaParams p)
+{
+    const int HALF = D / 2;
+    constexpr int OC = D / 16;
+    __shared__ __align__(16) float Qs[FA_QT][D + 4];
+    __shared__ __align__(16) float Gs[FA_QT][D + 4];
+    __shared__ __align__(16) float Ks[FA_FKB][D + 4];
+    __shared__ __align__(16) float dSs[FA_QT][FA_FKB + 4];
+    __shared__ float Ls[FA_QT], Ds[FA_QT];
+    int bh = blockIdx.y, b = bh / p.H, h = bh % p.H;
+    int jr = threadIdx.x / 2, half = threadIdx.x % 2;
+    int j = blockIdx.x * FA_FKB + jr;
+    bool active = j < p.Sk;
+
+    float kr[HALF], vr[HALF], dk[HALF], dv[HALF];
+    const float* krow = k + b * p.kb + h * p.kh + (long long)(active ? j : 0) * p.kr;
+    const float* vrow = v + b * p.vb + h * p.vh + (long long)(active ? j : 0) * p.vr;
+    #pragma unroll
+    for (int d = 0; d < HALF; d++)
+    {
+        kr[d] = active ? krow[FA_EL(d, half)] : 0.0f;
+        vr[d] = active ? vrow[FA_EL(d, half)] : 0.0f;
+        dk[d] = 0.0f; dv[d] = 0.0f;
+        Ks[jr][FA_EL(d, half)] = kr[d];   // inactive keys stay zero rows for the dQ product
+    }
+    int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;   // the dQ tile: rows ty*4 .. +4, columns tx*OC .. +OC
+
+    int firstKey = blockIdx.x * FA_FKB;
+    int iStart = p.causal ? max(0, firstKey - p.causalOffset) : 0;
+    iStart = iStart / FA_QT * FA_QT;
+    const float* qbase = q + b * p.qb + h * p.qh;
+    const float* gbase = dO + b * p.ob + h * p.oh;
+    float* dqbase = dQ + b * p.qb + h * p.qh;
+    for (int i0 = iStart; i0 < p.Sq; i0 += FA_QT)
+    {
+        int rows = min(FA_QT, p.Sq - i0);
+        for (int e = threadIdx.x; e < FA_QT * D; e += blockDim.x)
+        {
+            int ii = e / D, d = e % D;
+            bool in = ii < rows;
+            Qs[ii][d] = in ? qbase[(long long)(i0 + ii) * p.qr + d] * p.scale : 0.0f;
+            Gs[ii][d] = in ? gbase[(long long)(i0 + ii) * p.orow + d] : 0.0f;
+        }
+        for (int e = threadIdx.x; e < FA_QT; e += blockDim.x)
+        {
+            Ls[e] = e < rows ? lse[(long long)bh * p.Sq + i0 + e] : -INFINITY;
+            Ds[e] = e < rows ? delta[(long long)bh * p.Sq + i0 + e] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll 4
+        for (int ii = 0; ii < FA_QT; ii++)
+        {
+            int i = i0 + ii;
+            float sPart = 0.0f, dpPart = 0.0f;
+            #pragma unroll
+            for (int c4 = 0; c4 < HALF / 4; c4++)
+            {
+                float4 qv = *reinterpret_cast<const float4*>(&Qs[ii][8 * c4 + 4 * half]);
+                float4 gv = *reinterpret_cast<const float4*>(&Gs[ii][8 * c4 + 4 * half]);
+                sPart += qv.x * kr[4 * c4] + qv.y * kr[4 * c4 + 1] + qv.z * kr[4 * c4 + 2] + qv.w * kr[4 * c4 + 3];
+                dpPart += gv.x * vr[4 * c4] + gv.y * vr[4 * c4 + 1] + gv.z * vr[4 * c4 + 2] + gv.w * vr[4 * c4 + 3];
+            }
+            float raw = sPart + __shfl_xor_sync(0xffffffffu, sPart, 1);
+            float dp = dpPart + __shfl_xor_sync(0xffffffffu, dpPart, 1);
+            float rowLse = Ls[ii];
+            float ds = 0.0f;
+            if (active && ii < rows && rowLse != -INFINITY && fa_allowed(p, mask, b, h, i, j))
+            {
+                float slope;
+                float s = fa_cap(raw, p.softcap, &slope);
+                float pr = __expf(s - rowLse);
+                ds = pr * (dp - Ds[ii]) * slope;
+                #pragma unroll
+                for (int c4 = 0; c4 < HALF / 4; c4++)
+                {
+                    float4 qv = *reinterpret_cast<const float4*>(&Qs[ii][8 * c4 + 4 * half]);
+                    float4 gv = *reinterpret_cast<const float4*>(&Gs[ii][8 * c4 + 4 * half]);
+                    dv[4 * c4] += pr * gv.x; dv[4 * c4 + 1] += pr * gv.y; dv[4 * c4 + 2] += pr * gv.z; dv[4 * c4 + 3] += pr * gv.w;
+                    dk[4 * c4] += ds * qv.x; dk[4 * c4 + 1] += ds * qv.y; dk[4 * c4 + 2] += ds * qv.z; dk[4 * c4 + 3] += ds * qv.w;
+                }
+            }
+            if (half == 0) dSs[ii][jr] = ds;
+        }
+        __syncthreads();
+
+        // dQ_tile = scale * dS K over this block's keys, added into dQ.
+        float acc[4][OC];
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            #pragma unroll
+            for (int u = 0; u < OC; u++) acc[r][u] = 0.0f;
+        #pragma unroll 4
+        for (int c = 0; c < FA_FKB; c++)
+        {
+            float kv[OC];
+            #pragma unroll
+            for (int u = 0; u < OC; u++) kv[u] = Ks[c][tx * OC + u];
+            #pragma unroll
+            for (int r = 0; r < 4; r++)
+            {
+                float sv = dSs[ty * 4 + r][c];
+                #pragma unroll
+                for (int u = 0; u < OC; u++) acc[r][u] += sv * kv[u];
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int ii = ty * 4 + r;
+            if (ii >= rows) continue;
+            float* dqrow = dqbase + (long long)(i0 + ii) * p.qr;
+            #pragma unroll
+            for (int u = 0; u < OC; u++)
+                if (acc[r][u] != 0.0f) atomicAdd(dqrow + tx * OC + u, acc[r][u] * p.scale);
+        }
+        __syncthreads();
+    }
+    if (active)
+    {
+        float* dkrow = dK + b * p.kb + h * p.kh + (long long)j * p.kr;
+        float* dvrow = dV + b * p.vb + h * p.vh + (long long)j * p.vr;
+        #pragma unroll
+        for (int d = 0; d < HALF; d++) { dkrow[FA_EL(d, half)] = dk[d]; dvrow[FA_EL(d, half)] = dv[d]; }
+    }
+}
+
 #define FA_INSTANTIATE(D) \
 extern ""C"" __global__ __launch_bounds__(FA_BR * FA_SPLIT) void fa_forward_d##D(const float* __restrict__ q, \
     const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ o, float* __restrict__ lse, \
@@ -379,7 +525,12 @@ extern ""C"" __global__ __launch_bounds__(FA_KB * 2) void fa_backward_kv_d##D(co
 extern ""C"" __global__ __launch_bounds__(FA_QB * 2) void fa_backward_q_d##D(const float* __restrict__ q, \
     const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ dO, \
     const float* __restrict__ lse, const float* __restrict__ delta, float* __restrict__ dQ, \
-    const int* __restrict__ mask, FaParams p) { fa_backward_q<D>(q, k, v, dO, lse, delta, dQ, mask, p); }
+    const int* __restrict__ mask, FaParams p) { fa_backward_q<D>(q, k, v, dO, lse, delta, dQ, mask, p); } \
+extern ""C"" __global__ __launch_bounds__(FA_FKB * 2) void fa_backward_fused_d##D(const float* __restrict__ q, \
+    const float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ dO, \
+    const float* __restrict__ lse, const float* __restrict__ delta, float* __restrict__ dQ, float* __restrict__ dK, \
+    float* __restrict__ dV, const int* __restrict__ mask, FaParams p) \
+    { fa_backward_fused<D>(q, k, v, dO, lse, delta, dQ, dK, dV, mask, p); }
 
 FA_INSTANTIATE(16)
 FA_INSTANTIATE(32)
