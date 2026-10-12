@@ -1000,7 +1000,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Plain float-encoded buffers only (not split-complex planes or raw int32).
     /// </summary>
     internal Engines.DirectGpu.IGpuBuffer? VectorDeviceBuffer
-        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 ? buffer : null;
+        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64 ? buffer : null;
 
     internal Engines.DirectGpu.IDirectGpuBackend? VectorDeviceBackend => _data?._deviceState?.Backend;
 
@@ -1024,6 +1024,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     private int _viewGpuBufferVersion = -1;
     private bool _viewGpuBufferIsSplitComplex;
     private bool _viewGpuBufferContainsRawInt32;
+    private bool _viewGpuBufferContainsRawInt64;
 
     /// <summary>
     /// True when this tensor covers its whole data vector in the vector's own layout (contiguous, offset 0, same
@@ -1060,6 +1061,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             if (CoversWholeVector) _data.DeviceState.ContainsRawInt32 = value;
             else _viewGpuBufferContainsRawInt32 = value;
+        }
+    }
+
+    /// <summary>The device buffer holds raw int64 words (two per element), not floats (#1135).</summary>
+    internal bool _gpuBufferContainsRawInt64
+    {
+        get => CoversWholeVector ? _data._deviceState?.ContainsRawInt64 ?? false : _viewGpuBufferContainsRawInt64;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.ContainsRawInt64 = value;
+            else _viewGpuBufferContainsRawInt64 = value;
         }
     }
 
@@ -1365,6 +1377,79 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal int StorageMutationVersion => _storage.GpuCacheVersion;
 
+    /// <summary>
+    /// Makes this tensor take <paramref name="source"/>'s storage and layout (shape, strides, storage offset).
+    /// </summary>
+    /// <remarks>
+    /// <para>The primitive behind torch's <c>set_</c>, and the metadata half of the in-place view ops
+    /// (<c>squeeze_</c>, <c>t_</c>, <c>transpose_</c>, <c>as_strided_</c>, <c>resize_</c>): their out-of-place form
+    /// returns a view of this tensor's storage, and adopting it changes only the layout. Other tensors that view the
+    /// old storage keep it, as in torch.</para>
+    /// <para>Host data is made current first: this tensor's device binding describes the old layout and is dropped,
+    /// and data that lived only on the device would go with it. The next device op uploads the new layout.</para>
+    /// </remarks>
+    internal void AdoptFrom(TensorBase<T> source)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (ReferenceEquals(source, this)) return;
+        if (IsSparse || source.IsSparse)
+            throw new NotSupportedException("A sparse tensor cannot adopt or donate a dense layout.");
+
+        // Deferred, lazy or paged-out storage first (the raw vector would be empty), then any pending device download
+        // into the host array.
+        EnsureMaterialized();
+        source.EnsureMaterialized();
+        _ = _data.AsSpan();
+        _ = source._data.AsSpan();
+
+        // Under the source's copy-on-write family lock (when it has one), so a first-write detach cannot swap its
+        // storage between the snapshot below and this tensor joining the family that detach moves together.
+        var family = source._cowFamily;
+        if (family is null)
+        {
+            bool sameStorage = ReferenceEquals(_storage, source._storage);
+            AdoptStorageAndLayout(source);
+            // Left the old family only when it left that storage: a layout change over its own (still COW-shared)
+            // storage must keep the pending detach.
+            if (!sameStorage) _cowFamily = null;
+        }
+        else family.Adopt(source, this, () => AdoptStorageAndLayout(source));
+        IncrementVersion();
+    }
+
+    private void AdoptStorageAndLayout(TensorBase<T> source)
+    {
+        bool sameStorage = ReferenceEquals(_storage, source._storage);
+        if (!sameStorage)
+        {
+            // Acquire before release, as in RebindStorageFrom: source may hold the only other reference.
+            source._storage.AddRef();
+            var oldStorage = _storage;
+            _storage = source._storage;
+            oldStorage.Release();
+        }
+        _data = source._data;
+        _shape = (int[])source._shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = (int[])source._strides.Clone();
+        _rowMajorStridesCache = null;
+        _storageOffset = source._storageOffset;
+        Length = source.Length;
+        IsContiguous = source.IsContiguous;
+        // Sharing another tensor's storage makes this a view of it; a layout change over its own storage does not.
+        IsView = sameStorage ? IsView || source.IsView : true;
+        // Only this tensor's OWN binding goes. With the source's vector adopted, the whole-vector binding properties
+        // (_gpuBuffer, _gpuBackend, ...) address the vector's shared device state, which describes the same bytes in the
+        // same layout and belongs to the source too: clearing through them stripped the source's buffer.
+        _viewGpuBuffer = null;
+        _viewGpuBackend = null;
+        _viewGpuBufferVersion = -1;
+        _viewGpuBufferIsSplitComplex = false;
+        _viewGpuBufferContainsRawInt32 = false;
+        _ownsGpuBuffer = false;          // never the owner of a buffer it adopted
+        _device = TensorDevice.CPU;      // the host data was made current above
+    }
+
     private void InvalidateGpuBindingAfterStorageReplacement()
     {
         _gpuBuffer = null;
@@ -1384,6 +1469,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // ordinary float-format one, and a marker that outlived its buffer would route those floats
         // to that consumer as though their bit patterns were indices.
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
     }
 
     /// <summary>
@@ -1596,7 +1682,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Whether this tensor is a view into another tensor's storage.
     /// Views share memory — mutations through one view are visible in others.
     /// </summary>
-    public bool IsView { get; }
+    public bool IsView { get; private set; }
 
     /// <summary>
     /// Whether this tensor uses sparse storage (COO, CSR, or CSC format).
@@ -1646,7 +1732,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Gets the total number of logical elements in this tensor (product of all shape dimensions).
     /// For views, this is the view's element count, not the underlying storage size.
     /// </summary>
-    public int Length { get; }
+    public int Length { get; private set; }
 
     /// <summary>
     /// Gets the rank (number of dimensions) of the tensor.
@@ -2070,6 +2156,30 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
+    /// Changes a sparse tensor's logical shape in place and, when <paramref name="values"/> is given, its stored
+    /// values (the in-place sparse resizes). The caller keeps the indices consistent with both.
+    /// </summary>
+    internal void ReplaceSparseLayout(int[] logicalShape, Vector<T>? values)
+    {
+        if (!IsSparse) throw new InvalidOperationException("Only a sparse tensor's layout is replaced this way.");
+        ValidateShape(logicalShape);
+        _shape = (int[])logicalShape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(_shape);
+        _rowMajorStridesCache = null;
+        Length = ComputeProduct(_shape);
+        if (values is not null)
+        {
+            var oldStorage = _storage;
+            _data = values;
+            _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: true);
+            oldStorage.Release();
+            InvalidateGpuBindingAfterStorageReplacement();
+        }
+        IncrementVersion();
+    }
+
+    /// <summary>
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
@@ -2299,6 +2409,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Sets the value at a flat (logical) index. Handles views correctly.
     /// </summary>
+    /// <summary>
+    /// Writes <paramref name="value"/> to every element of this (strided) view through the storage, with no per-element
+    /// ownership check or version bump: the caller has already run <see cref="EnsureOwnedForWrite"/> and bumps the
+    /// version once for the whole write.
+    /// </summary>
+    private protected void FillStridedElements(T value)
+    {
+        var writable = _storage.AsWritableSpan();   // a read-only mmap alias throws here, as in SetFlat
+        for (int i = 0; i < Length; i++) writable[FlatIndexToStorageIndex(i)] = value;
+    }
+
     public void SetFlat(int flatIndex, T value)
     {
         EnsureMaterialized();
@@ -3420,6 +3541,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     return view;
                 }
                 return view;
+            }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="adopt"/> (which gives <paramref name="target"/> the source's storage) under the family
+        /// lock, then makes the target a member while a detach is pending, as <see cref="CreateView"/> does for a view.
+        /// </summary>
+        internal void Adopt(TensorBase<T> source, TensorBase<T> target, Action adopt)
+        {
+            lock (_sync)
+            {
+                adopt();
+                if (_requiresDetach != 0 && ReferenceEquals(source._cowFamily, this))
+                {
+                    target._cowFamily = this;
+                    _members.Add(new WeakReference<TensorBase<T>>(target));
+                }
+                else target._cowFamily = null;
             }
         }
 

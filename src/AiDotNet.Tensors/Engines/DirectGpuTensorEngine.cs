@@ -1654,7 +1654,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the vector's current values.
         return view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
             && shared.Handle != IntPtr.Zero && ReferenceEquals(state.Backend, backend)
-            && !state.IsSplitComplex && !state.ContainsRawInt32
+            && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64
             ? shared
             : null;
     }
@@ -1826,6 +1826,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -1967,6 +1968,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // held index bits rather than one float per element, and GetOrAllocateInt32IndexBuffer
         // forwards such a buffer to its consumer UNCONVERTED.
         tensor._gpuBufferContainsRawInt32 = false;
+        tensor._gpuBufferContainsRawInt64 = false;
         // ...and say so. Device and buffer are set together by Tensor.Gpu() and cleared together by
         // Tensor.Cpu(); leaving _device on a GPU after dropping the buffer produces a tensor that claims
         // GPU residency while nothing holds its data. That state is host-authoritative by this method's
@@ -2206,6 +2208,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Check caches without triggering CPU materialization
@@ -6585,6 +6588,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorAddInPlace(a, b); return; }
         // #3 FP16-act: FP16-native residual add when a is FP16-resident (keeps the activation FP16, no convert).
         if (TryFp16AddInPlace(a, b)) return;
         // Version-counter contract is enforced inside TryRunBinaryInPlace
@@ -6605,6 +6610,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyInPlace(a, b); return; }
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Multiply(bufA, bufB, bufA, size)))
             return;
@@ -6621,6 +6628,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorSubtractInPlace(a, b); return; }
         if (!a.IsContiguous) { base.TensorSubtractInPlace(a, b); return; }
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Subtract(bufA, bufB, bufA, size)))
@@ -6638,6 +6647,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyScalarInPlace(a, scalar); return; }
         if (!a.IsContiguous) { base.TensorMultiplyScalarInPlace(a, scalar); return; }
         var scalarF = ToFloatScalar(scalar);
         if (TryRunUnaryInPlace(a,
@@ -6656,6 +6667,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorBroadcastAddInPlace(a, b); return; }
         // #3 FP16-act: keep the activation FP16 across the add. Same-shape → FP16 residual add; per-channel
         // broadcast ([N,C,H,W] += [.,C,1,1]) → FP16 broadcast-add. Both no-op back to FP32 if not tagged.
         if (ShapesMatch(a.Shape._dims, b.Shape._dims)) { if (TryFp16AddInPlace(a, b)) return; }
@@ -6694,6 +6707,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.SigmoidInPlace(tensor); return; }
         if (TryRunUnaryInPlace(tensor,
             static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
             return;
@@ -6711,6 +6726,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.ReLUInPlace(tensor); return; }
         if (TryRunUnaryInPlace(tensor,
             static (backend, buf, size) => backend.Relu(buf, buf, size)))
             return;
@@ -17556,8 +17573,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Every axis of a contiguous tensor: one mean over all elements. Shape [1] whatever keepDims says,
-            // exactly as CpuEngine's full-reduction fast path returns it.
+            // Every axis of a contiguous tensor: one mean over all elements, shaped as CpuEngine's full reduction
+            // (rank 0, or every axis kept as 1 with keepDims).
             if (normalizedAxes.Length == input.Rank && input.IsContiguous && input.Length > 0)
             {
                 using var source = GetOrAllocateBuffer(backend, input);
@@ -17566,7 +17583,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     backend.MeanAxis(source.Buffer, output.Buffer, outerSize: 1, reduceSize: input.Length);
-                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, new[] { 1 });
+                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, FullReductionShape(input.Rank, keepDims));
                     handedOff = true;
                     Autodiff.DifferentiableOps.RecordUnary("ReduceMean", result, input,
                         Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { normalizedAxes, keepDims });
@@ -17710,7 +17727,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < inputRank; i++)
                 if (!reduceDimsSet.Contains(i))
                     outputShapeList.Add(inputShape[i]);
-            if (outputShapeList.Count == 0) outputShapeList.Add(1);
         }
         var outputShape = outputShapeList.ToArray();
 
@@ -17886,17 +17902,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     try
                     {
                         backend.SumAxis(input.Buffer, output.Buffer, outerSize: 1, reduceSize: tensor.Length);
-                        int[] outputShape;
-                        if (keepDims)
-                        {
-                            outputShape = new int[tensor.Rank];
-                            for (int i = 0; i < outputShape.Length; i++) outputShape[i] = 1;
-                        }
-                        else
-                        {
-                            outputShape = new[] { 1 };
-                        }
-
+                        var outputShape = FullReductionShape(tensor.Rank, keepDims);
                         var result = DeferTensorResult<T>(backend, output.Buffer, 1, outputShape);
                         handedOff = true;
                         var allAxes = new int[tensor.Rank];
@@ -18102,7 +18108,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             || inputShape is null || !TryGetBackend(out var backend))
             return null;
 
-        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor yields [1]): the
+        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor is rank 0): the
         // gradient is the incoming one, reshaped and scaled.
         int inputLength = 1;
         foreach (int d in inputShape) inputLength = checked(inputLength * d);
@@ -19155,7 +19161,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (i != axis) outputShapeList.Add(inputShape[i]);
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -19192,7 +19197,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputShapeList = new List<int>();
         for (int i = 0; i < inputRank; i++)
             if (i != axis) outputShapeList.Add(inputShape[i]);
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -20558,7 +20562,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSubtract", ex); }
         return base.TensorSubtract(a, b);
     }
 
@@ -20615,7 +20619,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorDivide", ex); }
         return base.TensorDivide(a, b);
     }
 
@@ -20634,7 +20638,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorExp", ex); }
         return base.TensorExp(tensor);
     }
 
@@ -20649,7 +20653,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorLog", ex); }
         return base.TensorLog(tensor);
     }
 
@@ -20664,7 +20668,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSqrt", ex); }
         return base.TensorSqrt(tensor);
     }
 
@@ -20679,7 +20683,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAbs", ex); }
         return base.TensorAbs(tensor);
     }
 
@@ -20708,7 +20712,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorNegate", ex); }
         return base.TensorNegate(tensor);
     }
 
@@ -20727,7 +20731,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Swish", ex); }
         return base.Swish(tensor);
     }
 
@@ -20743,7 +20747,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ELU", ex); }
         return base.ELU(tensor, alpha);
     }
 
@@ -20759,7 +20763,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Softplus", ex); }
         return base.Softplus(input);
     }
 
@@ -20777,7 +20781,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSELU", ex); }
         return base.TensorSELU(tensor);
     }
 
@@ -20793,7 +20797,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorHardSigmoid", ex); }
         return base.TensorHardSigmoid(tensor);
     }
 
@@ -20809,7 +20813,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorReLU6", ex); }
         return base.TensorReLU6(tensor);
     }
 
@@ -20882,7 +20886,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ReluBackward", ex); }
         return base.ReluBackward(gradOutput, input);
     }
 
@@ -20904,7 +20908,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { rBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("SigmoidBackward", ex); }
         return base.SigmoidBackward(gradOutput, output);
     }
 
@@ -20926,7 +20930,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { rBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TanhBackward", ex); }
         return base.TanhBackward(gradOutput, output);
     }
 
@@ -20976,7 +20980,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("GeluBackward", ex); }
         return base.GeluBackward(gradOutput, input);
     }
 
@@ -20997,7 +21001,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("LeakyReluBackward", ex); }
         return base.LeakyReluBackward(gradOutput, input, negativeSlope);
     }
 
@@ -21018,7 +21022,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("SwishBackward", ex); }
         return base.SwishBackward(gradOutput, input);
     }
 
@@ -21039,7 +21043,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("MishBackward", ex); }
         return base.MishBackward(gradOutput, input);
     }
 
@@ -21060,7 +21064,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("SoftplusBackward", ex); }
         return base.SoftplusBackward(gradOutput, input);
     }
 
@@ -21081,7 +21085,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("HardswishBackward", ex); }
         return base.HardswishBackward(gradOutput, input);
     }
 
@@ -21131,7 +21135,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("HardsigmoidBackward", ex); }
         return base.HardsigmoidBackward(gradOutput, input);
     }
 
@@ -21152,7 +21156,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Relu6Backward", ex); }
         return base.Relu6Backward(gradOutput, input);
     }
 
@@ -21173,7 +21177,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ThresholdBackward", ex); }
         return base.ThresholdBackward(gradOutput, input, threshold);
     }
 
@@ -21226,7 +21230,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { giB.Dispose(); gaB.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("PReLUBackward", ex); }
         return base.PReLUBackward(gradOutput, input, alpha);
     }
 
@@ -21250,7 +21254,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("VarBackward", ex); }
         return base.VarBackward(gradOutput, input, mean, axes);
     }
 
@@ -21275,7 +21279,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("StdBackward", ex); }
         return base.StdBackward(gradOutput, input, mean, std, axes);
     }
 
@@ -21294,7 +21298,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSin", ex); }
         return base.TensorSin(tensor);
     }
 
@@ -21309,7 +21313,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorCos", ex); }
         return base.TensorCos(tensor);
     }
 
@@ -21328,7 +21332,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAsin", ex); }
         return base.TensorAsin(tensor);
     }
 
@@ -21343,7 +21347,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAcos", ex); }
         return base.TensorAcos(tensor);
     }
 
@@ -21358,7 +21362,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAtan", ex); }
         return base.TensorAtan(tensor);
     }
 
@@ -21373,7 +21377,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAtanh", ex); }
         return base.TensorAtanh(tensor);
     }
 
@@ -21478,7 +21482,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorFloor", ex); }
         return base.TensorFloor(tensor);
     }
 
@@ -21493,7 +21497,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorCeiling", ex); }
         return base.TensorCeiling(tensor);
     }
 
@@ -21544,7 +21548,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (result != null)
                 return new Tensor<T>(result, tensor.Shape._dims);
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorRound", ex); }
         return base.TensorRound(tensor);
     }
 
@@ -21655,7 +21659,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSign", ex); }
         return base.TensorSign(tensor);
     }
 
@@ -21691,7 +21695,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorMax", ex); }
         return base.TensorMax(a, b);
     }
 
@@ -21721,7 +21725,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorMin", ex); }
         return base.TensorMin(a, b);
     }
 
@@ -23810,6 +23814,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.TensorAddInPlace(a, b); return; }
         // Version-counter contract is enforced inside TryRunBinaryInPlace
         // (and CpuEngine's base implementation on the fallback path), so
         // tape-replay safety + GPU buffer staleness checks observe the
@@ -23821,6 +23828,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.TensorSubtractInPlace(a, b); return; }
         if (TryRunBinaryInPlace(a, b, static (backend, ia, ib, size) => backend.Subtract(ia, ib, ia, size)))
             return;
         base.TensorSubtractInPlace(a, b);
@@ -23828,6 +23838,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyInPlace(a, b); return; }
         if (TryRunBinaryInPlace(a, b, static (backend, ia, ib, size) => backend.Multiply(ia, ib, ia, size)))
             return;
         base.TensorMultiplyInPlace(a, b);
@@ -23835,6 +23848,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.SigmoidInPlace(tensor); return; }
         if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
             return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
@@ -24138,7 +24154,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { rBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("EluBackward", ex); }
         return base.EluBackward(gradOutput, input, output, alpha);
     }
 
@@ -24301,7 +24317,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Sigmoid", ex); }
         return base.Sigmoid(tensor);
     }
 
@@ -24354,7 +24370,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ReLU", ex); }
         return base.ReLU(tensor);
     }
 
@@ -24399,7 +24415,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("GELU", ex); }
         return base.GELU(tensor);
     }
 
@@ -24417,7 +24433,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Mish", ex); }
         return base.Mish(tensor);
     }
 
@@ -24460,7 +24476,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("HardSwish", ex); }
         return base.HardSwish(input);
     }
 
@@ -25458,6 +25474,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void ReLUInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.ReLUInPlace(tensor); return; }
         if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
             return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
@@ -26600,7 +26619,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     outputShape.Add(input.Shape._dims[d]);
                 }
             }
-            if (outputShape.Count == 0) outputShape.Add(1);
 
             using var inputBuffer = GetOrAllocateBuffer(backend, reductionInput);
             using var valuesBuffer = AllocateOutputBuffer(backend, outerSize);
@@ -27900,7 +27918,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("StopGradient", ex); }
         return base.StopGradient(tensor);
     }
 
@@ -27935,7 +27953,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearReLU", ex); }
         return base.FusedLinearReLU(input, weight, bias);
     }
 
@@ -27963,7 +27981,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearSigmoid", ex); }
         return base.FusedLinearSigmoid(input, weight, bias);
     }
 
@@ -27991,7 +28009,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearTanh", ex); }
         return base.FusedLinearTanh(input, weight, bias);
     }
 
@@ -28019,7 +28037,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearGELU", ex); }
         return base.FusedLinearGELU(input, weight, bias);
     }
 
@@ -28047,7 +28065,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearSwish", ex); }
         return base.FusedLinearSwish(input, weight, bias);
     }
 
@@ -28072,7 +28090,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorIoULoss", ex); }
         return base.TensorIoULoss(predicted, target);
     }
 
@@ -28097,7 +28115,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorGIoULoss", ex); }
         return base.TensorGIoULoss(predicted, target);
     }
 
@@ -28122,7 +28140,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorDIoULoss", ex); }
         return base.TensorDIoULoss(predicted, target);
     }
 
@@ -28147,7 +28165,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorCIoULoss", ex); }
         return base.TensorCIoULoss(predicted, target);
     }
 

@@ -14,17 +14,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// oversized shift counts and zero operands -- launch device work, record no host fallback, and floor_divide by zero
 /// must raise the CPU's DivideByZeroException.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class TorchParityIntegerDeviceTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public abstract class TorchParityIntegerDeviceTestsBase
 {
-    private readonly DirectGpuTensorEngineTestFixture _fixture;
-    public TorchParityIntegerDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+    private readonly IDirectGpuTensorEngineFixture _fixture;
+    protected TorchParityIntegerDeviceTestsBase(IDirectGpuTensorEngineFixture fixture) => _fixture = fixture;
 
     private DirectGpuTensorEngine GpuOrSkip()
     {
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "These device kernels are CUDA-only.");
+        Skip.IfNot(gpu.GetBackend() is ITorchParityElementwiseBackend, "This backend has no PyTorch-parity device kernels.");
         return gpu;
     }
 
@@ -97,4 +96,18 @@ public class TorchParityIntegerDeviceTests : IClassFixture<DirectGpuTensorEngine
         Assert.Throws<DivideByZeroException>(() => new CpuEngine().TensorFloorDivide(a, b));
         Assert.Throws<DivideByZeroException>(() => gpu.TensorFloorDivide(a, b));
     }
+}
+
+/// <summary>The cases above on the machine's default DirectGpu backend.</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityIntegerDeviceTests : TorchParityIntegerDeviceTestsBase, IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    public TorchParityIntegerDeviceTests(DirectGpuTensorEngineTestFixture fixture) : base(fixture) { }
+}
+
+/// <summary>The cases above on the Vulkan backend (#1127).</summary>
+[Collection("VulkanGlobalState")]
+public class TorchParityIntegerVulkanDeviceTests : TorchParityIntegerDeviceTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
+{
+    public TorchParityIntegerVulkanDeviceTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
 }

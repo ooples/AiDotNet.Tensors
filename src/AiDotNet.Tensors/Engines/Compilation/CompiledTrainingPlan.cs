@@ -1112,7 +1112,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (lossOutput is null) throw new ArgumentNullException(nameof(lossOutput));
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
-        ValidateShapesMatch(_lossOutput, lossOutput, nameof(lossOutput));
+        // A scalar loss is rank 0 since full reductions follow torch (#1132); a caller's one-element [1] buffer
+        // still receives it, as it did when the loss itself was [1].
+        bool scalarIntoOneElement = _lossOutput.Length == 1 && lossOutput.Length == 1;
+        if (!scalarIntoOneElement) ValidateShapesMatch(_lossOutput, lossOutput, nameof(lossOutput));
 
         // Run the plan into its internal loss buffer, then copy into the
         // caller's buffer. Copy (not rebind) because specialized backward

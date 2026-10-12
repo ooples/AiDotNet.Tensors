@@ -595,6 +595,17 @@ public sealed class GradientTape<T> : IDisposable
         ResolveEngineFromData();
         if (sources is null) throw new ArgumentNullException(nameof(sources));
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
+        if (_postAccumulateHooks is { Count: > 0 })
+        {
+            // A post-accumulate hook sees each source's gradient the moment it is final, before the consumer.
+            var consumer = onSourceGradient;
+            onSourceGradient = (source, gradient) =>
+            {
+                if (_postAccumulateHooks.TryGetValue(source, out var hooks) && hooks.Count > 0)
+                    FirePostAccumulateHooks(source, MaterializeStreamingGradient(gradient));
+                consumer(source, gradient);
+            };
+        }
         if (_entries.Count == 0)
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         GradNode<T> lossGradFn = loss.GradFn ?? throw new InvalidOperationException(
@@ -1039,6 +1050,9 @@ public sealed class GradientTape<T> : IDisposable
         IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
     {
         var grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
+        if (_postAccumulateHooks is { Count: > 0 })
+            foreach (var pair in grads)
+                if (pair.Value is not null) FirePostAccumulateHooks(pair.Key, pair.Value);
         // What backward hands back belongs to the caller: the gradients (produced on the device during backward,
         // so inside the release window) and the loss outlive the tape, for as long as the caller holds them.
         KeepAfterTape(loss);
@@ -2732,6 +2746,122 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     /// <param name="tensor">The tensor to hook.</param>
     /// <param name="hook">Function receiving gradient, returning (possibly modified) gradient.</param>
+    /// <summary>
+    /// Registers <paramref name="hook"/> to run once <paramref name="tensor"/>'s gradient for a backward is complete
+    /// (torch <c>Tensor.register_post_accumulate_grad_hook</c>), as <c>(tensor, gradient)</c>: after
+    /// <see cref="ComputeGradients(Tensor{T}, IReadOnlyList{Tensor{T}}?, bool)"/> has accumulated every contribution,
+    /// or the moment <see cref="ComputeGradientsStreaming"/> emits it. The usual use is an optimizer step fused into
+    /// the backward. Disposing the returned handle removes the hook. Independent of
+    /// <see cref="GradientTapeOptions.EnableHooks"/>, since it never alters a gradient.
+    /// </summary>
+    public IDisposable RegisterPostAccumulateGradHook(Tensor<T> tensor, Action<Tensor<T>, Tensor<T>> hook)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (hook is null) throw new ArgumentNullException(nameof(hook));
+        _postAccumulateHooks ??= new Dictionary<Tensor<T>, List<Action<Tensor<T>, Tensor<T>>>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        if (!_postAccumulateHooks.TryGetValue(tensor, out var list))
+        {
+            list = new List<Action<Tensor<T>, Tensor<T>>>();
+            _postAccumulateHooks[tensor] = list;
+        }
+        list.Add(hook);
+        return new PostAccumulateHookHandle(list, hook);
+    }
+
+    private Dictionary<Tensor<T>, List<Action<Tensor<T>, Tensor<T>>>>? _postAccumulateHooks;
+
+    /// <summary>
+    /// Moves <paramref name="target"/>'s autograd history to a snapshot of its current value, before an in-place
+    /// write, and returns the snapshot.
+    /// </summary>
+    /// <remarks>
+    /// <para>Gradients are keyed by tensor object and the graph walk follows <c>GradFn</c>, so a tensor overwritten in
+    /// place would otherwise be both the output of its producer and of the in-place op: the producer would read the
+    /// gradient of the NEW value (the graph walk never even reached it once the in-place op took over
+    /// <c>GradFn</c>). Here the snapshot takes the producer's node and the target's place in every entry recorded
+    /// since that producer (as output or input, with its version), so the old value keeps its history and its
+    /// consumers' gradients, and the caller records the write as old -> target. Unlike torch, consumers of the old
+    /// value still differentiate correctly instead of failing a version check: they now read the snapshot.</para>
+    /// <para>The scan runs from the newest entry back to the target's producer (every consumer of the old value was
+    /// recorded after it), so its cost is the ops since the producer, not the tape length.</para>
+    /// </remarks>
+    internal Tensor<T> RebaseForInPlace(Tensor<T> target)
+    {
+        if (target is null) throw new ArgumentNullException(nameof(target));
+        var old = (Tensor<T>)target.Clone();
+        var node = target.GradFn;
+        old.GradFn = node;
+        if (node is not null && ReferenceEquals(node.Output, target)) node.Output = old;
+        target.GradFn = null;
+        old._pinnedByTape = target._pinnedByTape;
+        // Every ACTIVE tape, innermost out: an outer tape still recording around this one can hold the old value's
+        // consumers (and its producer), and repointing only the current tape left those reading the overwritten tensor.
+        for (var tape = this; tape is not null; tape = tape._parent)
+            if (tape.RepointToSnapshot(target, old, node)) break;
+        return old;
+    }
+
+    // Repoints this tape's entries from target to its snapshot, newest first; true once it reached the producer (every
+    // consumer of the old value was recorded after it, here or in an inner tape).
+    private bool RepointToSnapshot(Tensor<T> target, Tensor<T> old, GradNode<T>? node)
+    {
+        for (int i = _entries.Count - 1; i >= 0; i--)
+        {
+            ref var e = ref _entries[i];
+            if (e.Output is null) continue;
+            bool producer = ReferenceEquals(e.Output, target);
+            if (producer) e.Output = old;
+            if (ReferenceEquals(e.Input0, target)) { e.Input0 = old; e.Version0 = old.Version; }
+            if (ReferenceEquals(e.Input1, target)) { e.Input1 = old; e.Version1 = old.Version; }
+            if (ReferenceEquals(e.Input2, target)) { e.Input2 = old; e.Version2 = old.Version; }
+            if (e.InputsOverflow is { } overflow)
+                for (int k = 0; k < overflow.Length; k++)
+                    if (ReferenceEquals(overflow[k], target))
+                    {
+                        overflow[k] = old;
+                        if (e.InputVersionsOverflow is { } versions && k < versions.Length) versions[k] = old.Version;
+                    }
+            // A backward may keep the value in its saved state instead of (or as well as) its inputs.
+            if (e.SavedState is { } saved)
+                for (int k = 0; k < saved.Length; k++)
+                    if (ReferenceEquals(saved[k], target)) saved[k] = old;
+            if (e.Output.GradFn is { } consumer && !ReferenceEquals(consumer, node))
+            {
+                RepointNodeInputs(consumer, target, old);
+                if (consumer.SavedState is { } nodeSaved && !ReferenceEquals(nodeSaved, e.SavedState))
+                    for (int k = 0; k < nodeSaved.Length; k++)
+                        if (ReferenceEquals(nodeSaved[k], target)) nodeSaved[k] = old;
+            }
+            if (producer) return true;
+        }
+        return false;
+    }
+
+    private static void RepointNodeInputs(GradNode<T> n, Tensor<T> from, Tensor<T> to)
+    {
+        if (ReferenceEquals(n.Input0, from)) n.Input0 = to;
+        if (ReferenceEquals(n.Input1, from)) n.Input1 = to;
+        if (ReferenceEquals(n.Input2, from)) n.Input2 = to;
+        if (n.InputsOverflow is { } overflow)
+            for (int k = 0; k < overflow.Length; k++)
+                if (ReferenceEquals(overflow[k], from)) overflow[k] = to;
+    }
+
+    private sealed class PostAccumulateHookHandle : IDisposable
+    {
+        private List<Action<Tensor<T>, Tensor<T>>>? _list;
+        private readonly Action<Tensor<T>, Tensor<T>> _hook;
+        internal PostAccumulateHookHandle(List<Action<Tensor<T>, Tensor<T>>> list, Action<Tensor<T>, Tensor<T>> hook) { _list = list; _hook = hook; }
+        public void Dispose() { _list?.Remove(_hook); _list = null; }
+    }
+
+    private void FirePostAccumulateHooks(Tensor<T> tensor, Tensor<T> gradient)
+    {
+        if (_postAccumulateHooks is null || !_postAccumulateHooks.TryGetValue(tensor, out var list) || list.Count == 0) return;
+        foreach (var hook in list.ToArray()) hook(tensor, gradient);
+    }
+
     public void RegisterHook(Tensor<T> tensor, Func<Tensor<T>, Tensor<T>> hook)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
