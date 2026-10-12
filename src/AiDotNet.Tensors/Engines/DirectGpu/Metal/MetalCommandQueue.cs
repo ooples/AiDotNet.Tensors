@@ -750,11 +750,11 @@ public readonly struct ScopedComputeEncoder : IDisposable
     }
 
     /// <summary>
-    /// Sets a buffer at the specified index with zero offset.
+    /// Sets a buffer at the specified index, at its byte offset (nonzero only for a view).
     /// </summary>
     public void SetBuffer(MetalGpuBuffer buffer, int index)
     {
-        MetalCommandQueue.SetBuffer(_encoder, buffer.Handle, 0, (ulong)index);
+        MetalCommandQueue.SetBuffer(_encoder, buffer.Handle, (ulong)buffer.ByteOffset, (ulong)index);
     }
 
     /// <summary>

@@ -186,6 +186,9 @@ public sealed class WebGpuBindGroup : IDisposable
         GpuKernelDiagnostics.RecordLaunch(WebGpuShaderModule.DescribePipeline(pipelineId), 0, 0, buffers.Length);
 
         var bufferIds = new int[buffers.Length];
+        var offsets = new int[buffers.Length];
+        var sizes = new int[buffers.Length];
+        bool anyView = false;
         for (int i = 0; i < buffers.Length; i++)
         {
             if (buffers[i] is null || !buffers[i].IsValid)
@@ -193,9 +196,15 @@ public sealed class WebGpuBindGroup : IDisposable
                 throw new ArgumentException($"Buffer at index {i} is null or invalid", nameof(buffers));
             }
             bufferIds[i] = buffers[i].BufferId;
+            offsets[i] = buffers[i].OffsetBytes;
+            sizes[i] = buffers[i].SizeBytes;
+            anyView |= buffers[i].IsView;
         }
 
-        _bindGroupId = WebGpuNativeBindings.CreateBindGroup(pipelineId, bufferIds);
+        // A view binds only its own byte range of the shared buffer (#1142); whole buffers keep the plain call.
+        _bindGroupId = anyView
+            ? WebGpuNativeBindings.CreateBindGroupRanges(pipelineId, bufferIds, offsets, sizes)
+            : WebGpuNativeBindings.CreateBindGroup(pipelineId, bufferIds);
         if (_bindGroupId < 0)
         {
             throw new InvalidOperationException("Failed to create bind group");
