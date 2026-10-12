@@ -42,6 +42,7 @@ for await (const line of rl) {
       if (err) throw new Error(err.message);
       pipelines.set(job.code, pipe);
     }
+    if (job.compileOnly) { console.log(JSON.stringify({ ok: true, out: [] })); continue; }
     const bufs = job.buffers.map(b => {
       const bytes = Buffer.from(b, 'base64');
       const buf = device.createBuffer({ size: Math.max(16, bytes.length), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
@@ -118,6 +119,26 @@ for await (const line of rl) {
 
     /// <summary>A <see cref="PortableGenericFft.Launcher"/> that runs each launch's WGSL port on Dawn.</summary>
     public PortableGenericFft.Launcher For(IDirectGpuBackend host) => (name, threads, args) => Launch(host, name, threads, args);
+
+    /// <summary>
+    /// Builds <paramref name="name"/>'s compute pipeline on Dawn without dispatching it: null when it compiles, else
+    /// Dawn's error (the way a backend's readiness check asks its device compiler).
+    /// </summary>
+    public string? Compile(string name)
+    {
+        string? source = null;
+        if (!(_modules?.TryGetValue(name, out source) ?? false) && !WebGpuBatchExecutionKernels.ByKernelName.TryGetValue(name, out source))
+            return $"No WGSL port for {name}.";
+        var job = new { code = WebGpuShaderPrelude.Prepare(source ?? ""), compileOnly = true };
+        _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));
+        _node.StandardInput.Flush();
+        var read = _node.StandardOutput.ReadLineAsync();
+        if (!read.Wait(ReplyTimeout)) return $"{name}: Dawn did not reply within {ReplyTimeout.TotalMinutes} minutes.";
+        string? reply = read.Result;
+        if (reply is null) return "Dawn server exited: " + StderrText();
+        using var doc = JsonDocument.Parse(reply);
+        return doc.RootElement.GetProperty("ok").GetBoolean() ? null : doc.RootElement.GetProperty("error").GetString() ?? "compile failed";
+    }
 
     private void Launch(IDirectGpuBackend host, string name, int threads, object[] args)
     {

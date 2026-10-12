@@ -21,11 +21,14 @@ internal sealed class DawnWebGpuBatchBackend : DelegatingGpuBackend, IGpuBatchEx
     private readonly OpenClBackend _host;
     private readonly PortableGenericFft.Launcher _launch;
     private readonly PortableBatchExecution _portable;
+    private readonly GenericFftReadiness _fftReadiness;
 
     public DawnWebGpuBatchBackend(OpenClBackend host, DawnWgslLauncher dawn) : base(host)
     {
         _host = host;
         _launch = dawn.For(host);
+        // WebGPU's readiness gate, asking Dawn's compiler as WebGpuBackend asks the browser's.
+        _fftReadiness = new GenericFftReadiness(dawn.Compile);
         // WebGpuBackend.FullReduce dispatches one workgroup; one thread rounds up to exactly that.
         _portable = new PortableBatchExecution(_launch,
             (input, output, size, mode, maxVal) => _launch("bx_full_reduce", 1, input, output, size, mode, maxVal));
@@ -52,13 +55,23 @@ internal sealed class DawnWebGpuBatchBackend : DelegatingGpuBackend, IGpuBatchEx
 
     // ---- WebGPU's generic FFT, as WebGpuBackend.CapabilityParity calls it ----
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
-    bool IGenericFftBackend.SupportsFftElementType(FftElementType type) => PortableGenericFft.Supports(type);
+    internal GenericFftReadiness FftReadiness => _fftReadiness;
+    bool IGenericFftBackend.SupportsFftElementType(FftElementType type) => _fftReadiness.IsReady(type);
     void IGenericFftBackend.ConvertFloatToFftStorage(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
-        => PortableGenericFft.ToStorage(this, _launch, source, destination, count, type);
+    {
+        _fftReadiness.Require(type, "WebGPU");
+        PortableGenericFft.ToStorage(this, _launch, source, destination, count, type);
+    }
     void IGenericFftBackend.ConvertFftStorageToFloat(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)
-        => PortableGenericFft.FromStorage(this, _launch, source, destination, count, type);
+    {
+        _fftReadiness.Require(type, "WebGPU");
+        PortableGenericFft.FromStorage(this, _launch, source, destination, count, type);
+    }
     void IGenericFftBackend.LaunchFftGeneric(IGpuBuffer real, IGpuBuffer imaginary, int batch, int n, bool inverse, FftElementType type)
-        => PortableGenericFft.Launch(this, _launch, real, imaginary, batch, n, inverse, type);
+    {
+        _fftReadiness.Require(type, "WebGPU");
+        PortableGenericFft.Launch(this, _launch, real, imaginary, batch, n, inverse, type);
+    }
     void IFftBackend.LaunchFft(IGpuBuffer buffer, int batchCount, int n, bool inverse)
         => PortableGenericFft.LaunchInterleaved(this, this, buffer, batchCount, n, inverse);
 

@@ -16,6 +16,12 @@ internal static class PortableGenericFft
     /// <summary>Launches a shared batch kernel by name: (kernel, thread count, arguments in kernel order).</summary>
     public delegate void Launcher(string kernel, int threads, params object[] args);
 
+    /// <summary>Every kernel the transforms and storage conversions launch.</summary>
+    internal static readonly string[] KernelNames =
+    {
+        "bx_fft_to_storage", "bx_fft_from_storage", "bx_fft_chirp", "bx_fft_bluestein_pre", "bx_fft_cmul", "bx_fft_bluestein_post",
+    };
+
     public static bool Supports(FftElementType type)
     {
         _ = type.ByteSize();

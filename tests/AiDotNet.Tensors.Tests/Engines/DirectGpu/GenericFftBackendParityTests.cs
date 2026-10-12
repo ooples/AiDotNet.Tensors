@@ -1,7 +1,9 @@
 #if NET6_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
@@ -200,6 +202,54 @@ public sealed class GenericFftBackendParityTests
         {
             if (backend is null) return;
             CheckAll(backend);
+        }
+    }
+
+
+    /// <summary>
+    /// #965: the generic FFT through the shared IEngine contract on WebGPU's kernels (Dawn), with a tape active: the
+    /// result matches the DFT, records its backward, and the gradient reaches the input.
+    /// </summary>
+    [SkippableFact]
+    public void WebGpuWgsl_GenericFft_ThroughTheEngine_KeepsTheTapeConnected_OnDawn()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            var engine = new DirectGpuTensorEngine(new DirectGpuEngine(backend));
+            Assert.True(engine.SupportsFftElementType(FftElementType.Float32));
+            const int n = 6;   // Bluestein
+            var re = Values(n, 3);
+            var im = Values(n, 9);
+            var interleaved = new float[2 * n];
+            for (int i = 0; i < n; i++) { interleaved[2 * i] = re[i]; interleaved[2 * i + 1] = im[i]; }
+            Dft(re, im, n, false, out var eRe, out var eIm);
+            var input = new Tensor<float>(interleaved, new[] { 2 * n });
+            using var tape = new GradientTape<float>();
+            Tensor<float> result = ((IEngine)engine).FftGeneric(input);
+            Assert.NotNull(result.GradFn);
+            for (int i = 0; i < n; i++)
+                Assert.True(Math.Abs(result[2 * i] - eRe[i]) <= 1e-4 && Math.Abs(result[2 * i + 1] - eIm[i]) <= 1e-4,
+                    $"[{i}]: got ({result[2 * i]}, {result[2 * i + 1]}), expected ({eRe[i]}, {eIm[i]})");
+            Tensor<float> loss = engine.ReduceSum(result, new[] { 0 }, keepDims: false);
+            var gradients = tape.ComputeGradients(loss);
+            Assert.True(gradients.ContainsKey(input), "WebGPU FftGeneric must keep the active tape connected to its input.");
+        }
+    }
+
+    /// <summary>#965 criterion 1 on Dawn: the capability is reported after every FFT pipeline compiled there.</summary>
+    [SkippableFact]
+    public void WebGpuWgsl_GenericFft_ReportsTheCapability_AfterDawnCompiledEveryKernel()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            var fft = (IGenericFftBackend)backend;
+            foreach (var type in new[] { FftElementType.Float32, FftElementType.Float16, FftElementType.BFloat16 })
+                Assert.True(fft.SupportsFftElementType(type), $"{type}: {backend.FftReadiness.Error}");
+            Assert.Null(backend.FftReadiness.Error);
         }
     }
 
