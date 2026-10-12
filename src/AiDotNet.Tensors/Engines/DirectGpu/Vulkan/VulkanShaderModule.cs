@@ -2,6 +2,7 @@
 // Vulkan shader module management for SPIR-V compute shaders.
 
 using System;
+using System.Collections.Generic;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
@@ -189,14 +190,21 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
 {
     private readonly VulkanDevice _device;
     private IntPtr _descriptorSetLayout;
-    private Action? _pendingBatchFlush;
 
     /// <summary>What the launch journal calls this pipeline (#996).</summary>
     internal string Name { get; set; } = "vulkan-pipeline";
     private IntPtr _pipelineLayout;
     private IntPtr _pipeline;
+    // Every descriptor pool this pipeline has created; the last one is the one new sets come from.
+    private readonly List<IntPtr> _descriptorPools = new List<IntPtr>();
     private IntPtr _descriptorPool;
+    // The set the next dispatch binds. A dispatch that is recorded but not yet executed retains it
+    // (RetainDescriptorSet), and the next UpdateDescriptorSet then writes a different set instead of this one.
     private IntPtr _descriptorSet;
+    private bool _descriptorSetRetained;
+    private readonly Stack<IntPtr> _freeDescriptorSets = new Stack<IntPtr>();
+    // Sets a pool beyond the first holds. The first pool holds one: most pipelines never have two dispatches pending.
+    private const int DescriptorSetsPerGrowth = 16;
     private readonly int _bindingCount;
     private readonly uint _pushConstantSize;
     private readonly object _dispatchLock = new object();
@@ -256,8 +264,8 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
         if (!pipeline.CreateDescriptorSetLayout() ||
             !pipeline.CreatePipelineLayout() ||
             !pipeline.CreatePipeline(shaderModule) ||
-            !pipeline.CreateDescriptorPool() ||
-            !pipeline.AllocateDescriptorSet())
+            !pipeline.CreateDescriptorPool(1) ||
+            (pipeline._descriptorSet = pipeline.AllocateDescriptorSet()) == IntPtr.Zero)
         {
             pipeline.Dispose();
             return null;
@@ -379,12 +387,12 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
         }
     }
 
-    private bool CreateDescriptorPool()
+    private bool CreateDescriptorPool(int sets)
     {
         var poolSize = new VkDescriptorPoolSize
         {
             type = VulkanNativeBindings.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            descriptorCount = (uint)_bindingCount
+            descriptorCount = checked((uint)(_bindingCount * sets))
         };
 
         var createInfo = new VkDescriptorPoolCreateInfo
@@ -392,18 +400,22 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
             sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             pNext = null,
             flags = 0,
-            maxSets = 1,
+            maxSets = (uint)sets,
             poolSizeCount = 1,
             pPoolSizes = &poolSize
         };
 
         var result = VulkanNativeBindings.vkCreateDescriptorPool(
-            _device.Device, &createInfo, IntPtr.Zero, out _descriptorPool);
+            _device.Device, &createInfo, IntPtr.Zero, out IntPtr pool);
 
-        return result == VulkanNativeBindings.VK_SUCCESS && _descriptorPool != IntPtr.Zero;
+        if (result != VulkanNativeBindings.VK_SUCCESS || pool == IntPtr.Zero) return false;
+        _descriptorPool = pool;
+        _descriptorPools.Add(pool);
+        return true;
     }
 
-    private bool AllocateDescriptorSet()
+    // A set from the newest pool, or IntPtr.Zero.
+    private IntPtr AllocateDescriptorSet()
     {
         var layout = _descriptorSetLayout;
 
@@ -420,15 +432,56 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
         var result = VulkanNativeBindings.vkAllocateDescriptorSets(
             _device.Device, &allocInfo, &descriptorSet);
 
-        _descriptorSet = descriptorSet;
-        return result == VulkanNativeBindings.VK_SUCCESS && _descriptorSet != IntPtr.Zero;
+        return result == VulkanNativeBindings.VK_SUCCESS ? descriptorSet : IntPtr.Zero;
     }
 
-    /// <summary>Marks this pipeline as recorded in a pending batch; <paramref name="flush"/> submits that batch.</summary>
-    internal void MarkRecordedInBatch(Action flush) => _pendingBatchFlush = flush;
+    /// <summary>
+    /// Keeps the set the last <see cref="UpdateDescriptorSet"/> wrote for a dispatch that is recorded but has not
+    /// executed yet, and returns it. Until <see cref="ReleaseDescriptorSet"/> hands it back, the pipeline's next
+    /// dispatches write and bind other sets, so they cannot retarget this one.
+    /// </summary>
+    internal IntPtr RetainDescriptorSet()
+    {
+        lock (_dispatchLock)
+        {
+            _descriptorSetRetained = true;
+            return _descriptorSet;
+        }
+    }
 
-    /// <summary>Clears the mark once the batch that recorded this pipeline has been submitted.</summary>
-    internal void ClearBatchMark() => _pendingBatchFlush = null;
+    /// <summary>Hands back a set from <see cref="RetainDescriptorSet"/> once the dispatch that bound it has executed.</summary>
+    internal void ReleaseDescriptorSet(IntPtr descriptorSet)
+    {
+        if (descriptorSet == IntPtr.Zero) return;
+        lock (_dispatchLock)
+        {
+            if (_disposed) return;
+            if (descriptorSet == _descriptorSet) _descriptorSetRetained = false;
+            else _freeDescriptorSets.Push(descriptorSet);
+        }
+    }
+
+    /// <summary>Descriptor sets this pipeline has allocated, for tests.</summary>
+    internal int AllocatedDescriptorSetCount
+    {
+        get { lock (_dispatchLock) return _descriptorPools.Count == 0 ? 0 : 1 + (_descriptorPools.Count - 1) * DescriptorSetsPerGrowth; }
+    }
+
+    // Caller holds _dispatchLock. A set nothing pending has bound: a released one, or one from a new pool.
+    private IntPtr TakeFreeDescriptorSet()
+    {
+        if (_freeDescriptorSets.Count > 0) return _freeDescriptorSets.Pop();
+        if (!CreateDescriptorPool(DescriptorSetsPerGrowth))
+            throw new InvalidOperationException($"Failed to create a descriptor pool for Vulkan pipeline '{Name}'.");
+        for (int i = 0; i < DescriptorSetsPerGrowth; i++)
+        {
+            IntPtr set = AllocateDescriptorSet();
+            if (set == IntPtr.Zero)
+                throw new InvalidOperationException($"Failed to allocate a descriptor set for Vulkan pipeline '{Name}'.");
+            _freeDescriptorSets.Push(set);
+        }
+        return _freeDescriptorSets.Pop();
+    }
 
     /// <summary>
     /// Updates the descriptor set with buffer bindings.
@@ -449,12 +502,16 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
                 nameof(buffers));
         }
 
-        // A dispatch recorded into a pending batch reads this set when the batch is submitted, so rebinding
-        // it now would retarget that dispatch. Submit the batch first.
-        _pendingBatchFlush?.Invoke();
-
         lock (_dispatchLock)
         {
+            // A dispatch recorded but not yet executed reads the set it bound when it is submitted, so that set
+            // is left alone and this dispatch gets another.
+            if (_descriptorSetRetained)
+            {
+                _descriptorSet = TakeFreeDescriptorSet();
+                _descriptorSetRetained = false;
+            }
+
             int count = buffers.Length;
             var bufferInfos = stackalloc VkDescriptorBufferInfo[count];
             var writes = stackalloc VkWriteDescriptorSet[count];
@@ -507,11 +564,13 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
             _pipelineLayout = IntPtr.Zero;
         }
 
-        if (_descriptorPool != IntPtr.Zero)
-        {
-            VulkanNativeBindings.vkDestroyDescriptorPool(_device.Device, _descriptorPool, IntPtr.Zero);
-            _descriptorPool = IntPtr.Zero;
-        }
+        // Destroying a pool frees every set allocated from it.
+        foreach (IntPtr pool in _descriptorPools)
+            VulkanNativeBindings.vkDestroyDescriptorPool(_device.Device, pool, IntPtr.Zero);
+        _descriptorPools.Clear();
+        _freeDescriptorSets.Clear();
+        _descriptorPool = IntPtr.Zero;
+        _descriptorSet = IntPtr.Zero;
 
         if (_descriptorSetLayout != IntPtr.Zero)
         {
