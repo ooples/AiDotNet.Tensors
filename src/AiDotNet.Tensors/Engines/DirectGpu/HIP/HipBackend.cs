@@ -259,6 +259,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
     }
 
+    // The device this backend runs on; IThreadContextBackend binds it to each thread that issues work.
+    private readonly int _hipDeviceIndex;
+
     public HipBackend(int deviceIndex)
     {
         _kernelCache = new Dictionary<string, IntPtr>();
@@ -274,6 +277,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         try
         {
             // Initialize HIP and get device info
+            _hipDeviceIndex = deviceIndex;
             var result = HipNativeBindings.hipSetDevice(deviceIndex);
             if (result != HipError.Success)
             {

@@ -24,7 +24,6 @@ cast CompiledTrainingPlan.TryMultiTensorFiniteness CudaBackend #1154
 cast CompiledTrainingPlan.UploadHostWrittenParameters CudaBackend #1154
 cast CompiledTrainingPlan.ZeroDeviceBuffer CudaBackend #1154
 cast DirectGpuEngine.TryExecuteFusedResidualBatchNormRelu CudaBackend #1154
-cast DirectGpuTensorEngine.AbcScanForward CudaBackend #1154
 cast DirectGpuTensorEngine.AddGroupNormInto CudaBackend #1154
 cast DirectGpuTensorEngine.AllocateReclaiming CudaBackend #1154
 cast DirectGpuTensorEngine.AllocateStreamOrderedScratch CudaBackend #1154
@@ -36,14 +35,9 @@ cast DirectGpuTensorEngine.FlashAttention CudaBackend #1154
 cast DirectGpuTensorEngine.FusedConv2D CudaBackend #1154
 cast DirectGpuTensorEngine.GELU CudaBackend #1154
 cast DirectGpuTensorEngine.GeluBackward CudaBackend #1154
-cast DirectGpuTensorEngine.GetCachedOnesBuffer CudaBackend #1154
-cast DirectGpuTensorEngine.GetOrCacheFp16ColScratch CudaBackend #1154
-cast DirectGpuTensorEngine.GetOrCacheFp16Weights CudaBackend #1154
-cast DirectGpuTensorEngine.GetOrCacheWeightBuffer CudaBackend #1154
 cast DirectGpuTensorEngine.GroupNormBackward CudaBackend #1154
 cast DirectGpuTensorEngine.GroupNormSwishInto CudaBackend #1154
 cast DirectGpuTensorEngine.LayerNormBackward CudaBackend #1154
-cast DirectGpuTensorEngine.PrepareStableCaptureOutput CudaBackend #1154
 cast DirectGpuTensorEngine.ReclaimDetachedResultsOverBudget CudaBackend #1154
 cast DirectGpuTensorEngine.ReclaimGpuMemoryUnderPressure CudaBackend #1154
 cast DirectGpuTensorEngine.ReLU CudaBackend #1154
@@ -58,14 +52,10 @@ cast DirectGpuTensorEngine.TensorBroadcastAdd CudaBackend #1154
 cast DirectGpuTensorEngine.TensorBroadcastAddInPlace CudaBackend #1154
 cast DirectGpuTensorEngine.TensorEmbeddingLookupFromFloatIndices CudaBackend #1154
 cast DirectGpuTensorEngine.TensorGatherClassValues CudaBackend #1154
-cast DirectGpuTensorEngine.TensorNegate CudaBackend #1154
 cast DirectGpuTensorEngine.TensorSetSliceAxis CudaBackend #1154
-cast DirectGpuTensorEngine.TryAliasResidentOutput CudaBackend #1154
 cast DirectGpuTensorEngine.TryBatchedMatMulResidentInto CudaBackend #1154
 cast DirectGpuTensorEngine.TryCompressActivationFp16ByKey CudaBackend #1154
 cast DirectGpuTensorEngine.TryConcatenateChannelsResidentInto CudaBackend #1154
-cast DirectGpuTensorEngine.TryContiguousOnDevice CudaBackend #1154
-cast DirectGpuTensorEngine.TryCreateDeviceSeed CudaBackend #1154
 cast DirectGpuTensorEngine.TryDirectPtxFlashAttention CudaBackend #1154
 cast DirectGpuTensorEngine.TryEmbeddingBackwardFromFloatIds CudaBackend #1154
 cast DirectGpuTensorEngine.TryEmbeddingBackwardResident CudaBackend #1154
@@ -73,15 +63,12 @@ cast DirectGpuTensorEngine.TryFp16AddInPlace CudaBackend #1154
 cast DirectGpuTensorEngine.TryFp16BroadcastAddInPlace CudaBackend #1154
 cast DirectGpuTensorEngine.TryFreeActivationByKey CudaBackend #1154
 cast DirectGpuTensorEngine.TryFusedLinearResidentInto CudaBackend #1154
-cast DirectGpuTensorEngine.TryGetBackend CudaBackend #1154
 cast DirectGpuTensorEngine.TryGroupNormSwishResidentInto CudaBackend #1154
 cast DirectGpuTensorEngine.TryLandResidentHalf CudaBackend #1154
 cast DirectGpuTensorEngine.TryResidentZeros CudaBackend #1154
-cast DirectGpuTensorEngine.TryRunGeneralBroadcastBinary CudaBackend #1154
 cast DirectGpuTensorEngine.TrySliceAxisResidentInto CudaBackend #1154
 cast DirectGpuTensorEngine.TryTransientUpcastFp16 CudaBackend #1154
 cast DirectGpuTensorEngine.TryUpcastActivationFp32ByKey CudaBackend #1154
-cast DirectGpuTensorEngine.WriteOutputToStableCapture CudaBackend #1154
 cast DirectGpuTensorEngine.ZeroLstmGradient CudaBackend #1154
 cast ExecutionStreamFactory.TryGetCudaStream CudaBackend #1154
 

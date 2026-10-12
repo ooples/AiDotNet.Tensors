@@ -679,7 +679,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return cached;
         // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
         // Allocating/converting inside cuStreamBeginCapture aborts the graph (CUDA 906) — fail loudly instead.
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend capCb && capCb.IsStreamCapturing())
+        if (backend is IGpuGraphCapture capCb && capCb.IsStreamCapturing())
             throw new InvalidOperationException(
                 "FP16 conv weight cache miss during CUDA stream capture — convert the weights on the pre-residency pass before cuStreamBeginCapture.");
         var half = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
@@ -703,7 +703,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return cached;
         // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
         // Allocating inside cuStreamBeginCapture aborts the graph (CUDA 906) — fail loudly instead.
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend capCb && capCb.IsStreamCapturing())
+        if (backend is IGpuGraphCapture capCb && capCb.IsStreamCapturing())
             throw new InvalidOperationException(
                 "FP16 conv col-scratch cache miss during CUDA stream capture — allocate the scratch on the pre-residency pass before cuStreamBeginCapture.");
         var scratch = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
@@ -857,11 +857,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>Pre-capture (sync alloc — call OUTSIDE stream capture): allocate/reuse a persistent output buffer
-    /// sized to the forward's output. float only / no-op off CUDA.</summary>
+    /// sized to the forward's output. float only / no-op on a backend without graph capture.</summary>
     public void PrepareStableCaptureOutput<T>(Tensor<T> sampleOutput)
     {
         if (typeof(T) != typeof(float) || sampleOutput is null) return;
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        if (GetBackend() is not IGpuGraphCapture { SupportsGraphCapture: true } || !TryGetBackend(out var cb)) return;
         int need = sampleOutput.Length;
         if (_stableCaptureOutput is null || _stableCaptureOutput.Handle == System.IntPtr.Zero || _stableCaptureOutput.Size < need)
         {
@@ -879,7 +879,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (output is null) throw new System.ArgumentNullException(nameof(output));
         // Genuinely off the capture path (a non-float / non-CUDA forward never captures): no-op pass-through.
         if (typeof(T) != typeof(float)) return output;
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return output;
+        if (GetBackend() is not IGpuGraphCapture { SupportsGraphCapture: true } || !TryGetBackend(out var cb)) return output;
         // On the ACTIVE capture path the misses below are unrecoverable invalid-capture states, NOT benign
         // no-ops: returning `output` records no DtoD copy node, so the graph computes into its internal pool
         // and a later DownloadOutput reads the now-stale externally-held pointer — the exact frozen-output
@@ -1113,7 +1113,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // op driven from a different thread (parallel test execution, thread-pool continuation)
             // doesn't launch kernels / copy memory against the wrong (or no) context — the cause of
             // the intermittent concurrent-GPU 0xC0000005. No-op when already current.
-            (backend as DirectGpu.CUDA.CudaBackend)?.EnsureContextCurrent();
+            (backend as IThreadContextBackend)?.EnsureContextCurrent();
         }
         return available;
     }
@@ -1582,7 +1582,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         seed = null!;
         if (typeof(T) != typeof(float) || loss.Length == 0 || loss.TryGetGpuBuffer() is null) return false;
         if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing()) return false;
+        if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing()) return false;
         var output = AllocateOutputBuffer(backend, loss.Length);
         try
         {
@@ -1605,7 +1605,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         result = null!;
         if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing()) return false;
+        if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing()) return false;
         if (!TryPermuteViewOnDevice(backend, view, out var permuted)) return false;
         result = DeferTensorResult<T>(backend, permuted.Buffer, view.Length, view.Shape.ToArray());
         return true;
@@ -2997,7 +2997,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // A synchronize is illegal inside CUDA graph capture (it aborts the capture, CUDA-900). This path is
         // reachable during capture via TryAliasResidentOutput on a nonresident source under ResidentStepActive,
         // so gate every backend.Synchronize() below on this (mirrors the FP16 / ones-buffer capture fail-fast).
-        bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cudaCap && cudaCap.IsStreamCapturing();
+        bool capturing = backend is IGpuGraphCapture cudaCap && cudaCap.IsStreamCapturing();
         lock (_persistentBufferLock)
         {
             // Deferred reclamation: dispose buffers retired by EARLIER stale re-uploads. They were already
@@ -4017,7 +4017,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (srcBuf is null)
         {
-            bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cbk && cbk.IsStreamCapturing();
+            bool capturing = backend is IGpuGraphCapture cbk && cbk.IsStreamCapturing();
             bool hasBuf = src._gpuBuffer is not null;
             bool verMatch = hasBuf && src._gpuBufferVersion == src.GpuCacheVersion;
             var srcArr2 = src.GetBackingArrayForCacheLookupUnsafe();
@@ -5474,7 +5474,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (_onesBufferCache.TryGetValue(size, out var existing) && existing.Handle != System.IntPtr.Zero) return existing;
         // Allocate+fill only when NOT capturing (cuMemsetD32 aborts capture). The pre-pass populates the cache.
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend cb && cb.IsStreamCapturing()) return null;
+        if (backend is IGpuGraphCapture cb && cb.IsStreamCapturing()) return null;
         try
         {
             var buf = backend.AllocateBuffer(size);
@@ -11600,7 +11600,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (Compilation.GraphMode.IsActive || IsTapeActive<T>() || !TryGetBackend(out var abcBackend))
             return base.AbcScanForward(qProj, kProj, vProj, forgetGate, slotKeys, numHeads, slotInitScale);
-        if (abcBackend is Engines.DirectGpu.CUDA.CudaBackend abcCuda && abcCuda.IsStreamCapturing())
+        if (abcBackend is IGpuGraphCapture abcCuda && abcCuda.IsStreamCapturing())
             throw new NotSupportedException(
                 "AbcScanForward's composed GPU path allocates per recurrence step and cannot run during CUDA stream capture.");
 
@@ -18440,7 +18440,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // GetOrAllocateBuffer and every TileAxis expansion below may allocate synchronously. CUDA
         // forbids those allocations after cuStreamBeginCapture (CUDA 906), so decline the composed
         // path before touching either input and let the established caller fallback own the case.
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing())
+        if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing())
             return null;
 
         if (!CanBroadcast(a.Shape._dims, b.Shape._dims))
@@ -20680,7 +20680,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) == typeof(float))
         {
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"
-                && TryGetBackend(out var dbgB) && dbgB is Engines.DirectGpu.CUDA.CudaBackend dbgCb && dbgCb.IsStreamCapturing())
+                && TryGetBackend(out var dbgB) && dbgB is IGpuGraphCapture dbgCb && dbgCb.IsStreamCapturing())
                 AliasDiag($"Negate DURING-CAPTURE residentStep={ResidentStepActive} evictSusp={EvictionSuspended} capDepth>0");
             var resOut = new Tensor<T>(new T[tensor.Length], tensor.Shape._dims);
             if (TryUnaryResidentInto(resOut, tensor, static (be, i, o, n) => be.Negate(i, o, n), "Negate"))
