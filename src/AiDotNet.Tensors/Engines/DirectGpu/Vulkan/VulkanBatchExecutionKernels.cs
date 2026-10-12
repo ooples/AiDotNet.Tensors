@@ -33,10 +33,15 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
     /// runs the same code as HIP, OpenCL and Metal: each pointer parameter becomes a storage buffer of the same name
     /// (read-only when const), each scalar a push constant in order, and the float builtins their GLSL names.
     /// </summary>
-    public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(BatchExecutionCudaKernels.SolverSource);
+    public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(
+        BatchExecutionCudaKernels.SolverSource + BatchExecutionCudaKernels.AttentionSource + BatchExecutionCudaKernels.LstmSource);
 
     private static Dictionary<string, string> TranslateSolvers(string cuda)
     {
+        // The math names map on the whole source, so the #define bodies copied verbatim below are translated too.
+        cuda = Regex.Replace(cuda, @"\b(sqrt|fabs|fmax|exp|log|tanh)f\(",
+            m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
+            RegexOptions.None, RegexTimeout);
         var defines = new StringBuilder();
         foreach (Match d in Regex.Matches(cuda, @"^#define [^\n]*\n", RegexOptions.Multiline, RegexTimeout)) defines.Append(d.Value);
         var kernels = Regex.Matches(cuda, @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\) \{",
@@ -48,8 +53,8 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             int end = k + 1 < kernels.Count ? kernels[k + 1].Index : cuda.Length;
             string body = cuda.Substring(kernel.Index + kernel.Length, end - kernel.Index - kernel.Length)
                 .Replace("__uint_as_float(", "uintBitsToFloat(");
-            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax)f\(",
-                m => m.Groups[1].Value == "sqrt" ? "sqrt(" : m.Groups[1].Value == "fabs" ? "abs(" : "max(",
+            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax|exp|log|tanh)f\(",
+                m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
                 RegexOptions.None, RegexTimeout);
             var buffers = new List<string>();
             var push = new StringBuilder();

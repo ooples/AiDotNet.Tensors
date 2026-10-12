@@ -7,6 +7,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
 {
+    /// <remarks>Metal keeps its power-of-two FFT kernel.</remarks>
+    bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
+
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
     /// the undefined-contents contract.
