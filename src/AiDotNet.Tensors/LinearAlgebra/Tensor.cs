@@ -344,7 +344,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 result,
                 (_, output) =>
                 {
-                    CopyTo(output.AsWritableSpan());
+                    using var outputKeep1 = new KeepAliveScope(output);
+                    CopyTo(output.AsWritableSpanUnmarked());
                     output.IncrementVersion();
                 },
                 backward,
@@ -861,9 +862,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <param name="dimensions">The tensor shape.</param>
     /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
     /// <returns>A tensor backed by pooled memory.</returns>
-    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray)
+    // track: false for an array that came back from the thread cache. It is in an explicit-return cycle, so tracking
+    // its result buys nothing and cost a registration (owner, weak handle, locked map insert) plus an unregistration
+    // per call: about 1-2 us on a 1M-element subtract + Return loop. A result the caller drops instead is not lost to
+    // recycling: its array is collected, the next rent misses the cache, and that result (from the free list or fresh)
+    // is tracked as usual.
+    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray, bool track = true)
     {
         var vector = Vector<T>.FromMemory(memory);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this tensor, its views (which share this vector through the storage) and any zero-copy wraps has been collected.
+        if (track) vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         var tensor = new Tensor<T>(vector, dimensions);
         tensor._pooledArray = pooledArray;
         return tensor;
@@ -907,7 +916,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Use vectorized Copy operation to copy entire matrix data at once (5-10x faster than nested loops)
         // Matrix is stored in row-major order, which matches tensor storage
-        _numOps.Copy(matrix.AsSpan(), _data.AsWritableSpan());
+        using var matrixKeep1 = new KeepAliveScope(matrix);
+        _numOps.Copy(matrix.AsSpanUnmarked(), _data.AsWritableSpan());
     }
 
     /// <summary>
@@ -996,7 +1006,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     private void SetElementAt(int storageIndex, T value)
     {
         EnsureOwnedForWrite();
-        _storage.AsWritableSpan()[storageIndex] = value;
+        using var storageKeep1 = new KeepAliveScope(_storage);
+        _storage.AsWritableSpanUnmarked()[storageIndex] = value;
         IncrementVersion();
     }
 
@@ -1457,7 +1468,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 int offset = i * rowLength;
                 var sourceRow = srcSpan.Slice(offset, rowLength);
                 var destRow = destSpan.Slice(offset, rowLength);
-                _numOps.Add(sourceRow, vector.AsSpan(), destRow);
+                using var vectorKeep1 = new KeepAliveScope(vector);
+                _numOps.Add(sourceRow, vector.AsSpanUnmarked(), destRow);
             }
             return result;
         }
@@ -1479,7 +1491,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                     int offset = i * sliceSize + j * lastDimLength;
                     var sourceSlice = srcSpan.Slice(offset, lastDimLength);
                     var destSlice = destSpan.Slice(offset, lastDimLength);
-                    _numOps.Add(sourceSlice, vector.AsSpan(), destSlice);
+                    using var vectorKeep2 = new KeepAliveScope(vector);
+                    _numOps.Add(sourceSlice, vector.AsSpanUnmarked(), destSlice);
                 }
             }
             return result;
@@ -1661,7 +1674,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         var src = IsContiguous ? this : Contiguous();
         var result = TensorAllocator.Rent<T>(this._shape);
-        _numOps.MultiplyScalar(src.AsSpan(), factor, result._data.AsWritableSpan());
+        using var srcKeep1 = new KeepAliveScope(src);
+        _numOps.MultiplyScalar(src.AsSpanUnmarked(), factor, result._data.AsWritableSpan());
         return result;
     }
 
@@ -1987,7 +2001,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 if (typeof(T) == typeof(float))
                 {
                     var s = (float[])(object)GetDataArray();
-                    var r = (float[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (float[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         float acc = 0f;
@@ -2002,7 +2017,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 else
                 {
                     var s = (double[])(object)GetDataArray();
-                    var r = (double[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (double[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         double acc = 0d;
@@ -2023,7 +2039,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(float))
             {
                 var s = (float[])(object)GetDataArray();
-                var r = (float[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (float[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2039,7 +2056,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(double))
             {
                 var s = (double[])(object)GetDataArray();
-                var r = (double[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (double[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2055,7 +2073,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             // Generic T: still allocation-free / indexer-free; only Add is virtual.
             var src = AsSpan();
-            var rArr = result.GetDataArray();
+            using var rArrLease = result.LeaseArray();
+            var rArr = rArrLease.Array;
             for (int i = 0; i < len; i++)
             {
                 rArr[outFlat] = _numOps.Add(rArr[outFlat], src[i]);
@@ -2101,7 +2120,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         var result = new Vector<T>(length);
         var sourceSpan = _data.AsSpan().Slice(start, length);
-        var destSpan = result.AsWritableSpan();
+        using var destSpanLease = result.LeaseWritable();
+        var destSpan = destSpanLease.Span;
         _numOps.Copy(sourceSpan, destSpan);
         return result;
     }
@@ -3723,7 +3743,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// For GPU-resident tensors, this triggers synchronization and data download.
     /// For CPU-resident tensors, this returns the backing array directly.
     /// </summary>
-    public T[] GetCpuData()
+    internal T[] GetCpuData()
     {
         if (IsGpuResident)
         {
@@ -4230,8 +4250,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             {
                 var biasResult = Helpers.AutoTensorCache.RentOrAllocate<T>(_shape);
                 var aData = GetDataArray();
-                var bData = other.GetDataArray();
-                var rData = biasResult.GetDataArray();
+                using var bDataLease = other.LeaseArray();
+                var bData = bDataLease.Array;
+                using var rDataLease = biasResult.LeaseArray();
+                var rData = rDataLease.Array;
                 // Specialize for float to avoid interface dispatch in tight loop.
                 // #319 SIMD: per-row bias-add was a scalar loop on the hot path
                 // (TransformerBlock benchmark measured 711 µs/call at [197, 768]

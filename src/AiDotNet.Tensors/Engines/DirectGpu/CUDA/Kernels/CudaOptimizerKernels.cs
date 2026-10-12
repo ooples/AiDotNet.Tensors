@@ -21,6 +21,14 @@ internal static class CudaOptimizerKernels
 // CUDA OPTIMIZER KERNELS
 // ===========================================================================
 
+// 1 - beta^t for the optimizer bias corrections, without cancellation. These modules compile with --use_fast_math,
+// which maps powf to __powf: its ~1e-7 relative error, subtracted from 1, grows by 1/(1 - beta) (1000x for
+// beta2 = 0.999 at step 1) and moved an AMSGrad step by 1.7e-4 relative. log1pf and expm1f are not remapped.
+__device__ __forceinline__ float bias_correction(float beta, float t)
+{
+    return -expm1f(t * log1pf(-(1.0f - beta)));
+}
+
 __device__ __forceinline__ float bf16_to_float(unsigned short x)
 {
     unsigned int bits = ((unsigned int)x) << 16;
@@ -96,8 +104,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_update(
     m[idx] = mVal;
     v[idx] = vVal;
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
 
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
@@ -125,8 +133,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
     m[idx] = mVal;
     v[idx] = vVal;
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
 
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
@@ -174,8 +182,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
     param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
@@ -209,8 +217,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
     param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
@@ -236,8 +244,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_bf16_update(
     m[idx] = float_to_bf16_rne(mVal);
     v[idx] = float_to_bf16_rne(vVal);
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
 
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
@@ -265,8 +273,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_bf16_update(
     m[idx] = float_to_bf16_rne(mVal);
     v[idx] = float_to_bf16_rne(vVal);
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
 
     param[idx] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
@@ -380,8 +388,8 @@ extern ""C"" __global__ __launch_bounds__(256) void lamb_update(
     m[idx] = mVal;
     v[idx] = vVal;
 
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
 
     float adamUpdate = mHat / (sqrtf(vHat) + epsilon);
     float update = adamUpdate + weightDecay * p;
@@ -442,9 +450,9 @@ extern ""C"" __global__ __launch_bounds__(256) void amsgrad_update(
     float vMaxVal = fmaxf(vMax[idx], vVal);
     vMax[idx] = vMaxVal;
 
-    float beta2Pow = powf(beta2, (float)step);
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vMaxHat = vMaxVal / (1.0f - beta2Pow);
+    float beta2Corr = bias_correction(beta2, (float)step);
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vMaxHat = vMaxVal / beta2Corr;
 
     param[idx] -= learningRate * mHat / (sqrtf(vMaxHat) + epsilon);
 }
@@ -471,7 +479,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adamax_update(
     float uVal = fmaxf(beta2 * u[idx], fabsf(grad));
     u[idx] = uVal;
 
-    float biasCorrection = 1.0f - powf(beta1, (float)step);
+    float biasCorrection = bias_correction(beta1, (float)step);
 
     param[idx] -= (learningRate / biasCorrection) * mVal / (uVal + epsilon);
 }
@@ -523,15 +531,15 @@ extern ""C"" __global__ __launch_bounds__(256) void nadam_update(
     float vVal = beta2 * v[idx] + (1.0f - beta2) * grad * grad;
     v[idx] = vVal;
 
-    float beta1Pow = powf(beta1, (float)step);
-    float beta1PowNext = powf(beta1, (float)(step + 1));
-    float beta2Pow = powf(beta2, (float)step);
-    float vHat = vVal / (1.0f - beta2Pow);
+    float beta1Corr = bias_correction(beta1, (float)step);
+    float beta1CorrNext = bias_correction(beta1, (float)(step + 1));
+    float beta2Corr = bias_correction(beta2, (float)step);
+    float vHat = vVal / beta2Corr;
 
     // Nadam (Dozat 2016, Alg. 2, constant mu = beta1): the momentum look-ahead uses the NEXT step's bias
     // correction (1 - beta1^(t+1)), the current gradient this step's (1 - beta1^t). Matches PyTorch NAdam at
     // constant momentum and FusedOptimizer.NadamUpdateSimd.
-    float mNesterov = beta1 * mVal / (1.0f - beta1PowNext) + (1.0f - beta1) * grad / (1.0f - beta1Pow);
+    float mNesterov = beta1 * mVal / beta1CorrNext + (1.0f - beta1) * grad / beta1Corr;
 
     param[idx] -= learningRate * mNesterov / (sqrtf(vHat) + epsilon);
 }
@@ -742,8 +750,8 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adam_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
     float update = learningRate * mHat / (sqrtf(vHat) + epsilon);
     param[i] -= update;
 }
@@ -769,8 +777,8 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adamw_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vVal / bias_correction(beta2, (float)step);
     param[i] = p - learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
@@ -881,8 +889,8 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_amsgrad_update(
     v[i] = vVal;
     float vMaxNew = fmaxf(vMax[i], vVal);
     vMax[i] = vMaxNew;
-    float mHat = mVal / (1.0f - powf(beta1, (float)step));
-    float vHat = vMaxNew / (1.0f - powf(beta2, (float)step));
+    float mHat = mVal / bias_correction(beta1, (float)step);
+    float vHat = vMaxNew / bias_correction(beta2, (float)step);
     param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
@@ -906,7 +914,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adamax_update(
     float uVal = fmaxf(beta2 * u[i], fabsf(grad));
     m[i] = mVal;
     u[i] = uVal;
-    float lrAdj = learningRate / (1.0f - powf(beta1, (float)step));
+    float lrAdj = learningRate / bias_correction(beta1, (float)step);
     param[i] -= lrAdj * mVal / (uVal + epsilon);
 }
 
@@ -952,9 +960,9 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_nadam_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float bc1 = 1.0f - powf(beta1, (float)step);
-    float bc1Next = 1.0f - powf(beta1, (float)(step + 1));
-    float bc2 = 1.0f - powf(beta2, (float)step);
+    float bc1 = bias_correction(beta1, (float)step);
+    float bc1Next = bias_correction(beta1, (float)(step + 1));
+    float bc2 = bias_correction(beta2, (float)step);
     float mHat = beta1 * (mVal / bc1Next) + (1.0f - beta1) * grad / bc1;   // Dozat 2016 Alg. 2; see nadam_update
     float vHat = vVal / bc2;
     param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);

@@ -1260,47 +1260,26 @@ public static class MathHelper
     /// a random variable with normal distribution will fall within a certain range.
     /// </para>
     /// <para>
-    /// This implementation uses Abramowitz and Stegun's numerical approximation, which provides 
-    /// a good balance between accuracy and computational efficiency. The error function always 
-    /// returns values between -1 and 1, and erf(0) = 0.
+    /// This implementation uses W. J. Cody's rational Chebyshev approximations (Math. Comp. 1969), accurate to
+    /// double precision. The error function always returns values between -1 and 1, and erf(0) = 0.
     /// </para>
     /// </remarks>
     public static T Erf<T>(T x)
     {
-        var _numOps = GetNumericOperations<T>();
+        var ops = GetNumericOperations<T>();
+        return ops.FromDouble(ErrorFunction.Erf(ops.ToDouble(x)));
+    }
 
-        // Special case: erf(0) = 0 exactly
-        if (_numOps.Equals(x, _numOps.Zero))
-        {
-            return _numOps.Zero;
-        }
-
-        T _sign = _numOps.GreaterThanOrEquals(x, _numOps.Zero) ? _numOps.FromDouble(1) : _numOps.FromDouble(-1);
-        x = _numOps.Abs(x);
-
-        // Constants for Abramowitz and Stegun approximation
-        T _a1 = _numOps.FromDouble(0.254829592);
-        T _a2 = _numOps.FromDouble(-0.284496736);
-        T _a3 = _numOps.FromDouble(1.421413741);
-        T _a4 = _numOps.FromDouble(-1.453152027);
-        T _a5 = _numOps.FromDouble(1.061405429);
-        T _p = _numOps.FromDouble(0.3275911);
-
-        T _t = _numOps.Divide(_numOps.FromDouble(1), _numOps.Add(_numOps.FromDouble(1), _numOps.Multiply(_p, x)));
-        T _y = _numOps.Subtract(_numOps.FromDouble(1),
-            _numOps.Multiply(_t,
-                _numOps.Multiply(
-                    _numOps.Exp(_numOps.Negate(_numOps.Square(x))),
-                    _numOps.Add(_a1,
-                        _numOps.Multiply(_t,
-                            _numOps.Add(_a2,
-                                _numOps.Multiply(_t,
-                                    _numOps.Add(_a3,
-                                        _numOps.Multiply(_t,
-                                            _numOps.Add(_a4,
-                                                _numOps.Multiply(_a5, _t)))))))))));
-
-        return _numOps.Multiply(_sign, _y);
+    /// <summary>
+    /// Calculates the complementary error function erfc(x) = 1 − erf(x).
+    /// </summary>
+    /// <typeparam name="T">The numeric type to use for calculations.</typeparam>
+    /// <param name="x">The value for which to calculate the complementary error function.</param>
+    /// <returns>erfc(x), computed directly so it keeps its relative precision where erf(x) is close to 1.</returns>
+    public static T Erfc<T>(T x)
+    {
+        var ops = GetNumericOperations<T>();
+        return ops.FromDouble(ErrorFunction.Erfc(ops.ToDouble(x)));
     }
 
     /// <summary>

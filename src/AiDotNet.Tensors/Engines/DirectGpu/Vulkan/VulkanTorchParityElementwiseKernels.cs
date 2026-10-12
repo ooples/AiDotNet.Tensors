@@ -281,7 +281,7 @@ void main()
     /// <summary>arange / range / linspace-style points: start + i * span / denominator.</summary>
     public static string Range => Cached("range", () => DoubleShader(@"
 layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
-layout(push_constant) uniform P { uint n; uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; };
+layout(push_constant) uniform P { uint n; uint pad0; uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; };
 ", Unpack + @"
 void main()
 {
@@ -295,7 +295,7 @@ void main()
     /// <summary>logspace: base ^ (single ? start : start + i * span / denominator).</summary>
     public static string Logspace => Cached("logspace", () => DoubleShader(@"
 layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
-layout(push_constant) uniform P { uint n; uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; uint baseLo; uint baseHi; uint single; };
+layout(push_constant) uniform P { uint n; uint pad0; uint startLo; uint startHi; uint spanLo; uint spanHi; uint denLo; uint denHi; uint baseLo; uint baseHi; uint single; };
 ", Unpack + @"
 void main()
 {
@@ -309,7 +309,7 @@ void main()
     /// <summary>Windows over t = i / (m - 1): 0 Hann, 1 Hamming(alpha, beta), 2 Blackman, 3 Bartlett, 4 Kaiser(beta = alpha).</summary>
     public static string Window => Cached("window", () => DoubleShader(@"
 layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
-layout(push_constant) uniform P { uint n; int kind; int m; uint alphaLo; uint alphaHi; uint betaLo; uint betaHi; };
+layout(push_constant) uniform P { uint n; int kind; int m; uint pad0; uint alphaLo; uint alphaHi; uint betaLo; uint betaHi; };
 ", Unpack + @"
 void main()
 {
@@ -553,7 +553,7 @@ void main()
 layout(set = 0, binding = 0) readonly buffer Pr { float p[]; };
 layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
 " + FlagSlots(2) + @"
-layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+layout(push_constant) uniform P { uint n; uint pad0; uint seedLo; uint seedHi; };
 ", Rng + @"
 void main()
 {
@@ -570,7 +570,7 @@ void main()
 layout(set = 0, binding = 0) readonly buffer R { float rates[]; };
 layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
 " + FlagSlots(2) + @"
-layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+layout(push_constant) uniform P { uint n; uint pad0; uint seedLo; uint seedHi; };
 ", Rng + @"
 void main()
 {
@@ -609,7 +609,7 @@ layout(set = 0, binding = 0) readonly buffer C { float counts[]; };
 layout(set = 0, binding = 1) readonly buffer Pr { float probs[]; };
 layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
 " + FlagSlots(3) + @"
-layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+layout(push_constant) uniform P { uint n; uint pad0; uint seedLo; uint seedHi; };
 ", Rng + @"
 double parity_stirling_tail(double k)
 {
@@ -681,7 +681,7 @@ layout(set = 0, binding = 0) readonly buffer W { float w[]; };
 layout(set = 0, binding = 1) buffer S { " + (replacement ? "double prefix[];" : "float s[];") + @" };
 layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
 " + FlagSlots(3) + @"
-layout(push_constant) uniform P { uint rows; int categories; int numSamples; uint seedLo; uint seedHi; };
+layout(push_constant) uniform P { uint rows; int categories; int numSamples; uint pad0; uint seedLo; uint seedHi; };
 ", Rng + @"
 void main()
 {
@@ -756,7 +756,7 @@ void main()
     public static string Rrelu => Cached("rrelu", () => DoubleShader(@"
 layout(set = 0, binding = 0) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
-layout(push_constant) uniform P { uint n; uint lowerLo; uint lowerHi; uint upperLo; uint upperHi; int training; uint seedLo; uint seedHi; };
+layout(push_constant) uniform P { uint n; uint pad0; uint lowerLo; uint lowerHi; uint upperLo; uint upperHi; int training; uint pad1; uint seedLo; uint seedHi; };
 ", Unpack + Rng + @"
 void main()
 {
@@ -772,7 +772,7 @@ void main()
     /// <summary>randperm keys: one uniform per position.</summary>
     public static string RandomKeys => Cached("randomKeys", () => DoubleShader(@"
 layout(set = 0, binding = 0) writeonly buffer O { float o[]; };
-layout(push_constant) uniform P { uint n; uint seedLo; uint seedHi; };
+layout(push_constant) uniform P { uint n; uint pad0; uint seedLo; uint seedHi; };
 ", Rng + @"
 void main()
 {
@@ -815,7 +815,7 @@ void main()
 layout(set = 0, binding = 0) readonly buffer A { float indices[]; };
 layout(set = 0, binding = 1) writeonly buffer O { float o[]; };
 " + FlagSlots(2) + @"
-layout(push_constant) uniform P { uint n; uint totalLo; uint totalHi; uint strideLo; uint strideHi; uint extentLo; uint extentHi; int validate; };
+layout(push_constant) uniform P { uint n; uint pad0; uint totalLo; uint totalHi; uint strideLo; uint strideHi; uint extentLo; uint extentHi; int validate; };
 ", @"
 int64_t L(uint lo, uint hi) { return int64_t((uint64_t(hi) << 32) | uint64_t(lo)); }
 
@@ -966,14 +966,24 @@ layout(set = 0, binding = 2) writeonly buffer O { int o[]; };
 " + FlagSlots(3) + @"
 layout(push_constant) uniform P { uint n; int op; };
 ", @"
+// Binary (Stein's) gcd on the magnitudes: shifts and subtraction only. The AMD Vulkan driver's 64-bit % gave wrong
+// remainders (gcd(12, int.MinValue) came back 12, gcd(-9223372036854775807, 3) came back 0x100000001).
 int64_t parity_gcd(int64_t x, int64_t y)
 {
-    x = x < 0L ? -x : x;
-    y = y < 0L ? -y : y;
-    while (y != 0L) { int64_t t = x % y; x = y; y = t; }
-    return x;
+    uint64_t a = x < 0L ? uint64_t(-x) : uint64_t(x), b = y < 0L ? uint64_t(-y) : uint64_t(y);
+    if (a == 0UL) return int64_t(b);
+    if (b == 0UL) return int64_t(a);
+    int shift = 0;
+    while (((a | b) & 1UL) == 0UL) { a >>= 1; b >>= 1; shift++; }
+    while ((a & 1UL) == 0UL) a >>= 1;
+    while (b != 0UL)
+    {
+        while ((b & 1UL) == 0UL) b >>= 1;
+        if (a > b) { uint64_t s = a; a = b; b = s; }
+        b -= a;
+    }
+    return int64_t(a << shift);
 }
-
 void main()
 {
 " + Index + @"
@@ -1040,14 +1050,24 @@ layout(set = 0, binding = 2) writeonly buffer O { int64_t o[]; };
 layout(push_constant) uniform P { uint n; int op; int t; };
 ", Int64Narrow + @"
 // Both operands are non-negative here: the caller rejects long.MinValue before taking magnitudes.
+// Binary (Stein's) gcd on the magnitudes: shifts and subtraction only. The AMD Vulkan driver's 64-bit % gave wrong
+// remainders (gcd(12, int.MinValue) came back 12, gcd(-9223372036854775807, 3) came back 0x100000001).
 int64_t parity_gcd(int64_t x, int64_t y)
 {
-    x = x < 0L ? -x : x;
-    y = y < 0L ? -y : y;
-    while (y != 0L) { int64_t r = x % y; x = y; y = r; }
-    return x;
+    uint64_t a = x < 0L ? uint64_t(-x) : uint64_t(x), b = y < 0L ? uint64_t(-y) : uint64_t(y);
+    if (a == 0UL) return int64_t(b);
+    if (b == 0UL) return int64_t(a);
+    int shift = 0;
+    while (((a | b) & 1UL) == 0UL) { a >>= 1; b >>= 1; shift++; }
+    while ((a & 1UL) == 0UL) a >>= 1;
+    while (b != 0UL)
+    {
+        while ((b & 1UL) == 0UL) b >>= 1;
+        if (a > b) { uint64_t s = a; a = b; b = s; }
+        b -= a;
+    }
+    return int64_t(a << shift);
 }
-
 void main()
 {
 " + Index + @"

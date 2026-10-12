@@ -23,6 +23,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
     public interface ILinalgBackend
     {
         /// <summary>
+        /// False when this backend's linalg kernels failed to build (a rejected runtime compile), so the engine
+        /// routes the decompositions to the CPU instead of dispatching kernels that do not exist.
+        /// </summary>
+        bool LinalgKernelsReady { get; }
+
+        /// <summary>
+        /// The largest matrix dimension this backend's Eigh kernel provisions workgroup storage for; a larger matrix
+        /// would read and write past it, so the engine routes it to the CPU.
+        /// </summary>
+        int LinalgEighMaxN { get; }
+        /// <summary>
         /// Cholesky factorization <c>A = L · Lᵀ</c> (lower) or <c>A = Uᵀ · U</c>
         /// (upper) for symmetric positive-definite A. Per-batch <paramref name="info"/>
         /// is written 0 on success, k+1 if the leading k+1 × k+1 minor was not SPD.

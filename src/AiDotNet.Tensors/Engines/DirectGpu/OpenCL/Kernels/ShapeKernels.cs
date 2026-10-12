@@ -473,22 +473,31 @@ __kernel void rwkv7_forward(__global const float* R, __global const float* KAP, 
         }
     }
 }
-// One bitonic compare-exchange step. values/indices are numRows rows of length rowLen (a power of 2).
-// k = current bitonic sequence size, j = compare distance. NaN is treated as +inf (torch.sort order).
+// torch.sort's order as one strict total order: padding (index < 0) after every real element; NaN after every number
+// ascending and before every number descending; equal values by original index (so the sort is also stable). Keying
+// NaN as +inf instead tied it with +inf and with the padding, so NaN / +inf came out in either order and the un-pad
+// step could keep a padding element (the CUDA kernel's parity210_sorts_before, #1121).
+int bitonic_sorts_before(float va, float ia, float vb, float ib, int descending) {
+    int pa = ia < 0.0f, pb = ib < 0.0f;
+    if (pa != pb) return pb;
+    if (pa) return 0;
+    int na = isnan(va), nb = isnan(vb);
+    if (na != nb) return descending ? na : nb;
+    if (!na && va != vb) return descending ? (va > vb) : (va < vb);
+    return ia < ib;
+}
 __kernel void bitonic_step(__global float* values, __global float* indices, int rowLen, int k, int j, int numRows, int descending) {
     int gid = get_global_id(0); if (gid >= numRows * rowLen) return;
     int i = gid % rowLen; int ixj = i ^ j;
     if (ixj <= i) return;
     int base = (gid / rowLen) * rowLen;
     float a = values[base + i], b = values[base + ixj];
-    uint ua = as_uint(a), ub = as_uint(b);
-    float ka = (((ua >> 23) & 0xFFu) == 0xFFu && (ua & 0x7FFFFFu) != 0u) ? INFINITY : a;
-    float kb = (((ub >> 23) & 0xFFu) == 0xFFu && (ub & 0x7FFFFFu) != 0u) ? INFINITY : b;
-    int up = ((i & k) == 0); if (descending != 0) up = !up;
-    int doSwap = up ? (ka > kb) : (ka < kb);
+    float ia = indices[base + i], ib = indices[base + ixj];
+    int up = (i & k) == 0;
+    int doSwap = up ? bitonic_sorts_before(b, ib, a, ia, descending) : bitonic_sorts_before(a, ia, b, ib, descending);
     if (doSwap) {
         values[base + i] = b; values[base + ixj] = a;
-        float t = indices[base + i]; indices[base + i] = indices[base + ixj]; indices[base + ixj] = t;
+        indices[base + i] = ib; indices[base + ixj] = ia;
     }
 }
 // Copy the first copyLen elements of each row (src stride srcRowLen -> dst stride dstRowLen).
@@ -564,7 +573,9 @@ __kernel void gridsample_backward_input(__global const float* gradOut, __global 
     float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy + 1.0f) * 0.5f * (float)(H - 1);
     float srcW = (gx + 1.0f) * 0.5f * (float)(W - 1);
-    if (srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W) return;
+    // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+    // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+    if (!(srcH >= -1.0f && srcH < (float)H && srcW >= -1.0f && srcW < (float)W && (as_uint(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (as_uint(srcW) & 0x7FFFFFFFu) < 0x7F800000u)) return;
     int h0 = (int)floor(srcH); int h1 = h0 + 1; int w0 = (int)floor(srcW); int w1 = w0 + 1;
     float lh = srcH - (float)h0; float lw = srcW - (float)w0;
     float g = gradOut[idx];
@@ -584,7 +595,9 @@ __kernel void gridsample_backward_grid(__global const float* gradOut, __global c
     float gx = grid[gridBase]; float gy = grid[gridBase+1];
     float srcH = (gy+1.0f)*0.5f*(float)(H-1); float srcW = (gx+1.0f)*0.5f*(float)(W-1);
     float gradGx = 0.0f; float gradGy = 0.0f;
-    if (!(srcH <= -1.0f || srcH >= (float)H || srcW <= -1.0f || srcW >= (float)W)) {
+    // #1134: false for a NaN or infinite point, which passes no gradient; the bit test keeps fast math from folding it.
+    // At exactly -1 the output is 0 but its derivative is not (the corner at index 0 is in range), so -1 is included.
+    if (srcH >= -1.0f && srcH < (float)H && srcW >= -1.0f && srcW < (float)W && (as_uint(srcH) & 0x7FFFFFFFu) < 0x7F800000u && (as_uint(srcW) & 0x7FFFFFFFu) < 0x7F800000u) {
         int h0 = (int)floor(srcH); int h1 = h0+1; int w0 = (int)floor(srcW); int w1 = w0+1;
         float lh = srcH-(float)h0; float lw = srcW-(float)w0;
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);

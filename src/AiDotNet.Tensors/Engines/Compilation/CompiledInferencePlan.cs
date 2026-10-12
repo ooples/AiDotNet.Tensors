@@ -64,7 +64,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // denoising step runs. Opt-in via AIDOTNET_INFERENCE_CUDA_GRAPH=1; disabled automatically (eager
     // fallback) if any op issues a non-capturable sync alloc/copy during capture.
     private IntPtr _graphExec = IntPtr.Zero;
-    private Engines.DirectGpu.CUDA.CudaBackend? _graphBackend;
+    private Engines.DirectGpu.IGpuGraphCapture? _graphBackend;
     private DirectGpuTensorEngine? _graphEngine;
     private int _graphWarmupCalls;
     private bool _graphCaptureDisabled;
@@ -929,7 +929,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     }
 
     /// <summary>True when this plan is float + running on a CUDA backend that can capture graphs.</summary>
-    private bool TryGetGraphBackend(out Engines.DirectGpu.CUDA.CudaBackend cb)
+    private bool TryGetGraphBackend(out Engines.DirectGpu.IGpuGraphCapture cb)
     {
         cb = null!;
         // A cross-engine stitched plan runs some steps on a non-_engine backend; capturing only _engine's
@@ -937,7 +937,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (_containsCrossEngineSteps) return false;
         if (typeof(T) != typeof(float)) return false;
         if (_engine is not DirectGpuTensorEngine gte) return false;
-        if (gte.GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend backend) return false;
+        if (gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } backend) return false;
         cb = backend;
         return true;
     }
@@ -947,7 +947,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// in place (stable pointer), so a replayed graph — which reads the address captured at record
     /// time — sees fresh per-call data. Mirrors CompiledTrainingPlan.RefreshGraphInputInPlace.
     /// </summary>
-    private void RefreshInferenceInputsInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
+    private void RefreshInferenceInputsInPlace(Engines.DirectGpu.IGpuGraphCapture cb)
     {
         var inputs = _compiledInputTensors;
         for (int i = 0; i < inputs.Length; i++)
@@ -985,7 +985,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var data = eng.DownloadResidentBuffer(_finalOutput);
         if (data is null) return false;
         var src = (T[])(object)data;
-        var dst = _finalOutput.AsWritableSpan();
+        using var dstLease = _finalOutput.LeaseWritable();
+        var dst = dstLease.Span;
         if (src.Length < dst.Length) return false;
         src.AsSpan(0, dst.Length).CopyTo(dst);
         return true;
@@ -1011,7 +1012,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // under CUDA graph capture it's recorded as a device memcpy node and
         // replays correctly every iteration.
         Execute();
-        _finalOutput.AsSpan().CopyTo(output.AsWritableSpan());
+        using var finalOutputKeep1 = new KeepAliveScope(_finalOutput);
+        using var outputKeep1 = new KeepAliveScope(output);
+        _finalOutput.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -1041,7 +1044,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             var src = inputs[i] ?? throw new ArgumentException(
                 $"inputs[{i}] is null.", nameof(inputs));
             ValidateShapesMatch(_compiledInputTensors[i], src, $"inputs[{i}]");
-            src.AsSpan().CopyTo(_compiledInputTensors[i].AsWritableSpan());
+            using var srcKeep1 = new KeepAliveScope(src);
+            src.AsSpanUnmarked().CopyTo(_compiledInputTensors[i].AsWritableSpan());
         }
     }
 
@@ -1055,7 +1059,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 $"{nameof(SetInput)} requires exactly one.");
 
         ValidateShapesMatch(_compiledInputTensors[0], input, nameof(input));
-        input.AsSpan().CopyTo(_compiledInputTensors[0].AsWritableSpan());
+        using var inputKeep1 = new KeepAliveScope(input);
+        input.AsSpanUnmarked().CopyTo(_compiledInputTensors[0].AsWritableSpan());
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
@@ -1382,8 +1387,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         step.OpName,
                         (eng, o) =>
                         {
-                            var src = capturedInput.AsSpan();
-                            var dst = capturedOutput.AsWritableSpan();
+                            using var srcLease = capturedInput.Lease();
+                            var src = srcLease.Span;
+                            using var dstLease = capturedOutput.LeaseWritable();
+                            var dst = dstLease.Span;
                             for (int r = 0; r < rows; r++)
                                 for (int c = 0; c < cols; c++)
                                     dst[c * rows + r] = src[r * cols + c];
@@ -1402,7 +1409,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         (eng, o) =>
                         {
                             var transposed = eng.TensorTranspose(capturedInput);
-                            transposed.AsSpan().CopyTo(capturedOutput.AsWritableSpan());
+                            using var transposedKeep1 = new KeepAliveScope(transposed);
+                            using var capturedOutputKeep1 = new KeepAliveScope(capturedOutput);
+                            transposed.AsSpanUnmarked().CopyTo(capturedOutput.AsWritableSpanUnmarked());
                         },
                         step.OutputBuffer,
                         step.Inputs,

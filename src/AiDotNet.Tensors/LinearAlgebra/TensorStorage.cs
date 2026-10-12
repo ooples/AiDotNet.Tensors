@@ -197,7 +197,7 @@ internal sealed class TensorStorage<T>
         _data = data ?? throw new ArgumentNullException(nameof(data));
         _refCount = 1;
         if (shareExternalGpuCacheEpoch
-            && data.TryGetBackingArraySegmentForReadOnlyAccess(out var externalArray, out _)
+            && data.TryGetBackingArrayIdentity(out var externalArray, out _)   // identity: the epoch table key
             && externalArray is not null)
         {
             _externalArray = externalArray;
@@ -207,7 +207,7 @@ internal sealed class TensorStorage<T>
         if (Helpers.HostSync.HasPendingMaterializations)
         {
             _trackGpuCacheVersion = Helpers.HostSync.IsPending(data)
-                || (data.GetBackingArrayForReadOnlyAccess() is { } array
+                || (data.GetBackingArrayIdentity() is { } array
                     && Helpers.HostSync.IsPending(array));
             if (_trackGpuCacheVersion && ExternalEpoch(create: true) is { } external)
                 Volatile.Write(ref external.IsTracked, true);
@@ -334,6 +334,9 @@ internal sealed class TensorStorage<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal ReadOnlyMemory<T> AsReadOnlyMemory() => _data.AsMemory();
 
+    /// <summary><see cref="AsReadOnlyMemory"/> without the escape mark; see <see cref="VectorBase{T}.AsWritableMemoryUnmarked"/>.</summary>
+    internal ReadOnlyMemory<T> AsReadOnlyMemoryUnmarked() => _data.AsMemoryUnmarked();
+
     /// <summary>
     /// Gets the underlying data as a writable span.
     /// </summary>
@@ -342,6 +345,14 @@ internal sealed class TensorStorage<T>
     {
         ThrowIfReadOnlyMapped();
         return _data.AsWritableSpan();
+    }
+
+    /// <summary><see cref="AsWritableSpan"/> without the escape mark, for leases (which keep the owner alive).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal Span<T> AsWritableSpanUnmarked()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.AsWritableSpanUnmarked();
     }
 
     /// <summary>
@@ -354,6 +365,13 @@ internal sealed class TensorStorage<T>
         return _data.AsWritableMemory();
     }
 
+    /// <summary><see cref="AsMemory"/> without the escape mark; see <see cref="VectorBase{T}.AsWritableMemoryUnmarked"/>.</summary>
+    internal Memory<T> AsMemoryUnmarked()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.AsWritableMemoryUnmarked();
+    }
+
     /// <summary>
     /// Gets the raw backing array. Use with care — bypasses safety checks.
     /// </summary>
@@ -362,6 +380,14 @@ internal sealed class TensorStorage<T>
     {
         ThrowIfReadOnlyMapped();
         return _data.GetDataArray();
+    }
+
+    /// <summary><see cref="GetDataArray"/> without the escape mark; see <see cref="VectorBase{T}.GetDataArrayUnmarked"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal T[] GetDataArrayUnmarked()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.GetDataArrayUnmarked();
     }
 
     /// <summary>
@@ -376,6 +402,11 @@ internal sealed class TensorStorage<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal bool TryGetBackingArraySegmentForReadOnlyAccess(out T[]? array, out int offset)
         => _data.TryGetBackingArraySegmentForReadOnlyAccess(out array, out offset);
+
+    /// <summary>Backing lookup as an IDENTITY only: does not mark the array escaped (see VectorBase.GetBackingArrayIdentity).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetBackingArrayIdentity(out T[]? array, out int offset)
+        => _data.TryGetBackingArrayIdentity(out array, out offset);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ThrowIfReadOnlyMapped()

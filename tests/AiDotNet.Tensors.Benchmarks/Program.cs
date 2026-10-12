@@ -1397,6 +1397,176 @@ class Program
             return;
         }
 
+        // A forward that keeps its intermediates alive until it ends, with no gradient tape: how many driver
+        // allocations it pays per forward, and whether device buffers pile up, as the loop runs
+        if (args[0] == "--vulkan-forward-lifetime")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
+            int depth = args.Length > 1 ? int.Parse(args[1]) : 60;
+            int forwards = args.Length > 2 ? int.Parse(args[2]) : 400;
+            var a = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
+            var b = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
+            for (int i = 0; i < a.Length; i++) { a[i] = (i % 7) * 0.01f; b[i] = 0.5f; }
+            var ga = eng.TensorAdd(a, b);
+            var gb = eng.TensorMultiply(a, b);
+            var pool = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.Pool;
+            [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+            void Forward()
+            {
+                var live = new List<AiDotNet.Tensors.LinearAlgebra.Tensor<float>>(depth);
+                var x = ga;
+                for (int i = 0; i < depth; i++)
+                {
+                    x = (i % 3) switch { 0 => eng.TensorAdd(x, gb), 1 => eng.ReLU(x), _ => eng.TensorMultiply(x, gb) };
+                    live.Add(x);
+                }
+                GC.KeepAlive(live);
+            }
+            int block = forwards / 8;
+            for (int k = 0; k < 8; k++)
+            {
+                long d0 = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.DriverAllocations;
+                int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int f = 0; f < block; f++) Forward();
+                double ms = sw.Elapsed.TotalMilliseconds / block;
+                long d1 = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.DriverAllocations;
+                Console.WriteLine($"VKFWD depth={depth} forwards {k * block}-{(k + 1) * block - 1}: {ms:F2} ms per forward, {(d1 - d0) / (double)block:F1} driver allocations per forward (total {d1}), pooled {pool.PooledCount}, collections gen0 {GC.CollectionCount(0) - g0} gen1 {GC.CollectionCount(1) - g1} gen2 {GC.CollectionCount(2) - g2}");
+            }
+            return;
+        }
+
+        // Which collection returns a dropped engine result's device buffer to the Vulkan pool
+        if (args[0] == "--vulkan-result-lifetime")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
+            var a = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
+            var b = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
+            for (int i = 0; i < a.Length; i++) { a[i] = i; b[i] = 1; }
+            var ga = eng.TensorAdd(a, b);
+            var gb = eng.TensorMultiply(a, b);
+            var pool = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.Pool;
+            int Settle(int generation)
+            {
+                GC.Collect(generation, GCCollectionMode.Forced, blocking: true);
+                GC.WaitForPendingFinalizers();
+                using (vb.AllocateBuffer(3)) { }   // an allocation runs the queued pool returns
+                return pool.PooledCount;
+            }
+            foreach (var (name, op) in new (string, Func<AiDotNet.Tensors.LinearAlgebra.Tensor<float>>)[]
+                { ("relu", () => eng.ReLU(ga)), ("add", () => eng.TensorAdd(ga, gb)), ("matmul", () => eng.TensorMatMul(ga, gb)) })
+            {
+                Settle(2); Settle(2);
+                pool.DrainAll();
+                for (int round = 0; round < 6; round++)
+                {
+                    int before = pool.PooledCount, g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1);
+                    int lifeCalls = int.TryParse(Environment.GetEnvironmentVariable("VKLIFE_CALLS"), out int lc) ? lc : 300;
+                    for (int i = 0; i < lifeCalls; i++) op();
+                    int afterLoop = pool.PooledCount, loopG0 = GC.CollectionCount(0) - g0, loopG1 = GC.CollectionCount(1) - g1;
+                    bool gen0Only = Environment.GetEnvironmentVariable("VKLIFE_GEN0_ONLY") == "1";
+                    int afterGen0 = Settle(0), afterGen1 = gen0Only ? -1 : Settle(1), afterGen2 = gen0Only ? -1 : Settle(2);
+                    Console.WriteLine($"VKLIFE {name} round {round}: pooled before {before}, after {lifeCalls} calls {afterLoop} (gen0 x{loopG0}, gen1 x{loopG1}), after gen0 {afterGen0}, after gen1 {afterGen1}, after gen2 {afterGen2}");
+                }
+            }
+            return;
+        }
+
+        if (args[0] == "--vulkan-engine-ops")
+        {
+            // VKENGINE_NO_MISS_COLLECT=1 answers "a tape is open", which turns the collection on a pool miss off.
+            if (Environment.GetEnvironmentVariable("VKENGINE_NO_MISS_COLLECT") == "1")
+                AiDotNet.Tensors.Engines.DirectGpu.DeviceMemoryReclaim.TapeOpen = () => true;
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
+            foreach (int n in new[] { 64, 1024 })
+            {
+                var rng = new Random(1);
+                var a = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { n, n });
+                var b = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { n, n });
+                for (int i = 0; i < a.Length; i++) { a[i] = (float)rng.NextDouble(); b[i] = (float)rng.NextDouble(); }
+                double T(string name, Func<AiDotNet.Tensors.LinearAlgebra.Tensor<float>> f, int calls)
+                {
+                    for (int i = 0; i < 20; i++) f();
+                    var samples = new double[int.TryParse(Environment.GetEnvironmentVariable("VKENGINE_SAMPLES"), out int sampleCount) && sampleCount >= 7 ? sampleCount : 7];
+                    var trace = new System.Text.StringBuilder();
+                    for (int s = 0; s < samples.Length; s++)
+                    {
+                        int g0 = GC.CollectionCount(0);
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < calls; i++) f();
+                        samples[s] = sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                        trace.Append($" {samples[s]:F0}us/gc{GC.CollectionCount(0) - g0}/pool{AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.Pool.PooledCount}");
+                    }
+                    if (Environment.GetEnvironmentVariable("VKENGINE_TRACE") == "1") Console.WriteLine($"  trace {name}:{trace}");
+                    Array.Sort(samples);
+                    long up = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Uploads, rb = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+                    int fb = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Fallbacks.Length;
+                    f();
+                    up = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Uploads - up; rb = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks - rb;
+                    Console.WriteLine($"VKENGINE n={n} {name}: median {samples[samples.Length / 2]:F0}us min {samples[0]:F0} max {samples[samples.Length - 1]:F0} (per call: {up} uploads, {rb} readbacks; pooled={AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGpuBuffer.Pool.PooledCount}; gen0={GC.CollectionCount(0)}; fallbacks={string.Join(",", AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Fallbacks)})");
+                    return samples[samples.Length / 2];
+                }
+                int calls = n == 64 ? 200 : 30;
+                T("add(host,host)", () => eng.TensorAdd(a, b), calls);
+                var ga = eng.TensorAdd(a, b);
+                var gb = eng.TensorMultiply(a, b);
+                T("add(dev,dev)", () => eng.TensorAdd(ga, gb), calls);
+                T("mul(dev,dev)", () => eng.TensorMultiply(ga, gb), calls);
+                T("relu(dev)", () => eng.ReLU(ga), calls);
+                T("matmul(dev,dev)", () => eng.TensorMatMul(ga, gb), n == 64 ? 200 : 10);
+                T("softmax(dev)", () => eng.Softmax(ga, -1), calls);
+                T("add+relu+add chain", () => eng.TensorAdd(eng.ReLU(eng.TensorAdd(ga, gb)), gb), calls);
+            }
+            return;
+        }
+
+        // Cost of allocating and freeing a Vulkan device buffer, alone and around a small op
+        if (args[0] == "--vulkan-alloc")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            static double Median(Func<double> sample)
+            {
+                var samples = new double[9];
+                for (int s = 0; s < samples.Length; s++) samples[s] = sample();
+                Array.Sort(samples);
+                return samples[samples.Length / 2];
+            }
+            foreach (int n in new[] { 16, 4096, 262144, 4194304 })
+            {
+                using var x = vb.AllocateBuffer(new float[n]);
+                for (int i = 0; i < 50; i++) { using var w = vb.AllocateBuffer(n); vb.Abs(x, w, n); }
+                const int calls = 200;
+                double alloc = Median(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < calls; i++) { using var t = vb.AllocateBuffer(n); }
+                    return sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                });
+                double opFresh = Median(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < calls; i++) { using var t = vb.AllocateBuffer(n); vb.Abs(x, t, n); }
+                    return sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                });
+                using var reused = vb.AllocateBuffer(n);
+                double opReused = Median(() =>
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int i = 0; i < calls; i++) vb.Abs(x, reused, n);
+                    return sw.Elapsed.TotalMilliseconds * 1000 / calls;
+                });
+                Console.WriteLine($"VKALLOC n={n} allocate+free={alloc:F1}us abs-into-new-buffer={opFresh:F1}us abs-into-reused-buffer={opReused:F1}us");
+            }
+            return;
+        }
+
         // Cost of finding an already-built Vulkan pipeline, which every dispatch pays
         if (args[0] == "--vulkan-pipeline-lookup")
         {

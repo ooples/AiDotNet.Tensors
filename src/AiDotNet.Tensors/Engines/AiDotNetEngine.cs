@@ -1,4 +1,4 @@
-﻿using System.Threading;
+using System.Threading;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 
@@ -330,7 +330,7 @@ public static class AiDotNetEngine
                 // read them — no cross-context access (which made the GPU-resident
                 // optimizer's host-readback sync flaky).
                 "CUDA" or "NVIDIA" => new DirectGpu.CUDA.CudaOffloadAllocator(
-                    directGpu?.Backend is DirectGpu.CUDA.CudaBackend cudaBackend ? cudaBackend.CudaContextHandle : IntPtr.Zero),
+                    directGpu?.Backend is DirectGpu.IThreadContextBackend context ? context.NativeContextHandle : IntPtr.Zero),
                 // Hip/Metal/OpenCl/Vulkan/WebGpu offload allocators exist but are
                 // not IGpuDevicePointerWrapper yet, so they cannot back a
                 // GPU-resident weight buffer. Leave the registry unconfigured for

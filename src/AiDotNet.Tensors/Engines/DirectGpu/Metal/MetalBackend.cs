@@ -34,7 +34,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// through IGpuMixedPrecisionConvBackend yet — returns null so the
     /// capability is reported as absent until the Metal adapter lands.
     /// </summary>
-    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
     private readonly MetalDevice _device;
     private readonly MetalCommandQueue _commandQueue;
@@ -449,7 +448,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             var function = _shaderLibrary.GetFunction(library, kernelName);
             try
             {
-                return _shaderLibrary.CreatePipelineState(function);
+                var state = _shaderLibrary.CreatePipelineState(function);
+                // Names the pipeline in the launch journal (#996).
+                GpuKernelDiagnostics.RegisterKernelName(state.Handle, libraryName + ":" + kernelName);
+                return state;
             }
             finally
             {
@@ -698,6 +700,20 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         for (int i = 0; i < data.Length; i++)
             packed[i] = Int32BitsToSingleCompat(data[i]);
         metalBuffer.CopyFrom(packed, 0, packed.Length);
+    }
+
+    /// <inheritdoc/>
+    public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        ThrowIfDisposed();
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is not MetalGpuBuffer metalBuffer)
+            throw new ArgumentException("Buffer is not a MetalGpuBuffer.", nameof(buffer));
+        if (data.Length > metalBuffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({metalBuffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+        GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Metal);
+        metalBuffer.CopyFrom(data, 0, data.Length);
     }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)

@@ -708,3 +708,49 @@ public static class VkDescriptorPoolCreateFlags
     public const uint VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT = 0x00000001;
     public const uint VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT = 0x00000002;
 }
+
+/// <summary>
+/// VkPhysicalDeviceFeatures: 55 VkBool32 members in declaration order. Only the members the backend enables are named;
+/// their indices follow the Vulkan specification's member order.
+/// </summary>
+public unsafe struct VkPhysicalDeviceFeatures
+{
+    public const int Count = 55;
+    public const int ShaderFloat64 = 39;
+    public const int ShaderInt64 = 40;
+    public const int ShaderInt16 = 41;
+    public fixed uint Bits[Count];
+}
+
+/// <summary>VkPhysicalDeviceFeatures2 (Vulkan 1.1): the core features plus a pNext chain of extension feature structs.</summary>
+public unsafe struct VkPhysicalDeviceFeatures2
+{
+    public int sType;
+    public void* pNext;
+    public VkPhysicalDeviceFeatures features;
+}
+
+/// <summary>VkPhysicalDeviceShaderAtomicInt64Features (VK_KHR_shader_atomic_int64).</summary>
+public unsafe struct VkPhysicalDeviceShaderAtomicInt64Features
+{
+    public int sType;
+    public void* pNext;
+    public uint shaderBufferInt64Atomics;
+    public uint shaderSharedInt64Atomics;
+}
+
+/// <summary>VkPhysicalDeviceShaderAtomicFloatFeaturesEXT (VK_EXT_shader_atomic_float): 12 VkBool32 members.</summary>
+public unsafe struct VkPhysicalDeviceShaderAtomicFloatFeaturesEXT
+{
+    public const int Count = 12;
+    public int sType;
+    public void* pNext;
+    public fixed uint Bits[Count];
+}
+
+/// <summary>VkExtensionProperties.</summary>
+public unsafe struct VkExtensionProperties
+{
+    public fixed byte extensionName[256];
+    public uint specVersion;
+}

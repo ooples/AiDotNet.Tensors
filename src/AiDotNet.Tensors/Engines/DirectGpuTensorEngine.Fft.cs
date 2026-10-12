@@ -14,9 +14,6 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class DirectGpuTensorEngine
 {
-    private const string GenericFftBackendRoadmap =
-        "HIP #961, OpenCL #962, Metal #963, and WebGPU #965";
-
     /// <inheritdoc/>
     public override bool SupportsFftElementType(FftElementType type)
     {
@@ -39,8 +36,7 @@ public partial class DirectGpuTensorEngine
         {
             string backendName = backend?.BackendName ?? "unavailable DirectGpu backend";
             throw new NotSupportedException(
-                $"{backendName} does not implement generic-precision arbitrary-length FFT. " +
-                $"Tracked backend work: {GenericFftBackendRoadmap}. No host fallback was performed.");
+                $"{backendName} does not implement generic-precision arbitrary-length FFT. No host fallback was performed.");
         }
 
         if (!generic.SupportsFftElementType(elementType))
@@ -78,11 +74,11 @@ public partial class DirectGpuTensorEngine
         int batch = interleaved.Length / last;
 
         // Preferred generic path: arbitrary length, batched, and fully device-resident. CUDA takes it for every
-        // length. A backend that also has an established power-of-two kernel (Vulkan) keeps that kernel for
+        // length. A backend that also has an established power-of-two kernel keeps that kernel for
         // power-of-two lengths and takes this path for the lengths that otherwise had no device route at all.
         // The public Fft module records the backward operation after this method returns.
         bool powerOfTwo = (n & (n - 1)) == 0;
-        if (backend is IGenericFftBackend generic && (backend is CudaBackend || !powerOfTwo) &&
+        if (backend is IGenericFftBackend generic && (generic.PrefersGenericFftForPowerOfTwo || !powerOfTwo) &&
             generic.SupportsFftElementType(FftElementType.Float32))
         {
             try
@@ -233,7 +229,8 @@ public partial class DirectGpuTensorEngine
             }
             else
             {
-                int storageBytes = checked(complexCount * elementType.ByteSize());
+                // Whole 32-bit words: several backends pack two 16-bit values per word.
+                int storageBytes = checked((complexCount * elementType.ByteSize() + 3) & ~3);
                 realStorage = device.AllocateByteBuffer(storageBytes);
                 imaginaryStorage = device.AllocateByteBuffer(storageBytes);
                 generic.ConvertFloatToFftStorage(realFloat, realStorage, complexCount, elementType);

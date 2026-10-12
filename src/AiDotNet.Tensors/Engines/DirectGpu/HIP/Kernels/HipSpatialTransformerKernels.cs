@@ -192,6 +192,13 @@ extern ""C"" __global__ __launch_bounds__(256) void affine_grid(
 // GRID SAMPLE KERNEL (BILINEAR INTERPOLATION)
 // ===========================================================================
 
+// #1134: a NaN, infinite or out-of-int-range grid point samples nothing and has no gradient (the CPU rule). Tested on
+// the bits so fast math cannot fold the NaN case: |x| below 2147483520 (0x4EFFFFFF) has the smaller bit pattern, NaN
+// and infinity a larger one.
+__device__ __forceinline__ bool gs_point_usable(float ix, float iy)
+{
+    return (__float_as_uint(ix) & 0x7FFFFFFFu) < 0x4EFFFFFFu && (__float_as_uint(iy) & 0x7FFFFFFFu) < 0x4EFFFFFFu;
+}
 // Sample from input using grid with bilinear interpolation
 // input: [batch, channels, inH, inW] NCHW format
 // grid: [batch, outH, outW, 2] sampling coordinates in [-1, 1]
@@ -234,6 +241,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample(
         iy = ((gy + 1.0f) * inHeight - 1.0f) * 0.5f;
     }
 
+    if (!gs_point_usable(ix, iy)) { output[((b * channels + c) * outHeight + y) * outWidth + x] = 0.0f; return; }
     // Get the four nearest pixel coordinates
     int ix0 = (int)floorf(ix);
     int iy0 = (int)floorf(iy);
@@ -330,6 +338,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward(
         gradMultY = 0.5f * inHeight;
     }
 
+    if (!gs_point_usable(ix, iy)) { gradGrid[gridIdx] = 0.0f; gradGrid[gridIdx + 1] = 0.0f; return; }
     int ix0 = (int)floorf(ix);
     int iy0 = (int)floorf(iy);
     int ix1 = ix0 + 1;
@@ -423,6 +432,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_gr
         gradMultX = 0.5f * inWidth;
         gradMultY = 0.5f * inHeight;
     }
+    if (!gs_point_usable(ix, iy)) { gradGrid[gridIdx] = 0.0f; gradGrid[gridIdx + 1] = 0.0f; return; }
     int ix0 = (int)floorf(ix);
     int iy0 = (int)floorf(iy);
     int ix1 = ix0 + 1;
@@ -487,6 +497,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grid_sample_backward_grad_in
                 ix = ((gx + 1.0f) * inWidth - 1.0f) * 0.5f;
                 iy = ((gy + 1.0f) * inHeight - 1.0f) * 0.5f;
             }
+            if (!gs_point_usable(ix, iy)) continue;
             int ix0 = (int)floorf(ix);
             int iy0 = (int)floorf(iy);
             int ix1 = ix0 + 1;

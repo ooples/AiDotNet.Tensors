@@ -206,9 +206,15 @@ void main() {
     float gy = grid_[gOff + 1];
     float sx = alignCorners != 0 ? (gx + 1.0) * 0.5 * (W - 1) : ((gx + 1.0) * W - 1.0) * 0.5;
     float sy = alignCorners != 0 ? (gy + 1.0) * 0.5 * (H - 1) : ((gy + 1.0) * H - 1.0) * 0.5;
+    // #1134: a NaN, infinite or out-of-int-range point samples nothing (the CPU rule). Tested on the bits: |x| below
+    // 2147483520 (0x4EFFFFFF) has a smaller bit pattern, NaN and infinity a larger one.
+    if ((floatBitsToUint(sx) & 0x7FFFFFFFu) >= 0x4EFFFFFFu || (floatBitsToUint(sy) & 0x7FFFFFFFu) >= 0x4EFFFFFFu) {
+        for (int c = 0; c < C; c++) output_[((n * C + c) * outH + oy) * outW + ox] = 0.0;
+        return;
+    }
 
     if (mode == 1) {
-        int nx = int(round(sx)), ny = int(round(sy));
+        int nx = int(roundEven(sx)), ny = int(roundEven(sy));
         for (int c = 0; c < C; c++)
             output_[((n * C + c) * outH + oy) * outW + ox] = sample_safe(n, ny, nx, c);
     } else if (mode == 0) {

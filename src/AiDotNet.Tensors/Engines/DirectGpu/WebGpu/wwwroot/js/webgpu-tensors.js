@@ -545,6 +545,49 @@ export function createBindGroup(pipelineId, bufferIds) {
 }
 
 /**
+ * Creates a bind group that binds a byte range of each buffer, so a buffer view addresses only its own
+ * elements (#1142). Offsets must meet the device's minStorageBufferOffsetAlignment.
+ * @param {number} pipelineId - Pipeline ID.
+ * @param {number[]} bufferIds - Buffer IDs, one per binding in order.
+ * @param {number[]} offsets - Byte offset of each binding.
+ * @param {number[]} sizes - Byte size of each binding.
+ * @returns {number} Bind group ID, or -1 on failure.
+ */
+export function createBindGroupRanges(pipelineId, bufferIds, offsets, sizes) {
+    if (!device) return -1;
+
+    const pipeline = pipelines.get(pipelineId);
+    if (!pipeline) {
+        console.error(`Pipeline ${pipelineId} not found`);
+        return -1;
+    }
+
+    try {
+        const entries = bufferIds.map((bufferId, index) => {
+            const buffer = buffers.get(bufferId);
+            if (!buffer) {
+                throw new Error(`Buffer ${bufferId} not found`);
+            }
+            return {
+                binding: index,
+                resource: { buffer: buffer, offset: offsets[index], size: sizes[index] }
+            };
+        });
+
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: entries
+        });
+
+        const id = nextBindGroupId++;
+        bindGroups.set(id, bindGroup);
+        return id;
+    } catch (error) {
+        console.error('Failed to create ranged bind group:', error);
+        return -1;
+    }
+}
+/**
  * Destroys a bind group.
  * @param {number} bindGroupId - Bind group ID.
  */

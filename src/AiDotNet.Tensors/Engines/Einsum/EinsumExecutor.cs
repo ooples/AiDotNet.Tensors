@@ -455,7 +455,8 @@ public static class EinsumExecutor
     private static void FillZero<T>(Tensor<T> t, INumericOperations<T> numOps)
     {
         var zero = numOps.Zero;
-        var span = t.AsWritableSpan();
+        using var spanLease = t.LeaseWritable();
+        var span = spanLease.Span;
         for (int i = 0; i < span.Length; i++) span[i] = zero;
     }
 }

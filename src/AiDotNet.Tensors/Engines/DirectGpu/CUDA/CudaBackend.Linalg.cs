@@ -7,6 +7,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : ILinalgBackend
 {
+    /// <inheritdoc/>
+    /// <remarks>The linalg module is compiled with the backend; a rejected compile leaves it unset.</remarks>
+    public bool LinalgKernelsReady => _linalgModule != IntPtr.Zero;
+
+    /// <inheritdoc/>
+    /// <remarks>The Eigh kernel provisions 64 x 64 workgroup arrays.</remarks>
+    public int LinalgEighMaxN => 64;
+
     private IntPtr ResolveLinalgKernel(string name)
     {
         if (_linalgModule == IntPtr.Zero)
@@ -68,7 +76,11 @@ public sealed partial class CudaBackend : ILinalgBackend
         LaunchKernel(kernel, (uint)batchCount, LinalgBlockSize(Math.Max(m, n)), args);
     }
 
-    public unsafe void LinalgQrReduced(
+    /// <summary>
+    /// Householder (the shared <c>la_qr_reduced</c>), as the CPU and torch.linalg.qr: Gram-Schmidt would force R's
+    /// diagonal positive (#1142). The opt-in SM86 direct-PTX 4x4 experiment still runs first when admitted.
+    /// </summary>
+    public void LinalgQrReduced(
         IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
         int batchCount, int m, int n)
     {
@@ -77,14 +89,7 @@ public sealed partial class CudaBackend : ILinalgBackend
             DirectPtxSolver4x4Operation.QrReduced,
             input, q, r, batchCount, m, n)) return;
         if (TryDirectPtxQrReduced4x4(input, q, r, batchCount, m, n)) return;
-        var kernel = ResolveLinalgKernel("parity211_qr_reduced");
-        using var _ = PushContext();
-        IntPtr inPtr = input.Handle; IntPtr qPtr = q.Handle; IntPtr rPtr = r.Handle;
-        int b = batchCount, mm = m, nn = n;
-        void** args = stackalloc void*[6];
-        args[0] = &inPtr; args[1] = &qPtr; args[2] = &rPtr;
-        args[3] = &b; args[4] = &mm; args[5] = &nn;
-        LaunchKernel(kernel, (uint)batchCount, LinalgBlockSize(Math.Max(m, n)), args);
+        PortableExtendedLinalg.QrReduced(this, LaunchBatchKernel, input, q, r, batchCount, m, n);
     }
 
     public unsafe void LinalgEigh(

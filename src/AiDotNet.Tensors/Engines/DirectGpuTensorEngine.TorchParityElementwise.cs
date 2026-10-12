@@ -8,8 +8,8 @@ namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
 /// Device paths for PyTorch-parity elementwise ops that computed on the host (#1112). They run on backends implementing
-/// <see cref="ITorchParityElementwiseBackend"/>, which today is CUDA and Vulkan; HIP, Metal, OpenCL and WebGPU take the
-/// recorded host fallback until #1124, #1125, #1126 and #1128 land. Under an active tape or graph recording they
+/// <see cref="ITorchParityElementwiseBackend"/>: CUDA, OpenCL and Vulkan; HIP, Metal and WebGPU take the recorded host
+/// fallback until #1124, #1125 and #1128 land. Under an active tape or graph recording they
 /// defer to the CPU implementation, which records the backward (the convention of the engine's other parity
 /// overrides); so do non-float precisions, mismatched binary shapes and argument errors the CPU reports.
 /// </summary>
@@ -68,7 +68,8 @@ public partial class DirectGpuTensorEngine
         if (!x.IsContiguous) x = x.Contiguous();
         if (!degree.IsContiguous) degree = degree.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
-        foreach (var value in degree.AsSpan())
+        using var degreeKeep1 = new KeepAliveScope(degree);
+        foreach (var value in degree.AsSpanUnmarked())
         {
             double d = ops.ToDouble(value);
             if (double.IsInfinity(d) || d > (1 << 20)) return null;

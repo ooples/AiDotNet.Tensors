@@ -27,6 +27,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 public sealed class DirectGpuEngine : IDisposable
 {
     private readonly IDirectGpuBackend? _backend;
+
+    // The Vulkan backend is a process-wide singleton (VulkanBackend.Instance) that other components share; an engine
+    // that selected it borrows it and must not dispose it.
+    private readonly bool _borrowsBackend;
     private readonly KernelFusionManager _fusionManager;
     private readonly bool _isAvailable;
     private bool _disposed;
@@ -208,6 +212,8 @@ public sealed class DirectGpuEngine : IDisposable
             if (backend != null)
             {
                 _backend = backend;
+                // Decided by the name TryCreateBackend dispatched on, not a concrete-class test (TENS0007).
+                _borrowsBackend = string.Equals(backendName, "vulkan", StringComparison.OrdinalIgnoreCase);
                 _isAvailable = true;
                 return;
             }
@@ -269,10 +275,15 @@ public sealed class DirectGpuEngine : IDisposable
                 case "rocm":
                     AddBackend(result, seen, "hip");
                     break;
+                case "vulkan":
+                case "vk":
+                    // Opt-in only: not part of DefaultBackendOrder.
+                    AddBackend(result, seen, "vulkan");
+                    break;
                 case "":
                     break;
                 default:
-                    Trace.WriteLine($"[DirectGpuEngine] Unknown backend token '{token}' in {BackendOrderEnvVar}. Expected: cuda, opencl, hip, auto, none.");
+                    Trace.WriteLine($"[DirectGpuEngine] Unknown backend token '{token}' in {BackendOrderEnvVar}. Expected: cuda, opencl, hip, vulkan, auto, none.");
                     break;
             }
         }
@@ -293,6 +304,7 @@ public sealed class DirectGpuEngine : IDisposable
             "cuda" => TryCreateCudaBackend(),
             "opencl" => TryCreateOpenClBackend(),
             "hip" => TryCreateHipBackend(),
+            "vulkan" => TryCreateVulkanBackend(),
             _ => null
         };
     }
@@ -343,6 +355,25 @@ public sealed class DirectGpuEngine : IDisposable
             System.Diagnostics.Debug.WriteLine($"CUDA function not found: {ex.Message}");
         }
 
+        return null;
+    }
+
+    private static IDirectGpuBackend? TryCreateVulkanBackend()
+    {
+        try
+        {
+            var vulkan = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (vulkan.Initialize() && vulkan.IsGlslCompilerAvailable)
+            {
+                Trace.WriteLine("[DirectGpuEngine] SUCCESS: Using the shared Vulkan backend.");
+                return vulkan;
+            }
+            Trace.WriteLine($"[DirectGpuEngine] Vulkan unavailable: {vulkan.InitializationFailure}");
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[DirectGpuEngine] Vulkan backend creation failed: {ex.Message}");
+        }
         return null;
     }
 
@@ -896,7 +927,7 @@ public sealed class DirectGpuEngine : IDisposable
         out T[]? result)
     {
         result = null;
-        if (_backend is not CudaBackend cuda || operations == null || operations.Count != 3)
+        if (_backend is not IFusedResidualBatchNormRelu fused || operations == null || operations.Count != 3)
             return false;
         if (operations[0].OperationType != GpuOperationType.Residual ||
             operations[1].OperationType != GpuOperationType.BatchNorm ||
@@ -932,6 +963,7 @@ public sealed class DirectGpuEngine : IDisposable
         if (!(epsilon > 0f) || float.IsNaN(epsilon) || float.IsInfinity(epsilon))
             return false;
 
+        var cuda = _backend;
         using var inputBuffer = cuda.AllocateBuffer(ToFloatArray(input));
         using var residualBuffer = cuda.AllocateBuffer(ToFloatArray(residual));
         using var outputBuffer = cuda.AllocateBuffer((int)elementCount);
@@ -939,7 +971,7 @@ public sealed class DirectGpuEngine : IDisposable
         using var betaBuffer = cuda.AllocateBuffer(ToFloatArray(beta));
         using var meanBuffer = cuda.AllocateBuffer(ToFloatArray(runningMean));
         using var varianceBuffer = cuda.AllocateBuffer(ToFloatArray(runningVariance));
-        if (!cuda.TryResidualBatchNormRelu(
+        if (!fused.TryResidualBatchNormRelu(
                 inputBuffer, residualBuffer, outputBuffer,
                 gammaBuffer, betaBuffer, meanBuffer, varianceBuffer,
                 batch, channels, spatialSize, epsilon))
@@ -1337,7 +1369,7 @@ public sealed class DirectGpuEngine : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _backend?.Dispose();
+        if (!_borrowsBackend) _backend?.Dispose();
         _disposed = true;
     }
 }

@@ -40,7 +40,6 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// null so IDirectGpuBackend's mixed-precision discovery surface
     /// (Issue #337) correctly reports the capability as absent.
     /// </summary>
-    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
     private readonly WebGpuDevice _device;
     private readonly WebGpuShaderModule _shaderLibrary;
@@ -178,6 +177,22 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
         webGpuBuffer.CopyBytesFrom(bytes);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.WebGpu);
+    }
+
+    /// <inheritdoc/>
+    public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    {
+        ThrowIfNotInitialized();
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (buffer is not WebGpuBuffer webGpuBuffer)
+            throw new ArgumentException("Buffer is not a WebGpuBuffer.", nameof(buffer));
+        if (data.Length > webGpuBuffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({webGpuBuffer.Size}).", nameof(data));
+        if (data.Length == 0) return;
+        var bytes = new byte[data.Length * sizeof(float)];
+        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+        webGpuBuffer.CopyBytesFrom(bytes);
+        GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.WebGpu);
     }
 
     /// <param name="elementCount">Number of float elements.</param>

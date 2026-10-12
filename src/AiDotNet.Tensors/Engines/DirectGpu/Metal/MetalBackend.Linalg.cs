@@ -7,6 +7,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend : ILinalgBackend
 {
+    /// <inheritdoc/>
+    /// <remarks>The linalg module is compiled with the backend; a rejected compile leaves it unset.</remarks>
+    public bool LinalgKernelsReady => _linalgLibrary != IntPtr.Zero;
+
+    /// <inheritdoc/>
+    /// <remarks>The Eigh kernel provisions 64 x 64 workgroup arrays.</remarks>
+    public int LinalgEighMaxN => 64;
+
     private const string LinalgLibName = "Linalg";
 
     private MetalPipelineState GetLinalgPipeline(string kernelName)
@@ -81,32 +89,13 @@ public sealed partial class MetalBackend : ILinalgBackend
             new MTLSize(tpg, 1, 1));
     }
 
+    /// <summary>Householder, as the CPU and torch.linalg.qr: Gram-Schmidt would force R's diagonal positive (#1142).</summary>
     public void LinalgQrReduced(
         IGpuBuffer input, IGpuBuffer q, IGpuBuffer r,
         int batchCount, int m, int n)
     {
         ThrowIfDisposed();
-        if (batchCount <= 0 || m <= 0 || n <= 0) return;
-        if (input is not MetalGpuBuffer inBuf || q is not MetalGpuBuffer qBuf || r is not MetalGpuBuffer rBuf)
-            throw new ArgumentException("Buffers must be MetalGpuBuffer");
-
-        var pipeline = GetLinalgPipeline("parity211_qr_reduced");
-        uint tpg = LinalgThreadsPerGroup(Math.Max(m, n));
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(inBuf, 0);
-        encoder.SetBuffer(qBuf, 1);
-        encoder.SetBuffer(rBuf, 2);
-        encoder.SetBytes(batchCount, 3);
-        encoder.SetBytes(m, 4);
-        encoder.SetBytes(n, 5);
-        // Slot 0: one threadgroup float (sScalar) used by the MGS reduction.
-        // The per-kernel partials[1024] array is statically sized so it
-        // needs no explicit binding.
-        encoder.SetThreadgroupMemoryLength(16, 0);
-        encoder.DispatchThreadgroups(
-            new MTLSize((uint)batchCount, 1, 1),
-            new MTLSize(tpg, 1, 1));
+        PortableExtendedLinalg.QrReduced(this, LaunchBatch, input, q, r, batchCount, m, n);
     }
 
     public void LinalgEigh(

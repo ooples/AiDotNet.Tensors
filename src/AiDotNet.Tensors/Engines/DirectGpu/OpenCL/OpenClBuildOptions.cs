@@ -27,6 +27,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public const string PreciseMathFlags = "-cl-mad-enable";
 
         /// <summary>
+        /// No relaxation at all: IEEE NaN / infinity / signed-zero semantics and no mad contraction. For kernels that must
+        /// agree with a double CPU reference on every edge value (signbit(-0), NaN propagation, double-double products).
+        /// </summary>
+        public const string StrictMathFlags = "";
+
+        /// <summary>
         /// Opt-in precise-math mode. When true, kernels compile WITHOUT the aggressive
         /// fast-math flags, so transcendental/reduction results agree far more closely with
         /// the CPU engine (at a performance cost). Default off. Enable via the

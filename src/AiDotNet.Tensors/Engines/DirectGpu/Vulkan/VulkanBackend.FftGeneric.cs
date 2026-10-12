@@ -11,6 +11,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// </remarks>
 public sealed unsafe partial class VulkanBackend : IGenericFftBackend
 {
+    /// <remarks>Vulkan keeps its power-of-two FFT kernel.</remarks>
+    bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
+
     private const int MaximumGenericFftLength = 1 << 29;
 
     private readonly object _fftGenericLock = new object();

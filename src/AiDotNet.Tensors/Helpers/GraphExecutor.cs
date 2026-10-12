@@ -301,7 +301,9 @@ public sealed class GraphExecutor<T> : IDisposable
     /// </summary>
     private static void CopyAndReturn(Tensor<T> result, Tensor<T> output)
     {
-        result.AsSpan().Slice(0, Math.Min(result.Length, output.Length)).CopyTo(output.AsWritableSpan());
+        using var resultKeep1 = new KeepAliveScope(result);
+        using var outputKeep1 = new KeepAliveScope(output);
+        result.AsSpanUnmarked().Slice(0, Math.Min(result.Length, output.Length)).CopyTo(output.AsWritableSpanUnmarked());
         TensorAllocator.Return(result);
     }
 
@@ -311,7 +313,8 @@ public sealed class GraphExecutor<T> : IDisposable
             return cached;
         var t = new Tensor<T>(new[] { size });
         var numOps = MathHelper.GetNumericOperations<T>();
-        var span = t.AsWritableSpan();
+        using var spanLease = t.LeaseWritable();
+        var span = spanLease.Span;
         for (int i = 0; i < size; i++)
             span[i] = numOps.One;
         _cachedOnes[size] = t;

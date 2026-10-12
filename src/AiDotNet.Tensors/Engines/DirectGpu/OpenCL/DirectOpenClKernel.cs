@@ -126,6 +126,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void SetArg(uint index, ulong value)
             => Stage(this, index).Add(new PendingArg(index, ArgKind.UInt64, unchecked((long)value)));
 
+        /// <summary>A <c>double</c> kernel argument: its 8 bytes travel as the 64-bit raw value.</summary>
+        public void SetArg(uint index, double value)
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.UInt64, BitConverter.DoubleToInt64Bits(value)));
+
         /// <summary>
         /// Sets a local memory argument (for shared memory allocation).
         /// </summary>
