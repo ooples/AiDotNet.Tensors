@@ -20,7 +20,7 @@ public static class BatchExecutionKernels
     /// The IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C so OpenCL runs the same
     /// code HIP and Metal run: kernel qualifiers, global pointers, the thread index and the float builtins.
     /// </summary>
-    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.DecodeLinearSource);
+    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.DecodeLinearSource + K.DirectConvSource);
 
     private static string TranslateSolvers(string cuda)
     {
@@ -265,7 +265,7 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             K.FaLse, K.FaOut, K.FaDelta, K.FaDq, K.FaDk, K.FaDv,
             K.LstmGates, K.LstmCell, K.LstmCellBackward, K.LstmHiddenBackward, K.LstmInputGrad, K.LstmWeightIhGrad,
             K.LstmWeightHhGrad, K.LstmBiasGrad,
-            K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue
+            K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue, K.DcConv2dDirectFp16Hw
         };
     }
 }

@@ -6819,7 +6819,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     // #671: the tiny-spatial deep convs (N <= Fp16ConvTinyGemmN) that the im2col+GEMM path skips run
                     // through the DIRECT FP16 conv (no im2col materialization) for FP16-consistent numerics on the
-                    // small convs. CUDA-first; parity for the other backends is a tracked follow-up. Weights reuse the
+                    // small convs. Every backend reports the capability (#682). Weights reuse the
                     // same cached FP16 copy ([outC,inC,kh,kw] layout); input stays FP32 (rounded to FP16 in-kernel).
                     var wHalfDirect = GetOrCacheFp16Weights(rbk, bufK.Buffer, gemmM * gemmK);
                     // #3 FP16-act: the direct conv takes an FP32 input (rounds to FP16 in-kernel). When the activation

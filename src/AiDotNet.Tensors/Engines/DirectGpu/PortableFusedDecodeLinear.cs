@@ -41,7 +41,7 @@ internal static class PortableFusedDecodeLinear
     /// A buffer that ends mid-word is copied into a padded scratch (the extra bytes are never used: every element is
     /// masked out of its word). Returns the buffer to bind and, through <paramref name="scratch"/>, what to dispose.
     /// </summary>
-    private static IGpuBuffer WholeWords(IDirectGpuBackend backend, IGpuBuffer buffer, long bytes, out IGpuBuffer? scratch)
+    internal static IGpuBuffer WholeWords(IDirectGpuBackend backend, IGpuBuffer buffer, long bytes, out IGpuBuffer? scratch)
     {
         long padded = (bytes + 3) / 4 * 4;
         if (buffer.SizeInBytes >= padded)

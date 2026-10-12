@@ -955,6 +955,65 @@ fn dl_half(word: i32, slot: i32) -> f32 {
     y[i] = dl_gelu(s);
 }");
 
+    // #682 direct FP16 convolution: a line-for-line port of BatchExecutionCudaKernels.DirectConvSource.
+    // dc_round_half is the DC_ROUND_HALF macro: the value a float has after rounding to FP16, ties to even, on its
+    // bit pattern.
+    private const string DcRoundHalf = @"
+fn dc_round_half(bits: i32) -> f32 {
+    var mag = bits & 2147483647;
+    let e = mag >> 23u;
+    var v = 0.0;
+    if (e == 255) {
+        v = bitcast<f32>(mag);
+    } else {
+        if (e < 113) {
+            var q = 0;
+            let s = 126 - e;
+            if (e != 0 && s <= 24) {
+                let whole = (mag & 8388607) | 8388608;
+                q = whole >> u32(s);
+                let rem = whole - (q << u32(s));
+                let tie = 1 << u32(s - 1);
+                if (rem > tie || (rem == tie && (q & 1) != 0)) { q = q + 1; }
+            }
+            v = f32(q) * 5.9604644775390625e-8;
+        } else {
+            mag = mag + 4095 + ((mag >> 13u) & 1);
+            mag = (mag >> 13u) << 13u;
+            if (mag >= 1199570944) { mag = 2139095040; }
+            v = bitcast<f32>(mag);
+        }
+    }
+    if (bits < 0) { v = -v; }
+    return v;
+}
+";
+
+    public static readonly string DcConv2dDirectFp16Hw = Shader(new[] { "r:inBits:i32", "r:wh:i32", "rw:y" },
+        "batch: i32, inC: i32, inH: i32, inW: i32, outC: i32, outH: i32, outW: i32, kH: i32, kW: i32, sH: i32, sW: i32, pH: i32, pW: i32, dH: i32, dW: i32",
+        DlHalf + DcRoundHalf + Main + @"
+    if (i >= p.batch * p.outC * p.outH * p.outW) { return; }
+    let r1 = i / p.outW; let ow = i - r1 * p.outW;
+    let r2 = r1 / p.outH; let oh = r1 - r2 * p.outH;
+    let b = r2 / p.outC; let oc = r2 - b * p.outC;
+    var acc = 0.0;
+    for (var ic = 0; ic < p.inC; ic++) {
+        for (var kh = 0; kh < p.kH; kh++) {
+            let ih = oh * p.sH - p.pH + kh * p.dH;
+            if (ih >= 0 && ih < p.inH) {
+                for (var kw = 0; kw < p.kW; kw++) {
+                    let iw = ow * p.sW - p.pW + kw * p.dW;
+                    if (iw >= 0 && iw < p.inW) {
+                        let wi = ((oc * p.inC + ic) * p.kH + kh) * p.kW + kw;
+                        acc += dc_round_half(inBits[((b * p.inC + ic) * p.inH + ih) * p.inW + iw]) * dl_half(wh[wi >> 1u], wi & 1);
+                    }
+                }
+            }
+        }
+    }
+    y[i] = acc;
+}");
+
     public static readonly string DlW8A8LinearGelu = Shader(
         new[] { "r:x8:i32", "r:w8:i32", "r:actScale", "r:wScales", "r:bias", "rw:y" }, "K: i32, N: i32", DlCommon + Main + @"
     let K = p.K;
@@ -1114,6 +1173,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.LstmWeightHhGrad] = LstmWeightHhGrad, [BatchExecutionCudaKernels.LstmBiasGrad] = LstmBiasGrad,
         [BatchExecutionCudaKernels.DlLinearGelu] = DlLinearGelu, [BatchExecutionCudaKernels.DlLinearGeluFp16] = DlLinearGeluFp16,
         [BatchExecutionCudaKernels.DlW8A8LinearGelu] = DlW8A8LinearGelu, [BatchExecutionCudaKernels.DlW8A8Epilogue] = DlW8A8Epilogue,
+        [BatchExecutionCudaKernels.DcConv2dDirectFp16Hw] = DcConv2dDirectFp16Hw,
     };
 }
 #endif

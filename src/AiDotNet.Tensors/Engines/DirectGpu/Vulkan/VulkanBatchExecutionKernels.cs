@@ -35,7 +35,7 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
     /// </summary>
     public static readonly IReadOnlyDictionary<string, string> Solvers = TranslateSolvers(
         BatchExecutionCudaKernels.SolverSource + BatchExecutionCudaKernels.AttentionSource + BatchExecutionCudaKernels.LstmSource
-        + BatchExecutionCudaKernels.DecodeLinearSource);
+        + BatchExecutionCudaKernels.DecodeLinearSource + BatchExecutionCudaKernels.DirectConvSource);
 
     private static Dictionary<string, string> TranslateSolvers(string cuda)
     {
