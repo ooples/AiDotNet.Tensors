@@ -59,6 +59,9 @@ internal interface IFp16ActivationBackend : IGpuBatchExecution
     /// <summary>The FP16 ConvertToFp16Native kernel; only after its capability reported true.</summary>
     void ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size);
 
+    /// <summary>The FP16 ConvertToFp32Native kernel; only after its capability reported true.</summary>
+    void ConvertToFp32Native(IGpuBuffer input, IGpuBuffer output, int size);
+
     /// <summary>The FP16 Conv2dDirectFp16Hw kernel; only after its capability reported true.</summary>
     void Conv2dDirectFp16Hw(IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW);
 
@@ -67,4 +70,7 @@ internal interface IFp16ActivationBackend : IGpuBatchExecution
 
     /// <summary>The FP16 GemmFp16HalfOut kernel; only after its capability reported true.</summary>
     void GemmFp16HalfOut(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer Chalf, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f);
+
+    /// <summary>Copies byteCount raw bytes device to device (FP16 buffers are byte-sized).</summary>
+    void CopyBufferDtoD(IGpuBuffer source, IGpuBuffer destination, long byteCount);
 }

@@ -501,6 +501,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>True when this engine's backend can capture and replay device graphs (CUDA graphs today).</summary>
     public bool SupportsInferenceGraphCapture => GetBackend() is IGpuGraphCapture capture && capture.SupportsGraphCapture;
 
+    // The resident in-place routes keep device addresses stable for graph replay; they run where graph capture does.
+    private static bool HasResidentReplayRoutes(IDirectGpuBackend backend) => backend is IGpuGraphCapture { SupportsGraphCapture: true };
+
     /// <summary>Records the GPU kernel launches issued by <paramref name="forward"/> into a CUDA graph and
     /// returns a replayable handle (IntPtr.Zero on failure / a non-capturable op — caller falls back to eager).
     /// Must be called inside a <see cref="EnterResidentCaptureScope"/> so the forward runs resident (capturable).</summary>
@@ -3274,7 +3277,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryLandResidentHalf(Tensor<Half> r, Tensor<Half> o)
     {
         if (r is null || o is null || o.Length == 0 || r.Length != o.Length) return false;
-        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
+        if (!TryGetBackend(out var backend) || backend is not IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cb) return false;
         if (!TryGetResidentFp16Buffer(r, backend, out var rBuf) || rBuf is null) return false;
         var oKey = o.GetBackingArrayForCacheLookupUnsafe();
         if (oKey is null) return false;
@@ -5357,7 +5360,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (b.Shape._dims[0] != n || b.Shape._dims[2] != h || b.Shape._dims[3] != w) return false;
         if (output.Shape._dims[0] != n || output.Shape._dims[1] != cA + cB
             || output.Shape._dims[2] != h || output.Shape._dims[3] != w) return false;
-        if (!TryGetBackend(out var be) || be is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
+        if (!TryGetBackend(out var be) || !HasResidentReplayRoutes(be) || be is not IGpuBatchExecution cb) return false;
         try
         {
             int spatial = h * w;
@@ -5680,7 +5683,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryBatchedMatMulResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
-        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
+        if (!TryGetBackend(out var backend) || !HasResidentReplayRoutes(backend) || backend is not IGpuBatchExecution cb) return false;
         int rank = a.Rank;
         // ND batched: equal rank ≥ 3, contiguous, matching leading (batch) dims, inner dims compatible (K).
         if (rank < 3 || b.Rank != rank || !a.IsContiguous || !b.IsContiguous) return false;
@@ -5831,8 +5834,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var gradBuf = GetOrCreateResidentBuffer(backend, gradTable, vocabSize * embeddingDim);
             if (gradBuf.Handle == System.IntPtr.Zero || gradBuf.Size < (long)vocabSize * embeddingDim) return null;
             // Capturable zero (cuMemsetD8Async); backend.Fill (cuMemsetD32) aborts capture (906). Scatter-ADD needs 0-init.
-            if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaEmbBe)
-                cudaEmbBe.MemsetBuffer(gradBuf, 0, (long)vocabSize * embeddingDim * sizeof(float));
+            if (backend is IDeviceZeroFill zeroEmb)
+                zeroEmb.ZeroBuffer(gradBuf, vocabSize * embeddingDim);
             else backend.Fill(gradBuf, 0f, vocabSize * embeddingDim);
             backend.EmbeddingBackward(gR, _cachedEmbIndexBuffer, gradBuf, numIndices, embeddingDim, vocabSize);
             ResidentSyncCheck("EmbeddingBackward");
@@ -5854,7 +5857,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int axisSize = input.Shape._dims[axis];
         int stride = 1; for (int i = axis + 1; i < input.Rank; i++) stride *= input.Shape._dims[i];
         if (index < 0 || index >= axisSize || (long)outerSize * stride != output.Length) return false;
-        if (backend is not Engines.DirectGpu.CUDA.CudaBackend cudaB) return false;   // SliceAxis is a CudaBackend op
+        if (!HasResidentReplayRoutes(backend) || backend is not IGpuBatchExecution cudaB) return false;
         try
         {
             using var bufIn = GetResidentOrPersistentInputBuffer(backend, input);
@@ -6670,7 +6673,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
             && a.Shape._dims[1] == b.Shape._dims[1]
             && (b.Shape._dims[0] == 1 || b.Shape._dims[0] == a.Shape._dims[0])
-            && TryGetBackend(out var beCh) && beCh is Engines.DirectGpu.CUDA.CudaBackend cbCh)
+            && TryGetBackend(out var beCh) && HasResidentReplayRoutes(beCh) && beCh is IGpuBatchExecution cbCh)
         {
             try
             {
@@ -6777,7 +6780,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && input.Rank == 4 && kernel.Rank == 4
             && output.GetBackingArrayForCacheLookupUnsafe() is not null
-            && TryGetBackend(out var rbk) && rbk is Engines.DirectGpu.CUDA.CudaBackend)
+            && TryGetBackend(out var rbk) && HasResidentReplayRoutes(rbk))
         {
             try
             {
@@ -6816,7 +6819,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         hbConvR.Im2colKNFp16(bufIn.Buffer, colHalf, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
                     var wHalf = GetOrCacheFp16Weights(rbk, bufK.Buffer, M * K); // FP16 weights, converted once + cached
                     // FP16-act: keep the conv OUTPUT FP16 (GemmFp16HalfOut) + tag, so the next op reads FP16 (no convert).
-                    if (Fp16ActEnabled && rbk is Engines.DirectGpu.CUDA.CudaBackend cbOut)
+                    if (Fp16ActEnabled && rbk is IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cbOut)
                     {
                         cbOut.GemmFp16HalfOut(wHalf, colHalf, outBuf, M, N, K);
                         ResidentSyncCheck("Conv2DInto");
@@ -7786,7 +7789,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (no host round-trip), so the resident path covers Swish/SiLU (the diffusion ResBlock time-MLP —
         // the first in-capture blocker), Sigmoid, Tanh, ELU, Mish, etc. — not just ReLU/GELU. An activation
         // ApplyGpuActivation doesn't support throws inside the try and cleanly falls back to the eager path.
-        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cb) return false;
+        if (!TryGetBackend(out var backend) || !HasResidentReplayRoutes(backend) || backend is not IGpuBatchExecution cb) return false;
         int K = weights.Shape._dims[0];   // input features
         int N = weights.Shape._dims[1];   // output features
         if (K <= 0 || N <= 0 || input.Length % K != 0) return false;
@@ -12582,7 +12585,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // through to the eager download path below. Numerically identical — same FlashAttentionV2 kernel.
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && attentionBias is null && query.IsContiguous && key.IsContiguous && value.IsContiguous
-            && backend is Engines.DirectGpu.CUDA.CudaBackend)
+            && HasResidentReplayRoutes(backend))
         {
             try
             {
@@ -21544,7 +21547,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                var cuda = backend as DirectGpu.CUDA.CudaBackend;
+                var cuda = backend as IFusedIndexKernels;
                 bool fused = cuda is not null && cuda.HasClassGatherKernels;
                 using var valuesBuffer = GetOrAllocateBuffer(backend, values.IsContiguous ? values : values.Contiguous());
                 using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
@@ -21553,9 +21556,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var classes = fused ? null : new DeviceFloatIds(backend, rows);
                 var result = DispatchDeferredGpuOp<T>(backend, rows, (int[])classIndices._shape.Clone(), output =>
                 {
-                    if (fused)
+                    if (fused && cuda is not null)
                     {
-                        cuda!.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
+                        cuda.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
                         return;
                     }
                     classes!.Normalize(classBuffer.Buffer);
@@ -21586,7 +21589,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                var cuda = backend as DirectGpu.CUDA.CudaBackend;
+                var cuda = backend as IFusedIndexKernels;
                 bool fused = cuda is not null && cuda.HasClassGatherKernels;
                 using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
                 using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
@@ -21603,9 +21606,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     if (!fused && ones is null) return base.ScatterClassValuesGrad(gradOutput, classIndices, valuesShape);
                     return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
                     {
-                        if (fused)
+                        if (fused && cuda is not null)
                         {
-                            cuda!.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
+                            cuda.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
                             return;
                         }
                         classes!.Normalize(classBuffer.Buffer);
@@ -23045,7 +23048,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // numerically identical; tape training still records via the eager path below.
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && input.Rank == 4 && kernel.Rank == 4 && !IsTapeActive<T>()
-            && input.IsContiguous && backend is Engines.DirectGpu.CUDA.CudaBackend rbkT)
+            && input.IsContiguous && HasResidentReplayRoutes(backend) && backend is IGpuBatchExecution rbkT)
         {
             try
             {
@@ -24567,7 +24570,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && a.Rank == 4 && b.Rank == 4 && a.IsContiguous && b.IsContiguous
             && b.Shape._dims[0] == 1 && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
             && a.Shape._dims[1] == b.Shape._dims[1]
-            && TryGetBackend(out var beCh) && beCh is Engines.DirectGpu.CUDA.CudaBackend cbCh)
+            && TryGetBackend(out var beCh) && HasResidentReplayRoutes(beCh) && beCh is IGpuBatchExecution cbCh)
         {
             try
             {
@@ -25372,11 +25375,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int d = 0; d < axis; d++) outerCount *= destination.Shape._dims[d];
                     int axisSize = destination.Shape._dims[axis];
                     var dstBuf = GetOrCreateResidentBuffer(backend, destination, destination.Length);
-                    if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaBe
+                    if (HasResidentReplayRoutes(backend) && backend is IGpuBatchExecution cudaBe && backend is IDeviceZeroFill zeroSlice
                         && dstBuf.Handle != System.IntPtr.Zero && dstBuf.Size >= destination.Length)
                     {
                         // Capturable zero (cuMemsetD8Async) — backend.Fill is cuMemsetD32 which aborts capture (906).
-                        cudaBe.MemsetBuffer(dstBuf, 0, (long)destination.Length * sizeof(float));
+                        zeroSlice.ZeroBuffer(dstBuf, destination.Length);
                         cudaBe.SetSliceAxis(dstBuf, srcR, outerCount, axisSize, stride, index);
                         ResidentSyncCheck("SetSliceAxisResident");
                         BindResidentBuffer(destination, dstBuf, backend);
@@ -26449,7 +26452,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     private static IGpuBuffer AllocateStreamOrderedScratch(IDirectGpuBackend backend, int size) =>
-        backend is DirectGpu.CUDA.CudaBackend cuda
+        backend is IStreamOrderedScratch cuda
             ? cuda.AllocateStreamOrderedScratchBuffer(size)
             : backend.AllocateBuffer(size);
 

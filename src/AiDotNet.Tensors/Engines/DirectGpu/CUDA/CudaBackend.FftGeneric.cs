@@ -8,6 +8,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend : IGenericFftBackend
 {
+    /// <remarks>The generic path is the only FFT route on CUDA.</remarks>
+    bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => true;
+
     bool IGenericFftBackend.SupportsFftElementType(FftElementType type) => SupportsFftElementType(type);
 
     void IGenericFftBackend.ConvertFloatToFftStorage(IGpuBuffer source, IGpuBuffer destination, int count, FftElementType type)

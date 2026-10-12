@@ -53,6 +53,9 @@ public sealed unsafe partial class VulkanBackend : IFp16ActivationBackend
     void IFp16ActivationBackend.ConvertToFp16Native(IGpuBuffer input, IGpuBuffer output, int size)
         => throw NoFp16Activations(nameof(IFp16ActivationBackend.ConvertToFp16Native));
 
+    void IFp16ActivationBackend.ConvertToFp32Native(IGpuBuffer input, IGpuBuffer output, int size)
+        => throw NoFp16Activations(nameof(IFp16ActivationBackend.ConvertToFp32Native));
+
     void IFp16ActivationBackend.Conv2dDirectFp16Hw(IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => throw NoFp16Activations(nameof(IFp16ActivationBackend.Conv2dDirectFp16Hw));
 
@@ -61,4 +64,7 @@ public sealed unsafe partial class VulkanBackend : IFp16ActivationBackend
 
     void IFp16ActivationBackend.GemmFp16HalfOut(IGpuBuffer Ahalf, IGpuBuffer Bhalf, IGpuBuffer Chalf, int M, int N, int K, float alpha, float beta)
         => throw NoFp16Activations(nameof(IFp16ActivationBackend.GemmFp16HalfOut));
+
+    void IFp16ActivationBackend.CopyBufferDtoD(IGpuBuffer source, IGpuBuffer destination, long byteCount)
+        => throw NoFp16Activations(nameof(IFp16ActivationBackend.CopyBufferDtoD));
 }
