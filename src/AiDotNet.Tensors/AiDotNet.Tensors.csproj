@@ -83,6 +83,9 @@
     <InternalsVisibleTo Include="AiDotNet.Tensors.Autotune.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Benchmarks" />
     <InternalsVisibleTo Include="OptBench" />
+    <!-- tools/ConvParallelProbe (the gemm-bench CI job builds it): it reads tensors' backing arrays, which are
+         internal since undisposed result buffers are recycled (#1118). -->
+    <InternalsVisibleTo Include="ConvParallelProbe" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Onnx" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Onnx.Tests" />
     <InternalsVisibleTo Include="HarmonicEngine" />
