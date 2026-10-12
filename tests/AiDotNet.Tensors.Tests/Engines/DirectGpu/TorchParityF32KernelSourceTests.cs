@@ -20,12 +20,12 @@ public sealed class TorchParityF32KernelSourceTests
     {
         string source = TorchParityF32Kernels.GetSource();
         var kernels = Regex.Matches(source, @"__global__ __launch_bounds__\(256\) void (\w+)\(", RegexOptions.None, Timeout)
-            .Select(m => m.Groups[1].Value).ToHashSet(StringComparer.Ordinal);
+            .Cast<Match>().Select(m => m.Groups[1].Value).Distinct(StringComparer.Ordinal).ToArray();
         var helpers = Regex.Matches(source, @"__device__ __forceinline__ (?:unsigned int|\w+) (\w+)\(", RegexOptions.None, Timeout)
-            .Select(m => m.Groups[1].Value).ToHashSet(StringComparer.Ordinal);
-        Assert.True(kernels.Count > 50, $"only {kernels.Count} kernels parsed");
-        Assert.True(helpers.Count > 50, $"only {helpers.Count} helpers parsed");
-        var clashes = helpers.Intersect(kernels).OrderBy(n => n, StringComparer.Ordinal).ToArray();
+            .Cast<Match>().Select(m => m.Groups[1].Value).Distinct(StringComparer.Ordinal).ToArray();
+        Assert.True(kernels.Length > 50, $"only {kernels.Length} kernels parsed");
+        Assert.True(helpers.Length > 50, $"only {helpers.Length} helpers parsed");
+        var clashes = helpers.Intersect(kernels, StringComparer.Ordinal).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Assert.True(clashes.Length == 0, "helpers named like kernels: " + string.Join(", ", clashes));
     }
 
