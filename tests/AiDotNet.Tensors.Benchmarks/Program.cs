@@ -1478,6 +1478,9 @@ class Program
 
         if (args[0] == "--vulkan-engine-ops")
         {
+            // VKENGINE_NO_MISS_COLLECT=1 answers "a tape is open", which turns the collection on a pool miss off.
+            if (Environment.GetEnvironmentVariable("VKENGINE_NO_MISS_COLLECT") == "1")
+                AiDotNet.Tensors.Engines.DirectGpu.DeviceMemoryReclaim.TapeOpen = () => true;
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
             if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
             AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
