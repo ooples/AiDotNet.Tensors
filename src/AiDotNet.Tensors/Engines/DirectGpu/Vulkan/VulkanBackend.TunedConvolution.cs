@@ -51,7 +51,9 @@ void main()
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("vulkan.conv2d.direct", TunedKernelOrigin.Builtin, true,
                             _ => true, (in TunedConv2DArgs a) => Conv2DDirectReference(a)),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("vulkan.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
-                            shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedPipeline(Im2ColShader, 2, 14 * sizeof(uint)),
+                            shape => TunedConv2DArgs.GemmScratchFits(shape)
+                                && FitsDispatch((long)shape[0] * shape[13] * shape[14], 256)
+                                && HasTunedPipeline(Im2ColShader, 2, 14 * sizeof(uint)),
                             (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
                     };
                     foreach (int tile in VulkanTunedRowKernels.ConvChannelTiles)
@@ -61,7 +63,9 @@ void main()
                         candidates.Add(new DelegateTunedKernelCandidate<TunedConv2DArgs>("generated.conv2d.channels" + t,
                             TunedKernelOrigin.Generated, true,
                             // shape[4] is the output channel count: a tile wider than it has nothing to share.
-                            shape => shape[4] >= t && HasTunedPipeline(source, 3, 15 * sizeof(uint)),
+                            shape => shape[4] >= t
+                                && FitsDispatch((long)shape[0] * ((shape[4] + t - 1) / t) * shape[13] * shape[14], VulkanTunedRowKernels.GroupSize)
+                                && HasTunedPipeline(source, 3, 15 * sizeof(uint)),
                             (in TunedConv2DArgs a) => Conv2DChannelTile(source, t, a)));
                     }
                     _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,

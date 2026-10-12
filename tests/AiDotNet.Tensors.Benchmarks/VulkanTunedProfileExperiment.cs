@@ -33,17 +33,42 @@ internal static class VulkanTunedProfileExperiment
     public static void Run(string[] args)
     {
         string? output = args.Length > 0 ? args[0] : null;
-        int rounds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 5;
+        int rounds = 5;
+        if (args.Length > 1 && (!int.TryParse(args[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out rounds) || rounds <= 0))
+        {
+            Console.Error.WriteLine($"rounds must be a positive integer, got '{args[1]}'.");
+            Environment.ExitCode = 2;
+            return;
+        }
 
         var backend = VulkanBackend.Instance;
         if (!backend.Initialize() || !backend.IsGlslCompilerAvailable)
         {
             Console.WriteLine("No Vulkan device with the runtime GLSL compiler.");
+            Environment.ExitCode = 1;
             return;
         }
+        // The policy is process-wide: restore it for whatever runs next in this process.
+        var previousMode = TunedKernelPolicy.ModeOverride;
+        bool previousPersist = TunedKernelPolicy.PersistDecisions;
+        double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
         TunedKernelPolicy.BudgetMilliseconds = double.MaxValue;
+        try
+        {
+            Tune(backend, output, rounds);
+        }
+        finally
+        {
+            TunedKernelPolicy.ModeOverride = previousMode;
+            TunedKernelPolicy.PersistDecisions = previousPersist;
+            TunedKernelPolicy.BudgetMilliseconds = previousBudget;
+        }
+    }
+
+    private static void Tune(VulkanBackend backend, string? output, int rounds)
+    {
         Console.WriteLine($"device {backend.TunedDeviceKey}; clock {(backend.TunedKernelTimingUsesDeviceClock ? "device timestamps" : "host")}; rounds {rounds}");
 
         // (op, shape) -> the decision of each round

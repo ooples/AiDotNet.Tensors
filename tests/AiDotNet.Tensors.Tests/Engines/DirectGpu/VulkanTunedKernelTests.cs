@@ -682,9 +682,20 @@ public sealed class VulkanTunedKernelTests
         double one = Median(1), sixteen = Median(16);
         Assert.True(one > 0, $"one run measured {one} ms");
         Assert.True(sixteen > 4 * one, $"16 runs measured {sixteen} ms against {one} ms for one");
-        // The RTX-class devices this runs on expose timestamp queries; a device without them times on the host clock.
-        if (backend.TunedKernelTimingUsesDeviceClock)
-            Assert.True(sixteen < 60_000, "device timestamps are in milliseconds");
+        // Units: the measured interval lies inside the host-observed wall time of the same call (it cannot exceed it,
+        // and per-submit host overhead is far below 1000x the work), so a wrong timestampPeriod scaling (ns read as
+        // ms, or ticks unscaled) falls outside. Holds on either clock; medians absorb one disturbed sample.
+        var ratios = new double[7];
+        for (int i = 0; i < ratios.Length; i++)
+        {
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            double measured = backend.MeasureTunedKernelMilliseconds(Run, 16);
+            ratios[i] = measured / watch.Elapsed.TotalMilliseconds;
+        }
+        Array.Sort(ratios);
+        double ratio = ratios[ratios.Length / 2];
+        Assert.True(ratio > 1e-3 && ratio <= 1.05,
+            $"measured / host wall time = {ratio:G4} on the {(backend.TunedKernelTimingUsesDeviceClock ? "device" : "host")} clock");
     }
 
     [SkippableFact]

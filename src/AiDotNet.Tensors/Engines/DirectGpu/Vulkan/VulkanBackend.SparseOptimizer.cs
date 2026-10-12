@@ -16,9 +16,17 @@ public sealed unsafe partial class VulkanBackend
             (state2 is not null && state2.Size < param.Size) ||
             (state3 is not null && state3.Size < param.Size))
             throw new ArgumentException("Sparse optimizer state buffers must be at least as large as the parameter buffer.");
+        int required = SparseStateBufferCount(operation);
+        string? missing = required >= 1 && state1 is null ? nameof(state1)
+            : required >= 2 && state2 is null ? nameof(state2)
+            : required >= 3 && state3 is null ? nameof(state3)
+            : null;
+        if (missing is not null)
+            throw new ArgumentNullException(missing, $"Sparse optimizer operation {operation} needs {required} state buffer(s).");
         if (nnz == 0) return;
 
-        // An optimizer that keeps fewer than three state buffers leaves the others' bindings untouched.
+        // An optimizer that keeps fewer than three state buffers leaves the others' bindings untouched: the shared
+        // placeholder is bound only past the operation's required count, which the shader never indexes.
         var unused = UnusedBinding;
         GlslNaryOp(VulkanOptimizerKernels.Sparse,
             new[] { param, state1 ?? unused, state2 ?? unused, state3 ?? unused, sparseIndices, sparseValues },
@@ -125,6 +133,15 @@ public sealed unsafe partial class VulkanBackend
         => DispatchSparseOptimizer(param, null, null, null, sparseIndices, sparseValues,
             nnz, 13, 0, learningRate, l1Strength, 0f, 0f, 0f);
 
+    // State buffers each operation of VulkanOptimizerKernels.Sparse reads and writes (state1, state2, state3 in order).
+    private static int SparseStateBufferCount(int operation) => operation switch
+    {
+        0 or 13 => 0,                     // SGD, proximal L1
+        1 or 4 or 5 or 6 or 10 => 1,      // momentum, RMSprop, Adagrad, NAG, Lion
+        2 or 3 or 7 or 9 or 11 or 12 => 2, // Adam, AdamW, Adadelta, Adamax, Nadam, FTRL
+        8 => 3,                           // AMSGrad
+        _ => throw new ArgumentOutOfRangeException(nameof(operation)),
+    };
     private static void ValidateSparseBiasCorrected(int step, float epsilon)
     {
         if (step < 1) throw new ArgumentOutOfRangeException(nameof(step));

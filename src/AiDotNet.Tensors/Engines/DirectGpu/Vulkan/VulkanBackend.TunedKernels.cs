@@ -48,6 +48,9 @@ public sealed unsafe partial class VulkanBackend
     /// </summary>
     internal double MeasureTunedKernelMilliseconds(Action run, int repetitions)
     {
+        // Tuning expects a quiet queue: each run is its own submit, so work another thread submits between the two
+        // timestamps lands inside the interval. The gate takes the median over paired reference/candidate samples,
+        // which bounds a burst's effect on the decision without removing it.
         // Its own lock: gates of different slots tuning concurrently would otherwise overwrite each other's queries.
         // Nothing acquires a slot lock while holding it (run launches a candidate kernel), so the order
         // slot lock -> this lock is safe.
@@ -146,6 +149,10 @@ public sealed unsafe partial class VulkanBackend
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _tunedPipelineAvailable =
         new(StringComparer.Ordinal);
 
+    // Dispatches are one-dimensional: a variant whose workgroup count exceeds the device's X limit cannot launch.
+    private bool FitsDispatch(long invocations, int groupSize) =>
+        (invocations + groupSize - 1) / groupSize <= _device.Limits.maxComputeWorkGroupCountX;
+
     private bool HasTunedPipeline(string source, int bindings, uint pushSize)
     {
         if (_tunedPipelineAvailable.TryGetValue(source, out bool known)) return known;
@@ -204,7 +211,8 @@ public sealed unsafe partial class VulkanBackend
                         string source = VulkanTunedRowKernels.Softmax(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxArgs>("generated.softmax.lanes" + l,
                             TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 2, 2 * sizeof(uint)),
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1])
+                                && FitsDispatch((long)shape[0] * l, VulkanTunedRowKernels.GroupSize) && HasTunedPipeline(source, 2, 2 * sizeof(uint)),
                             (in TunedSoftmaxArgs a) => GlslNaryOp(source, new[] { a.Input, a.Output }, RowThreads(a.Rows, l), Push(a.Rows, a.N))));
                     }
                     _softmaxSlot = new TunedKernelSlot<TunedSoftmaxArgs>(TunedKernelOp.Softmax, TunedDeviceKey,
@@ -237,7 +245,8 @@ public sealed unsafe partial class VulkanBackend
                         string source = VulkanTunedRowKernels.SoftmaxBackward(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxBackwardArgs>("generated.softmax_backward.lanes" + l,
                             TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 3, 2 * sizeof(uint)),
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1])
+                                && FitsDispatch((long)shape[0] * l, VulkanTunedRowKernels.GroupSize) && HasTunedPipeline(source, 3, 2 * sizeof(uint)),
                             (in TunedSoftmaxBackwardArgs a) => GlslNaryOp(source, new[] { a.GradOutput, a.Output, a.GradInput },
                                 RowThreads(a.Rows, l), Push(a.Rows, a.N))));
                     }
@@ -273,7 +282,8 @@ public sealed unsafe partial class VulkanBackend
                         string source = VulkanTunedRowKernels.LayerNorm(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedLayerNormArgs>("generated.layernorm_forward.lanes" + l,
                             TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 6, 3 * sizeof(uint)),
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1])
+                                && FitsDispatch((long)shape[0] * l, VulkanTunedRowKernels.GroupSize) && HasTunedPipeline(source, 6, 3 * sizeof(uint)),
                             (in TunedLayerNormArgs a) => GlslNaryOp(source,
                                 new[] { a.Input, a.Output, a.Gamma, a.Beta, a.SaveMean, a.SaveInvVar }, RowThreads(a.Rows, l),
                                 new[] { unchecked((uint)a.Rows), unchecked((uint)a.N), FloatBits(a.Epsilon) })));
@@ -309,7 +319,8 @@ public sealed unsafe partial class VulkanBackend
                         string source = VulkanTunedRowKernels.LayerNormBackward(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>("generated.layernorm_backward.lanes" + l,
                             TunedKernelOrigin.Generated, true,
-                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1]) && HasTunedPipeline(source, 6, 2 * sizeof(uint)),
+                            shape => VulkanTunedRowKernels.RowLanesFit(l, shape[0], shape[1])
+                                && FitsDispatch((long)shape[0] * l, VulkanTunedRowKernels.GroupSize) && HasTunedPipeline(source, 6, 2 * sizeof(uint)),
                             (in TunedNormBackwardArgs a) => GlslNaryOp(source,
                                 new[] { a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0 },
                                 RowThreads(a.Rows, l), Push(a.Rows, a.N))));
@@ -359,7 +370,9 @@ public sealed unsafe partial class VulkanBackend
             string source = rms ? VulkanTunedRowKernels.RmsNormGradGamma(r) : VulkanTunedRowKernels.LayerNormGradParams(r);
             candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>(
                 (rms ? "generated.rmsnorm_grad_gamma.rows" : "generated.layernorm_grad_params.rows") + r,
-                TunedKernelOrigin.Generated, true, _ => HasTunedPipeline(source, rms ? 4 : 6, 2 * sizeof(uint)),
+                TunedKernelOrigin.Generated, true,
+                // One workgroup per 32-column tile.
+                shape => FitsDispatch((shape[1] + 31L) / 32, 1) && HasTunedPipeline(source, rms ? 4 : 6, 2 * sizeof(uint)),
                 (in TunedNormBackwardArgs a) =>
                 {
                     // One workgroup of 32 * R invocations per 32-column tile.
