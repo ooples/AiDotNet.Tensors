@@ -298,14 +298,14 @@ void main() {
         int kernelH, int kernelW, int strideH, int strideW)
     {
         EnsureInitialized();
-        using var biasDummy = bias is null ? AllocateBuffer(Math.Max(1, outChannels)) : null;
-        if (biasDummy is not null) Fill(biasDummy, 0f, outChannels);
         int total = checked(checked(batch * outChannels) * checked(outHeight * outWidth));
         var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
             (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
             (uint)strideH, (uint)strideW };
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2D, pc, total,
-            input, weights, bias ?? biasDummy!, output);
+        if (bias is null)
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2DNoBias, pc, total, input, weights, output);
+        else
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.LocallyConnectedConv2D, pc, total, input, weights, bias, output);
     }
 
     public void LocallyConnectedConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer gradInput,
@@ -395,16 +395,15 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
-        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
-        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
-        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
         int total = checked(checked(batch * outChannels) * outHeight * outWidth);
         var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
             (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
             (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
             (uint)groups, (uint)deformGroups };
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2D, pc, total,
-            input, weights, offsets, mask ?? maskDummy!, output);
+        if (mask is null)
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DNoMask, pc, total, input, weights, offsets, output);
+        else
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2D, pc, total, input, weights, offsets, mask, output);
     }
 
     public void DeformableConv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradInput,
@@ -415,16 +414,15 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
-        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
-        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
-        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
         int total = checked(checked(batch * inChannels) * inHeight * inWidth);
         var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
             (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
             (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
             (uint)groups, (uint)deformGroups };
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInput, pc, total,
-            gradOutput, weights, offsets, mask ?? maskDummy!, gradInput);
+        if (mask is null)
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInputNoMask, pc, total, gradOutput, weights, offsets, gradInput);
+        else
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardInput, pc, total, gradOutput, weights, offsets, mask, gradInput);
     }
 
     public void DeformableConv2DBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradWeights,
@@ -435,16 +433,15 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
-        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
-        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
-        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
         int total = checked(checked(outChannels * (inChannels / groups)) * kernelH * kernelW);
         var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
             (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
             (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
             (uint)groups, (uint)deformGroups };
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeights, pc, total,
-            gradOutput, input, offsets, mask ?? maskDummy!, gradWeights);
+        if (mask is null)
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeightsNoMask, pc, total, gradOutput, input, offsets, gradWeights);
+        else
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardWeights, pc, total, gradOutput, input, offsets, mask, gradWeights);
     }
 
     public void DeformableConv2DBackwardOffset(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer? mask, IGpuBuffer gradOffsets,
@@ -455,16 +452,15 @@ void main() {
         int dilationH, int dilationW, int groups, int deformGroups)
     {
         ValidateDeformableGroups(inChannels, outChannels, groups, deformGroups);
-        int maskSize = checked(checked(checked(batch * deformGroups) * kernelH * kernelW) * outHeight * outWidth);
-        using var maskDummy = mask is null ? AllocateBuffer(Math.Max(1, maskSize)) : null;
-        if (maskDummy is not null) Fill(maskDummy, 1f, maskSize);
         int total = checked(checked(checked(batch * deformGroups) * 2 * kernelH * kernelW) * outHeight * outWidth);
         var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
             (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
             (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
             (uint)groups, (uint)deformGroups };
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffset, pc, total,
-            gradOutput, input, weights, offsets, mask ?? maskDummy!, gradOffsets);
+        if (mask is null)
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffsetNoMask, pc, total, gradOutput, input, weights, offsets, gradOffsets);
+        else
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.DeformableConv2DBackwardOffset, pc, total, gradOutput, input, weights, offsets, mask, gradOffsets);
     }
 
     public void DeformableConv2DBackwardMask(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weights, IGpuBuffer offsets, IGpuBuffer gradMask,
@@ -496,12 +492,13 @@ void main() {
     {
         EnsureInitialized();
         int total = checked(checked(batch * channels) * outHeight * outWidth);
-        using var indicesDummy = indices is null ? AllocateBuffer(Math.Max(1, total)) : null;
         var pc = new uint[] { (uint)batch, (uint)channels, (uint)inHeight, (uint)inWidth,
             (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
             (uint)strideH, (uint)strideW, (uint)padH, (uint)padW };
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2D, pc, total,
-            input, output, indices ?? indicesDummy!);
+        if (indices is null)
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2DNoIndices, pc, total, input, output);
+        else
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool2D, pc, total, input, output, indices);
     }
 
     public void MaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
@@ -628,12 +625,13 @@ void main() {
     {
         EnsureInitialized();
         int total = checked(checked(checked(batch * channels) * outDepth) * outHeight * outWidth);
-        using var indicesDummy = indices is null ? AllocateBuffer(Math.Max(1, total)) : null;
         var pc = new uint[] { (uint)batch, (uint)channels, (uint)inDepth, (uint)inHeight, (uint)inWidth,
             (uint)outDepth, (uint)outHeight, (uint)outWidth,
             (uint)kernelD, (uint)kernelH, (uint)kernelW, (uint)strideD, (uint)strideH, (uint)strideW };
-        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3D, pc, total,
-            input, output, indices ?? indicesDummy!);
+        if (indices is null)
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3DNoIndices, pc, total, input, output);
+        else
+            TryDispatchConvPoolGlsl(VulkanConvPoolKernels.MaxPool3D, pc, total, input, output, indices);
     }
 
     public void MaxPool3DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
