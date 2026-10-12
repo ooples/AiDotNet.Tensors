@@ -13676,7 +13676,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     throw new InvalidOperationException("The persistent cache entry disappeared during replacement.");
                 replacement = null; // Ownership transferred to the persistent cache.
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("InvalidatePersistentTensor", capabilityGap);
+            // Cache maintenance, not a computation: the eager re-upload is an optimization, and whatever it fails on
+            // (allocation, synchronization, a missing kernel), the stale entry must go. The tensor's next GPU use
+            // uploads again, so a persistent device failure still reaches the caller there (#1165).
+            catch (Exception reuploadFailure) { GpuLaunchProbe.OnFallback("InvalidatePersistentTensor", reuploadFailure);
                 try { replacement?.Dispose(); }
                 finally
                 {
@@ -24116,7 +24119,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the gradient correctness test. Kernel now matches the
         // CpuEngine convention.
         if (IsTapeActive<T>()) return base.TensorUpsampleBilinear(input, outputSize);
-        if (!TryGetBackend(out var backend) || input.Rank != 4 || outputSize.Length < 2)
+        // An empty (or negative) output has no device buffer to allocate; the CPU implementation defines it.
+        if (!TryGetBackend(out var backend) || input.Rank != 4 || outputSize.Length < 2
+            || outputSize[0] <= 0 || outputSize[1] <= 0 || input.Length == 0)
             return base.TensorUpsampleBilinear(input, outputSize);
         try
         {

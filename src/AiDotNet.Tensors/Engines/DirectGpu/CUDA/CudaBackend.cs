@@ -5632,13 +5632,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 DirectPtxLinearWeightLayout.InputMajor))
             return;
 
-        // Map activation to fused kernel name
+        // Map activation to the CudaFusedKernels GEMM epilogue (compiled as gemm_bias[_<activation>]; the
+        // "fused_"-prefixed names this used to look up were never compiled, so every caller-stream launch failed).
         string kernelName = activation switch
         {
-            FusedActivationType.ReLU => "fused_gemm_bias_relu",
-            FusedActivationType.Sigmoid => "fused_gemm_bias_sigmoid",
-            FusedActivationType.Tanh => "fused_gemm_bias_tanh",
-            FusedActivationType.None => "fused_gemm_bias",
+            FusedActivationType.ReLU => "gemm_bias_relu",
+            FusedActivationType.Sigmoid => "gemm_bias_sigmoid",
+            FusedActivationType.Tanh => "gemm_bias_tanh",
+            FusedActivationType.None => "gemm_bias",
             _ => throw new NotSupportedException($"Activation type {activation} not supported for fused GEMM")
         };
 
