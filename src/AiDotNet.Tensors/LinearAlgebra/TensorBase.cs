@@ -141,7 +141,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// vector access; callers must treat the returned array as read-only.
     /// </summary>
     internal T[]? GetBackingArrayForCacheLookupUnsafe()
-        => _data.GetBackingArrayForReadOnlyAccess();
+        => _data.GetBackingArrayIdentity();   // identity for cache lookups; does not escape the array
 
     /// <summary>
     /// The no-upcast resident form of a streaming int8 weight (int8 + per-row scales). Non-null
@@ -1000,7 +1000,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Plain float-encoded buffers only (not split-complex planes or raw int32).
     /// </summary>
     internal Engines.DirectGpu.IGpuBuffer? VectorDeviceBuffer
-        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 ? buffer : null;
+        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64 ? buffer : null;
 
     internal Engines.DirectGpu.IDirectGpuBackend? VectorDeviceBackend => _data?._deviceState?.Backend;
 
@@ -1024,6 +1024,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     private int _viewGpuBufferVersion = -1;
     private bool _viewGpuBufferIsSplitComplex;
     private bool _viewGpuBufferContainsRawInt32;
+    private bool _viewGpuBufferContainsRawInt64;
 
     /// <summary>
     /// True when this tensor covers its whole data vector in the vector's own layout (contiguous, offset 0, same
@@ -1060,6 +1061,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             if (CoversWholeVector) _data.DeviceState.ContainsRawInt32 = value;
             else _viewGpuBufferContainsRawInt32 = value;
+        }
+    }
+
+    /// <summary>The device buffer holds raw int64 words (two per element), not floats (#1135).</summary>
+    internal bool _gpuBufferContainsRawInt64
+    {
+        get => CoversWholeVector ? _data._deviceState?.ContainsRawInt64 ?? false : _viewGpuBufferContainsRawInt64;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.ContainsRawInt64 = value;
+            else _viewGpuBufferContainsRawInt64 = value;
         }
     }
 
@@ -1365,6 +1377,79 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal int StorageMutationVersion => _storage.GpuCacheVersion;
 
+    /// <summary>
+    /// Makes this tensor take <paramref name="source"/>'s storage and layout (shape, strides, storage offset).
+    /// </summary>
+    /// <remarks>
+    /// <para>The primitive behind torch's <c>set_</c>, and the metadata half of the in-place view ops
+    /// (<c>squeeze_</c>, <c>t_</c>, <c>transpose_</c>, <c>as_strided_</c>, <c>resize_</c>): their out-of-place form
+    /// returns a view of this tensor's storage, and adopting it changes only the layout. Other tensors that view the
+    /// old storage keep it, as in torch.</para>
+    /// <para>Host data is made current first: this tensor's device binding describes the old layout and is dropped,
+    /// and data that lived only on the device would go with it. The next device op uploads the new layout.</para>
+    /// </remarks>
+    internal void AdoptFrom(TensorBase<T> source)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (ReferenceEquals(source, this)) return;
+        if (IsSparse || source.IsSparse)
+            throw new NotSupportedException("A sparse tensor cannot adopt or donate a dense layout.");
+
+        // Deferred, lazy or paged-out storage first (the raw vector would be empty), then any pending device download
+        // into the host array.
+        EnsureMaterialized();
+        source.EnsureMaterialized();
+        _ = _data.AsSpan();
+        _ = source._data.AsSpan();
+
+        // Under the source's copy-on-write family lock (when it has one), so a first-write detach cannot swap its
+        // storage between the snapshot below and this tensor joining the family that detach moves together.
+        var family = source._cowFamily;
+        if (family is null)
+        {
+            bool sameStorage = ReferenceEquals(_storage, source._storage);
+            AdoptStorageAndLayout(source);
+            // Left the old family only when it left that storage: a layout change over its own (still COW-shared)
+            // storage must keep the pending detach.
+            if (!sameStorage) _cowFamily = null;
+        }
+        else family.Adopt(source, this, () => AdoptStorageAndLayout(source));
+        IncrementVersion();
+    }
+
+    private void AdoptStorageAndLayout(TensorBase<T> source)
+    {
+        bool sameStorage = ReferenceEquals(_storage, source._storage);
+        if (!sameStorage)
+        {
+            // Acquire before release, as in RebindStorageFrom: source may hold the only other reference.
+            source._storage.AddRef();
+            var oldStorage = _storage;
+            _storage = source._storage;
+            oldStorage.Release();
+        }
+        _data = source._data;
+        _shape = (int[])source._shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = (int[])source._strides.Clone();
+        _rowMajorStridesCache = null;
+        _storageOffset = source._storageOffset;
+        Length = source.Length;
+        IsContiguous = source.IsContiguous;
+        // Sharing another tensor's storage makes this a view of it; a layout change over its own storage does not.
+        IsView = sameStorage ? IsView || source.IsView : true;
+        // Only this tensor's OWN binding goes. With the source's vector adopted, the whole-vector binding properties
+        // (_gpuBuffer, _gpuBackend, ...) address the vector's shared device state, which describes the same bytes in the
+        // same layout and belongs to the source too: clearing through them stripped the source's buffer.
+        _viewGpuBuffer = null;
+        _viewGpuBackend = null;
+        _viewGpuBufferVersion = -1;
+        _viewGpuBufferIsSplitComplex = false;
+        _viewGpuBufferContainsRawInt32 = false;
+        _ownsGpuBuffer = false;          // never the owner of a buffer it adopted
+        _device = TensorDevice.CPU;      // the host data was made current above
+    }
+
     private void InvalidateGpuBindingAfterStorageReplacement()
     {
         _gpuBuffer = null;
@@ -1384,6 +1469,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // ordinary float-format one, and a marker that outlived its buffer would route those floats
         // to that consumer as though their bit patterns were indices.
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
     }
 
     /// <summary>
@@ -1596,7 +1682,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Whether this tensor is a view into another tensor's storage.
     /// Views share memory — mutations through one view are visible in others.
     /// </summary>
-    public bool IsView { get; }
+    public bool IsView { get; private set; }
 
     /// <summary>
     /// Whether this tensor uses sparse storage (COO, CSR, or CSC format).
@@ -1646,7 +1732,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Gets the total number of logical elements in this tensor (product of all shape dimensions).
     /// For views, this is the view's element count, not the underlying storage size.
     /// </summary>
-    public int Length { get; }
+    public int Length { get; private set; }
 
     /// <summary>
     /// Gets the rank (number of dimensions) of the tensor.
@@ -1710,6 +1796,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal Memory<T> Data => Memory;
 
     /// <summary>
+    /// <see cref="Data"/> without the escape mark: for engine code that keeps this tensor alive while it uses the memory
+    /// (<see cref="KeepAliveScope"/>) and does not let the memory outlive that scope, so a large result stays
+    /// recyclable once nothing references it.
+    /// </summary>
+    internal Memory<T> DataUnmarked
+    {
+        get
+        {
+            EnsureMaterialized();
+            EnsureOwnedForWrite();
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            if (_storageOffset == 0 && _storage.Length == Length)
+                return _storage.AsMemoryUnmarked();
+            return _storage.AsMemoryUnmarked().Slice(_storageOffset, Length);
+        }
+    }
+
+    /// <summary>
     /// COW Stage 2 (#624): a READ-ONLY <see cref="ReadOnlyMemory{T}"/> view of the backing store
     /// that does <b>not</b> privatize a copy-on-write clone — the <see cref="Memory"/>/<see cref="Data"/>
     /// counterpart for engine INPUT operands passed to read-only-typed parameters (e.g.
@@ -1728,6 +1834,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             if (_storageOffset == 0 && _storage.Length == Length)
                 return _storage.AsReadOnlyMemory();
             return _storage.AsReadOnlyMemory().Slice(_storageOffset, Length);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ReadOnlyData"/> without the escape mark, under the same rule as <see cref="DataUnmarked"/>: the caller
+    /// keeps this tensor alive while it uses the memory and does not let the memory outlive that scope.
+    /// </summary>
+    internal ReadOnlyMemory<T> ReadOnlyDataUnmarked
+    {
+        get
+        {
+            EnsureMaterialized();
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            if (_storageOffset == 0 && _storage.Length == Length)
+                return _storage.AsReadOnlyMemoryUnmarked();
+            return _storage.AsReadOnlyMemoryUnmarked().Slice(_storageOffset, Length);
         }
     }
 
@@ -2032,6 +2156,30 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
+    /// Changes a sparse tensor's logical shape in place and, when <paramref name="values"/> is given, its stored
+    /// values (the in-place sparse resizes). The caller keeps the indices consistent with both.
+    /// </summary>
+    internal void ReplaceSparseLayout(int[] logicalShape, Vector<T>? values)
+    {
+        if (!IsSparse) throw new InvalidOperationException("Only a sparse tensor's layout is replaced this way.");
+        ValidateShape(logicalShape);
+        _shape = (int[])logicalShape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(_shape);
+        _rowMajorStridesCache = null;
+        Length = ComputeProduct(_shape);
+        if (values is not null)
+        {
+            var oldStorage = _storage;
+            _data = values;
+            _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: true);
+            oldStorage.Release();
+            InvalidateGpuBindingAfterStorageReplacement();
+        }
+        IncrementVersion();
+    }
+
+    /// <summary>
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
@@ -2261,6 +2409,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Sets the value at a flat (logical) index. Handles views correctly.
     /// </summary>
+    /// <summary>
+    /// Writes <paramref name="value"/> to every element of this (strided) view through the storage, with no per-element
+    /// ownership check or version bump: the caller has already run <see cref="EnsureOwnedForWrite"/> and bumps the
+    /// version once for the whole write.
+    /// </summary>
+    private protected void FillStridedElements(T value)
+    {
+        var writable = _storage.AsWritableSpan();   // a read-only mmap alias throws here, as in SetFlat
+        for (int i = 0; i < Length; i++) writable[FlatIndexToStorageIndex(i)] = value;
+    }
+
     public void SetFlat(int flatIndex, T value)
     {
         EnsureMaterialized();
@@ -2376,7 +2535,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Gets a read-only span over the tensor data. Throws for non-contiguous views.
     /// </summary>
-    public ReadOnlySpan<T> AsSpan()
+    internal ReadOnlySpan<T> AsSpan()
     {
         EnsureMaterialized();
 
@@ -2389,6 +2548,37 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             return _data.AsSpan();
         return _data.AsSpan().Slice(_storageOffset, Length);
     }
+
+    /// <summary><see cref="AsSpan"/> without the escape mark, for leases (which keep this tensor alive).</summary>
+    internal ReadOnlySpan<T> AsSpanUnmarked()
+    {
+        EnsureMaterialized();
+
+        ThrowIfSparse();
+        if (Length == 0) return ReadOnlySpan<T>.Empty;
+        if (!IsContiguous)
+            throw new InvalidOperationException(
+                "Cannot get a contiguous span from a non-contiguous tensor view. Call Contiguous() first.");
+        if (_storageOffset == 0 && _storage.Length == Length)
+            return _data.AsSpanUnmarked();
+        return _data.AsSpanUnmarked().Slice(_storageOffset, Length);
+    }
+
+    /// <summary>
+    /// A read-only view of this object's data that keeps the object alive until the lease is disposed. Use it instead
+    /// of <see cref="AsSpan"/> whenever the object could otherwise become unreachable while the span is in use (a
+    /// temporary result, or a local whose last use is the span); see <see cref="ReadLease{T}"/>.
+    /// </summary>
+    internal ReadLease<T> Lease() => new(this, AsSpanUnmarked());
+
+    /// <summary>The writable form of <see cref="Lease"/>.</summary>
+    internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());
+
+    /// <summary>
+    /// The backing array with this object kept alive until the lease is disposed; the lease form of GetDataArray, which
+    /// marks the array escaped. See <see cref="ArrayLease{T}"/>.
+    /// </summary>
+    internal ArrayLease<T> LeaseArray() => new(this, GetDataArrayUnmarked());
 
     /// <summary>
     /// Gets a writable span over the tensor data. Throws for non-contiguous views.
@@ -2418,6 +2608,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (_storageOffset == 0 && _storage.Length == Length)
             return _storage.AsWritableSpan();
         return _storage.AsWritableSpan().Slice(_storageOffset, Length);
+    }
+
+    /// <summary><see cref="AsWritableSpan"/> without the escape mark, for leases (which keep this tensor alive).</summary>
+    internal Span<T> AsWritableSpanUnmarked()
+    {
+        EnsureMaterialized();
+        EnsureOwnedForWrite();
+
+        if (Length == 0) return Span<T>.Empty;
+        if (!IsContiguous)
+            throw new InvalidOperationException(
+                "Cannot get a contiguous writable span from a non-contiguous tensor view. Call Contiguous() first.");
+        // Route through _storage (not _data) so a read-only mmap alias fails loud via
+        // ThrowIfReadOnlyMapped instead of faulting the mapped pages on write. _storage wraps the same
+        // Vector as _data, so this is transparent for normal tensors; a writable mmap alias is allowed.
+        if (_storageOffset == 0 && _storage.Length == Length)
+            return _storage.AsWritableSpanUnmarked();
+        return _storage.AsWritableSpanUnmarked().Slice(_storageOffset, Length);
     }
 
     /// <summary>
@@ -2474,6 +2682,50 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
+    /// <see cref="GetDataArray"/> without the escape mark, for an op that keeps this tensor alive while it uses the
+    /// array (its own result, or an input held with a <see cref="KeepAliveScope"/>).
+    /// </summary>
+    internal T[] GetDataArrayUnmarked()
+    {
+        // COW: GetDataArray hands back a live, writable backing array (specializations pin it and
+        // expect later writes to land), so privatize first if this is a shared COW clone. No-op for
+        // every normal tensor. Stage 1 conservatively treats this as a write-intent accessor; the
+        // read/write split that avoids privatizing on engine reads is Stage 2.
+        EnsureOwnedForWrite();
+        // Eager simple-layout CPU tensors: hand back the backing array
+        // directly. Specializations (TryBuildSpecializedForward) capture
+        // this reference at compile time and need later writes — notably
+        // user-supplied graph-input data landing in a placeholder — to
+        // show up at replay. Returning a copy here was the missing piece
+        // that produced "importer plan outputs all zeros" on ONNX graphs:
+        // specializations pinned the placeholder's zero-initialized state
+        // and never saw the user's Execute-time input.
+        //
+        // GPU-resident or non-full layouts still go through ToArray() so the
+        // realized CPU snapshot is what the caller sees. That path
+        // preserves the BERT-SQuAD × 100 fix: a lazy tensor whose
+        // upstream hasn't run yet would have had its placeholder-filled
+        // backing pinned, leaking stale/zero bytes into every replay.
+        var live = GetLiveBackingArrayIdentityOrNull();
+        if (live is not null)
+        {
+            // Force any PENDING GPU download before handing the array out.
+            // DirectGpuTensorEngine.FinishGpuOp returns a GC.AllocateUninitializedArray and
+            // registers a HostSync keyed on it, documenting that the data is
+            // "populated lazily when code first accesses the data (via HostSync
+            // triggered by GetDataArray/AsSpan/indexer)". VectorBase.GetDataArray does call
+            // TryMaterialize; this accessor did NOT, so reading a deferred GPU result through the
+            // TENSOR accessor returned UNINITIALISED memory. Fresh pages read as zero, which is why
+            // 13 Parity210 GPU ops (Erfc, Lgamma, Erfinv, I0, Flip, Roll, CumSum, CumMax,
+            // LogCumSumExp, LogAddExp, Hypot, DiagEmbed, NanToNum) each reported gpu=0 against
+            // every CPU value. TryMaterialize is a no-op for arrays with nothing pending.
+            Helpers.HostSync.TryMaterialize(live);
+            return live;
+        }
+        return ToArray();
+    }
+
+    /// <summary>
     /// COW Stage 2 (issue #624): a READ-ONLY view of the live backing array that does
     /// <b>not</b> privatize a copy-on-write clone. A full contiguous CPU view can also
     /// return its shared backing array: reading it neither transfers ownership nor
@@ -2488,6 +2740,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal T[] GetReadOnlyDataArray()
     {
         var live = LazySource is null ? GetLiveBackingArrayOrNull() : null;
+        if (live is not null)
+        {
+            // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
+            // has to see materialised data.
+            Helpers.HostSync.TryMaterialize(live);
+            return live;
+        }
+        return ToArray();
+    }
+
+    /// <summary><see cref="GetReadOnlyDataArray"/> without the escape mark, for a caller holding this tensor with a <see cref="KeepAliveScope"/>.</summary>
+    internal T[] GetReadOnlyDataArrayUnmarked()
+    {
+        var live = LazySource is null ? GetLiveBackingArrayIdentityOrNull() : null;
         if (live is not null)
         {
             // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
@@ -2525,6 +2791,25 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (_device != TensorDevice.CPU)
             return null;
         return _storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset)
+            && baseOffset == 0
+            ? array
+            : null;
+    }
+
+    /// <summary><see cref="GetLiveBackingArrayOrNull"/> without the escape mark (for the unmarked accessors).</summary>
+    internal T[]? GetLiveBackingArrayIdentityOrNull()
+    {
+        if (!IsContiguous || _storageOffset != 0 || _storage.Length != Length)
+            return null;
+        // GPU-resident tensors keep the authoritative data on-device; the
+        // CPU backing array may hold stale/placeholder bytes that haven't
+        // been copied back. Pinning that into a specialization would read
+        // the wrong values at replay. Force these callers onto the AsSpan
+        // path, which goes through EnsureMaterialized and copies GPU→CPU
+        // before the caller touches the buffer.
+        if (_device != TensorDevice.CPU)
+            return null;
+        return _storage.TryGetBackingArrayIdentity(out var array, out int baseOffset)
             && baseOffset == 0
             ? array
             : null;
@@ -2700,6 +2985,95 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// was ~13% of a CPU Transformer training step, mostly transposed and permuted gradient views. Pure copies,
     /// so the result is identical to any element-order walk.
     /// </summary>
+    // #653: below this many elements a strided materialization stays the single-threaded span walk.
+    internal const int ParallelStridedCopyMinElements = 64 * 1024;
+    private const int TransposeTile = 32;
+
+    /// <summary>
+    /// Array form of <see cref="CopyStridedToRowMajor(ReadOnlySpan{T}, int, int[], int[], Span{T})"/> for large views:
+    /// the same axis coalescing, then either a cache-blocked tile copy (two coalesced axes -- a transpose or any 2-D
+    /// permutation) or contiguous row chunks, split across threads. A pure copy, so the result is identical at any
+    /// thread count. (#653: the span walk ran on one thread and, for a transpose, gathered one cache line per element;
+    /// an [8192, 1024] float transpose + Contiguous took ~60 ms at DOP 1 through 64.)
+    /// </summary>
+    internal static void CopyStridedToRowMajorParallel(T[] source, int offset, int[] shape, int[] strides, T[] destination, int destOffset)
+    {
+        int rank = shape.Length;
+        long totalL = 1;
+        for (int d = 0; d < rank; d++) totalL *= shape[d];
+        int total = (int)totalL;
+        if (total == 0) return;
+        var dims = new int[Math.Max(rank, 1)];
+        var steps = new int[Math.Max(rank, 1)];
+        int n = 0;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            int extent = shape[d];
+            if (extent == 1) continue;
+            if (n > 0 && strides[d] == steps[n - 1] * dims[n - 1]) { dims[n - 1] *= extent; continue; }
+            dims[n] = extent; steps[n] = strides[d]; n++;
+        }
+        if (n == 0) { destination[destOffset] = source[offset]; return; }
+
+        int inner = dims[0], innerStep = steps[0];
+        if (n == 2 && innerStep != 1)
+        {
+            // Two coalesced axes: dst[o * inner + i] = src[offset + o * steps[1] + i * innerStep]. Walk 32 x 32 tiles so
+            // both the strided reads and the contiguous writes stay within a few cache lines per tile.
+            int outer = dims[1], outerStep = steps[1];
+            int oTiles = (outer + TransposeTile - 1) / TransposeTile, iTiles = (inner + TransposeTile - 1) / TransposeTile;
+            // Work units are (outer tile row, group of inner tiles), about four per thread: splitting over the outer
+            // tiles alone left a [32, 6144] view one unit and a [256, 8192] view eight.
+            int wanted = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism * 4);
+            int iGroups = Math.Max(1, Math.Min(iTiles, (wanted + oTiles - 1) / oTiles));
+            int tilesPerGroup = (iTiles + iGroups - 1) / iGroups;
+            iGroups = (iTiles + tilesPerGroup - 1) / tilesPerGroup;
+            CpuParallelSettings.ParallelForOrSerial(0, oTiles * iGroups, total, unit =>
+            {
+                int ot = unit / iGroups, ig = unit % iGroups;
+                int o0 = ot * TransposeTile, o1 = Math.Min(outer, o0 + TransposeTile);
+                int itEnd = Math.Min(iTiles, (ig + 1) * tilesPerGroup);
+                for (int it = ig * tilesPerGroup; it < itEnd; it++)
+                {
+                    int i0 = it * TransposeTile, i1 = Math.Min(inner, i0 + TransposeTile);
+                    for (int o = o0; o < o1; o++)
+                    {
+                        int s = offset + o * outerStep + i0 * innerStep, dRow = destOffset + o * inner;
+                        for (int i = i0; i < i1; i++, s += innerStep) destination[dRow + i] = source[s];
+                    }
+                }
+            }, deterministicSafe: true);
+            return;
+        }
+
+        int rows = total / inner;
+        int chunks = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism * 4, rows));
+        int rowsPerChunk = (rows + chunks - 1) / chunks;
+        chunks = (rows + rowsPerChunk - 1) / rowsPerChunk;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, total, c =>
+        {
+            int r0 = c * rowsPerChunk, r1 = Math.Min(rows, r0 + rowsPerChunk);
+            // Decode r0 into the outer odometer (axes 1..n-1, axis 1 fastest) and its source offset.
+            var counter = new int[n];
+            int src = offset, rem = r0;
+            for (int d = 1; d < n; d++) { counter[d] = rem % dims[d]; rem /= dims[d]; src += counter[d] * steps[d]; }
+            int dst = destOffset + r0 * inner;
+            for (int row = r0; row < r1; row++)
+            {
+                if (innerStep == 1) Array.Copy(source, src, destination, dst, inner);
+                else { int s = src; for (int i = 0; i < inner; i++, s += innerStep) destination[dst + i] = source[s]; }
+                dst += inner;
+                for (int d = 1; d < n; d++)
+                {
+                    src += steps[d];
+                    if (++counter[d] < dims[d]) break;
+                    counter[d] = 0;
+                    src -= steps[d] * dims[d];
+                }
+            }
+        }, deterministicSafe: true);
+    }
+
     internal static void CopyStridedToRowMajor(ReadOnlySpan<T> source, int offset, int[] shape, int[] strides, Span<T> destination)
     {
         int rank = shape.Length;
@@ -3167,6 +3541,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     return view;
                 }
                 return view;
+            }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="adopt"/> (which gives <paramref name="target"/> the source's storage) under the family
+        /// lock, then makes the target a member while a detach is pending, as <see cref="CreateView"/> does for a view.
+        /// </summary>
+        internal void Adopt(TensorBase<T> source, TensorBase<T> target, Action adopt)
+        {
+            lock (_sync)
+            {
+                adopt();
+                if (_requiresDetach != 0 && ReferenceEquals(source._cowFamily, this))
+                {
+                    target._cowFamily = this;
+                    _members.Add(new WeakReference<TensorBase<T>>(target));
+                }
+                else target._cowFamily = null;
             }
         }
 

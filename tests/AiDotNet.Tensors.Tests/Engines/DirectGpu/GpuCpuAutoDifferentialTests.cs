@@ -445,6 +445,24 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
 
     // Compares one GPU value against the CPU reference (Tensor<float> exact-ish, Tensor<Complex<float>>
     // by real+imag). Returns max abs error, or -1 if not a comparable pair.
+    // Scale-aware error: absolute up to |cpu| = 1 and relative above it, so the one tolerance means the same thing for
+    // an op whose outputs are ~1 and one whose outputs are ~1e4. With a flat absolute error, TensorNormExceptDim at the
+    // harness's pow = 0.5 -- (sum of sqrt(x))^2 ~ 2e4 over 129 elements -- failed at 1.17e-2 absolute, which is
+    // 7.3e-7 relative: exact FP32 agreement, reported as a GPU defect.
+    private static double ScaledError(double gpu, double cpu) => Math.Abs(gpu - cpu) / Math.Max(1.0, Math.Abs(cpu));
+
+    private static double ComponentError(float gpu, float cpu, int index)
+    {
+        bool g = float.IsNaN(gpu) || float.IsInfinity(gpu), c = float.IsNaN(cpu) || float.IsInfinity(cpu);
+        if (g || c)
+        {
+            Assert.True(g == c && (float.IsNaN(gpu) == float.IsNaN(cpu)) && (float.IsNaN(gpu) || gpu == cpu),
+                $"GPU/CPU diverged at complex index {index}: GPU={gpu} CPU={cpu}");
+            return 0;
+        }
+        return ScaledError(gpu, cpu);
+    }
+
     private static double CompareValue(object gpu, object cpu)
     {
         if (gpu is Tensor<float> gf && cpu is Tensor<float> cf)
@@ -469,7 +487,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
                     // Both non-finite — treat as match for tolerance accounting.
                     continue;
                 }
-                double e = Math.Abs((double)ga[i] - ca[i]); if (e > m) m = e;
+                double e = ScaledError(ga[i], ca[i]); if (e > m) m = e;
             }
             return m;
         }
@@ -480,7 +498,9 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
             double m = 0;
             for (int i = 0; i < ca.Length; i++)
             {
-                double er = Math.Abs((double)ga[i].Real - ca[i].Real), ei = Math.Abs((double)ga[i].Imaginary - ca[i].Imaginary);
+                // Non-finite parity per component BEFORE scaling: an infinite CPU component would make the scaled error
+                // Inf/Inf = NaN, which no "e > m" comparison ever records.
+                double er = ComponentError(ga[i].Real, ca[i].Real, i), ei = ComponentError(ga[i].Imaginary, ca[i].Imaginary, i);
                 if (er > m) m = er; if (ei > m) m = ei;
             }
             return m;
@@ -582,7 +602,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
                     double e = CompareValue(gpuArgs[i], cpuArgs[i]);
                     if (e > maxErr) maxErr = e; // -1 (non-comparable out) ignored
                 }
-                Assert.True(maxErr < Tol, $"{opKey} on shape [{string.Join(",", shape)}]: GPU vs CPU max_abs_err {maxErr:E3} exceeded tolerance {Tol:E3}");
+                Assert.True(maxErr < Tol, $"{opKey} on shape [{string.Join(",", shape)}]: GPU vs CPU max scaled error {maxErr:E3} (absolute up to |cpu| = 1, relative above) exceeded tolerance {Tol:E3}");
                 return; // first CPU-accepted combo checked -> done
             }
         }
@@ -625,6 +645,10 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     // TODO(gpu-correctness): add dedicated GPU-vs-CPU tests for these and remove them from the list.
     private static readonly HashSet<string> DedicatedlyCovered = new(StringComparer.Ordinal)
     {
+        // Advanced indexing and grouped / scaled-grouped GEMM: TorchParityGpuCorrectnessTests.
+        "TensorIndex(Tensor<T>,Tensor<Int32>[])",
+        "TensorGroupedMatMul(Tensor<T>,Tensor<T>,Tensor<Int32>,Tensor<T>)",
+        "TensorScaledGroupedMatMul(Tensor<T>,Tensor<T>,Tensor<T>,ScalingRecipe,Tensor<T>,ScalingRecipe,ScaleSwizzle,ScaleSwizzle,Tensor<T>,Tensor<Int32>)",
         // PyTorch-parity ops the generic harness cannot drive (constant constructors, integer-valued operands,
         // shape-coupled convolution/pooling/sampling): TorchParityGpuCorrectnessTests, GPU vs CPU per op.
         "TensorAdaptiveAvgPool3D(Tensor<T>,Int32[])",

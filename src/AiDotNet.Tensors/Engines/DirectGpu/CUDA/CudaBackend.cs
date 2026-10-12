@@ -135,6 +135,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     /// <summary>Shortest row SumAxis reduces with one block per row; see <see cref="SumAxis"/>.</summary>
     internal const int SumAxisRowsMinReduce = 32;
+
+    // How many row sums took the split path (#1150): lets tests assert the dispatch, not only the result.
+    private long _splitRowSumLaunches;
+    internal long SplitRowSumLaunches => System.Threading.Interlocked.Read(ref _splitRowSumLaunches);
+
+    // #1150: rows at least this long, when there are fewer than two per SM, are split across blocks.
+    internal const int SplitRowMinReduce = 64 * 1024;
+
+    // ... into chunks of at least this many elements (32 per thread of a 256-thread block).
+    internal const int SplitRowChunkMin = 8 * 1024;
     private const int MaxRnnBlockSize = 1024;
     // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
     private const int Fp16ByteWidth = 2;
@@ -243,6 +253,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // call site instead of an opaque "kernel not found" deep in dispatch.
     private bool _fusedAdvancedKernelsAvailable;
     private IntPtr _activationModule;
+    private IntPtr _torchParityElementwiseModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
     private IntPtr _poolingModule;
@@ -1136,6 +1147,22 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // catch that degraded silently to the CPU. See CudaMissingLookupKernels.
         CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
             Kernels.CudaMissingLookupKernels.GetKernelNames());
+
+        // PyTorch-parity elementwise ops that computed on the host (#1112). useFastMath:false -- erff, log1pf, expf
+        // and sinpif must be the accurate versions to match the CPU's double-precision reference.
+        // Optional: if this module fails to compile, its kernels stay out of the cache, every parity launcher throws
+        // "kernel not found", and the engine's device helpers fall back to the CPU (recording the fallback) -- the rest
+        // of the backend stays available.
+        try
+        {
+            _torchParityElementwiseModule = CompileKernelModule(device, Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity_elementwise_kernels",
+                Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
+        }
+        catch (Exception ex)
+        {
+            _torchParityElementwiseModule = IntPtr.Zero;
+            System.Diagnostics.Trace.TraceWarning($"CUDA torch-parity kernels unavailable; those ops use the CPU path: {ex.Message}");
+        }
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
@@ -1177,6 +1204,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Optional P2 serving kernel; its public call degrades gracefully.
         }
         _attentionModule = CompileKernelModule(device, CudaAttentionKernels.GetSource(), "attention_kernels", CudaAttentionKernels.GetKernelNames());
+        CompileFusedAttentionModule(device);   // #1141: optional; on failure the engine keeps its other attention paths
         _fftModule = CompileKernelModule(device, Kernels.CudaFFTKernels.GetSource(), "fft_kernels", Kernels.CudaFFTKernels.GetKernelNames());
         try
         {
@@ -1313,6 +1341,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Compile softmax variant + GEMM extension kernels
         CompileKernelModule(device, CudaSoftmaxVariantKernels.GetSource(), "softmax_variant_kernels", CudaSoftmaxVariantKernels.GetKernelNames());
+
+        // IGpuBatchExecution kernels shared with HIP (#1142).
+        CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
 
         // Self-contained FP16 kernels (#558 layer 7): manual IEEE-754 half<->float, NO cuda_fp16.h, so
         // they compile with the driver alone (the header-based CudaFp16Kernels below silently fails on
@@ -2020,11 +2051,33 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_asyncAlloc)
             return AllocateBuffer(size);
         using var _ = PushContext();
-        if (TryRentAsyncBuffer(size) is { } reused)
-            return reused;
-        var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
-        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+        var buffer = TryRentAsyncBuffer(size)
+            ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
+                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
+        if (PoisonUninitializedBuffers)
+        {
+            try
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemsetD8Async(buffer.Handle, 0xFF, (ulong)size * sizeof(float), _stream),
+                    "cuMemsetD8Async(poison)");
+            }
+            catch
+            {
+                buffer.Dispose();
+                throw;
+            }
+        }
+        return buffer;
     }
+
+    /// <summary>
+    /// Debug switch (env <c>AIDOTNET_GPU_POISON_UNINITIALIZED=1</c>): fill every uninitialized buffer with 0xFF bytes,
+    /// a NaN in every float, so an op that allocates uninitialized but does not write every element surfaces as NaN in
+    /// GPU-vs-CPU tests instead of passing on whatever the reused memory happened to hold.
+    /// </summary>
+    internal static readonly bool PoisonUninitializedBuffers =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_POISON_UNINITIALIZED") == "1";
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
@@ -5085,6 +5138,35 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // uncoalesced, and serial when there are few rows. It was 97.8% of GPU time in N-BEATS training, whose
         // bias and basis gradients are ≤256 rows (#1804). Short rows keep sum_axis: a block per 2-element row
         // would idle most of its threads.
+        // #1150: few long rows (a full reduction is one) would leave all but a handful of SMs idle with a block per
+        // row -- 33.5M floats took 2.3 ms on one block. Split each row into chunks of about 4 blocks per SM, sum them
+        // into partials, then reduce the partials with this same method. Fixed partition and order: deterministic.
+        if (reduceSize >= SplitRowMinReduce && outerSize < 2 * Math.Max(1, ComputeUnits)
+            && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
+        {
+            // Ceilings in 64 bits: reduceSize can be close to int.MaxValue.
+            int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SplitRowChunkMin - 1) / SplitRowChunkMin,
+                4L * Math.Max(1, ComputeUnits) / outerSize));
+            int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+            chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+            using var partial = AllocateStreamOrderedScratchBuffer(outerSize * chunks);
+            using (PushContext())
+            {
+                IntPtr inPtr = A.Handle, partialPtr = partial.Handle;
+                int reduceArg = reduceSize, chunksArg = chunks, lenArg = chunkLen;
+                unsafe
+                {
+                    void** splitArgs = stackalloc void*[5];
+                    splitArgs[0] = &inPtr; splitArgs[1] = &partialPtr; splitArgs[2] = &reduceArg;
+                    splitArgs[3] = &chunksArg; splitArgs[4] = &lenArg;
+                    LaunchKernel2D(splitKernel, (uint)chunks, (uint)outerSize, DefaultBlockSize, 1, splitArgs);
+                }
+            }
+            System.Threading.Interlocked.Increment(ref _splitRowSumLaunches);
+            SumAxis(partial, B, outerSize, chunks);
+            return;
+        }
+
         bool blockPerRow = reduceSize >= SumAxisRowsMinReduce;
         string kernelName = blockPerRow ? "sum_axis_rows" : "sum_axis";
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
@@ -9929,6 +10011,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, byteSize, _stream),
             "cuMemcpyDtoDAsync (Copy)");
+        // Device-side copy IS GPU work, as in the strided overload and CopyBufferAsync. This overload alone was not
+        // counted, so ops whose device work is one whole-buffer copy (TensorReal/TensorImag of a split-complex
+        // input) showed up on the residency probe as CPU fallbacks.
+        GpuLaunchProbe.OnLaunch();
     }
 
     public void Fill(IGpuBuffer buffer, float value, int size)
@@ -13628,6 +13714,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // Upper bound on the multi-tensor reduction's grid: enough blocks to fill the device, few enough that the one
     // atomic per block does not serialize.
     private const int MultiTensorReductionMaxBlocks = 1024;
+    // Elements per gradient-table chunk for the multi-tensor norm and scale kernels (MT_CHUNK in
+    // CudaOptimizerKernels must match): 16 per thread as four float4s, so a 10M-parameter model is ~2.4K chunks
+    // rather than ~39K 256-element ones (#1106).
+    private const int GradientTableChunk = 4096;
+    // Grid cap for the grid-stride multi-tensor scale.
+    private const int MultiTensorScaleMaxBlocks = 4096;
 
     private MultiTensorTable GetGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
     {
@@ -13656,15 +13748,15 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             handles[t] = tensors[t].Handle;
             WriteAddress(addresses, t, handles[t]);
             sizeArray[t] = size;
-            totalChunks += (size + MultiTensorChunk - 1) / MultiTensorChunk;
+            totalChunks += (size + GradientTableChunk - 1) / GradientTableChunk;
         }
         var chunkTensor = new int[totalChunks];
         var chunkStart = new int[totalChunks];
         int c = 0;
         for (int t = 0; t < n; t++)
         {
-            int chunks = (sizeArray[t] + MultiTensorChunk - 1) / MultiTensorChunk;
-            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
+            int chunks = (sizeArray[t] + GradientTableChunk - 1) / GradientTableChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * GradientTableChunk; c++; }
         }
 
         // Build the replacement completely before retiring the cached table: a failed allocation or upload disposes
@@ -13741,15 +13833,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (tensors is null || tensors.Count == 0) return;
         if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         lock (_gradientTableSync)
         {
             var table = GetGradientTable(tensors, sizes);
             using var _ = PushContext();
             IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
             IntPtr scH = scale.Handle;
-            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
-            LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+            int totalChunks = table.TotalChunks;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH; args[5] = &totalChunks;
+            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), MultiTensorChunk, args);
         }
     }
 
@@ -17945,6 +18038,17 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             _activationModule = IntPtr.Zero;
         }
 
+        if (_fusedAttentionModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_fusedAttentionModule);
+            _fusedAttentionModule = IntPtr.Zero;
+        }
+        if (_torchParityElementwiseModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
+            _torchParityElementwiseModule = IntPtr.Zero;
+        }
+
         if (_parity210Module != IntPtr.Zero)
         {
             CudaNativeBindings.cuModuleUnload(_parity210Module);
@@ -18229,21 +18333,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         => LaunchFusedUnaryReduce(
             GpuDeterminism.IsActive ? "reduce_mean_deterministic" : "reduce_mean",
             input, output, size, GpuDeterminism.IsActive);
-    public void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_product", input, output, size);
-    public unsafe void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size)
+    public void ReduceProduct(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullProduct, 0f);
+    public void ReduceNormL2(IGpuBuffer input, IGpuBuffer output, int size)
     {
+        // The direct-PTX row kernel writes the sum of squares; the contract is the norm.
         if (size % PtxRowNormalizationD64Kernel.Dimension == 0 &&
             TryDirectPtxReduceNormL2D64(
                 input, output, size / PtxRowNormalizationD64Kernel.Dimension))
+        {
+            Sqrt(output, output, 1);
             return;
-        LaunchFusedUnaryReduce(
-            GpuDeterminism.IsActive ? "reduce_norm_l2_deterministic" : "reduce_norm_l2",
-            input, output, size, GpuDeterminism.IsActive);
+        }
+        BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullNormL2, 0f);
     }
-    public unsafe void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size)
-        => LaunchFusedUnaryReduce(
-            GpuDeterminism.IsActive ? "reduce_sum_of_squares_deterministic" : "reduce_sum_of_squares",
-            input, output, size, GpuDeterminism.IsActive);
+    public void ReduceSumOfSquares(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullSumOfSquares, 0f);
 
     /// <summary>
     /// Issue #382: variant of LaunchFusedUnary for scalar reductions that
@@ -18263,29 +18366,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         uint grid = deterministic ? 1u : (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
-    public void ReduceMaxMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_max_magnitude", input, output, size);
-    public void ReduceMinMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => LaunchFusedUnary("reduce_min_magnitude", input, output, size);
+    public void ReduceMaxMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullMaxMagnitude, 0f);
+    public void ReduceMinMagnitude(IGpuBuffer input, IGpuBuffer output, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullMinMagnitude, 0f);
 
-    public unsafe void ReduceLogSumExp(IGpuBuffer input, IGpuBuffer output, float maxVal, int size)
-    {
-        using var _ = PushContext();
-        IntPtr inPtr = input.Handle, outPtr = output.Handle;
-        void** args = stackalloc void*[4];
-        args[0] = &inPtr; args[1] = &outPtr; args[2] = &maxVal; args[3] = &size;
-
-        if (GpuDeterminism.IsActive)
-        {
-            if (!_kernelCache.TryGetValue("reduce_logsumexp_deterministic", out var kernelD))
-                throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp_deterministic");
-            Fill(output, 0f, 1);
-            LaunchKernel(kernelD, 1, DefaultBlockSize, args);
-            return;
-        }
-
-        if (!_kernelCache.TryGetValue("reduce_logsumexp", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: reduce_logsumexp");
-        LaunchKernel(kernel, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
-    }
+    public void ReduceLogSumExp(IGpuBuffer input, IGpuBuffer output, float maxVal, int size) => BatchFullReduce(input, output, size, BatchExecutionCudaKernels.FullLogSumExp, maxVal);
 
     public void VarianceAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("variance_axis", input, output, outerSize, reduceSize);
     public void StdAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int reduceSize) => LaunchFusedAxis("std_axis", input, output, outerSize, reduceSize);
@@ -18667,24 +18751,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public unsafe void Crop2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW)
-    {
-        using var _ = PushContext();
-        IntPtr goPtr = gradOutput.Handle, giPtr = gradInput.Handle;
-        void** args = stackalloc void*[10];
-        args[0] = &goPtr; args[1] = &giPtr; args[2] = &batch; args[3] = &channels;
-        args[4] = &inH; args[5] = &inW; args[6] = &outH; args[7] = &outW; args[8] = &offsetH; args[9] = &offsetW;
-        uint total = (uint)(batch * channels * outH * outW);
-
-        // Issue #382: original uses atomicAdd defensively (mapping is one-to-one
-        // per launch). Deterministic variant uses direct +=.
-        string kernelName = GpuDeterminism.IsActive
-            ? "crop_2d_backward_deterministic"
-            : "crop_2d_backward";
-        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: " + kernelName);
-        LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
-    }
+    public void Crop2DBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int batch, int channels, int inH, int inW, int outH, int outW, int offsetH, int offsetW)
+        // One thread per input-gradient cell, so cells outside the crop window are written as zero.
+        => LaunchBatchKernel("bx_window_2d", batch * channels * inH * inW, gradOutput, gradInput, batch, channels, inH, inW, outH, outW, offsetH, offsetW, 0f, 3);
 
     public unsafe void EyeKernel(IGpuBuffer output, int n)
     {
@@ -18782,7 +18851,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     }
 
     // --- Loss Forward ---
-    public void CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses) { LaunchLoss("cross_entropy_loss", predictions, targets, loss, batchSize, numClasses); }
+    // Two modules define a kernel named cross_entropy_loss (logits and probabilities); bx_row_loss is unambiguous.
+    public void CrossEntropyLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numClasses)
+        => LaunchBatchKernel("bx_row_loss", batchSize, predictions, targets, loss, batchSize, numClasses, 0);
     public void MseLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int batchSize, int numFeatures)
     {
 #if NET5_0_OR_GREATER
@@ -18864,7 +18935,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxSparsemax(input, output, outerSize, innerSize)) return;
-        LaunchFusedAxis("sparsemax", input, output, outerSize, innerSize);
+        LaunchBatchKernel("bx_row_map", outerSize, input, output, outerSize, innerSize, BatchExecutionCudaKernels.MapSparsemax);
     }
 
     public void TaylorSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)

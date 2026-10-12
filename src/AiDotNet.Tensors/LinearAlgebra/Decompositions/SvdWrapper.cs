@@ -45,9 +45,12 @@ internal static class SvdWrapper
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
         var inData = input.Contiguous().GetDataArray();
-        var uData = U.GetDataArray();
-        var sData = S.GetDataArray();
-        var vhData = Vh.GetDataArray();
+        using var uDataLease = U.LeaseArray();
+        var uData = uDataLease.Array;
+        using var sDataLease = S.LeaseArray();
+        var sData = sDataLease.Array;
+        using var vhDataLease = Vh.LeaseArray();
+        var vhData = vhDataLease.Array;
         int inStride = m * n;
         int uStride = m * uCols;
         int sStride = k;
@@ -99,12 +102,18 @@ internal static class SvdWrapper
         int m = input.Shape[inputRank - 2];
         int n = input.Shape[inputRank - 1];
 
-        var uF = full.U.GetDataArray();
-        var sF = full.S.GetDataArray();
-        var vhF = full.Vh.GetDataArray();
-        var uD = U.GetDataArray();
-        var sD = S.GetDataArray();
-        var vhD = Vh.GetDataArray();
+        using var uFLease = full.U.LeaseArray();
+        var uF = uFLease.Array;
+        using var sFLease = full.S.LeaseArray();
+        var sF = sFLease.Array;
+        using var vhFLease = full.Vh.LeaseArray();
+        var vhF = vhFLease.Array;
+        using var uDLease = U.LeaseArray();
+        var uD = uDLease.Array;
+        using var sDLease = S.LeaseArray();
+        var sD = sDLease.Array;
+        using var vhDLease = Vh.LeaseArray();
+        var vhD = vhDLease.Array;
 
         for (int b = 0; b < batch; b++)
         {

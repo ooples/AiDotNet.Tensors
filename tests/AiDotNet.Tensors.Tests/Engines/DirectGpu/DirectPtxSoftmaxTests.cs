@@ -116,39 +116,15 @@ public class DirectPtxSoftmaxTests
             "CudaBackend.SoftmaxBackward",
             "CudaBackend.LogSumExpBackward",
             "CudaBackend.MaskedFillKernel",
-            "CudaBackend.MaskedFillBackward"
-        ];
-        Assert.All(fullyNativeApis, api =>
-            Assert.All(DirectPtxSoftmaxCoverageManifest.Get(api).PeerBackends,
-                peer => Assert.False(string.IsNullOrWhiteSpace(peer.NativeImplementation))));
-
-        string[] variantApis =
-        [
+            "CudaBackend.MaskedFillBackward",
             "CudaBackend.LogSoftmax",
             "CudaBackend.LogSumExpAxis",
             "CudaBackend.Sparsemax",
             "CudaBackend.TaylorSoftmax"
         ];
-        var expectedIssues = new System.Collections.Generic.Dictionary<string, int>
-        {
-            ["HIP"] = 914,
-            ["Metal"] = 915,
-            ["OpenCL"] = 916,
-            ["WebGPU"] = 917
-        };
-        Assert.All(variantApis, api =>
-        {
-            DirectPtxSoftmaxCoverageCell cell = DirectPtxSoftmaxCoverageManifest.Get(api);
-            DirectPtxPeerBackendCoverage vulkan = Assert.Single(cell.PeerBackends,
-                peer => peer.Backend == "Vulkan");
-            Assert.False(string.IsNullOrWhiteSpace(vulkan.NativeImplementation));
-            Assert.All(expectedIssues, expected =>
-            {
-                DirectPtxPeerBackendCoverage peer = Assert.Single(cell.PeerBackends,
-                    candidate => candidate.Backend == expected.Key);
-                Assert.Equal(expected.Value, peer.FollowUpIssue);
-            });
-        });
+        Assert.All(fullyNativeApis, api =>
+            Assert.All(DirectPtxSoftmaxCoverageManifest.Get(api).PeerBackends,
+                peer => Assert.False(string.IsNullOrWhiteSpace(peer.NativeImplementation))));
     }
 
     [Fact]

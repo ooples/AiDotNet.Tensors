@@ -87,10 +87,14 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// <param name="cols">Number of columns in the matrix.</param>
     /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
     /// <returns>A matrix backed by pooled memory.</returns>
-    internal static Matrix<T> FromPooledMemory(Memory<T> memory, int rows, int cols, T[] pooledArray)
+    // track: false for an array that came back from the thread cache; see Tensor<T>.FromPooledMemory.
+    internal static Matrix<T> FromPooledMemory(Memory<T> memory, int rows, int cols, T[] pooledArray, bool track = true)
     {
         var matrix = new Matrix<T>(memory, rows, cols);
         matrix.SetPooledArray(pooledArray);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this result (and every zero-copy view of it) has been collected.
+        if (track) matrix.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         return matrix;
     }
 
@@ -144,7 +148,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         var identityMatrix = new Matrix<T>(size, size);
 
         // Use vectorized Fill to initialize entire matrix with zeros
-        _numOps.Fill(identityMatrix.AsWritableSpan(), _numOps.Zero);
+        using var identityMatrixKeep1 = new KeepAliveScope(identityMatrix);
+        _numOps.Fill(identityMatrix.AsWritableSpanUnmarked(), _numOps.Zero);
 
         // Set diagonal elements to one
         for (int i = 0; i < size; i++)
@@ -473,7 +478,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         var matrix = new Matrix<T>(diagonal.Length, diagonal.Length);
 
         // Use vectorized Fill to initialize entire matrix with zeros
-        _numOps.Fill(matrix.AsWritableSpan(), _numOps.Zero);
+        using var matrixKeep1 = new KeepAliveScope(matrix);
+        _numOps.Fill(matrix.AsWritableSpanUnmarked(), _numOps.Zero);
 
         // Set diagonal elements from the vector
         for (int i = 0; i < diagonal.Length; i++)
@@ -500,7 +506,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         var identity = new Matrix<T>(size, size);
 
         // Use vectorized Fill to initialize entire matrix with zeros
-        _numOps.Fill(identity.AsWritableSpan(), _numOps.Zero);
+        using var identityKeep1 = new KeepAliveScope(identity);
+        _numOps.Fill(identity.AsWritableSpanUnmarked(), _numOps.Zero);
 
         // Set diagonal elements to one
         for (int i = 0; i < size; i++)
@@ -526,7 +533,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     {
         var matrix = new Matrix<T>(rows, columns);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(matrix.AsWritableSpan());
+        using var matrixKeep2 = new KeepAliveScope(matrix);
+        rng.FillUniform(matrix.AsWritableSpanUnmarked());
 
         return matrix;
     }
@@ -575,7 +583,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public static Matrix<T> CreateDefault(int rows, int columns, T defaultValue)
     {
         var matrix = new Matrix<T>(rows, columns);
-        _numOps.Fill(matrix.AsWritableSpan(), defaultValue);
+        using var matrixKeep3 = new KeepAliveScope(matrix);
+        _numOps.Fill(matrix.AsWritableSpanUnmarked(), defaultValue);
         return matrix;
     }
 
@@ -600,7 +609,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         var matrix = new Matrix<T>(rows, columns);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniformRange(matrix.AsWritableSpan(), min, max);
+        using var matrixKeep4 = new KeepAliveScope(matrix);
+        rng.FillUniformRange(matrix.AsWritableSpanUnmarked(), min, max);
 
         return matrix;
     }
@@ -747,7 +757,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public Vector<T> GetColumnSegment(int columnIndex, int startRow, int length)
     {
         var result = VA.RentUninitialized<T>(length);
-        var destSpan = result.AsWritableSpan();
+        var destSpan = result.AsWritableSpanUnmarked();
         var srcSpan = _memory.Span;
         for (int i = 0; i < length; i++)
         {
@@ -773,7 +783,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     {
         var result = VA.RentUninitialized<T>(length);
         var sourceSpan = _memory.Span.Slice(rowIndex * _cols + startColumn, length);
-        _numOps.Copy(sourceSpan, result.AsWritableSpan());
+        _numOps.Copy(sourceSpan, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -852,7 +862,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public Vector<T> ToRowVector()
     {
         Vector<T> result = new(Rows * Columns);
-        _numOps.Copy(_memory.Span, result.AsWritableSpan());
+        _numOps.Copy(_memory.Span, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -876,7 +886,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         }
 
         var result = MA.RentUninitialized<T>(Rows, Columns);
-        _numOps.Add(_memory.Span, tensor.AsSpan(), result.AsWritableSpan());
+        using var tensorKeep1 = new KeepAliveScope(tensor);
+        _numOps.Add(_memory.Span, tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -953,7 +964,9 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public static Matrix<T> FromVector(Vector<T> vector)
     {
         var matrix = new Matrix<T>(vector.Length, 1);
-        _numOps.Copy(vector.AsSpan(), matrix.AsWritableSpan());
+        using var vectorKeep1 = new KeepAliveScope(vector);
+        using var matrixKeep5 = new KeepAliveScope(matrix);
+        _numOps.Copy(vector.AsSpanUnmarked(), matrix.AsWritableSpanUnmarked());
         return matrix;
     }
 
@@ -1099,7 +1112,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public Matrix<T> Divide(T scalar)
     {
         Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
-        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
+        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1129,6 +1142,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Divide(Matrix<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (this.Rows != other.Rows || this.Columns != other.Columns)
         {
             throw new ArgumentException("Matrices must have the same dimensions for division.");
@@ -1136,7 +1150,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
         // Use vectorized Divide operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -1168,7 +1182,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         for (int i = 0; i < rows; i++)
         {
-            _numOps.MultiplyScalar(b.AsSpan(), a[i], result.GetRowSpan(i));
+            using var bKeep1 = new KeepAliveScope(b);
+            _numOps.MultiplyScalar(b.AsSpanUnmarked(), a[i], result.GetRowSpan(i));
         }
 
         return result;
@@ -1450,7 +1465,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// This is efficient because matrix data is stored in row-major order (rows are contiguous in memory).
     /// Use this for SIMD vectorization with TensorPrimitives.</para>
     /// </remarks>
-    public Span<T> GetRowSpan(int rowIndex)
+    internal Span<T> GetRowSpan(int rowIndex)
     {
         if (rowIndex < 0 || rowIndex >= Rows)
             throw new ArgumentOutOfRangeException(nameof(rowIndex));
@@ -1468,7 +1483,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> A ReadOnlySpan provides a high-performance, zero-allocation view over a matrix row
     /// that prevents modifications. This is efficient for reading row data without copying.</para>
     /// </remarks>
-    public ReadOnlySpan<T> GetRowReadOnlySpan(int rowIndex)
+    internal ReadOnlySpan<T> GetRowReadOnlySpan(int rowIndex)
     {
         if (rowIndex < 0 || rowIndex >= Rows)
             throw new ArgumentOutOfRangeException(nameof(rowIndex));

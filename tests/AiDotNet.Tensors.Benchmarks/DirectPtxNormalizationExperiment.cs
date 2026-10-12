@@ -245,7 +245,8 @@ internal static class DirectPtxNormalizationExperiment
         using (var baselineOutput = backend.AllocateBuffer(1))
         using (var directOutput = backend.AllocateBuffer(1))
         {
-            Action baseline = () => backend.ReduceNormL2(input, baselineOutput, elements);
+            // The banked direct-PTX kernel writes the whole-tensor sum of squares; ReduceNormL2 returns its root.
+            Action baseline = () => backend.ReduceSumOfSquares(input, baselineOutput, elements);
             Action direct = () =>
             {
                 if (!backend.TryDirectPtxReduceNormL2BankedD64(input, directOutput, rows))

@@ -570,7 +570,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) != typeof(float) || t is null) return;
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
         if (t._gpuBuffer is not { } buf || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
-        var data = t.GetDataArray();
+        using var dataLease = t.LeaseArray();
+        var data = dataLease.Array;
         if (buf.Size < t.Length) return;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         t._gpuBufferVersion = t.GpuCacheVersion;
@@ -590,7 +591,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // a view sharing its array (the backward's Reshape or Transpose of the batch) can have armed a download into
         // it; materializing that would read back data the host already holds.
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
-        var data = t.GetDataArray();
+        using var dataLease = t.LeaseArray();
+        var data = dataLease.Array;
         if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda && t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
             && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
         {
@@ -964,6 +966,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (IsDisposed || !Helpers.HostSync.AnyExists) return;
         if (Helpers.HostSync.IsPending(array))
             Helpers.HostSync.Remove(array);
+        // The persistent weight cache and its version maps are keyed by the array too. A new owner's version can equal
+        // the one recorded for the old owner, so a surviving entry would serve the old owner's device data.
+        if (_persistentBufferCache.ContainsKey(array))
+        {
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryRemove(array, out var pe)) pe.Dispose();
+                _tensorVersions.TryRemove(array, out _);
+                _persistentWeightHostVersion.TryRemove(array, out _);
+            }
+        }
         if (!_activationCache.ContainsKey(array)) return;
         ActivationCacheEntry? removed = null;
         lock (_activationCacheLock)
@@ -1059,7 +1072,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void DownloadIntoTensor(IDirectGpuBackend backend, IGpuBuffer gpuBuffer, Tensor<float> tensor)
     {
         var downloaded = backend.DownloadBuffer(gpuBuffer);
-        downloaded.AsSpan(0, Math.Min(downloaded.Length, tensor.Length)).CopyTo(tensor.Data.Span);
+        using var tensorDataKeep1 = new KeepAliveScope(tensor);
+        downloaded.AsSpan(0, Math.Min(downloaded.Length, tensor.Length)).CopyTo(tensor.DataUnmarked.Span);
     }
 
     private bool TryGetBackend(out IDirectGpuBackend backend)
@@ -1539,8 +1553,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var reciprocal = default(OwnedBuffer);
         try
         {
-            squared = AllocateOutputBuffer(backend, count);
-            reciprocal = AllocateOutputBuffer(backend, count);
+            squared = AllocateFullyWrittenOutputBuffer(backend, count);
+            reciprocal = AllocateFullyWrittenOutputBuffer(backend, count);
             backend.Multiply(
                 inverseStandardDeviationAndVariance,
                 inverseStandardDeviationAndVariance,
@@ -1640,7 +1654,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the vector's current values.
         return view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
             && shared.Handle != IntPtr.Zero && ReferenceEquals(state.Backend, backend)
-            && !state.IsSplitComplex && !state.ContainsRawInt32
+            && !state.IsSplitComplex && !state.ContainsRawInt32 && !state.ContainsRawInt64
             ? shared
             : null;
     }
@@ -1703,7 +1717,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var permutation = new int[rank];
         for (int k = 0; k < rank; k++) permutation[order[k]] = k;   // output axis j reads base axis permutation[j]
 
-        var output = AllocateOutputBuffer(backend, view.Length);
+        var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
         try
         {
             backend.Permute(baseBuffer, output.Buffer, baseShape, permutation);
@@ -1812,6 +1826,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -1953,6 +1968,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // held index bits rather than one float per element, and GetOrAllocateInt32IndexBuffer
         // forwards such a buffer to its consumer UNCONVERTED.
         tensor._gpuBufferContainsRawInt32 = false;
+        tensor._gpuBufferContainsRawInt64 = false;
         // ...and say so. Device and buffer are set together by Tensor.Gpu() and cleared together by
         // Tensor.Cpu(); leaving _device on a GPU after dropping the buffer produces a tensor that claims
         // GPU residency while nothing holds its data. That state is host-authoritative by this method's
@@ -2192,6 +2208,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
             tensor._gpuBufferContainsRawInt32 = false;
+            tensor._gpuBufferContainsRawInt64 = false;
         }
 
         // Check caches without triggering CPU materialization
@@ -2232,7 +2249,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // No cached buffer — must upload from CPU
-        var data = tensor.GetDataArray();
+        using var dataLease = tensor.LeaseArray();
+        var data = dataLease.Array;
         float[] floatData = DirectGpuEngine.ToFloatArray(data);
         return new OwnedBuffer(backend.AllocateBuffer(floatData), ownsBuffer: true);
     }
@@ -3071,10 +3089,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var eng = s_residentScratchEngine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
-        return new OwnedBuffer(AllocateReclaiming(backend, b => b is IUninitializedGpuAllocation uninitialized
-            ? uninitialized.AllocateBufferUninitialized(size)
-            : b.AllocateBuffer(size)), ownsBuffer: true);
+        return new OwnedBuffer(AllocateReclaiming(backend, b => AllocateDeviceBufferUninitialized(b, size)), ownsBuffer: true);
     }
+
+    /// <summary>
+    /// A raw device buffer the caller's next kernel writes in full: not zero-filled where the backend supports it
+    /// (see <see cref="IUninitializedGpuAllocation"/> for what must never use this).
+    /// </summary>
+    private static IGpuBuffer AllocateDeviceBufferUninitialized(IDirectGpuBackend backend, int size) =>
+        backend is IUninitializedGpuAllocation uninitialized
+            ? uninitialized.AllocateBufferUninitialized(size)
+            : backend.AllocateBuffer(size);
 
     /// <summary>
     /// Runs <paramref name="allocate"/>, and if it fails, reclaims memory held only by unreachable objects and tries
@@ -3942,9 +3967,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             dest._gpuBackend = null;
             dest._gpuBufferVersion = -1;
         }
-        var destination = dest.AsWritableSpan();
+        using var destinationLease = dest.LeaseWritable();
+        var destination = destinationLease.Span;
+        using var srcKeep1 = new KeepAliveScope(src);
         if (src.IsContiguous)
-            src.AsSpan().CopyTo(destination);
+            src.AsSpanUnmarked().CopyTo(destination);
         else
             src.CopyLogicalTo(destination);
         dest.IncrementVersion();
@@ -4515,7 +4542,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
         }
 
-        var inputArray = input.GetDataArray();
+        using var inputArrayLease = input.LeaseArray();
+        var inputArray = inputArrayLease.Array;
         if (inputArray is not float[] inputFloat) return null; // only float supported by this path
 
         var resultFloat = new float[totalElements];
@@ -5180,7 +5208,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // so SAME-tensor consumers resolve it via t._gpuBuffer; the (action,local) key gives determinism.
         if (ScratchPoolingActive)
             return RentActionScratch(backend, length, fullyWritten);
-        var buf = backend.AllocateBuffer(length);
+        var buf = fullyWritten ? AllocateDeviceBufferUninitialized(backend, length) : backend.AllocateBuffer(length);
         if (arr is not null) CacheActivation(arr, buf, t._shape, backend, hostVersion: t.GpuCacheVersion);
         return buf;
     }
@@ -6560,6 +6588,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorAddInPlace(a, b); return; }
         // #3 FP16-act: FP16-native residual add when a is FP16-resident (keeps the activation FP16, no convert).
         if (TryFp16AddInPlace(a, b)) return;
         // Version-counter contract is enforced inside TryRunBinaryInPlace
@@ -6580,6 +6610,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyInPlace(a, b); return; }
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Multiply(bufA, bufB, bufA, size)))
             return;
@@ -6596,6 +6628,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorSubtractInPlace(a, b); return; }
         if (!a.IsContiguous) { base.TensorSubtractInPlace(a, b); return; }
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryRunBinaryInPlace(a, b,
             static (backend, bufA, bufB, size) => backend.Subtract(bufA, bufB, bufA, size)))
@@ -6613,6 +6647,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyScalarInPlace(a, scalar); return; }
         if (!a.IsContiguous) { base.TensorMultiplyScalarInPlace(a, scalar); return; }
         var scalarF = ToFloatScalar(scalar);
         if (TryRunUnaryInPlace(a,
@@ -6631,6 +6667,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.TensorBroadcastAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.TensorBroadcastAddInPlace(a, b); return; }
         // #3 FP16-act: keep the activation FP16 across the add. Same-shape → FP16 residual add; per-channel
         // broadcast ([N,C,H,W] += [.,C,1,1]) → FP16 broadcast-add. Both no-op back to FP32 if not tagged.
         if (ShapesMatch(a.Shape._dims, b.Shape._dims)) { if (TryFp16AddInPlace(a, b)) return; }
@@ -6669,6 +6707,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.SigmoidInPlace(tensor); return; }
         if (TryRunUnaryInPlace(tensor,
             static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
             return;
@@ -6679,11 +6719,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Sigmoid(i, o, n), "Sigmoid")) return;
         var result = ((IEngine)this).Sigmoid(input);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        using var resultDataKeep1 = new KeepAliveScope(result);
+        using var destDataKeep1 = new KeepAliveScope(dest);
+        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write.
+        if (IsRecordingInPlace<T>()) { base.ReLUInPlace(tensor); return; }
         if (TryRunUnaryInPlace(tensor,
             static (backend, buf, size) => backend.Relu(buf, buf, size)))
             return;
@@ -6727,7 +6771,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Relu(i, o, n), "ReLU")) return;
         var result = ((IEngine)this).ReLU(input);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        using var resultDataKeep2 = new KeepAliveScope(result);
+        using var destDataKeep2 = new KeepAliveScope(dest);
+        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     /// <summary>GPU-resident elementwise log into the destination's stable buffer (the cross-entropy loss's log
@@ -6975,7 +7021,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)destination;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
                 var gpuOut = gpuBackend.AllocateBuffer(input.Length);
@@ -7051,7 +7098,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
                 int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
@@ -7088,7 +7136,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
                 int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
@@ -7122,7 +7171,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
                 int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
@@ -7203,7 +7253,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // GPU matmul into destination
         var result = ((IEngine)this).TensorMatMul(a, b);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        using var resultDataKeep3 = new KeepAliveScope(result);
+        using var destDataKeep3 = new KeepAliveScope(dest);
+        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
@@ -7468,7 +7520,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (a.GetLiveBackingArrayOrNull() is null)
             return false;
 
-        var aData = a.GetDataArray();
+        using var aDataLease = a.LeaseArray();
+        var aData = aDataLease.Array;
         var bData = b.GetReadOnlyDataArray();
         // Compared against bData, not b.Length, on purpose: the device op reads bData from index 0, so bData must
         // be exactly b's elements. A padded backing array or a view's shared source is longer than b and would
@@ -7552,7 +7605,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor.GetLiveBackingArrayOrNull() is null)
             return TryRunUnaryInPlaceResident(tensor, op);
 
-        var data = tensor.GetDataArray();
+        using var dataLease = tensor.LeaseArray();
+        var data = dataLease.Array;
         using var buffer = GetOrAllocateBuffer(backend, tensor);
 
         // See TryRunBinaryInPlace: a stale cached buffer can be smaller than the
@@ -8096,7 +8150,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int n = preActivation.Length;
                 using var preBuffer = GetOrAllocateBuffer(backend, preActivation);
                 var result = DispatchDeferredGpuOp<T>(backend, n, (int[])preActivation._shape.Clone(), output =>
-                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation));
+                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation), fullyWritten: true);
                 return (result, preActivation);
             }
         }
@@ -12412,7 +12466,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!HasResidentIndexStorage(targetIds))
             {
-                var ids = targetIds.GetDataArray();
+                using var idsLease = targetIds.LeaseArray();
+                var ids = idsLease.Array;
                 for (int i = 0; i < n; i++)
                     if (ids[i] < 0 || ids[i] >= vocab)
                         throw new ArgumentOutOfRangeException(nameof(targetIds),
@@ -15368,12 +15423,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // while the forward + matmul/softmax/embedding backward were all correct (see Phase_GPU_Grad_Check).
             // Convert variance → invVar here so the kernels get the inverse-std they actually consume.
             using var trueVarianceBuffer = GetOrAllocateBuffer(backend, variance);
-            using var saveVarBuffer = AllocateOutputBuffer(backend, batchSize);
+            using var saveVarBuffer = AllocateFullyWrittenOutputBuffer(backend, batchSize);
             backend.AddScalar(trueVarianceBuffer.Buffer, saveVarBuffer.Buffer, (float)epsilon, batchSize);
             backend.Sqrt(saveVarBuffer.Buffer, saveVarBuffer.Buffer, batchSize);
             backend.Reciprocal(saveVarBuffer.Buffer, saveVarBuffer.Buffer, batchSize);
 
-            var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
+            // gradGamma / gradBeta stay zero-filled: they reduce across rows, and a tuned candidate may accumulate.
+            var gradInputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
             var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
             var gradBetaBuffer = AllocateOutputBuffer(backend, normalizedSize);
             bool handedOff = false;
@@ -16818,8 +16874,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int lastDim = input.Shape._dims[^1];
-        var inputData = input.GetDataArray();
-        var biasData = bias.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var biasDataLease = bias.LeaseArray();
+        var biasData = biasDataLease.Array;
         var result = new T[input.Length];
 
         // Add bias (broadcast along last dimension)
@@ -16857,7 +16915,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -16914,7 +16973,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -17065,7 +17125,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _cachedEmbIndexCapacity = n;
         }
         if (_embIndexScratch is null || _embIndexScratch.Length < n) _embIndexScratch = new int[n];
-        var raw = indices.GetDataArray();
+        using var rawLease = indices.LeaseArray();
+        var raw = rawLease.Array;
         // Typed fast paths avoid boxing every token each step (Convert.ToInt32((object)x) on ~B*ctx elements
         // per step is heavy GC pressure). Token indices are int or long in practice.
         if (raw is int[] ir) System.Array.Copy(ir, _embIndexScratch, n);
@@ -17512,8 +17573,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Every axis of a contiguous tensor: one mean over all elements. Shape [1] whatever keepDims says,
-            // exactly as CpuEngine's full-reduction fast path returns it.
+            // Every axis of a contiguous tensor: one mean over all elements, shaped as CpuEngine's full reduction
+            // (rank 0, or every axis kept as 1 with keepDims).
             if (normalizedAxes.Length == input.Rank && input.IsContiguous && input.Length > 0)
             {
                 using var source = GetOrAllocateBuffer(backend, input);
@@ -17522,7 +17583,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     backend.MeanAxis(source.Buffer, output.Buffer, outerSize: 1, reduceSize: input.Length);
-                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, new[] { 1 });
+                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, FullReductionShape(input.Rank, keepDims));
                     handedOff = true;
                     Autodiff.DifferentiableOps.RecordUnary("ReduceMean", result, input,
                         Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { normalizedAxes, keepDims });
@@ -17666,7 +17727,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (int i = 0; i < inputRank; i++)
                 if (!reduceDimsSet.Contains(i))
                     outputShapeList.Add(inputShape[i]);
-            if (outputShapeList.Count == 0) outputShapeList.Add(1);
         }
         var outputShape = outputShapeList.ToArray();
 
@@ -17790,7 +17850,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     backend.OuterProduct(gradient.Buffer, ones, output, outerSize, reduceCount);
                     backend.Scale(output, output, 1f / reduceCount, inputSize);
-                });
+                }, fullyWritten: true);
             }
             catch (Exception ex)
             {
@@ -17842,17 +17902,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     try
                     {
                         backend.SumAxis(input.Buffer, output.Buffer, outerSize: 1, reduceSize: tensor.Length);
-                        int[] outputShape;
-                        if (keepDims)
-                        {
-                            outputShape = new int[tensor.Rank];
-                            for (int i = 0; i < outputShape.Length; i++) outputShape[i] = 1;
-                        }
-                        else
-                        {
-                            outputShape = new[] { 1 };
-                        }
-
+                        var outputShape = FullReductionShape(tensor.Rank, keepDims);
                         var result = DeferTensorResult<T>(backend, output.Buffer, 1, outputShape);
                         handedOff = true;
                         var allAxes = new int[tensor.Rank];
@@ -18058,7 +18108,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             || inputShape is null || !TryGetBackend(out var backend))
             return null;
 
-        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor yields [1]): the
+        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor is rank 0): the
         // gradient is the incoming one, reshaped and scaled.
         int inputLength = 1;
         foreach (int d in inputShape) inputLength = checked(inputLength * d);
@@ -18350,7 +18400,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1];
         }
 
-        var inputData = input.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
         var outputData = new T[input.Length];
 
         // Permute data
@@ -19110,7 +19161,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (i != axis) outputShapeList.Add(inputShape[i]);
         }
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -19147,7 +19197,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var outputShapeList = new List<int>();
         for (int i = 0; i < inputRank; i++)
             if (i != axis) outputShapeList.Add(inputShape[i]);
-        if (outputShapeList.Count == 0) outputShapeList.Add(1);
 
         return Tensor<T>.FromGpuBuffer(backend, outputBuffer, outputShapeList.ToArray(), GpuTensorRole.Activation, true);
     }
@@ -20309,7 +20358,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         IGpuBuffer? output = null;
         try
         {
-            output = backend.AllocateBuffer(a.Length);
+            output = AllocateDeviceBufferUninitialized(backend, a.Length);   // an elementwise map writes every element
             kernel(backend, residentA, residentB, output, a.Length);
             var result = DeferTensorResult<T>(backend, output, a.Length, a.Shape.ToArray());
             output = null; // ownership transferred to the deferred tensor
@@ -20513,7 +20562,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSubtract", ex); }
         return base.TensorSubtract(a, b);
     }
 
@@ -20570,7 +20619,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorDivide", ex); }
         return base.TensorDivide(a, b);
     }
 
@@ -20589,7 +20638,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorExp", ex); }
         return base.TensorExp(tensor);
     }
 
@@ -20604,7 +20653,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorLog", ex); }
         return base.TensorLog(tensor);
     }
 
@@ -20619,7 +20668,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSqrt", ex); }
         return base.TensorSqrt(tensor);
     }
 
@@ -20634,7 +20683,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAbs", ex); }
         return base.TensorAbs(tensor);
     }
 
@@ -20663,7 +20712,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorNegate", ex); }
         return base.TensorNegate(tensor);
     }
 
@@ -20682,7 +20731,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Swish", ex); }
         return base.Swish(tensor);
     }
 
@@ -20698,7 +20747,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ELU", ex); }
         return base.ELU(tensor, alpha);
     }
 
@@ -20714,7 +20763,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Softplus", ex); }
         return base.Softplus(input);
     }
 
@@ -20732,7 +20781,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSELU", ex); }
         return base.TensorSELU(tensor);
     }
 
@@ -20748,7 +20797,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorHardSigmoid", ex); }
         return base.TensorHardSigmoid(tensor);
     }
 
@@ -20764,7 +20813,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorReLU6", ex); }
         return base.TensorReLU6(tensor);
     }
 
@@ -20837,7 +20886,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ReluBackward", ex); }
         return base.ReluBackward(gradOutput, input);
     }
 
@@ -20859,7 +20908,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { rBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("SigmoidBackward", ex); }
         return base.SigmoidBackward(gradOutput, output);
     }
 
@@ -20881,7 +20930,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { rBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TanhBackward", ex); }
         return base.TanhBackward(gradOutput, output);
     }
 
@@ -20931,7 +20980,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("GeluBackward", ex); }
         return base.GeluBackward(gradOutput, input);
     }
 
@@ -20952,7 +21001,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("LeakyReluBackward", ex); }
         return base.LeakyReluBackward(gradOutput, input, negativeSlope);
     }
 
@@ -20973,7 +21022,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("SwishBackward", ex); }
         return base.SwishBackward(gradOutput, input);
     }
 
@@ -20994,7 +21043,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("MishBackward", ex); }
         return base.MishBackward(gradOutput, input);
     }
 
@@ -21015,7 +21064,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("SoftplusBackward", ex); }
         return base.SoftplusBackward(gradOutput, input);
     }
 
@@ -21036,7 +21085,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("HardswishBackward", ex); }
         return base.HardswishBackward(gradOutput, input);
     }
 
@@ -21086,7 +21135,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("HardsigmoidBackward", ex); }
         return base.HardsigmoidBackward(gradOutput, input);
     }
 
@@ -21107,7 +21156,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Relu6Backward", ex); }
         return base.Relu6Backward(gradOutput, input);
     }
 
@@ -21128,7 +21177,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ThresholdBackward", ex); }
         return base.ThresholdBackward(gradOutput, input, threshold);
     }
 
@@ -21181,7 +21230,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { giB.Dispose(); gaB.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("PReLUBackward", ex); }
         return base.PReLUBackward(gradOutput, input, alpha);
     }
 
@@ -21205,7 +21254,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("VarBackward", ex); }
         return base.VarBackward(gradOutput, input, mean, axes);
     }
 
@@ -21230,7 +21279,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { oBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("StdBackward", ex); }
         return base.StdBackward(gradOutput, input, mean, std, axes);
     }
 
@@ -21249,7 +21298,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSin", ex); }
         return base.TensorSin(tensor);
     }
 
@@ -21264,7 +21313,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorCos", ex); }
         return base.TensorCos(tensor);
     }
 
@@ -21283,7 +21332,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAsin", ex); }
         return base.TensorAsin(tensor);
     }
 
@@ -21298,7 +21347,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAcos", ex); }
         return base.TensorAcos(tensor);
     }
 
@@ -21313,7 +21362,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAtan", ex); }
         return base.TensorAtan(tensor);
     }
 
@@ -21328,7 +21377,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorAtanh", ex); }
         return base.TensorAtanh(tensor);
     }
 
@@ -21433,7 +21482,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorFloor", ex); }
         return base.TensorFloor(tensor);
     }
 
@@ -21448,7 +21497,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorCeiling", ex); }
         return base.TensorCeiling(tensor);
     }
 
@@ -21499,7 +21548,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (result != null)
                 return new Tensor<T>(result, tensor.Shape._dims);
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorRound", ex); }
         return base.TensorRound(tensor);
     }
 
@@ -21610,7 +21659,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorSign", ex); }
         return base.TensorSign(tensor);
     }
 
@@ -21646,7 +21695,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorMax", ex); }
         return base.TensorMax(a, b);
     }
 
@@ -21676,7 +21725,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorMin", ex); }
         return base.TensorMin(a, b);
     }
 
@@ -22353,7 +22402,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
             using var bufIn = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);
             var transposed = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, new[] { cols, rows });
             Autodiff.DifferentiableOps.RecordUnary("TensorTranspose", transposed, tensor, Autodiff.BackwardFunctions<T>.TransposeBackward);
@@ -22538,7 +22587,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
                 backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
-                var dst = output.GetDataArray();
+                using var dstLease = output.LeaseArray();
+                var dst = dstLease.Array;
                 DownloadGpuBufferInto(backend, bufOut, output, dst, output.Length);
             }
         }
@@ -22725,9 +22775,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
-            bufOut = AllocateOutputBuffer(backend, input.Length);
-            bufMean = AllocateOutputBuffer(backend, outerSize);
-            bufVar = AllocateOutputBuffer(backend, outerSize);
+            bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            bufMean = AllocateFullyWrittenOutputBuffer(backend, outerSize);
+            bufVar = AllocateFullyWrittenOutputBuffer(backend, outerSize);
             backend.LayerNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, outerSize, normSize, (float)epsilon);
             ConvertInverseStandardDeviationToVariance(
@@ -23209,7 +23259,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= sourceRows)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -23262,7 +23313,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -23762,6 +23814,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.TensorAddInPlace(a, b); return; }
         // Version-counter contract is enforced inside TryRunBinaryInPlace
         // (and CpuEngine's base implementation on the fallback path), so
         // tape-replay safety + GPU buffer staleness checks observe the
@@ -23773,6 +23828,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.TensorSubtractInPlace(a, b); return; }
         if (TryRunBinaryInPlace(a, b, static (backend, ia, ib, size) => backend.Subtract(ia, ib, ia, size)))
             return;
         base.TensorSubtractInPlace(a, b);
@@ -23780,6 +23838,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.TensorMultiplyInPlace(a, b); return; }
         if (TryRunBinaryInPlace(a, b, static (backend, ia, ib, size) => backend.Multiply(ia, ib, ia, size)))
             return;
         base.TensorMultiplyInPlace(a, b);
@@ -23787,6 +23848,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void SigmoidInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.SigmoidInPlace(tensor); return; }
         if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
             return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Sigmoid(buf, buf, size)))
@@ -23809,7 +23873,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.LeakyRelu(buf.Buffer, buf.Buffer, alphaF, tensor.Length);
             float[] result = backend.DownloadBuffer(buf.Buffer);
             var ops = MathHelper.GetNumericOperations<T>();
-            ops.FromFloatSpan(new ReadOnlySpan<float>(result), tensor.AsWritableSpan());
+            using var tensorKeep1 = new KeepAliveScope(tensor);
+            ops.FromFloatSpan(new ReadOnlySpan<float>(result), tensor.AsWritableSpanUnmarked());
             // Version-counter contract — same rationale as TryRunUnaryInPlace.
             tensor.IncrementVersion();
             tensor._gpuBufferVersion = tensor.GpuCacheVersion;
@@ -24089,7 +24154,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 catch { rBuf.Dispose(); throw; }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("EluBackward", ex); }
         return base.EluBackward(gradOutput, input, output, alpha);
     }
 
@@ -24252,7 +24317,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Sigmoid", ex); }
         return base.Sigmoid(tensor);
     }
 
@@ -24305,7 +24370,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("ReLU", ex); }
         return base.ReLU(tensor);
     }
 
@@ -24350,7 +24415,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("GELU", ex); }
         return base.GELU(tensor);
     }
 
@@ -24368,7 +24433,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("Mish", ex); }
         return base.Mish(tensor);
     }
 
@@ -24411,7 +24476,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return output;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("HardSwish", ex); }
         return base.HardSwish(input);
     }
 
@@ -24561,7 +24626,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int outerSize = a.Length / b.Length;
                 using var bufA = GetOrAllocateBuffer(backend, a);
                 using var bufB = GetOrAllocateBuffer(backend, b);
-                var bufOut = AllocateOutputBuffer(backend, a.Length);
+                var bufOut = AllocateFullyWrittenOutputBuffer(backend, a.Length);
                 backend.BroadcastAddLast(bufA.Buffer, bufB.Buffer, bufOut.Buffer, outerSize, b.Length);
                 var output = DeferTensorResult<T>(backend, bufOut.Buffer, a.Length, a.Shape.ToArray());
                 return RecordGpuResult(output);
@@ -25025,7 +25090,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexData = contiguousIndices.GetDataArray();
+                using var indexDataLease = contiguousIndices.LeaseArray();
+                var indexData = indexDataLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new IndexOutOfRangeException(
@@ -25408,6 +25474,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void ReLUInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.ReLUInPlace(tensor); return; }
         if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
             return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Relu(buf, buf, size)))
@@ -26284,7 +26353,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var input = UploadTensorRaw(backend, tensor);
-            output = backend.AllocateBuffer(total);
+            output = AllocateDeviceBufferUninitialized(backend, total);   // every route below writes all of it
             int segment = length[tensor.Rank - 1];
             int rows = total / segment;
             if (TryLastAxisOnlySlice(backend, input, output, tensor, start, length, rows, segment))
@@ -26341,7 +26410,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Fast path of <see cref="TryDeviceRectSlice{T}"/> for the common case where only the LAST axis is narrowed
     /// (every leading axis taken in full): the source is a [rows, D] matrix and the result is columns
     /// [start, start + width). Uses O(width) single-launch kernels instead of one device copy per row:
-    /// width 1 is one strided gather; start 0 is one row-prefix copy; otherwise each column is gathered
+    /// width 1 is one strided gather; start 0 is one row-prefix copy, as is any start on a backend with buffer views
+    /// (a row copy from a view offset by the start); otherwise each column is gathered
     /// (width launches) into a [width, rows] buffer and transposed once into [rows, width]. All of these are
     /// IDirectGpuBackend kernels, so the fast path stays recordable.
     /// </summary>
@@ -26363,6 +26433,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (first == 0)
         {
             backend.CopyRows(input, output, full, width, rows, width);
+            return true;
+        }
+
+        // #1106: a window starting at column `first` is a row copy from a view offset by `first` -- one launch. (The
+        // column gather below issued 2 * width + 1 launches: splitting a fused [rows, 3 * D] QKV projection with
+        // D = 64 cost 128 kernel launches + device copies per transformer step.) Reads stay in bounds: the last is
+        // (rows - 1) * full + first + width - 1 < rows * full.
+        if (backend is IGpuBufferViews views && views.TryCreateView(input, first, input.Size - first) is { } window)
+        {
+            backend.CopyRows(window, output, full, width, rows, width);
             return true;
         }
 
@@ -26539,7 +26619,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     outputShape.Add(input.Shape._dims[d]);
                 }
             }
-            if (outputShape.Count == 0) outputShape.Add(1);
 
             using var inputBuffer = GetOrAllocateBuffer(backend, reductionInput);
             using var valuesBuffer = AllocateOutputBuffer(backend, outerSize);
@@ -27839,7 +27918,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("StopGradient", ex); }
         return base.StopGradient(tensor);
     }
 
@@ -27874,7 +27953,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearReLU", ex); }
         return base.FusedLinearReLU(input, weight, bias);
     }
 
@@ -27902,7 +27981,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearSigmoid", ex); }
         return base.FusedLinearSigmoid(input, weight, bias);
     }
 
@@ -27930,7 +28009,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearTanh", ex); }
         return base.FusedLinearTanh(input, weight, bias);
     }
 
@@ -27958,7 +28037,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearGELU", ex); }
         return base.FusedLinearGELU(input, weight, bias);
     }
 
@@ -27986,7 +28065,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return DeferTensorResult<T>(backend, go, batchSize * outFeatures, new[] { batchSize, outFeatures });
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("FusedLinearSwish", ex); }
         return base.FusedLinearSwish(input, weight, bias);
     }
 
@@ -28011,7 +28090,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorIoULoss", ex); }
         return base.TensorIoULoss(predicted, target);
     }
 
@@ -28036,7 +28115,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorGIoULoss", ex); }
         return base.TensorGIoULoss(predicted, target);
     }
 
@@ -28061,7 +28140,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorDIoULoss", ex); }
         return base.TensorDIoULoss(predicted, target);
     }
 
@@ -28086,7 +28165,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return result;
             }
         }
-        catch { }
+        catch (System.Exception ex) { GpuLaunchProbe.OnFallback("TensorCIoULoss", ex); }
         return base.TensorCIoULoss(predicted, target);
     }
 
@@ -28137,20 +28216,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // --- Native Complex<T> GPU overrides ---
     // Decomposes Tensor<Complex<T>> to split real/imag GPU buffers,
     // dispatches via IDirectGpuBackend.SplitComplex*, recomposes result.
-
-    private static (float[] real, float[] imag) DecomposeComplex<T>(Tensor<Complex<T>> tensor)
-    {
-        var ops = MathHelper.GetNumericOperations<T>();
-        int n = tensor.Length;
-        var real = new float[n];
-        var imag = new float[n];
-        for (int i = 0; i < n; i++)
-        {
-            real[i] = (float)ops.ToDouble(tensor[i].Real);
-            imag[i] = (float)ops.ToDouble(tensor[i].Imaginary);
-        }
-        return (real, imag);
-    }
 
     /// <summary>
     /// Creates a logical complex tensor whose physical GPU buffer contains two
@@ -28256,21 +28321,52 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        var (hostReal, hostImaginary) = DecomposeComplex(tensor);
-        IGpuBuffer? uploadedReal = null;
-        IGpuBuffer? uploadedImaginary = null;
+        // A host complex tensor goes up ONCE, interleaved as it is laid out, and is split into the real and imaginary
+        // planes by the device's deinterleave kernel. Splitting it on the host first (two passes through the
+        // per-element indexer and two uploads) left the work of every complex op on a host input on the CPU -- the
+        // GPU residency probe saw TensorReal / TensorImag launch no kernel at all (#1112).
+        var interleaved = InterleaveComplexHost(tensor);
+        IGpuBuffer? uploaded = null;
+        IGpuBuffer? deviceReal = null;
+        IGpuBuffer? deviceImaginary = null;
         try
         {
-            uploadedReal = backend.AllocateBuffer(hostReal);
-            uploadedImaginary = backend.AllocateBuffer(hostImaginary);
-            return (new OwnedBuffer(uploadedReal, true), new OwnedBuffer(uploadedImaginary, true));
+            uploaded = backend.AllocateBuffer(interleaved);
+            deviceReal = backend.AllocateBuffer(n);
+            deviceImaginary = backend.AllocateBuffer(n);
+            backend.DeinterleaveComplex(uploaded, deviceReal, deviceImaginary, n);
+            return (new OwnedBuffer(deviceReal, true), new OwnedBuffer(deviceImaginary, true));
         }
         catch
         {
-            uploadedReal?.Dispose();
-            uploadedImaginary?.Dispose();
+            deviceReal?.Dispose();
+            deviceImaginary?.Dispose();
             throw;
         }
+        finally
+        {
+            // The deinterleave kernel may still be queued: release the upload only after that work (the legacy
+            // buffer pool would otherwise hand the allocation to the next request while the kernel still reads it).
+            if (uploaded is not null) DisposeBufferAfterQueuedUse(backend, uploaded);
+        }
+    }
+
+    /// <summary>
+    /// The tensor's logical elements as interleaved float32 (re, im) pairs -- the per-element conversion the former host split
+    /// used (ToDouble, then float), read through one logical-order pass.
+    /// </summary>
+    private static float[] InterleaveComplexHost<T>(Tensor<Complex<T>> tensor)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var source = tensor.GetFlattenedData();
+        int n = tensor.Length;
+        var interleaved = new float[2 * n];
+        for (int i = 0; i < n; i++)
+        {
+            interleaved[2 * i] = (float)ops.ToDouble(source[i].Real);
+            interleaved[2 * i + 1] = (float)ops.ToDouble(source[i].Imaginary);
+        }
+        return interleaved;
     }
 
     private static int[] NormalizeFftAxes(int[] axes, int rank)

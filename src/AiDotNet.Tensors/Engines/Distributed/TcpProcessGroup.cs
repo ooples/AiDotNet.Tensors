@@ -267,7 +267,8 @@ public sealed class TcpProcessGroup : IProcessGroup
                     // Coord receives root's tensor, fans it out, also overwrites our own copy.
                     ExpectOpcode(_clientStreams![root], OP_BROADCAST);
                     var rootArr = ReadTensorArray<T>(_clientStreams![root], tensor.Length);
-                    rootArr.AsSpan().CopyTo(tensor.AsWritableSpan());
+                    using var tensorKeep1 = new KeepAliveScope(tensor);
+                    rootArr.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
                     for (int r = 1; r < WorldSize; r++)
                     {
                         if (r == root) continue;
@@ -288,7 +289,8 @@ public sealed class TcpProcessGroup : IProcessGroup
                 {
                     ExpectOpcode(_coordStream!, OP_BROADCAST);
                     var arr = ReadTensorArray<T>(_coordStream!, tensor.Length);
-                    arr.AsSpan().CopyTo(tensor.AsWritableSpan());
+                    using var tensorKeep2 = new KeepAliveScope(tensor);
+                    arr.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
                 }
             }
         }
@@ -325,7 +327,8 @@ public sealed class TcpProcessGroup : IProcessGroup
                 WriteTensorPayload(_coordStream!, tensor);
                 ExpectOpcode(_coordStream!, OP_ALL_REDUCE);
                 var arr = ReadTensorArray<T>(_coordStream!, tensor.Length);
-                arr.AsSpan().CopyTo(tensor.AsWritableSpan());
+                using var tensorKeep4 = new KeepAliveScope(tensor);
+                arr.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
             }
         }
     }
@@ -434,7 +437,8 @@ public sealed class TcpProcessGroup : IProcessGroup
                 if (tagAdvertised != tag)
                     throw new InvalidOperationException($"Tag mismatch: expected {tag}, got {tagAdvertised}.");
                 var arr = ReadTensorArray<T>(_clientStreams![src], tensor.Length);
-                arr.AsSpan().CopyTo(tensor.AsWritableSpan());
+                using var tensorKeep5 = new KeepAliveScope(tensor);
+                arr.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
             }
             else
             {
@@ -446,7 +450,8 @@ public sealed class TcpProcessGroup : IProcessGroup
                 if (tagAdvertised != tag)
                     throw new InvalidOperationException($"Tag mismatch: expected {tag}, got {tagAdvertised}.");
                 var arr = ReadTensorArray<T>(_coordStream!, tensor.Length);
-                arr.AsSpan().CopyTo(tensor.AsWritableSpan());
+                using var tensorKeep6 = new KeepAliveScope(tensor);
+                arr.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
             }
         }
     }
@@ -521,7 +526,8 @@ public sealed class TcpProcessGroup : IProcessGroup
     private static T[] ToArrayCopy<T>(Tensor<T> t)
     {
         var arr = new T[t.Length];
-        t.AsSpan().CopyTo(arr);
+        using var tKeep1 = new KeepAliveScope(t);
+        t.AsSpanUnmarked().CopyTo(arr);
         return arr;
     }
 
@@ -619,7 +625,8 @@ public sealed class TcpProcessGroup : IProcessGroup
     private static void WriteTensorPayload<T>(Stream s, Tensor<T> tensor)
     {
         WriteInt32(s, tensor.Length);
-        WritePayloadCore(s, tensor.AsSpan());
+        using var tensorKeep7 = new KeepAliveScope(tensor);
+        WritePayloadCore(s, tensor.AsSpanUnmarked());
         s.Flush();
     }
 

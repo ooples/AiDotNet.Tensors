@@ -28,4 +28,6 @@ internal sealed class VectorDeviceState
 
     /// <summary>Int data stored as raw int32 rather than numeric floats.</summary>
     internal bool ContainsRawInt32;
+    // Two raw 32-bit words per element: an int64 value (narrower and unsigned integer types widened to it) (#1135).
+    internal bool ContainsRawInt64;
 }

@@ -189,6 +189,10 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
 {
     private readonly VulkanDevice _device;
     private IntPtr _descriptorSetLayout;
+    private Action? _pendingBatchFlush;
+
+    /// <summary>What the launch journal calls this pipeline (#996).</summary>
+    internal string Name { get; set; } = "vulkan-pipeline";
     private IntPtr _pipelineLayout;
     private IntPtr _pipeline;
     private IntPtr _descriptorPool;
@@ -420,6 +424,12 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
         return result == VulkanNativeBindings.VK_SUCCESS && _descriptorSet != IntPtr.Zero;
     }
 
+    /// <summary>Marks this pipeline as recorded in a pending batch; <paramref name="flush"/> submits that batch.</summary>
+    internal void MarkRecordedInBatch(Action flush) => _pendingBatchFlush = flush;
+
+    /// <summary>Clears the mark once the batch that recorded this pipeline has been submitted.</summary>
+    internal void ClearBatchMark() => _pendingBatchFlush = null;
+
     /// <summary>
     /// Updates the descriptor set with buffer bindings.
     /// </summary>
@@ -438,6 +448,10 @@ public sealed unsafe class VulkanComputePipeline : IDisposable
                 "All bindings must be provided to avoid undefined behavior.",
                 nameof(buffers));
         }
+
+        // A dispatch recorded into a pending batch reads this set when the batch is submitted, so rebinding
+        // it now would retarget that dispatch. Submit the batch first.
+        _pendingBatchFlush?.Invoke();
 
         lock (_dispatchLock)
         {

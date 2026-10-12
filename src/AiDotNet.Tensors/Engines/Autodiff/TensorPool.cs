@@ -70,7 +70,8 @@ public static class TensorPool<T>
         var tensor = Rent(shape);
         // One vectorised fill. The per-element indexer + virtual numOps.Zero loop this replaced was 14% of a
         // CPU CNN training step, through every backward function that rents a zeroed gradient.
-        tensor.AsWritableSpan().Fill(Helpers.MathHelper.GetNumericOperations<T>().Zero);
+        using var tensorKeep1 = new KeepAliveScope(tensor);
+        tensor.AsWritableSpanUnmarked().Fill(Helpers.MathHelper.GetNumericOperations<T>().Zero);
         return tensor;
     }
 

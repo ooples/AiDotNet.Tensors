@@ -221,6 +221,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         view._gpuBackend = _gpuBackend;
         view._gpuBufferIsSplitComplex = _gpuBufferIsSplitComplex;
         view._gpuBufferContainsRawInt32 = _gpuBufferContainsRawInt32;
+        view._gpuBufferContainsRawInt64 = _gpuBufferContainsRawInt64;
         view._gpuRole = _gpuRole;
         view._ownsGpuBuffer = false;
         view._gpuMaterializerCallback = _gpuMaterializerCallback;
@@ -343,7 +344,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 result,
                 (_, output) =>
                 {
-                    CopyTo(output.AsWritableSpan());
+                    using var outputKeep1 = new KeepAliveScope(output);
+                    CopyTo(output.AsWritableSpanUnmarked());
                     output.IncrementVersion();
                 },
                 backward,
@@ -500,6 +502,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // the current strided source offset incrementally — no divisions at
         // all on the hot path.
         if (Rank == 0 || Length == 0) return FinalizeContiguousCopy(result);
+        // Large views: tiled / row-chunked copy across threads straight between the backing arrays (#653).
+        // (On one thread the span walk below is faster than the tiled copy.)
+        if (Length >= ParallelStridedCopyMinElements && Helpers.CpuParallelSettings.MaxDegreeOfParallelism > 1
+            && GetCpuBackingForStridedRead(out int srcBase) is { } srcArr
+            && result.GetCpuBackingForContiguousWrite(out int dstBase) is { } dstArr)
+        {
+            CopyStridedToRowMajorParallel(srcArr, srcBase, _shape, _strides, dstArr, dstBase);   // srcBase already includes the view offset
+            return FinalizeContiguousCopy(result);
+        }
         // Run-wise: block copies (or tight strided loops) per innermost run instead of an odometer step per element.
         CopyStridedToRowMajor(_data.AsSpan(), _storageOffset, _shape, _strides, dstSpan);
         return FinalizeContiguousCopy(result);
@@ -851,9 +862,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <param name="dimensions">The tensor shape.</param>
     /// <param name="pooledArray">The original array rented from ArrayPool (may be larger than memory).</param>
     /// <returns>A tensor backed by pooled memory.</returns>
-    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray)
+    // track: false for an array that came back from the thread cache. It is in an explicit-return cycle, so tracking
+    // its result buys nothing and cost a registration (owner, weak handle, locked map insert) plus an unregistration
+    // per call: about 1-2 us on a 1M-element subtract + Return loop. A result the caller drops instead is not lost to
+    // recycling: its array is collected, the next rent misses the cache, and that result (from the free list or fresh)
+    // is tracked as usual.
+    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray, bool track = true)
     {
         var vector = Vector<T>.FromMemory(memory);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this tensor, its views (which share this vector through the storage) and any zero-copy wraps has been collected.
+        if (track) vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         var tensor = new Tensor<T>(vector, dimensions);
         tensor._pooledArray = pooledArray;
         return tensor;
@@ -897,7 +916,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Use vectorized Copy operation to copy entire matrix data at once (5-10x faster than nested loops)
         // Matrix is stored in row-major order, which matches tensor storage
-        _numOps.Copy(matrix.AsSpan(), _data.AsWritableSpan());
+        using var matrixKeep1 = new KeepAliveScope(matrix);
+        _numOps.Copy(matrix.AsSpanUnmarked(), _data.AsWritableSpan());
     }
 
     /// <summary>
@@ -986,7 +1006,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     private void SetElementAt(int storageIndex, T value)
     {
         EnsureOwnedForWrite();
-        _storage.AsWritableSpan()[storageIndex] = value;
+        using var storageKeep1 = new KeepAliveScope(_storage);
+        _storage.AsWritableSpanUnmarked()[storageIndex] = value;
         IncrementVersion();
     }
 
@@ -1447,7 +1468,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 int offset = i * rowLength;
                 var sourceRow = srcSpan.Slice(offset, rowLength);
                 var destRow = destSpan.Slice(offset, rowLength);
-                _numOps.Add(sourceRow, vector.AsSpan(), destRow);
+                using var vectorKeep1 = new KeepAliveScope(vector);
+                _numOps.Add(sourceRow, vector.AsSpanUnmarked(), destRow);
             }
             return result;
         }
@@ -1469,7 +1491,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                     int offset = i * sliceSize + j * lastDimLength;
                     var sourceSlice = srcSpan.Slice(offset, lastDimLength);
                     var destSlice = destSpan.Slice(offset, lastDimLength);
-                    _numOps.Add(sourceSlice, vector.AsSpan(), destSlice);
+                    using var vectorKeep2 = new KeepAliveScope(vector);
+                    _numOps.Add(sourceSlice, vector.AsSpanUnmarked(), destSlice);
                 }
             }
             return result;
@@ -1561,7 +1584,16 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         EnsureMaterialized();
         EnsureOwnedForWrite();
-        _numOps.Fill(_data.AsWritableSpan(), value);
+        // Only this tensor's elements. Filling the whole data vector also overwrote every other view of the storage
+        // (a row of a matrix filled the matrix), and a strided view filled the elements between its own.
+        if (IsContiguous)
+        {
+            _numOps.Fill(AsWritableSpan(), value);
+        }
+        else
+        {
+            FillStridedElements(value);   // one ownership check (above) and one version bump (below), not one per element
+        }
         IncrementVersion();
         UniformFillValue = _numOps.ToDouble(value);
     }
@@ -1642,7 +1674,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         var src = IsContiguous ? this : Contiguous();
         var result = TensorAllocator.Rent<T>(this._shape);
-        _numOps.MultiplyScalar(src.AsSpan(), factor, result._data.AsWritableSpan());
+        using var srcKeep1 = new KeepAliveScope(src);
+        _numOps.MultiplyScalar(src.AsSpanUnmarked(), factor, result._data.AsWritableSpan());
         return result;
     }
 
@@ -1968,7 +2001,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 if (typeof(T) == typeof(float))
                 {
                     var s = (float[])(object)GetDataArray();
-                    var r = (float[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (float[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         float acc = 0f;
@@ -1983,7 +2017,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 else
                 {
                     var s = (double[])(object)GetDataArray();
-                    var r = (double[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (double[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         double acc = 0d;
@@ -2004,7 +2039,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(float))
             {
                 var s = (float[])(object)GetDataArray();
-                var r = (float[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (float[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2020,7 +2056,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(double))
             {
                 var s = (double[])(object)GetDataArray();
-                var r = (double[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (double[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2036,7 +2073,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             // Generic T: still allocation-free / indexer-free; only Add is virtual.
             var src = AsSpan();
-            var rArr = result.GetDataArray();
+            using var rArrLease = result.LeaseArray();
+            var rArr = rArrLease.Array;
             for (int i = 0; i < len; i++)
             {
                 rArr[outFlat] = _numOps.Add(rArr[outFlat], src[i]);
@@ -2082,7 +2120,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         var result = new Vector<T>(length);
         var sourceSpan = _data.AsSpan().Slice(start, length);
-        var destSpan = result.AsWritableSpan();
+        using var destSpanLease = result.LeaseWritable();
+        var destSpan = destSpanLease.Span;
         _numOps.Copy(sourceSpan, destSpan);
         return result;
     }
@@ -3565,16 +3604,62 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <param name="role">The GPU memory management role for allocation decisions.</param>
     /// <param name="ownsBuffer">If true, the tensor owns the buffer lifetime.</param>
     /// <returns>A GPU-resident Tensor with deferred CPU synchronization.</returns>
+    /// <summary>True for the element types the GPU engine stores as raw int64 words (#1135).</summary>
+    internal static bool IsRawInt64Element()
+        => typeof(T) == typeof(long) || typeof(T) == typeof(ulong) || typeof(T) == typeof(short)
+           || typeof(T) == typeof(ushort) || typeof(T) == typeof(sbyte) || typeof(T) == typeof(byte) || typeof(T) == typeof(uint);
+
+    /// <summary>Widens elements to the raw int64 device layout (ulong keeps its bits).</summary>
+    internal static long[] ToRawInt64(T[] values)
+    {
+        var result = new long[values.Length];
+        if (typeof(T) == typeof(long)) Array.Copy((long[])(object)values, result, values.Length);
+        else if (typeof(T) == typeof(ulong)) System.Buffer.BlockCopy((ulong[])(object)values, 0, result, 0, values.Length * sizeof(long));
+        else if (typeof(T) == typeof(short)) { var s = (short[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(ushort)) { var s = (ushort[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(sbyte)) { var s = (sbyte[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(byte)) { var s = (byte[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else if (typeof(T) == typeof(uint)) { var s = (uint[])(object)values; for (int i = 0; i < s.Length; i++) result[i] = s[i]; }
+        else throw new NotSupportedException($"{typeof(T).Name} has no raw int64 device layout.");
+        return result;
+    }
+
+    /// <summary>Narrows raw int64 values (unchecked) to the element type.</summary>
+    internal static T[] FromRawInt64(long[] values)
+    {
+        if (typeof(T) == typeof(long)) return (T[])(object)values;
+        if (typeof(T) == typeof(ulong))
+        {
+            var u = new ulong[values.Length];
+            System.Buffer.BlockCopy(values, 0, u, 0, values.Length * sizeof(long));
+            return (T[])(object)u;
+        }
+        unchecked
+        {
+            if (typeof(T) == typeof(short)) { var r = new short[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (short)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(ushort)) { var r = new ushort[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (ushort)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(sbyte)) { var r = new sbyte[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (sbyte)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(byte)) { var r = new byte[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (byte)values[i]; return (T[])(object)r; }
+            if (typeof(T) == typeof(uint)) { var r = new uint[values.Length]; for (int i = 0; i < r.Length; i++) r[i] = (uint)values[i]; return (T[])(object)r; }
+        }
+        throw new NotSupportedException($"{typeof(T).Name} has no raw int64 device layout.");
+    }
+
     internal static Tensor<T> FromGpuBuffer(
         Engines.DirectGpu.IDirectGpuBackend backend,
         Engines.DirectGpu.IGpuBuffer buffer,
         int[] shape,
         Engines.Gpu.GpuTensorRole role = Engines.Gpu.GpuTensorRole.General,
         bool ownsBuffer = true,
-        bool bufferContainsRawInt32 = false)
+        bool bufferContainsRawInt32 = false,
+        bool bufferContainsRawInt64 = false)
     {
         if (bufferContainsRawInt32 && typeof(T) != typeof(int))
             throw new ArgumentException("Raw int32 GPU storage is only valid for Tensor<int>.", nameof(bufferContainsRawInt32));
+        if (bufferContainsRawInt64 && !IsRawInt64Element())
+            throw new ArgumentException(
+                "Raw int64 GPU storage is only valid for long, ulong, short, ushort, sbyte, byte and uint tensors.",
+                nameof(bufferContainsRawInt64));
 
         var tensor = new Tensor<T>(shape, backend.DeviceType);
         tensor._gpuBuffer = buffer;
@@ -3582,6 +3667,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         tensor._gpuBufferVersion = tensor.GpuCacheVersion;
         tensor._gpuRole = role;
         tensor._gpuBufferContainsRawInt32 = bufferContainsRawInt32;
+        tensor._gpuBufferContainsRawInt64 = bufferContainsRawInt64;
         if (ownsBuffer)
             tensor._storage.AttachGpuBufferOwner(buffer);
         tensor._ownsGpuBuffer = false;
@@ -3598,6 +3684,17 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         Action<object> materializeCallback = _ =>
         {
             var downloaded = capturedBackend.DownloadBuffer(capturedBuffer);
+            if (bufferContainsRawInt64)
+            {
+                // Two raw words per element: the int64 value, narrowed (unchecked) to the element type.
+                if (downloaded.Length < 2L * capturedLength)
+                    throw new InvalidOperationException(
+                        $"GPU buffer returned {downloaded.Length} words for a {capturedLength}-element int64 tensor.");
+                var longs = new long[capturedLength];
+                System.Buffer.BlockCopy(downloaded, 0, longs, 0, capturedLength * sizeof(long));
+                capturedVector.MaterializeBacking(FromRawInt64(longs));
+                return;
+            }
             var floatData = downloaded;
             if (downloaded.Length != capturedLength)
             {
@@ -3646,7 +3743,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// For GPU-resident tensors, this triggers synchronization and data download.
     /// For CPU-resident tensors, this returns the backing array directly.
     /// </summary>
-    public T[] GetCpuData()
+    internal T[] GetCpuData()
     {
         if (IsGpuResident)
         {
@@ -4153,8 +4250,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             {
                 var biasResult = Helpers.AutoTensorCache.RentOrAllocate<T>(_shape);
                 var aData = GetDataArray();
-                var bData = other.GetDataArray();
-                var rData = biasResult.GetDataArray();
+                using var bDataLease = other.LeaseArray();
+                var bData = bDataLease.Array;
+                using var rDataLease = biasResult.LeaseArray();
+                var rData = rDataLease.Array;
                 // Specialize for float to avoid interface dispatch in tight loop.
                 // #319 SIMD: per-row bias-add was a scalar loop on the hot path
                 // (TransformerBlock benchmark measured 711 µs/call at [197, 768]
@@ -4907,6 +5006,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // int32 bits. See the note on the same pair in Gpu() below.
         _gpuBufferIsSplitComplex = false;
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
         _gpuDeviceIndex = deviceInfo.Index;
         _device = deviceInfo.Type;
         _gpuBufferVersion = GpuCacheVersion; // filled from the current host data, so in sync (see Gpu())
@@ -4973,6 +5073,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // consumer unconverted, and index 3 would arrive as 0x40400000.
         _gpuBufferIsSplitComplex = false;
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
         // Tag the freshly-uploaded buffer with the CURRENT tensor version. The buffer was just filled from this
         // tensor's host data, so it IS in sync — but every version-gated resident-buffer consumer
         // (GetOrAllocateBuffer / GetWeightBufferPreferResident: `_gpuBufferVersion == GpuCacheVersion`) leaves
@@ -5022,6 +5123,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         {
             _gpuBufferIsSplitComplex = false;
             _gpuBufferContainsRawInt32 = false;
+            _gpuBufferContainsRawInt64 = false;
             _device = TensorDevice.CPU;
             return this;
         }
@@ -5061,6 +5163,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // the markers that described its encoding must not survive into the next upload.
         _gpuBufferIsSplitComplex = false;
         _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
         _device = TensorDevice.CPU;
         return this;
     }

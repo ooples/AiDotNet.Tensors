@@ -38,7 +38,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// null so IDirectGpuBackend's mixed-precision discovery surface
     /// (Issue #337) correctly reports the capability as absent.
     /// </summary>
-    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
     private IntPtr _stream;
     private HipStream? _defaultStream;
@@ -565,6 +564,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile Neural Net kernels
             CompileKernelModule(HipNeuralNetKernels.GetSource(), "neural_net", ref _neuralNetModule,
                 HipNeuralNetKernels.GetKernelNames());
+
+            // IGpuBatchExecution (#1142): precise math, so min |x| can start at INFINITY.
+            CompileKernelModule(BatchExecutionCudaKernels.GetSource(), "batch_execution", ref _batchExecutionModule,
+                BatchExecutionCudaKernels.GetKernelNames(), useFastMath: false);
 
             // Categorical sampling: its own module, and NOT fast-math. Sharing the neural-net
             // module would make every kernel in it hostage to this one compiling, and fast math
@@ -1487,7 +1490,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <summary>
     /// Allocates an uninitialized device buffer for kernels that overwrite every element.
     /// </summary>
-    private IGpuBuffer AllocateBufferUninitialized(int size)
+    public IGpuBuffer AllocateBufferUninitialized(int size)
     {
         IntPtr devicePtr = IntPtr.Zero;
         long sizeInBytes = (long)size * sizeof(float);
@@ -10212,44 +10215,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         uint gridDimX = (uint)((M + tileM - 1) / tileM);
         uint gridDimY = (uint)((N + tileN - 1) / tileN);
 
-        IntPtr[] kernelArgs = new IntPtr[8];
-            {
-            var argA = bufferA.Handle;
-            var argB = bufferB.Handle;
-            var argC = bufferC.Handle;
-            void** args = stackalloc void*[8];
-            args[0] = &argA;
-            args[1] = &argB;
-            args[2] = &argC;
-            args[3] = &M;
-            args[4] = &N;
-            args[5] = &K;
-            args[6] = &alpha;
-            args[7] = &beta;
-
-            for (int i = 0; i < 8; i++)
-            {
-            }
-
-            GCHandle kernelParamsHandle = GCHandle.Alloc(kernelArgs, GCHandleType.Pinned);
-            try
-            {
-                var result = HipNativeBindings.hipModuleLaunchKernel(
-                    kernel,
-                    gridDimX, gridDimY, 1,
-                    (uint)blockSize, 1, 1,
-                    0,
-                    stream,
-                    kernelParamsHandle.AddrOfPinnedObject(),
-                    IntPtr.Zero);
-
-                HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
-            }
-            finally
-            {
-                kernelParamsHandle.Free();
-            }
-            }
+        // Launch with the argument pointers it fills. This used to pass a separate, never-filled IntPtr[8], so every
+        // kernel argument was a null pointer and GemmAsync crashed the process with an access violation.
+        IntPtr argA = bufferA.Handle, argB = bufferB.Handle, argC = bufferC.Handle;
+        void** args = stackalloc void*[8];
+        args[0] = &argA;
+        args[1] = &argB;
+        args[2] = &argC;
+        args[3] = &M;
+        args[4] = &N;
+        args[5] = &K;
+        args[6] = &alpha;
+        args[7] = &beta;
+        var result = HipNativeBindings.hipModuleLaunchKernel(
+            kernel,
+            gridDimX, gridDimY, 1,
+            (uint)blockSize, 1, 1,
+            0, stream,
+            (IntPtr)args,
+            IntPtr.Zero);
+        HipNativeBindings.CheckError(result, "hipModuleLaunchKernel");
 
         if (synchronize)
         {
@@ -11412,6 +11397,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _categoricalModule = IntPtr.Zero;
         }
 
+        if (_batchExecutionModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_batchExecutionModule);
+            _batchExecutionModule = IntPtr.Zero;
+        }
         if (_neuralNetModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_neuralNetModule);
@@ -12450,6 +12440,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal HipBackend OwningBackend { get; }
     private readonly Action<HipGpuBuffer>? _returnToPool;
     private int _poolState;
+    private readonly IGpuBuffer? _viewParent;
 
     /// <summary>Frees of HIP buffers collected without Dispose, run by the backend's next allocation.</summary>
     internal static readonly DeviceFreeQueue PendingFrees = new();
@@ -12467,6 +12458,19 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         _returnToPool = returnToPool;
     }
 
+    private HipGpuBuffer(IntPtr handle, int size, HipBackend owningBackend, IGpuBuffer viewParent)
+        : this(handle, size, owningBackend)
+    {
+        _viewParent = viewParent;
+    }
+
+    /// <summary>
+    /// A non-owning view into <paramref name="parent"/>'s allocation at <paramref name="handle"/>: never pooled or
+    /// freed, and it holds the parent so the parent's memory outlives it.
+    /// </summary>
+    internal static HipGpuBuffer CreateView(IGpuBuffer parent, IntPtr handle, int size, HipBackend owningBackend)
+        => new HipGpuBuffer(handle, size, owningBackend, parent);
+
     public void MarkRented(int size)
     {
         if (size <= 0 || size > Capacity)
@@ -12477,6 +12481,13 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     public void Release()
     {
+        if (_viewParent is not null)
+        {
+            Interlocked.Exchange(ref _poolState, 2);
+            GC.SuppressFinalize(this);
+            return;
+        }
+
         if (Interlocked.Exchange(ref _poolState, 2) == 2)
             return;
 
@@ -12519,6 +12530,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     // its device memory through the queue.
     ~HipGpuBuffer()
     {
+        if (_viewParent is not null) return; // a view owns no device memory
         if (_returnToPool is { } returnToPool && Handle != IntPtr.Zero && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
         {
             IntPtr pooledHandle = Handle;

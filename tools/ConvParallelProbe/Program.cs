@@ -10,7 +10,7 @@ using AiDotNet.Tensors.LinearAlgebra;
 // #642 P0 verification: time a single 3x3 stride-1 pad-1 Conv2D (the SD-UNet resblock
 // conv, routed through FusedConvHelper.Conv2DFused) at a chosen MaxDegreeOfParallelism.
 // Sweep maxdop=1..N: speedup/N = parallel efficiency = core utilization for that shape.
-internal static class Program
+internal static partial class Program
 {
     private static int Main(string[] args)
     {
@@ -58,6 +58,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--intoaudit") return RunIntoAudit(eng, args);
         if (args.Length > 0 && args[0] == "--resblockops") return RunResBlockOps(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
+        if (args.Length > 0 && args[0] == "--ops") return RunOps(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
         if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);

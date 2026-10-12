@@ -1,0 +1,174 @@
+{
+  "schemaVersion": 1,
+  "device": "vulkan:Radeon RX 5500 XT",
+  "entries": [
+    {
+      "op": "Softmax",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes16",
+      "speedup": 2.636
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes16",
+      "speedup": 6.367
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes8",
+      "speedup": 2.204
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.softmax.lanes32",
+      "speedup": 2.281
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes32",
+      "speedup": 3.265
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes32",
+      "speedup": 8.863
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes16",
+      "speedup": 3.063
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.softmax_backward.lanes16",
+      "speedup": 2.725
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes16",
+      "speedup": 18.978
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes16",
+      "speedup": 25.375
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes16",
+      "speedup": 20.042
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes16",
+      "speedup": 21.416
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes16",
+      "speedup": 17.933
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 29.252
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes8",
+      "speedup": 16.116
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 19.123
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 25.046
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:1024x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 21.1
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 22.444
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 18.709
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:32x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:128x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x1x28x28x16x3x3x1x1x1x1x1x1x28x28",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    },
+    {
+      "op": "Conv2DForward",
+      "shape": "f32:64x16x14x14x32x3x3x1x1x1x1x1x1x14x14",
+      "deterministic": true,
+      "candidate": "vulkan.conv2d.direct",
+      "speedup": 1
+    }
+  ]
+}

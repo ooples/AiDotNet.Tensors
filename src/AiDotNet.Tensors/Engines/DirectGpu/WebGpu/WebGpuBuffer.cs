@@ -37,6 +37,9 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     private readonly int _elementCount;
     private readonly WebGpuBufferUsage _usage;
     private int _disposedFlag;
+    private readonly int _offsetBytes;
+    // A view keeps its parent reachable, so the parent's finalizer cannot destroy memory the view still addresses.
+    private readonly WebGpuBuffer? _viewParent;
     private bool _disposed => System.Threading.Volatile.Read(ref _disposedFlag) != 0;
 
     /// <summary>Frees of WebGPU buffers collected without Dispose, run by the next allocation.</summary>
@@ -46,6 +49,12 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     /// Gets the buffer handle ID.
     /// </summary>
     public int BufferId => _bufferId;
+
+    /// <summary>Byte offset of this buffer's first element in <see cref="BufferId"/>: zero except for a view.</summary>
+    public int OffsetBytes => _offsetBytes;
+
+    /// <summary>True when this buffer is a view into another buffer's memory (see <see cref="IGpuBufferViews"/>).</summary>
+    internal bool IsView => _viewParent is not null;
 
     /// <summary>
     /// Gets the buffer size in bytes.
@@ -65,7 +74,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     /// <summary>
     /// Gets whether this buffer is valid for use.
     /// </summary>
-    public bool IsValid => _bufferId >= 0 && !_disposed;
+    public bool IsValid => _bufferId >= 0 && !_disposed && (_viewParent is null || _viewParent.IsValid);
 
     /// <summary>
     /// Gets the number of elements in the buffer (IGpuBuffer implementation).
@@ -120,6 +129,23 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     }
 
     /// <summary>
+    /// A view of <paramref name="elementCount"/> floats starting <paramref name="elementOffset"/> floats into
+    /// <paramref name="parent"/>: the same device buffer, bound and transferred at a byte offset.
+    /// </summary>
+    internal WebGpuBuffer(WebGpuBuffer parent, int elementOffset, int elementCount)
+    {
+        if (parent is null) throw new ArgumentNullException(nameof(parent));
+        if (elementOffset < 0 || elementCount <= 0 || (long)elementOffset + elementCount > parent._elementCount)
+            throw new ArgumentOutOfRangeException(nameof(elementOffset));
+        parent.ThrowIfDisposed();
+        _bufferId = parent._bufferId;
+        _viewParent = parent;
+        _offsetBytes = checked(parent._offsetBytes + elementOffset * sizeof(float));
+        _elementCount = elementCount;
+        _sizeBytes = elementCount * sizeof(float);
+        _usage = parent._usage;
+    }
+    /// <summary>
     /// Creates a WebGPU buffer with initial data.
     /// </summary>
     /// <param name="data">Initial data to upload.</param>
@@ -148,7 +174,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
             throw new ArgumentException($"Data length ({data.Length}) exceeds buffer capacity ({_elementCount})", nameof(data));
         }
 
-        WebGpuNativeBindings.WriteBuffer(_bufferId, data, 0);
+        WebGpuNativeBindings.WriteBuffer(_bufferId, data, _offsetBytes);
     }
 
     /// <summary>
@@ -178,7 +204,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
             throw new ArgumentException($"Data length ({data.Length}) exceeds buffer capacity ({_sizeBytes})", nameof(data));
         }
 
-        WebGpuNativeBindings.WriteByteBuffer(_bufferId, data, 0);
+        WebGpuNativeBindings.WriteByteBuffer(_bufferId, data, _offsetBytes);
     }
 
     /// <summary>
@@ -206,7 +232,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
             throw new ArgumentException($"Data length ({data.Length}) exceeds buffer capacity ({_sizeBytes})", nameof(data));
         }
 
-        var result = await WebGpuNativeBindings.ReadByteBufferAsync(_bufferId, data.Length, 0);
+        var result = await WebGpuNativeBindings.ReadByteBufferAsync(_bufferId, data.Length, _offsetBytes);
         Array.Copy(result, data, Math.Min(result.Length, data.Length));
     }
 
@@ -228,7 +254,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
             throw new ArgumentException($"Data length ({data.Length}) exceeds buffer capacity ({_elementCount})", nameof(data));
         }
 
-        var result = await WebGpuNativeBindings.ReadBufferAsync(_bufferId, data.Length * sizeof(float), 0);
+        var result = await WebGpuNativeBindings.ReadBufferAsync(_bufferId, data.Length * sizeof(float), _offsetBytes);
         Array.Copy(result, data, Math.Min(result.Length, data.Length));
     }
 
@@ -248,7 +274,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     public async Task<float[]> DownloadAsync()
     {
         ThrowIfDisposed();
-        return await WebGpuNativeBindings.ReadBufferAsync(_bufferId, _sizeBytes, 0);
+        return await WebGpuNativeBindings.ReadBufferAsync(_bufferId, _sizeBytes, _offsetBytes);
     }
 
     /// <summary>
@@ -271,9 +297,9 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
 
         WebGpuNativeBindings.CopyBufferToBuffer(
             source.BufferId,
-            srcOffset * sizeof(float),
+            source.OffsetBytes + srcOffset * sizeof(float),
             _bufferId,
-            dstOffset * sizeof(float),
+            _offsetBytes + dstOffset * sizeof(float),
             count * sizeof(float));
     }
 
@@ -295,7 +321,8 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
             return;
         }
 
-        if (_bufferId >= 0)
+        // A view owns no device memory: its parent destroys the buffer.
+        if (_bufferId >= 0 && _viewParent is null)
         {
             WebGpuNativeBindings.DestroyBuffer(_bufferId);
         }
@@ -305,7 +332,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     // An undisposed buffer (a result nothing references any more) destroys its device buffer through the queue.
     ~WebGpuBuffer()
     {
-        if (System.Threading.Interlocked.Exchange(ref _disposedFlag, 1) != 0 || _bufferId < 0) return;
+        if (System.Threading.Interlocked.Exchange(ref _disposedFlag, 1) != 0 || _bufferId < 0 || _viewParent is not null) return;
         int bufferId = _bufferId;
         PendingFrees.Enqueue(() => WebGpuNativeBindings.DestroyBuffer(bufferId));
     }

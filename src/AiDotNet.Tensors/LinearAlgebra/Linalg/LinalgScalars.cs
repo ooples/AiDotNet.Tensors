@@ -26,9 +26,12 @@ internal static class LinalgScalars
             ? TakePrefix(input._shape, rank - 2)
             : new[] { 1 };
         var det = new Tensor<T>(outShape);
-        var detData = det.GetDataArray();
-        var luData = lu.GetDataArray();
-        var pivData = pivots.GetDataArray();
+        using var detDataLease = det.LeaseArray();
+        var detData = detDataLease.Array;
+        using var luDataLease = lu.LeaseArray();
+        var luData = luDataLease.Array;
+        using var pivDataLease = pivots.LeaseArray();
+        var pivData = pivDataLease.Array;
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
@@ -63,10 +66,14 @@ internal static class LinalgScalars
         var outShape = rank > 2 ? TakePrefix(input._shape, rank - 2) : new[] { 1 };
         var sign = new Tensor<T>(outShape);
         var logAbs = new Tensor<T>(outShape);
-        var signData = sign.GetDataArray();
-        var laData = logAbs.GetDataArray();
-        var luData = lu.GetDataArray();
-        var pivData = pivots.GetDataArray();
+        using var signDataLease = sign.LeaseArray();
+        var signData = signDataLease.Array;
+        using var laDataLease = logAbs.LeaseArray();
+        var laData = laDataLease.Array;
+        using var luDataLease = lu.LeaseArray();
+        var luData = luDataLease.Array;
+        using var pivDataLease = pivots.LeaseArray();
+        var pivData = pivDataLease.Array;
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
@@ -119,8 +126,10 @@ internal static class LinalgScalars
 
         var outShape = rank > 2 ? TakePrefix(input._shape, rank - 2) : new[] { 1 };
         var result = new Tensor<int>(outShape);
-        var rData = result.GetDataArray();
-        var sData = svd.S.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
+        using var sDataLease = svd.S.LeaseArray();
+        var sData = sDataLease.Array;
 
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
@@ -154,7 +163,8 @@ internal static class LinalgScalars
         int rank = input.Rank;
         var outShape = rank > 2 ? TakePrefix(input._shape, rank - 2) : new[] { 1 };
         var result = new Tensor<T>(outShape);
-        var rData = result.GetDataArray();
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
 
         if (useSvd)
         {
@@ -162,7 +172,8 @@ internal static class LinalgScalars
             int m = input.Shape[rank - 2];
             int n = input.Shape[rank - 1];
             int k = Math.Min(m, n);
-            var sData = svd.S.GetDataArray();
+            using var sDataLease = svd.S.LeaseArray();
+            var sData = sDataLease.Array;
             int batch = 1;
             for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
@@ -231,8 +242,10 @@ internal static class LinalgScalars
             var inv = LinalgInverses.Inv(input);
             var aNorm = LinalgNorms.MatrixNorm(input, pOrd, null!, false);
             var iNorm = LinalgNorms.MatrixNorm(inv, pOrd, null!, false);
-            var anData = aNorm.GetDataArray();
-            var inData = iNorm.GetDataArray();
+            using var anDataLease = aNorm.LeaseArray();
+            var anData = anDataLease.Array;
+            using var inDataLease = iNorm.LeaseArray();
+            var inData = inDataLease.Array;
             for (int b = 0; b < rData.Length; b++)
                 rData[b] = FromDouble<T>(ToDouble(anData[b]) * ToDouble(inData[b]));
         }

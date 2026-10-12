@@ -477,17 +477,26 @@ public class CudaFftGenericKernelTests
     }
 
     [SkippableFact]
-    public async Task ExplicitPeerBackendRequestThrowsInsteadOfCopyingToHost()
+    public async Task PeerBackendRunsGenericFftOnTheDevice()
     {
+        // #962: every DirectGpu backend implements the generic FFT natively, so a non-CUDA backend now computes
+        // what the CPU contract computes instead of refusing the request.
         await Task.Yield();
         using var engine = new DirectGpuTensorEngine();
         Skip.IfNot(engine.IsGpuAvailable, "No DirectGpu backend is available.");
         Skip.If(engine.GetBackend() is CudaBackend, "Requires a non-CUDA DirectGpu backend.");
-        var input = new Tensor<float>(new float[] { 1, 0, 2, -1, 3, 0.5f }, new[] { 6 });
-
-        NotSupportedException error = Assert.Throws<NotSupportedException>(
-            () => ((IEngine)engine).FftGeneric(input));
-        Assert.Contains("No host fallback was performed", error.Message);
+        var input = new Tensor<float>(new float[] { 1, 0, 2, -1, 3, 0.5f, -1.5f, 2, 0.25f, 0 }, new[] { 10 });
+        foreach (var type in new[] { FftElementType.Float32, FftElementType.Float16, FftElementType.BFloat16 })
+        {
+            Assert.True(((IEngine)engine).SupportsFftElementType(type));
+            // The CPU engine computes in float32 only; 16-bit storage differs from it by storage rounding.
+            var expected = new CpuEngine().FftGeneric(input, inverse: false, FftElementType.Float32).ToArray();
+            var actual = ((IEngine)engine).FftGeneric(input, inverse: false, type).ToArray();
+            double tolerance = type == FftElementType.Float32 ? 1e-4 : type == FftElementType.Float16 ? 1e-2 : 1e-1;
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= tolerance,
+                    $"{type} [{i}]: device {actual[i]}, cpu {expected[i]}");
+        }
     }
 
     [Fact]

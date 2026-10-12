@@ -98,7 +98,8 @@ public static class DpSgdStep<T>
             foreach (var g in grads.Values)
             {
                 if (g is null) continue;
-                var span = g.AsSpan();
+                using var spanLease = g.Lease();
+                var span = spanLease.Span;
                 for (int i = 0; i < span.Length; i++)
                 {
                     double v = ops.ToDouble(span[i]);
@@ -113,7 +114,8 @@ public static class DpSgdStep<T>
             {
                 if (!grads.TryGetValue(p, out var g) || g is null) continue;
                 var sumSpan = sums[p].AsWritableSpan();
-                var gSpan = g.AsSpan();
+                using var gSpanLease = g.Lease();
+                var gSpan = gSpanLease.Span;
                 for (int i = 0; i < gSpan.Length; i++)
                 {
                     double v = ops.ToDouble(sumSpan[i]) + ops.ToDouble(gSpan[i]) * clipFactor;
@@ -131,8 +133,10 @@ public static class DpSgdStep<T>
         {
             var sum = sums[p];
             var averaged = new Tensor<T>(p._shape);
-            var sumSpan = sum.AsSpan();
-            var avgSpan = averaged.AsWritableSpan();
+            using var sumSpanLease = sum.Lease();
+            var sumSpan = sumSpanLease.Span;
+            using var avgSpanLease = averaged.LeaseWritable();
+            var avgSpan = avgSpanLease.Span;
             for (int i = 0; i < sumSpan.Length; i++)
             {
                 double noise = noiseStd > 0 ? SampleGaussian(rng) * noiseStd : 0.0;

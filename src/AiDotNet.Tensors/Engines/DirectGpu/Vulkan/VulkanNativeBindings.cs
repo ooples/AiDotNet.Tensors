@@ -339,6 +339,52 @@ public static unsafe class VulkanNativeBindings
 
     #endregion
 
+    #region Feature and Extension Queries
+
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000;
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES = 1000180000;
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT = 1000260000;
+
+    [DllImport(VulkanWindows, EntryPoint = "vkEnumerateInstanceVersion")]
+    private static extern int vkEnumerateInstanceVersion_Windows(uint* pApiVersion);
+
+    [DllImport(VulkanLinux, EntryPoint = "vkEnumerateInstanceVersion")]
+    private static extern int vkEnumerateInstanceVersion_Linux(uint* pApiVersion);
+
+    /// <summary>The loader's instance version (Vulkan 1.1+); throws EntryPointNotFoundException on a 1.0 loader.</summary>
+    public static int vkEnumerateInstanceVersion(uint* pApiVersion)
+        => RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? vkEnumerateInstanceVersion_Windows(pApiVersion)
+            : vkEnumerateInstanceVersion_Linux(pApiVersion);
+
+    [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceFeatures2")]
+    private static extern void vkGetPhysicalDeviceFeatures2_Windows(IntPtr physicalDevice, VkPhysicalDeviceFeatures2* pFeatures);
+
+    [DllImport(VulkanLinux, EntryPoint = "vkGetPhysicalDeviceFeatures2")]
+    private static extern void vkGetPhysicalDeviceFeatures2_Linux(IntPtr physicalDevice, VkPhysicalDeviceFeatures2* pFeatures);
+
+    /// <summary>Vulkan 1.1: valid only on an instance created with apiVersion 1.1 or later.</summary>
+    public static void vkGetPhysicalDeviceFeatures2(IntPtr physicalDevice, VkPhysicalDeviceFeatures2* pFeatures)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            vkGetPhysicalDeviceFeatures2_Windows(physicalDevice, pFeatures);
+        else
+            vkGetPhysicalDeviceFeatures2_Linux(physicalDevice, pFeatures);
+    }
+
+    [DllImport(VulkanWindows, EntryPoint = "vkEnumerateDeviceExtensionProperties")]
+    private static extern int vkEnumerateDeviceExtensionProperties_Windows(IntPtr physicalDevice, byte* pLayerName, uint* pPropertyCount, VkExtensionProperties* pProperties);
+
+    [DllImport(VulkanLinux, EntryPoint = "vkEnumerateDeviceExtensionProperties")]
+    private static extern int vkEnumerateDeviceExtensionProperties_Linux(IntPtr physicalDevice, byte* pLayerName, uint* pPropertyCount, VkExtensionProperties* pProperties);
+
+    public static int vkEnumerateDeviceExtensionProperties(IntPtr physicalDevice, byte* pLayerName, uint* pPropertyCount, VkExtensionProperties* pProperties)
+        => RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? vkEnumerateDeviceExtensionProperties_Windows(physicalDevice, pLayerName, pPropertyCount, pProperties)
+            : vkEnumerateDeviceExtensionProperties_Linux(physicalDevice, pLayerName, pPropertyCount, pProperties);
+
+    #endregion
+
     #region Physical Device Functions
 
     [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceProperties")]
@@ -353,6 +399,33 @@ public static unsafe class VulkanNativeBindings
             vkGetPhysicalDeviceProperties_Windows(physicalDevice, pProperties);
         else
             vkGetPhysicalDeviceProperties_Linux(physicalDevice, pProperties);
+    }
+
+    [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceFeatures")]
+    private static extern void vkGetPhysicalDeviceFeatures_Windows(IntPtr physicalDevice, uint* pFeatures);
+
+    [DllImport(VulkanLinux, EntryPoint = "vkGetPhysicalDeviceFeatures")]
+    private static extern void vkGetPhysicalDeviceFeatures_Linux(IntPtr physicalDevice, uint* pFeatures);
+
+    /// <summary>Number of VkBool32 members in VkPhysicalDeviceFeatures.</summary>
+    public const int PhysicalDeviceFeatureCount = 55;
+
+    /// <summary>Index of VkPhysicalDeviceFeatures.shaderFloat64.</summary>
+    public const int FeatureShaderFloat64 = 39;
+
+    /// <summary>Index of VkPhysicalDeviceFeatures.shaderInt64.</summary>
+    public const int FeatureShaderInt64 = 40;
+
+    /// <summary>
+    /// Fills <paramref name="pFeatures"/> (<see cref="PhysicalDeviceFeatureCount"/> VkBool32 values, the layout of
+    /// VkPhysicalDeviceFeatures) with the features the physical device supports.
+    /// </summary>
+    public static void vkGetPhysicalDeviceFeatures(IntPtr physicalDevice, uint* pFeatures)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            vkGetPhysicalDeviceFeatures_Windows(physicalDevice, pFeatures);
+        else
+            vkGetPhysicalDeviceFeatures_Linux(physicalDevice, pFeatures);
     }
 
     [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceMemoryProperties")]
@@ -920,6 +993,9 @@ public static unsafe class VulkanNativeBindings
 
     public static void vkCmdDispatch(IntPtr commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ)
     {
+        // The one place every Vulkan compute dispatch passes through: counted for the GPU-residency diagnostics, as
+        // the CUDA and OpenCL launch choke points are.
+        GpuLaunchProbe.OnLaunch();
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             vkCmdDispatch_Windows(commandBuffer, groupCountX, groupCountY, groupCountZ);
         else

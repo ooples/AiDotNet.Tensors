@@ -131,6 +131,7 @@ internal static class GpuLaunchProbe
     {
         // An empty upload moves nothing across the boundary (several backends return before copying).
         if (byteCount == 0) return;
+        if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningUploads); return; }
         RecordScoped(Diagnostics.GpuTransferKind.HostToDevice, byteCount, backend);
     }
 
@@ -141,7 +142,13 @@ internal static class GpuLaunchProbe
 
     /// <summary>The host blocked until the device drained its queue.</summary>
     public static void OnSynchronize(GpuBackendType backend)
-        => RecordScoped(Diagnostics.GpuTransferKind.Synchronize, 0, backend);
+    {
+        if (_tuningDepth > 0) return;
+        RecordScoped(Diagnostics.GpuTransferKind.Synchronize, 0, backend);
+    }
+
+    /// <summary>Residency scopes open anywhere in the process; with none, every transfer hook is one volatile read.</summary>
+    internal static int ActiveScopes => Volatile.Read(ref _activeScopes);
 
     private static void RecordScoped(Diagnostics.GpuTransferKind kind, long bytes, GpuBackendType backend)
     {
@@ -189,18 +196,44 @@ internal static class GpuLaunchProbe
     }
 
     /// <summary>A device-to-host copy of <paramref name="byteCount"/> bytes.</summary>
+    // Transfers the tuned-kernel registry makes while it gathers evidence (snapshotting candidate outputs for the
+    // correctness gate) are the registry's own one-time cost per shape class, not the op's: inside a tuning scope they
+    // count toward TuningReadbacks / TuningUploads instead of the op's Readbacks / Uploads and residency scopes.
+    [System.ThreadStatic] private static int _tuningDepth;
+    private static long _tuningReadbacks, _tuningUploads;
+
+    /// <summary>Readbacks the tuned-kernel registry made while measuring (not attributed to any op).</summary>
+    public static long TuningReadbacks => Interlocked.Read(ref _tuningReadbacks);
+
+    /// <summary>Uploads the tuned-kernel registry made while measuring (not attributed to any op).</summary>
+    public static long TuningUploads => Interlocked.Read(ref _tuningUploads);
+
+    /// <summary>Attributes this thread's transfers to registry tuning until disposed.</summary>
+    internal static TuningAttribution TuningScope()
+    {
+        _tuningDepth++;
+        return default;
+    }
+
+    internal readonly struct TuningAttribution : System.IDisposable
+    {
+        public void Dispose() => _tuningDepth--;
+    }
+
     public static void OnReadback(long byteCount, GpuBackendType backend)
     {
         if (byteCount < 0)
             throw new System.ArgumentOutOfRangeException(nameof(byteCount), "A readback cannot move a negative number of bytes.");
         // An empty readback moves nothing (the byte-download paths return an empty array without a copy).
         if (byteCount == 0) return;
+        if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningReadbacks); return; }
         RecordScoped(Diagnostics.GpuTransferKind.DeviceToHost, byteCount, backend);
         OnReadback(byteCount);
     }
 
     public static void OnReadback(long byteCount)
     {
+        if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningReadbacks); return; }
         Interlocked.Increment(ref _readbacks);
         Interlocked.Add(ref _readbackBytes, byteCount);
         if (CaptureReadbackSites)
@@ -269,6 +302,7 @@ internal static class GpuLaunchProbe
     /// <summary>Records one host-to-device transfer at a driver copy (every cuMemcpyHtoD / HtoDAsync).</summary>
     public static void OnUpload(long byteCount)
     {
+        if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningUploads); return; }
         Interlocked.Increment(ref _uploads);
         Interlocked.Add(ref _uploadBytes, byteCount);
         if (CaptureReadbackSites)
@@ -330,6 +364,8 @@ internal static class GpuLaunchProbe
         Interlocked.Exchange(ref _readbackBytes, 0);
         Interlocked.Exchange(ref _uploads, 0);
         Interlocked.Exchange(ref _uploadBytes, 0);
+        Interlocked.Exchange(ref _tuningReadbacks, 0);
+        Interlocked.Exchange(ref _tuningUploads, 0);
         _uploadSites.Clear();
         _uploadSiteBytes.Clear();
         _missedNames.Clear();

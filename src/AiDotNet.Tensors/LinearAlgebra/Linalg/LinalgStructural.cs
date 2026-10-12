@@ -51,8 +51,10 @@ internal static class LinalgStructural
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
         var result = new Tensor<T>((int[])input._shape.Clone());
-        var src = input.GetDataArray();
-        var dst = result.GetDataArray();
+        using var srcLease = input.LeaseArray();
+        var src = srcLease.Array;
+        using var dstLease = result.LeaseArray();
+        var dst = dstLease.Array;
 
         for (int b = 0; b < batch; b++)
         {
@@ -192,9 +194,12 @@ internal static class LinalgStructural
         // positions > d form the "inner" stride; the 3 components at axis d
         // are combined per (outer, inner) slot.
         var result = new Tensor<T>((int[])a._shape.Clone());
-        var aD = a.GetDataArray();
-        var bD = b.GetDataArray();
-        var rD = result.GetDataArray();
+        using var aDLease = a.LeaseArray();
+        var aD = aDLease.Array;
+        using var bDLease = b.LeaseArray();
+        var bD = bDLease.Array;
+        using var rDLease = result.LeaseArray();
+        var rD = rDLease.Array;
 
         int outer = 1;
         int inner = 1;
@@ -232,8 +237,10 @@ internal static class LinalgStructural
         int cols = n ?? m;
 
         var result = new Tensor<T>(new[] { m, cols });
-        var xD = x.GetDataArray();
-        var rD = result.GetDataArray();
+        using var xDLease = x.LeaseArray();
+        var xD = xDLease.Array;
+        using var rDLease = result.LeaseArray();
+        var rD = rDLease.Array;
 
         for (int i = 0; i < m; i++)
         {
@@ -266,9 +273,12 @@ internal static class LinalgStructural
         outShape[rank - 1] = m;
         var result = new Tensor<T>(outShape);
 
-        var refD = reflectors.GetDataArray();
-        var tauD = tau.GetDataArray();
-        var rD = result.GetDataArray();
+        using var refDLease = reflectors.LeaseArray();
+        var refD = refDLease.Array;
+        using var tauDLease = tau.LeaseArray();
+        var tauD = tauDLease.Array;
+        using var rDLease = result.LeaseArray();
+        var rD = rDLease.Array;
 
         for (int b = 0; b < batch; b++)
         {
@@ -322,8 +332,10 @@ internal static class LinalgStructural
         outShape[oi] = dLen;
 
         var result = new Tensor<T>(outShape);
-        var inD = input.GetDataArray();
-        var rD = result.GetDataArray();
+        using var inDLease = input.LeaseArray();
+        var inD = inDLease.Array;
+        using var rDLease = result.LeaseArray();
+        var rD = rDLease.Array;
 
         int batch = 1;
         for (int i = 0; i < outShape.Length - 1; i++) batch *= outShape[i];
@@ -383,9 +395,12 @@ internal static class LinalgStructural
         if (outShape.Length == 0) outShape = new[] { 1 };
 
         var result = new Tensor<T>(outShape);
-        var aD = a.GetDataArray();
-        var bD = b.GetDataArray();
-        var rD = result.GetDataArray();
+        using var aDLease = a.LeaseArray();
+        var aD = aDLease.Array;
+        using var bDLease = b.LeaseArray();
+        var bD = bDLease.Array;
+        using var rDLease = result.LeaseArray();
+        var rD = rDLease.Array;
 
         int n = a.Shape[d];
         int outer = 1;
@@ -466,7 +481,8 @@ internal static class LinalgStructural
     {
         var shape = (int[])like._shape.Clone();
         var eye = new Tensor<T>(shape);
-        var data = eye.GetDataArray();
+        using var dataLease = eye.LeaseArray();
+        var data = dataLease.Array;
         int batch = 1;
         for (int i = 0; i < shape.Length - 2; i++) batch *= shape[i];
         for (int b = 0; b < batch; b++)
@@ -495,9 +511,12 @@ internal static class LinalgStructural
         var outShape = (int[])a._shape.Clone();
         outShape[rA - 1] = n;
         var result = new Tensor<T>(outShape);
-        var aD = a.GetDataArray();
-        var bD = b.GetDataArray();
-        var rD = result.GetDataArray();
+        using var aDLease = a.LeaseArray();
+        var aD = aDLease.Array;
+        using var bDLease = b.LeaseArray();
+        var bD = bDLease.Array;
+        using var rDLease = result.LeaseArray();
+        var rD = rDLease.Array;
 
         int batch = 1;
         for (int i = 0; i < rA - 2; i++) batch *= a._shape[i];

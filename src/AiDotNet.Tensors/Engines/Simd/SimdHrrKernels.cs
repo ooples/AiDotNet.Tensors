@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -482,6 +483,8 @@ public static class SimdHrrKernels
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, V, (long)V * D, v =>
         {
             int rowOff = v * D;
+            using var queryRKeep1 = new KeepAliveScope(queryR);
+            using var queryIKeep1 = new KeepAliveScope(queryI);
             scores[v] = PhaseCoherenceRow(
                 new ReadOnlySpan<double>(codesR, rowOff, D),
                 new ReadOnlySpan<double>(codesI, rowOff, D),

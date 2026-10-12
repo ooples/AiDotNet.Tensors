@@ -34,7 +34,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// through IGpuMixedPrecisionConvBackend yet — returns null so the
     /// capability is reported as absent until the Metal adapter lands.
     /// </summary>
-    public AiDotNet.Tensors.Engines.Gpu.IGpuMixedPrecisionConvBackend? MixedPrecisionConv => null;
 
     private readonly MetalDevice _device;
     private readonly MetalCommandQueue _commandQueue;
@@ -449,7 +448,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             var function = _shaderLibrary.GetFunction(library, kernelName);
             try
             {
-                return _shaderLibrary.CreatePipelineState(function);
+                var state = _shaderLibrary.CreatePipelineState(function);
+                // Names the pipeline in the launch journal (#996).
+                GpuKernelDiagnostics.RegisterKernelName(state.Handle, libraryName + ":" + kernelName);
+                return state;
             }
             finally
             {

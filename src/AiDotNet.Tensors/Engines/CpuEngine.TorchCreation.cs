@@ -15,7 +15,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 public partial class CpuEngine
 {
-    private static int NormalizeDim(int dim, int rank)
+    private protected static int NormalizeDim(int dim, int rank)
     {
         int d = dim < 0 ? dim + rank : dim;
         if (d < 0 || d >= rank) throw new ArgumentOutOfRangeException(nameof(dim), $"dim {dim} is out of range for rank {rank}.");
@@ -31,7 +31,8 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < dst.Length; i++) dst[i] = ops.FromDouble(value(i));
         return result;
     }
@@ -60,7 +61,8 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
-        var values = source.AsSpan().ToArray();
+        using var sourceKeep1 = new KeepAliveScope(source);
+        var values = source.AsSpanUnmarked().ToArray();
         var indicator = FromDoubles<T>((int[])source._shape.Clone(), i => ops.Equals(values[i], ops.Zero) ? 0 : 1);
         var reduceAxes = axes ?? AllAxes(tensor.Rank);
         using (new NoGradScope<T>())
@@ -74,7 +76,7 @@ public partial class CpuEngine
         return FromDoubles<T>(new[] { count }, i => start + i * step);
     }
 
-    private static int RangeCount(double start, double end, double step, double size)
+    private protected static int RangeCount(double start, double end, double step, double size)
     {
         if (double.IsNaN(start) || double.IsInfinity(start)) throw new ArgumentOutOfRangeException(nameof(start), "start must be finite.");
         if (double.IsNaN(end) || double.IsInfinity(end)) throw new ArgumentOutOfRangeException(nameof(end), "end must be finite.");
@@ -113,7 +115,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorFullLike<T>(Tensor<T> tensor, T value)
     {
         var result = new Tensor<T>(LikeShape(tensor));
-        result.AsWritableSpan().Fill(value);
+        using var resultKeep1 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked().Fill(value);
         return result;
     }
 
@@ -235,10 +238,13 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         long total = shape.Aggregate(1L, (a, d) => a * d);
         var source = indices.IsContiguous ? indices : indices.Contiguous();
-        var flat = source.AsSpan().ToArray().Select(v => (long)ops.ToDouble(v)).ToArray();
-        foreach (var f in flat)
-            if (f < -total || f >= total)
-                throw new ArgumentOutOfRangeException(nameof(indices), $"index {f} is out of range for shape [{string.Join(", ", shape)}].");
+        // Truncate toward zero and range-check the truncated value. NaN and infinities are rejected explicitly: a bare
+        // (long) cast is runtime-dependent (.NET Framework gives long.MinValue, .NET 9+ saturates NaN to 0).
+        var truncated = source.AsSpan().ToArray().Select(v => Math.Truncate(ops.ToDouble(v))).ToArray();
+        foreach (var t in truncated)
+            if (double.IsNaN(t) || t < -total || t >= total)
+                throw new ArgumentOutOfRangeException(nameof(indices), $"index {t} is out of range for shape [{string.Join(", ", shape)}].");
+        var flat = truncated.Select(t => (long)t).ToArray();
         var result = new Tensor<T>[shape.Length];
         long stride = 1;
         for (int d = shape.Length - 1; d >= 0; d--)
@@ -379,7 +385,8 @@ public partial class CpuEngine
         int d = dim is null ? 0 : NormalizeDim(dim.Value, tensor.Rank);
         var source = x.IsContiguous ? x : x.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
-        var values = source.AsSpan();
+        using var valuesLease = source.Lease();
+        var values = valuesLease.Span;
         int extent = source._shape[d];
         int outer = source._shape.Take(d).Aggregate(1, (a, b) => a * b);
         int inner = source._shape.Skip(d + 1).Aggregate(1, (a, b) => a * b);
@@ -445,7 +452,8 @@ public partial class CpuEngine
         var weight = (double[])savedState[2];
         var ops = MathHelper.GetNumericOperations<T>();
         var dy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-        var g = dy.AsSpan();
+        using var gLease = dy.Lease();
+        var g = gLease.Span;
         var dx = new double[inputs[0].Length];
         for (int k = 0; k < lo.Length; k++)
         {

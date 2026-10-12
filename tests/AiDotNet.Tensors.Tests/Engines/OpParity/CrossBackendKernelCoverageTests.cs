@@ -57,10 +57,19 @@ public sealed class CrossBackendKernelCoverageTests
     // the CUDA home. Adding an entry here is an assertion "this op already runs on-device on CUDA/HIP".
     private static readonly HashSet<string> CoveredUnderDifferentName = new(StringComparer.Ordinal)
     {
+        // OpenCL batch-execution kernels whose CUDA/HIP twin is a shared mode kernel (BatchExecutionCudaKernels.cs):
+        "bx_crop_2d_backward",               // -> bx_window_2d mode 3
+        "bx_mse_loss_rows",                  // -> bx_row_loss mode 1
+        "bx_reduce_log_variance",            // -> bx_row_reduce mode 5
+        "bx_reduce_max_backward",            // -> bx_reduce_backward mode 1
+        "bx_reduce_variance_backward",       // -> bx_reduce_backward mode 2
+        "bx_reduce_log_variance_backward",   // -> bx_reduce_backward mode 3
+        "bx_sparsemax",                      // -> bx_row_map mode 5
         "add_gelu", "add_relu", "add_sigmoid",                 // fused bias+activation epilogue (CudaBackend.cs)
         "clip_by_value", "where_select", "max_axis", "var_axis", // elementwise/axis-reduce (CudaBackend.cs)
         "mixed_precision_forward", "mixed_precision_backward",  // CudaBackend.MixedPrecisionConv.cs
         "global_maxpool2d_with_indices",                       // -> global_maxpool2d (+backward)
+        "tk_im2col_pbl",                                       // -> im2col (CudaBackend.ConvGemm.cs); [P, B*L] layout for the registry
         "conv_transpose2d_backward_weights",                   // -> conv_transpose2d_backward_kernel
         "gru_accumulate_bias_gradients", "gru_accumulate_weight_gradients_hh",
         "gru_accumulate_weight_gradients_ih",                  // -> gru_accumulate_weight_gradients (fused hh/ih/bias)
@@ -192,6 +201,9 @@ public sealed class CrossBackendKernelCoverageTests
             }
             catch { /* a registry that needs a device/context — skip, best effort */ }
         }
+        // The batch-execution kernels are one CUDA C source compiled by both CUDA and HIP (#1142).
+        if (backendSegment is "CUDA" or "HIP")
+            foreach (var n in AiDotNet.Tensors.Engines.DirectGpu.BatchExecutionCudaKernels.GetKernelNames()) set.Add(n);
         return set;
     }
 

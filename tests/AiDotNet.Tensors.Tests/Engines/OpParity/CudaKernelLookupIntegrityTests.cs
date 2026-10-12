@@ -106,7 +106,10 @@ public sealed class CudaKernelLookupIntegrityTests
             StringComparer.Ordinal);
 
         var defined = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var file in Directory.GetFiles(Path.Combine(cuda, "Kernels"), "*.cs"))
+        // CudaBackend also compiles the batch-execution source it shares with HIP (#1142).
+        var kernelSources = Directory.GetFiles(Path.Combine(cuda, "Kernels"), "*.cs")
+            .Append(Path.Combine(cuda, "..", "BatchExecutionCudaKernels.cs"));
+        foreach (var file in kernelSources)
         {
             string src = File.ReadAllText(file);
             // The declaration frequently wraps, e.g.

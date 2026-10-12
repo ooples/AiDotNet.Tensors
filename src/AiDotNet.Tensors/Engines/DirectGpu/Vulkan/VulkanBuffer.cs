@@ -39,11 +39,16 @@ public sealed unsafe class VulkanBuffer : IDisposable
     private readonly uint _usage;
     private readonly bool _isHostVisible;
     private bool _disposed;
+    private readonly ulong _offset;
+    private readonly VulkanBuffer? _viewParent;
 
     /// <summary>
     /// Gets the Vulkan buffer handle.
     /// </summary>
     public IntPtr Handle => _buffer;
+
+    /// <summary>Byte offset of this buffer's range within <see cref="Handle"/>; non-zero only for a view.</summary>
+    public ulong Offset => _offset;
 
     /// <summary>
     /// Gets the device memory handle.
@@ -84,6 +89,30 @@ public sealed unsafe class VulkanBuffer : IDisposable
         _size = (ulong)elementCount * sizeof(float);
         _usage = usage;
         _isHostVisible = hostVisible;
+    }
+
+    private VulkanBuffer(VulkanBuffer parent, ulong offsetBytes, int elementCount)
+    {
+        _device = parent._device;
+        _buffer = parent._buffer;
+        _memory = parent._memory;
+        _elementCount = elementCount;
+        _size = (ulong)elementCount * sizeof(float);
+        _usage = parent._usage;
+        _isHostVisible = parent._isHostVisible;
+        _offset = parent._offset + offsetBytes;
+        _viewParent = parent;
+    }
+
+    /// <summary>
+    /// A non-owning view of <paramref name="elementCount"/> floats starting <paramref name="elementOffset"/> floats
+    /// into <paramref name="parent"/>, or null when the byte offset is not a multiple of 256, the largest storage-buffer
+    /// offset alignment Vulkan lets a device require. The view keeps its parent alive.
+    /// </summary>
+    internal static VulkanBuffer? CreateView(VulkanBuffer parent, int elementOffset, int elementCount)
+    {
+        ulong offsetBytes = (ulong)elementOffset * sizeof(float);
+        return (parent._offset + offsetBytes) % 256 != 0 ? null : new VulkanBuffer(parent, offsetBytes, elementCount);
     }
 
     /// <summary>
@@ -270,7 +299,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
         ulong copySize = (ulong)copyCount * sizeof(float);
 
         var result = VulkanNativeBindings.vkMapMemory(
-            _device.Device, _memory, 0, copySize, 0, out IntPtr mappedPtr);
+            _device.Device, _memory, _offset, copySize, 0, out IntPtr mappedPtr);
 
         if (result != VulkanNativeBindings.VK_SUCCESS || mappedPtr == IntPtr.Zero)
         {
@@ -310,7 +339,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
         ulong copySize = (ulong)copyCount * sizeof(float);
 
         var result = VulkanNativeBindings.vkMapMemory(
-            _device.Device, _memory, 0, copySize, 0, out IntPtr mappedPtr);
+            _device.Device, _memory, _offset, copySize, 0, out IntPtr mappedPtr);
 
         if (result != VulkanNativeBindings.VK_SUCCESS || mappedPtr == IntPtr.Zero)
         {
@@ -347,7 +376,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
         }
 
         var result = VulkanNativeBindings.vkMapMemory(
-            _device.Device, _memory, 0, copySize, 0, out IntPtr mappedPtr);
+            _device.Device, _memory, _offset, copySize, 0, out IntPtr mappedPtr);
 
         if (result != VulkanNativeBindings.VK_SUCCESS || mappedPtr == IntPtr.Zero)
         {
@@ -387,7 +416,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
         }
 
         var result = VulkanNativeBindings.vkMapMemory(
-            _device.Device, _memory, 0, copySize, 0, out IntPtr mappedPtr);
+            _device.Device, _memory, _offset, copySize, 0, out IntPtr mappedPtr);
 
         if (result != VulkanNativeBindings.VK_SUCCESS || mappedPtr == IntPtr.Zero)
         {
@@ -416,7 +445,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
         return new VkDescriptorBufferInfo
         {
             buffer = _buffer,
-            offset = 0,
+            offset = _offset,
             range = _size
         };
     }
@@ -432,6 +461,14 @@ public sealed unsafe class VulkanBuffer : IDisposable
         }
 
         _disposed = true;
+
+        // A view shares its parent's buffer and memory; only the parent releases them.
+        if (_viewParent is not null)
+        {
+            _buffer = IntPtr.Zero;
+            _memory = IntPtr.Zero;
+            return;
+        }
 
         if (_buffer != IntPtr.Zero)
         {
@@ -496,8 +533,8 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         // Record copy command
         var copyRegion = new VkBufferCopy
         {
-            srcOffset = 0,
-            dstOffset = 0,
+            srcOffset = staging.Offset,
+            dstOffset = device.Offset,
             size = copySize
         };
 
@@ -569,7 +606,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
             srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             buffer = source.Handle,
-            offset = sourceOffset,
+            offset = source.Offset + sourceOffset,
             size = byteCount
         };
         preBarriers[1] = new VkBufferMemoryBarrier
@@ -581,7 +618,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
             srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             buffer = destination.Handle,
-            offset = destinationOffset,
+            offset = destination.Offset + destinationOffset,
             size = byteCount
         };
         VulkanNativeBindings.vkCmdPipelineBarrier(
@@ -592,8 +629,8 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
 
         var copyRegion = new VkBufferCopy
         {
-            srcOffset = sourceOffset,
-            dstOffset = destinationOffset,
+            srcOffset = source.Offset + sourceOffset,
+            dstOffset = destination.Offset + destinationOffset,
             size = byteCount
         };
         VulkanNativeBindings.vkCmdCopyBuffer(
@@ -608,7 +645,7 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
             srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
             buffer = destination.Handle,
-            offset = destinationOffset,
+            offset = destination.Offset + destinationOffset,
             size = byteCount
         };
         VulkanNativeBindings.vkCmdPipelineBarrier(
@@ -674,8 +711,8 @@ public sealed unsafe class VulkanBufferTransfer : IDisposable
         // Record copy command
         var copyRegion = new VkBufferCopy
         {
-            srcOffset = 0,
-            dstOffset = 0,
+            srcOffset = device.Offset,
+            dstOffset = staging.Offset,
             size = copySize
         };
 

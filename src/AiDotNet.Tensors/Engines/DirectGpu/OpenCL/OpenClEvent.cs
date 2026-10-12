@@ -1,3 +1,4 @@
+using System.Diagnostics;
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL event implementation of IGpuEvent.
 
@@ -18,6 +19,8 @@ public sealed class OpenClEvent : IGpuEvent
     private bool _disposed;
     private readonly OpenClCommandQueue? _sourceQueue;
     private bool _profilingEnabled;
+    private readonly bool _timingRequested;
+    private long _hostTimestamp;
 
     /// <inheritdoc/>
     public IntPtr Handle => _handle;
@@ -52,6 +55,7 @@ public sealed class OpenClEvent : IGpuEvent
         _handle = handle;
         _sourceQueue = sourceQueue;
         _profilingEnabled = profilingEnabled;
+        _timingRequested = profilingEnabled;
 
         // Retain the event to ensure it's not released prematurely
         if (handle != IntPtr.Zero)
@@ -92,6 +96,15 @@ public sealed class OpenClEvent : IGpuEvent
         // Timing capability belongs to the queue that produced this event. An event created
         // with enableTiming=true but recorded on an ordinary queue must not claim otherwise.
         _profilingEnabled = openClQueue.IsProfilingEnabled;
+        // An event asked for timing (CreateEvent(enableTiming: true)) still times on an ordinary queue, which stays
+        // profiling-free: the queue is drained past the marker and the host clock read then. That is host time, not
+        // a device profile, so the two kinds are never mixed in GetElapsedTime.
+        _hostTimestamp = 0;
+        if (_timingRequested && !_profilingEnabled)
+        {
+            OpenClNativeBindings.Finish(openClQueue.Handle);
+            _hostTimestamp = Stopwatch.GetTimestamp();
+        }
     }
 
     /// <inheritdoc/>
@@ -156,8 +169,11 @@ public sealed class OpenClEvent : IGpuEvent
             throw new ArgumentException("Event must be an OpenClEvent", nameof(startEvent));
         }
 
-        if (!_profilingEnabled)
+        if (!_profilingEnabled || !openClStartEvent._profilingEnabled)
         {
+            // Timing events recorded on ordinary queues carry host timestamps taken once their queue had drained.
+            if (_hostTimestamp != 0 && openClStartEvent._hostTimestamp != 0)
+                return (float)((_hostTimestamp - openClStartEvent._hostTimestamp) * 1000.0 / Stopwatch.Frequency);
             throw new InvalidOperationException("Event was created without profiling capability");
         }
 

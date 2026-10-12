@@ -51,6 +51,8 @@ public sealed unsafe class VulkanDevice : IDisposable
     private string _deviceName = string.Empty;
     private string _vendorName = string.Empty;
     private VkPhysicalDeviceLimits _limits;
+    private bool _shaderFloat64;
+    private bool _shaderInt64;
     private VkPhysicalDeviceMemoryProperties _memoryProperties;
 
     /// <summary>
@@ -151,6 +153,16 @@ public sealed unsafe class VulkanDevice : IDisposable
     /// Gets the maximum storage buffer range.
     /// </summary>
     public uint MaxStorageBufferRange => _limits.maxStorageBufferRange;
+
+    /// <summary>
+    /// True when the device supports 64-bit floats in shaders (shaderFloat64) and the feature is enabled.
+    /// </summary>
+    public bool SupportsShaderFloat64 => _shaderFloat64;
+
+    /// <summary>
+    /// True when the device supports 64-bit integers in shaders (shaderInt64) and the feature is enabled.
+    /// </summary>
+    public bool SupportsShaderInt64 => _shaderInt64;
 
     /// <summary>
     /// Gets the total device-local memory in bytes by summing all device-local heaps.
@@ -306,7 +318,7 @@ public sealed unsafe class VulkanDevice : IDisposable
                 applicationVersion = 1,
                 pEngineName = pEngineName,
                 engineVersion = 1,
-                apiVersion = (uint)VulkanNativeBindings.VK_API_VERSION_1_0
+                apiVersion = _instanceApiVersion = SelectInstanceApiVersion()
             };
 
             uint instanceFlags = 0;
@@ -555,6 +567,63 @@ public sealed unsafe class VulkanDevice : IDisposable
         return 0;
     }
 
+    // The instance API version requested: 1.1 when the loader supports it (vkGetPhysicalDeviceFeatures2 needs it), else 1.0.
+    private uint _instanceApiVersion = (uint)VulkanNativeBindings.VK_API_VERSION_1_0;
+
+    /// <summary>Whether the physical device supports shaderFloat64.</summary>
+    public bool Float64Supported { get; private set; }
+
+    /// <summary>Whether the physical device supports shaderInt64.</summary>
+    public bool Int64Supported { get; private set; }
+
+    /// <summary>Whether the device was created with shaderFloat64 enabled (double arithmetic in shaders).</summary>
+    public bool Float64Enabled { get; private set; }
+
+    /// <summary>Whether the device was created with shaderInt64 enabled.</summary>
+    public bool Int64Enabled { get; private set; }
+
+    /// <summary>Whether 64-bit buffer atomics (VK_KHR_shader_atomic_int64) were enabled.</summary>
+    public bool BufferInt64AtomicsEnabled { get; private set; }
+
+    /// <summary>Whether 32-bit float buffer atomic add (VK_EXT_shader_atomic_float) was enabled.</summary>
+    public bool BufferFloat32AtomicAddEnabled { get; private set; }
+
+    private static uint SelectInstanceApiVersion()
+    {
+        try
+        {
+            uint loader = 0;
+            if (VulkanNativeBindings.vkEnumerateInstanceVersion(&loader) == VulkanNativeBindings.VK_SUCCESS
+                && loader >= (uint)VulkanNativeBindings.VK_API_VERSION_1_1)
+                return (uint)VulkanNativeBindings.VK_API_VERSION_1_1;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // A Vulkan 1.0 loader has no vkEnumerateInstanceVersion; 1.0 is the only version it accepts.
+        }
+        return (uint)VulkanNativeBindings.VK_API_VERSION_1_0;
+    }
+
+    private HashSet<string> DeviceExtensions()
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        uint count = 0;
+        if (VulkanNativeBindings.vkEnumerateDeviceExtensionProperties(_physicalDevice, null, &count, null) != VulkanNativeBindings.VK_SUCCESS || count == 0)
+            return names;
+        var properties = new VkExtensionProperties[count];
+        fixed (VkExtensionProperties* p = properties)
+        {
+            if (VulkanNativeBindings.vkEnumerateDeviceExtensionProperties(_physicalDevice, null, &count, p) != VulkanNativeBindings.VK_SUCCESS)
+                return names;
+            for (int i = 0; i < count; i++)
+            {
+                string? name = Marshal.PtrToStringAnsi((IntPtr)p[i].extensionName);
+                if (name is not null) names.Add(name);
+            }
+        }
+        return names;
+    }
+
     private bool CreateLogicalDevice()
     {
         float queuePriority = 1.0f;
@@ -569,21 +638,98 @@ public sealed unsafe class VulkanDevice : IDisposable
             pQueuePriorities = &queuePriority
         };
 
-        var deviceCreateInfo = new VkDeviceCreateInfo
-        {
-            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            pNext = null,
-            flags = 0,
-            queueCreateInfoCount = 1,
-            pQueueCreateInfos = &queueCreateInfo,
-            enabledLayerCount = 0,
-            ppEnabledLayerNames = null,
-            enabledExtensionCount = 0,
-            ppEnabledExtensionNames = null,
-            pEnabledFeatures = null
-        };
+        // Enable the optional features the kernels rely on, where the device has them: double and 64-bit integer
+        // arithmetic, 64-bit buffer atomics and float atomic add. Using one in a shader without enabling it is invalid
+        // usage that only lenient drivers tolerate. A shader needing an absent feature fails to build and its op falls back.
+        VkPhysicalDeviceFeatures supported;
+        // VkPhysicalDeviceFeatures is the 55 VkBool32 words the binding fills.
+        VulkanNativeBindings.vkGetPhysicalDeviceFeatures(_physicalDevice, (uint*)&supported);
+        VkPhysicalDeviceFeatures enabled = default;
+        foreach (int feature in new[] { VkPhysicalDeviceFeatures.ShaderFloat64, VkPhysicalDeviceFeatures.ShaderInt64, VkPhysicalDeviceFeatures.ShaderInt16 })
+            enabled.Bits[feature] = supported.Bits[feature];
+        Float64Supported = supported.Bits[VkPhysicalDeviceFeatures.ShaderFloat64] != 0;
+        Int64Supported = supported.Bits[VkPhysicalDeviceFeatures.ShaderInt64] != 0;
+        Float64Enabled = enabled.Bits[VkPhysicalDeviceFeatures.ShaderFloat64] != 0;
+        Int64Enabled = enabled.Bits[VkPhysicalDeviceFeatures.ShaderInt64] != 0;
+        _shaderFloat64 = Float64Enabled;
+        _shaderInt64 = Int64Enabled;
 
-        var result = VulkanNativeBindings.vkCreateDevice(_physicalDevice, &deviceCreateInfo, IntPtr.Zero, out _device);
+        const string AtomicInt64Extension = "VK_KHR_shader_atomic_int64";
+        const string AtomicFloatExtension = "VK_EXT_shader_atomic_float";
+        var available = DeviceExtensions();
+        var atomicInt64 = new VkPhysicalDeviceShaderAtomicInt64Features { sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES };
+        var atomicFloat = new VkPhysicalDeviceShaderAtomicFloatFeaturesEXT { sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT };
+        var extensionNames = new List<string>();
+        void* chain = null;
+        VkPhysicalDeviceProperties deviceProperties;
+        VulkanNativeBindings.vkGetPhysicalDeviceProperties(_physicalDevice, &deviceProperties);
+        // The extension feature structs are queried with vkGetPhysicalDeviceFeatures2, which needs a 1.1 instance and device.
+        if (_instanceApiVersion >= (uint)VulkanNativeBindings.VK_API_VERSION_1_1
+            && deviceProperties.apiVersion >= (uint)VulkanNativeBindings.VK_API_VERSION_1_1)
+        {
+            bool hasInt64 = available.Contains(AtomicInt64Extension), hasFloat = available.Contains(AtomicFloatExtension);
+            atomicInt64.pNext = hasFloat ? &atomicFloat : null;
+            var query = new VkPhysicalDeviceFeatures2
+            {
+                sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                pNext = hasInt64 ? &atomicInt64 : (hasFloat ? &atomicFloat : null),
+            };
+            if (hasInt64 || hasFloat) VulkanNativeBindings.vkGetPhysicalDeviceFeatures2(_physicalDevice, &query);
+            // The query filled each struct with what the device supports; enabling exactly that is valid. Rebuild the
+            // chain for creation from only the extensions being enabled.
+            atomicInt64.pNext = null;
+            atomicFloat.pNext = null;
+            if (hasFloat)
+            {
+                extensionNames.Add(AtomicFloatExtension);
+                atomicFloat.pNext = chain;
+                chain = &atomicFloat;
+                BufferFloat32AtomicAddEnabled = atomicFloat.Bits[1] != 0;   // shaderBufferFloat32AtomicAdd
+            }
+            if (hasInt64)
+            {
+                extensionNames.Add(AtomicInt64Extension);
+                atomicInt64.pNext = chain;
+                chain = &atomicInt64;
+                BufferInt64AtomicsEnabled = atomicInt64.shaderBufferInt64Atomics != 0;
+            }
+        }
+
+        var nameBytes = new byte[extensionNames.Count][];
+        for (int i = 0; i < nameBytes.Length; i++) nameBytes[i] = Encoding.UTF8.GetBytes(extensionNames[i] + "\0");
+        var handles = new GCHandle[nameBytes.Length];
+        var namePointers = new IntPtr[nameBytes.Length];
+        try
+        {
+            for (int i = 0; i < nameBytes.Length; i++)
+            {
+                handles[i] = GCHandle.Alloc(nameBytes[i], GCHandleType.Pinned);
+                namePointers[i] = handles[i].AddrOfPinnedObject();
+            }
+            fixed (IntPtr* pNames = namePointers)
+            {
+                var deviceCreateInfo = new VkDeviceCreateInfo
+                {
+                    sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                    pNext = chain,
+                    flags = 0,
+                    queueCreateInfoCount = 1,
+                    pQueueCreateInfos = &queueCreateInfo,
+                    enabledLayerCount = 0,
+                    ppEnabledLayerNames = null,
+                    enabledExtensionCount = (uint)nameBytes.Length,
+                    ppEnabledExtensionNames = nameBytes.Length > 0 ? (byte**)pNames : null,
+                    pEnabledFeatures = &enabled
+                };
+                _lastVkResult = VulkanNativeBindings.vkCreateDevice(_physicalDevice, &deviceCreateInfo, IntPtr.Zero, out _device);
+            }
+        }
+        finally
+        {
+            foreach (var handle in handles) if (handle.IsAllocated) handle.Free();
+        }
+
+        var result = _lastVkResult;
         _lastVkResult = result;
         if (result != VulkanNativeBindings.VK_SUCCESS)
         {
