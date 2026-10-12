@@ -1330,6 +1330,34 @@ void main() {
     b[idx] = sum;
 }";
 
+    // A long row split into chunks: one workgroup sums one chunk of one row, its 256 invocations each taking every
+    // 256th element and folding through shared memory in a fixed tree, and writes b[row * chunks + chunk]. The
+    // partials are then summed by SumAxis again. Fixed partition, fixed order, no atomics: deterministic.
+    public static string SumAxisChunks => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint outerSize; uint reduceSize; uint chunks; uint chunkLen; };
+shared float scratch[256];
+void main() {
+    uint group = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint row = group / chunks;
+    uint chunk = group % chunks;
+    bool live = row < outerSize;
+    float sum = 0.0;
+    if (live) {
+        uint start = chunk * chunkLen;
+        uint end = min(start + chunkLen, reduceSize);
+        uint offset = row * reduceSize;
+        for (uint j = start + lid; j < end; j += 256u) sum += a[offset + j];
+    }
+    scratch[lid] = sum;
+    barrier();
+    for (uint o = 128u; o > 0u; o >>= 1) {
+        if (lid < o) scratch[lid] += scratch[lid + o];
+        barrier();
+    }
+    if (live && lid == 0u) b[group] = scratch[0];
+}";
+
     public static string ScalarReduce => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint size; uint op; };
 void main() {

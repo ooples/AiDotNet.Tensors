@@ -1064,8 +1064,45 @@ void main() {
     public float Max(IGpuBuffer A, int size) => ResidentScalarReduce(A, size, 1);
     public float Min(IGpuBuffer A, int size) => ResidentScalarReduce(A, size, 2);
 
+    // How many row sums took the split path (#1157): lets tests assert the dispatch, not only the result.
+    private long _splitRowSumLaunches;
+    internal long SplitRowSumLaunches => System.Threading.Interlocked.Read(ref _splitRowSumLaunches);
+
+    // Rows at least this long are split into chunks (the threshold CUDA uses, #1150) ...
+    internal const int SplitRowMinReduce = 64 * 1024;
+
+    // ... of at least this many elements, 32 per invocation of a 256-invocation workgroup ...
+    internal const int SplitRowChunkMin = 8 * 1024;
+
+    // ... with at most this many workgroups in the dispatch (the specification guarantees 65,535 per dimension).
+    internal const int SplitRowMaxGroups = 16 * 1024;
+
+    /// <summary>Off runs every row sum on the unsplit kernel; benchmarks compare the two.</summary>
+    internal bool SplitRowSumsEnabled { get; set; } = true;
+
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        // The row kernel below gives a row ONE invocation that walks every element, so a full reduction (one row)
+        // ran on a single thread of the device. A long row is split into chunks, each summed by a whole workgroup
+        // into a partial, and the partials are reduced by this same method. Not inside a batch: a batch only records
+        // dispatches, and the partial buffer would be released before the recorded ones run.
+        if (reduceSize >= SplitRowMinReduce && outerSize > 0 && outerSize <= SplitRowMaxGroups / 2 && IsGlslCompilerAvailable
+            && !_batchMode && SplitRowSumsEnabled)
+        {
+            // Ceilings in 64 bits: reduceSize can be close to int.MaxValue.
+            int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SplitRowChunkMin - 1) / SplitRowChunkMin,
+                SplitRowMaxGroups / outerSize));
+            int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+            chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+            int groups = checked(outerSize * chunks);
+            using var partial = AllocateBuffer(groups);
+            GlslUnaryOp(VulkanGlslKernels.SumAxisChunks, A, partial, groups * VulkanKernels.WorkgroupSize,
+                new uint[] { (uint)outerSize, (uint)reduceSize, (uint)chunks, (uint)chunkLen }, 4 * sizeof(uint));
+            System.Threading.Interlocked.Increment(ref _splitRowSumLaunches);
+            SumAxis(partial, B, outerSize, chunks);
+            return;
+        }
+
         GlslUnaryOp(VulkanGlslKernels.SumAxis, A, B, outerSize,
             new uint[] { (uint)outerSize, (uint)reduceSize }, 2 * sizeof(uint));
     }
