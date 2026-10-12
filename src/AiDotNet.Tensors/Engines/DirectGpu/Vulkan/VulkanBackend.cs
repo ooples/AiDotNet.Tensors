@@ -1197,6 +1197,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         // Wait for device to finish
         _device.WaitIdle();
 
+        // Parked buffers must be freed while the device still exists.
+        VulkanGpuBuffer.PendingFrees.Drain();
+        VulkanGpuBuffer.Pool.DrainAll();
+
         // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()
 
         // Dispose pipelines
