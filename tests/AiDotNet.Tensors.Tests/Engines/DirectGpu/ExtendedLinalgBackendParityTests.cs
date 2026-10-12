@@ -71,9 +71,9 @@ public sealed class ExtendedLinalgBackendParityTests
         return values;
     }
 
-    private static void Check(IDirectGpuBackend backend)
+    private static void Check(IDirectGpuBackend backend, IExtendedLinalgBackend? linOverride = null)
     {
-        var lin = Assert.IsAssignableFrom<IExtendedLinalgBackend>(backend);
+        var lin = linOverride ?? Assert.IsAssignableFrom<IExtendedLinalgBackend>(backend);
         foreach (int n in Sizes)
         {
             CheckLuSolve(backend, lin, n);
@@ -334,5 +334,60 @@ public sealed class ExtendedLinalgBackendParityTests
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
         Check(backend);
     }
-}
+
+    // The shared la_ kernels through a launcher (the WebGPU WGSL ports on Dawn), with buffers on the host backend.
+    private sealed class LaunchedExtendedLinalg : IExtendedLinalgBackend
+    {
+        private readonly IDirectGpuBackend _host;
+        private readonly PortableGenericFft.Launcher _launch;
+        public LaunchedExtendedLinalg(IDirectGpuBackend host, PortableGenericFft.Launcher launch) { _host = host; _launch = launch; }
+
+        public void LinalgQrReducedDirect(IGpuBuffer input, IGpuBuffer q, IGpuBuffer r, int batchCount, int m, int n)
+            => PortableExtendedLinalg.QrReduced(_host, _launch, input, q, r, batchCount, m, n);
+
+        public void LinalgSvdReduced(IGpuBuffer input, IGpuBuffer u, IGpuBuffer singularValues, IGpuBuffer vh,
+            int batchCount, int m, int n)
+            => PortableExtendedLinalg.SvdReduced(_launch, input, u, singularValues, vh, batchCount, m, n);
+
+        public void LinalgLuSolve(IGpuBuffer lu, IGpuBuffer pivots, IGpuBuffer rhs, IGpuBuffer solution,
+            int batchCount, int n, int rightHandSides, bool rhsIsVector)
+            => PortableExtendedLinalg.LuSolve(_launch, lu, pivots, rhs, solution, batchCount, n, rightHandSides, rhsIsVector);
+
+        public void LinalgEighSymmetric(IGpuBuffer input, IGpuBuffer eigenvalues, IGpuBuffer eigenvectors,
+            int batchCount, int n, bool upper)
+            => PortableExtendedLinalg.EighSymmetric(_host, (ILinalgBackend)_host, _launch, input, eigenvalues, eigenvectors, batchCount, n, upper);
+
+        public void LinalgLdlFactor(IGpuBuffer input, IGpuBuffer ld, IGpuBuffer pivots, int batchCount, int n, bool upper)
+            => PortableExtendedLinalg.LdlFactor(_launch, input, ld, pivots, batchCount, n, upper);
+
+        public void LinalgLdlSolve(IGpuBuffer ld, IGpuBuffer pivots, IGpuBuffer rhs, IGpuBuffer solution,
+            int batchCount, int n, bool upper, bool rhsIsVector)
+            => PortableExtendedLinalg.LdlSolve(_launch, ld, pivots, rhs, solution, batchCount, n, upper, rhsIsVector);
+
+        public void LinalgSolveVector(IGpuBuffer input, IGpuBuffer rhs, IGpuBuffer solution, IGpuBuffer info,
+            int batchCount, int n)
+            => PortableExtendedLinalg.SolveVector(_launch, input, rhs, solution, info, batchCount, n);
+
+        public void LinalgTriangularSolveVector(IGpuBuffer input, IGpuBuffer rhs, IGpuBuffer solution,
+            int batchCount, int n, bool upper, bool unitDiagonal)
+            => PortableExtendedLinalg.TriangularSolveVector(_launch, input, rhs, solution, batchCount, n, upper, unitDiagonal);
+
+        public void LinalgCholeskyBackwardLower(IGpuBuffer factor, IGpuBuffer gradOutput, IGpuBuffer gradInput,
+            int batchCount, int n)
+            => PortableExtendedLinalg.CholeskyBackwardLower(_launch, factor, gradOutput, gradInput, batchCount, n);
+
+        public void LinalgSolveBackwardVector(IGpuBuffer input, IGpuBuffer solution, IGpuBuffer gradOutput,
+            IGpuBuffer gradInput, IGpuBuffer gradRhs, int batchCount, int n)
+            => PortableExtendedLinalg.SolveBackwardVector(_launch, input, solution, gradOutput, gradInput, gradRhs, batchCount, n);
+    }
+
+    [SkippableFact]
+    public void WebGpuWgsl_ExtendedLinalg_MatchesManagedReference_OnDawn()
+    {
+        using var dawn = DawnWgslLauncher.TryCreate();
+        Skip.If(dawn is null, "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).");
+        using var host = new OpenClBackend();
+        Skip.IfNot(host.IsAvailable, "OpenCL hosts the buffers and is not available.");
+        Check(host, new LaunchedExtendedLinalg(host, dawn!.For(host)));
+    }}
 #endif

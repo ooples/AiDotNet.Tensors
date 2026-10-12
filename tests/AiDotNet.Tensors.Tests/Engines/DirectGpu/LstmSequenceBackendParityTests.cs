@@ -242,5 +242,14 @@ public sealed class LstmSequenceBackendParityTests
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
         Check(backend, Launcher(backend, "LaunchBatch"));
     }
-}
+
+    [SkippableFact]
+    public void WebGpuWgsl_PortableLstmSequence_MatchesCpu_OnDawn()
+    {
+        using var dawn = DawnWgslLauncher.TryCreate();
+        Skip.If(dawn is null, "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).");
+        using var host = new OpenClBackend();
+        Skip.IfNot(host.IsAvailable, "OpenCL hosts the buffers and is not available.");
+        Check(host, dawn!.For(host));
+    }}
 #endif
