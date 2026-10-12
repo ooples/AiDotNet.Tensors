@@ -1290,6 +1290,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 kernel, gridX, 1, 1, blockSize, 1, 1,
                 sharedMemBytes, _stream, (IntPtr)argsPtr);
             HipNativeBindings.CheckError(result, "hipModuleLaunchCooperativeKernel");
+            GpuLaunchProbe.OnLaunch();
         }
     }
 
@@ -1320,6 +1321,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             kernel, gridX, 1, 1, blockSize, 1, 1,
             sharedMemBytes, _stream, (IntPtr)args);
         HipNativeBindings.CheckError(result, "hipModuleLaunchCooperativeKernel");
+        GpuLaunchProbe.OnLaunch();
     }
 
     private unsafe void LaunchKernel2D(IntPtr kernel, uint gridX, uint gridY, uint blockX, uint blockY, IntPtr[] args, uint sharedMem = 0)
@@ -3069,6 +3071,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (size <= 0) return;
         var result = HipNativeBindings.hipMemcpy(destination.Handle, source.Handle, (nuint)(size * sizeof(float)), HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy CopyBuffer");
+        GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
     }
 
     public unsafe void FusedLinearReLU(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output, int batchSize, int inFeatures, int outFeatures) { LaunchFusedLinear("fused_linear_relu", input, weight, bias, output, batchSize, inFeatures, outFeatures); }
@@ -9983,6 +9986,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var size = (UIntPtr)(count * sizeof(float));
         var result = HipNativeBindings.hipMemset(buffer.Handle, 0, size);
         HipNativeBindings.CheckError(result, "hipMemset");
+        GpuLaunchProbe.OnLaunch();   // a device-side memset is GPU work
     }
 
     #endregion
@@ -10168,6 +10172,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             HipMemcpyKind.DeviceToDevice,
             stream.Handle);
         HipNativeBindings.CheckError(result, "hipMemcpyAsync D2D");
+        GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
     }
 
     /// <inheritdoc/>

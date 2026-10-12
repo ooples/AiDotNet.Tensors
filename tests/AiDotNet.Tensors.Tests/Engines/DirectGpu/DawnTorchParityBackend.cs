@@ -96,12 +96,30 @@ public sealed class DawnTorchParityFixture : IDirectGpuTensorEngineFixture, IDis
 
     public DawnTorchParityFixture()
     {
-        _dawn = DawnWgslLauncher.TryCreate(TorchParityModules.Value);
-        if (_dawn is null) return;
-        var host = new OpenClBackend();
-        if (!host.IsAvailable) { host.Dispose(); return; }
+        var dawn = DawnWgslLauncher.TryCreate(TorchParityModules.Value);
+        if (dawn is null) return;
+        OpenClBackend? host = null;
+        try
+        {
+            host = new OpenClBackend();
+            if (!host.IsAvailable)
+            {
+                // An unusable fixture must not keep the node process alive until xUnit disposes it.
+                host.Dispose();
+                dawn.Dispose();
+                return;
+            }
+            Engine = new DirectGpuTensorEngine(new DirectGpuEngine(new DawnTorchParityBackend(host, dawn)));
+        }
+        catch
+        {
+            // A constructor that throws is never disposed by xUnit: release the node process and the host here.
+            host?.Dispose();
+            dawn.Dispose();
+            throw;
+        }
         _host = host;
-        Engine = new DirectGpuTensorEngine(new DirectGpuEngine(new DawnTorchParityBackend(host, _dawn)));
+        _dawn = dawn;
     }
 
     internal static readonly Lazy<System.Collections.Generic.IReadOnlyDictionary<string, string>> TorchParityModules = new(() =>

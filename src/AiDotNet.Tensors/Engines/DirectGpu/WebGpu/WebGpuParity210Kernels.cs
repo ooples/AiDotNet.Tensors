@@ -421,7 +421,7 @@ struct P { size: i32 };
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let bv = b[gid];
-    // torch.fmod(x, 0) = NaN for fp; WGSL has no NAN literal so 0.0/0.0.
+    // torch.fmod(x, 0) = NaN for fp; WGSL rejects a NaN constant expression, so NaN comes from wgsl_f32_bits(0x7FC00000u).
     if (bv == 0.0) { o[gid] = wgsl_f32_bits(0x7FC00000u); return; }
     let av = a[gid];
     let q = trunc(av / bv);
@@ -560,7 +560,7 @@ struct P { size: i32 };
     if (gid >= p.size) { return; }
     let y = a[gid];
     // Domain: [-1, 1].  Exact +/-1 -> +/-infinity; anything strictly outside is NaN.
-    // WGSL has no INF / NaN literals so we construct them via wgsl_f32_bits(0x7F800000u) and 0.0/0.0.
+    // WGSL has no INF / NaN literals so we construct them via wgsl_f32_bits(0x7F800000u) and wgsl_f32_bits(0x7FC00000u).
     if (y == 1.0) { o[gid] = wgsl_f32_bits(0x7F800000u); return; }
     if (y == -1.0) { o[gid] = wgsl_f32_bits(0xFF800000u); return; }
     if (y < -1.0 || y > 1.0) { o[gid] = wgsl_f32_bits(0x7FC00000u); return; }

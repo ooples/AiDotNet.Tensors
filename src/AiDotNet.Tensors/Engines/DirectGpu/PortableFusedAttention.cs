@@ -18,7 +18,7 @@ internal static class PortableFusedAttention
             ? (int)value
             : throw new NotSupportedException($"fused attention: stride {name} = {value} does not fit the portable kernels' int32 indexing.");
 
-    // The scalars every fa_p_ kernel reads, in AttentionSource's order (scale and soft-cap as float bits), carried in a float buffer.
+    // The scalars every fa_p_ kernel reads, in AttentionSource's order (scale and soft-cap as float bits): int32 words bit-cast into a float-typed allocation, which the kernels read as int* / array<i32>.
     private static IGpuBuffer Meta(IDirectGpuBackend backend, in FusedAttentionParams p, int headDim)
     {
         int[] values =

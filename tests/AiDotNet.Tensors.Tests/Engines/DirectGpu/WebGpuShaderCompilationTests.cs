@@ -62,6 +62,7 @@ process.exit(0);
         string? nodeDir = Environment.GetEnvironmentVariable("AIDOTNET_WEBGPU_NODE_DIR");
         Skip.If(string.IsNullOrEmpty(nodeDir) || !Directory.Exists(Path.Combine(nodeDir, "node_modules", "webgpu")),
             "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).");
+        string node = nodeDir ?? string.Empty;
 
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-wgsl-" + Guid.NewGuid().ToString("N"));
         string shaders = Path.Combine(work, "shaders");
@@ -95,22 +96,35 @@ process.exit(0);
                     count++;
                 }
             }
+            // The FP32 PyTorch-parity kernels, one translated module per kernel (#1125, #1128).
+            foreach (var module in CudaDialectToWgsl.Translate(AiDotNet.Tensors.Engines.DirectGpu.TorchParityF32Kernels.GetSource()))
+            {
+                File.WriteAllText(Path.Combine(shaders, "TorchParityF32." + module.Key + ".wgsl"), WebGpuShaderPrelude.Prepare(module.Value));
+                count++;
+            }
             Assert.True(count > 100, $"only {count} WGSL sources found");
 
             // The script must sit beside node_modules for the 'webgpu' import to resolve.
-            string script = Path.Combine(nodeDir!, "aidotnet-wgsl-validate.mjs");
+            string script = Path.Combine(node, "aidotnet-wgsl-validate.mjs");
             File.WriteAllText(script, Validator);
             var start = new ProcessStartInfo("node", $"\"{script}\" \"{shaders}\"")
             {
-                WorkingDirectory = nodeDir!,
+                WorkingDirectory = node,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
             };
             using var process = Process.Start(start) ?? throw new InvalidOperationException("node did not start");
-            string output = process.StandardOutput.ReadToEnd();
-            string errors = process.StandardError.ReadToEnd();
-            process.WaitForExit(600_000);
+            // Both pipes drain concurrently (a full stderr pipe would block node), and the wait is bounded.
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(600_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+                Assert.Fail("Dawn shader validation did not finish within 10 minutes.");
+            }
+            string output = stdout.GetAwaiter().GetResult();
+            string errors = stderr.GetAwaiter().GetResult();
             Skip.If(output.Contains("NOADAPTER"), "Dawn found no WebGPU adapter on this machine.");
             Assert.True(output.Contains("DONE"), $"node exited {process.ExitCode} before finishing: {errors}");
             var failures = output.Split('\n').Where(line => line.StartsWith("FAIL ", StringComparison.Ordinal)).ToArray();

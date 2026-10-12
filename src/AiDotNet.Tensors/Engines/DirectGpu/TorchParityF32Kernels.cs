@@ -35,7 +35,7 @@ internal static class TorchParityF32Kernels
     private const string Helpers = @"
 __device__ __forceinline__ bool tp_isnan(float v) { return (__float_as_uint(v) & 0x7FFFFFFFu) > 0x7F800000u; }
 __device__ __forceinline__ bool tp_isinf(float v) { return (__float_as_uint(v) & 0x7FFFFFFFu) == 0x7F800000u; }
-__device__ __forceinline__ bool tp_signbit(float v) { return (__float_as_uint(v) & 0x80000000u) != 0u; }
+__device__ __forceinline__ bool tp_signbit_f(float v) { return (__float_as_uint(v) & 0x80000000u) != 0u; }
 __device__ __forceinline__ float tp_nan() { return __uint_as_float(0x7FC00000u); }
 __device__ __forceinline__ float tp_inf() { return __uint_as_float(0x7F800000u); }
 __device__ __forceinline__ float tp_ninf() { return __uint_as_float(0xFF800000u); }
@@ -200,6 +200,12 @@ __device__ __forceinline__ float tp_erf_series(float x)
     return 1.1283791670955126f * sum;
 }
 
+// An int as an exact double-float: each half fits float's 24-bit significand, so (float)v cannot merge neighbours past 2^24.
+__device__ __forceinline__ float2 tp_df_int(int v)
+{
+    return tp_df_add(tp_df((float)(v >> 12) * 4096.0f), tp_df((float)(v & 4095)));
+}
+
 // sqrt(pi) exp(x^2) erfc(x) by the modified-Lentz continued fraction, x >= 2.5.
 __device__ __forceinline__ float tp_erfc_continued_fraction(float x)
 {
@@ -252,7 +258,7 @@ __device__ __forceinline__ float tp_erfc(float x)
     return 1.0f - tp_erf_series(x);
 }
 
-__device__ __forceinline__ float tp_erf(float x)
+__device__ __forceinline__ float tp_erf_f(float x)
 {
     if (tp_isnan(x)) { return x; }
     if (tp_isinf(x)) { return tp_pick(x > 0.0f, 1.0f, -1.0f); }
@@ -262,7 +268,7 @@ __device__ __forceinline__ float tp_erf(float x)
     return tail - 1.0f;
 }
 
-__device__ __forceinline__ float tp_erfcx(float x)
+__device__ __forceinline__ float tp_erfcx_f(float x)
 {
     if (tp_isnan(x)) { return x; }
     if (tp_isinf(x) && x > 0.0f) { return 0.0f; }
@@ -277,19 +283,19 @@ __device__ __forceinline__ float tp_erfcx(float x)
     return 2.0f * expf(x * x) - positive;
 }
 
-__device__ __forceinline__ float tp_ndtr(float x) { return 0.5f * tp_erfc(-x / 1.4142135623730951f); }
+__device__ __forceinline__ float tp_ndtr_f(float x) { return 0.5f * tp_erfc(-x / 1.4142135623730951f); }
 
-__device__ __forceinline__ float tp_log_ndtr(float x)
+__device__ __forceinline__ float tp_log_ndtr_f(float x)
 {
     if (tp_isnan(x)) { return x; }
     if (tp_isinf(x) && x < 0.0f) { return tp_ninf(); }
-    if (x > 0.0f) { return tp_log1p(-tp_ndtr(-x)); }
-    if (x > -1.0f) { return logf(tp_ndtr(x)); }
-    return logf(0.5f * tp_erfcx(-x / 1.4142135623730951f)) - 0.5f * x * x;
+    if (x > 0.0f) { return tp_log1p(-tp_ndtr_f(-x)); }
+    if (x > -1.0f) { return logf(tp_ndtr_f(x)); }
+    return logf(0.5f * tp_erfcx_f(-x / 1.4142135623730951f)) - 0.5f * x * x;
 }
 
 // Acklam's rational approximation refined by two Halley steps against ndtr.
-__device__ __forceinline__ float tp_ndtri(float p)
+__device__ __forceinline__ float tp_ndtri_f(float p)
 {
     if (tp_isnan(p) || p < 0.0f || p > 1.0f) { return tp_nan(); }
     if (tp_is_zero(p)) { return tp_ninf(); }
@@ -320,7 +326,7 @@ __device__ __forceinline__ float tp_ndtri(float p)
     }
     for (int k = 0; k < 2; k++)
     {
-        float e = tp_ndtr(x) - p;
+        float e = tp_ndtr_f(x) - p;
         float u = e * 2.5066282746310002f * expf(x * x / 2.0f);
         x = x - u / (1.0f + x * u / 2.0f);
     }
@@ -531,7 +537,7 @@ __device__ __forceinline__ float tp_bessel_j_fractional(float nu, float x)
     return (first - sinf(nu * 3.14159265358979f) * second) / 3.14159265358979f;
 }
 
-__device__ __forceinline__ float tp_airy_ai(float x)
+__device__ __forceinline__ float tp_airy_ai_f(float x)
 {
     if (tp_isnan(x)) { return x; }
     if (tp_isinf(x)) { return 0.0f; }
@@ -642,27 +648,27 @@ __device__ __forceinline__ float tp_igamma_continued_fraction(float a, float x)
         ("tp_softsign", "y[t] = v / (1.0f + fabsf(v));"),
         ("tp_logit", "float c = tp_clamp_nan(v, p0, p1); if (tp_isnan(c)) { y[t] = c; } else if ((__float_as_uint(c) & 0x80000000u) == 0u && !tp_is_zero(c) && c < 1.0f) { y[t] = tp_log(c) - tp_log1p(-c); } else { y[t] = logf(c / (1.0f - c)); }"),
         ("tp_sinc", "if (v == 0.0f) { y[t] = 1.0f; } else if (tp_isinf(v)) { y[t] = 0.0f; } else { y[t] = tp_sinpi(v) / (3.14159265358979f * v); }"),
-        ("tp_erf", "y[t] = tp_erf(v);"),
+        ("tp_erf", "y[t] = tp_erf_f(v);"),
         ("tp_bessel_j0", "y[t] = tp_bessel_j(0, v);"),
         ("tp_bessel_j1", "y[t] = tp_bessel_j(1, v);"),
         ("tp_bessel_y0", "y[t] = tp_bessel_y(0, v);"),
         ("tp_bessel_y1", "y[t] = tp_bessel_y(1, v);"),
         ("tp_bessel_i0", "y[t] = tp_bessel_i(0, v);"),
         ("tp_bessel_i1", "y[t] = tp_bessel_i(1, v);"),
-        ("tp_erfcx", "y[t] = tp_erfcx(v);"),
-        ("tp_ndtr", "y[t] = tp_ndtr(v);"),
-        ("tp_ndtri", "y[t] = tp_ndtri(v);"),
+        ("tp_erfcx", "y[t] = tp_erfcx_f(v);"),
+        ("tp_ndtr", "y[t] = tp_ndtr_f(v);"),
+        ("tp_ndtri", "y[t] = tp_ndtri_f(v);"),
         ("tp_entr", "if (tp_isnan(v)) { y[t] = v; } else if (v > 0.0f) { y[t] = -v * logf(v); } else if (v == 0.0f) { y[t] = 0.0f; } else { y[t] = tp_ninf(); }"),
-        ("tp_signbit", "y[t] = tp_pick(tp_signbit(v), 1.0f, 0.0f);"),
+        ("tp_signbit", "y[t] = tp_pick(tp_signbit_f(v), 1.0f, 0.0f);"),
         ("tp_isposinf", "y[t] = tp_pick(tp_isinf(v) && v > 0.0f, 1.0f, 0.0f);"),
         ("tp_isneginf", "y[t] = tp_pick(tp_isinf(v) && v < 0.0f, 1.0f, 0.0f);"),
-        ("tp_log_ndtr", "y[t] = tp_log_ndtr(v);"),
+        ("tp_log_ndtr", "y[t] = tp_log_ndtr_f(v);"),
         ("tp_bessel_k0", "y[t] = tp_bessel_k(0.0f, v);"),
         ("tp_bessel_k1", "y[t] = tp_bessel_k(1.0f, v);"),
         ("tp_bessel_k0e", "y[t] = tp_bessel_k_scaled(0.0f, v);"),
         ("tp_bessel_k1e", "y[t] = tp_bessel_k_scaled(1.0f, v);"),
         ("tp_spherical_bessel_j0", "if (tp_isnan(v)) { y[t] = v; } else if (tp_isinf(v)) { y[t] = 0.0f; } else if (fabsf(v) < 1e-4f) { y[t] = 1.0f - v * v / 6.0f; } else { y[t] = sinf(v) / v; }"),
-        ("tp_airy_ai", "y[t] = tp_airy_ai(v);"),
+        ("tp_airy_ai", "y[t] = tp_airy_ai_f(v);"),
         ("tp_angle", "if (tp_isnan(v)) { y[t] = v; } else if (v < 0.0f) { y[t] = 3.14159265358979f; } else { y[t] = 0.0f; }"),
         ("tp_nonzero", "y[t] = tp_pick(v != 0.0f, 1.0f, 0.0f);"),
         // mvlgamma (p = p0 >= 1): NaN at or below (p - 1) / 2, else p (p - 1) / 4 log(pi) + sum_j lgamma(x - j / 2).
@@ -825,7 +831,7 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_range(float* y, int n, fl
 {
     int t = bx_gid();
     if (t >= n) { return; }
-    float2 v = tp_df_add(make_float2(startHi, startLo), tp_df_div(tp_df_mul(tp_df((float)t), make_float2(spanHi, spanLo)), make_float2(denHi, denLo)));
+    float2 v = tp_df_add(make_float2(startHi, startLo), tp_df_div(tp_df_mul(tp_df_int(t), make_float2(spanHi, spanLo)), make_float2(denHi, denLo)));
     y[t] = v.x + v.y;
 }
 
@@ -849,7 +855,7 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_logspace(float* y, int n,
     int t = bx_gid();
     if (t >= n) { return; }
     float2 e = make_float2(startHi, startLo);
-    if (single == 0) { e = tp_df_add(e, tp_df_div(tp_df_mul(tp_df((float)t), make_float2(spanHi, spanLo)), make_float2(denHi, denLo))); }
+    if (single == 0) { e = tp_df_add(e, tp_df_div(tp_df_mul(tp_df_int(t), make_float2(spanHi, spanLo)), make_float2(denHi, denLo))); }
     float2 l = tp_df_mul(e, make_float2(lnBaseHi, lnBaseLo));
     if (l.x > 89.0f) { y[t] = tp_inf(); return; }
     if (l.x < -104.0f) { y[t] = 0.0f; return; }
@@ -972,7 +978,7 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_quantile_rows(const float
     }
     int count = lo;
     if (count == 0 || (count < length && ignoreNan == 0)) { y[r] = tp_nan(); return; }
-    float2 position = tp_df_mul(make_float2(qHi, qLo), tp_df((float)(count - 1)));
+    float2 position = tp_df_mul(make_float2(qHi, qLo), tp_df_int(count - 1));
     float below = floorf(position.x);
     if (position.x == below && position.y < 0.0f) { below = below - 1.0f; }
     float above = ceilf(position.x);
@@ -1764,7 +1770,8 @@ __device__ __forceinline__ float2 tp_grid_unnormalize(float normalized, int size
     float scale = (float)size / 2.0f;
     if (alignCorners != 0) { scale = (float)(size - 1) / 2.0f; }
     float prod = normalized * scale;
-    return tp_df_add(make_float2(prod, tp_two_prod_err(normalized, scale, prod)), tp_df((float)(size - 1) / 2.0f));
+    float2 shift = tp_df_int(size - 1);
+    return tp_df_add(make_float2(prod, tp_two_prod_err(normalized, scale, prod)), make_float2(shift.x * 0.5f, shift.y * 0.5f));
 }
 
 // Reflects a coordinate into [twiceLow / 2, twiceHigh / 2] (the CPU's reflection: fold by the span, mirror odd folds).

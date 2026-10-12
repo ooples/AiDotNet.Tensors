@@ -77,10 +77,19 @@ for await (const line of rl) {
 }
 ";
 
+    // A launch longer than this is a hung shader or a stuck mapAsync, not a slow one.
+    private static readonly TimeSpan ReplyTimeout = TimeSpan.FromMinutes(5);
+
     private readonly Process _node;
     private readonly IReadOnlyDictionary<string, string>? _modules;
+    private readonly System.Text.StringBuilder _stderr;
 
-    private DawnWgslLauncher(Process node, IReadOnlyDictionary<string, string>? modules) { _node = node; _modules = modules; }
+    private DawnWgslLauncher(Process node, IReadOnlyDictionary<string, string>? modules, System.Text.StringBuilder stderr)
+    {
+        _node = node;
+        _modules = modules;
+        _stderr = stderr;
+    }
 
     /// <summary>A launcher, or null when AIDOTNET_WEBGPU_NODE_DIR is not set up.</summary>
     /// <param name="modules">Kernel name to WGSL module; null runs the batch-execution ports.</param>
@@ -99,7 +108,12 @@ for await (const line of rl) {
             UseShellExecute = false,
         };
         var node = Process.Start(start);
-        return node is null ? null : new DawnWgslLauncher(node, modules);
+        if (node is null) return null;
+        // Drain stderr as it arrives: a full stderr pipe would block node, and then the reply read below.
+        var stderr = new System.Text.StringBuilder();
+        node.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (stderr) stderr.AppendLine(e.Data); };
+        node.BeginErrorReadLine();
+        return new DawnWgslLauncher(node, modules, stderr);
     }
 
     /// <summary>A <see cref="PortableGenericFft.Launcher"/> that runs each launch's WGSL port on Dawn.</summary>
@@ -141,8 +155,14 @@ for await (const line of rl) {
         var job = new { code, buffers = encoded, uniform = Convert.ToBase64String(fields.ToArray()), workgroups = (threads + 255) / 256 };
         _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));
         _node.StandardInput.Flush();
-        string? reply = _node.StandardOutput.ReadLine();
-        if (reply is null) throw new InvalidOperationException("Dawn server exited: " + _node.StandardError.ReadToEnd());
+        var read = _node.StandardOutput.ReadLineAsync();
+        if (!read.Wait(ReplyTimeout))
+        {
+            try { _node.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+            throw new TimeoutException($"{name} on Dawn did not reply within {ReplyTimeout.TotalMinutes} minutes: {StderrText()}");
+        }
+        string? reply = read.Result;
+        if (reply is null) throw new InvalidOperationException("Dawn server exited: " + StderrText());
         using var doc = JsonDocument.Parse(reply);
         if (!doc.RootElement.GetProperty("ok").GetBoolean())
             throw new InvalidOperationException($"{name} on Dawn: {doc.RootElement.GetProperty("error").GetString()}");
@@ -155,6 +175,11 @@ for await (const line of rl) {
             Buffer.BlockCopy(bytes, 0, data, 0, bytes.Length);
             host.UploadBufferInPlace(data, buffers[b]);
         }
+    }
+
+    private string StderrText()
+    {
+        lock (_stderr) return _stderr.ToString();
     }
 
     public void Dispose()
