@@ -27859,13 +27859,29 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    // Vector multiply and add round exactly as the scalar tail (no fused multiply-add), so every column's bits are
+    // the same whether it falls in the SIMD body or the tail.
+    [MethodImpl(Hot)]
     private static void RmsNormBackwardAccumGammaRows(float[] gradOut, float[] input, float[] rms, float[] gAcc, int gOff, int r0, int r1, int fs)
     {
         for (int b = r0; b < r1; b++)
         {
             int off = b * fs;
             float invRms = 1f / rms[b];
-            for (int f = 0; f < fs; f++)
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= Vector256<float>.Count)
+            {
+                var vInv = Vector256.Create(invRms);
+                for (; f + Vector256<float>.Count <= fs; f += Vector256<float>.Count)
+                {
+                    var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + Vector256.LoadUnsafe(ref gradOut[off + f]) * normalized)
+                        .StoreUnsafe(ref gAcc[gOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
             {
                 float normalized = input[off + f] * invRms;
                 gAcc[gOff + f] += gradOut[off + f] * normalized;
@@ -27894,13 +27910,29 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    // Vector multiply and add round exactly as the scalar tail (no fused multiply-add), so every column's bits are
+    // the same whether it falls in the SIMD body or the tail.
+    [MethodImpl(Hot)]
     private static void RmsNormBackwardAccumGammaRows(double[] gradOut, double[] input, double[] rms, double[] gAcc, int gOff, int r0, int r1, int fs)
     {
         for (int b = r0; b < r1; b++)
         {
             int off = b * fs;
             double invRms = 1.0 / rms[b];
-            for (int f = 0; f < fs; f++)
+            int f = 0;
+#if NET5_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && fs >= Vector256<double>.Count)
+            {
+                var vInv = Vector256.Create(invRms);
+                for (; f + Vector256<double>.Count <= fs; f += Vector256<double>.Count)
+                {
+                    var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                    (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + Vector256.LoadUnsafe(ref gradOut[off + f]) * normalized)
+                        .StoreUnsafe(ref gAcc[gOff + f]);
+                }
+            }
+#endif
+            for (; f < fs; f++)
             {
                 double normalized = input[off + f] * invRms;
                 gAcc[gOff + f] += gradOut[off + f] * normalized;
@@ -28514,7 +28546,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
-    // GroupNorm backward, double: the same (batch, channel) passes as the float kernel, scalar arithmetic.
+    // GroupNorm backward, double: the same (batch, channel) passes as the float kernel, scalar arithmetic. The per-item
+    // bodies are static methods so their arrays are locals (a closure's captured fields kept the JIT from hoisting).
     private static void GroupNormBackwardDouble(double[] gradOut, double[] input, double[] gamma, double[] mean, double[] variance,
         double[] gradGamma, double[] gradBeta, double[] gradInput, int batch, int channels, int spatial, int numGroups, double eps)
     {
@@ -28523,29 +28556,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var stats = System.Buffers.ArrayPool<double>.Shared.Rent(4 * items);
         try
         {
-            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial, bc =>
-            {
-                int b = bc / channels, c = bc % channels, g = c / cpg;
-                double groupMean = mean[b * numGroups + g];
-                double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
-                double gammaC = gamma[c];
-                int off = bc * spatial;
-                double gammaAcc = 0, betaAcc = 0, sumGrad = 0, sumGradNorm = 0;
-                for (int s = 0; s < spatial; s++)
-                {
-                    double go = gradOut[off + s];
-                    double normalized = (input[off + s] - groupMean) * invStd;
-                    double scaledGrad = gammaC * go;
-                    gammaAcc += go * normalized;
-                    betaAcc += go;
-                    sumGrad += scaledGrad;
-                    sumGradNorm += scaledGrad * normalized;
-                }
-                stats[bc] = gammaAcc;
-                stats[items + bc] = betaAcc;
-                stats[2 * items + bc] = sumGrad;
-                stats[3 * items + bc] = sumGradNorm;
-            }, deterministicSafe: true);
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardDoubleChannelStats(gradOut, input, gamma, mean, variance, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
             for (int c = 0; c < channels; c++)
             {
                 double gAcc = 0, bAcc = 0;
@@ -28557,33 +28570,66 @@ public partial class CpuEngine : ITensorLevelEngine
                 gradGamma[c] = gAcc;
                 gradBeta[c] = bAcc;
             }
-            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial, bc =>
-            {
-                int b = bc / channels, c = bc % channels, g = c / cpg;
-                double groupMean = mean[b * numGroups + g];
-                double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
-                double sumGrad = 0, sumGradNorm = 0;
-                int first = b * channels + g * cpg;
-                for (int k = 0; k < cpg; k++)
-                {
-                    sumGrad += stats[2 * items + first + k];
-                    sumGradNorm += stats[3 * items + first + k];
-                }
-                double groupSizeD = (double)cpg * spatial;
-                double scale = invStd / groupSizeD;
-                double gammaC = gamma[c];
-                int off = bc * spatial;
-                for (int s = 0; s < spatial; s++)
-                {
-                    double normalized = (input[off + s] - groupMean) * invStd;
-                    double gradNorm = gammaC * gradOut[off + s];
-                    gradInput[off + s] = scale * (groupSizeD * gradNorm - sumGrad - normalized * sumGradNorm);
-                }
-            }, deterministicSafe: true);
+            CpuParallelSettings.ParallelForOrSerial(0, items, (long)items * spatial,
+                bc => GroupNormBackwardDoubleChannelInput(gradOut, input, gamma, mean, variance, gradInput, stats, items,
+                    bc, channels, spatial, numGroups, cpg, eps), deterministicSafe: true);
         }
         finally
         {
             System.Buffers.ArrayPool<double>.Shared.Return(stats);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardDoubleChannelStats(double[] gradOut, double[] input, double[] gamma, double[] mean,
+        double[] variance, double[] stats, int items, int bc, int channels, int spatial, int numGroups, int cpg, double eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        double groupMean = mean[b * numGroups + g];
+        double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
+        double gammaC = gamma[c];
+        int off = bc * spatial;
+        double gammaAcc = 0, betaAcc = 0, sumGrad = 0, sumGradNorm = 0;
+        for (int s = 0; s < spatial; s++)
+        {
+            double go = gradOut[off + s];
+            double normalized = (input[off + s] - groupMean) * invStd;
+            double scaledGrad = gammaC * go;
+            gammaAcc += go * normalized;
+            betaAcc += go;
+            sumGrad += scaledGrad;
+            sumGradNorm += scaledGrad * normalized;
+        }
+        stats[bc] = gammaAcc;
+        stats[items + bc] = betaAcc;
+        stats[2 * items + bc] = sumGrad;
+        stats[3 * items + bc] = sumGradNorm;
+    }
+
+    [MethodImpl(Hot)]
+    private static void GroupNormBackwardDoubleChannelInput(double[] gradOut, double[] input, double[] gamma, double[] mean,
+        double[] variance, double[] gradInput, double[] stats, int items, int bc, int channels, int spatial, int numGroups,
+        int cpg, double eps)
+    {
+        int b = bc / channels, c = bc % channels, g = c / cpg;
+        double groupMean = mean[b * numGroups + g];
+        double invStd = 1.0 / Math.Sqrt(variance[b * numGroups + g] + eps);
+        double sumGrad = 0, sumGradNorm = 0;
+        int first = b * channels + g * cpg;
+        for (int k = 0; k < cpg; k++)
+        {
+            sumGrad += stats[2 * items + first + k];
+            sumGradNorm += stats[3 * items + first + k];
+        }
+        double groupSizeD = (double)cpg * spatial;
+        double scale = invStd / groupSizeD;
+        double gammaC = gamma[c];
+        int off = bc * spatial;
+        for (int s = 0; s < spatial; s++)
+        {
+            double normalized = (input[off + s] - groupMean) * invStd;
+            double gradNorm = gammaC * gradOut[off + s];
+            gradInput[off + s] = scale * (groupSizeD * gradNorm - sumGrad - normalized * sumGradNorm);
         }
     }
 
