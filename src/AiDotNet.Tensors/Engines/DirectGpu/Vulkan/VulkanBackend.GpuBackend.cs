@@ -243,8 +243,12 @@ public sealed unsafe partial class VulkanBackend
         if (size > input.Size)
             throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) exceeds buffer length ({input.Size}).");
         using var result = AllocateBuffer(1);
-        GlslUnaryOp(VulkanGlslKernels.ScalarReduce, input, result, 1,
-            new uint[] { (uint)size, operation }, 2 * sizeof(uint));
+        // ScalarReduce is ONE invocation over the whole buffer. A long sum goes through the split row sum instead.
+        if (operation == 0 && SplitsRowSum(1, size))
+            SumAxis(input, result, 1, size);
+        else
+            GlslUnaryOp(VulkanGlslKernels.ScalarReduce, input, result, 1,
+                new uint[] { (uint)size, operation }, 2 * sizeof(uint));
         return DownloadBuffer(result)[0];
     }
 
@@ -1080,14 +1084,17 @@ void main() {
     /// <summary>Off runs every row sum on the unsplit kernel; benchmarks compare the two.</summary>
     internal bool SplitRowSumsEnabled { get; set; } = true;
 
+    private bool SplitsRowSum(int outerSize, int reduceSize)
+        => reduceSize >= SplitRowMinReduce && outerSize > 0 && outerSize <= SplitRowMaxGroups / 2 && IsGlslCompilerAvailable
+           && !_batchMode && SplitRowSumsEnabled;
+
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         // The row kernel below gives a row ONE invocation that walks every element, so a full reduction (one row)
         // ran on a single thread of the device. A long row is split into chunks, each summed by a whole workgroup
         // into a partial, and the partials are reduced by this same method. Not inside a batch: a batch only records
         // dispatches, and the partial buffer would be released before the recorded ones run.
-        if (reduceSize >= SplitRowMinReduce && outerSize > 0 && outerSize <= SplitRowMaxGroups / 2 && IsGlslCompilerAvailable
-            && !_batchMode && SplitRowSumsEnabled)
+        if (SplitsRowSum(outerSize, reduceSize))
         {
             // Ceilings in 64 bits: reduceSize can be close to int.MaxValue.
             int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SplitRowChunkMin - 1) / SplitRowChunkMin,

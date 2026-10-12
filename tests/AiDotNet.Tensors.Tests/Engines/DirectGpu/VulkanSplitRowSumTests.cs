@@ -113,6 +113,38 @@ public class VulkanSplitRowSumTests
     }
 
     [SkippableFact]
+    public void TheScalarSum_AndLongRowMeans_TakeTheSplitPath()
+    {
+        var backend = BackendOrSkip();
+        const int rows = 3, cols = 131_072;   // a power of two, so each mean is an exact division
+        float[] x = Values(21, rows * cols);
+        using var input = backend.AllocateBuffer(x);
+
+        long splits = backend.SplitRowSumLaunches;
+        float total = backend.Sum(input, x.Length);
+        Assert.True(backend.SplitRowSumLaunches > splits, "the scalar sum did not take the split-row path");
+        AssertExact(x.Sum(v => (double)v), total, "scalar sum");
+
+        using var means = backend.AllocateBuffer(rows);
+        backend.Fill(means, float.NaN, rows);
+        splits = backend.SplitRowSumLaunches;
+        backend.MeanAxis(input, means, rows, cols);
+        Assert.True(backend.SplitRowSumLaunches > splits, "the row means did not take the split-row path");
+        float[] got = backend.DownloadBuffer(means);
+        for (int r = 0; r < rows; r++)
+        {
+            double sum = 0;
+            for (int c = 0; c < cols; c++) sum += x[r * cols + c];
+            AssertExact(sum / cols, got[r], $"mean of row {r}");
+        }
+
+        // A short buffer keeps the single-dispatch kernels.
+        splits = backend.SplitRowSumLaunches;
+        AssertExact(x.Take(1000).Sum(v => (double)v), backend.Sum(input, 1000), "short scalar sum");
+        Assert.Equal(splits, backend.SplitRowSumLaunches);
+    }
+
+    [SkippableFact]
     public void InsideABatch_TheUnsplitKernelRuns()
     {
         var backend = BackendOrSkip();
