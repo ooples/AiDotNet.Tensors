@@ -502,6 +502,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> ElementwiseDivide(Vector<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (other == null)
             throw new ArgumentNullException(nameof(other));
@@ -544,6 +545,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> Where(Func<T, bool> predicate)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         return new Vector<T>(_memory.ToArray().Where(predicate));
     }
 
@@ -559,6 +561,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<TResult> Select<TResult>(Func<T, TResult> selector)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         return new Vector<TResult>(_memory.ToArray().Select(selector));
     }
 
@@ -619,6 +622,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public new Vector<TResult> Transform<TResult>(Func<T, TResult> function)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var resultArray = new TResult[Length];
         var span = _memory.Span;
         for (int i = 0; i < Length; i++)
@@ -642,6 +646,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public new Vector<TResult> Transform<TResult>(Func<T, int, TResult> function)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var resultArray = new TResult[Length];
         var span = _memory.Span;
         for (int i = 0; i < Length; i++)
@@ -698,6 +703,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> GetSubVector(int startIndex, int length)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (startIndex < 0 || startIndex >= this.Length)
             throw new ArgumentOutOfRangeException(nameof(startIndex), "Start index must be within the bounds of the vector.");
         if (length < 0)
@@ -755,6 +761,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public T DotProduct(Vector<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (other == null)
             throw new ArgumentNullException(nameof(other));
@@ -778,6 +785,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public T Norm()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Use vectorized dot product: ||x|| = sqrt(x . x)
         var span = _memory.Span;
         T sumOfSquares = _numOps.Dot(span, span);
@@ -797,6 +805,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> Divide(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = VA.RentUninitialized<T>(this.Length);
         _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
@@ -828,6 +837,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public byte[] Serialize()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var ms = new MemoryStream();
         using var writer = new BinaryWriter(ms);
 
@@ -891,6 +901,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> ElementwiseMultiply(Vector<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (other == null)
             throw new ArgumentNullException(nameof(other));
@@ -1090,6 +1101,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// <returns>A new vector containing the specified _data.</returns>
     protected override VectorBase<T> CreateInstance(T[] _data)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         return new Vector<T>(_data);
     }
 
@@ -1309,6 +1321,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public Matrix<T> Transpose()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // Create a column matrix (Nx1) from this vector
         // In linear algebra, transposing a row vector (1xN) gives a column vector (Nx1)
         var result = new Matrix<T>(Length, 1);
@@ -1381,6 +1394,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> RemoveAt(int index)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (index < 0 || index >= Length)
             throw new ArgumentOutOfRangeException(nameof(index));
 
@@ -1482,6 +1496,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> Add(VectorBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
@@ -1503,6 +1518,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> Subtract(VectorBase<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
@@ -1524,6 +1540,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> Multiply(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = VA.RentUninitialized<T>(Length);
         _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;

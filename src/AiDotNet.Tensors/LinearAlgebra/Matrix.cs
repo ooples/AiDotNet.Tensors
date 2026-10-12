@@ -756,6 +756,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     [MethodImpl(Hot)]
     public Vector<T> GetColumnSegment(int columnIndex, int startRow, int length)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = VA.RentUninitialized<T>(length);
         var destSpan = result.AsWritableSpanUnmarked();
         var srcSpan = _memory.Span;
@@ -781,6 +782,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> GetRowSegment(int rowIndex, int startColumn, int length)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         var result = VA.RentUninitialized<T>(length);
         var sourceSpan = _memory.Span.Slice(rowIndex * _cols + startColumn, length);
         _numOps.Copy(sourceSpan, result.AsWritableSpanUnmarked());
@@ -861,6 +863,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> ToRowVector()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         Vector<T> result = new(Rows * Columns);
         _numOps.Copy(_memory.Span, result.AsWritableSpanUnmarked());
         return result;
@@ -880,6 +883,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Add(Tensor<T> tensor)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (tensor._shape.Length != 2 || tensor._shape[0] != Rows || tensor._shape[1] != Columns)
         {
             throw new ArgumentException("Tensor dimensions must match matrix dimensions for addition.");
@@ -1111,6 +1115,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Divide(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
         _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
@@ -1125,6 +1130,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public void DivideInPlace(T scalar)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         MarkDirty();
         _numOps.DivideScalar(_memory.Span, scalar, _memory.Span);
     }
@@ -1142,6 +1148,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Divide(Matrix<T> other)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (this.Rows != other.Rows || this.Columns != other.Columns)
         {
@@ -1467,6 +1474,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     internal Span<T> GetRowSpan(int rowIndex)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (rowIndex < 0 || rowIndex >= Rows)
             throw new ArgumentOutOfRangeException(nameof(rowIndex));
         int startIndex = rowIndex * Columns;
@@ -1485,6 +1493,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     internal ReadOnlySpan<T> GetRowReadOnlySpan(int rowIndex)
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (rowIndex < 0 || rowIndex >= Rows)
             throw new ArgumentOutOfRangeException(nameof(rowIndex));
         int startIndex = rowIndex * Columns;
