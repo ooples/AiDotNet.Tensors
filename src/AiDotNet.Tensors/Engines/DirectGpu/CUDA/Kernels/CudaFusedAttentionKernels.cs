@@ -17,6 +17,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// (2 threads per key row, half the head dimension each) that owns dK / dV, and a query-block pass (2 threads per query
 /// row) that owns dQ. Every reduction has a fixed order, so results do not depend on scheduling.
 /// Head dimension D (= value dimension) is a template parameter: 16, 32 and 64 are compiled.
+/// <para>
+/// The default backward (<c>fa_backward_fused_d*</c>) is a CUDA-only implementation of
+/// <see cref="IFusedAttentionBackend.FusedAttentionBackward"/>, not a new operation: it computes the same dQ, dK and dV
+/// as the two-pass kernels, which <c>DeterministicReductions</c> still selects. It needs a float atomic add on device
+/// memory for dQ. WGSL has none, and Vulkan and OpenCL offer one only through optional extensions, so it cannot be
+/// written once for every backend. The other five backends get the same interface method from per-element kernels
+/// that have no cross-block sums and need no atomics (#1179, implemented in #1181).
+/// </para>
 /// </summary>
 internal static class CudaFusedAttentionKernels
 {

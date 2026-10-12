@@ -124,8 +124,9 @@ public sealed partial class CudaBackend : IFusedAttentionBackend
         // two-pass kernels, whose every sum has a fixed order (torch.use_deterministic_algorithms).
         if (!AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions)
         {
-            if (p.Sq <= 0) return;
-            MemsetBuffer(dQ, 0, (long)p.B * p.H * p.Sq * headDim * sizeof(float));   // dQ covers q's elements exactly
+            // With no query rows the fused kernel still runs: its query loop is empty and it writes zero dK / dV.
+            if (p.Sq > 0)
+                MemsetBuffer(dQ, 0, (long)p.B * p.H * p.Sq * headDim * sizeof(float));   // dQ covers q's elements exactly
             if (p.Sk <= 0) return;
             IntPtr fusedKernel = FusedAttentionKernel($"fa_backward_fused_d{headDim}");
             void** fargs = stackalloc void*[11];

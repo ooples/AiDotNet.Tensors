@@ -172,4 +172,40 @@ public class FusedAttentionDeviceTests : IClassFixture<DirectGpuTensorEngineTest
         }
         finally { AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = saved; }
     }
+
+    // dK and dV are written, not accumulated, even with no query rows: both backward paths must overwrite them with
+    // zeros (no query reaches any key), never leave the caller's buffer contents behind.
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Backward_WithNoQueryRows_WritesZeroKeyAndValueGradients(bool deterministic)
+    {
+        var gpu = (DirectGpuTensorEngine)GpuOrSkip();
+        if (gpu.GetBackend() is not { } backend || backend is not IFusedAttentionBackend fused)
+            throw new InvalidOperationException("GpuOrSkip returned an engine without a fused-attention backend.");
+        const int b = 1, h = 2, sk = 70, d = 16;   // 70 keys: two fused key blocks, one of them partial
+        int keyElements = b * h * sk * d;
+        var stale = Enumerable.Repeat(float.NaN, keyElements).ToArray();
+        var p = new FusedAttentionParams
+        {
+            B = b, H = h, Sq = 0, Sk = sk,
+            Kb = h * sk * d, Kh = sk * d, Kr = d,
+            Vb = h * sk * d, Vh = sk * d, Vr = d,
+            Scale = 0.25f,
+        };
+        bool saved = AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions;
+        try
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = deterministic;
+            using var empty = backend.AllocateBuffer(1);   // q, o, dO, lse and dQ have no elements
+            using var k = backend.AllocateBuffer(Random(31, keyElements).ToArray());
+            using var v = backend.AllocateBuffer(Random(32, keyElements).ToArray());
+            using var dK = backend.AllocateBuffer(stale);
+            using var dV = backend.AllocateBuffer(stale);
+            fused.FusedAttentionBackward(empty, k, v, empty, empty, empty, null, empty, dK, dV, p, d);
+            Assert.All(backend.DownloadBuffer(dK), x => Assert.Equal(0f, x));
+            Assert.All(backend.DownloadBuffer(dV), x => Assert.Equal(0f, x));
+        }
+        finally { AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = saved; }
+    }
 }
