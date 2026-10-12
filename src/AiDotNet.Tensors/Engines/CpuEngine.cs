@@ -27771,12 +27771,19 @@ public partial class CpuEngine : ITensorLevelEngine
     // block it is the plain serial loop.
     private const int NormRowBlock = 128;
 
+    // Rows per block: NormRowBlock, raised for narrow rows so a block holds at least NormMinBlockWork elements (a
+    // [6144, 32] gradient in 128-row blocks paid more in per-block overhead than it saved). A function of the shape
+    // only -- never of the thread count -- so the summation order stays fixed.
+    private const int NormMinBlockWork = 32 * 1024;
+    private static int NormRowsPerBlock(int fs) => Math.Max(NormRowBlock, NormMinBlockWork / Math.Max(1, fs));
+
     private static void LayerNormBackwardFloatAccumGammaBeta(
         float[] gradOut, float[] input, float[] mean, float[] variance,
         float[] gradGamma, float[] gradBeta,
         int rows, int fs, float eps)
     {
-        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        int rpb = NormRowsPerBlock(fs);
+        int blocks = (rows + rpb - 1) / rpb;
         if (blocks <= 1)
         {
             LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, gradGamma, 0, gradBeta, 0, 0, rows, fs, eps);
@@ -27791,7 +27798,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(partial, gOff, fs);
                 Array.Clear(partial, bOff, fs);
                 LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, partial, gOff, partial, bOff,
-                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs, eps);
+                    blk * rpb, Math.Min(rows, (blk + 1) * rpb), fs, eps);
             }, deterministicSafe: true);
             AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
             AccumulateAxisRows(partial, blocks * fs, fs, blocks, gradBeta, 0, fs);
@@ -27840,7 +27847,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void RmsNormBackwardAccumGamma(float[] gradOut, float[] input, float[] rms, float[] gradGamma, int rows, int fs)
     {
-        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        int rpb = NormRowsPerBlock(fs);
+        int blocks = (rows + rpb - 1) / rpb;
         if (blocks <= 1) { RmsNormBackwardAccumGammaRows(gradOut, input, rms, gradGamma, 0, 0, rows, fs); return; }
         var partial = System.Buffers.ArrayPool<float>.Shared.Rent(blocks * fs);
         try
@@ -27849,7 +27857,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 Array.Clear(partial, blk * fs, fs);
                 RmsNormBackwardAccumGammaRows(gradOut, input, rms, partial, blk * fs,
-                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs);
+                    blk * rpb, Math.Min(rows, (blk + 1) * rpb), fs);
             }, deterministicSafe: true);
             AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
         }
@@ -27891,7 +27899,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
     private static void RmsNormBackwardAccumGamma(double[] gradOut, double[] input, double[] rms, double[] gradGamma, int rows, int fs)
     {
-        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        int rpb = NormRowsPerBlock(fs);
+        int blocks = (rows + rpb - 1) / rpb;
         if (blocks <= 1) { RmsNormBackwardAccumGammaRows(gradOut, input, rms, gradGamma, 0, 0, rows, fs); return; }
         var partial = System.Buffers.ArrayPool<double>.Shared.Rent(blocks * fs);
         try
@@ -27900,7 +27909,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 Array.Clear(partial, blk * fs, fs);
                 RmsNormBackwardAccumGammaRows(gradOut, input, rms, partial, blk * fs,
-                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs);
+                    blk * rpb, Math.Min(rows, (blk + 1) * rpb), fs);
             }, deterministicSafe: true);
             AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
         }
@@ -27945,7 +27954,8 @@ public partial class CpuEngine : ITensorLevelEngine
         double[] gradGamma, double[] gradBeta,
         int rows, int fs, double epsilon)
     {
-        int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
+        int rpb = NormRowsPerBlock(fs);
+        int blocks = (rows + rpb - 1) / rpb;
         if (blocks <= 1)
         {
             LayerNormBackwardDoubleAccumGammaBetaRows(gradOut, input, mean, variance, gradGamma, 0, gradBeta, 0, 0, rows, fs, epsilon);
@@ -27960,7 +27970,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(partial, gOff, fs);
                 Array.Clear(partial, bOff, fs);
                 LayerNormBackwardDoubleAccumGammaBetaRows(gradOut, input, mean, variance, partial, gOff, partial, bOff,
-                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs, epsilon);
+                    blk * rpb, Math.Min(rows, (blk + 1) * rpb), fs, epsilon);
             }, deterministicSafe: true);
             AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
             AccumulateAxisRows(partial, blocks * fs, fs, blocks, gradBeta, 0, fs);
