@@ -3406,6 +3406,79 @@ fn rms_norm(@builtin(global_invocation_id) gid: vec3<u32>,
     /// <summary>
     /// Statistics kernels: argmax, argmin along axis.
     /// </summary>
+    /// <summary>
+    /// #1157: row sums with a workgroup per row (sum_axis_rows) and the few-long-rows split (sum_axis_rows_split, the
+    /// CUDA #1150 split). One 1-D workgroup index per row, or per (chunk, row) as row * chunks + chunk; a fixed
+    /// workgroup-memory tree, so the order is deterministic.
+    /// </summary>
+    public const string SumAxisRowsSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+struct Params {
+    outer_size: u32,
+    reduce_size: u32,
+    chunks: u32,
+    chunk_len: u32,
+}
+@group(0) @binding(2) var<uniform> params: Params;
+
+var<workgroup> scratch: array<f32, 256>;
+
+fn tree_sum(lid: u32) {
+    var s: u32 = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (lid < s) { scratch[lid] = scratch[lid] + scratch[lid + s]; }
+        workgroupBarrier();
+        s = s >> 1u;
+    }
+}
+
+@compute @workgroup_size(256)
+fn sum_axis_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let row = wg.x;
+    let lid = lid3.x;
+    var sum: f32 = 0.0;
+    if (row < params.outer_size) {
+        let base = row * params.reduce_size;
+        var i: u32 = lid;
+        loop {
+            if (i >= params.reduce_size) { break; }
+            sum = sum + input[base + i];
+            i = i + 256u;
+        }
+    }
+    scratch[lid] = sum;
+    workgroupBarrier();
+    tree_sum(lid);
+    if (lid == 0u && row < params.outer_size) { output[row] = scratch[0]; }
+}
+
+@compute @workgroup_size(256)
+fn sum_axis_rows_split(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let chunk = wg.x % params.chunks;
+    let row = wg.x / params.chunks;
+    let lid = lid3.x;
+    var sum: f32 = 0.0;
+    if (row < params.outer_size) {
+        let start = chunk * params.chunk_len;
+        let end = min(start + params.chunk_len, params.reduce_size);
+        let base = row * params.reduce_size;
+        var i: u32 = start + lid;
+        loop {
+            if (i >= end) { break; }
+            sum = sum + input[base + i];
+            i = i + 256u;
+        }
+    }
+    scratch[lid] = sum;
+    workgroupBarrier();
+    tree_sum(lid);
+    if (lid == 0u && row < params.outer_size) { output[row * params.chunks + chunk] = scratch[0]; }
+}
+";
+
     public const string StatisticsSource = @"
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;

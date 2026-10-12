@@ -4207,8 +4207,49 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
     }
 
+    // SumAxis thresholds, as on CUDA and OpenCL (#1150 / #1157).
+    internal const int SumAxisRowsMinReduce = 32;
+    internal const int SumAxisSplitMinReduce = 64 * 1024;
+    internal const int SumAxisSplitChunkMin = 8 * 1024;
+
     public unsafe void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (outerSize <= 0 || reduceSize <= 0)
+            throw new ArgumentException("outerSize and reduceSize must be positive.");
+
+        // #1157 (the CUDA #1150 split): few long rows -- a full reduction is one -- would leave all but a handful of
+        // compute units idle with a block per row. Split each row into chunks of about 4 blocks per compute unit,
+        // sum them into partials, then reduce the partials with this same method. Fixed partition and order.
+        if (reduceSize >= SumAxisSplitMinReduce && outerSize < 2 * Math.Max(1, ComputeUnits)
+            && _kernelCache.TryGetValue("sum_axis_rows_split", out var splitKernel))
+        {
+            int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin,
+                4L * Math.Max(1, ComputeUnits) / outerSize));
+            int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+            chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+            using var partial = AllocateBuffer(outerSize * chunks);
+            IntPtr inPtr = A.Handle, partialPtr = partial.Handle;
+            int reduceArg = reduceSize, chunksArg = chunks, lenArg = chunkLen;
+            void** splitArgs = stackalloc void*[5];
+            splitArgs[0] = &inPtr; splitArgs[1] = &partialPtr; splitArgs[2] = &reduceArg;
+            splitArgs[3] = &chunksArg; splitArgs[4] = &lenArg;
+            LaunchKernel2D(splitKernel, (uint)chunks, (uint)outerSize, 256u, 1u, splitArgs);
+            SumAxis(partial, B, outerSize, chunks);
+            return;
+        }
+
+        // Rows of at least SumAxisRowsMinReduce elements: a block per row (coalesced reads, parallel in-row tree).
+        if (reduceSize >= SumAxisRowsMinReduce && _kernelCache.TryGetValue("sum_axis_rows", out var rowsKernel))
+        {
+            IntPtr inPtr = A.Handle, outPtr = B.Handle;
+            int outerArg = outerSize, reduceArg = reduceSize;
+            void** rowArgs = stackalloc void*[4];
+            rowArgs[0] = &inPtr; rowArgs[1] = &outPtr; rowArgs[2] = &outerArg; rowArgs[3] = &reduceArg;
+            LaunchKernel(rowsKernel, (uint)outerSize, 256u, rowArgs);
+            Synchronize();
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("sum_axis", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: sum_axis");
 
