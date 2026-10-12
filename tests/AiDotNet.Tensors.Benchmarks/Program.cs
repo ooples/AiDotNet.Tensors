@@ -1523,6 +1523,13 @@ class Program
             return;
         }
 
+        // Run the tuned-kernel registry gate on the Vulkan device and export a shippable profile
+        if (args[0] == "--vulkan-tuned-profile")
+        {
+            VulkanTunedProfileExperiment.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         // Cost of finding an already-built Vulkan pipeline, which every dispatch pays
         if (args[0] == "--vulkan-pipeline-lookup")
         {
@@ -1985,6 +1992,7 @@ class Program
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
+        Console.WriteLine("  --vulkan-tuned-profile [out.json] [rounds] : Tune the Vulkan kernel registry and export a profile");
         Console.WriteLine("  --vulkan-meshgrid2d : Time the Vulkan fused Meshgrid2D route against the composed route");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");
         Console.WriteLine("  --webgpu   : Run WebGPU backend diagnostics (browser GPU compute)");
