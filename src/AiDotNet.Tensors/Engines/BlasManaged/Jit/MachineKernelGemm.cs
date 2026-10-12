@@ -299,7 +299,7 @@ internal static class MachineKernelGemm
 
     /// <summary>
     /// Run C = A·B (FP64) with the machine kernel; returns false if the shape doesn't
-    /// qualify. C must already be zeroed (the kernel accumulates). Uses the AVX-512
+    /// qualify. C must already be zeroed (the kernel accumulates); any m, n. Uses the AVX-512
     /// 6×16 kernel when that path is active, otherwise the AVX2 6×8 kernel.
     /// </summary>
     internal static unsafe bool TryGemmFp64(
@@ -313,13 +313,13 @@ internal static class MachineKernelGemm
         nint kern = z ? _kernZ64 : _kern64;
         if (!z && !TryInitFp64()) return false;
         if (kern == 0) return false;
-        if (m % Fp64Mr != 0 || n % nr != 0 || m <= 0 || n <= 0 || k <= 0) return false;
+        if (m <= 0 || n <= 0 || k <= 0) return false; // edges run on zero-padded panels (#1218)
         return RunPacked<double>(a, lda, b, ldb, c, ldc, m, n, k, Fp64Mr, nr, kern);
     }
 
     /// <summary>
     /// Run C = A·B (FP32) with the machine kernel; returns false if the shape doesn't
-    /// qualify. C must already be zeroed. Uses the AVX-512 6×32 kernel when active,
+    /// qualify. C must already be zeroed; any m, n. Uses the AVX-512 6×32 kernel when active,
     /// otherwise the AVX2 6×16 kernel.
     /// </summary>
     internal static unsafe bool TryGemmFp32(
@@ -333,7 +333,7 @@ internal static class MachineKernelGemm
         nint kern = z ? _kernZ32 : _kern32;
         if (!z && !TryInitFp32()) return false;
         if (kern == 0) return false;
-        if (m % Fp32Mr != 0 || n % nr != 0 || m <= 0 || n <= 0 || k <= 0) return false;
+        if (m <= 0 || n <= 0 || k <= 0) return false; // edges run on zero-padded panels (#1218)
         // #653: the AVX2 6×16 path can drive a whole M-stripe (all N-tiles) per call via the
         // GEBP panel kernel; the AVX-512 6×32 path has no panel kernel yet (falls back to per-tile).
         nint panel = (!z && EnablePanelKernel && TryInitPanelFp32()) ? _kernPanel32 : 0;
@@ -343,18 +343,24 @@ internal static class MachineKernelGemm
     /// <summary>
     /// Shared pack + parallel macro-loop. The <c>typeof(T)</c> branch is a JIT-time constant per
     /// instantiation (double/float) and folds away, so there's no per-call type test in the hot
-    /// loop. C must be pre-zeroed; m%Mr==0 &amp;&amp; n%Nr==0 (callers guarantee). Returns true.
+    /// loop. C must be pre-zeroed (the kernel accumulates). Any m, n ≥ 1: a partial last M-stripe or
+    /// N-tile runs the same kernel on a zero-padded panel into a scratch tile. Returns true.
     ///
     /// <para>
-    /// #653 macro-blocking: the K-loop (pc) packs whole A (shared, read-only) and whole B once per
-    /// K-block, then parallelizes over <b>N-panels</b> (the jc dimension) — NOT the inner M-stripes.
-    /// The previous M-stripe split had all cores hammer ONE shared packed-B panel, maximal cache
-    /// contention (the BLIS many-core anti-pattern) that capped scaling at ~3.4× on 16 cores. Giving
-    /// each thread its own B sub-panel — sized so tiles·Nr·Kc stays ~half-L2-resident, with block
-    /// width chosen for ≥ <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/> blocks of
-    /// occupancy — keeps the kernel's hot B data in that thread's private L2. Each thread writes a
-    /// disjoint set of C columns, so the split is race-free and deterministic. Packing stays serial
-    /// (the Span pack API can't be captured by the parallel lambda); A is reused across all panels.
+    /// #653 macro-blocking: per K-block (pc) the work is split over <b>N-panels</b> (the jc dimension),
+    /// not the inner M-stripes. The M-stripe split had all cores hammer ONE shared packed-B panel,
+    /// maximal cache contention (the BLIS many-core anti-pattern) that capped scaling at ~3.4× on 16
+    /// cores. Each thread's B sub-panel is sized so tiles·Nr·Kc stays ~half-L2-resident, with block
+    /// width chosen for ≥ <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/> blocks of occupancy.
+    /// Each thread writes a disjoint set of C columns, so the split is race-free and deterministic.
+    /// </para>
+    /// <para>
+    /// #1218: packing runs in parallel too. It used to be serial on the calling thread (the Span pack
+    /// API can't be captured by the lambda), which with the edge tails left 43% of a 1000³ FP64 GEMM
+    /// and 70% of a 500³ one serial while the pool spun. A is packed by stripe groups in one dispatch
+    /// per K-block (every N-panel reads all of it); each N-panel then packs its own B sub-panel inside
+    /// the compute dispatch, so B is packed by the thread whose L2 it is about to be read from. The
+    /// spans are rebuilt inside the lambdas from addresses captured as nint (the buffers stay pinned).
     /// </para>
     /// </summary>
     [MethodImpl(Hot)]
@@ -363,8 +369,10 @@ internal static class MachineKernelGemm
         int m, int n, int k, int Mr, int Nr, nint kernelAddr, nint panelKernelAddr = 0) where T : unmanaged
     {
         int elem = sizeof(T);
-        int mStripes = m / Mr;
-        int nTiles = n / Nr;
+        int mStripes = (m + Mr - 1) / Mr;   // the last one may be partial
+        int mFull = m / Mr;
+        int nTiles = (n + Nr - 1) / Nr;     // the last one may be partial
+        int nFull = n / Nr;
 
         // N-panel block width (in Nr-tiles): enough blocks for full core occupancy, but capped so a
         // thread's packed-B sub-panel (tiles·Nr·Kc) stays ~half-L2-resident (private per thread).
@@ -373,38 +381,64 @@ internal static class MachineKernelGemm
         int l2Tiles = Math.Max(1, (256 * 1024) / (KcBlock * Nr * elem));  // sub-panel ≤ ~half L2
         int tilesPerBlock = Math.Min(occTiles, l2Tiles);
         int jcBlocks = (nTiles + tilesPerBlock - 1) / tilesPerBlock;
+        int aGroups = Math.Min(mStripes, maxDeg);
 
-        var packA = ArrayPool<T>.Shared.Rent(m * KcBlock);   // [mStripes, Kc, Mr] (whole A panel per Kc)
-        var packB = ArrayPool<T>.Shared.Rent(KcBlock * n);   // [nTiles, Kc, Nr]   (whole B panel per Kc)
+        var packA = ArrayPool<T>.Shared.Rent(mStripes * Mr * KcBlock); // [mStripes, Kc, Mr] (whole A panel per Kc)
+        var packB = ArrayPool<T>.Shared.Rent(KcBlock * nTiles * Nr);   // [nTiles, Kc, Nr]   (whole B panel per Kc)
         try
         {
+            fixed (T* aPtr = a)
+            fixed (T* bPtr = b)
             fixed (T* cPtr = c)
             fixed (T* paBase = packA)
             fixed (T* pbBase = packB)
             {
-                // Capture buffer addresses as nint — pointers can't be captured by the
-                // parallel body lambda, but the surrounding `fixed` keeps them pinned.
-                nint paAddr = (nint)paBase, pbAddr = (nint)pbBase, cAddr = (nint)cPtr;
-                int ldcL = ldc, MrL = Mr, NrL = Nr, mStripesL = mStripes, nTilesL = nTiles, tpbL = tilesPerBlock;
+                // Capture buffer addresses as nint: pointers can't be captured by the parallel body
+                // lambdas, but the surrounding `fixed` keeps them pinned.
+                nint aAddr = (nint)aPtr, bAddr = (nint)bPtr, paAddr = (nint)paBase, pbAddr = (nint)pbBase, cAddr = (nint)cPtr;
+                int aLen = a.Length, bLen = b.Length;
+                int mL = m, nL = n, ldaL = lda, ldbL = ldb, ldcL = ldc, MrL = Mr, NrL = Nr;
+                int mStripesL = mStripes, mFullL = mFull, nTilesL = nTiles, nFullL = nFull, tpbL = tilesPerBlock, aGroupsL = aGroups, jcBlocksL = jcBlocks;
                 nint panelAddr = panelKernelAddr; // FP32 AVX2 GEBP panel kernel (0 = per-tile path)
 
                 for (int pc = 0; pc < k; pc += KcBlock)
                 {
-                    int ekc = Math.Min(KcBlock, k - pc);
-                    // Pack whole A[:, pc:pc+ekc] and whole B[pc:pc+ekc, :] once per K-block.
-                    Avx2Pack.PackA<T>(a.Slice(pc), lda, false,
-                        new Span<T>(paBase, m * ekc), mc: m, kc: ekc, Mr);
-                    Avx2Pack.PackB<T>(b.Slice(pc * ldb), ldb, false,
-                        new Span<T>(pbBase, ekc * n), nc: n, kc: ekc, Nr);
+                    int ekcL = Math.Min(KcBlock, k - pc);
+                    int pcL = pc;
 
-                    int ekcL = ekc;
+                    // Pack A[:, pc:pc+ekc] by stripe groups; the partial last stripe is zero-padded.
+                    CpuParallelSettings.ParallelForOrSerial(0, aGroupsL, (long)mL * ekcL, g =>
+                    {
+                        int s0 = (int)((long)g * mStripesL / aGroupsL);
+                        int s1 = (int)((long)(g + 1) * mStripesL / aGroupsL);
+                        int f1 = Math.Min(s1, mFullL);
+                        T* src = (T*)aAddr;
+                        T* dst = (T*)paAddr;
+                        if (f1 > s0)
+                        {
+                            long srcOff = (long)s0 * MrL * ldaL + pcL;
+                            Avx2Pack.PackA<T>(new ReadOnlySpan<T>(src + srcOff, (int)(aLen - srcOff)), ldaL, false,
+                                new Span<T>(dst + (long)s0 * ekcL * MrL, (f1 - s0) * ekcL * MrL), mc: (f1 - s0) * MrL, kc: ekcL, MrL);
+                        }
+                        if (s1 > mFullL)
+                            PackPartialStripe(src, ldaL, pcL, mFullL * MrL, mL - mFullL * MrL, dst + (long)mFullL * ekcL * MrL, ekcL, MrL);
+                    }, deterministicSafe: true);
+
                     long flopsPerBlock = (long)tpbL * mStripesL * ekcL * MrL * NrL * 2;
-                    CpuParallelSettings.ParallelForOrSerial(0, jcBlocks, (long)jcBlocks * flopsPerBlock, [MethodImpl(Hot)] (jb) =>
+                    CpuParallelSettings.ParallelForOrSerial(0, jcBlocksL, (long)jcBlocksL * flopsPerBlock, [MethodImpl(Hot)] (jb) =>
                     {
                         int t0 = jb * tpbL;
                         int t1 = Math.Min(t0 + tpbL, nTilesL);
                         int nt = t1 - t0;
                         if (nt <= 0) return;
+
+                        // This N-panel's B sub-panel: tiles [t0, t1) of B[pc:pc+ekc, :], partial tile zero-padded.
+                        long bOff = (long)pcL * ldbL;
+                        Avx2Pack.PackBStripeRange<T>(new ReadOnlySpan<T>((T*)bAddr + bOff, (int)(bLen - bOff)), ldbL, false,
+                            new Span<T>((T*)pbAddr + (long)t0 * ekcL * NrL, nt * ekcL * NrL), t0, nt, nL, ekcL, NrL);
+
+                        int tFull = Math.Min(t1, nFullL); // tiles [t0, tFull) are whole; [tFull, t1) is the partial one
+                        T* scratch = stackalloc T[MrL * NrL];
                         if (typeof(T) == typeof(double))
                         {
                             var kern = (delegate* unmanaged<double*, double*, double*, long, long, void>)kernelAddr;
@@ -412,29 +446,53 @@ internal static class MachineKernelGemm
                             for (int isr = 0; isr < mStripesL; isr++)
                             {
                                 double* aS = pa + (long)isr * ekcL * MrL;
-                                double* cR = cb + (long)(isr * MrL) * ldcL + (long)t0 * NrL;
-                                for (int t = t0; t < t1; t++)
-                                    kern(aS, pb + (long)t * ekcL * NrL, cR + (long)(t - t0) * NrL, ldcL, ekcL);
+                                if (isr < mFullL)
+                                {
+                                    double* cR = cb + (long)(isr * MrL) * ldcL;
+                                    for (int t = t0; t < tFull; t++)
+                                        kern(aS, pb + (long)t * ekcL * NrL, cR + (long)t * NrL, ldcL, ekcL);
+                                    for (int t = tFull; t < t1; t++)
+                                        EdgeTile(kern, aS, pb + (long)t * ekcL * NrL, cb, ldcL, isr * MrL, t * NrL, MrL, NrL,
+                                            MrL, nL - t * NrL, ekcL, (double*)scratch);
+                                }
+                                else
+                                {
+                                    for (int t = t0; t < t1; t++)
+                                        EdgeTile(kern, aS, pb + (long)t * ekcL * NrL, cb, ldcL, isr * MrL, t * NrL, MrL, NrL,
+                                            mL - isr * MrL, Math.Min(NrL, nL - t * NrL), ekcL, (double*)scratch);
+                                }
                             }
                         }
                         else // float
                         {
+                            var kern = (delegate* unmanaged<float*, float*, float*, long, long, void>)kernelAddr;
                             float* pa = (float*)paAddr, pb = (float*)pbAddr, cb = (float*)cAddr;
                             for (int isr = 0; isr < mStripesL; isr++)
                             {
                                 float* aS = pa + (long)isr * ekcL * MrL;
-                                float* cR = cb + (long)(isr * MrL) * ldcL + (long)t0 * NrL;
-                                if (panelAddr != 0)
+                                if (isr < mFullL)
                                 {
-                                    // One GEBP call drives all N-tiles of this M-stripe (loops N in machine code).
-                                    var panel = (delegate* unmanaged<float*, float*, float*, long, long, long, void>)panelAddr;
-                                    panel(aS, pb + (long)t0 * ekcL * NrL, cR, ldcL, ekcL, nt);
+                                    float* cR = cb + (long)(isr * MrL) * ldcL;
+                                    if (panelAddr != 0 && tFull > t0)
+                                    {
+                                        // One GEBP call drives all whole N-tiles of this M-stripe (loops N in machine code).
+                                        var panel = (delegate* unmanaged<float*, float*, float*, long, long, long, void>)panelAddr;
+                                        panel(aS, pb + (long)t0 * ekcL * NrL, cR + (long)t0 * NrL, ldcL, ekcL, tFull - t0);
+                                    }
+                                    else
+                                    {
+                                        for (int t = t0; t < tFull; t++)
+                                            kern(aS, pb + (long)t * ekcL * NrL, cR + (long)t * NrL, ldcL, ekcL);
+                                    }
+                                    for (int t = tFull; t < t1; t++)
+                                        EdgeTile(kern, aS, pb + (long)t * ekcL * NrL, cb, ldcL, isr * MrL, t * NrL, MrL, NrL,
+                                            MrL, nL - t * NrL, ekcL, (float*)scratch);
                                 }
                                 else
                                 {
-                                    var kern = (delegate* unmanaged<float*, float*, float*, long, long, void>)kernelAddr;
                                     for (int t = t0; t < t1; t++)
-                                        kern(aS, pb + (long)t * ekcL * NrL, cR + (long)(t - t0) * NrL, ldcL, ekcL);
+                                        EdgeTile(kern, aS, pb + (long)t * ekcL * NrL, cb, ldcL, isr * MrL, t * NrL, MrL, NrL,
+                                            mL - isr * MrL, Math.Min(NrL, nL - t * NrL), ekcL, (float*)scratch);
                                 }
                             }
                         }
@@ -448,6 +506,52 @@ internal static class MachineKernelGemm
             ArrayPool<T>.Shared.Return(packA);
             ArrayPool<T>.Shared.Return(packB);
         }
+    }
+
+    // Packs rows [row0, row0 + rows) (rows < mr) of A[:, pc:pc+kc] as one stripe, zero-padding rows rows..mr-1.
+    private static unsafe void PackPartialStripe<T>(T* a, int lda, int pc, int row0, int rows, T* packed, int kc, int mr)
+        where T : unmanaged
+    {
+        for (int kk = 0; kk < kc; kk++)
+        {
+            T* dst = packed + (long)kk * mr;
+            for (int r = 0; r < mr; r++)
+                dst[r] = r < rows ? a[(long)(row0 + r) * lda + pc + kk] : default;
+        }
+    }
+
+    // A tile the kernel can't write in place (rows < Mr or cols < Nr): run it on a scratch Mr×Nr tile loaded with the
+    // valid part of C (the kernel accumulates; the padded rows/cols of A and B are zero), then copy the valid part back.
+    private static unsafe void EdgeTile(delegate* unmanaged<double*, double*, double*, long, long, void> kern,
+        double* aS, double* bT, double* c, int ldc, int row0, int col0, int mr, int nr, int rows, int cols, int kc, double* scratch)
+    {
+        LoadEdge(c, ldc, row0, col0, mr, nr, rows, cols, scratch);
+        kern(aS, bT, scratch, nr, kc);
+        StoreEdge(c, ldc, row0, col0, nr, rows, cols, scratch);
+    }
+
+    private static unsafe void EdgeTile(delegate* unmanaged<float*, float*, float*, long, long, void> kern,
+        float* aS, float* bT, float* c, int ldc, int row0, int col0, int mr, int nr, int rows, int cols, int kc, float* scratch)
+    {
+        LoadEdge(c, ldc, row0, col0, mr, nr, rows, cols, scratch);
+        kern(aS, bT, scratch, nr, kc);
+        StoreEdge(c, ldc, row0, col0, nr, rows, cols, scratch);
+    }
+
+    private static unsafe void LoadEdge<T>(T* c, int ldc, int row0, int col0, int mr, int nr, int rows, int cols, T* scratch)
+        where T : unmanaged
+    {
+        for (int r = 0; r < mr; r++)
+            for (int j = 0; j < nr; j++)
+                scratch[r * nr + j] = r < rows && j < cols ? c[(long)(row0 + r) * ldc + col0 + j] : default;
+    }
+
+    private static unsafe void StoreEdge<T>(T* c, int ldc, int row0, int col0, int nr, int rows, int cols, T* scratch)
+        where T : unmanaged
+    {
+        for (int r = 0; r < rows; r++)
+            for (int j = 0; j < cols; j++)
+                c[(long)(row0 + r) * ldc + col0 + j] = scratch[r * nr + j];
     }
 #else
     /// <summary>net471 has no x86 intrinsics / function pointers — always defer to managed.</summary>
