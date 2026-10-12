@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Submission without waiting (#1191): a dispatch is submitted and the caller returns; the wait happens when a
-// result is read on the host.
+// result is read on the host. Coalescing (#1192): consecutive dispatches are recorded into one command buffer and
+// submitted together.
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -22,22 +23,41 @@ internal readonly struct DeferredCommandSlot
 
 public sealed unsafe partial class VulkanDevice
 {
-    // One submission that has been handed to the queue and not yet observed complete.
+    // One submission that has been handed to the queue and not yet observed complete, with the descriptor set of
+    // each dispatch recorded in it.
     private readonly struct PendingSubmission
     {
-        internal PendingSubmission(long serial, DeferredCommandSlot slot, VulkanComputePipeline pipeline, IntPtr descriptorSet)
+        internal PendingSubmission(long serial, DeferredCommandSlot slot, (VulkanComputePipeline Pipeline, IntPtr Set)[] sets)
         {
             Serial = serial;
             Slot = slot;
-            Pipeline = pipeline;
-            DescriptorSet = descriptorSet;
+            Sets = sets;
         }
 
         internal long Serial { get; }
         internal DeferredCommandSlot Slot { get; }
-        internal VulkanComputePipeline Pipeline { get; }
-        internal IntPtr DescriptorSet { get; }
+        internal (VulkanComputePipeline Pipeline, IntPtr Set)[] Sets { get; }
     }
+
+    /// <summary>
+    /// Dispatches recorded into one command buffer before it is submitted. A submit costs about 20 microseconds
+    /// whatever it carries (#1160), so sixteen dispatches share one. It also bounds how long recorded work waits
+    /// for the device when nothing reads a result.
+    /// </summary>
+    internal const int MaxCoalescedDispatches = 16;
+
+    /// <summary>
+    /// Held while a dispatch is recorded into the open command buffer, and by anything that ends and submits that
+    /// buffer. The Vulkan backend uses this object as its compute lock, so a flush from another thread (a transfer,
+    /// a host read) waits for a dispatch that is mid-recording. Always taken before <c>_pendingLock</c>.
+    /// </summary>
+    internal object DispatchLock { get; } = new object();
+
+    // The command buffer dispatches are being recorded into, not yet submitted. Guarded by DispatchLock.
+    private DeferredCommandSlot _openSlot;
+    private bool _hasOpenSlot;
+    private long _openSerial;
+    private readonly List<(VulkanComputePipeline Pipeline, IntPtr Set)> _openSets = new();
 
     /// <summary>
     /// Submissions the queue may hold before the next one waits for the oldest. It bounds the command buffers,
@@ -67,12 +87,83 @@ public sealed unsafe partial class VulkanDevice
         get { lock (_pendingLock) return _pending.Count; }
     }
 
+    /// <summary>Dispatches recorded into the open command buffer and not yet submitted.</summary>
+    internal int OpenDispatchCount
+    {
+        get { lock (DispatchLock) return _openSets.Count; }
+    }
+
     /// <summary>
-    /// A command buffer and fence for a submission that will not be waited for. Recording into the command buffer
-    /// needs the same external synchronization as acquiring it: the caller holds the backend's compute lock from
-    /// this call until <see cref="SubmitWithoutWaiting"/>.
+    /// The command buffer the next dispatch is recorded into, already begun: the open one, or a new one when none
+    /// is open. Caller holds <see cref="DispatchLock"/> from here until <see cref="RecordedDispatch"/>.
     /// </summary>
-    internal DeferredCommandSlot AcquireDeferredSlot()
+    internal IntPtr OpenCommandBuffer()
+    {
+        if (_hasOpenSlot) return _openSlot.CommandBuffer;
+        var slot = AcquireDeferredSlot();
+        VulkanNativeBindings.vkResetCommandBuffer(slot.CommandBuffer, 0);
+        var beginInfo = new VkCommandBufferBeginInfo
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            pNext = null,
+            flags = VkCommandBufferUsageFlags.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            pInheritanceInfo = null
+        };
+        int beginResult = VulkanNativeBindings.vkBeginCommandBuffer(slot.CommandBuffer, &beginInfo);
+        if (beginResult != VulkanNativeBindings.VK_SUCCESS)
+        {
+            lock (_pendingLock) _freeSlots.Push(slot);
+            throw new InvalidOperationException($"vkBeginCommandBuffer failed with error code {beginResult}");
+        }
+        _openSlot = slot;
+        _hasOpenSlot = true;
+        // The serial this buffer will be submitted under: every unwaited submission goes through the open buffer,
+        // so nothing else can take it first. Buffers are marked with it as they are bound, before the submit.
+        lock (_pendingLock) _openSerial = _submittedSerial + 1;
+        return slot.CommandBuffer;
+    }
+
+    /// <summary>
+    /// Notes one dispatch recorded into the open command buffer: its descriptor set is held until the buffer has
+    /// executed and its buffers are marked as in use by it. Submits the buffer once it holds
+    /// <see cref="MaxCoalescedDispatches"/>. Caller holds <see cref="DispatchLock"/>.
+    /// </summary>
+    internal void RecordedDispatch(VulkanComputePipeline pipeline, IntPtr descriptorSet, VulkanBuffer[] boundBuffers)
+    {
+        _openSets.Add((pipeline, descriptorSet));
+        // Under the lock a release takes to compare serials, so a release cannot slip in before the mark.
+        lock (_pendingLock)
+            foreach (var buffer in boundBuffers) buffer.MarkUsedBySubmission(_openSerial);
+        if (_openSets.Count >= MaxCoalescedDispatches) SubmitOpenCommands();
+    }
+
+    /// <summary>Ends the open command buffer and submits it without waiting. Does nothing when none is open.</summary>
+    internal void SubmitOpenCommands()
+    {
+        lock (DispatchLock)
+        {
+            if (!_hasOpenSlot) return;
+            var slot = _openSlot;
+            var sets = _openSets.ToArray();
+            _hasOpenSlot = false;
+            _openSlot = default;
+            _openSets.Clear();
+            VulkanNativeBindings.vkEndCommandBuffer(slot.CommandBuffer);
+            try
+            {
+                SubmitWithoutWaiting(slot, sets);
+            }
+            catch
+            {
+                // Nothing was queued, so nothing pending has these sets bound.
+                foreach (var (pipeline, set) in sets) pipeline.ReleaseDescriptorSet(set);
+                throw;
+            }
+        }
+    }
+
+    // A command buffer and fence for a submission that will not be waited for. Caller holds DispatchLock.
+    private DeferredCommandSlot AcquireDeferredSlot()
     {
         if (!_initialized || _disposed)
             throw new GpuCapabilityUnavailableException("Vulkan device not initialized.");
@@ -143,14 +234,10 @@ public sealed unsafe partial class VulkanDevice
         return new DeferredCommandSlot(commandBuffer, fence);
     }
 
-    /// <summary>
-    /// Submits <paramref name="slot"/>'s recorded command buffer and returns without waiting. The slot and
-    /// <paramref name="descriptorSet"/> (retained from <paramref name="pipeline"/>) are handed back when the
-    /// submission is observed complete; <paramref name="boundBuffers"/> are marked as used by it. On failure the
-    /// slot goes back to the free list and nothing is queued. Returns the submission's serial.
-    /// </summary>
-    internal long SubmitWithoutWaiting(DeferredCommandSlot slot, VulkanComputePipeline pipeline, IntPtr descriptorSet,
-        VulkanBuffer[] boundBuffers)
+    // Submits the slot's recorded and ended command buffer and returns without waiting. The slot and the descriptor
+    // sets are handed back when the submission is observed complete. On failure the slot goes back to the free
+    // list and nothing is queued.
+    private void SubmitWithoutWaiting(DeferredCommandSlot slot, (VulkanComputePipeline Pipeline, IntPtr Set)[] sets)
     {
         EnsureDeviceWarm();
         long serial;
@@ -188,13 +275,9 @@ public sealed unsafe partial class VulkanDevice
             lock (_pendingLock)
             {
                 serial = ++_submittedSerial;
-                _pending.Enqueue(new PendingSubmission(serial, slot, pipeline, descriptorSet));
-                // Marked under the lock a release takes to compare serials, so a release cannot slip between the
-                // submission and the mark.
-                foreach (var buffer in boundBuffers) buffer.MarkUsedBySubmission(serial);
+                _pending.Enqueue(new PendingSubmission(serial, slot, sets));
             }
         }
-        return serial;
     }
 
     /// <summary>
@@ -204,6 +287,8 @@ public sealed unsafe partial class VulkanDevice
     internal void WaitForPendingSubmissions()
     {
         if (_device == IntPtr.Zero) return;
+        // What has only been recorded has to reach the queue before it can be waited for.
+        SubmitOpenCommands();
         List<Action>? releases = null;
         try
         {
@@ -263,7 +348,7 @@ public sealed unsafe partial class VulkanDevice
         var fencePtr = oldest.Slot.Fence;
         int waitResult = VulkanNativeBindings.vkWaitForFences(_device, 1, &fencePtr, 1, ulong.MaxValue);
         // Recycled either way: after a failed wait the device is lost and nothing will run on it again.
-        oldest.Pipeline.ReleaseDescriptorSet(oldest.DescriptorSet);
+        foreach (var (pipeline, set) in oldest.Sets) pipeline.ReleaseDescriptorSet(set);
         _freeSlots.Push(oldest.Slot);
         Interlocked.Exchange(ref _completedSerial, oldest.Serial);
         CollectReleasesLocked(ref releases);
@@ -313,12 +398,17 @@ public sealed unsafe partial class VulkanDevice
                     var fence = _freeSlots.Pop().Fence;
                     if (fence != IntPtr.Zero) VulkanNativeBindings.vkDestroyFence(_device, fence, IntPtr.Zero);
                 }
+                if (_hasOpenSlot && _openSlot.Fence != IntPtr.Zero)
+                    VulkanNativeBindings.vkDestroyFence(_device, _openSlot.Fence, IntPtr.Zero);
                 // Destroying the pool frees every command buffer allocated from it.
                 if (_deferredCommandPool != IntPtr.Zero)
                     VulkanNativeBindings.vkDestroyCommandPool(_device, _deferredCommandPool, IntPtr.Zero);
             }
             _pending.Clear();
             _freeSlots.Clear();
+            _hasOpenSlot = false;
+            _openSlot = default;
+            _openSets.Clear();
             _deferredCommandPool = IntPtr.Zero;
             _deferredReleases.Clear();
         }

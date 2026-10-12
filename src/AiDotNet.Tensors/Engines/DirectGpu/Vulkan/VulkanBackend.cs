@@ -54,7 +54,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         new(SourceInstanceComparer.Instance);
     private VulkanGlslCompiler? _glslCompiler;
     private VulkanBufferTransfer? _transfer;
-    private readonly object _computeLock = new object();
+    // The device's dispatch lock: recording a dispatch into the device's open command buffer, and ending and
+    // submitting that buffer, exclude each other through it (#1192).
+    private readonly object _computeLock = VulkanDevice.Instance.DispatchLock;
     private bool _initialized;
     private volatile bool _disposed;
 
@@ -891,8 +893,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         // Immediate submit path
-        var cmdBuffer = DispatchCommandBuffer(threadRes, out var deferredSlot, out bool deferred);
-        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+        var cmdBuffer = DispatchCommandBuffer(threadRes, out bool deferred);
+        if (!deferred) VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
         var beginInfo = new VkCommandBufferBeginInfo
         {
             sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -900,8 +902,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             flags = VkCommandBufferUsageFlags.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
             pInheritanceInfo = null
         };
-        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
-        if (deferred) RecordComputeMemoryBarrier(cmdBuffer);
+        if (!deferred) VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        else RecordComputeMemoryBarrier(cmdBuffer);
         VulkanNativeBindings.vkCmdBindPipeline(cmdBuffer, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle);
         var ds = deferred ? pipeline.RetainDescriptorSet() : pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(cmdBuffer, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Layout, 0, 1, &ds, 0, null);
@@ -915,8 +917,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         uint workgroupCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
         JournalDispatch(pipeline, workgroupCount, workgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
-        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
-        SubmitDispatch(cmdBuffer, threadRes, deferredSlot, deferred, pipeline, ds);
+        if (!deferred) VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        SubmitDispatch(cmdBuffer, threadRes, deferred, pipeline, ds);
     }
 
     private static uint CalculateWorkgroupCount(int elementCount, int workgroupSize)
@@ -974,9 +976,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         // Non-batch mode: record + submit immediately (original path)
-        var cmdBuffer = DispatchCommandBuffer(threadRes, out var deferredSlot, out bool deferred);
+        var cmdBuffer = DispatchCommandBuffer(threadRes, out bool deferred);
 
-        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+        if (!deferred) VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         var beginInfo = new VkCommandBufferBeginInfo
         {
@@ -986,8 +988,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
-        if (deferred) RecordComputeMemoryBarrier(cmdBuffer);
+        if (!deferred) VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        else RecordComputeMemoryBarrier(cmdBuffer);
 
         VulkanNativeBindings.vkCmdBindPipeline(
             cmdBuffer,
@@ -1012,8 +1014,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         JournalDispatch(pipeline, workgroupCount, VulkanKernels.WorkgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
-        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
-        SubmitDispatch(cmdBuffer, threadRes, deferredSlot, deferred, pipeline, ds);
+        if (!deferred) VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        SubmitDispatch(cmdBuffer, threadRes, deferred, pipeline, ds);
     }
 
     /// <summary>
@@ -1021,10 +1023,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void RecordAndExecuteComputeWithScalarUnlocked(VulkanComputePipeline pipeline, int elementCount, float scalar, ThreadCommandResources threadRes)
     {
-        var cmdBuffer = DispatchCommandBuffer(threadRes, out var deferredSlot, out bool deferred);
+        var cmdBuffer = DispatchCommandBuffer(threadRes, out bool deferred);
 
         // Reset command buffer
-        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+        if (!deferred) VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         // Begin recording
         var beginInfo = new VkCommandBufferBeginInfo
@@ -1035,8 +1037,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
-        if (deferred) RecordComputeMemoryBarrier(cmdBuffer);
+        if (!deferred) VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        else RecordComputeMemoryBarrier(cmdBuffer);
 
         // Bind pipeline
         VulkanNativeBindings.vkCmdBindPipeline(
@@ -1076,10 +1078,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
         // End recording
-        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        if (!deferred) VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
 
         // Submit and wait using per-thread fence
-        SubmitDispatch(cmdBuffer, threadRes, deferredSlot, deferred, pipeline, descriptorSet);
+        SubmitDispatch(cmdBuffer, threadRes, deferred, pipeline, descriptorSet);
     }
 
     #region Batch Execution
