@@ -4826,23 +4826,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     internal Tensor<T> SumOverAxisDirect(int axis)
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        EnsureMaterialized();
-        if (axis < 0 || axis >= Rank)
-            throw new ArgumentOutOfRangeException(nameof(axis));
-
-        var newShape = _shape.ToList();
-        newShape.RemoveAt(axis);
-        var result = new Tensor<T>([.. newShape]);
-        int axisSize = Shape[axis];
-
-        // Use vectorized Sum for each slice (5-15x faster with AVX2)
-        for (int i = 0; i < _data.Length; i += axisSize)
-        {
-            var slice = new ReadOnlySpan<T>(_data, i, axisSize);
-            result._data[i / axisSize] = _numOps.Sum(slice);
-        }
-
-        return result;
+        return ReduceOverAxis(axis, max: false);
     }
 
     /// <summary>
@@ -4861,23 +4845,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<T> MaxOverAxis(int axis)
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        EnsureMaterialized();
-        if (axis < 0 || axis >= Rank)
-            throw new ArgumentOutOfRangeException(nameof(axis));
-
-        var newShape = _shape.ToList();
-        newShape.RemoveAt(axis);
-        var result = new Tensor<T>([.. newShape]);
-        int axisSize = Shape[axis];
-
-        // Use vectorized Max for each slice (5-15x faster with AVX2)
-        for (int i = 0; i < _data.Length; i += axisSize)
-        {
-            var slice = new ReadOnlySpan<T>(_data, i, axisSize);
-            result._data[i / axisSize] = _numOps.Max(slice);
-        }
-
-        return result;
+        return ReduceOverAxis(axis, max: true);
     }
 
     /// <summary>
@@ -4904,6 +4872,20 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         ThrowIfSparse();
+        var result = ReduceOverAxis(axis, max: false);
+        T divisor = _numOps.FromDouble(_shape[axis]);
+        using var lease = result.LeaseWritable();
+        var dst = lease.Span;
+        for (int i = 0; i < dst.Length; i++)
+            dst[i] = _numOps.Divide(dst[i], divisor);
+        return result;
+    }
+
+    // Sum or max over one axis, the tensor read as [outer, axisSize, inner] in row-major order. The last axis (inner = 1)
+    // reduces each contiguous run with the vectorized reduction; any other axis folds the axisSize slabs of `inner`
+    // elements into the result row (#1211: the loops used to reduce contiguous runs whatever the axis).
+private Tensor<T> ReduceOverAxis(int axis, bool max)
+    {
         EnsureMaterialized();
         if (axis < 0 || axis >= Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
@@ -4911,17 +4893,51 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var newShape = _shape.ToList();
         newShape.RemoveAt(axis);
         var result = new Tensor<T>([.. newShape]);
-        int axisSize = Shape[axis];
-        T divisor = _numOps.FromDouble(axisSize);
-
-        // Use vectorized Sum for each slice (5-15x faster with AVX2)
-        for (int i = 0; i < _data.Length; i += axisSize)
+        int axisSize = _shape[axis];
+        int inner = 1;
+        for (int d = axis + 1; d < Rank; d++)
+            inner *= _shape[d];
+        int outer = axisSize == 0 || inner == 0 ? 0 : Length / (axisSize * inner);
+        if (axisSize == 0)
         {
-            var slice = new ReadOnlySpan<T>(_data, i, axisSize);
-            T sum = _numOps.Sum(slice);
-            result._data[i / axisSize] = _numOps.Divide(sum, divisor);
+            if (max && result.Length > 0)
+                throw new InvalidOperationException("Cannot take the maximum over an empty axis.");
+            return result; // zeros: the sum over an empty axis
         }
 
+        ReadOnlySpan<T> src = TryGetContiguousSpan(out var contiguous) ? contiguous : ToArray();
+        using var lease = result.LeaseWritable();
+        var dst = lease.Span;
+        if (inner == 1)
+        {
+            for (int o = 0; o < outer; o++)
+            {
+                var run = src.Slice(o * axisSize, axisSize);
+                dst[o] = max ? _numOps.Max(run) : _numOps.Sum(run);
+            }
+            return result;
+        }
+
+        for (int o = 0; o < outer; o++)
+        {
+            var row = dst.Slice(o * inner, inner);
+            int block = o * axisSize * inner;
+            src.Slice(block, inner).CopyTo(row);
+            for (int k = 1; k < axisSize; k++)
+            {
+                var slab = src.Slice(block + k * inner, inner);
+                if (max)
+                {
+                    for (int j = 0; j < inner; j++)
+                        if (_numOps.GreaterThan(slab[j], row[j]))
+                            row[j] = slab[j];
+                }
+                else
+                {
+                    _numOps.Add(row, slab, row);
+                }
+            }
+        }
         return result;
     }
 
