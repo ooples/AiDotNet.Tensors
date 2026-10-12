@@ -82,7 +82,6 @@
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Autotune.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Benchmarks" />
-    <InternalsVisibleTo Include="ConvParallelProbe" /> <!-- tools/ConvParallelProbe reads raw storage (GetCpuData) since #1118 made it internal -->
     <InternalsVisibleTo Include="OptBench" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Onnx" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Onnx.Tests" />
