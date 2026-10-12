@@ -56,7 +56,9 @@ public sealed class PowerKernelSourceTests
 #if NET7_0_OR_GREATER // WebGpuKernels is compiled only on net7.0+
     [InlineData(
         "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuKernels", "ScalarOpsSource", "fn pow_scalar(",
-        "bitcast<f32>(0x7fc00000u)")]
+        // Through the wgsl_f32_bits helper: a bitcast of a NaN pattern written inline is a constant expression,
+        // which WGSL rejects.
+        "wgsl_f32_bits(0x7fc00000u)")]
 #endif
     public void ShaderBackendsExplicitlyReturnNaNForNegativeBasesWithFractionalExponents(
         string typeName,

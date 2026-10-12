@@ -52,11 +52,11 @@ var<workgroup> localInfo : i32;
             if (diag <= 0.0) { localInfo = j + 1; L[off + j * n + j] = 0.0; }
             else { L[off + j * n + j] = sqrt(diag); }
         }
-        workgroupBarrier();
-        if (localInfo != 0) { break; }
+        // workgroupUniformLoad: the exit sits in front of a barrier, so it must be uniform. A zero pivot always sets
+        // localInfo first, so the former djj == 0 exit is covered by this one.
+        if (workgroupUniformLoad(&localInfo) != 0) { break; }
 
         let djj : f32 = L[off + j * n + j];
-        if (djj == 0.0) { break; }
 
         var i : i32 = j + 1 + tid;
         loop {
@@ -79,7 +79,7 @@ var<workgroup> localInfo : i32;
         if (idx >= n * n) { break; }
         let i2 = idx / n;
         let j2 = idx % n;
-        let shouldZero : bool = select(i2 < j2, i2 > j2, p.upper != 0);
+        let shouldZero : bool = select((i2 < j2), (i2 > j2), p.upper != 0);
         if (shouldZero) { L[off + idx] = 0.0; }
         idx = idx + bs;
     }
@@ -98,6 +98,8 @@ struct P { batchCount: i32, m: i32, n: i32 };
 @group(0) @binding(3) var<uniform> p : P;
 
 var<workgroup> pivRow : i32;
+// Read through workgroupUniformLoad: control flow around a barrier must be uniform.
+var<workgroup> pivZero : i32;
 
 @compute @workgroup_size(256) fn main(
     @builtin(workgroup_id) wg : vec3<u32>,
@@ -129,7 +131,7 @@ var<workgroup> pivRow : i32;
         }
         workgroupBarrier();
 
-        let pp : i32 = pivRow;
+        let pp : i32 = workgroupUniformLoad(&pivRow);
         if (pp != j) {
             var c : i32 = tid;
             loop {
@@ -142,7 +144,8 @@ var<workgroup> pivRow : i32;
             workgroupBarrier();
         }
         let pivVal : f32 = LU[matOff + j * n + j];
-        if (pivVal == 0.0) { continue; }
+        if (tid == 0) { pivZero = select(0, 1, pivVal == 0.0); }
+        if (workgroupUniformLoad(&pivZero) != 0) { continue; }
         var i1 : i32 = j + 1 + tid;
         loop { if (i1 >= m) { break; } LU[matOff + i1 * n + j] = LU[matOff + i1 * n + j] / pivVal; i1 = i1 + bs; }
         workgroupBarrier();
@@ -179,6 +182,9 @@ var<workgroup> Ash : array<f32, 1024>;
 var<workgroup> Vsh : array<f32, 1024>;
 var<workgroup> c_sh : f32;
 var<workgroup> s_sh : f32;
+// WGSL treats a workgroup-memory read as non-uniform, so the loop exit and the rotation skip, which a barrier follows,
+// read these through workgroupUniformLoad.
+var<workgroup> done_sh : i32;
 
 @compute @workgroup_size(256) fn main(
     @builtin(workgroup_id) wg : vec3<u32>,
@@ -212,7 +218,8 @@ var<workgroup> s_sh : f32;
                 offSum = offSum + Ash[pp * n + qq] * Ash[pp * n + qq];
             }
         }
-        if (sqrt(offSum) < eps) { break; }
+        if (tid == 0) { done_sh = select(0, 1, sqrt(offSum) < eps); }
+        if (workgroupUniformLoad(&done_sh) != 0) { break; }
 
         for (var pp : i32 = 0; pp < n - 1; pp = pp + 1) {
             for (var qq : i32 = pp + 1; qq < n; qq = qq + 1) {
@@ -231,7 +238,7 @@ var<workgroup> s_sh : f32;
                     }
                 }
                 workgroupBarrier();
-                if (s_sh == 0.0) { continue; }
+                if (workgroupUniformLoad(&s_sh) == 0.0) { continue; }
                 let cc : f32 = c_sh;
                 let ss : f32 = s_sh;
 

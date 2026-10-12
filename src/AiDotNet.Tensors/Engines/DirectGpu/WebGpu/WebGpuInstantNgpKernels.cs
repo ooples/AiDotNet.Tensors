@@ -353,7 +353,7 @@ struct NonzeroP { length: i32, rank: i32 };
 struct ModeP { length: i32 };
 @group(0) @binding(2) var<uniform> p : ModeP;
 fn mode_equal(left: f32, right: f32) -> bool {
-    return left == right || (isNan(left) && isNan(right));
+    return left == right || (wgsl_is_nan(left) && wgsl_is_nan(right));
 }
 @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     if (id.x != 0u) { return; }
@@ -447,7 +447,7 @@ struct ScatterMaxP { sourceRows: i32, innerSize: i32, outputRows: i32, padding: 
     if (gid >= total) { return; }
     let group = gid / p.innerSize;
     let inner = gid % p.innerSize;
-    var best = bitcast<f32>(0xff800000u);
+    var best = wgsl_f32_bits(0xff800000u);
     var bestRow = -1;
     for (var row = 0; row < p.sourceRows; row = row + 1) {
         let value = source[row * p.innerSize + inner];
@@ -514,7 +514,7 @@ struct P{sourceRows:i32,innerSize:i32,outputRows:i32,pad:i32};@group(0) @binding
 @group(0) @binding(1) var<storage,read> indices:array<i32>;
 @group(0) @binding(2) var<storage,read_write> output_:array<f32>;
 struct P{sourceRows:i32,innerSize:i32,numGroups:i32,pad:i32};@group(0) @binding(3) var<uniform> p:P;
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>){let gid=i32(id.x);if(gid>=p.sourceRows*p.innerSize){return;}let inner=gid%p.innerSize;let row=gid/p.innerSize;let group=indices[row];if(group<0||group>=p.numGroups){output_[gid]=0.0;return;}var maximum=bitcast<f32>(0xff800000u);for(var other=0;other<p.sourceRows;other=other+1){if(indices[other]==group){maximum=max(maximum,source[other*p.innerSize+inner]);}}var sum=0.0;for(var other=0;other<p.sourceRows;other=other+1){if(indices[other]==group){sum=sum+exp(source[other*p.innerSize+inner]-maximum);}}let value=exp(source[gid]-maximum);if(sum!=0.0){output_[gid]=value/sum;}else{output_[gid]=value;}}";
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>){let gid=i32(id.x);if(gid>=p.sourceRows*p.innerSize){return;}let inner=gid%p.innerSize;let row=gid/p.innerSize;let group=indices[row];if(group<0||group>=p.numGroups){output_[gid]=0.0;return;}var maximum=wgsl_f32_bits(0xff800000u);for(var other=0;other<p.sourceRows;other=other+1){if(indices[other]==group){maximum=max(maximum,source[other*p.innerSize+inner]);}}var sum=0.0;for(var other=0;other<p.sourceRows;other=other+1){if(indices[other]==group){sum=sum+exp(source[other*p.innerSize+inner]-maximum);}}let value=exp(source[gid]-maximum);if(sum!=0.0){output_[gid]=value/sum;}else{output_[gid]=value;}}";
 
     public static string ScatterAddBackwardRows => @"
 @group(0) @binding(0) var<storage,read> gradOutput:array<f32>;@group(0) @binding(1) var<storage,read> indices:array<i32>;@group(0) @binding(2) var<storage,read_write> gradSource:array<f32>;struct P{sourceRows:i32,innerSize:i32,outputRows:i32,pad:i32};@group(0) @binding(3) var<uniform> p:P;@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id:vec3<u32>){let gid=i32(id.x);if(gid>=p.sourceRows*p.innerSize){return;}let inner=gid%p.innerSize;let group=indices[gid/p.innerSize];if(group>=0&&group<p.outputRows){gradSource[gid]=gradOutput[group*p.innerSize+inner];}else{gradSource[gid]=0.0;}}";
@@ -606,8 +606,8 @@ struct NmsP { length: i32, threshold: f32, batched: i32, pad0: i32 };
         for (var i = 0; i < p.length; i = i + 1) {
             if (suppressed[i] != 0.0) { continue; }
             let score = scores[i];
-            if (best < 0 || (!isNan(score) &&
-                (isNan(bestScore) || score > bestScore || (score == bestScore && i < best)))) {
+            if (best < 0 || (!wgsl_is_nan(score) &&
+                (wgsl_is_nan(bestScore) || score > bestScore || (score == bestScore && i < best)))) {
                 best = i; bestScore = score;
             }
         }

@@ -774,13 +774,15 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
 }");
     // #1179 fused attention: line-for-line ports of BatchExecutionCudaKernels.AttentionSource (WGSL reserves "meta",
     // hence "fam" for the metadata buffer on every port). -inf is tested on its bits, since WGSL lets an implementation
-    // assume floats are finite.
+    // assume floats are finite. No kernel binds more than 8 storage buffers, WebGPU's guaranteed per-stage limit.
     private const string FaLoad = @"
-struct Fa { H: i32, Sq: i32, Sk: i32, D: i32, qb: i32, qh: i32, qr: i32, kb: i32, kh: i32, kr: i32, vb: i32, vh: i32,
-    vr: i32, ob: i32, oh: i32, orw: i32, mb: i32, mh: i32, mi: i32, mj: i32, causal: i32, coff: i32, hasMask: i32 }
+struct Fa { B: i32, H: i32, Sq: i32, Sk: i32, D: i32, qb: i32, qh: i32, qr: i32, kb: i32, kh: i32, kr: i32, vb: i32,
+    vh: i32, vr: i32, ob: i32, oh: i32, orw: i32, mb: i32, mh: i32, mi: i32, mj: i32, causal: i32, coff: i32,
+    hasMask: i32, scale: f32, cap: f32 }
 fn fa_load() -> Fa {
-    return Fa(fam[1], fam[2], fam[3], fam[4], fam[5], fam[6], fam[7], fam[8], fam[9], fam[10], fam[11], fam[12], fam[13],
-        fam[14], fam[15], fam[16], fam[17], fam[18], fam[19], fam[20], fam[21], fam[22], fam[23]);
+    return Fa(fam[0], fam[1], fam[2], fam[3], fam[4], fam[5], fam[6], fam[7], fam[8], fam[9], fam[10], fam[11], fam[12],
+        fam[13], fam[14], fam[15], fam[16], fam[17], fam[18], fam[19], fam[20], fam[21], fam[22], fam[23],
+        bitcast<f32>(fam[24]), bitcast<f32>(fam[25]));
 }
 fn fa_neg_inf() -> f32 { let bits = 0xff800000u; return bitcast<f32>(bits); }
 fn fa_has_keys(lr: f32) -> bool { return bitcast<u32>(lr) != 0xff800000u; }
@@ -794,10 +796,9 @@ fn fa_allowed(f: Fa, b: i32, h: i32, i: i32, j: i32) -> bool {
 }
 // The capped score and d(capped) / d(raw).
 fn fa_score(f: Fa, b: i32, h: i32, i: i32, j: i32) -> vec2<f32> {
-    let scale = fp[0]; let cap = fp[1];
     var s = 0.0;
-    for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
-    if (cap > 0.0) { let t = tanh(s / cap); return vec2<f32>(cap * t, 1.0 - t * t); }
+    for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * f.scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
+    if (f.cap > 0.0) { let t = tanh(s / f.cap); return vec2<f32>(f.cap * t, 1.0 - t * t); }
     return vec2<f32>(s, 1.0);
 }
 ";
@@ -810,7 +811,7 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
 }
 ";
 
-    public static readonly string FaLse = Shader(new[] { "r:q", "r:k", "r:fam:i32", "r:fp", "r:mask:i32", "rw:lse" }, "total: i32",
+    public static readonly string FaLse = Shader(new[] { "r:q", "r:k", "r:fam:i32", "r:mask:i32", "rw:lse" }, "total: i32",
         FaLoad + FaScore + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
@@ -831,7 +832,7 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     lse[i] = m + log(l);
 }");
 
-    public static readonly string FaOut = Shader(new[] { "r:q", "r:k", "r:v", "r:fam:i32", "r:fp", "r:mask:i32", "r:lse", "rw:o" },
+    public static readonly string FaOut = Shader(new[] { "r:q", "r:k", "r:v", "r:fam:i32", "r:mask:i32", "r:lse", "rw:o" },
         "total: i32", FaLoad + FaScore + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
@@ -846,51 +847,66 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     o[b * f.ob + h * f.oh + qi * f.orw + e] = acc;
 }");
 
-    public static readonly string FaDelta = Shader(new[] { "r:o", "r:dout", "r:fam:i32", "rw:delta" }, "total: i32", FaLoad + Main + @"
+    public static readonly string FaDelta = Shader(new[] { "r:o", "r:dout", "r:fam:i32", "rw:st" }, "total: i32", FaLoad + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
     let qi = i % f.Sq; let bh = i / f.Sq; let b = bh / f.H; let h = bh % f.H;
     var acc = 0.0;
     for (var e = 0; e < f.D; e++) { acc += dout[b * f.ob + h * f.oh + qi * f.orw + e] * o[b * f.ob + h * f.oh + qi * f.orw + e]; }
-    delta[i] = acc;
+    st[p.total + i] = acc;
 }");
 
     public static readonly string FaDq = Shader(
-        new[] { "r:q", "r:k", "r:v", "r:dout", "r:lse", "r:delta", "r:fam:i32", "r:fp", "r:mask:i32", "rw:dq" }, "total: i32",
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dq" }, "total: i32",
         FaLoad + FaScore + FaDp + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
+    let rows = f.B * f.H * f.Sq;
     let e = i % f.D; let r = i / f.D; let qi = r % f.Sq; let bh = r / f.Sq; let b = bh / f.H; let h = bh % f.H;
-    let lr = lse[r]; var acc = 0.0;
+    let lr = st[r]; var acc = 0.0;
     if (fa_has_keys(lr)) {
-        let dl = delta[r];
+        let dl = st[rows + r];
         for (var j = 0; j < f.Sk; j++) {
             if (!fa_allowed(f, b, h, qi, j)) { continue; }
             let s = fa_score(f, b, h, qi, j);
             acc += exp(s.x - lr) * (fa_dp(f, b, h, qi, j) - dl) * s.y * k[b * f.kb + h * f.kh + j * f.kr + e];
         }
     }
-    dq[b * f.qb + h * f.qh + qi * f.qr + e] = acc * fp[0];
+    dq[b * f.qb + h * f.qh + qi * f.qr + e] = acc * f.scale;
 }");
 
-    public static readonly string FaDkv = Shader(
-        new[] { "r:q", "r:k", "r:v", "r:dout", "r:lse", "r:delta", "r:fam:i32", "r:fp", "r:mask:i32", "rw:dk", "rw:dv" },
-        "total: i32", FaLoad + FaScore + FaDp + Main + @"
+    public static readonly string FaDk = Shader(
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dk" }, "total: i32",
+        FaLoad + FaScore + FaDp + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let rows = f.B * f.H * f.Sq;
+    let e = i % f.D; let r = i / f.D; let j = r % f.Sk; let bh = r / f.Sk; let b = bh / f.H; let h = bh % f.H;
+    var ak = 0.0;
+    for (var qi = 0; qi < f.Sq; qi++) {
+        let lr = st[bh * f.Sq + qi];
+        if (!fa_has_keys(lr) || !fa_allowed(f, b, h, qi, j)) { continue; }
+        let s = fa_score(f, b, h, qi, j);
+        ak += exp(s.x - lr) * (fa_dp(f, b, h, qi, j) - st[rows + bh * f.Sq + qi]) * s.y * q[b * f.qb + h * f.qh + qi * f.qr + e] * f.scale;
+    }
+    dk[b * f.kb + h * f.kh + j * f.kr + e] = ak;
+}");
+
+    public static readonly string FaDv = Shader(
+        new[] { "r:q", "r:k", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dv" }, "total: i32",
+        FaLoad + FaScore + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
     let e = i % f.D; let r = i / f.D; let j = r % f.Sk; let bh = r / f.Sk; let b = bh / f.H; let h = bh % f.H;
-    var ak = 0.0; var av = 0.0;
+    var av = 0.0;
     for (var qi = 0; qi < f.Sq; qi++) {
-        let lr = lse[bh * f.Sq + qi];
+        let lr = st[bh * f.Sq + qi];
         if (!fa_has_keys(lr) || !fa_allowed(f, b, h, qi, j)) { continue; }
-        let s = fa_score(f, b, h, qi, j);
-        let pr = exp(s.x - lr);
-        av += pr * dout[b * f.ob + h * f.oh + qi * f.orw + e];
-        ak += pr * (fa_dp(f, b, h, qi, j) - delta[bh * f.Sq + qi]) * s.y * q[b * f.qb + h * f.qh + qi * f.qr + e] * fp[0];
+        av += exp(fa_score(f, b, h, qi, j).x - lr) * dout[b * f.ob + h * f.oh + qi * f.orw + e];
     }
-    dk[b * f.kb + h * f.kh + j * f.kr + e] = ak;
     dv[b * f.vb + h * f.vh + j * f.vr + e] = av;
 }");
+
     // #1107 / #1108 fused LSTM: line-for-line ports of BatchExecutionCudaKernels.LstmSource.
     private const string LstmSig = @"
 fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
@@ -1019,7 +1035,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.LaSolveBackwardVector] = LaSolveBackwardVector, [BatchExecutionCudaKernels.LaSvdReduced] = LaSvdReduced,
         [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
         [BatchExecutionCudaKernels.FaLse] = FaLse, [BatchExecutionCudaKernels.FaOut] = FaOut, [BatchExecutionCudaKernels.FaDelta] = FaDelta,
-        [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDkv] = FaDkv,
+        [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDk] = FaDk, [BatchExecutionCudaKernels.FaDv] = FaDv,
         [BatchExecutionCudaKernels.LstmGates] = LstmGates, [BatchExecutionCudaKernels.LstmCell] = LstmCell,
         [BatchExecutionCudaKernels.LstmCellBackward] = LstmCellBackward, [BatchExecutionCudaKernels.LstmHiddenBackward] = LstmHiddenBackward,
         [BatchExecutionCudaKernels.LstmInputGrad] = LstmInputGrad, [BatchExecutionCudaKernels.LstmWeightIhGrad] = LstmWeightIhGrad,
