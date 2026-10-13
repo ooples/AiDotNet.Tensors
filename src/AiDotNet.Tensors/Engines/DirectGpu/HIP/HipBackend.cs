@@ -48,7 +48,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _rdnaGemmWave32;
     private readonly Dictionary<string, IntPtr> _kernelCache;
 
-    /// <summary>Whether a compiled module registered this kernel name (HipKernelLookupIntegrityTests).</summary>
+    /// <summary>Whether a compiled module registered this kernel name (KernelLookupIntegrityTests).</summary>
     internal bool HasCompiledKernel(string name) => _kernelCache.ContainsKey(name);
     private readonly List<HipKernelCompilationException> _kernelCompilationFailures = new();
     private AmdGpuArchitecture _architecture;

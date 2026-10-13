@@ -7,26 +7,29 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// The HIP entry points whose kernels were never compiled (see HipKernelLookupIntegrityTests) now run on the device
-/// for the first time, so each is compared with a CPU reference written from its documented contract: MaxAxis,
-/// Copy2DStrided, CsrSegmented{Max,Min,StdDev}, BatchedDotProduct, TileBatch and BroadcastMultiplyLastAxis.
-/// The octonion kernels are covered by HipHyperbolicOctonionGpuCorrectnessTests.
+/// Entry points whose kernels no compiled program provided (see KernelLookupIntegrityTests) now run on the device for
+/// the first time, so each is compared with a CPU reference written from its documented contract: MaxAxis,
+/// Copy2DStrided, CsrSegmented{Max,Min,StdDev}, BatchedDotProduct, TileBatch, BroadcastMultiplyLastAxis, Fma and the
+/// SNN RbfForward / UpdateTraces / StdpUpdate. The octonion kernels are covered by
+/// HyperbolicOctonionGpuCorrectnessTests.
 /// </summary>
-[Collection("DirectGpuSerial")]
-public sealed class HipRestoredKernelParityTests : IClassFixture<HipTensorEngineTestFixture>
+public abstract class RestoredKernelParityTestsBase
 {
     private const float Sentinel = -12345f;
-    private readonly HipTensorEngineTestFixture _fixture;
+    private readonly IDirectGpuBackend? _backend;
+    private readonly string _skipReason;
 
-    public HipRestoredKernelParityTests(HipTensorEngineTestFixture fixture) => _fixture = fixture;
+    protected RestoredKernelParityTestsBase(IDirectGpuBackend? backend, string skipReason)
+    {
+        _backend = backend;
+        _skipReason = skipReason;
+    }
 
     private IDirectGpuBackend Backend()
     {
-        Skip.IfNot(_fixture.IsAvailable, "HIP GPU backend not available");
-        var engine = _fixture.Engine ?? throw new InvalidOperationException("HIP fixture reports available without an engine.");
-        return engine.GetBackend();
+        Skip.If(_backend is null, _skipReason);
+        return _backend ?? throw new InvalidOperationException(_skipReason);
     }
-
     private static float[] Values(int count, int seed)
     {
         var rng = new Random(seed);
@@ -198,5 +201,114 @@ public sealed class HipRestoredKernelParityTests : IClassFixture<HipTensorEngine
         backend.BroadcastMultiplyLastAxis(da, db, dOut, outer, inner);
         AssertClose(expected, backend.DownloadBuffer(dOut), 1e-6, "BroadcastMultiplyLastAxis");
     }
+    [SkippableFact]
+    public void Fma_MatchesCpu()
+    {
+        var backend = Backend();
+        const int n = 1000;
+        float[] a = Values(n, 9), b = Values(n, 10), c = Values(n, 11);
+        var expected = new float[n];
+        for (int i = 0; i < n; i++) expected[i] = (float)((double)a[i] * b[i] + c[i]);
+        using var da = backend.AllocateBuffer(a);
+        using var db = backend.AllocateBuffer(b);
+        using var dc = backend.AllocateBuffer(c);
+        using var dOut = Filled(backend, n, Sentinel);
+        backend.Fma(da, db, dc, dOut, n);
+        AssertClose(expected, backend.DownloadBuffer(dOut), 1e-6, "Fma");
+    }
+
+    [SkippableTheory]
+    [InlineData(1, 1, 1)]
+    [InlineData(37, 20, 9)]
+    public void RbfForward_MatchesCpu(int batch, int centers, int dim)
+    {
+        var backend = Backend();
+        float[] x = Values(batch * dim, 12 + batch), cs = Values(centers * dim, 13 + centers);
+        var eps = new float[centers];
+        for (int c = 0; c < centers; c++) eps[c] = 0.1f + 0.05f * c;
+        var expected = new float[batch * centers];
+        for (int b = 0; b < batch; b++)
+            for (int c = 0; c < centers; c++)
+            {
+                double d2 = 0;
+                for (int d = 0; d < dim; d++) { double diff = x[b * dim + d] - cs[c * dim + d]; d2 += diff * diff; }
+                expected[b * centers + c] = (float)Math.Exp(-eps[c] * d2);
+            }
+        using var dx = backend.AllocateBuffer(x);
+        using var dc = backend.AllocateBuffer(cs);
+        using var de = backend.AllocateBuffer(eps);
+        using var dOut = Filled(backend, batch * centers, Sentinel);
+        backend.RbfForward(dx, dc, de, dOut, batch, centers, dim);
+        AssertClose(expected, backend.DownloadBuffer(dOut), 1e-5, "RbfForward");
+    }
+
+    [SkippableFact]
+    public void UpdateTraces_MatchesCpu()
+    {
+        var backend = Backend();
+        const int n = 700;
+        const float decay = 0.9f, threshold = 0.5f;
+        float[] traces = Values(n, 14), input = Values(n, 15);
+        var expTraces = new float[n];
+        var expSpikes = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            bool spike = input[i] > threshold;
+            expSpikes[i] = spike ? 1f : 0f;
+            expTraces[i] = decay * traces[i] + (spike ? 1f : 0f);
+        }
+        using var dt = backend.AllocateBuffer(traces);
+        using var ds = Filled(backend, n, Sentinel);
+        using var di = backend.AllocateBuffer(input);
+        backend.UpdateTraces(dt, ds, di, decay, threshold, n);
+        AssertClose(expTraces, backend.DownloadBuffer(dt), 1e-6, "UpdateTraces.traces");
+        AssertClose(expSpikes, backend.DownloadBuffer(ds), 0, "UpdateTraces.spikes");
+    }
+
+    [SkippableTheory]
+    [InlineData(1, 1)]
+    [InlineData(23, 41)]
+    public void StdpUpdate_MatchesCpu(int numPre, int numPost)
+    {
+        var backend = Backend();
+        const float ltp = 0.01f, ltd = 0.012f, homeo = 0.001f, wMin = -1f, wMax = 1f;
+        float[] w = Values(numPre * numPost, 16 + numPre), preT = Values(numPre, 17), postT = Values(numPost, 18);
+        var rng = new Random(19);
+        var preS = new float[numPre];
+        var postS = new float[numPost];
+        for (int i = 0; i < numPre; i++) preS[i] = rng.Next(2);
+        for (int j = 0; j < numPost; j++) postS[j] = rng.Next(2);
+        var expected = new float[w.Length];
+        for (int i = 0; i < numPre; i++)
+            for (int j = 0; j < numPost; j++)
+            {
+                float wij = w[i * numPost + j], dw = 0f;
+                if (preS[i] > 0.5f && postT[j] > 0f) dw += ltp * postT[j];
+                if (postS[j] > 0.5f && preT[i] > 0f) dw -= ltd * preT[i];
+                dw += homeo * ((wMin + wMax) * 0.5f - wij);
+                expected[i * numPost + j] = Math.Min(Math.Max(wij + dw, wMin), wMax);
+            }
+        using var dw0 = backend.AllocateBuffer(w);
+        using var dPreT = backend.AllocateBuffer(preT);
+        using var dPostT = backend.AllocateBuffer(postT);
+        using var dPreS = backend.AllocateBuffer(preS);
+        using var dPostS = backend.AllocateBuffer(postS);
+        backend.StdpUpdate(dw0, dPreT, dPostT, dPreS, dPostS, ltp, ltd, homeo, wMin, wMax, numPre, numPost);
+        AssertClose(expected, backend.DownloadBuffer(dw0), 1e-6, "StdpUpdate");
+    }
+}
+
+[Collection("DirectGpuSerial")]
+public sealed class HipRestoredKernelParityTests : RestoredKernelParityTestsBase, IClassFixture<HipTensorEngineTestFixture>
+{
+    public HipRestoredKernelParityTests(HipTensorEngineTestFixture fixture)
+        : base(fixture.IsAvailable ? fixture.Engine?.GetBackend() : null, "HIP GPU backend not available") { }
+}
+
+[Collection("OpenClBackend")]
+public sealed class OpenClRestoredKernelParityTests : RestoredKernelParityTestsBase, IClassFixture<OpenClBackendTestFixture>
+{
+    public OpenClRestoredKernelParityTests(OpenClBackendTestFixture fixture)
+        : base(fixture.IsAvailable ? fixture.Backend : null, "OpenCL GPU backend not available") { }
 }
 #endif
