@@ -12,6 +12,7 @@ public class SymmDeterminismTests
     [InlineData(64, 48)]
     [InlineData(128, 96)]
     [InlineData(192, 64)]
+    [InlineData(400, 8)]   // #517: a narrow panel against a matrix past 1 MiB reads the stored triangle in place
     public void Symm_FP64_BitExactAcrossThreadCounts(int m, int n)
     {
         var rng = new Random(42);
