@@ -197,6 +197,7 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
         private readonly CsrWeights _shape;
         private readonly int[] _versions;
         private CsrWeights? _csr;
+        private int _rewrites;
         internal float[]? Dense;
 
         internal SnapshotState(CsrWeights initial)
@@ -219,6 +220,14 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
 
             for (int i = 0; i < _versions.Length; i++)
                 _versions[i] = _shape.Sources[i].StorageMutationVersion;
+            // A weight rewritten more than once is being fed per call (a graph input): scanning it for sparsity every
+            // execute would cost more than it saves, so a single source stays on the dense path from then on.
+            if (++_rewrites >= 2 && _shape.Sources.Length == 1)
+            {
+                _csr = null;
+                Dense = DenseArray(_shape.Sources[0]);
+                return null;
+            }
             float[] denseInOut = _shape.Sources.Length == 1
                 ? DenseArray(_shape.Sources[0])
                 : Product(DenseArray(_shape.Sources[0]), DenseArray(_shape.Sources[1]));
