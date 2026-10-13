@@ -207,8 +207,8 @@ public static class OnnxImporter
         // Individual op-level translators still route through all the fast
         // paths inside CpuEngine (SIMD, BLAS-backed MatMul, fused Conv).
         CompiledInferencePlan<T> plan;
-        var prevOpts = TensorCodecOptions.Current;
-        TensorCodecOptions.SetCurrent(new TensorCodecOptions
+        // Push restores the thread's exact prior state in the finally (#1221).
+        var codecScope = TensorCodecOptions.Push(new TensorCodecOptions
         {
             EnableDataflowFusion = false,
             EnableSpectralDecomposition = false,
@@ -323,7 +323,7 @@ public static class OnnxImporter
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(prevOpts);
+            codecScope.Dispose();
         }
 
         // Collect the declared graph outputs' tensors for the result.

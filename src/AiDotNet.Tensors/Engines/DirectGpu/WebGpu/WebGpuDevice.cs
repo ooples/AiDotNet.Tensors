@@ -210,10 +210,15 @@ public sealed class WebGpuDevice : IDisposable
     /// <returns>Number of workgroups needed.</returns>
     public (int Workgroups, int WorkgroupSize) CalculateWorkgroups1D(int totalWork, int workgroupSize = 256)
     {
-        // Clamp to device limits
         workgroupSize = Math.Min(workgroupSize, _limits?.MaxComputeWorkgroupSizeX ?? 256);
-        var workgroups = (totalWork + workgroupSize - 1) / workgroupSize;
-        workgroups = Math.Min(workgroups, _limits?.MaxComputeWorkgroupsPerDimension ?? 65535);
+        int workgroups = (int)(((long)totalWork + workgroupSize - 1) / workgroupSize);
+        int limit = _limits?.MaxComputeWorkgroupsPerDimension ?? 65535;
+        // Clamping instead would leave every invocation past the limit unlaunched: these shaders cover one element per
+        // invocation, so the tail of the output would silently keep whatever the buffer held. The work does not fit
+        // one dispatch on this device, a missing capability the engine answers by taking another route.
+        if (workgroups > limit)
+            throw new GpuCapabilityUnavailableException(
+                $"{totalWork} work items need {workgroups} workgroups of {workgroupSize}; this device dispatches at most {limit} per dimension.");
 
         return (workgroups, workgroupSize);
     }
@@ -247,8 +252,10 @@ public sealed class WebGpuDevice : IDisposable
         var workgroupsY = (height + workgroupSizeY - 1) / workgroupSizeY;
 
         var maxWg = _limits?.MaxComputeWorkgroupsPerDimension ?? 65535;
-        workgroupsX = Math.Min(workgroupsX, maxWg);
-        workgroupsY = Math.Min(workgroupsY, maxWg);
+        // As in CalculateWorkgroups1D: clamping would leave the rows or columns past the limit uncomputed.
+        if (workgroupsX > maxWg || workgroupsY > maxWg)
+            throw new GpuCapabilityUnavailableException(
+                $"A {width} x {height} dispatch needs {workgroupsX} x {workgroupsY} workgroups; this device dispatches at most {maxWg} per dimension.");
 
         return (workgroupsX, workgroupsY, workgroupSizeX, workgroupSizeY);
     }
