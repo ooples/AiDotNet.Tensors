@@ -1,3 +1,4 @@
+using System;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
@@ -50,6 +51,12 @@ internal static class OnnxRuntimeReference
             // ORT's native library may fail to load on some test hosts (e.g.
             // ARM64 without the matching wheel). Probe once and cache.
             try { using var _ = new SessionOptions(); return true; }
+            catch (Exception e) when (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_ORT") == "1")
+            {
+                // CI sets this: an ORT that fails to load would otherwise skip every parity test and let a wrong
+                // importer pass the gate silently (#1235 went unseen for a month).
+                throw new InvalidOperationException("AIDOTNET_REQUIRE_ORT=1 but ONNX Runtime failed to load.", e);
+            }
             catch { return false; }
         }
     }
