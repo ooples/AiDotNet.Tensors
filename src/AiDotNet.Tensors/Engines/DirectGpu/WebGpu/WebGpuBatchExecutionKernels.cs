@@ -27,6 +27,21 @@ fn bx_hash(counter: u32, key: u32) -> u32 {
 }
 // Built at run time: an infinite constant expression is a shader-creation error.
 fn bx_inf() -> f32 { let bits = 0x7f800000u; return bitcast<f32>(bits); }
+// tanh built on exp, not the device's own: a shading language's tanh may carry a large error, and one D3D12 driver's
+// is off by up to 7.7e-6 (130 ulp), which 1 - tanh^2 in the LSTM backward amplifies (#1220). The same driver's exp is
+// within 8 ulp. Below 0.25 the Maclaurin series is used (truncation under 1e-10), so small arguments keep their
+// relative accuracy; above it (1 - e^-2|x|) / (1 + e^-2|x|).
+fn bx_tanh(x: f32) -> f32 {
+    let a = abs(x);
+    if (a < 0.25) {
+        let u = x * x;
+        return x * (1.0 + u * (-0.33333334 + u * (0.13333334 + u * (-0.053968254 + u * (0.021869488 + u * -0.0088632355)))));
+    }
+    let e = exp(-2.0 * a);
+    let r = (1.0 - e) / (1.0 + e);
+    if (x < 0.0) { return -r; }
+    return r;
+}
 fn bx_unit(h: u32) -> f32 { return f32(h >> 8u) * (1.0 / 16777216.0); }
 // (a * b) mod m in 32 bits; a, b < m <= 2^30.
 fn bx_mulmod(a0: u32, b0: u32, m: u32) -> u32 {
@@ -228,7 +243,7 @@ var<workgroup> scratch: array<f32, 256>;
     var act = 0.0; var dact = 0.0;
     if (p.mode == 0) { let s = 1.0 / (1.0 + exp(-g)); act = s; dact = s * (1.0 - s); }
     else if (p.mode == 1) {
-        let t = tanh(0.7978845608 * (g + 0.044715 * g * g * g));
+        let t = bx_tanh(0.7978845608 * (g + 0.044715 * g * g * g));
         act = 0.5 * g * (1.0 + t);
         dact = 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * 0.7978845608 * (1.0 + 0.134145 * g * g);
     }
@@ -798,7 +813,7 @@ fn fa_allowed(f: Fa, b: i32, h: i32, i: i32, j: i32) -> bool {
 fn fa_score(f: Fa, b: i32, h: i32, i: i32, j: i32) -> vec2<f32> {
     var s = 0.0;
     for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * f.scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
-    if (f.cap > 0.0) { let t = tanh(s / f.cap); return vec2<f32>(f.cap * t, 1.0 - t * t); }
+    if (f.cap > 0.0) { let t = bx_tanh(s / f.cap); return vec2<f32>(f.cap * t, 1.0 - t * t); }
     return vec2<f32>(s, 1.0);
 }
 ";
@@ -910,7 +925,7 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     // #974 fused decode-linear: line-for-line ports of BatchExecutionCudaKernels.DecodeLinearSource. dl_half is the
     // DL_HALF macro: one FP16 value widened to f32 on its bit pattern (zero, subnormals, infinity and NaN included).
     private const string DlCommon = @"
-fn dl_gelu(s: f32) -> f32 { return 0.5 * s * (1.0 + tanh(0.7978845608028654 * (s + 0.044715 * s * s * s))); }
+fn dl_gelu(s: f32) -> f32 { return 0.5 * s * (1.0 + bx_tanh(0.7978845608028654 * (s + 0.044715 * s * s * s))); }
 ";
 
     private const string DlHalf = @"
@@ -1052,7 +1067,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     var s = bih[row] + bhh[row];
     for (var k = 0; k < In; k++) { s += wih[row * In + k] * x[(b * p.T + p.t) * In + k]; }
     for (var j = 0; j < H; j++) { s += whh[row * H + j] * allH[(p.t * B + b) * H + j]; }
-    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), tanh(s), row / H == 2);
+    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), bx_tanh(s), row / H == 2);
 }");
 
     public static readonly string LstmCell = Shader(
@@ -1062,7 +1077,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     let b = i / H; let h = i - b * H;
     let gb = (t * B + b) * 4 * H;
     let c = gates[gb + H + h] * allC[(t * B + b) * H + h] + gates[gb + h] * gates[gb + 2 * H + h];
-    let hv = gates[gb + 3 * H + h] * tanh(c);
+    let hv = gates[gb + 3 * H + h] * bx_tanh(c);
     allC[((t + 1) * B + b) * H + h] = c;
     allH[((t + 1) * B + b) * H + h] = hv;
     y[(b * p.T + t) * H + h] = hv;
@@ -1075,7 +1090,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     let b = i / H; let h = i - b * H;
     let gb = (t * B + b) * 4 * H;
     let ig = gates[gb + h]; let fg = gates[gb + H + h]; let gg = gates[gb + 2 * H + h]; let og = gates[gb + 3 * H + h];
-    let tc = tanh(allC[((t + 1) * B + b) * H + h]);
+    let tc = bx_tanh(allC[((t + 1) * B + b) * H + h]);
     let dhv = gy[(b * p.T + t) * H + h] + dh[i];
     let dcv = dhv * og * (1.0 - tc * tc) + dc[i];
     dpre[gb + h] = dcv * gg * ig * (1.0 - ig);

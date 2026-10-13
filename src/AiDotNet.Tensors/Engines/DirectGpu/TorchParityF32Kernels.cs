@@ -57,6 +57,23 @@ __device__ __forceinline__ float tp_log1p(float y)
     return logf(u) * y / (u - 1.0f);
 }
 
+// sin(pi a) for a in [0, 0.5], from the Maclaurin series: sin on [0, pi/4], cos of the complement above it (0.5 - a is
+// exact there). Not the device's sinf: a shading language may give sin an ABSOLUTE error bound and no relative one,
+// and one D3D12 driver returns sin(3.14e-7) = 1.87e-7, which is 40% low (#1220). sinc, and lgamma's reflection through
+// log(sin(pi x)), need the relative accuracy near zero. The truncation error here is below 1e-10.
+__device__ __forceinline__ float tp_sinpi_reduced(float a)
+{
+    if (a <= 0.25f)
+    {
+        float ts = 3.14159265358979f * a;
+        float us = ts * ts;
+        return ts * (1.0f + us * (-0.16666666666666666f + us * (8.333333333333333e-3f + us * (-1.984126984126984e-4f + us * (2.7557319223985893e-6f + us * (-2.505210838544172e-8f))))));
+    }
+    float tc = 3.14159265358979f * (0.5f - a);
+    float uc = tc * tc;
+    return 1.0f + uc * (-0.5f + uc * (4.1666666666666664e-2f + uc * (-1.3888888888888889e-3f + uc * (2.48015873015873e-5f + uc * (-2.755731922398589e-7f + uc * 2.08767569878681e-9f)))));
+}
+
 // sin(pi x) with exact argument reduction (SpecialFunctions.SinPi).
 __device__ __forceinline__ float tp_sinpi(float x)
 {
@@ -65,7 +82,7 @@ __device__ __forceinline__ float tp_sinpi(float x)
     float a = fabsf(r);
     if (a == 0.0f || a == 1.0f) { return 0.0f; }
     if (a > 0.5f) { a = 1.0f - a; }
-    float s = sinf(3.14159265358979f * a);
+    float s = tp_sinpi_reduced(a);
     if (r < 0.0f) { return -s; }
     return s;
 }
@@ -667,7 +684,7 @@ __device__ __forceinline__ float tp_igamma_continued_fraction(float a, float x)
         ("tp_bessel_k1", "y[t] = tp_bessel_k(1.0f, v);"),
         ("tp_bessel_k0e", "y[t] = tp_bessel_k_scaled(0.0f, v);"),
         ("tp_bessel_k1e", "y[t] = tp_bessel_k_scaled(1.0f, v);"),
-        ("tp_spherical_bessel_j0", "if (tp_isnan(v)) { y[t] = v; } else if (tp_isinf(v)) { y[t] = 0.0f; } else if (fabsf(v) < 1e-4f) { y[t] = 1.0f - v * v / 6.0f; } else { y[t] = sinf(v) / v; }"),
+        ("tp_spherical_bessel_j0", "if (tp_isnan(v)) { y[t] = v; } else if (tp_isinf(v)) { y[t] = 0.0f; } else if (fabsf(v) < 0.5f) { float w = v * v; y[t] = 1.0f + w * (-0.16666666666666666f + w * (8.333333333333333e-3f + w * (-1.984126984126984e-4f + w * 2.7557319223985893e-6f))); } else { y[t] = sinf(v) / v; }"),
         ("tp_airy_ai", "y[t] = tp_airy_ai_f(v);"),
         ("tp_angle", "if (tp_isnan(v)) { y[t] = v; } else if (v < 0.0f) { y[t] = 3.14159265358979f; } else { y[t] = 0.0f; }"),
         ("tp_nonzero", "y[t] = tp_pick(v != 0.0f, 1.0f, 0.0f);"),
