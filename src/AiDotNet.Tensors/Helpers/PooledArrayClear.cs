@@ -18,6 +18,15 @@ internal static class PooledArrayClear
     /// <summary>Smallest clear, in bytes, that is split across workers.</summary>
     internal const long ParallelMinBytes = 1L << 20;
 
+    [ThreadStatic] private static int t_lastChunks;
+
+    /// <summary>
+    /// How many pieces the calling thread's last <see cref="Clear"/> actually ran as: 1 for a serial clear, else the
+    /// chunks the dispatcher executed (it runs a nested call serially, as one). Lets tests assert the dispatch, not only
+    /// the zeroed range, which a serial clear produces too.
+    /// </summary>
+    internal static int LastClearChunks => t_lastChunks;
+
     internal static void Clear<T>(T[] array, int start, int length)
     {
         long bytes = (long)length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
@@ -25,9 +34,16 @@ internal static class PooledArrayClear
         if (chunks < 2)
         {
             Array.Clear(array, start, length);
+            t_lastChunks = 1;
             return;
         }
         int grain = (length + chunks - 1) / chunks;
-        CpuParallelSettings.ParallelForChunks(length, grain, (s, n) => Array.Clear(array, start + s, n));
+        int ran = 0;
+        CpuParallelSettings.ParallelForChunks(length, grain, (s, n) =>
+        {
+            Array.Clear(array, start + s, n);
+            System.Threading.Interlocked.Increment(ref ran);
+        });
+        t_lastChunks = ran;
     }
 }
