@@ -15,7 +15,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// preallocated device buffers; JIT, module creation, graph construction, and
 /// host/device copies are outside the timed region.
 /// </summary>
-internal static class DirectPtxDenseLinearFullExperiment
+internal static partial class DirectPtxDenseLinearFullExperiment
 {
     private const int Warmups = 30;
     private const int Samples = 101;
@@ -94,6 +94,8 @@ internal static class DirectPtxDenseLinearFullExperiment
                 if (Includes(onlyOperation, "linear-backward-relu")) RunLinearBackward(backend, run);
                 if (onlyOperation is null || onlyOperation is "dot" or "outer" or "batched-dot" or "strided-dot")
                     RunDenseVectors(backend, run, onlyOperation);
+                // Opt-in only: the #1261 shape grid is far longer than the default matrix.
+                if (onlyOperation == GemmGridOperation) RunGemmGrid(backend, run);
             }
             if (includePython)
             {
@@ -796,7 +798,8 @@ internal static class DirectPtxDenseLinearFullExperiment
         Resources resources,
         bool capture,
         bool allowMissingEstablishedKernel = false,
-        double tolerance = Tolerance)
+        double tolerance = Tolerance,
+        int deviceLaunches = DeviceLaunches)
     {
         string environmentLabel = operation + "-" + method;
         // The process/suite admission checks reject active WDDM C+G work while
@@ -830,7 +833,7 @@ internal static class DirectPtxDenseLinearFullExperiment
         }
         backend.Synchronize();
         double maxError = error();
-        Distribution device = MeasureDevice(backend, launch);
+        Distribution device = MeasureDevice(backend, launch, minimumLogicalOperationsPerSample: deviceLaunches);
         Distribution endToEnd = MeasureEndToEnd(backend, launch);
         long allocation = MeasureAllocation(backend, launch);
         DeviceAllocation temporary = MeasureTemporaryDeviceAllocation(backend, launch);
