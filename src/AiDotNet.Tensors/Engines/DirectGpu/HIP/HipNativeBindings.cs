@@ -167,7 +167,7 @@ internal static class HipNativeBindings
     // ROCm 6.4 on Windows installs versioned DLLs:
     //   C:\Program Files\AMD\ROCm\6.4\bin\amdhip64_6.dll
     //   C:\Program Files\AMD\ROCm\6.4\bin\hiprtc0604.dll
-#if NETFRAMEWORK
+#if !NETCOREAPP
     private const string HipLibrary = "amdhip64_6";
     private const string HipRtcLibrary = "hiprtc0604";
 #else

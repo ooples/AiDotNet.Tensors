@@ -5,7 +5,7 @@
 // composition on the live CUDA backend and checks it matches a CPU clip_grad_norm reference, in both the
 // clipping-active (norm>maxNorm) and no-op (norm<=maxNorm) regimes. Runs only when a GPU is present.
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
 #nullable disable
 
 using System;

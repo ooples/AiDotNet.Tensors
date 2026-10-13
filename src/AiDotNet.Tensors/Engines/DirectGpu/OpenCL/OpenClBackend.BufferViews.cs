@@ -1,5 +1,4 @@
 // Copyright (c) AiDotNet. All rights reserved.
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : IGpuBufferViews
@@ -19,4 +18,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

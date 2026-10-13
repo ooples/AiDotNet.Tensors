@@ -1,6 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL launcher shims for the geometry / sampling kernels (Issue #217).
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : IGeometryBackend
@@ -88,4 +87,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

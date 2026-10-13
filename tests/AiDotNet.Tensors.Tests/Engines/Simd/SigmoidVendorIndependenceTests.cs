@@ -1,4 +1,4 @@
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Runtime.Intrinsics;

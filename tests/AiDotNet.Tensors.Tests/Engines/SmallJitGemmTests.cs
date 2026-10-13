@@ -40,7 +40,7 @@ public class SmallJitGemmTests
         for (int i = 0; i < c.Length; i++) c[i] = float.NaN;   // must be fully overwritten
 
         bool ran = SimdGemm.TryGemmSmallJit(a, transA ? m : k, transA, b, transB ? k : n, transB, c, m, k, n);
-#if !NET471
+#if NETCOREAPP
         // Every shape here is inside a route's band: where the panel kernel exists, the route must engage (a silent
         // decline would pass the comparison below vacuously).
         // Each route has its own switch (AIDOTNET_JIT_SMALLK, and AIDOTNET_JIT_SPLITK for A transposed); a disabled

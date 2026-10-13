@@ -310,7 +310,7 @@ public class ConvBiasActivationFusionTests
         }
     }
 
-#if !NET471 // SimdConvHelper is not compiled for net471 (AiDotNet.Tensors.csproj removes it there).
+#if NETCOREAPP // SimdConvHelper is not compiled for net471 (AiDotNet.Tensors.csproj removes it there).
     /// <summary>A non-default 3x3 variant routes the conv off the tiled kernel; the entry must still be exact.</summary>
     [Fact]
     public void FusedConvForwardMatchesTwoPassOnLegacyVariant()

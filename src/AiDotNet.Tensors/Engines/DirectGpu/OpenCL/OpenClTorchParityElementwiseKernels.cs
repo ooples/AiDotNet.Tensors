@@ -7,7 +7,6 @@
 // Bessel, erfcx or normal-quantile builtins, so those are ports of SpecialFunctions' series, asymptotic expansions and
 // quadratures over the same Gauss-Legendre nodes. Requires cl_khr_fp64 and cl_khr_int64_base_atomics (the 64-bit
 // validation flag); a device without them fails to build this module and the ops keep their host fallback.
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 /// <summary>OpenCL source for the PyTorch-parity elementwise kernels.</summary>
@@ -1353,4 +1352,3 @@ __kernel void parity_grid_sample_3d_backward(__global const float* restrict x, _
         "parity_int_not", "parity_grid_sample_3d_backward", "parity_int64_binary", "parity_int64_not",
     };
 }
-#endif

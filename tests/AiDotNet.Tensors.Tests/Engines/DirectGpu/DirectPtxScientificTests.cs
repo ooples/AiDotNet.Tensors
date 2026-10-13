@@ -393,7 +393,7 @@ public class DirectPtxScientificTests
         [
             typeof(CudaBackend), typeof(HipBackend), typeof(MetalBackend),
             typeof(OpenClBackend), typeof(VulkanBackend),
-#if !NETFRAMEWORK
+#if NETCOREAPP
             // WebGpuBackend is only compiled for .NET 7+; net471 verifies the five
             // backends available on that target, while net10 verifies all six.
             typeof(WebGpuBackend)
@@ -420,7 +420,7 @@ public class DirectPtxScientificTests
         [
             typeof(CudaBackend), typeof(HipBackend), typeof(MetalBackend),
             typeof(OpenClBackend), typeof(VulkanBackend),
-#if !NETFRAMEWORK
+#if NETCOREAPP
             typeof(WebGpuBackend)
 #endif
         ];

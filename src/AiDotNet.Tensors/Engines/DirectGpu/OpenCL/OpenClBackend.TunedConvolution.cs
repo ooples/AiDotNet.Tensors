@@ -1,4 +1,3 @@
-#if !NET462
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
@@ -106,4 +105,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

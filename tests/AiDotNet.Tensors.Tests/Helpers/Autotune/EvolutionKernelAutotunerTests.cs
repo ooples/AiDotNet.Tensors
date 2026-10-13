@@ -112,7 +112,7 @@ public sealed partial class EvolutionKernelAutotunerTests : IDisposable
             MeasurePassed);
         FakeKernelConfiguration duplicate = Seeds()[0];
         FakeKernelConfiguration[] overBudget = Seeds()
-            .Append(new FakeKernelConfiguration(FakeKernelVariant.Safe, 16))
+            .Concat(new[] { new FakeKernelConfiguration(FakeKernelVariant.Safe, 16) })
             .ToArray();
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
@@ -402,7 +402,7 @@ public sealed partial class EvolutionKernelAutotunerTests : IDisposable
             new MemoryStore(),
             MeasurePassed);
         FakeKernelConfiguration[] tooMany = Seeds()
-            .Append(new FakeKernelConfiguration(FakeKernelVariant.Safe, 16))
+            .Concat(new[] { new FakeKernelConfiguration(FakeKernelVariant.Safe, 16) })
             .ToArray();
 
         await Assert.ThrowsAsync<ArgumentException>(() => tuner.TuneAsync(tooMany));

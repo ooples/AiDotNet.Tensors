@@ -496,8 +496,8 @@ public sealed class GradientTape<T> : IDisposable
     /// <returns>A dictionary mapping each source tensor to its gradient tensor.</returns>
     /// <exception cref="ObjectDisposedException">Thrown if the tape has been disposed.</exception>
     /// <exception cref="InvalidOperationException">Thrown if the tape has no entries.</exception>
-#if !NETFRAMEWORK
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+#if NETCOREAPP
+    [System.Runtime.CompilerServices.MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     /// <summary>
     /// Identical to <see cref="ComputeGradients"/> but returns the

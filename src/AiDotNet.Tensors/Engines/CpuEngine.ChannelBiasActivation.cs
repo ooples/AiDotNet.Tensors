@@ -93,7 +93,7 @@ public partial class CpuEngine
             || output._shape[0] != input._shape[0] || output._shape[1] != kernel._shape[0])
             throw new ArgumentException("Conv2DBiasActivationInto needs input [N, C, H, W], kernel [O, C, kH, kW], bias [O] and output [N, O, oH, oW].");
 
-#if !NET471
+#if NETCOREAPP
         int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1];
         int dilationH = dilation[0], dilationW = dilation[1];
         int kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];

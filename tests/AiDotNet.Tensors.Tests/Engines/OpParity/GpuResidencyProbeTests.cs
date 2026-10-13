@@ -9,7 +9,7 @@
 // ZERO kernels. A zero-launch op computed entirely on the host when the caller asked for the GPU
 // engine — the TRUE coverage gap. Projected cases require an additional dispatch so that the
 // projection kernel cannot hide a host-computed result from the operation under test.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Collections.Generic;

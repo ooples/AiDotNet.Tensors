@@ -114,7 +114,7 @@ public class PerformanceRegressionTests
     // --filter and therefore could not actually gate anything.
     private bool PerfGatesEnabled()
     {
-#if NET471
+#if !NETCOREAPP
         // Perf gates target the performance-critical modern runtime (net5+), where
         // System.Runtime.Intrinsics is available. On net471 the fast paths fall back
         // to Vector<T>/scalar kernels, and — more decisively — the parallel dispatch

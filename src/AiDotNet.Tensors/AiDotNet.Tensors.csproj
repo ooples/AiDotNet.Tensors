@@ -9,7 +9,10 @@
                 (NU1701). See issue #679 for extending to net462 + netstandard2.0.
       net471  — .NET Framework 4.7.1–4.8.1 (scalar fallback, no System.Runtime.Intrinsics)
     -->
-    <TargetFrameworks>net10.0;net8.0;net471</TargetFrameworks>
+    <TargetFrameworks>net10.0;net8.0;net471;net462;netstandard2.0</TargetFrameworks>
+    <!-- The target's framework family (.NETCoreApp / .NETFramework / .NETStandard), for conditions in this file:
+         TargetFrameworkIdentifier itself is only inferred after the project body is evaluated. -->
+    <AiDnTargetFrameworkIdentifier>$([MSBuild]::GetTargetFrameworkIdentifier('$(TargetFramework)'))</AiDnTargetFrameworkIdentifier>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -49,7 +52,7 @@
          release of a package should not have a prerelease dependency") when a
          stable Tensors release depends on a prerelease, which blocked the
          v0.131.0 and v0.132.0 release pipelines at the Pack NuGet job. -->
-    <PackageReference Include="AiDotNet.Evolution" Version="0.1.0" />
+    <PackageReference Include="AiDotNet.Evolution" Version="0.3.0" />
   </ItemGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
@@ -66,7 +69,7 @@
   </PropertyGroup>
 
   <!-- Define WINDOWS for correct DLL names on Windows -->
-  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) or '$(TargetFramework)' == 'net471'">
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) or '$(AiDnTargetFrameworkIdentifier)' == '.NETFramework'">
     <DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
   </PropertyGroup>
 
@@ -169,7 +172,7 @@
        directly wins the resolution and NuGet reports it as a downgrade (NU1605),
        which TreatWarningsAsErrors turns into a build failure. Keep this at or
        above whatever the referenced AiDotNet.Evolution requires. -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
+  <ItemGroup Condition="'$(AiDnTargetFrameworkIdentifier)' == '.NETFramework'">
     <PackageReference Include="System.Text.Json" Version="10.0.12" />
     <!-- ZipArchive (System.IO.Compression) ships in mscorlib on .NET 5+ but
          needs an explicit reference on net471 — used by PtReader to parse
@@ -179,6 +182,21 @@
     <!-- System.Threading.Channels is in BCL on .NET 5+; net471 needs the
          compat package. Used by the multi-worker DataLoader (#216). -->
     <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- .NET Framework 4.6.2 (#679): RuntimeInformation / Architecture are built into 4.7.1+ only. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net462'">
+    <PackageReference Include="System.Runtime.InteropServices.RuntimeInformation" Version="4.3.0" />
+  </ItemGroup>
+
+  <!-- .NET Standard 2.0 (#679: .NET 5/6/7, Unity/Mono and other netstandard consumers): the same BCL polyfills as
+       .NET Framework, plus Reflection.Emit for the compiled-backward IL path. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.Text.Json" Version="10.0.12" />
+    <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
+    <PackageReference Include="System.Reflection.Emit" Version="4.7.0" />
+    <PackageReference Include="System.Reflection.Emit.ILGeneration" Version="4.7.0" />
+    <PackageReference Include="System.Reflection.Emit.Lightweight" Version="4.7.0" />
   </ItemGroup>
 
   <!-- Cross-TFM packages: needed on both net10.0 and net471. Don't add to
@@ -344,8 +362,8 @@
     in-house CPU kernels (SimdGemm / SimdKernels / FusedConv).
   -->
 
-  <!-- Exclude files that require .NET Core intrinsics from .NET Framework builds -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
+  <!-- Exclude files that require .NET Core intrinsics from .NET Framework and .NET Standard builds -->
+  <ItemGroup Condition="'$(AiDnTargetFrameworkIdentifier)' != '.NETCoreApp'">
     <Compile Remove="Helpers\SimdVector.cs" />
     <Compile Remove="Helpers\SimdConvHelper.cs" />
     <Compile Remove="Helpers\OneDnnProvider.cs" />

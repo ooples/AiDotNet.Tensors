@@ -22,7 +22,7 @@ internal static class MethodImplHelper
     /// tiered compilation in some environments.
     /// </summary>
     internal const MethodImplOptions Hot =
-#if NETFRAMEWORK
+#if !NETCOREAPP
         (MethodImplOptions)512;
 #else
         MethodImplOptions.AggressiveOptimization;

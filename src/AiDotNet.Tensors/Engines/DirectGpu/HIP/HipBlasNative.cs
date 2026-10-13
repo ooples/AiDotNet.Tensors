@@ -263,7 +263,7 @@ internal static class HipBlasNative
 
     private static bool CanLoadLibrary(string name)
     {
-#if NETFRAMEWORK
+#if !NETCOREAPP
         var handle = LoadLibrary(name);
         if (handle == IntPtr.Zero)
         {
@@ -283,7 +283,7 @@ internal static class HipBlasNative
 #endif
     }
 
-#if NETFRAMEWORK
+#if !NETCOREAPP
     [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr LoadLibrary(string lpFileName);
 

@@ -1,4 +1,4 @@
-#if !NET471 // OneDnnProvider is net5+ only (excluded on net471); outc.Shape is also not IEnumerable<int> on net471.
+#if NETCOREAPP // OneDnnProvider is net5+ only (excluded on net471); outc.Shape is also not IEnumerable<int> on net471.
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;

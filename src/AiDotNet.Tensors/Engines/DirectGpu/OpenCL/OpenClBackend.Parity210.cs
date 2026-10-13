@@ -2,7 +2,6 @@
 // OpenCL launcher shims for the parity-210 kernels. Each method pulls the
 // compiled DirectOpenClKernel from _kernelCache (populated at backend init)
 // and dispatches via kernel.Execute1D with 256-thread workgroups.
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : IParity210Backend
@@ -258,4 +257,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

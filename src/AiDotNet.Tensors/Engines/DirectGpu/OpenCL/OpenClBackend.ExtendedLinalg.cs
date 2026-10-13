@@ -1,4 +1,3 @@
-#if !NET462
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL IExtendedLinalgBackend (#1142): the portable solver family over the shared la_ kernels.
 using P = AiDotNet.Tensors.Engines.DirectGpu.PortableExtendedLinalg;
@@ -45,4 +44,3 @@ public sealed partial class OpenClBackend : IExtendedLinalgBackend
         IGpuBuffer gradInput, IGpuBuffer gradRhs, int batchCount, int n)
         => P.SolveBackwardVector(LaunchBatch, input, solution, gradOutput, gradInput, gradRhs, batchCount, n);
 }
-#endif

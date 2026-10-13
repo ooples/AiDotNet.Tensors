@@ -53,7 +53,7 @@ public sealed unsafe partial class VulkanBackend
     }
 
     private static uint FBits(float value)
-#if NETFRAMEWORK
+#if !NETCOREAPP
         => unchecked((uint)BitConverter.ToInt32(BitConverter.GetBytes(value), 0));
 #else
         => BitConverter.SingleToUInt32Bits(value);

@@ -1,7 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // OpenCL launcher for categorical sampling. Mirrors OpenClBackend.Ann.cs's pattern: pull the
 // compiled DirectOpenClKernel from _kernelCache and dispatch via kernel.Execute1D.
-#if !NET462
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
@@ -79,4 +78,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

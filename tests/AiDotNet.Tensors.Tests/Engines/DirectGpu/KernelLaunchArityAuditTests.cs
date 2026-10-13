@@ -72,7 +72,7 @@ public class KernelLaunchArityAuditTests
         {
             if (file.Contains(Path.DirectorySeparatorChar + "Kernels" + Path.DirectorySeparatorChar)) continue;
             var src = File.ReadAllText(file);
-            var starts = method.Matches(src).Cast<Match>().Select(m => m.Index).Append(src.Length).ToList();
+            var starts = method.Matches(src).Cast<Match>().Select(m => m.Index).Concat(new[] { src.Length }).ToList();
             for (int s = 0; s + 1 < starts.Count; s++)
             {
                 string body = src.Substring(starts[s], starts[s + 1] - starts[s]);

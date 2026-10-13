@@ -35,7 +35,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-#if NET471
+#if !NETCOREAPP
         // net471 ships MaybeNullWhenAttribute as internal (inaccessible here) and its BCL is
         // nullable-oblivious, so a plain non-null out forwards to Dictionary.TryGetValue without any
         // nullable warning; callers guard on the bool return before using the value either way.

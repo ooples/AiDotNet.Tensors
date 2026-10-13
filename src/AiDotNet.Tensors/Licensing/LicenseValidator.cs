@@ -6,7 +6,7 @@ using System.IO;
 using System.Net;
 using System.Text;
 using System.Text.Json;
-#if !NET471
+#if NETCOREAPP
 using System.Net.Http;
 #endif
 
@@ -54,7 +54,7 @@ public sealed class LicenseValidator
     private LicenseValidationResult? _cached;
     private readonly object _cacheLock = new();
 
-#if !NET471
+#if NETCOREAPP
     private static readonly HttpClient SharedHttpClient = new()
     {
         Timeout = TimeSpan.FromSeconds(15)
@@ -273,14 +273,14 @@ public sealed class LicenseValidator
 
         string json = JsonSerializer.Serialize(body);
 
-#if NET471
+#if !NETCOREAPP
         return PostNet471(url, json, nonce, _licenseKey.RequireSignedResponse);
 #else
         return PostModern(url, json, nonce, _licenseKey.RequireSignedResponse);
 #endif
     }
 
-#if NET471
+#if !NETCOREAPP
     private LicenseValidationResult PostNet471(string url, string json, string nonce, bool requireSigned)
     {
         var req = (HttpWebRequest)WebRequest.Create(url);

@@ -1,4 +1,3 @@
-#if !NET462
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -124,7 +123,7 @@ public static class CuBlasNative
         "libcublas.so"
     ];
 
-#if !NET471
+#if NETCOREAPP
     static CuBlasNative()
     {
         // Use the shared registry so cuBLAS, cuRAND, cuSparse, rocBLAS,
@@ -222,7 +221,7 @@ public static class CuBlasNative
         return dirs.ToArray();
     }
 
-#if NET471
+#if !NETCOREAPP
     /// <summary>
     /// cuBLAS on .NET Framework, bound at run time. net5+ maps the build-time name (cublas64_12) onto whichever
     /// cuBLAS is installed through a DllImport resolver; .NET Framework has no resolver, so a DllImport of
@@ -478,7 +477,7 @@ public static class CuBlasNative
     /// <summary>
     /// Creates a cuBLAS handle.
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasCreate(out IntPtr handle);
     public static CublasStatus cublasCreate(out IntPtr handle)
@@ -491,7 +490,7 @@ public static class CuBlasNative
     /// <summary>
     /// Destroys a cuBLAS handle.
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasDestroy(IntPtr handle);
     public static CublasStatus cublasDestroy(IntPtr handle)
@@ -511,7 +510,7 @@ public static class CuBlasNative
     /// <summary>
     /// Sets the cuBLAS stream.
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSetStream(IntPtr handle, IntPtr stream);
     public static CublasStatus cublasSetStream(IntPtr handle, IntPtr stream)
@@ -524,7 +523,7 @@ public static class CuBlasNative
     /// <summary>
     /// Gets the cuBLAS version.
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasGetVersion(IntPtr handle, out int version);
     public static CublasStatus cublasGetVersion(IntPtr handle, out int version)
@@ -552,7 +551,7 @@ public static class CuBlasNative
     /// - Swap lda and ldb
     /// - Use transpose operations accordingly
     /// </remarks>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSgemm(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref float alpha, IntPtr A, int lda, IntPtr B, int ldb, ref float beta, IntPtr C, int ldc);
     public static CublasStatus cublasSgemm(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref float alpha, IntPtr A, int lda, IntPtr B, int ldb, ref float beta, IntPtr C, int ldc)
@@ -580,7 +579,7 @@ public static class CuBlasNative
     /// Double-precision General Matrix Multiply (DGEMM).
     /// C = alpha * op(A) * op(B) + beta * C
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasDgemm(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref double alpha, IntPtr A, int lda, IntPtr B, int ldb, ref double beta, IntPtr C, int ldc);
     public static CublasStatus cublasDgemm(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref double alpha, IntPtr A, int lda, IntPtr B, int ldb, ref double beta, IntPtr C, int ldc)
@@ -607,7 +606,7 @@ public static class CuBlasNative
     /// <summary>
     /// Batched single-precision GEMM for processing multiple matrices at once.
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSgemmBatched(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref float alpha, IntPtr[] Aarray, int lda, IntPtr[] Barray, int ldb, ref float beta, IntPtr[] Carray, int ldc, int batchCount);
     public static CublasStatus cublasSgemmBatched(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref float alpha, IntPtr[] Aarray, int lda, IntPtr[] Barray, int ldb, ref float beta, IntPtr[] Carray, int ldc, int batchCount)
@@ -630,7 +629,7 @@ public static class CuBlasNative
     /// <summary>
     /// Strided batched single-precision GEMM (more efficient for contiguous batches).
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSgemmStridedBatched(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref float alpha, IntPtr A, int lda, long strideA, IntPtr B, int ldb, long strideB, ref float beta, IntPtr C, int ldc, long strideC, int batchCount);
     public static CublasStatus cublasSgemmStridedBatched(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref float alpha, IntPtr A, int lda, long strideA, IntPtr B, int ldb, long strideB, ref float beta, IntPtr C, int ldc, long strideC, int batchCount)
@@ -657,7 +656,7 @@ public static class CuBlasNative
     /// <summary>
     /// Single-precision scalar-vector multiply and add: y = alpha * x + y
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSaxpy(IntPtr handle, int n, ref float alpha, IntPtr x, int incx, IntPtr y, int incy);
     public static CublasStatus cublasSaxpy(IntPtr handle, int n, ref float alpha, IntPtr x, int incx, IntPtr y, int incy)
@@ -675,7 +674,7 @@ public static class CuBlasNative
     /// <summary>
     /// Single-precision vector copy: y = x
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasScopy(IntPtr handle, int n, IntPtr x, int incx, IntPtr y, int incy);
     public static CublasStatus cublasScopy(IntPtr handle, int n, IntPtr x, int incx, IntPtr y, int incy)
@@ -692,7 +691,7 @@ public static class CuBlasNative
     /// <summary>
     /// Single-precision dot product: result = x · y
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSdot(IntPtr handle, int n, IntPtr x, int incx, IntPtr y, int incy, out float result);
     public static CublasStatus cublasSdot(IntPtr handle, int n, IntPtr x, int incx, IntPtr y, int incy, out float result)
@@ -710,7 +709,7 @@ public static class CuBlasNative
     /// <summary>
     /// Single-precision vector scaling: x = alpha * x
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSscal(IntPtr handle, int n, ref float alpha, IntPtr x, int incx);
     public static CublasStatus cublasSscal(IntPtr handle, int n, ref float alpha, IntPtr x, int incx)
@@ -731,7 +730,7 @@ public static class CuBlasNative
     /// <summary>
     /// Sets the math mode for cuBLAS (enables tensor cores).
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasSetMathMode(IntPtr handle, int mode);
     public static CublasStatus cublasSetMathMode(IntPtr handle, int mode)
@@ -750,7 +749,7 @@ public static class CuBlasNative
     /// <summary>
     /// Half-precision GEMM (uses tensor cores on Volta+).
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasHgemm(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref ushort alpha, IntPtr A, int lda, IntPtr B, int ldb, ref ushort beta, IntPtr C, int ldc);
     public static CublasStatus cublasHgemm(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, ref ushort alpha, IntPtr A, int lda, IntPtr B, int ldb, ref ushort beta, IntPtr C, int ldc)
@@ -773,7 +772,7 @@ public static class CuBlasNative
     /// Mixed-precision GEMM with tensor cores.
     /// Computes in FP16, accumulates in FP32.
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasGemmEx(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, IntPtr alpha, IntPtr A, int Atype, int lda, IntPtr B, int Btype, int ldb, IntPtr beta, IntPtr C, int Ctype, int ldc, int computeType, int algo);
     public static CublasStatus cublasGemmEx(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, IntPtr alpha, IntPtr A, int Atype, int lda, IntPtr B, int Btype, int ldb, IntPtr beta, IntPtr C, int Ctype, int ldc, int computeType, int algo)
@@ -799,7 +798,7 @@ public static class CuBlasNative
     /// comparison for a packed batch of attention heads because it performs
     /// the entire Q*K^T fanout with one host launch.
     /// </summary>
-#if NET471
+#if !NETCOREAPP
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate CublasStatus D_cublasGemmStridedBatchedEx(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, IntPtr alpha, IntPtr A, int Atype, int lda, long strideA, IntPtr B, int Btype, int ldb, long strideB, IntPtr beta, IntPtr C, int Ctype, int ldc, long strideC, int batchCount, int computeType, int algo);
     public static CublasStatus cublasGemmStridedBatchedEx(IntPtr handle, CublasOperation transa, CublasOperation transb, int m, int n, int k, IntPtr alpha, IntPtr A, int Atype, int lda, long strideA, IntPtr B, int Btype, int ldb, long strideB, IntPtr beta, IntPtr C, int Ctype, int ldc, long strideC, int batchCount, int computeType, int algo)
@@ -1568,4 +1567,3 @@ public sealed class CuBlasMatMul : IDisposable
         Dispose();
     }
 }
-#endif

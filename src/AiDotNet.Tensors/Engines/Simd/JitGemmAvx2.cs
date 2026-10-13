@@ -1,6 +1,6 @@
 using System.Runtime.CompilerServices;
 using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
-#if !NET471
+#if NETCOREAPP
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;

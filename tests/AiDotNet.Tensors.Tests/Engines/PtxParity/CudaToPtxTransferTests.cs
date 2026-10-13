@@ -2,7 +2,7 @@
 // PTX transfer tracking. Reports transfer progress and signals — via a single
 // gate that flips from skipped to passing — when every CUDA kernel has a
 // promoted PTX replacement and the CUDA kernels can be deleted.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Collections.Generic;

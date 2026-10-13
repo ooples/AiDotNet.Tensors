@@ -1,7 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // PTX transfer tracking. Which CUDA kernels have a PTX replacement, and how far
 // along it is — the ledger that answers "when can we delete the CUDA kernels?".
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Collections.Generic;

@@ -45,7 +45,7 @@ public class GraphedInferenceStepTests
     public void Options_Default_IsSingleton()
         => Assert.Same(GraphedInferenceStepOptions.Default, GraphedInferenceStepOptions.Default);
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
     // ─── State machine + remaining guards — via DispatchProxy mock (.NET Core 5+) ──
     // All fire before any GPU call, so they're deterministic on a CUDA-less host.
 

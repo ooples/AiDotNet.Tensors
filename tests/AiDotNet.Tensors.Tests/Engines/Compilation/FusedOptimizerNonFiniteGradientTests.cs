@@ -511,7 +511,7 @@ public class FusedOptimizerNonFiniteGradientTests
         }
     }
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
     [SkippableFact]
     public void ActiveGpuBackend_ClassifyAndReduceDetectsEveryNonFiniteKind()
     {

@@ -3,7 +3,6 @@
 // Mirrors OpenClBackend.Detection.cs's pattern: each method pulls the compiled
 // DirectOpenClKernel from _kernelCache and dispatches via kernel.Execute1D with
 // 256-thread workgroups. Numerically mirrors AiDotNet.Tensors.Ann.AnnPrimitives.
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     public sealed partial class OpenClBackend : IAnnBackend
@@ -114,4 +113,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 }
-#endif

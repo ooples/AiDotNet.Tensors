@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net10.0;net471</TargetFrameworks>
+    <TargetFrameworks>net10.0;net471;net462</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
@@ -61,7 +61,7 @@
   </ItemGroup>
 
   <!-- ZipArchive needs an explicit reference on net471. -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
+  <ItemGroup Condition="'$(TargetFramework)' == 'net471' or '$(TargetFramework)' == 'net462'">
     <PackageReference Include="System.Reflection.DispatchProxy" Version="4.7.1" />
     <Reference Include="System.IO.Compression" />
     <Reference Include="System.IO.Compression.FileSystem" />
@@ -72,7 +72,7 @@
        which exist on net471. The kernels they cover are net5.0+ only (see the
        #if NET5_0_OR_GREATER guard in MachineKernelGemm), so exclude these test
        files from the net471 build (net471 is build-only; tests run on net10.0). -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
+  <ItemGroup Condition="'$(TargetFramework)' == 'net471' or '$(TargetFramework)' == 'net462'">
     <Compile Remove="Engines\BlasManaged\FmaCeilingProbe.cs" />
     <Compile Remove="Engines\BlasManaged\Fp64MicrokernelEmitterTests.cs" />
     <Compile Remove="Engines\BlasManaged\MachineCodeKernelTests.cs" />

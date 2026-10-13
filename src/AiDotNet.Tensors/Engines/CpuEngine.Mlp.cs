@@ -294,7 +294,7 @@ public partial class CpuEngine
                         ReadOnlySpan<float> wSpan = wSpanLease.Span;
 
                         bool gemmDone = false;
-#if !NET471
+#if NETCOREAPP
                         // JIT'd AVX2 kernel first (opt-in) — beats both managed cached-B
                         // and native BLAS on the MLP shapes; this is the path the MLP
                         // actually takes (so without it the JIT never reached the MLP).

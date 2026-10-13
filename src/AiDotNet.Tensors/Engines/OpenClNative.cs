@@ -1,4 +1,3 @@
-#if !NET462
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -1942,4 +1941,3 @@ public static class OpenClInfo
         return sb.ToString();
     }
 }
-#endif

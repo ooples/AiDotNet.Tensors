@@ -1,4 +1,4 @@
-#if !NETFRAMEWORK
+#if NETCOREAPP
 // GpuCpuCorrectnessFixture (GpuCpuCorrectnessTests.cs) is compiled only off .NET Framework.
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;

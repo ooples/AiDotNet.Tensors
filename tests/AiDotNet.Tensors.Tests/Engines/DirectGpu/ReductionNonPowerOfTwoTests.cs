@@ -1,5 +1,5 @@
 // Copyright (c) AiDotNet. All rights reserved.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;

@@ -1,4 +1,4 @@
-#if !NET471 // JitGemmAvx2 is the AVX2 runtime-emit kernel — net5+/x86 only (see JitGemmAvx2.cs).
+#if NETCOREAPP // JitGemmAvx2 is the AVX2 runtime-emit kernel — net5+/x86 only (see JitGemmAvx2.cs).
 // Correctness of the 6×N asm panel kernel (JitGemmAvx2): the runtime-emitted
 // machine code must match a managed reference GEMM across shapes and edges
 // (M%6 != 0, N%16 != 0, various K). Requires AIDOTNET_JIT_GEMM=1 so the panel

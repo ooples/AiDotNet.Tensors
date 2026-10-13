@@ -1,4 +1,3 @@
-#if !NET462
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -292,4 +291,3 @@ public class GpuTimingDiagnostics
         }
     }
 }
-#endif

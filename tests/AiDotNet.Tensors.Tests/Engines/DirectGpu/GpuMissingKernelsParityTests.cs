@@ -3,7 +3,7 @@
 // override must produce bit-comparable results to the trusted CPU reference across a
 // shape sweep. Runs only when a GPU is present; CPU-only hosts early-return (no-op pass).
 
-#if !NETFRAMEWORK
+#if NETCOREAPP
 #nullable disable
 
 using System;

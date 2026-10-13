@@ -3,7 +3,6 @@
 // Mirrors CudaGeometryKernels function-for-function. Same mode-int
 // mapping: InterpolateMode/PadMode/GridSampleMode/GridSamplePadding.
 
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public static class OpenClGeometryKernels
@@ -315,4 +314,3 @@ __kernel void geometry_affine_grid_3d(
 }
 ";
 }
-#endif

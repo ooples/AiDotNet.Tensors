@@ -3147,8 +3147,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -3311,8 +3311,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Adds tensor b to tensor a in-place (a += b). Zero allocation.
     /// Uses parallel SIMD for large float tensors.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe void TensorAddInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -3373,7 +3373,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pB = (float*)pinB.Pointer;
 
-#if !NET471
+#if NETCOREAPP
             // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
             if (OneDnnProvider.IsAvailable)
             {
@@ -3431,8 +3431,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Adds tensors a and b, storing result in destination. Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorAddInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
@@ -5599,8 +5599,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Subtract into pre-allocated destination. Zero allocation.</summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorSubtractInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
@@ -5976,8 +5976,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6134,8 +6134,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6280,8 +6280,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Multiplies tensor a by tensor b in-place (a *= b). Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe void TensorMultiplyInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6333,7 +6333,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pB = (float*)pinB.Pointer;
 
-#if !NET471
+#if NETCOREAPP
             // Strategy 1: Try oneDNN for best performance (uses JIT-compiled native kernels)
             if (OneDnnProvider.IsAvailable)
             {
@@ -6388,8 +6388,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Multiplies tensors a and b, storing result in destination. Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorMultiplyInto<T>(Tensor<T> destination, Tensor<T> a, Tensor<T> b)
     {
@@ -6446,8 +6446,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Subtracts tensor b from tensor a in-place: a[i] -= b[i]. Zero allocation.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe void TensorSubtractInPlace<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -6542,8 +6542,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Multiplies all elements of tensor a by a scalar in-place: a[i] *= scalar. Zero allocation.
     /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorMultiplyScalarInPlace<T>(Tensor<T> a, T scalar)
     {
@@ -6639,8 +6639,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Multiplies all elements of a tensor by a scalar into a pre-allocated destination. Zero allocation.
     /// Uses SIMD with parallel chunking for float, vectorized numOps for all types.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe void TensorMultiplyScalarInto<T>(Tensor<T> destination, Tensor<T> a, T scalar)
     {
@@ -6831,8 +6831,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual unsafe Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -8563,8 +8563,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
@@ -10429,7 +10429,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Using Environment.ProcessorCount here would over-route into
             // the direct kernel on capped hosts where it'd actually
             // task-starve.
-#if !NET471
+#if NETCOREAPP
             // SimdConvHelper.Conv3x3Stride1Double is gated on AVX2/FMA intrinsics
             // (System.Runtime.Intrinsics is unavailable on net471 — the file is
             // <Compile Remove>'d in the .csproj for that TFM). On net471 doubles
@@ -10640,7 +10640,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // CpuParallelSettings.LightweightParallel internally).
         if (typeof(T) == typeof(double))
         {
-#if !NET471
+#if NETCOREAPP
             long convFmasInto = (long)batch * outChannels * inChannels * outputHeight * outputWidth * 9L;
             // AiDotNet#1305 perf gate: see Conv2D allocating overload above
             // for the empirical cliff (~3% peak GFLOPS at SD UNet deepest
@@ -10861,7 +10861,7 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float>? epilogueBias = null,
         bool epilogueRelu = false)
     {
-#if !NET471
+#if NETCOREAPP
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
         if (TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
@@ -10975,7 +10975,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return false;
         }
 
-#if !NET471
+#if NETCOREAPP
         // Strategy 4: Try SIMD direct convolution for small 3x3 kernels with stride=1
         if (TryConv2DSimd(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
@@ -10991,7 +10991,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return false;
     }
 
-#if !NET471
+#if NETCOREAPP
     /// <summary>
     /// Try Conv2D using Intel oneDNN library.
     /// </summary>
@@ -11186,7 +11186,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = inChannels * height * width;
 
-#if !NET471
+#if NETCOREAPP
         // Recycled exact-size column buffer (this thread's cache, byte-capped). A fresh native buffer
         // per call paid first-touch page faults on the whole column matrix every conv (2.4 MB for a
         // 16-channel 64x64 3x3 conv).
@@ -11257,7 +11257,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         finally
         {
-#if NET471
+#if !NETCOREAPP
             pool.Return(im2colArray);
 #else
             ThreadLocalTensorCache<float>.TryReturn(im2colArray);
@@ -11499,7 +11499,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
-#if !NET471
+#if NETCOREAPP
         using var im2colBuffer = new NativeBuffer<double>(sliceSize);
         var im2colSpan = im2colBuffer.Span;
 #else
@@ -11540,7 +11540,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-#if NET471
+#if !NETCOREAPP
         }
         finally
         {
@@ -11992,7 +11992,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Applies Sigmoid activation in-place: x = 1 / (1 + exp(-x)). Zero allocation.
     /// Uses oneDNN for float tensors when available, otherwise falls back to SIMD.
     /// </summary>
-#if !NETFRAMEWORK
+#if NETCOREAPP
     public virtual unsafe void SigmoidInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
@@ -12311,7 +12311,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Applies ReLU activation in-place: x = max(0, x). Zero allocation.
     /// Uses parallel SIMD for large float tensors, oneDNN when available.
     /// </summary>
-#if !NETFRAMEWORK
+#if NETCOREAPP
     public virtual unsafe void ReLUInPlace<T>(Tensor<T> tensor)
     {
         if (tensor == null)
@@ -13691,8 +13691,8 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual Tensor<T> TensorMatMul<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -14189,8 +14189,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Standard 2D matrix multiplication: [M, N] @ [N, P] = [M, P]
     /// Uses BLAS when available for float/double, falls back to parallel loops otherwise.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     private Tensor<T> TensorMatMul2D<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
@@ -14271,7 +14271,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // worker-pool wakeup overhead. Above the cutover (large M) native BLAS's raw
         // throughput wins, so keep TryGemm there. Numerically equivalent to the native
         // path (float reduction-order only). M-cutover env-tunable (AIDOTNET_CACHEDB_MAXM).
-#if !NET471
+#if NETCOREAPP
         // Our JIT'd AVX2 GEMM (opt-in). C[m,p] = A[m,n]·B[n,p] ⇒ TryMultiply(M=m,N=p,K=n).
         if (_jitGemm && typeof(T) == typeof(float) && a.IsContiguous && b.IsContiguous)
         {
@@ -14608,8 +14608,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Batched matmul: [..., M, N] @ [N, P] = [..., M, P]
     /// Weights (b) are broadcasted over all batch dimensions of a.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     private Tensor<T> TensorMatMulBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
@@ -14754,8 +14754,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Full batched matmul: [..., M, N] @ [..., N, P] = [..., M, P]
     /// Batch dimensions must match.
     /// </summary>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     private Tensor<T> TensorMatMulFullBatched<T>(Tensor<T> a, Tensor<T> b, INumericOperations<T> numOps)
     {
@@ -15899,7 +15899,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 });
                 return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputD1x1));
             }
-#if !NET471
+#if NETCOREAPP
             // #415 Phase B: direct-kernel fast path for 3×3 stride=1 padding=1
             // (the dominant VGG / ResNet 3×3 backward-input shape). Uses the
             // identity: Conv2DBackwardInput with these constraints is exactly
@@ -17177,7 +17177,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
             }
 
-#if !NET471
+#if NETCOREAPP
             // #415 Phase B-2: direct backward-kernel fast path for 3×3 /
             // stride=1 / padding=1 / FP64 (mirror of Phase B for backward-
             // input). Skips im2col allocation (~8 MB per call at ResNet
@@ -17472,7 +17472,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
-#if !NET471
+#if NETCOREAPP
             // 3x3 stride-1 dilation-1 kernels whose per-image GEMM is small: the direct FMA kernel (one task per
             // (oc, ic) pair summing over every image). The im2col + per-image GEMM route below fans one native
             // call per image across the pool, and those calls serialise on the native compute gate.
@@ -43076,8 +43076,8 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Fused Operations
 
     /// <inheritdoc/>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     // Phase 1 (compiled-inference) routing gate: prefer the managed cached-B GEMM
     // (persistent prepack, no pinned→managed copy) for small/medium inference
@@ -43297,7 +43297,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 bool blasDone = false;
                 var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
 
-#if !NET471
+#if NETCOREAPP
                 // Tier -3 (opt-in, AIDOTNET_JIT_GEMM=1): our runtime-JIT'd AVX2 kernel.
                 // Beats managed + oneDNN on the small-K/N FFN shape, on our own pool.
                 // Bias+activation still run in the shared SIMD epilogue below.
@@ -43597,7 +43597,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 bool blasDone = false;
                 var _ffnGemmScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("FFN.GEMM");
 
-#if !NET471
+#if NETCOREAPP
                 if (!blasDone && _jitGemm
                     && Simd.JitGemmAvx2.TryMultiply(inArr.AsSpan(0, M * K), wArr.AsSpan(0, K * N), outArr.AsSpan(0, M * N), M, N, K))
                     blasDone = true;
@@ -45267,7 +45267,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Output shape
         var outputShape = magnitude._shape.Take(magnitude._shape.Length - 2).ToArray();
-        outputShape = outputShape.Length > 0 ? outputShape.Append(outputLength).ToArray() : new[] { outputLength };
+        outputShape = outputShape.Length > 0 ? outputShape.Concat(new[] { outputLength }).ToArray() : new[] { outputLength };
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var windowSum = AutoTensorCache.RentOrAllocate<T>(outputShape);
         using var magDataLease = magnitude.LeaseArray();

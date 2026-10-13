@@ -1,4 +1,3 @@
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 /// <summary>
@@ -405,4 +404,3 @@ __kernel void detection_iou_backward_b(
 }
 ";
 }
-#endif

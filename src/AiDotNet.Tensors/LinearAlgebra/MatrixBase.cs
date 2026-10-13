@@ -763,8 +763,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// This is also known as the Frobenius inner product of two matrices.
     /// Both matrices must have exactly the same shape (same number of rows and columns).</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual T ElementWiseMultiplyAndSum(MatrixBase<T> other)
     {
@@ -792,8 +792,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// The result is a new matrix of the same size where each element is the sum of the corresponding elements
     /// from the two input matrices.</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual MatrixBase<T> Add(MatrixBase<T> other)
     {
@@ -829,8 +829,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// the original matrix.</para>
     /// <para><b>Performance:</b> Zero-allocation SIMD-accelerated addition.</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual void AddInPlace(MatrixBase<T> other)
     {
@@ -925,8 +925,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// from the two input matrices.</para>
     /// <para><b>Performance:</b> Uses SIMD-accelerated operations (5-15x faster with AVX2).</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual MatrixBase<T> Subtract(MatrixBase<T> other)
     {
@@ -957,8 +957,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <remarks>
     /// <para><b>Performance:</b> Zero-allocation SIMD-accelerated subtraction.</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual void SubtractInPlace(MatrixBase<T> other)
     {
@@ -1054,8 +1054,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <para><b>Performance:</b> Uses cache-oblivious recursive divide-and-conquer algorithm.
     /// Automatically adapts to all cache levels without manual tuning. Base case uses SIMD-accelerated dot products.</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual MatrixBase<T> Multiply(MatrixBase<T> other)
     {
@@ -1239,8 +1239,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// This operation is commonly used in machine learning to apply transformations to data points.</para>
     /// <para><b>Performance:</b> Uses vectorized dot product for each row (SIMD accelerated, 8-12x faster with AVX2).</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual VectorBase<T> Multiply(Vector<T> vector)
     {
@@ -1273,8 +1273,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// This operation is useful for scaling data or adjusting the magnitude of values in a matrix.</para>
     /// <para><b>Performance:</b> Uses SIMD-accelerated operations (5-15x faster with AVX2).</para>
     /// </remarks>
-    #if !NETFRAMEWORK
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    #if NETCOREAPP
+    [MethodImpl(AiDotNet.Tensors.Compatibility.MethodImplHelper.Hot)]
 #endif
     public virtual MatrixBase<T> Multiply(T scalar)
     {

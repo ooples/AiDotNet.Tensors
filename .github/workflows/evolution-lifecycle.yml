@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
         with:
           repository: ooples/AiDotNet.Evolution
-          ref: 255feb24369702a32ea9db7a3f8a0b7a847d2762
+          ref: ae079180704178527f56e20617c285c4c2d566c0 # v0.3.0, the version Tensors references (net462/netstandard2.0, #679)
           path: evolution
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:

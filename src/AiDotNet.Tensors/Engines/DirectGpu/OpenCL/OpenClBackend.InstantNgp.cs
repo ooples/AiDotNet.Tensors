@@ -1,4 +1,3 @@
-#if !NET462
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
@@ -316,4 +315,3 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
         kernel.Execute1D(1, 1);
     }
 }
-#endif

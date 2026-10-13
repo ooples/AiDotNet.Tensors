@@ -66,6 +66,26 @@ jobs:
         dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net471 -p:TelemetryUrl="${{ secrets.AIDOTNET_TELEMETRY_URL }}" -p:TelemetryKey="${{ secrets.AIDOTNET_TELEMETRY_KEY }}"
         dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net471
 
+    # #679: the net462 and .NET Standard 2.0 assets build, and the netstandard2.0 asset runs on a .NET 5 runtime
+    # (a net5.0 app resolves it) -- what .NET 5/6/7, Unity and Mono consumers load.
+    - name: Build (net462, netstandard2.0)
+      run: |
+        dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net462
+        dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework netstandard2.0
+        # Onnx is not in AiDotNet.Tensors.slnx, so the solution restore above does not cover it.
+        dotnet restore src/AiDotNet.Tensors.Onnx/AiDotNet.Tensors.Onnx.csproj
+        dotnet build src/AiDotNet.Tensors.Onnx/AiDotNet.Tensors.Onnx.csproj --configuration Release --no-restore --framework net462
+        dotnet build src/AiDotNet.Tensors.Onnx/AiDotNet.Tensors.Onnx.csproj --configuration Release --no-restore --framework netstandard2.0
+        dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net462
+
+    - name: Setup .NET 5 runtime (netstandard2.0 smoke)
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '5.0.x'
+
+    - name: Run the netstandard2.0 asset on .NET 5
+      run: dotnet run --project tests/AiDotNet.Tensors.NetStandardSmoke/AiDotNet.Tensors.NetStandardSmoke.csproj --configuration Release
+
     - name: Test with Coverage
       env:
         # Writes the GPU launch journal and buffer residency totals as the test host exits. This is

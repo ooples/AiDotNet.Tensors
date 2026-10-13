@@ -51,8 +51,10 @@ public sealed class MetalBatchExecutionKernelsTests
     [Fact]
     public void Translation_GivesEveryLocalPointerAnAddressSpace()
     {
-        foreach (Match m in Regex.Matches(MetalBatchExecutionKernels.Source, @"[^\n]*\bfloat\* \w+ =[^\n]*",
-                     RegexOptions.None, RegexTimeout))
-            Assert.StartsWith("device ", m.Value.TrimStart());
+        // Per line, not one pattern over the whole source: a leading [^\n]* is retried from every position of every
+        // line, which on the .NET Framework interpreter ran past the regex timeout under a loaded full-suite run.
+        foreach (string line in MetalBatchExecutionKernels.Source.Split('\n'))
+            if (Regex.IsMatch(line, @"\bfloat\* \w+ =", RegexOptions.None, RegexTimeout))
+                Assert.StartsWith("device ", line.TrimStart());
     }
 }

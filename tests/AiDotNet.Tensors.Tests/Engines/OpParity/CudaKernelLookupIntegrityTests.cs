@@ -12,7 +12,7 @@
 //
 // This guard is static — it reads the sources, needs no GPU, and runs everywhere. It catches the whole
 // class at authoring time instead of waiting for an op to be exercised at runtime on CUDA.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 using System;
 using System.Collections.Generic;
 using System.IO;

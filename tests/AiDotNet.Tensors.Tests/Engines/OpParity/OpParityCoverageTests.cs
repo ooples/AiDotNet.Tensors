@@ -1,6 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775). Full-surface coverage audit.
-#if !NETFRAMEWORK
+#if NETCOREAPP
 
 using System;
 using System.Collections.Generic;

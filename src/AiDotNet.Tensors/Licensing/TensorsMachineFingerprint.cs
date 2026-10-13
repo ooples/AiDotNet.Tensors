@@ -57,7 +57,7 @@ internal static class TensorsMachineFingerprint
 
     private static string? GetPlatformMachineId()
     {
-#if NET471
+#if !NETCOREAPP
         // .NET Framework — use fallback (registry APIs differ; keep it simple), matching the main SDK.
         return null;
 #else
@@ -80,7 +80,7 @@ internal static class TensorsMachineFingerprint
 #endif
     }
 
-#if !NET471
+#if NETCOREAPP
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static string? ReadWindowsMachineGuid()
     {
@@ -187,7 +187,7 @@ internal static class TensorsMachineFingerprint
     {
         byte[] bytes = Encoding.UTF8.GetBytes(input);
 
-#if NET471
+#if !NETCOREAPP
         using var sha = SHA256.Create();
         byte[] hash = sha.ComputeHash(bytes);
 #else
