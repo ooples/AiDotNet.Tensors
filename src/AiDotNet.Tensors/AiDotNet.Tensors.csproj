@@ -82,6 +82,11 @@
     <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*.linker.txt" />
     <InternalsVisibleTo Include="AiDotNet" />
     <InternalsVisibleTo Include="AiDotNetTests" />
+    <!-- AiDotNet's benchmark, serving dev-host and serving test assemblies read tensor storage through
+         AsSpan, which is internal since the storage rework; the main AiDotNet grant does not cover them. -->
+    <InternalsVisibleTo Include="AiDotNet.Benchmarks" />
+    <InternalsVisibleTo Include="AiDotNet.Serving.DevHost" />
+    <InternalsVisibleTo Include="AiDotNet.Serving.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Autotune.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Benchmarks" />
