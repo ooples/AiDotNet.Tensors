@@ -8,7 +8,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// #1191: a Vulkan dispatch is submitted and not waited for; the wait happens when the host reads. Whatever is
+/// #1191 and #1192: a Vulkan dispatch is recorded with the ones around it and not waited for; the submit happens
+/// when the command buffer is full or a result is needed, and the wait when the host reads. Whatever is
 /// read must be what a submit-and-wait backend would have produced: later dispatches see earlier ones' writes, a
 /// host upload does not overtake a dispatch that reads the buffer, and a buffer released while a dispatch still
 /// uses it is not handed to anyone else until that dispatch has run.
@@ -64,16 +65,19 @@ void main() {
         using var output = backend.AllocateBuffer(size);
         backend.Synchronize();
         Assert.Equal(0, Device.PendingSubmissionCount);
+        Assert.Equal(0, Device.OpenDispatchCount);
 
         long submittedBefore = Device.SubmittedSerial;
         RunAddOne(backend, input, output, size);
-        Assert.Equal(submittedBefore + 1, Device.SubmittedSerial);
-        // Nothing has asked for the result, so nothing has waited for it.
-        Assert.Equal(1, Device.PendingSubmissionCount);
-        Assert.True(Device.CompletedSerial < Device.SubmittedSerial);
+        // Nothing has asked for the result: the dispatch is recorded, and not even submitted yet (#1192).
+        Assert.Equal(1, Device.OpenDispatchCount);
+        Assert.Equal(0, Device.PendingSubmissionCount);
+        Assert.Equal(submittedBefore, Device.SubmittedSerial);
 
         float[] values = backend.DownloadBuffer(output);
+        Assert.Equal(0, Device.OpenDispatchCount);
         Assert.Equal(0, Device.PendingSubmissionCount);
+        Assert.Equal(submittedBefore + 1, Device.SubmittedSerial);
         Assert.Equal(Device.SubmittedSerial, Device.CompletedSerial);
         for (int i = 0; i < size; i++) Assert.Equal(i + 1f, values[i]);
     }
@@ -90,6 +94,7 @@ void main() {
             if ((step & 1) == 0) RunAddOne(backend, ping, pong, size);
             else RunAddOne(backend, pong, ping, size);
             Assert.True(Device.PendingSubmissionCount <= VulkanDevice.MaxPendingSubmissions);
+            Assert.True(Device.OpenDispatchCount < VulkanDevice.MaxCoalescedDispatches);
         }
         // An odd number of steps ends in pong.
         float[] values = backend.DownloadBuffer(pong);
@@ -124,7 +129,7 @@ void main() {
         var scratch = backend.AllocateBuffer(size);
         IntPtr scratchHandle = scratch.Handle;
         RunAddOne(backend, input, scratch, size);
-        Assert.Equal(1, Device.PendingSubmissionCount);
+        Assert.Equal(1, Device.OpenDispatchCount);
         // The caller is done with it, but the dispatch is not.
         scratch.Dispose();
 
@@ -152,6 +157,7 @@ void main() {
             long submittedBefore = Device.SubmittedSerial;
             RunAddOne(backend, input, output, size);
             Assert.Equal(0, Device.PendingSubmissionCount);
+            Assert.Equal(0, Device.OpenDispatchCount);
             // The waited path does not take a serial at all.
             Assert.Equal(submittedBefore, Device.SubmittedSerial);
         }
@@ -160,6 +166,59 @@ void main() {
             backend.SubmitsWithoutWaiting = true;
         }
         Assert.All(backend.DownloadBuffer(output), v => Assert.Equal(2f, v));
+    }
+
+    [SkippableFact]
+    public void ConsecutiveDispatches_ShareOneSubmission_UpToTheLimit()
+    {
+        var backend = BackendOrSkip();
+        const int size = 257;
+        int limit = VulkanDevice.MaxCoalescedDispatches;
+        using var ping = backend.AllocateBuffer(Enumerable.Repeat(0f, size).ToArray());
+        using var pong = backend.AllocateBuffer(size);
+        backend.Synchronize();
+        long submittedBefore = Device.SubmittedSerial;
+
+        // One short of the limit: all recorded, none submitted.
+        int steps = 0;
+        for (; steps < limit - 1; steps++)
+        {
+            if ((steps & 1) == 0) RunAddOne(backend, ping, pong, size); else RunAddOne(backend, pong, ping, size);
+        }
+        Assert.Equal(limit - 1, Device.OpenDispatchCount);
+        Assert.Equal(submittedBefore, Device.SubmittedSerial);
+
+        // The one that fills the command buffer submits it: one submission for all of them.
+        if ((steps & 1) == 0) RunAddOne(backend, ping, pong, size); else RunAddOne(backend, pong, ping, size);
+        steps++;
+        Assert.Equal(0, Device.OpenDispatchCount);
+        Assert.Equal(submittedBefore + 1, Device.SubmittedSerial);
+
+        // The next opens a new one; the read submits and waits for it.
+        if ((steps & 1) == 0) RunAddOne(backend, ping, pong, size); else RunAddOne(backend, pong, ping, size);
+        steps++;
+        Assert.Equal(1, Device.OpenDispatchCount);
+        float[] values = backend.DownloadBuffer((steps & 1) == 1 ? pong : ping);
+        Assert.Equal(submittedBefore + 2, Device.SubmittedSerial);
+        Assert.Equal(Device.SubmittedSerial, Device.CompletedSerial);
+        Assert.All(values, v => Assert.Equal((float)steps, v));
+    }
+
+    [SkippableFact]
+    public void ARecordedDispatch_SeesAnUploadMadeBeforeIt_AndNotOneMadeAfter()
+    {
+        // Uploads are waited submissions: they flush what is recorded first. So the order the caller wrote is the
+        // order the device runs, with a dispatch on either side of an upload.
+        var backend = BackendOrSkip();
+        const int size = 600;
+        using var input = backend.AllocateBuffer(Enumerable.Repeat(1f, size).ToArray());
+        using var first = backend.AllocateBuffer(size);
+        using var second = backend.AllocateBuffer(size);
+        RunAddOne(backend, input, first, size);                                   // reads 1
+        backend.UploadBufferInPlace(Enumerable.Repeat(40f, size).ToArray(), input);
+        RunAddOne(backend, input, second, size);                                  // reads 40
+        Assert.All(backend.DownloadBuffer(second), v => Assert.Equal(41f, v));
+        Assert.All(backend.DownloadBuffer(first), v => Assert.Equal(2f, v));
     }
 
     [SkippableFact]
