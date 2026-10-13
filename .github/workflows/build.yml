@@ -72,6 +72,8 @@ jobs:
       run: |
         dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework net462
         dotnet build src/AiDotNet.Tensors/AiDotNet.Tensors.csproj --configuration Release --no-restore --framework netstandard2.0
+        # Onnx is not in AiDotNet.Tensors.slnx, so the solution restore above does not cover it.
+        dotnet restore src/AiDotNet.Tensors.Onnx/AiDotNet.Tensors.Onnx.csproj
         dotnet build src/AiDotNet.Tensors.Onnx/AiDotNet.Tensors.Onnx.csproj --configuration Release --no-restore --framework net462
         dotnet build src/AiDotNet.Tensors.Onnx/AiDotNet.Tensors.Onnx.csproj --configuration Release --no-restore --framework netstandard2.0
         dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-restore --framework net462
