@@ -114,7 +114,8 @@ public sealed partial class WebGpuBackend
     // One generated variant: its own pipeline per source (keyed by the candidate id), the parameter block after the
     // storage buffers, workgroupsX workgroups.
     private void TunedDispatch(string key, string source, IGpuBuffer[] buffers, float[] uniforms, long workgroups)
-        => DispatchWorkgroupsAsync("tuned." + key, source, "main", buffers, uniforms, checked((int)workgroups)).GetAwaiter().GetResult();
+        => WithDistinctBindings(buffers, bound =>
+            DispatchWorkgroupsAsync("tuned." + key, source, "main", bound, uniforms, checked((int)workgroups)).GetAwaiter().GetResult());
 
     private async System.Threading.Tasks.Task DispatchWorkgroupsAsync(string moduleName, string source, string entryPoint,
         IGpuBuffer[] buffers, float[] uniformParams, int workgroupsX)
@@ -134,44 +135,84 @@ public sealed partial class WebGpuBackend
     private Func<TunedShape, bool> RowFit(int lanes) =>
         shape => IsAvailable && WebGpuTunedRowKernels.RowLanesFit(shape[0], shape[1], lanes);
 
+    /// <summary>
+    /// WebGPU rejects a dispatch that binds one buffer both read-only and writable, so an op called in place (an input
+    /// that is also its output) failed on every kernel. Runs <paramref name="run"/> with a binding list in which every
+    /// buffer is distinct: an earlier occurrence of a repeated buffer is replaced by a scratch copy of it. Every binding
+    /// list here puts the buffers a kernel reads before the ones it writes, so the copy is always the one read and the
+    /// output lands in the caller's buffer.
+    /// </summary>
+    private void WithDistinctBindings(IGpuBuffer[] buffers, Action<IGpuBuffer[]> run)
+    {
+        IGpuBuffer[] bound = buffers;
+        List<IGpuBuffer>? scratch = null;
+        for (int i = 0; i < buffers.Length; i++)
+        {
+            for (int j = i + 1; j < buffers.Length; j++)
+            {
+                if (!ReferenceEquals(buffers[i], buffers[j])) continue;
+                if (ReferenceEquals(bound, buffers)) bound = (IGpuBuffer[])buffers.Clone();
+                var copy = AllocateBuffer(buffers[i].Size);
+                Copy(buffers[i], copy, buffers[i].Size);
+                (scratch ??= new List<IGpuBuffer>()).Add(copy);
+                bound[i] = copy;
+                break;
+            }
+        }
+        try { run(bound); }
+        finally
+        {
+            if (scratch is not null) foreach (var b in scratch) b.Dispose();
+        }
+    }
     // ---------------------------------------------------------------- references (the established kernels)
 
     private void SoftmaxReference(IGpuBuffer input, IGpuBuffer output, int rows, int n)
-        => SoftmaxAsync(input, output, rows, n).GetAwaiter().GetResult();
+        => WithDistinctBindings(new[] { input, output }, b => SoftmaxAsync(b[0], b[1], rows, n).GetAwaiter().GetResult());
 
+    // softmax_backward reduces one row per workgroup (workgroup_id.x is the row). It was dispatched as rows / 256
+    // workgroups (one per 256 "elements"), so only the first row was ever computed and the rest kept their old contents.
     private void SoftmaxBackwardReference(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int rows, int n)
-        => Dispatch3BufferAsync("SoftmaxBackward", WebGpuKernels.SoftmaxBackwardSource, "softmax_backward",
-            gradOutput, output, gradInput, MakeUniformInts2(rows, n), rows).GetAwaiter().GetResult();
+        => WithDistinctBindings(new[] { gradOutput, output, gradInput }, b =>
+            DispatchWorkgroupsAsync("SoftmaxBackward", WebGpuKernels.SoftmaxBackwardSource, "softmax_backward", b,
+                new[] { BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(n), 0f, 0f }, rows).GetAwaiter().GetResult());
 
     // The established layer_norm kernel writes only the output; the row statistics the interface promises in
     // saveMean / saveInvVar (and the input-gradient candidates read) come from a statistics pass with the same 256-lane
     // reduction. They used to be filled with zeros.
     private void LayerNormReference(in TunedLayerNormArgs a)
     {
-        LayerNormAsync(a.Input, a.Gamma, a.Beta, a.Output, a.Rows, a.N, a.Epsilon).GetAwaiter().GetResult();
+        var args = a;
+        // The statistics come first: they read the input, which an in-place call is about to overwrite.
         TunedDispatch("layernorm_row_stats", WebGpuTunedRowKernels.LayerNormRowStats,
             new[] { a.Input, a.SaveMean, a.SaveInvVar }, TunedParams(a.Rows, a.N, a.Epsilon), a.Rows);
+        WithDistinctBindings(new[] { args.Input, args.Gamma, args.Beta, args.Output }, b =>
+            LayerNormAsync(b[0], b[1], b[2], b[3], args.Rows, args.N, args.Epsilon).GetAwaiter().GetResult());
     }
 
     private void LayerNormBackwardInputReference(in TunedNormBackwardArgs a)
     {
-        var unused = UnusedTunedBinding();
-        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource, "layer_norm_backward_data",
-            a.GradOutput, a.Input, a.Gamma ?? unused, a.Out0, unused, UnusedTunedBinding2(),
-            TunedParams(a.Rows, a.N, a.Epsilon), checked(a.Rows * a.N)).GetAwaiter().GetResult();
+        var args = a;
+        WithDistinctBindings(new[] { a.GradOutput, a.Input, a.Gamma ?? UnusedTunedBinding(), a.Out0 }, b =>
+            Dispatch4BufferAsync("LayerNormBackwardData", WebGpuKernels.LayerNormBackwardDataSource, "layer_norm_backward_data",
+                b[0], b[1], b[2], b[3], TunedParams(args.Rows, args.N, args.Epsilon), checked(args.Rows * args.N)).GetAwaiter().GetResult());
     }
 
     private void LayerNormGradParamsReference(in TunedNormBackwardArgs a)
     {
-        var unused = UnusedTunedBinding();
-        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource, "layer_norm_backward_stats",
-            a.GradOutput, a.Input, unused, UnusedTunedBinding2(), a.Out0, a.Out1 ?? unused,
-            TunedParams(a.Rows, a.N, a.Epsilon), a.N).GetAwaiter().GetResult();
+        var args = a;
+        WithDistinctBindings(new[] { a.GradOutput, a.Input, a.Out0, a.Out1 ?? UnusedTunedBinding() }, b =>
+            Dispatch4BufferAsync("LayerNormBackwardStats", WebGpuKernels.LayerNormBackwardStatsSource, "layer_norm_backward_stats",
+                b[0], b[1], b[2], b[3], TunedParams(args.Rows, args.N, args.Epsilon), args.N).GetAwaiter().GetResult());
     }
 
     private void RmsNormGradGammaReference(in TunedNormBackwardArgs a)
-        => Dispatch4BufferAsync("RmsNormGradGamma", WebGpuKernels.RmsNormGradGammaSource, "rmsnorm_grad_gamma",
-            a.GradOutput, a.Input, a.Stat0, a.Out0, TunedParams(a.Rows, a.N), a.N).GetAwaiter().GetResult();
+    {
+        var args = a;
+        WithDistinctBindings(new[] { a.GradOutput, a.Input, a.Stat0, a.Out0 }, b =>
+            Dispatch4BufferAsync("RmsNormGradGamma", WebGpuKernels.RmsNormGradGammaSource, "rmsnorm_grad_gamma",
+                b[0], b[1], b[2], b[3], TunedParams(args.Rows, args.N), args.N).GetAwaiter().GetResult());
+    }
 
     private IGpuBuffer? _tunedUnusedBinding2;
 
@@ -294,7 +335,7 @@ public sealed partial class WebGpuBackend
                     foreach (int lanes in WebGpuTunedRowKernels.RowLanes)
                     {
                         int l = lanes;
-                        string id = "generated.layernorm_backward_input.lanes" + l, source = WebGpuTunedRowKernels.LayerNormBackward(l);
+                        string id = "generated.layernorm_backward.lanes" + l, source = WebGpuTunedRowKernels.LayerNormBackward(l);
                         candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>(id, TunedKernelOrigin.Generated, true,
                             shape => RowFit(l)(shape), (in TunedNormBackwardArgs a) => RowVariant(id, source,
                                 new[] { a.GradOutput, a.Input, a.Gamma ?? UnusedTunedBinding(), a.Stat0, a.Stat1 ?? UnusedTunedBinding(), a.Out0 },

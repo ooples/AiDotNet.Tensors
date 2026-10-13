@@ -92,7 +92,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 
     internal static string Softmax(int lanes) => RowHeader(lanes,
         Storage(0, "x", false) + Storage(1, "y", true) + Params(2)) + RowPrologue + @"
-    var m = bitcast<f32>(0xff800000u);
+    var m: f32 = -3.4028234663852886e38;
     if (live) { for (var f = lane; f < p.n; f = f + L) { m = max(m, x[base + f]); } }
     m = lane_max(m, lid);
     var s: f32 = 0.0;
