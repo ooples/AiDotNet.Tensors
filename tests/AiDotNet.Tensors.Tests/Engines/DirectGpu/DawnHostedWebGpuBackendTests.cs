@@ -18,6 +18,8 @@ internal static class DawnHostedWebGpu
     private static WebGpuBackend? s_backend;
     private static DawnWebGpuHost? s_host;
     private static string s_reason = "";
+    // A startup that threw (as opposed to Dawn being absent): every test fails with it, not only the first.
+    private static Exception? s_failure;
 
     public static DawnWebGpuHost? Host { get { lock (Gate) return s_host; } }
 
@@ -29,10 +31,14 @@ internal static class DawnHostedWebGpu
             if (!s_tried)
             {
                 s_tried = true;
-                Start();
+                try { Start(); }
+                catch (Exception ex) { s_failure = ex; }
             }
-            Skip.If(s_backend is null, s_reason);
-            return s_backend!;
+            if (s_failure is not null)
+                throw new InvalidOperationException("The Dawn-hosted WebGPU backend failed to start.", s_failure);
+            if (s_backend is { } backend) return backend;
+            Skip.If(true, s_reason);
+            throw new InvalidOperationException(s_reason);   // unreachable: Skip.If(true) throws
         }
     }
 
@@ -46,7 +52,19 @@ internal static class DawnHostedWebGpu
         }
         WebGpuNativeBindings.Host = host;
         var backend = new WebGpuBackend();
-        if (!backend.InitializeAsync().GetAwaiter().GetResult())
+        bool initialized;
+        try
+        {
+            initialized = backend.InitializeAsync().GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // Release the node process and the binding before the failure propagates to BackendOrSkip.
+            WebGpuNativeBindings.Host = null;
+            host.Dispose();
+            throw;
+        }
+        if (!initialized)
         {
             WebGpuNativeBindings.Host = null;
             host.Dispose();
