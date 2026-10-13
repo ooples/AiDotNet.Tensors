@@ -18,12 +18,11 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
-            dilationH, dilationW);
-        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * outChannels);
-        Dispatch3Buffer3DAsync("Convolution", WebGpuKernels.ConvolutionSource, "conv2d",
-            input, kernel, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
+        // Registry dispatch (#1117): the direct kernel or im2col + GEMM, chosen per shape class.
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)) return;
+        Conv2DDirectReference(args);
     }
 
     public void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -860,40 +859,30 @@ public sealed partial class WebGpuBackend
     public void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
-        // Use existing GPU LayerNormAsync kernel
-        LayerNormAsync(input, gamma, beta, output, batchSize, normalizedSize, epsilon).GetAwaiter().GetResult();
-        // saveMean and saveInvVar not populated by GPU kernel; fill with zeros for compatibility
-        Fill(saveMean, 0f, batchSize);
-        Fill(saveInvVar, 0f, batchSize);
+        // Served by the tuned-kernel registry (#1117). Every candidate, the established kernel included, now stores
+        // the row statistics in saveMean / saveInvVar; they used to be filled with zeros.
+        var args = new TunedLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar, batchSize, normalizedSize, epsilon);
+        if (batchSize > 0 && normalizedSize > 0 && LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), args))
+            return;
+        LayerNormReference(args);
     }
 
     public void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batchSize, int normalizedSize, float epsilon)
     {
-        // LayerNormBackwardFullSource: two-pass approach.
-        // Pass 1: Compute gradGamma and gradBeta by summing over batch dimension.
-        //   gradBeta[f] = sum_n(gradOutput[n,f])
-        //   gradGamma[f] = sum_n(gradOutput[n,f] * x_hat[n,f])
-        // Pass 2: Compute gradInput per element using the full chain rule with gamma.
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(batchSize),
-            BitConverter.Int32BitsToSingle(normalizedSize),
-            epsilon,
-            0
-        };
-        // Pass 1: gradGamma/gradBeta stats (dispatches per feature)
-        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource,
-            "layer_norm_backward_stats",
-            gradOutput, input, gamma, gradInput, gradGamma, gradBeta,
-            uniforms, normalizedSize).GetAwaiter().GetResult();
-        // Pass 2: gradInput (dispatches per element)
-        int totalElements = batchSize * normalizedSize;
-        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource,
-            "layer_norm_backward_data",
-            gradOutput, input, gamma, gradInput, gradGamma, gradBeta,
-            uniforms, totalElements).GetAwaiter().GetResult();
+        // Two registry slots (#1117): the input gradient (row kernels) and the affine gradients (column reductions).
+        // Their references are the established LayerNormBackwardFullSource passes, which recompute the row statistics
+        // from the input and epsilon; the generated variants read the saved ones.
+        bool rowsValid = batchSize > 0 && normalizedSize > 0;
+        var inputGradArgs = new TunedNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, null,
+            batchSize, normalizedSize, epsilon);
+        if (!(rowsValid && LayerNormBackwardSlot.TryExecute(RowShape(batchSize, normalizedSize), inputGradArgs)))
+            LayerNormBackwardInputReference(inputGradArgs);
+        var paramArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar, gradGamma, gradBeta,
+            batchSize, normalizedSize, epsilon);
+        if (!(rowsValid && LayerNormGradParametersSlot.TryExecute(RowShape(batchSize, normalizedSize), paramArgs)))
+            LayerNormGradParamsReference(paramArgs);
     }
 
     public void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -988,15 +977,10 @@ public sealed partial class WebGpuBackend
         int totalElements = batchSize * normalizedSize;
         Dispatch3BufferAsync("NormBackward", WebGpuKernels.NormBackwardSource, "rms_norm_backward",
             gradOutput, input, gradInput, uniforms, totalElements).GetAwaiter().GetResult();
-        // Compute gradGamma = sum_b(gradOutput[b,i] * input[b,i] / rms[b])
-        var gammaUniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(batchSize),
-            BitConverter.Int32BitsToSingle(normalizedSize),
-            0, 0
-        };
-        Dispatch4BufferAsync("RmsNormGradGamma", WebGpuKernels.RmsNormGradGammaSource, "rmsnorm_grad_gamma",
-            gradOutput, input, saveRms, gradGamma, gammaUniforms, normalizedSize).GetAwaiter().GetResult();
+        // gradGamma = sum_b(gradOutput[b,i] * input[b,i] / rms[b]), a column reduction served by the registry (#1117).
+        var gammaArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null, batchSize, normalizedSize);
+        if (!(batchSize > 0 && normalizedSize > 0 && RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)))
+            RmsNormGradGammaReference(gammaArgs);
     }
 
     #endregion

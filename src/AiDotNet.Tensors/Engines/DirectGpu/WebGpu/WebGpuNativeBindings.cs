@@ -401,6 +401,19 @@ public static partial class WebGpuNativeBindings
     private static partial int JsCreateTimestampQuery();
 
     /// <summary>
+    /// Writes the GPU timestamp <paramref name="index"/> (0 or 1) of a query from <see cref="CreateTimestampQuery"/>, in a
+    /// submission of its own: work submitted between the two writes is what the query times.
+    /// </summary>
+    public static void WriteTimestamp(int queryId, int index)
+    {
+        if (Host is { } host) host.Invoke("writeTimestamp", Args(queryId, index));
+        else JsWriteTimestamp(queryId, index);
+    }
+
+    [JSImport("writeTimestamp", ModuleName)]
+    private static partial void JsWriteTimestamp(int queryId, int index);
+
+    /// <summary>
     /// Reads timestamp query results in nanoseconds.
     /// </summary>
     public static Task<double> ReadTimestampQueryAsync(int queryId)

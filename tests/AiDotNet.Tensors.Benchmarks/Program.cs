@@ -1618,6 +1618,13 @@ class Program
             return;
         }
 
+        // Run the tuned-kernel registry gate on the WebGPU device (Dawn) and export a shippable profile
+        if (args[0] == "--webgpu-tuned-profile")
+        {
+            WebGpuTunedProfileExperiment.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         // Run the tuned-kernel registry gate on the Vulkan device and export a shippable profile
         if (args[0] == "--vulkan-tuned-profile")
         {
@@ -2184,6 +2191,7 @@ class Program
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
         Console.WriteLine("  --vulkan-tuned-profile [out.json] [rounds] : Tune the Vulkan kernel registry and export a profile");
+        Console.WriteLine("  --webgpu-tuned-profile [out.json] [rounds] : Tune the WebGPU kernel registry on Dawn and export a profile");
         Console.WriteLine("  --vulkan-meshgrid2d : Time the Vulkan fused Meshgrid2D route against the composed route");
         Console.WriteLine("  --webgpu-meshgrid2d-dawn : Time WebGPU's fused Meshgrid2D against the composed route on Dawn");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");

@@ -567,8 +567,10 @@ public sealed partial class WebGpuBackend
 
     public void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
-        Dispatch3BufferAsync("SoftmaxBackward", WebGpuKernels.SoftmaxBackwardSource, "softmax_backward",
-            gradOutput, output, gradInput, MakeUniformInts2(batchSize, features), batchSize).GetAwaiter().GetResult();
+        if (batchSize > 0 && features > 0 && SoftmaxBackwardSlot.TryExecute(RowShape(batchSize, features),
+                new TunedSoftmaxBackwardArgs(gradOutput, output, gradInput, batchSize, features)))
+            return;
+        SoftmaxBackwardReference(gradOutput, output, gradInput, batchSize, features);
     }
 
     #endregion
