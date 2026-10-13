@@ -72,10 +72,10 @@ public sealed class OpenClRng : IDeviceRng
     /// <summary>Constructs an OpenCL-backed RNG. Currently only
     /// <see cref="DeviceRngAlgorithm.Philox"/> is supported.</summary>
     public OpenClRng(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
         Algorithm = algo;
-        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset);
+        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
     /// <inheritdoc/>
     public void Uniform(Tensor<float> output) => _cpu.Uniform(output);

@@ -185,7 +185,7 @@ public sealed class CpuPhiloxGenerator : IDeviceRng
         }
     }
 
-    private (uint r0, uint r1, uint r2, uint r3) NextBlock()
+    internal (uint r0, uint r1, uint r2, uint r3) NextBlock()
     {
         // Philox 4x32-10: 10 rounds of double-multiply-and-XOR over a
         // 128-bit counter (Subsequence:64 | Offset:64) keyed by Seed.

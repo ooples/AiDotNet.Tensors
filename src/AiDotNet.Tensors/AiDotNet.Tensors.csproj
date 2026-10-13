@@ -431,6 +431,8 @@
     <EmbeddedResource Include="Engines\BlasManaged\Autotune\prewarm\*.prewarm.json" />
     <!-- Shipped tuned-kernel registry profiles (per device), see TunedKernelProfiles. -->
     <EmbeddedResource Include="Helpers\Autotune\TunedKernels\Profiles\*.tuned-profile.json" />
+    <!-- #1204: the Joe-Kuo Sobol direction numbers, packed by scripts/pack_joe_kuo.py. -->
+    <EmbeddedResource Include="Engines\DevicePrimitives\Cpu\Data\joe-kuo-6.bin" />
   </ItemGroup>
 
   <!-- Optional signed revocation deny-list (CRL) for signed entitlements, verified by

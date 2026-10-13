@@ -117,10 +117,10 @@ public sealed class VulkanRng : IDeviceRng
     public static bool IsAvailable => VulkanLoaderProbe.IsAvailable;
     /// <summary>Constructs a Vulkan-backed RNG.</summary>
     public VulkanRng(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
         Algorithm = algo;
-        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset);
+        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
     /// <inheritdoc/>
     public void Uniform(Tensor<float> output) => _cpu.Uniform(output);

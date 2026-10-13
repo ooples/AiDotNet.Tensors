@@ -65,10 +65,10 @@ public sealed class CuRand : IDeviceRng
     /// a #219 follow-up; this CPU-only path is stable for tests +
     /// reproducibility.</summary>
     public CuRand(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
         Algorithm = algo;
-        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset);
+        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
 
     /// <inheritdoc/>
