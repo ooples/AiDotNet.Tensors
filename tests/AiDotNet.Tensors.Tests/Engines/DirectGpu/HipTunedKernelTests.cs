@@ -406,5 +406,42 @@ public sealed class HipTunedKernelTests
                 + (winograd ? 0 : 1));
         }
     }
+
+    [SkippableFact]
+    public void ShippedProfile_ResolvesForThisDevice_AndNamesOnlyRealCandidates()
+    {
+        using var backend = RequireBackend();
+        var slots = new Dictionary<TunedKernelOp, IReadOnlyList<string>>
+        {
+            [TunedKernelOp.Softmax] = backend.SoftmaxSlot.CandidateIds,
+            [TunedKernelOp.SoftmaxBackward] = backend.SoftmaxBackwardSlot.CandidateIds,
+            [TunedKernelOp.LayerNorm] = backend.LayerNormSlot.CandidateIds,
+            [TunedKernelOp.LayerNormBackward] = backend.LayerNormBackwardSlot.CandidateIds,
+            [TunedKernelOp.LayerNormGradParameters] = backend.LayerNormGradParametersSlot.CandidateIds,
+            [TunedKernelOp.RmsNormGradGamma] = backend.RmsNormGradGammaSlot.CandidateIds,
+            [TunedKernelOp.Conv2DForward] = backend.Conv2DForwardSlot.CandidateIds,
+        };
+        string json;
+        using (var stream = typeof(HipBackend).Assembly.GetManifestResourceStream(
+            typeof(HipBackend).Assembly.GetManifestResourceNames().Single(n => n.EndsWith("hip-gfx1012-rx5500xt.tuned-profile.json", StringComparison.Ordinal))))
+        using (var reader = new System.IO.StreamReader(stream ?? throw new InvalidOperationException("profile resource missing")))
+            json = reader.ReadToEnd();
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        int checkedEntries = 0;
+        foreach (var e in doc.RootElement.GetProperty("entries").EnumerateArray())
+        {
+            var op = (TunedKernelOp)Enum.Parse(typeof(TunedKernelOp), e.GetProperty("op").GetString() ?? "");
+            string candidate = e.GetProperty("candidate").GetString() ?? "";
+            Assert.Contains(candidate, slots[op]);
+            checkedEntries++;
+        }
+        Assert.True(checkedEntries > 50, $"only {checkedEntries} profile entries");
+        // On a gfx1012 device the profile applies: a shape it covers resolves to its candidate with no measuring.
+        Skip.IfNot(backend.TunedDeviceKey.StartsWith("hip:gfx1012", StringComparison.Ordinal), $"profile is for gfx1012; this is {backend.TunedDeviceKey}");
+        Assert.True(TunedKernelProfiles.TryLookup(TunedKernelOp.SoftmaxBackward, backend.TunedDeviceKey,
+            TunedShape.Of2(TunedKernelDType.Float32, 1024, 256), deterministic: true, out string? chosen));
+        Assert.Equal("generated.softmax_backward.lanes32", chosen);
+    }
+
 }
 #endif
