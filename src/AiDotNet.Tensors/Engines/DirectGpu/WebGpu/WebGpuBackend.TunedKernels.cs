@@ -118,8 +118,20 @@ public sealed partial class WebGpuBackend
         => WithDistinctBindings(buffers, bound =>
             DispatchWorkgroupsAsync("tuned." + key, source, "main", bound, uniforms, checked((int)workgroups)).GetAwaiter().GetResult());
 
+    // The row kernels (WebGpuTunedRowKernels.RowPrologue) fold their workgroups over a 2-D grid.
+    private void TunedRowDispatch(string key, string source, IGpuBuffer[] buffers, float[] uniforms, long workgroups)
+        => WithDistinctBindings(buffers, bound =>
+            DispatchWorkgroupsAsync("tuned." + key, source, "main", bound, uniforms, RowGridX(workgroups), RowGridY(workgroups))
+                .GetAwaiter().GetResult());
+
+    // A per-row dispatch of `rows` workgroups, folded over a 2-D grid (WebGPU allows 65535 workgroups per dimension by
+    // default); the row kernels index rows as workgroup_id.x + workgroup_id.y * 65535.
+    internal static int RowGridX(long workgroups) => (int)Math.Min(Math.Max(workgroups, 1), WebGpuTunedRowKernels.MaxWorkgroups);
+
+    internal static int RowGridY(long workgroups) => (int)((Math.Max(workgroups, 1) + WebGpuTunedRowKernels.MaxWorkgroups - 1) / WebGpuTunedRowKernels.MaxWorkgroups);
+
     private async System.Threading.Tasks.Task DispatchWorkgroupsAsync(string moduleName, string source, string entryPoint,
-        IGpuBuffer[] buffers, float[] uniformParams, int workgroupsX)
+        IGpuBuffer[] buffers, float[] uniformParams, int workgroupsX, int workgroupsY = 1)
     {
         ThrowIfNotInitialized();
         var wbufs = new WebGpuBuffer[buffers.Length];
@@ -127,11 +139,11 @@ public sealed partial class WebGpuBackend
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, entryPoint);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, wbufs);
-        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, 1, 1);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, workgroupsY, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
     private void RowVariant(string key, string source, IGpuBuffer[] buffers, int rows, int n, int lanes, float epsilon = 0f)
-        => TunedDispatch(key, source, buffers, TunedParams(rows, n, epsilon), WebGpuTunedRowKernels.RowWorkgroups(rows, lanes));
+        => TunedRowDispatch(key, source, buffers, TunedParams(rows, n, epsilon), WebGpuTunedRowKernels.RowWorkgroups(rows, lanes));
 
     private Func<TunedShape, bool> RowFit(int lanes) =>
         shape => IsAvailable && WebGpuTunedRowKernels.RowLanesFit(shape[0], shape[1], lanes);
@@ -176,7 +188,8 @@ public sealed partial class WebGpuBackend
     private void SoftmaxBackwardReference(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int rows, int n)
         => WithDistinctBindings(new[] { gradOutput, output, gradInput }, b =>
             DispatchWorkgroupsAsync("SoftmaxBackward", WebGpuKernels.SoftmaxBackwardSource, "softmax_backward", b,
-                new[] { BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(n), 0f, 0f }, rows).GetAwaiter().GetResult());
+                new[] { BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(n), 0f, 0f }, RowGridX(rows), RowGridY(rows))
+                .GetAwaiter().GetResult());
 
     // The established layer_norm kernel writes only the output; the row statistics the interface promises in
     // saveMean / saveInvVar (and the input-gradient candidates read) come from a statistics pass with the same 256-lane
@@ -185,7 +198,7 @@ public sealed partial class WebGpuBackend
     {
         var args = a;
         // The statistics come first: they read the input, which an in-place call is about to overwrite.
-        TunedDispatch("layernorm_row_stats", WebGpuTunedRowKernels.LayerNormRowStats,
+        TunedRowDispatch("layernorm_row_stats", WebGpuTunedRowKernels.LayerNormRowStats,
             new[] { a.Input, a.SaveMean, a.SaveInvVar }, TunedParams(a.Rows, a.N, a.Epsilon), a.Rows);
         WithDistinctBindings(new[] { args.Input, args.Gamma, args.Beta, args.Output }, b =>
             LayerNormAsync(b[0], b[1], b[2], b[3], args.Rows, args.N, args.Epsilon).GetAwaiter().GetResult());
@@ -352,6 +365,12 @@ public sealed partial class WebGpuBackend
         }
     }
 
+    private bool ColumnVariantFits(int rowLanes)
+    {
+        int invocations = 32 * rowLanes;
+        return invocations <= MaxWorkgroupSize && invocations <= (Limits?.MaxComputeWorkgroupSizeX ?? 256);
+    }
+
     internal TunedKernelSlot<TunedNormBackwardArgs> LayerNormGradParametersSlot => ColumnSlot(ref _layerNormGradParamsSlot, rms: false);
 
     internal TunedKernelSlot<TunedNormBackwardArgs> RmsNormGradGammaSlot => ColumnSlot(ref _rmsNormGradGammaSlot, rms: true);
@@ -376,7 +395,9 @@ public sealed partial class WebGpuBackend
                     string id = (rms ? "generated.rmsnorm_grad_gamma.rows" : "generated.layernorm_grad_params.rows") + rowLanes;
                     string source = rms ? WebGpuTunedRowKernels.RmsNormGradGamma(rowLanes) : WebGpuTunedRowKernels.LayerNormGradParams(rowLanes);
                     candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>(id, TunedKernelOrigin.Generated, true,
-                        shape => IsAvailable && WebGpuTunedRowKernels.ColumnFit(shape[1]),
+                        // 32 * R invocations per workgroup: the 32-row variant (1024) exceeds WebGPU's default limit of 256,
+                        // so each variant is offered only where the device's limits admit it.
+                        shape => IsAvailable && ColumnVariantFits(rowLanes) && WebGpuTunedRowKernels.ColumnFit(shape[1]),
                         (in TunedNormBackwardArgs a) => TunedDispatch(id, source,
                             rms ? new[] { a.GradOutput, a.Input, a.Stat0, a.Out0 }
                                 : new[] { a.GradOutput, a.Input, a.Stat0, a.Stat1 ?? UnusedTunedBinding(), a.Out0, a.Out1 ?? UnusedTunedBinding2() },

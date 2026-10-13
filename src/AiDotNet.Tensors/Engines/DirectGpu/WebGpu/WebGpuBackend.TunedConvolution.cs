@@ -104,6 +104,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         TunedDispatch("conv2d_im2col", Im2ColSource, new[] { a.Input, col }, bits, workgroups);
         if (a.Batch == 1)
         {
+            // The GEMM writes alpha * acc + beta * C; zero the output so a stale NaN cannot survive beta = 0.
+            Fill(a.Output, 0f, checked(a.OutChannels * l));
             Gemm(a.Kernel, col, a.Output, a.OutChannels, l, p);
             return;
         }

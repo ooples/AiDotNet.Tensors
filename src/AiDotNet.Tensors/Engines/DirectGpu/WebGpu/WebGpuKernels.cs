@@ -879,7 +879,9 @@ var<workgroup> local_data: array<f32, 256>;
 fn softmax(@builtin(global_invocation_id) gid: vec3<u32>,
            @builtin(local_invocation_id) lid: vec3<u32>,
            @builtin(workgroup_id) wid: vec3<u32>) {
-    let batch_idx = wid.x;
+    // One workgroup per row, folded over a 2-D grid: one dimension holds at most 65535 workgroups.
+    let batch_idx = wid.x + wid.y * 65535u;
+    if (batch_idx >= params.batch_size) { return; }
     let local_idx = lid.x;
     let base = batch_idx * params.class_count;
 
@@ -955,7 +957,9 @@ var<workgroup> local_data: array<f32, 256>;
 fn layer_norm(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(local_invocation_id) lid: vec3<u32>,
               @builtin(workgroup_id) wid: vec3<u32>) {
-    let batch_idx = wid.x;
+    // One workgroup per row, folded over a 2-D grid: one dimension holds at most 65535 workgroups.
+    let batch_idx = wid.x + wid.y * 65535u;
+    if (batch_idx >= params.batch_size) { return; }
     let local_idx = lid.x;
     let base = batch_idx * params.feature_size;
 
@@ -2746,7 +2750,9 @@ var<workgroup> local_data: array<f32, 256>;
 fn softmax_backward(@builtin(global_invocation_id) gid: vec3<u32>,
                     @builtin(local_invocation_id) lid: vec3<u32>,
                     @builtin(workgroup_id) wid: vec3<u32>) {
-    let batch_idx = wid.x;
+    // One workgroup per row, folded over a 2-D grid: one dimension holds at most 65535 workgroups.
+    let batch_idx = wid.x + wid.y * 65535u;
+    if (batch_idx >= params.batch_size) { return; }
     let local_idx = lid.x;
     let base = batch_idx * params.features;
 

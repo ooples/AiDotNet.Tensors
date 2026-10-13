@@ -18,12 +18,11 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
-            dilationH, dilationW);
-        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(outWidth, outHeight, batch * outChannels);
-        Dispatch3Buffer3DAsync("Convolution", WebGpuKernels.ConvolutionSource, "conv2d",
-            input, kernel, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
+        // Registry dispatch (#1117): the direct kernel or im2col + GEMM, chosen per shape class.
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)) return;
+        Conv2DDirectReference(args);
     }
 
     public void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,

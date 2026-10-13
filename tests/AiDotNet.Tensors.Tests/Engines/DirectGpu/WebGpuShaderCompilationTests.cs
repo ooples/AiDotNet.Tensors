@@ -103,7 +103,30 @@ process.exit(0);
                 File.WriteAllText(Path.Combine(shaders, "TorchParityF32." + module.Key + ".wgsl"), WebGpuShaderPrelude.Prepare(module.Value));
                 count++;
             }
-            Assert.True(count > 100, $"only {count} WGSL sources found");
+            // The tuned-kernel variants are generated per lane count (methods, not fields), so the reflection above never
+            // sees them. Every row variant runs 256 invocations; a column variant runs 32 * R, so only the ones within the
+            // default 256 are compiled here (WebGpuBackend offers the wider ones only on devices whose limits admit them).
+            foreach (int lanes in WebGpuTunedRowKernels.RowLanes)
+            {
+                foreach (var (name, source) in new[]
+                {
+                    ("Softmax", WebGpuTunedRowKernels.Softmax(lanes)), ("SoftmaxBackward", WebGpuTunedRowKernels.SoftmaxBackward(lanes)),
+                    ("LayerNorm", WebGpuTunedRowKernels.LayerNorm(lanes)), ("LayerNormBackward", WebGpuTunedRowKernels.LayerNormBackward(lanes)),
+                })
+                {
+                    File.WriteAllText(Path.Combine(shaders, $"Tuned.{name}.lanes{lanes}.wgsl"), WebGpuShaderPrelude.Prepare(source));
+                    count++;
+                }
+            }
+            foreach (int rows in WebGpuTunedRowKernels.ColumnRowLanes)
+            {
+                if (32 * rows > 256) continue;
+                File.WriteAllText(Path.Combine(shaders, $"Tuned.LayerNormGradParams.rows{rows}.wgsl"),
+                    WebGpuShaderPrelude.Prepare(WebGpuTunedRowKernels.LayerNormGradParams(rows)));
+                File.WriteAllText(Path.Combine(shaders, $"Tuned.RmsNormGradGamma.rows{rows}.wgsl"),
+                    WebGpuShaderPrelude.Prepare(WebGpuTunedRowKernels.RmsNormGradGamma(rows)));
+                count += 2;
+            }            Assert.True(count > 100, $"only {count} WGSL sources found");
 
             // The script must sit beside node_modules for the 'webgpu' import to resolve.
             string script = Path.Combine(node, "aidotnet-wgsl-validate.mjs");

@@ -36,7 +36,8 @@ internal static class WebGpuTunedRowKernels
     /// per lane, and the dispatch must fit one dimension's workgroup limit.
     /// </summary>
     internal static bool RowLanesFit(long rows, long n, int lanes) =>
-        (lanes == GroupSize || n <= (long)MaxColumnsPerLane * lanes) && RowWorkgroups(rows, lanes) <= MaxWorkgroups;
+        (lanes == GroupSize || n <= (long)MaxColumnsPerLane * lanes)
+        && RowWorkgroups(rows, lanes) <= (long)MaxWorkgroups * MaxWorkgroups && rows * n <= int.MaxValue;
 
     internal static long RowWorkgroups(long rows, int lanes) => (rows * lanes + GroupSize - 1) / GroupSize;
 
@@ -81,9 +82,10 @@ fn lane_max(v: f32, lid: i32) -> f32 {
 
     private const string RowPrologue = @"
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lidv: vec3<u32>) {
-    let t = i32(gid.x);
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lidv: vec3<u32>) {
+    // Workgroups fold over a 2-D grid (65535 per dimension), so a row count past 65535 workgroups still dispatches.
     let lid = i32(lidv.x);
+    let t = (i32(wid.x) + i32(wid.y) * 65535) * 256 + lid;
     let row = t / L;
     let lane = t % L;
     let live = row < p.rows;

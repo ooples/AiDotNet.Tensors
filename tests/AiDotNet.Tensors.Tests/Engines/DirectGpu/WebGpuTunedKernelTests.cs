@@ -27,6 +27,8 @@ public sealed class WebGpuTunedKernelTests
         (129, 257), (3, 511), (2, 1024), (2048, 64), (8192, 32),
         // around the whole-workgroup lane count, and rows wider than any narrower count is offered
         (3, 255), (2, 256), (5, 4097), (1, 20000),
+        // more rows than one dispatch dimension's 65535 workgroups: the row kernels fold over a 2-D grid
+        (70_000, 3),
     };
 
     private static float[] Values(int count, int seed, float scale = 1f)
