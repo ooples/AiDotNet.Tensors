@@ -131,136 +131,79 @@ public static partial class WebGpuNativeBindings
     [JSImport("destroyBuffer", ModuleName)]
     private static partial void JsDestroyBuffer(int bufferId);
 
-    /// <summary>
-    /// Writes data to a GPU buffer (internal double[] version for JS interop).
-    /// </summary>
-    internal static void WriteBufferInternal(int bufferId, double[] data, int offsetBytes)
+    // Buffer contents cross to JavaScript as base64 text, not as arrays of numbers. A number array cannot carry
+    // every bit pattern: an int reinterpreted as a float (how int buffers and the integer fields of kernel
+    // parameters are uploaded) is a NaN whenever it is negative, and a NaN's payload does not survive the trip
+    // through a JS number. Base64 is exact for any bytes, and it is one string to marshal instead of one boxed
+    // number per element.
+
+    /// <summary>Writes <paramref name="base64"/> (the bytes to store) into a buffer at <paramref name="offsetBytes"/>.</summary>
+    internal static void WriteBufferBase64(int bufferId, string base64, int offsetBytes)
     {
-        if (Host is { } host) host.Invoke("writeBuffer", Args(bufferId, data, offsetBytes));
-        else JsWriteBufferInternal(bufferId, data, offsetBytes);
+        if (Host is { } host) host.Invoke("writeBufferBase64", Args(bufferId, base64, offsetBytes));
+        else JsWriteBufferBase64(bufferId, base64, offsetBytes);
     }
 
-    [JSImport("writeBuffer", ModuleName)]
-    private static partial void JsWriteBufferInternal(int bufferId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] data, int offsetBytes);
+    [JSImport("writeBufferBase64", ModuleName)]
+    private static partial void JsWriteBufferBase64(int bufferId, string base64, int offsetBytes);
+
+    /// <summary>Reads <paramref name="sizeBytes"/> bytes of a buffer as base64 text.</summary>
+    internal static Task<string> ReadBufferBase64Async(int bufferId, int sizeBytes, int offsetBytes)
+        => Host is { } host ? Task.FromResult(HostValue<string>(host.Invoke("readBufferBase64", Args(bufferId, sizeBytes, offsetBytes)))) : JsReadBufferBase64Async(bufferId, sizeBytes, offsetBytes);
+
+    [JSImport("readBufferBase64", ModuleName)]
+    [return: JSMarshalAs<JSType.Promise<JSType.String>>]
+    private static partial Task<string> JsReadBufferBase64Async(int bufferId, int sizeBytes, int offsetBytes);
 
     /// <summary>
-    /// Writes data to a GPU buffer.
+    /// Writes float data to a GPU buffer, bit for bit.
     /// </summary>
     /// <param name="bufferId">Buffer handle ID.</param>
-    /// <param name="data">Float array data to write.</param>
+    /// <param name="data">Data to write.</param>
     /// <param name="offsetBytes">Offset in bytes.</param>
     public static void WriteBuffer(int bufferId, float[] data, int offsetBytes)
     {
-        var doubleData = new double[data.Length];
-        for (int i = 0; i < data.Length; i++)
-        {
-            doubleData[i] = data[i];
-        }
-        WriteBufferInternal(bufferId, doubleData, offsetBytes);
+        var bytes = new byte[data.Length * sizeof(float)];
+        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+        WriteBufferBase64(bufferId, Convert.ToBase64String(bytes), offsetBytes);
     }
 
     /// <summary>
-    /// Writes raw bytes to a GPU buffer (internal double[] version for JS interop).
-    /// </summary>
-    internal static void WriteByteBufferInternal(int bufferId, double[] data, int offsetBytes)
-    {
-        if (Host is { } host) host.Invoke("writeByteBuffer", Args(bufferId, data, offsetBytes));
-        else JsWriteByteBufferInternal(bufferId, data, offsetBytes);
-    }
-
-    [JSImport("writeByteBuffer", ModuleName)]
-    private static partial void JsWriteByteBufferInternal(int bufferId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] data, int offsetBytes);
-
-    /// <summary>
-    /// Writes raw bytes to a GPU buffer.
-    /// </summary>
-    public static void WriteByteBuffer(int bufferId, byte[] data, int offsetBytes)
-    {
-        var doubleData = new double[data.Length];
-        for (int i = 0; i < data.Length; i++)
-        {
-            doubleData[i] = data[i];
-        }
-        WriteByteBufferInternal(bufferId, doubleData, offsetBytes);
-    }
-
-    /// <summary>
-    /// Reads data from a GPU buffer. Returns JSON string of the data array.
-    /// </summary>
-    /// <remarks>
-    /// Since Task{T[]} is not supported by JS interop for complex types,
-    /// we return a JSON string that can be parsed on the C# side.
-    /// </remarks>
-    internal static Task<string> ReadBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes)
-        => Host is { } host ? Task.FromResult(HostValue<string>(host.Invoke("readBufferAsJson", Args(bufferId, sizeBytes, offsetBytes)))) : JsReadBufferAsJsonAsync(bufferId, sizeBytes, offsetBytes);
-
-    [JSImport("readBufferAsJson", ModuleName)]
-    [return: JSMarshalAs<JSType.Promise<JSType.String>>]
-    private static partial Task<string> JsReadBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
-
-    /// <summary>
-    /// Reads raw bytes from a GPU buffer. Returns JSON string of byte values.
-    /// </summary>
-    internal static Task<string> ReadByteBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes)
-        => Host is { } host ? Task.FromResult(HostValue<string>(host.Invoke("readByteBufferAsJson", Args(bufferId, sizeBytes, offsetBytes)))) : JsReadByteBufferAsJsonAsync(bufferId, sizeBytes, offsetBytes);
-
-    [JSImport("readByteBufferAsJson", ModuleName)]
-    [return: JSMarshalAs<JSType.Promise<JSType.String>>]
-    private static partial Task<string> JsReadByteBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
-
-    /// <summary>
-    /// Reads data from a GPU buffer.
+    /// Writes raw bytes to a GPU buffer. A length that is not a multiple of four is padded with zeros to the next
+    /// word, which the buffer must have room for.
     /// </summary>
     /// <param name="bufferId">Buffer handle ID.</param>
-    /// <param name="sizeBytes">Size to read in bytes.</param>
+    /// <param name="data">Bytes to write.</param>
     /// <param name="offsetBytes">Offset in bytes.</param>
-    /// <returns>Float array data.</returns>
+    public static void WriteByteBuffer(int bufferId, byte[] data, int offsetBytes)
+        => WriteBufferBase64(bufferId, Convert.ToBase64String(data), offsetBytes);
+
+    /// <summary>
+    /// Reads float data from a GPU buffer, bit for bit.
+    /// </summary>
+    /// <param name="bufferId">Buffer handle ID.</param>
+    /// <param name="sizeBytes">Number of bytes to read.</param>
+    /// <param name="offsetBytes">Offset in bytes.</param>
+    /// <returns>Float array containing the data.</returns>
     public static async Task<float[]> ReadBufferAsync(int bufferId, int sizeBytes, int offsetBytes)
     {
-        var jsonData = await ReadBufferAsJsonAsync(bufferId, sizeBytes, offsetBytes);
-        if (string.IsNullOrEmpty(jsonData))
-        {
-            return Array.Empty<float>();
-        }
-
-        // Parse JSON array of numbers
-        var values = System.Text.Json.JsonSerializer.Deserialize<double[]>(jsonData, HostJson);
-        if (values is null)
-        {
-            return Array.Empty<float>();
-        }
-
-        var floatData = new float[values.Length];
-        for (int i = 0; i < values.Length; i++)
-        {
-            floatData[i] = (float)values[i];
-        }
-        return floatData;
+        byte[] bytes = await ReadByteBufferAsync(bufferId, sizeBytes, offsetBytes);
+        var floats = new float[bytes.Length / sizeof(float)];
+        Buffer.BlockCopy(bytes, 0, floats, 0, floats.Length * sizeof(float));
+        return floats;
     }
 
     /// <summary>
     /// Reads raw bytes from a GPU buffer.
     /// </summary>
+    /// <param name="bufferId">Buffer handle ID.</param>
+    /// <param name="sizeBytes">Number of bytes to read.</param>
+    /// <param name="offsetBytes">Offset in bytes.</param>
+    /// <returns>The bytes read.</returns>
     public static async Task<byte[]> ReadByteBufferAsync(int bufferId, int sizeBytes, int offsetBytes)
     {
-        var jsonData = await ReadByteBufferAsJsonAsync(bufferId, sizeBytes, offsetBytes);
-        if (string.IsNullOrEmpty(jsonData))
-        {
-            return Array.Empty<byte>();
-        }
-
-        var values = System.Text.Json.JsonSerializer.Deserialize<double[]>(jsonData, HostJson);
-        if (values is null)
-        {
-            return Array.Empty<byte>();
-        }
-
-        var byteData = new byte[values.Length];
-        for (int i = 0; i < values.Length; i++)
-        {
-            byteData[i] = checked((byte)values[i]);
-        }
-        return byteData;
+        string base64 = await ReadBufferBase64Async(bufferId, sizeBytes, offsetBytes);
+        return string.IsNullOrEmpty(base64) ? Array.Empty<byte>() : Convert.FromBase64String(base64);
     }
 
     /// <summary>

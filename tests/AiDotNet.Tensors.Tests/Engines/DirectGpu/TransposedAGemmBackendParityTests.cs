@@ -96,10 +96,7 @@ public sealed class TransposedAGemmBackendParityTests
     [SkippableFact]
     public void WebGpu_MatMulTransposedA_MatchesCpu()
     {
-        // WebGPU runs through the browser's JavaScript interop; elsewhere the backend throws PlatformNotSupportedException.
-        Skip.IfNot(OperatingSystem.IsBrowser(), "WebGPU needs a browser host.");
-        using var backend = new WebGpuBackend();
-        Skip.IfNot(backend.InitializeAsync().GetAwaiter().GetResult(), "WebGPU is not available.");
+        var backend = DawnHostedWebGpu.BackendOrSkip();   // the real backend, executing on Dawn; shared, so not disposed
         Check(backend);
     }
 }

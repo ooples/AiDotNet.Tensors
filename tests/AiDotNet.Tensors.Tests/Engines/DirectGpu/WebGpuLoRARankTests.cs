@@ -27,8 +27,7 @@ public sealed class WebGpuLoRARankTests
     [InlineData(1, 8, 600, 9)]      // three chunks
     public void FusedLoRAForward_AnyRank_MatchesReference(int batch, int inFeatures, int rank, int outFeatures)
     {
-        using var backend = new WebGpuBackend();
-        Skip.IfNot(backend.IsAvailable, "WebGPU is not available.");
+        var backend = DawnHostedWebGpu.BackendOrSkip();   // the real backend, executing on Dawn; shared, so not disposed
         float[] input = Values(batch * inFeatures, 1), a = Values(inFeatures * rank, 2), b = Values(rank * outFeatures, 3);
         float[] baseOut = Values(batch * outFeatures, 4);
         const float scaling = 0.375f;

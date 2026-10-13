@@ -486,10 +486,9 @@ public sealed class CompressedMomentGpuOptimizerTests :
 #if NET7_0_OR_GREATER
                 case BackendKind.WebGpu:
                 {
-                    var b = new WebGpuBackend();
-                    return b.IsAvailable
-                        ? new AcquiredBackend(b, b.Dispose, null)
-                        : new AcquiredBackend(null, b.Dispose, null);
+                    // The real backend, executing on Dawn (DawnHostedWebGpu). It is shared, so not disposed.
+                    var b = DawnHostedWebGpu.BackendOrNull();
+                    return new AcquiredBackend(b, () => { }, null);
                 }
 #endif
                 default:

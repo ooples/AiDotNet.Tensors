@@ -19,11 +19,12 @@ public sealed class FlashDecodeWebGpuTests : IDisposable
 
     public FlashDecodeWebGpuTests()
     {
-        try { _backend = new WebGpuBackend(); _ready = _backend.IsAvailable; }
+        // The real backend, executing on Dawn (DawnHostedWebGpu); null when Dawn is not set up.
+        try { _backend = DawnHostedWebGpu.BackendOrNull(); _ready = _backend is not null; }
         catch { _ready = false; }
     }
 
-    public void Dispose() => _backend?.Dispose();
+    public void Dispose() { }   // the hosted backend is shared by the test process
 
     [Fact]
     public void Probe_WebGpuAvailability()

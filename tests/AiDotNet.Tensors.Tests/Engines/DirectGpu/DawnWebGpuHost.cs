@@ -53,14 +53,20 @@ for await (const line of rl) {
 }
 ";
 
-    // A call longer than this is a hung device or a stuck mapAsync, not a slow one.
-    private static readonly TimeSpan ReplyTimeout = TimeSpan.FromMinutes(5);
+    // A call longer than this is a hung device or a stuck mapAsync, not a slow one. Once one call has timed out or the
+    // device has been lost, the host is dead: every later call fails at once with the original reason, so one broken
+    // test costs one timeout and the rest of the run reports what actually happened.
+    private static readonly TimeSpan ReplyTimeout = TimeSpan.FromSeconds(90);
 
     private readonly Process _node;
     private readonly StringBuilder _stderr = new();
     private readonly string[] _temporaryFiles;
     private readonly object _gate = new();
     private bool _disposed;
+    private string? _dead;
+
+    /// <summary>Why the host can no longer serve calls (a timeout, a lost device, an exited process), or null.</summary>
+    public string? Dead { get { lock (_gate) return _dead; } }
 
     /// <summary>Calls served, by export name. For tests that assert a path really went through the host.</summary>
     public Dictionary<string, int> Calls { get; } = new(StringComparer.Ordinal);
@@ -136,14 +142,16 @@ for await (const line of rl) {
         if (!read.Wait(ReplyTimeout))
         {
             try { _node.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
-            throw new TimeoutException($"The WebGPU host did not answer '{what}' within {ReplyTimeout.TotalMinutes} minutes.");
+            _dead = $"The WebGPU host did not answer '{what}' within {ReplyTimeout.TotalSeconds} seconds and was stopped.";
+            throw new TimeoutException(_dead);
         }
         string? line = read.Result;
         if (line is null)
         {
             string stderr;
             lock (_stderr) stderr = _stderr.ToString();
-            throw new InvalidOperationException($"The WebGPU host exited during '{what}'. stderr: {stderr}");
+            _dead = $"The WebGPU host exited during '{what}'. stderr: {stderr}";
+            throw new InvalidOperationException(_dead);
         }
         return line;
     }
@@ -153,6 +161,7 @@ for await (const line of rl) {
         lock (_gate)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(DawnWebGpuHost));
+            if (_dead is not null) throw new InvalidOperationException($"The WebGPU host is no longer usable ({function} not sent): {_dead}");
             Calls[function] = Calls.TryGetValue(function, out int n) ? n + 1 : 1;
             _node.StandardInput.Write("{\"f\":");
             _node.StandardInput.Write(JsonSerializer.Serialize(function));
@@ -169,6 +178,9 @@ for await (const line of rl) {
                 var text = new List<string>();
                 foreach (var e in errors.EnumerateArray()) text.Add(e.GetString() ?? "");
                 reported = string.Join(Environment.NewLine, text);
+                // The module nulls its device when it is lost; nothing after that can work.
+                if (reported.IndexOf("device lost", StringComparison.OrdinalIgnoreCase) >= 0)
+                    _dead = $"The WebGPU device was lost (seen at {function}): {reported}";
             }
             if (!root.GetProperty("ok").GetBoolean())
                 throw new InvalidOperationException($"webgpu-tensors.js {function} failed: {root.GetProperty("error").GetString()}"
