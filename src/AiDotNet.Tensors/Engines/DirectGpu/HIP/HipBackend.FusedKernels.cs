@@ -151,9 +151,19 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public void BatchedDotProduct(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int batchSize, int dim)
-        => LaunchResidentAxis("batched_dot_product", left, right, output, batchSize, dim, batchSize);
-
+    public unsafe void BatchedDotProduct(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int batchSize, int dim)
+    {
+        // One block per row (blockIdx.y), block-reducing over dim -- the kernel's geometry, as CudaBackend launches it.
+        // This went through LaunchResidentAxis, a 1-D grid of one thread per row, and no compiled module defined the
+        // kernel, so every call threw GpuCapabilityUnavailableException and ran on the CPU.
+        if (batchSize <= 0) return;
+        IntPtr kernel = RequireResidentKernel("batched_dot_product");
+        IntPtr leftPtr = left.Handle, rightPtr = right.Handle, outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &leftPtr; args[1] = &rightPtr; args[2] = &outputPtr;
+        args[3] = &batchSize; args[4] = &dim;
+        LaunchKernel2D(kernel, 1, (uint)batchSize, DefaultBlockSize, 1, args);
+    }
     private IntPtr RequireResidentKernel(string kernelName)
     {
         if (!_kernelCache.TryGetValue(kernelName, out IntPtr kernel))

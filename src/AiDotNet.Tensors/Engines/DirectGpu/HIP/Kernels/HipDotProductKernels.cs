@@ -21,27 +21,21 @@ internal static class HipDotProductKernels
 #define INFINITY __builtin_huge_valf()
 #endif
 
-// Warp-level reduction
-__device__ __forceinline__ float warpReduceSum(float val) {
-    for (int offset = 32; offset > 0; offset /= 2) {
-        val += __shfl_down(val, offset);
-    }
-    return val;
-}
-
-// Block-level reduction
+// Block-level sum through shared memory, for a power-of-two blockDim.x <= 256. The previous version shuffled from
+// offset 32 and took lanes as threadIdx.x % 64, which is right only for 64-wide waves: on a wave32 RDNA device the
+// offset-32 shuffle returns the lane's own value (doubling it) and lanes 32-63 never reach shared memory.
+// Every thread returns the block's sum.
 __device__ __forceinline__ float blockReduceSum(float val) {
-    __shared__ float shared[64];
-    int lane = threadIdx.x % 64;
-    int wid = threadIdx.x / 64;
-
-    val = warpReduceSum(val);
-    if (lane == 0) shared[wid] = val;
+    __shared__ float shared[256];
+    shared[threadIdx.x] = val;
     __syncthreads();
-
-    val = (threadIdx.x < blockDim.x / 64) ? shared[lane] : 0.0f;
-    if (wid == 0) val = warpReduceSum(val);
-    return val;
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float sum = shared[0];
+    __syncthreads();
+    return sum;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void dot_product(
