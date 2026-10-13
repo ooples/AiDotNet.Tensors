@@ -658,6 +658,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, specializedProgram, name);
                 }
 
+                // The octonion backward and fused-ReLU kernels live in OctonionKernels, which nothing compiled, so
+                // OctonionLinearBackward{Input,Weights,Biases} and OctonionLinearForwardFusedReLU threw kernel-not-found
+                // and ran on the CPU. Names the specialized program already registered keep that definition. Optional:
+                // a compile failure leaves these ops on the CPU path instead of failing backend initialization.
+                try
+                {
+                    var octonionProgram = CompileOrLoadCached(OctonionKernels.GetSource(), optimizationFlags, "Octonion kernels");
+                    _programs.Add(octonionProgram);
+                    foreach (var name in OctonionKernels.GetKernelNames())
+                    {
+                        if (!_kernelCache.ContainsKey(name))
+                            _kernelCache[name] = new DirectOpenClKernel(_context, octonionProgram, name);
+                    }
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL octonion kernels unavailable; those ops use the CPU path: {ex.Message}");
+                }
                 // Compile FP16 conversion kernels (half-precision float conversion)
                 var fp16Program = CompileOrLoadCached(Fp16Kernels.GetSource(), optimizationFlags, "FP16 conversion kernels");
                 _programs.Add(fp16Program);

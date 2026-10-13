@@ -117,9 +117,10 @@ __kernel void poincare_exp_map(
         return;
     }
 
-    float conformalFactor = 1.0f - c * xNormSq;
-    float lambda = conformalFactor / 2.0f;
-    float arg = sqrtC * vNorm * lambda;
+    // Conformal factor lambda_x = 2 / (1 - c ||x||^2), exp_x(v) = x (+)_c tanh(sqrt(c) lambda_x ||v|| / 2) v / (sqrt(c) ||v||)
+    // (Ganea et al. 2018). This used (1 - c ||x||^2) / 2, the reciprocal, which is right only at the origin.
+    float lambda = 2.0f / fmax(1.0f - c * xNormSq, 1e-10f);
+    float arg = sqrtC * vNorm * lambda / 2.0f;
     float scale = tanh(arg) / (sqrtC * vNorm);
 
     // Compute scaled tangent and Mobius addition inline

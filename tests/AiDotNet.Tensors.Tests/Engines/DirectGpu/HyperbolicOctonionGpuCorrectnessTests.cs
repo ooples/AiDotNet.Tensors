@@ -7,6 +7,7 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -18,45 +19,31 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// octonion algebra operations. Each test runs the operation on CPU, then on GPU,
 /// and verifies element-wise equality within floating-point tolerance.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
+/// <remarks>
+/// The tests run on every backend that derives from this base; each derived class supplies its backend, or the reason
+/// it cannot run. HIP joined after its octonion backward kernels turned out never to have been compiled.
+/// </remarks>
+public abstract class HyperbolicOctonionGpuCorrectnessTestsBase : IDisposable
 {
-    private readonly VulkanBackend? _vulkan;
-    private readonly bool _isVulkanAvailable;
-    private const float Tolerance = 1e-4f;
-    private const float GradTolerance = 1e-3f; // Gradients accumulate error
+    protected readonly IDirectGpuBackend? _gpu;
+    private readonly string? _skipReason;
+    private protected const float Tolerance = 1e-4f;
+    private protected const float GradTolerance = 1e-3f; // Gradients accumulate error
 
-    public HyperbolicOctonionGpuCorrectnessTests()
+    protected HyperbolicOctonionGpuCorrectnessTestsBase(IDirectGpuBackend? gpu, string? skipReason)
     {
-        try
-        {
-            _vulkan = VulkanBackend.Instance;
-            _isVulkanAvailable = _vulkan.Initialize();
-        }
-        catch
-        {
-            _isVulkanAvailable = false;
-        }
+        _gpu = gpu;
+        _skipReason = gpu is null && skipReason is null ? "GPU backend not available" : skipReason;
     }
 
-    public void Dispose()
+    public virtual void Dispose()
     {
-        // VulkanBackend is a singleton — don't dispose
     }
 
-    private void SkipIfNoGpu()
-    {
-        Skip.If(!_isVulkanAvailable, "Vulkan GPU backend not available");
-        // Octonion + hyperbolic kernels are emitted as GLSL and compiled at
-        // runtime. When libshaderc is missing the pipelines silently
-        // no-op (GlslQuadOp returns early), the output buffer stays at
-        // its zero-allocation fill, and the CPU↔GPU comparison reads
-        // "GPU=0" vs a non-zero CPU result. That's an environment gap,
-        // not a kernel bug — skip here instead of failing on every dev
-        // box that hasn't installed shaderc.
-        Skip.If(_vulkan is not null && !_vulkan.IsGlslCompilerAvailable,
-            "GLSL runtime compiler (libshaderc) unavailable — install to run octonion/hyperbolic GPU tests.");
-    }
+    private protected void SkipIfNoGpu() => Skip.If(_skipReason is not null, _skipReason);
+
+    // The backend a test runs on; SkipIfNoGpu has already skipped when there is none.
+    private protected IDirectGpuBackend Gpu => _gpu ?? throw new InvalidOperationException("No GPU backend; call SkipIfNoGpu first.");
 
     private static float[] RandomFloats(int count, int seed, float scale = 1f)
     {
@@ -280,10 +267,10 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var input = RandomFloats(batchSize * dim, 42, scale: 2f);
         var cpuResult = CpuPoincareProject(input, batchSize, dim, curvature, 1e-5f);
 
-        using var gpuIn = _vulkan!.AllocateBuffer(input);
-        using var gpuOut = _vulkan.AllocateBuffer(batchSize * dim);
-        _vulkan.PoincareProject(gpuIn, gpuOut, batchSize, dim, curvature);
-        var gpuResult = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuIn = Gpu.AllocateBuffer(input);
+        using var gpuOut = Gpu.AllocateBuffer(batchSize * dim);
+        Gpu.PoincareProject(gpuIn, gpuOut, batchSize, dim, curvature);
+        var gpuResult = Gpu.DownloadBuffer(gpuOut);
 
         AssertArraysClose(cpuResult, gpuResult, Tolerance, "PoincareProject");
     }
@@ -300,11 +287,11 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var y = RandomPoincarePoints(batchSize, dim, curvature, 99);
         var cpuResult = CpuMobiusAdd(x, y, batchSize, dim, curvature);
 
-        using var gpuX = _vulkan!.AllocateBuffer(x);
-        using var gpuY = _vulkan.AllocateBuffer(y);
-        using var gpuOut = _vulkan.AllocateBuffer(batchSize * dim);
-        _vulkan.MobiusAdd(gpuX, gpuY, gpuOut, batchSize, dim, curvature);
-        var gpuResult = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuX = Gpu.AllocateBuffer(x);
+        using var gpuY = Gpu.AllocateBuffer(y);
+        using var gpuOut = Gpu.AllocateBuffer(batchSize * dim);
+        Gpu.MobiusAdd(gpuX, gpuY, gpuOut, batchSize, dim, curvature);
+        var gpuResult = Gpu.DownloadBuffer(gpuOut);
 
         AssertArraysClose(cpuResult, gpuResult, Tolerance, "MobiusAdd");
     }
@@ -321,11 +308,11 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var tangentVecs = RandomFloats(batchSize * dim, 99, scale: 0.5f); // Keep tangent small
         var cpuResult = CpuPoincareExpMap(basePoints, tangentVecs, batchSize, dim, curvature);
 
-        using var gpuBp = _vulkan!.AllocateBuffer(basePoints);
-        using var gpuTv = _vulkan.AllocateBuffer(tangentVecs);
-        using var gpuOut = _vulkan.AllocateBuffer(batchSize * dim);
-        _vulkan.PoincareExpMap(gpuBp, gpuTv, gpuOut, batchSize, dim, curvature);
-        var gpuResult = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuBp = Gpu.AllocateBuffer(basePoints);
+        using var gpuTv = Gpu.AllocateBuffer(tangentVecs);
+        using var gpuOut = Gpu.AllocateBuffer(batchSize * dim);
+        Gpu.PoincareExpMap(gpuBp, gpuTv, gpuOut, batchSize, dim, curvature);
+        var gpuResult = Gpu.DownloadBuffer(gpuOut);
 
         AssertArraysClose(cpuResult, gpuResult, Tolerance, "PoincareExpMap");
     }
@@ -341,11 +328,11 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var y = RandomPoincarePoints(batchSize, dim, curvature, 99);
         var cpuResult = CpuPoincareDistance(x, y, batchSize, dim, curvature);
 
-        using var gpuX = _vulkan!.AllocateBuffer(x);
-        using var gpuY = _vulkan.AllocateBuffer(y);
-        using var gpuOut = _vulkan.AllocateBuffer(batchSize);
-        _vulkan.PoincareDistance(gpuX, gpuY, gpuOut, batchSize, dim, curvature);
-        var gpuResult = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuX = Gpu.AllocateBuffer(x);
+        using var gpuY = Gpu.AllocateBuffer(y);
+        using var gpuOut = Gpu.AllocateBuffer(batchSize);
+        Gpu.PoincareDistance(gpuX, gpuY, gpuOut, batchSize, dim, curvature);
+        var gpuResult = Gpu.DownloadBuffer(gpuOut);
 
         AssertArraysClose(cpuResult, gpuResult, Tolerance, "PoincareDistance");
     }
@@ -357,11 +344,11 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var x = RandomPoincarePoints(32, 16, 1f, 42);
         var y = RandomPoincarePoints(32, 16, 1f, 99);
 
-        using var gpuX = _vulkan!.AllocateBuffer(x);
-        using var gpuY = _vulkan.AllocateBuffer(y);
-        using var gpuOut = _vulkan.AllocateBuffer(32);
-        _vulkan.PoincareDistance(gpuX, gpuY, gpuOut, 32, 16, 1f);
-        var result = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuX = Gpu.AllocateBuffer(x);
+        using var gpuY = Gpu.AllocateBuffer(y);
+        using var gpuOut = Gpu.AllocateBuffer(32);
+        Gpu.PoincareDistance(gpuX, gpuY, gpuOut, 32, 16, 1f);
+        var result = Gpu.DownloadBuffer(gpuOut);
 
         foreach (var d in result)
             Assert.True(d >= 0, $"Distance must be non-negative, got {d}");
@@ -373,10 +360,10 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var x = RandomPoincarePoints(8, 16, 1f, 42);
 
-        using var gpuX = _vulkan!.AllocateBuffer(x);
-        using var gpuOut = _vulkan.AllocateBuffer(8);
-        _vulkan.PoincareDistance(gpuX, gpuX, gpuOut, 8, 16, 1f);
-        var result = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuX = Gpu.AllocateBuffer(x);
+        using var gpuOut = Gpu.AllocateBuffer(8);
+        Gpu.PoincareDistance(gpuX, gpuX, gpuOut, 8, 16, 1f);
+        var result = Gpu.DownloadBuffer(gpuOut);
 
         foreach (var d in result)
             Assert.True(d < 1e-5f, $"Distance to self must be ~0, got {d}");
@@ -398,11 +385,11 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var b = RandomFloats(count * 8, 99);
         var cpuResult = CpuOctonionMultiply(a, b, count);
 
-        using var gpuA = _vulkan!.AllocateBuffer(a);
-        using var gpuB = _vulkan.AllocateBuffer(b);
-        using var gpuOut = _vulkan.AllocateBuffer(count * 8);
-        _vulkan.OctonionMultiply(gpuA, gpuB, gpuOut, count);
-        var gpuResult = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuA = Gpu.AllocateBuffer(a);
+        using var gpuB = Gpu.AllocateBuffer(b);
+        using var gpuOut = Gpu.AllocateBuffer(count * 8);
+        Gpu.OctonionMultiply(gpuA, gpuB, gpuOut, count);
+        var gpuResult = Gpu.DownloadBuffer(gpuOut);
 
         AssertArraysClose(cpuResult, gpuResult, Tolerance, "OctonionMultiply");
     }
@@ -414,14 +401,14 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var a = RandomFloats(8, 42);
         var b = RandomFloats(8, 99);
 
-        using var gpuA = _vulkan!.AllocateBuffer(a);
-        using var gpuB = _vulkan.AllocateBuffer(b);
-        using var gpuAB = _vulkan.AllocateBuffer(8);
-        using var gpuBA = _vulkan.AllocateBuffer(8);
-        _vulkan.OctonionMultiply(gpuA, gpuB, gpuAB, 1);
-        _vulkan.OctonionMultiply(gpuB, gpuA, gpuBA, 1);
-        var ab = _vulkan.DownloadBuffer(gpuAB);
-        var ba = _vulkan.DownloadBuffer(gpuBA);
+        using var gpuA = Gpu.AllocateBuffer(a);
+        using var gpuB = Gpu.AllocateBuffer(b);
+        using var gpuAB = Gpu.AllocateBuffer(8);
+        using var gpuBA = Gpu.AllocateBuffer(8);
+        Gpu.OctonionMultiply(gpuA, gpuB, gpuAB, 1);
+        Gpu.OctonionMultiply(gpuB, gpuA, gpuBA, 1);
+        var ab = Gpu.DownloadBuffer(gpuAB);
+        var ba = Gpu.DownloadBuffer(gpuBA);
 
         bool anyDifferent = false;
         for (int i = 0; i < 8; i++)
@@ -442,12 +429,12 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var biases = RandomFloats(outputFeatures * 8, 77, scale: 0.1f);
         var cpuResult = CpuOctonionLinearForward(input, weights, biases, batchSize, inputFeatures, outputFeatures);
 
-        using var gpuIn = _vulkan!.AllocateBuffer(input);
-        using var gpuW = _vulkan.AllocateBuffer(weights);
-        using var gpuB = _vulkan.AllocateBuffer(biases);
-        using var gpuOut = _vulkan.AllocateBuffer(batchSize * outputFeatures * 8);
-        _vulkan.OctonionLinearForward(gpuIn, gpuW, gpuB, gpuOut, batchSize, inputFeatures, outputFeatures);
-        var gpuResult = _vulkan.DownloadBuffer(gpuOut);
+        using var gpuIn = Gpu.AllocateBuffer(input);
+        using var gpuW = Gpu.AllocateBuffer(weights);
+        using var gpuB = Gpu.AllocateBuffer(biases);
+        using var gpuOut = Gpu.AllocateBuffer(batchSize * outputFeatures * 8);
+        Gpu.OctonionLinearForward(gpuIn, gpuW, gpuB, gpuOut, batchSize, inputFeatures, outputFeatures);
+        var gpuResult = Gpu.DownloadBuffer(gpuOut);
 
         AssertArraysClose(cpuResult, gpuResult, Tolerance, "OctonionLinearForward");
     }
@@ -461,10 +448,10 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var gradOutput = RandomFloats(batchSize * outputFeatures * 8, 42);
         var cpuResult = CpuOctonionLinearBackwardBiases(gradOutput, batchSize, outputFeatures);
 
-        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
-        using var gpuGb = _vulkan.AllocateBuffer(outputFeatures * 8);
-        _vulkan.OctonionLinearBackwardBiases(gpuGo, gpuGb, batchSize, outputFeatures);
-        var gpuResult = _vulkan.DownloadBuffer(gpuGb);
+        using var gpuGo = Gpu.AllocateBuffer(gradOutput);
+        using var gpuGb = Gpu.AllocateBuffer(outputFeatures * 8);
+        Gpu.OctonionLinearBackwardBiases(gpuGo, gpuGb, batchSize, outputFeatures);
+        var gpuResult = Gpu.DownloadBuffer(gpuGb);
 
         AssertArraysClose(cpuResult, gpuResult, Tolerance, "OctonionLinearBackwardBiases");
     }
@@ -512,12 +499,12 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         }
 
         var input = RandomFloats(batchSize * inputFeatures * 8, 55, scale: 0.5f);
-        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
-        using var gpuIn = _vulkan.AllocateBuffer(input);
-        using var gpuW = _vulkan.AllocateBuffer(weights);
-        using var gpuGi = _vulkan.AllocateBuffer(batchSize * inputFeatures * 8);
-        _vulkan.OctonionLinearBackwardInput(gpuGo, gpuIn, gpuW, gpuGi, batchSize, inputFeatures, outputFeatures);
-        var gpuGradInput = _vulkan.DownloadBuffer(gpuGi);
+        using var gpuGo = Gpu.AllocateBuffer(gradOutput);
+        using var gpuIn = Gpu.AllocateBuffer(input);
+        using var gpuW = Gpu.AllocateBuffer(weights);
+        using var gpuGi = Gpu.AllocateBuffer(batchSize * inputFeatures * 8);
+        Gpu.OctonionLinearBackwardInput(gpuGo, gpuIn, gpuW, gpuGi, batchSize, inputFeatures, outputFeatures);
+        var gpuGradInput = Gpu.DownloadBuffer(gpuGi);
 
         AssertArraysClose(cpuGradInput, gpuGradInput, GradTolerance, "OctonionLinearBackwardInput");
     }
@@ -564,11 +551,11 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
             }
         }
 
-        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
-        using var gpuIn = _vulkan.AllocateBuffer(input);
-        using var gpuGw = _vulkan.AllocateBuffer(outputFeatures * inputFeatures * 8);
-        _vulkan.OctonionLinearBackwardWeights(gpuGo, gpuIn, gpuGw, batchSize, inputFeatures, outputFeatures);
-        var gpuGradWeights = _vulkan.DownloadBuffer(gpuGw);
+        using var gpuGo = Gpu.AllocateBuffer(gradOutput);
+        using var gpuIn = Gpu.AllocateBuffer(input);
+        using var gpuGw = Gpu.AllocateBuffer(outputFeatures * inputFeatures * 8);
+        Gpu.OctonionLinearBackwardWeights(gpuGo, gpuIn, gpuGw, batchSize, inputFeatures, outputFeatures);
+        var gpuGradWeights = Gpu.DownloadBuffer(gpuGw);
 
         AssertArraysClose(cpuGradWeights, gpuGradWeights, GradTolerance, "OctonionLinearBackwardWeights");
     }
@@ -598,11 +585,11 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var gradOutput = (float[])output.Clone(); // dLoss/dOutput = output (for L = ||out||^2 / 2)
 
         // GPU backward for weight gradients
-        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
-        using var gpuIn = _vulkan.AllocateBuffer(input);
-        using var gpuGw = _vulkan.AllocateBuffer(O * I * 8);
-        _vulkan.OctonionLinearBackwardWeights(gpuGo, gpuIn, gpuGw, B, I, O);
-        var analyticGrad = _vulkan.DownloadBuffer(gpuGw);
+        using var gpuGo = Gpu.AllocateBuffer(gradOutput);
+        using var gpuIn = Gpu.AllocateBuffer(input);
+        using var gpuGw = Gpu.AllocateBuffer(O * I * 8);
+        Gpu.OctonionLinearBackwardWeights(gpuGo, gpuIn, gpuGw, B, I, O);
+        var analyticGrad = Gpu.DownloadBuffer(gpuGw);
 
         // Compare against numerical gradient via finite differences
         float worstDiff = 0f;
@@ -669,12 +656,12 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var output = CpuOctonionLinearForward(input, weights, biases, B, I, O);
         var gradOutput = (float[])output.Clone(); // dLoss/dOutput = output (for L = ||out||^2 / 2)
 
-        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
-        using var gpuIn = _vulkan.AllocateBuffer(input);
-        using var gpuW = _vulkan.AllocateBuffer(weights);
-        using var gpuGi = _vulkan.AllocateBuffer(B * I * 8);
-        _vulkan.OctonionLinearBackwardInput(gpuGo, gpuIn, gpuW, gpuGi, B, I, O);
-        var analyticGrad = _vulkan.DownloadBuffer(gpuGi);
+        using var gpuGo = Gpu.AllocateBuffer(gradOutput);
+        using var gpuIn = Gpu.AllocateBuffer(input);
+        using var gpuW = Gpu.AllocateBuffer(weights);
+        using var gpuGi = Gpu.AllocateBuffer(B * I * 8);
+        Gpu.OctonionLinearBackwardInput(gpuGo, gpuIn, gpuW, gpuGi, B, I, O);
+        var analyticGrad = Gpu.DownloadBuffer(gpuGi);
 
         float worstDiff = 0f;
         int worstIdx = -1;
@@ -713,4 +700,51 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
             $"Gradient mismatch at input[{worstIdx}]: numerical={worstNumerical:G6}, " +
             $"analytic(GPU)={(worstIdx >= 0 ? analyticGrad[worstIdx] : 0f):G6}, diff={worstDiff:G6}");
     }
+}
+
+[Collection("VulkanGlobalState")]
+public sealed class HyperbolicOctonionGpuCorrectnessTests : HyperbolicOctonionGpuCorrectnessTestsBase
+{
+    public HyperbolicOctonionGpuCorrectnessTests() : base(CreateVulkan(out string? reason), reason) { }
+
+    // VulkanBackend is a singleton, so it is not disposed here.
+    private static VulkanBackend? CreateVulkan(out string? skipReason)
+    {
+        skipReason = null;
+        try
+        {
+            var vulkan = VulkanBackend.Instance;
+            if (!vulkan.Initialize()) { skipReason = "Vulkan GPU backend not available"; return null; }
+            // Octonion + hyperbolic kernels are emitted as GLSL and compiled at runtime. When libshaderc is missing the
+            // pipelines silently no-op (GlslQuadOp returns early), the output buffer stays at its zero-allocation fill,
+            // and the CPU-GPU comparison reads "GPU=0" vs a non-zero CPU result. That's an environment gap, not a
+            // kernel bug, so skip instead of failing on every dev box that hasn't installed shaderc.
+            if (!vulkan.IsGlslCompilerAvailable)
+                skipReason = "GLSL runtime compiler (libshaderc) unavailable — install to run octonion/hyperbolic GPU tests.";
+            return vulkan;
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or PlatformNotSupportedException or TypeInitializationException
+            or InvalidOperationException)
+        {
+            skipReason = "Vulkan GPU backend not available";
+            return null;
+        }
+    }
+}
+
+[Collection("DirectGpuSerial")]
+public sealed class HipHyperbolicOctonionGpuCorrectnessTests : HyperbolicOctonionGpuCorrectnessTestsBase,
+    IClassFixture<HipTensorEngineTestFixture>
+{
+    // The fixture owns the backend: constructing a HipBackend compiles every module, too slow to repeat per test.
+    public HipHyperbolicOctonionGpuCorrectnessTests(HipTensorEngineTestFixture fixture)
+        : base(fixture.IsAvailable ? fixture.Engine?.GetBackend() : null, fixture.IsAvailable ? null : "HIP GPU backend not available") { }
+}
+
+[Collection("OpenClBackend")]
+public sealed class OpenClHyperbolicOctonionGpuCorrectnessTests : HyperbolicOctonionGpuCorrectnessTestsBase,
+    IClassFixture<OpenClBackendTestFixture>
+{
+    public OpenClHyperbolicOctonionGpuCorrectnessTests(OpenClBackendTestFixture fixture)
+        : base(fixture.Backend, fixture.Backend is null ? "OpenCL GPU backend not available" : null) { }
 }
