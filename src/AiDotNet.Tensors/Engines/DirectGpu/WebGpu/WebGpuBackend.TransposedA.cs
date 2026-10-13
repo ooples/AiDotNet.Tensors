@@ -24,7 +24,8 @@ fn gemm_transposed_a(@builtin(global_invocation_id) gid: vec3<u32>) {
         acc = acc + A[kk * params.M + row] * B[kk * params.N + col];
     }
     if (params.beta != 0.0) {
-        C[idx] = params.alpha * acc + params.beta * C[idx];
+        // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+        C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
     } else {
         C[idx] = params.alpha * acc;
     }

@@ -9768,7 +9768,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[5] = &nMels;
 
 
-            LaunchKernel2D(kernel, gridX, gridY, 1, (uint)DefaultBlockSize, args);
+            // The kernel indexes mels as blockIdx.y * blockDim.x + threadIdx.x: the block is DefaultBlockSize wide in x.
+            // It was launched (1, DefaultBlockSize), so each block computed one mel band and the rest stayed unwritten.
+            LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
             Synchronize();
             }
     }
