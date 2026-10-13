@@ -81,8 +81,8 @@ internal sealed class PersistentParallelExecutor
         public readonly int Stride;
         /// <summary>Distinct per dispatch: a worker joins a dispatch at most once.</summary>
         public readonly long Id;
-        /// <summary>Plain mode: the next unclaimed chunk (claimed with Interlocked.Increment).</summary>
-        public int Next;
+        /// <summary>Plain mode: 1 once a participant has taken the chunk (Interlocked.Exchange), so each runs once.</summary>
+        public readonly int[]? Claimed;
         /// <summary>Plain mode: chunks not yet finished; the dispatch completes when this reaches zero.</summary>
         public int Pending;
 
@@ -99,6 +99,8 @@ internal sealed class PersistentParallelExecutor
             Stride = stride;
             Id = Interlocked.Increment(ref s_ids);
             Pending = numChunks;
+            if (localBody is null)
+                Claimed = new int[numChunks];
         }
     }
 
@@ -381,27 +383,36 @@ internal sealed class PersistentParallelExecutor
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
     /// <summary>
-    /// Plain mode: claim chunks from <c>job.Next</c> until none are left, running each; whoever finishes the last
-    /// chunk signals the dispatcher. Claiming instead of a fixed strided set means a woken worker that does not get
-    /// a core (another runtime's spinning threads, a busy CI host) delays nothing: the others take its chunks. With
-    /// the fixed sets one starved worker held the whole dispatch: an ONNX MatMul chain run right after ONNX Runtime
-    /// (whose pool keeps spinning after Run) took 21.8 ms on its first call against ~40 us steady (#1248).
-    /// Chunks write disjoint output, so the order they run in does not change results.
+    /// Plain mode. A participant first runs its own strided set (p, p+stride, ...), exactly the chunks the fixed
+    /// assignment gave it, so a repeated op keeps each chunk on the same core and its data in that core's cache
+    /// (1M-element elementwise ops run from L2 at ~1 TB/s; scattering chunks across cores made them ~10x slower).
+    /// Each chunk is taken with an atomic flag, so a participant that has finished its own set then steals chunks
+    /// nobody has started, scanning from the far end. A woken worker that does not get a core (another runtime's
+    /// spinning threads, a busy CI host) therefore delays nothing: its chunks are run by the others. With fixed sets
+    /// alone, one starved worker held the whole dispatch: an ONNX MatMul chain run right after ONNX Runtime (whose
+    /// pool keeps spinning after Run) took 21.8 ms on its first call against ~40 us steady (#1248). Whoever finishes
+    /// the last chunk signals the dispatcher. Chunks write disjoint output, so who runs them does not change results.
     /// </summary>
     [MethodImpl(Hot)]
-    private Exception? RunClaimedChunksPublishing(Job job) => RunClaimedChunks(job, publish: true);
-
-    [MethodImpl(Hot)]
-    private Exception? RunClaimedChunks(Job job, bool publish = false)
+    private Exception? RunOwnedThenSteal(Job job, int participant, bool publish)
     {
         Exception? first = null;
         var action = job.Action!;
-        int numChunks = job.NumChunks;
-        while (true)
+        var claimed = job.Claimed!;
+        int numChunks = job.NumChunks, stride = job.Stride;
+        if (participant < stride)
         {
-            int c = Interlocked.Increment(ref job.Next) - 1;
-            if (c >= numChunks)
-                return first;
+            for (int c = participant; c < numChunks; c += stride)
+                if (Interlocked.Exchange(ref claimed[c], 1) == 0)
+                    RunOne(c);
+        }
+        for (int c = numChunks - 1; c >= 0 && Volatile.Read(ref job.Pending) > 0; c--)
+            if (Volatile.Read(ref claimed[c]) == 0 && Interlocked.Exchange(ref claimed[c], 1) == 0)
+                RunOne(c);
+        return first;
+
+        void RunOne(int c)
+        {
             try { action(c); }
             catch (Exception ex)
             {
@@ -612,8 +623,9 @@ internal sealed class PersistentParallelExecutor
             lastJobId = job.Id;
             if (job.LocalBody is null)
             {
-                // Plain mode: claim chunks. A chunk's exception is published before the chunk counts as finished.
-                _ = RunClaimedChunksPublishing(job);
+                // Plain mode: its own set if this dispatch woke it, then steal. A chunk's exception is published
+                // before the chunk counts as finished.
+                _ = RunOwnedThenSteal(job, slot + 1, publish: true);
                 continue;
             }
             if (slot >= job.Stride - 1)
@@ -819,10 +831,10 @@ internal sealed class PersistentParallelExecutor
                     _workReady[i].Set();
                 }
 
-                // The calling thread claims chunks like every worker, then waits for the chunks still running
-                // elsewhere -- not for every woken worker: one that has not started claims nothing and is not
-                // waited on.
-                Exception? mainException = RunClaimedChunks(job);
+                // The calling thread runs its own set (participant 0) and steals what is left, then waits for the
+                // chunks still running elsewhere -- not for every woken worker: one that has not started holds no
+                // chunk and is not waited on.
+                Exception? mainException = RunOwnedThenSteal(job, 0, publish: false);
                 WaitForZero(ref job.Pending);
 
                 _job = null; // release the body's captured references for GC between dispatches
