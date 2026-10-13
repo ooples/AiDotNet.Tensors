@@ -73,6 +73,50 @@ public class ArenaTrainingStepTests
     }
 
     /// <summary>
+    /// A backward that rents its gradient from <see cref="TensorPool{T}"/> (Narrow's does) must not be handed memory
+    /// the arena reissues after a reset. TensorPool outlives every arena reset, so a pooled arena-backed tensor came
+    /// back from Rent while the arena gave the same buffer to a live tensor of the next step: from the second step on,
+    /// the narrowed rows' gradient was overwritten (0.34 off on an [8, 8] weight).
+    /// </summary>
+    [Fact]
+    public void NarrowBackward_AfterArenaReset_MatchesTheNoArenaGradients()
+    {
+        var rng = new Random(2307);
+        var x = new Tensor<double>(new[] { 8, 8 });
+        for (int i = 0; i < x.Length; i++) x[i] = rng.NextDouble() - 0.5;
+        var initial = new double[64];
+        for (int i = 0; i < initial.Length; i++) initial[i] = rng.NextDouble() - 0.5;
+
+        List<double[]> Train(bool arena)
+        {
+            TensorPool<double>.Clear();
+            var w = new Tensor<double>(new[] { 8, 8 });
+            for (int i = 0; i < w.Length; i++) w[i] = initial[i];
+            var gradients = new List<double[]>();
+            using var scope = arena ? TensorArena.Create() : null;
+            for (int step = 0; step < 4; step++)
+            {
+                scope?.Reset();
+                using var tape = new GradientTape<double>();
+                var y = _engine.TensorNarrow(_engine.TensorMatMulTransposed(x, w), 1, 2, 3);
+                var loss = _engine.ReduceSum(_engine.TensorMultiply(y, y), null);
+                var g = tape.ComputeGradients(loss, new[] { w })[w];
+                gradients.Add(g.ToArray());
+                using (new NoGradScope<double>())
+                    _engine.TensorSubtractInPlace(w, _engine.TensorMultiplyScalar(g, 0.01));
+            }
+            return gradients;
+        }
+
+        var expected = Train(arena: false);
+        var actual = Train(arena: true);
+        for (int step = 0; step < expected.Count; step++)
+            for (int i = 0; i < expected[step].Length; i++)
+                Assert.True(expected[step][i] == actual[step][i],
+                    $"step {step}, element {i}: {actual[step][i]:R} under the arena, {expected[step][i]:R} without it");
+    }
+
+    /// <summary>
     /// #1031: a WGAN-critic step. Gradient step on [1, 64] and [64, 1] weights, then weight clipping written back with
     /// <c>TensorCopy(TensorClamp(w, lo, hi), w)</c>, repeated inside one arena. The weights must equal the same sequence
     /// run outside any arena, and every backward must succeed.

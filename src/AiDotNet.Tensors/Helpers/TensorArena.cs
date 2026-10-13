@@ -438,6 +438,22 @@ public sealed class TensorArena : IDisposable
     /// </summary>
     internal static TensorArena? Current => _current;
 
+    // Every backing array an arena has issued, for as long as the array lives. An arena array outlives the step that
+    // rented it: Reset hands it to the next rent of this arena, and Dispose hands it to the cross-arena persistent pool
+    // and so to a later arena. Anything that recycles tensors on its own terms (TensorPool) must therefore never keep
+    // one, or the same buffer ends up behind two live tensors. Weak keys, so tracking never extends an array's life.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Array, object> s_issuedArrays = new();
+    private static readonly object s_issuedMarker = new();
+
+    private static void MarkIssued(Array array)
+    {
+        if (!s_issuedArrays.TryGetValue(array, out _))
+            s_issuedArrays.Add(array, s_issuedMarker);
+    }
+
+    /// <summary>True when <paramref name="array"/> was issued by an arena, which may reissue it.</summary>
+    internal static bool IsArenaIssued(Array array) => s_issuedArrays.TryGetValue(array, out _);
+
     // When true, Dispose returns this arena's scratch/ring backing arrays to the
     // cross-arena persistent pool EVEN when nested (_previous != null). Normally
     // only a TOP-LEVEL arena may pool (a nested arena's op outputs can escape to the
@@ -609,6 +625,7 @@ public sealed class TensorArena : IDisposable
     {
         if (_disposed) return null;
         var arr = new T[elementCount];
+        MarkIssued(arr);
         _pinnedArrays.Add(arr);
         TrackBackingBytes<T>(elementCount);
         return arr;
@@ -723,6 +740,7 @@ public sealed class TensorArena : IDisposable
         // path above still clears, because those buffers were handed out earlier
         // THIS lifetime and may hold stale data the caller wrote.)
         var arr = RentPersistent(typeof(T), elementCount) as T[] ?? new T[elementCount];
+        MarkIssued(arr);
         bucket.Add(arr);
         TrackBackingBytes<T>(elementCount);
         _cursor[key] = cursor + 1;
@@ -818,6 +836,7 @@ public sealed class TensorArena : IDisposable
                     if (cached.IsDisposed)
                     {
                         var replacementArray = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
+                        MarkIssued(replacementArray);
                         _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
                         TrackBackingBytes<T>(totalSize);
                         cached = LinearAlgebra.Tensor<T>.FromMemory(
@@ -844,6 +863,7 @@ public sealed class TensorArena : IDisposable
                 // backing array if available (ring tensors are uninitialized:
                 // the caller overwrites every element, so no clear needed).
                 var newArr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
+                MarkIssued(newArr);
                 _ringBackingArrays.Add((typeof(T), totalSize, newArr));
                 TrackBackingBytes<T>(totalSize);
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
@@ -857,6 +877,7 @@ public sealed class TensorArena : IDisposable
         if (_tensorRingCount < MaxTensorRingSlots)
         {
             var arr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
+            MarkIssued(arr);
             _ringBackingArrays.Add((typeof(T), totalSize, arr));
             TrackBackingBytes<T>(totalSize);
             var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);

@@ -122,7 +122,13 @@ public static class TensorPool<T>
         // before applying the backing-layout discriminator. CPU-only —
         // GPU-resident tensors also fail this check so we don't pool device
         // buffers.
-        if (tensor.IsView || tensor.GetLiveBackingArrayOrNull() is null) return;
+        if (tensor.IsView || tensor.GetLiveBackingArrayOrNull() is not { } backing) return;
+
+        // An arena reissues its arrays after every Reset (and, once disposed, through the persistent pool to later
+        // arenas), while this pool outlives all of them. Keeping an arena-backed tensor here put one buffer behind two
+        // live tensors from the next step on: NarrowBackward's RentZeroed gradient was overwritten by the step's own
+        // temporaries. The arena already recycles these, so the pool has nothing to add.
+        if (Helpers.TensorArena.IsArenaIssued(backing)) return;
 
         if (_totalPooled >= MaxTotalPooled) return;
 
