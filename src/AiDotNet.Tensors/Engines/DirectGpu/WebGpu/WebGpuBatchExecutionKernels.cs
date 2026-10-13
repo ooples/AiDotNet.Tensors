@@ -438,6 +438,31 @@ var<workgroup> scratch: array<f32, 256>;
     aIm[i] = xr * yi + xi * yr;
 }");
 
+    // Batched radix-2 FFT (#965): the bit-reversal permute, scaled for the inverse, then one butterfly stage per span.
+    public static readonly string FftBitReverse = Shader(new[] { "r:inRe", "r:inIm", "rw:outRe", "rw:outIm" },
+        "batch: i32, n: i32, log2n: i32, scale: f32", Main + @"
+    if (i >= p.batch * p.n) { return; }
+    let b = i / p.n;
+    var k = u32(i % p.n);
+    var r = 0u;
+    for (var bit = 0; bit < p.log2n; bit++) { r = (r << 1u) | (k & 1u); k = k >> 1u; }
+    outRe[b * p.n + i32(r)] = inRe[i] * p.scale;
+    outIm[b * p.n + i32(r)] = inIm[i] * p.scale;
+}");
+
+    public static readonly string FftButterfly = Shader(new[] { "rw:re", "rw:im" }, "batch: i32, n: i32, span: i32, inverse: i32", Main + @"
+    let pairs = p.n / 2;
+    if (i >= p.batch * pairs) { return; }
+    let b = i / pairs; let j = i % pairs; let pos = j % p.span;
+    let i0 = b * p.n + (j / p.span) * 2 * p.span + pos; let i1 = i0 + p.span;
+    let a = select(-3.14159265358979323846, 3.14159265358979323846, p.inverse != 0) * f32(pos) / f32(p.span);
+    let wr = cos(a); let wi = sin(a);
+    let xr = re[i1]; let xi = im[i1];
+    let tr = wr * xr - wi * xi; let ti = wr * xi + wi * xr;
+    let ur = re[i0]; let ui = im[i0];
+    re[i0] = ur + tr; im[i0] = ui + ti;
+    re[i1] = ur - tr; im[i1] = ui - ti;
+}");
     public static readonly string FftBluesteinPost = Shader(new[] { "r:padRe", "r:padIm", "r:chirpRe", "r:chirpIm", "rw:re", "rw:im" },
         "batch: i32, n: i32, m: i32, scale: f32", Main + @"
     if (i >= p.batch * p.n) { return; }
@@ -1173,7 +1198,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         ["bx_gaussian_noise"] = GaussianNoise, ["bx_gumbel_softmax"] = GumbelSoftmax,
         ["bx_batch_outer_product"] = BatchOuterProduct, ["bx_meshgrid2d"] = Meshgrid2D,
         ["bx_fft_chirp"] = FftChirp, ["bx_fft_bluestein_pre"] = FftBluesteinPre, ["bx_fft_cmul"] = FftCmul,
-        ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
+        ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_bit_reverse"] = FftBitReverse, ["bx_fft_butterfly"] = FftButterfly, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
         [BatchExecutionCudaKernels.LaSymmetrize] = LaSymmetrize, [BatchExecutionCudaKernels.LaLuSolve] = LaLuSolve,
         [BatchExecutionCudaKernels.LaLdlFactor] = LaLdlFactor, [BatchExecutionCudaKernels.LaLdlSolve] = LaLdlSolve,
         [BatchExecutionCudaKernels.LaSolveVector] = LaSolveVector, [BatchExecutionCudaKernels.LaTriangularSolveVector] = LaTriangularSolveVector,

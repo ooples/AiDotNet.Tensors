@@ -685,6 +685,13 @@ public sealed partial class WebGpuBackend
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
         int batch, int n, bool inverse)
     {
+        // #965: a power-of-two length runs the radix-2 kernels (O(n log n)); fft_1d below is a direct O(n^2) DFT, kept for
+        // the other lengths. The generic FFT's power-of-two transforms and all three Bluestein transforms land here.
+        if (n > 0 && (n & (n - 1)) == 0)
+        {
+            PortableGenericFft.BatchedRadix2(this, LaunchBatch, inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
+            return;
+        }
         // FFTSource fft_1d: batched DFT kernel
         var uniforms = new float[]
         {
