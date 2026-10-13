@@ -17,7 +17,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// </summary>
 public sealed class RocRand : IDeviceRng
 {
-    private readonly CpuPhiloxGenerator _cpuFallback;
+    private readonly IDeviceRng _cpuFallback;
 
     /// <summary>True when <c>librocrand</c> is loadable on this host.</summary>
     public static bool IsAvailable => RocRandNative.IsAvailable;
@@ -49,11 +49,8 @@ public sealed class RocRand : IDeviceRng
     public RocRand(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
         ulong subsequence = 0, ulong offset = 0)
     {
-        if (algo != DeviceRngAlgorithm.Philox)
-            throw new NotSupportedException(
-                $"RocRand currently implements only {DeviceRngAlgorithm.Philox}; requested {algo}.");
         Algorithm = algo;
-        _cpuFallback = new CpuPhiloxGenerator(seed, subsequence, offset);
+        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset);
     }
 
     /// <inheritdoc/>
