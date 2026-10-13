@@ -73,6 +73,14 @@ public sealed class CpuMrg32k3aGenerator : IDeviceRng
         set => Reset(value);
     }
 
+    /// <summary>
+    /// True while every value since the offset was last set came from a uniform-consuming call (uniform or
+    /// Bernoulli), so <see cref="Offset"/> is the exact position cuRAND's <c>curandSetGeneratorOffset</c> would
+    /// resume from. A normal call clears it (see the remarks on <see cref="Offset"/>); setting the offset sets it
+    /// again. <see cref="DirectGpu.CUDA.CuRand"/> generates on the device only while it holds.
+    /// </summary>
+    internal bool OffsetIsExact => _onlyUniform;
+
     /// <inheritdoc/>
     public ulong Subsequence
     {
