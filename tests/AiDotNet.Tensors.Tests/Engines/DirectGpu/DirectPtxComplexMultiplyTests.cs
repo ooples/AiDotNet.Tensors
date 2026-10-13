@@ -1469,7 +1469,7 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("exact-shape count=65536 block=256 op=db-to-power", ptx);
         Assert.Contains("ld.param.f32 %f3, [ref_val]", ptx);
         Assert.Contains("ex2.approx.f32", ptx);
-        Assert.Equal(3, Count(ptx, "mul.rn.f32"));   // db*const, refSq, *refSq
+        Assert.Equal(2, Count(ptx, "mul.rn.f32"));   // db*const, *refValue
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
         Assert.True(PtxDbToPowerF32Kernel.IsSupportedShape(65536));
         Assert.False(PtxDbToPowerF32Kernel.IsPromotedShape(65536));
@@ -1512,7 +1512,8 @@ public class DirectPtxComplexMultiplyTests
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
             "The candidate is admitted only on SM86.");
         const int n = 65536;
-        const float refValue = 1.0f, minDb = -80.0f;
+        // A reference other than 1, so the test pins what refValue means: a power reference (#1236).
+        const float refValue = 2.5f, minDb = -80.0f;
         using var toDb = new PtxPowerToDbF32Kernel(runtime, n);
         using var toPower = new PtxDbToPowerF32Kernel(runtime, n);
         var power = new float[n];
@@ -1520,7 +1521,7 @@ public class DirectPtxComplexMultiplyTests
         for (int i = 0; i < n; i++) power[i] = (float)(random.NextDouble() * 4 + 1e-3);   // above the floor
         var expectedDb = new double[n];
         for (int i = 0; i < n; i++)
-            expectedDb[i] = Math.Max(10.0 * Math.Log10(Math.Max(power[i], 1e-10) / (refValue * (double)refValue)), minDb);
+            expectedDb[i] = Math.Max(10.0 * Math.Log10(Math.Max(power[i], 1e-10) / (double)refValue), minDb);
 
         using var pB = runtime.AllocateBytes(toDb.Blueprint.Tensors[0].RequiredBytes);
         using var dB = runtime.AllocateBytes(toDb.Blueprint.Tensors[1].RequiredBytes);

@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Decibel-to-power conversion for issue #850, matching the NVRTC <c>db_to_power</c> kernel:
-/// <c>power[i] = pow(10, db[i]/10) * refValue^2</c>. PTX has no pow primitive, so the base-10 exponential
+/// <c>power[i] = pow(10, db[i]/10) * refValue</c>. PTX has no pow primitive, so the base-10 exponential
 /// is computed as <c>ex2.approx(db[i] * (log2(10)/10))</c>; the specialization is therefore covered by a
 /// TOLERANCE-based parity spec, not bit-exact. The <c>refValue</c> scalar is a per-launch <c>.param .f32</c>.
 /// The element <c>count</c> is baked and the launch covers it exactly (no bounds guard). Two pointers plus
@@ -117,8 +117,7 @@ internal sealed class PtxDbToPowerF32Kernel : IDisposable
         ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");        // db
         ptx.AppendLine($"    mul.rn.f32 %f0, %f0, {log2Of10Over10};"); // db * log2(10)/10
         ptx.AppendLine("    ex2.approx.f32 %f0, %f0;");             // pow(10, db/10)
-        ptx.AppendLine("    mul.rn.f32 %f1, %f3, %f3;");            // refSq
-        ptx.AppendLine("    mul.rn.f32 %f0, %f0, %f1;");            // * refSq
+        ptx.AppendLine("    mul.rn.f32 %f0, %f0, %f3;");            // * refValue (a power reference, #941)
         ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
         ptx.AppendLine("    st.global.f32 [%rd5], %f0;");
         ptx.AppendLine("    ret;");
@@ -149,7 +148,7 @@ internal sealed class PtxDbToPowerF32Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "power[i] = pow(10, db[i]/10) * refValue^2",
+                ["formula"] = "power[i] = pow(10, db[i]/10) * refValue",
                 ["mode"] = "inference-forward-db-to-power",
                 ["arithmetic"] = "ex2.approx of db*log2(10)/10; tolerance-based parity, not bit-exact",
                 ["scalars"] = "refValue is a per-launch .param .f32",
