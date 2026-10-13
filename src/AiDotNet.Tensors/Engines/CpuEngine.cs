@@ -10924,7 +10924,19 @@ public partial class CpuEngine : ITensorLevelEngine
             // im2col, so blocking would only add per-block overhead). Bit-identical output.
             bool isPointwiseIdentity = kernelHeight == 1 && kernelWidth == 1
                 && stride == 1 && padding == 0 && dilation == 1;
-            if (isPointwiseIdentity || t_forceFullIm2Col)
+            // #653: the row-blocked implicit GEMM runs one GEMM per block of output rows, and those narrow GEMMs stop
+            // scaling at about 8 threads, while one GEMM over the whole column matrix keeps scaling. Measured on a
+            // 16-core 3950X, batch 1, implicit -> full im2col in ms: 320ch@32x32 at 16 threads 6.85 -> 3.96, at 8 8.86 ->
+            // 7.09; 320ch@64x64 at 16 25.7 -> 17.5 and even at 1 thread 200 -> 133; 640ch@16x16 at 16 5.24 -> 4.08;
+            // 256ch@32x32 at 16 4.38 -> 2.41. Below 8 threads small planes go either way (320ch@32x32 at 1: 43.1 vs
+            // 49.8), so the implicit path keeps them. The full matrix is one image's [colH, colW] buffer, reused per
+            // image; above FullIm2ColMaxBytes the implicit path keeps its memory bound.
+            long fullIm2ColBytes = (long)inChannels * kernelHeight * kernelWidth * outputHeight * outputWidth * sizeof(float);
+            bool fullIm2ColScales = highChannelNonWinograd
+                && (Helpers.CpuParallelSettings.MaxDegreeOfParallelism >= FullIm2ColMinThreads
+                    || (long)outputHeight * outputWidth >= FullIm2ColMinPlane)
+                && fullIm2ColBytes <= FullIm2ColMaxBytes;
+            if (isPointwiseIdentity || t_forceFullIm2Col || fullIm2ColScales)
             {
                 Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
@@ -11264,6 +11276,11 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
         }
     }
+
+    // #653 full-im2col routing for high-channel 3x3 convs (see the gate in Conv2DWithIm2ColFloat).
+    private const int FullIm2ColMinThreads = 8;
+    private const long FullIm2ColMinPlane = 64L * 64;
+    private const long FullIm2ColMaxBytes = 128L * 1024 * 1024;
 
     // Test-only override: forces the high-channel float forward conv onto the full-matrix im2col
     // path instead of the fused (implicit-GEMM) path, so a parity test can assert the two are
