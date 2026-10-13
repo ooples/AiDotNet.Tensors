@@ -659,7 +659,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(Kernels.HipOctonionKernels.GetSource(), "octonion", ref _octonionModule,
                 Kernels.HipOctonionKernels.GetKernelNames().Where(name => name != "octonion_linear_forward").ToArray());
             CompileKernelModule(Kernels.HipDotProductKernels.GetSource(), "dot_product", ref _dotProductModule,
-                new[] { "batched_dot_product" });
+                Kernels.HipDotProductKernels.GetKernelNames());
 
             // Compile Sparse kernels (CSR SpMM, GNN message passing)
             CompileKernelModule(HipSparseKernels.GetSource(), "sparse", ref _sparseModule,

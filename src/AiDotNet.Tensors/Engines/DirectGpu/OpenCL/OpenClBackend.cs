@@ -668,12 +668,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 try
                 {
                     var octonionProgram = CompileOrLoadCached(OctonionKernels.GetSource(), optimizationFlags, "Octonion kernels");
-                    _programs.Add(octonionProgram);
+                    // Commit program + kernels together, as the Detection block does, so a kernel that fails to build
+                    // does not leave _kernelCache half-populated.
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
                     foreach (var name in OctonionKernels.GetKernelNames())
                     {
                         if (!_kernelCache.ContainsKey(name))
-                            _kernelCache[name] = new DirectOpenClKernel(_context, octonionProgram, name);
+                            built.Add((name, new DirectOpenClKernel(_context, octonionProgram, name)));
                     }
+                    _programs.Add(octonionProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
@@ -685,17 +689,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 try
                 {
                     var missingLookupProgram = CompileOrLoadCached(OpenClMissingLookupKernels.GetSource(), optimizationFlags, "Missing-lookup kernels");
-                    _programs.Add(missingLookupProgram);
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
                     foreach (var name in OpenClMissingLookupKernels.GetKernelNames())
                     {
                         if (!_kernelCache.ContainsKey(name))
-                            _kernelCache[name] = new DirectOpenClKernel(_context, missingLookupProgram, name);
+                            built.Add((name, new DirectOpenClKernel(_context, missingLookupProgram, name)));
                     }
+                    _programs.Add(missingLookupProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
                     System.Diagnostics.Trace.TraceWarning($"OpenCL missing-lookup kernels unavailable; those ops use the CPU path: {ex.Message}");
-                }                // Compile FP16 conversion kernels (half-precision float conversion)
+                }
+
+                // Compile FP16 conversion kernels (half-precision float conversion)
                 var fp16Program = CompileOrLoadCached(Fp16Kernels.GetSource(), optimizationFlags, "FP16 conversion kernels");
                 _programs.Add(fp16Program);
                 foreach (var name in Fp16Kernels.GetKernelNames())
@@ -3683,7 +3691,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             reduceKernel.SetArg(0, partialClBuf.Handle);
             reduceKernel.SetArg(1, bufR.Handle);
             reduceKernel.SetArg(2, numGroups);
-            int reduceLocal = Math.Min(localSize, numGroups);
+            // reduce_partial_sums halves its work-group in a tree, so the group size must be a power of two: min(256, numGroups)
+            // dropped partial sums whenever the group count was not one (20 groups for 5000 elements). The strided loop
+            // covers every partial at any group size.
+            int reduceLocal = 1;
+            while (reduceLocal * 2 <= Math.Min(localSize, numGroups)) reduceLocal *= 2;
             reduceKernel.SetLocalArg(3, reduceLocal * sizeof(float));
             reduceKernel.Execute1D(reduceLocal, reduceLocal);
         }
@@ -3720,7 +3732,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             reduceKernel.SetArg(0, partialClBuf.Handle);
             reduceKernel.SetArg(1, bufR.Handle);
             reduceKernel.SetArg(2, numGroups);
-            int reduceLocal = Math.Min(localSize, numGroups);
+            // reduce_partial_sums halves its work-group in a tree, so the group size must be a power of two: min(256, numGroups)
+            // dropped partial sums whenever the group count was not one (20 groups for 5000 elements). The strided loop
+            // covers every partial at any group size.
+            int reduceLocal = 1;
+            while (reduceLocal * 2 <= Math.Min(localSize, numGroups)) reduceLocal *= 2;
             reduceKernel.SetLocalArg(3, reduceLocal * sizeof(float));
             reduceKernel.Execute1D(reduceLocal, reduceLocal);
         }
@@ -14099,7 +14115,9 @@ KERNEL VARIANTS (A/B testing):
             _context?.Dispose();
         }
 
-        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("reduce_mean", i, o, sz); }
+        // o[0] = mean(i[0 .. sz)). This went through ExecuteActivation("reduce_mean"), a kernel no OpenCL program defines, so
+        // it threw and ran on the CPU; the row sum (split across compute units for one long row) and a scale do it.
+        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { if (sz <= 0) return; SumAxis(i, o, 1, sz); Scale(o, o, 1f / sz, 1); }
         public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if (_context == null) return; var k = _kernelCache["clip_kernel"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, mn); k.SetArg(3, mx); k.SetArg(4, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { if (_context == null) return; var k = _kernelCache["pow_scalar"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, ex); k.SetArg(3, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("frac_kernel", i, o, sz); }

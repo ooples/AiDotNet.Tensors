@@ -254,6 +254,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private bool _fusedAdvancedKernelsAvailable;
     private IntPtr _activationModule;
     private IntPtr _torchParityElementwiseModule;
+    private IntPtr _octonionModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
     private IntPtr _poolingModule;
@@ -1154,11 +1155,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // module: a compile failure leaves these ops on the CPU path rather than disabling the backend.
         try
         {
-            CompileKernelModule(device, Kernels.CudaOctonionKernels.GetSource(), "octonion_kernels",
+            _octonionModule = CompileKernelModule(device, Kernels.CudaOctonionKernels.GetSource(), "octonion_kernels",
                 Kernels.CudaOctonionKernels.GetKernelNames().Where(name => name != "octonion_linear_forward").ToArray());
         }
         catch (Exception ex)
         {
+            _octonionModule = IntPtr.Zero;
             System.Diagnostics.Trace.TraceWarning($"CUDA octonion kernels unavailable; those ops use the CPU path: {ex.Message}");
         }
         // PyTorch-parity elementwise ops that computed on the host (#1112). useFastMath:false -- erff, log1pf, expf
@@ -18061,6 +18063,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
             _torchParityElementwiseModule = IntPtr.Zero;
+        }
+        if (_octonionModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_octonionModule);
+            _octonionModule = IntPtr.Zero;
         }
 
         if (_parity210Module != IntPtr.Zero)

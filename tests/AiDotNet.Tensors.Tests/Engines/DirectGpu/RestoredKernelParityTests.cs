@@ -201,6 +201,72 @@ public abstract class RestoredKernelParityTestsBase
         backend.BroadcastMultiplyLastAxis(da, db, dOut, outer, inner);
         AssertClose(expected, backend.DownloadBuffer(dOut), 1e-6, "BroadcastMultiplyLastAxis");
     }
+    // The outputs start as a sentinel, so a result accumulated without zeroing first (the atomicAdd kernels) fails.
+    [SkippableTheory]
+    [InlineData(false, 1)]
+    [InlineData(false, 1000)]
+    [InlineData(false, 100_003)]
+    [InlineData(true, 1000)]
+    [InlineData(true, 100_003)]
+    public void DotProduct_MatchesCpu(bool deterministic, int size)
+    {
+        var backend = Backend();
+        float[] a = Values(size, 20 + size), b = Values(size, 21 + size);
+        double expected = 0;
+        for (int i = 0; i < size; i++) expected += (double)a[i] * b[i];
+        using var da = backend.AllocateBuffer(a);
+        using var db = backend.AllocateBuffer(b);
+        using var dOut = Filled(backend, 1, Sentinel);
+        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
+        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(deterministic);
+        try { backend.DotProduct(da, db, dOut, size); }
+        finally { AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous); }
+        float actual = backend.DownloadBuffer(dOut)[0];
+        Assert.True(Math.Abs(expected - actual) <= 1e-4 * Math.Sqrt(size) * 4, $"DotProduct({size}, deterministic={deterministic}): expected {expected:R}, got {actual:R}");
+    }
+
+    // result = sum(a[i] * b[bOffset + i * bStride]); a stride of 0 reads one element of b throughout.
+    [SkippableTheory]
+    [InlineData(false, 300, 3, 2)]
+    [InlineData(false, 5000, 7, 0)]
+    [InlineData(true, 300, 3, 2)]
+    [InlineData(true, 5000, 7, 0)]
+    public void StridedDotProduct_MatchesCpu(bool deterministic, int aSize, int bOffset, int bStride)
+    {
+        var backend = Backend();
+        int bSize = bOffset + Math.Max(1, (aSize - 1) * bStride + 1);
+        float[] a = Values(aSize, 22 + aSize), b = Values(bSize, 23 + bSize);
+        double expected = 0;
+        for (int i = 0; i < aSize; i++) expected += (double)a[i] * b[bOffset + i * bStride];
+        using var da = backend.AllocateBuffer(a);
+        using var db = backend.AllocateBuffer(b);
+        using var dOut = Filled(backend, 1, Sentinel);
+        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
+        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(deterministic);
+        try { backend.StridedDotProduct(da, db, dOut, aSize, bSize, bOffset, bStride); }
+        finally { AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous); }
+        float actual = backend.DownloadBuffer(dOut)[0];
+        Assert.True(Math.Abs(expected - actual) <= 1e-4 * Math.Sqrt(aSize) * 4,
+            $"StridedDotProduct({aSize}, +{bOffset}, x{bStride}, deterministic={deterministic}): expected {expected:R}, got {actual:R}");
+    }
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(1000)]
+    [InlineData(1_000_003)]
+    public void ReduceMean_MatchesCpu(int size)
+    {
+        var backend = Backend();
+        float[] x = Values(size, 24 + size);
+        double expected = 0;
+        for (int i = 0; i < size; i++) expected += x[i];
+        expected /= size;
+        using var dx = backend.AllocateBuffer(x);
+        using var dOut = Filled(backend, 1, Sentinel);
+        backend.ReduceMean(dx, dOut, size);
+        float actual = backend.DownloadBuffer(dOut)[0];
+        Assert.True(Math.Abs(expected - actual) <= 1e-5 * Math.Max(1.0, Math.Sqrt(size) * 2 / size * 100),
+            $"ReduceMean({size}): expected {expected:R}, got {actual:R}");
+    }
     [SkippableFact]
     public void Fma_MatchesCpu()
     {

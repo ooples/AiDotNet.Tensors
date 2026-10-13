@@ -7,6 +7,8 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -373,6 +375,45 @@ public abstract class HyperbolicOctonionGpuCorrectnessTestsBase : IDisposable
     // Octonion Algebra Tests
     // =====================================================================
 
+    // A base point near the boundary and a long tangent saturate tanh, so the Mobius sum's float numerator and
+    // denominator can cancel; the result must still be finite and strictly inside the ball (the CPU engine projects it
+    // back to (1 - 1e-5) / sqrt(c), and so do the kernels).
+    [SkippableTheory]
+    [InlineData(1.0f)]
+    [InlineData(0.5f)]
+    public void PoincareExpMap_NearTheBoundary_StaysInsideTheBall(float curvature)
+    {
+        SkipIfNoGpu();
+        const int batch = 32, dim = 16;
+        float radius = 1f / MathF.Sqrt(curvature);
+        var bp = new float[batch * dim];
+        var tv = new float[batch * dim];
+        var rng = RandomHelper.CreateSeededRandom(1260);
+        for (int b = 0; b < batch; b++)
+        {
+            // x at 0.999 of the radius along a random direction; v long, along +x for even rows and -x for odd rows.
+            double norm = 0;
+            for (int d = 0; d < dim; d++) { bp[b * dim + d] = (float)(rng.NextDouble() * 2 - 1); norm += bp[b * dim + d] * bp[b * dim + d]; }
+            float s = (float)(0.999 * radius / Math.Sqrt(norm));
+            float sign = b % 2 == 0 ? 1f : -1f;
+            for (int d = 0; d < dim; d++) { bp[b * dim + d] *= s; tv[b * dim + d] = sign * 50f * bp[b * dim + d]; }
+        }
+        using var gBp = Gpu.AllocateBuffer(bp);
+        using var gTv = Gpu.AllocateBuffer(tv);
+        using var gOut = Gpu.AllocateBuffer(batch * dim);
+        Gpu.PoincareExpMap(gBp, gTv, gOut, batch, dim, curvature);
+        var result = Gpu.DownloadBuffer(gOut);
+        for (int b = 0; b < batch; b++)
+        {
+            double norm = 0;
+            for (int d = 0; d < dim; d++)
+            {
+                Assert.False(float.IsNaN(result[b * dim + d]) || float.IsInfinity(result[b * dim + d]), $"row {b} is not finite");
+                norm += (double)result[b * dim + d] * result[b * dim + d];
+            }
+            Assert.True(Math.Sqrt(norm) < radius, $"row {b}: norm {Math.Sqrt(norm)} is not inside the ball of radius {radius}");
+        }
+    }
     [SkippableTheory]
     [InlineData(1)]
     [InlineData(32)]
@@ -741,6 +782,37 @@ public sealed class HipHyperbolicOctonionGpuCorrectnessTests : HyperbolicOctonio
         : base(fixture.IsAvailable ? fixture.Engine?.GetBackend() : null, fixture.IsAvailable ? null : "HIP GPU backend not available") { }
 }
 
+/// <summary>One CUDA backend per test class, or none (and a reason) when there is no NVIDIA driver and GPU.</summary>
+public sealed class CudaHyperbolicOctonionFixture : IDisposable
+{
+    public CudaBackend? Backend { get; }
+
+    public CudaHyperbolicOctonionFixture()
+    {
+        try
+        {
+            if (!DirectPtxRuntime.IsAvailable) return;
+            var backend = new CudaBackend();
+            if (backend.IsAvailable) Backend = backend;
+            else backend.Dispose();
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or PlatformNotSupportedException or TypeInitializationException
+            or InvalidOperationException)
+        {
+            Backend = null;
+        }
+    }
+
+    public void Dispose() => Backend?.Dispose();
+}
+
+[Collection("DirectGpuSerial")]
+public sealed class CudaHyperbolicOctonionGpuCorrectnessTests : HyperbolicOctonionGpuCorrectnessTestsBase,
+    IClassFixture<CudaHyperbolicOctonionFixture>
+{
+    public CudaHyperbolicOctonionGpuCorrectnessTests(CudaHyperbolicOctonionFixture fixture)
+        : base(fixture.Backend, fixture.Backend is null ? "Requires an NVIDIA CUDA driver and GPU." : null) { }
+}
 #if NET6_0_OR_GREATER
 // OpenClBackendTestFixture exists only on .NET 6+.
 [Collection("OpenClBackend")]
@@ -748,6 +820,6 @@ public sealed class OpenClHyperbolicOctonionGpuCorrectnessTests : HyperbolicOcto
     IClassFixture<OpenClBackendTestFixture>
 {
     public OpenClHyperbolicOctonionGpuCorrectnessTests(OpenClBackendTestFixture fixture)
-        : base(fixture.Backend, fixture.Backend is null ? "OpenCL GPU backend not available" : null) { }
+        : base(fixture.IsAvailable ? fixture.Backend : null, fixture.IsAvailable ? null : "OpenCL GPU backend not available") { }
 }
 #endif

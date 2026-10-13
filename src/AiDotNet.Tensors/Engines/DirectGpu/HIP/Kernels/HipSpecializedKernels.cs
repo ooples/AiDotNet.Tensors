@@ -132,9 +132,20 @@ extern ""C"" __global__ __launch_bounds__(256) void poincare_exp_map(
     float denom = 1.0f + 2.0f * c * xsvDot + c * c * xNormSq * svNormSq;
     if (fabsf(denom) < 1e-10f) denom = 1e-10f;
 
+    // Then project back inside the ball, as the CPU engine's ProjectToBall does: near the boundary tanh saturates and the
+    // float Mobius numerator and denominator can cancel, which could otherwise leave the result on or past the boundary.
+    float outNormSq = 0.0f;
     for (int i = 0; i < dim; i++) {
         float scaledV = v[i] * scale;
-        out[i] = (num_coef_x * x[i] + num_coef_sv * scaledV) / denom;
+        float r = (num_coef_x * x[i] + num_coef_sv * scaledV) / denom;
+        out[i] = r;
+        outNormSq += r * r;
+    }
+    float maxNorm = (1.0f - 1e-5f) / sqrtC;
+    float outNorm = sqrtf(outNormSq);
+    if (outNorm > maxNorm) {
+        float shrink = maxNorm / outNorm;
+        for (int i = 0; i < dim; i++) out[i] *= shrink;
     }
 }
 
