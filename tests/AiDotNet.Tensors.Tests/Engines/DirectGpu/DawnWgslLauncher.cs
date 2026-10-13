@@ -42,6 +42,7 @@ for await (const line of rl) {
       if (err) throw new Error(err.message);
       pipelines.set(job.code, pipe);
     }
+    if (job.compileOnly) { console.log(JSON.stringify({ ok: true, out: [] })); continue; }
     const bufs = job.buffers.map(b => {
       const bytes = Buffer.from(b, 'base64');
       const buf = device.createBuffer({ size: Math.max(16, bytes.length), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
@@ -119,6 +120,33 @@ for await (const line of rl) {
     /// <summary>A <see cref="PortableGenericFft.Launcher"/> that runs each launch's WGSL port on Dawn.</summary>
     public PortableGenericFft.Launcher For(IDirectGpuBackend host) => (name, threads, args) => Launch(host, name, threads, args);
 
+    /// <summary>
+    /// Builds <paramref name="name"/>'s compute pipeline on Dawn without dispatching it: null when it compiles, else
+    /// Dawn's error (the way a backend's readiness check asks its device compiler). A hung server is killed and the
+    /// call throws <see cref="TimeoutException"/>, since its stream can no longer be trusted.
+    /// </summary>
+    public string? Compile(string name)
+    {
+        string? source = null;
+        if (!(_modules?.TryGetValue(name, out source) ?? false) && !WebGpuBatchExecutionKernels.ByKernelName.TryGetValue(name, out source))
+            return $"No WGSL port for {name}.";
+        var job = new { code = WebGpuShaderPrelude.Prepare(source ?? ""), compileOnly = true };
+        _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));
+        _node.StandardInput.Flush();
+        var read = _node.StandardOutput.ReadLineAsync();
+        if (!read.Wait(ReplyTimeout))
+        {
+            // Replies are untagged and sequential: a late one would answer the next request. Stop the server, as Launch
+            // does, so nothing reads this launcher's stream again.
+            try { _node.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+            throw new TimeoutException($"{name} on Dawn did not compile within {ReplyTimeout.TotalMinutes} minutes: {StderrText()}");
+        }
+        string? reply = read.Result;
+        if (reply is null) return "Dawn server exited: " + StderrText();
+        using var doc = JsonDocument.Parse(reply);
+        return doc.RootElement.GetProperty("ok").GetBoolean() ? null : doc.RootElement.GetProperty("error").GetString() ?? "compile failed";
+    }
+
     private void Launch(IDirectGpuBackend host, string name, int threads, object[] args)
     {
         if (threads <= 0) return;
@@ -139,9 +167,22 @@ for await (const line of rl) {
             switch (arg)
             {
                 case IGpuBuffer buffer:
-                    float[] data = host.DownloadBuffer(buffer);
-                    var bytes = new byte[data.Length * 4];
-                    Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+                    byte[] bytes;
+                    if (IsByteBuffer(buffer))
+                    {
+                        // A byte buffer (FP16 or int8 operands): its Size is a byte count, and the host reads it
+                        // through its own call. The shader binds it as 32-bit words, so the copy is padded to a
+                        // whole word; the kernels mask every element out of its word and never use the padding.
+                        byte[] raw = host.DownloadByteBuffer(buffer, checked((int)buffer.SizeInBytes));
+                        bytes = new byte[(raw.Length + 3) / 4 * 4];
+                        Buffer.BlockCopy(raw, 0, bytes, 0, raw.Length);
+                    }
+                    else
+                    {
+                        float[] data = host.DownloadBuffer(buffer);
+                        bytes = new byte[data.Length * 4];
+                        Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
+                    }
                     buffers.Add(buffer);
                     encoded.Add(Convert.ToBase64String(bytes));
                     break;
@@ -171,6 +212,14 @@ for await (const line of rl) {
         {
             if (!writable.Contains(b)) continue;
             byte[] bytes = Convert.FromBase64String(outputs[b].GetString() ?? "");
+            if (IsByteBuffer(buffers[b]))
+            {
+                // The shader wrote whole 32-bit words; the buffer holds only SizeInBytes of them.
+                var exact = new byte[checked((int)buffers[b].SizeInBytes)];
+                Buffer.BlockCopy(bytes, 0, exact, 0, Math.Min(exact.Length, bytes.Length));
+                host.UploadByteBuffer(buffers[b], exact);
+                continue;
+            }
             var data = new float[bytes.Length / 4];
             Buffer.BlockCopy(bytes, 0, data, 0, bytes.Length);
             host.UploadBufferInPlace(data, buffers[b]);
@@ -181,6 +230,9 @@ for await (const line of rl) {
     {
         lock (_stderr) return _stderr.ToString();
     }
+
+    // A byte buffer (AllocateByteBuffer) counts its Size in bytes; a float buffer's SizeInBytes is four times its Size.
+    private static bool IsByteBuffer(IGpuBuffer buffer) => buffer.SizeInBytes != (long)buffer.Size * sizeof(float);
 
     public void Dispose()
     {

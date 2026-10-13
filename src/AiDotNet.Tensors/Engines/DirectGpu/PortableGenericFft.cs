@@ -16,6 +16,49 @@ internal static class PortableGenericFft
     /// <summary>Launches a shared batch kernel by name: (kernel, thread count, arguments in kernel order).</summary>
     public delegate void Launcher(string kernel, int threads, params object[] args);
 
+    /// <summary>Every kernel the transforms and storage conversions launch.</summary>
+    internal static readonly string[] KernelNames =
+    {
+        "bx_fft_to_storage", "bx_fft_from_storage", "bx_fft_chirp", "bx_fft_bluestein_pre", "bx_fft_cmul", "bx_fft_bluestein_post",
+        "bx_fft_bit_reverse", "bx_fft_butterfly",
+    };
+
+    /// <summary>
+    /// A batched radix-2 FFT of power-of-two length <paramref name="n"/> on the shared kernels (#965), for a backend
+    /// whose own <see cref="IDirectGpuBackend.BatchedFFT"/> is not one: a bit-reversal permute into the output (scaled
+    /// by 1/n for the inverse), then log2(n) butterfly stages in place. Input and output may be the same buffers.
+    /// </summary>
+    public static void BatchedRadix2(IDirectGpuBackend backend, Launcher launch, IGpuBuffer inputReal, IGpuBuffer inputImag,
+        IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        if (launch is null) throw new ArgumentNullException(nameof(launch));
+        if (batch < 1) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (n < 1 || (n & (n - 1)) != 0 || n > MaximumLength) throw new ArgumentOutOfRangeException(nameof(n), "n must be a power of two.");
+        int count = checked(batch * n);
+        foreach (var (buffer, name) in new[] { (inputReal, nameof(inputReal)), (inputImag, nameof(inputImag)),
+                     (outputReal, nameof(outputReal)), (outputImag, nameof(outputImag)) })
+        {
+            if (buffer is null) throw new ArgumentNullException(name);
+            if (buffer.Size < count) throw new ArgumentException($"{name} holds {buffer.Size} values, fewer than {batch} x {n}.", name);
+        }
+        // The permute reads every input before any output position is final, so it cannot run in place.
+        if (ReferenceEquals(inputReal, outputReal) || ReferenceEquals(inputImag, outputImag)
+            || ReferenceEquals(inputReal, outputImag) || ReferenceEquals(inputImag, outputReal))
+        {
+            using var re = backend.AllocateBuffer(count);
+            using var im = backend.AllocateBuffer(count);
+            backend.Copy(inputReal, re, count);
+            backend.Copy(inputImag, im, count);
+            BatchedRadix2(backend, launch, re, im, outputReal, outputImag, batch, n, inverse);
+            return;
+        }
+        int log2n = 0;
+        while ((1 << log2n) < n) log2n++;
+        launch("bx_fft_bit_reverse", count, inputReal, inputImag, outputReal, outputImag, batch, n, log2n, inverse ? 1f / n : 1f);
+        for (int span = 1; span < n; span <<= 1)
+            launch("bx_fft_butterfly", count / 2, outputReal, outputImag, batch, n, span, inverse ? 1 : 0);
+    }
     public static bool Supports(FftElementType type)
     {
         _ = type.ByteSize();

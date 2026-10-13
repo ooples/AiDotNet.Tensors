@@ -50,7 +50,7 @@ public sealed partial class VulkanBackend
     }
 
     /// <summary>Row softmax over the last axis of a packed-half buffer: one work-group per row, FP32
-    /// max/sum, half in/out. Requires even cols (packed-half rows are word-aligned). Vulkan counterpart of
+    /// max/sum, half in/out. An odd column count runs as two passes (row statistics, then apply). Vulkan counterpart of
     /// the CUDA fp16_softmax_native.</summary>
     public void Fp16Softmax(IGpuBuffer input, IGpuBuffer output, int rows, int cols)
     {
@@ -58,7 +58,17 @@ public sealed partial class VulkanBackend
         if (output is null) throw new ArgumentNullException(nameof(output));
         if (rows <= 0 || cols <= 0) throw new ArgumentException($"rows/cols must be positive (rows={rows}, cols={cols}).");
         if ((cols & 1) != 0)
-            throw new NotSupportedException("Vulkan FP16 softmax requires an even column count (packed-half storage is word-aligned per row).");
+        {
+            // A row is not a whole number of words: statistics per row, then one invocation per output word (#1230).
+            if (!IsGlslCompilerAvailable)
+                throw new NotSupportedException("Vulkan FP16-native ops require libshaderc for runtime GLSL compilation, which is unavailable.");
+            var extents = new uint[] { (uint)rows, (uint)cols };
+            using var stats = AllocateBuffer(checked(2 * rows));
+            GlslNaryOp(VulkanFp16NativeKernels.SoftmaxRowStats, new[] { input, stats }, checked(rows * 256), extents);
+            GlslNaryOp(VulkanFp16NativeKernels.SoftmaxApply, new[] { input, stats, output },
+                (int)(((long)rows * cols + 1) / 2), extents);
+            return;
+        }
 
         var pipeline = GetOrCreateGlslPipeline(VulkanFp16NativeKernels.Softmax, 2, 2u * sizeof(uint));
         if (pipeline is null)
@@ -87,7 +97,27 @@ public sealed partial class VulkanBackend
         if (eps <= 0f || float.IsNaN(eps) || float.IsInfinity(eps))
             throw new ArgumentOutOfRangeException(nameof(eps), eps, "eps must be finite and positive.");
         if ((cols & 1) != 0)
-            throw new NotSupportedException("Vulkan FP16 layernorm requires an even column count (packed-half storage is word-aligned per row).");
+        {
+            // A row is not a whole number of words: statistics per row, then one invocation per output word (#1230).
+            if (!IsGlslCompilerAvailable)
+                throw new NotSupportedException("Vulkan FP16-native ops require libshaderc for runtime GLSL compilation, which is unavailable.");
+            IGpuBuffer? ownedMean = null, ownedVar = null;
+            var mean = meanFp32 ?? (ownedMean = AllocateBuffer(rows));
+            var variance = varFp32 ?? (ownedVar = AllocateBuffer(rows));
+            try
+            {
+                GlslNaryOp(VulkanFp16NativeKernels.LayerNormRowStats, new[] { input, mean, variance }, checked(rows * 256),
+                    new uint[] { (uint)rows, (uint)cols });
+                GlslNaryOp(VulkanFp16NativeKernels.LayerNormApply, new[] { input, gamma, beta, mean, variance, output },
+                    (int)(((long)rows * cols + 1) / 2), new uint[] { (uint)rows, (uint)cols, FloatBits(eps) });
+            }
+            finally
+            {
+                ownedMean?.Dispose();
+                ownedVar?.Dispose();
+            }
+            return;
+        }
 
         var pipeline = GetOrCreateGlslPipeline(VulkanFp16NativeKernels.LayerNorm, 6, 3u * sizeof(uint));
         if (pipeline is null)

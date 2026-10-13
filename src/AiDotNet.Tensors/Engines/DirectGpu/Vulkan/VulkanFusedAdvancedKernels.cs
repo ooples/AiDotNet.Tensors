@@ -75,6 +75,53 @@ void main()
 }
 ";
 
+    // ---- LoRA for any rank (#1230). LoRAForward keeps a row's rank-sized projection in work-group shared memory,
+    // which caps the rank at the 256 entries that array holds. These do the same two stages as two dispatches with
+    // the projection in a device buffer: proj[b, r] = input[b, :] . A[:, r], then
+    // output[b, o] = base[b, o] + scaling * proj[b, :] . B[:, o]. One invocation per element.
+    public const string LoRAProject = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Input { float inputData[]; };
+layout(std430, binding = 1) readonly buffer LoraA { float loraAData[]; };
+layout(std430, binding = 2) writeonly buffer Proj { float projData[]; };
+layout(push_constant) uniform Params { uint batchSize; uint inputFeatures; uint rank; } p;
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.batchSize * p.rank) return;
+    uint b = idx / p.rank;
+    uint r = idx - b * p.rank;
+    uint inBase = b * p.inputFeatures;
+    float acc = 0.0;
+    for (uint i = 0u; i < p.inputFeatures; ++i)
+        acc += inputData[inBase + i] * loraAData[i * p.rank + r];
+    projData[idx] = acc;
+}
+";
+
+    public const string LoRAApply = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BaseOutput { float baseOutputData[]; };
+layout(std430, binding = 1) readonly buffer Proj { float projData[]; };
+layout(std430, binding = 2) readonly buffer LoraB { float loraBData[]; };
+layout(std430, binding = 3) writeonly buffer Output { float outputData[]; };
+layout(push_constant) uniform Params { uint batchSize; uint rank; uint outputFeatures; uint scalingBits; } p;
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.batchSize * p.outputFeatures) return;
+    uint b = idx / p.outputFeatures;
+    uint o = idx - b * p.outputFeatures;
+    float scaling = uintBitsToFloat(p.scalingBits);
+    float delta = 0.0;
+    for (uint r = 0u; r < p.rank; ++r)
+        delta += projData[b * p.rank + r] * loraBData[r * p.outputFeatures + o];
+    outputData[idx] = baseOutputData[idx] + scaling * delta;
+}
+";
+
     public const string DDIMStep = @"
 #version 450
 layout(local_size_x = 256) in;

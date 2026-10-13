@@ -2,8 +2,9 @@
 // Copyright (c) AiDotNet. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-// No FP16-native activation kernels here: every capability reports false, so the engine keeps activations in FP32.
+// No FP16-native activation kernels here: those capabilities report false, so the engine keeps activations in FP32.
 // The operations still work: PortableFp16Activation widens, runs the FP32 kernel and narrows back.
+// The direct FP16 convolution is the exception (#682): it runs the shared dc_p_conv2d_direct_fp16hw kernel.
 public sealed partial class WebGpuBackend : IFp16ActivationBackend
 {
     bool IFp16ActivationBackend.SupportsFp16ActivationStorage => false;
@@ -12,7 +13,7 @@ public sealed partial class WebGpuBackend : IFp16ActivationBackend
 
     bool IFp16ActivationBackend.Fp16BroadcastAddChannelAvailable => false;
 
-    bool IFp16ActivationBackend.Fp16DirectConvAvailable => false;
+    bool IFp16ActivationBackend.Fp16DirectConvAvailable => true;
 
     bool IFp16ActivationBackend.Fp16GroupNormSwishAvailable => false;
 
@@ -55,7 +56,7 @@ public sealed partial class WebGpuBackend : IFp16ActivationBackend
         => ConvertToFp32(input, output, size);
 
     void IFp16ActivationBackend.Conv2dDirectFp16Hw(IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
-        => PortableFp16Activation.Conv2dHalfWeights(this, input, weightsHalf, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        => PortableFp16Activation.Conv2dDirectHalfWeights(this, LaunchBatch, input, weightsHalf, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
 
     void IFp16ActivationBackend.UnfoldKNFp16FromFp16(IGpuBuffer inputHalf, IGpuBuffer outputHalf, int batch, int channels, int height, int width, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => PortableFp16Activation.UnfoldKN(this, inputHalf, outputHalf, batch, channels, height, width, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);

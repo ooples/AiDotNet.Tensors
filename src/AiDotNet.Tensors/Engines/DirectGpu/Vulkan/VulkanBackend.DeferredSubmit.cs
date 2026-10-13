@@ -32,43 +32,31 @@ public sealed unsafe partial class VulkanBackend
         Environment.GetEnvironmentVariable(SyncSubmitEnvironmentVariable) != "1";
 
     /// <summary>
-    /// The command buffer a dispatch records into: one of its own when it will not be waited for, the calling
-    /// thread's when it will. Caller holds <c>_computeLock</c> until <see cref="SubmitDispatch"/>.
+    /// The command buffer a dispatch records into: the device's open one (already begun, shared with the dispatches
+    /// recorded before it, #1192) when it will not be waited for, the calling thread's when it will. Caller holds
+    /// <c>_computeLock</c> until <see cref="SubmitDispatch"/>.
     /// </summary>
-    private IntPtr DispatchCommandBuffer(ThreadCommandResources threadResources, out DeferredCommandSlot slot, out bool deferred)
+    private IntPtr DispatchCommandBuffer(ThreadCommandResources threadResources, out bool deferred)
     {
         deferred = SubmitsWithoutWaiting;
-        if (!deferred)
-        {
-            slot = default;
-            return threadResources.CommandBuffer;
-        }
-        slot = _device.AcquireDeferredSlot();
-        return slot.CommandBuffer;
+        return deferred ? _device.OpenCommandBuffer() : threadResources.CommandBuffer;
     }
 
     /// <summary>
-    /// Submits the recorded (and ended) command buffer. A submission that is not waited for begins with a
-    /// compute-to-compute memory barrier (recorded by the caller), so it sees what the submissions before it wrote
-    /// even though they may not have finished when it is submitted.
+    /// Finishes one recorded dispatch. A waited dispatch's command buffer (ended by the caller) is submitted and
+    /// waited for. An unwaited one stays in the device's open command buffer, which is submitted when it holds
+    /// <see cref="VulkanDevice.MaxCoalescedDispatches"/> or when something needs its results. Each unwaited
+    /// dispatch is preceded by a compute-to-compute memory barrier (recorded by the caller), so it sees what the
+    /// dispatches before it wrote, in this command buffer or an earlier submission.
     /// </summary>
-    private void SubmitDispatch(IntPtr commandBuffer, ThreadCommandResources threadResources, DeferredCommandSlot slot,
-        bool deferred, VulkanComputePipeline pipeline, IntPtr descriptorSet)
+    private void SubmitDispatch(IntPtr commandBuffer, ThreadCommandResources threadResources, bool deferred,
+        VulkanComputePipeline pipeline, IntPtr descriptorSet)
     {
         if (!deferred)
         {
             _device.SubmitAndWait(commandBuffer, threadResources.Fence);
             return;
         }
-        try
-        {
-            _device.SubmitWithoutWaiting(slot, pipeline, descriptorSet, pipeline.BoundBuffers);
-        }
-        catch
-        {
-            // Nothing was queued: the set is not bound by anything pending.
-            pipeline.ReleaseDescriptorSet(descriptorSet);
-            throw;
-        }
+        _device.RecordedDispatch(pipeline, descriptorSet, pipeline.BoundBuffers);
     }
 }
