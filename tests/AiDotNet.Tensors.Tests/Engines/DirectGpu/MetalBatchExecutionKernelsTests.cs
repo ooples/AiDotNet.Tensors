@@ -23,6 +23,15 @@ public sealed class MetalBatchExecutionKernelsTests
             Assert.Contains($"kernel void {name}(", msl);
     }
 
+    // #963: Metal's generic FFT (PortableGenericFft) launches these by name from the translated batch library.
+    [Fact]
+    public void Translation_DeclaresEveryGenericFftKernel()
+    {
+        string msl = MetalBatchExecutionKernels.Source;
+        foreach (string name in PortableGenericFft.KernelNames)
+            Assert.Contains($"kernel void {name}(", msl);
+    }
+
     [Theory]
     [InlineData("__global__")]
     [InlineData("__shared__")]

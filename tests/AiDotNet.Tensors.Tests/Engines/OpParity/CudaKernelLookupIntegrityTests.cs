@@ -109,9 +109,19 @@ public sealed class CudaKernelLookupIntegrityTests
         // CudaBackend also compiles the batch-execution source it shares with HIP (#1142).
         var kernelSources = Directory.GetFiles(Path.Combine(cuda, "Kernels"), "*.cs")
             .Append(Path.Combine(cuda, "..", "BatchExecutionCudaKernels.cs"));
+        // Only sources CudaBackend actually compiles define anything. CudaOctonionKernels defined four kernels the
+        // backend looked up, but nothing compiled it, so a "defined in some source" check passed while every one of
+        // those ops threw kernel-not-found on CUDA.
+        var compiledClasses = new HashSet<string>(
+            Regex.Matches(backend, @"\b(\w+)\.Get\w*Source\w*\s*\(", RegexOptions.None, TimeSpan.FromSeconds(5)).Select(m => m.Groups[1].Value),
+            StringComparer.Ordinal);
+        Assert.Contains("CudaOctonionKernels", compiledClasses);
         foreach (var file in kernelSources)
         {
             string src = File.ReadAllText(file);
+            Match declared = Regex.Match(src, @"\bstatic\s+(?:partial\s+)?class\s+(\w+)", RegexOptions.None, TimeSpan.FromSeconds(5));
+            if (declared.Success && !compiledClasses.Contains(declared.Groups[1].Value))
+                continue;
             // The declaration frequently wraps, e.g.
             //     extern ""C"" __global__ __launch_bounds__(256)
             //     void normalize_rows_fused(

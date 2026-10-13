@@ -82,6 +82,11 @@
     <EmbeddedResource Include="Engines\DirectGpu\CUDA\Ptx\Artifacts\*\*\*.linker.txt" />
     <InternalsVisibleTo Include="AiDotNet" />
     <InternalsVisibleTo Include="AiDotNetTests" />
+    <!-- AiDotNet's benchmark, serving dev-host and serving test assemblies read tensor storage through
+         AsSpan, which is internal since the storage rework; the main AiDotNet grant does not cover them. -->
+    <InternalsVisibleTo Include="AiDotNet.Benchmarks" />
+    <InternalsVisibleTo Include="AiDotNet.Serving.DevHost" />
+    <InternalsVisibleTo Include="AiDotNet.Serving.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Autotune.Tests" />
     <InternalsVisibleTo Include="AiDotNet.Tensors.Benchmarks" />
@@ -426,6 +431,8 @@
     <EmbeddedResource Include="Engines\BlasManaged\Autotune\prewarm\*.prewarm.json" />
     <!-- Shipped tuned-kernel registry profiles (per device), see TunedKernelProfiles. -->
     <EmbeddedResource Include="Helpers\Autotune\TunedKernels\Profiles\*.tuned-profile.json" />
+    <!-- #1204: the Joe-Kuo Sobol direction numbers, packed by scripts/pack_joe_kuo.py. -->
+    <EmbeddedResource Include="Engines\DevicePrimitives\Cpu\Data\joe-kuo-6.bin" />
   </ItemGroup>
 
   <!-- Optional signed revocation deny-list (CRL) for signed entitlements, verified by

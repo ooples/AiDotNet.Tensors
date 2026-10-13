@@ -27,7 +27,7 @@ public sealed partial class MetalBackend : IGpuBatchExecution
         return GetPipeline(BatchExecutionLibName, _batchExecutionLibrary, name);
     }
 
-    private void LaunchBatch(string name, int threads, params object[] args)
+    internal void LaunchBatch(string name, int threads, params object[] args)
     {
         if (threads <= 0) return;
         ThrowIfDisposed();

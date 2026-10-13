@@ -6,8 +6,10 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.Engines.Diagnostics;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -308,5 +310,92 @@ public sealed class GenericFftBackendParityTests
     }
 
 
+    // ---------------------------------------------------------------- Metal (#963): skips without a Metal device.
+
+    private static MetalBackend MetalOrSkip()
+    {
+        Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal is only available on macOS/iOS.");
+        var backend = new MetalBackend();
+        if (!backend.IsAvailable)
+        {
+            backend.Dispose();
+            Skip.If(true, "Metal is not available.");
+        }
+        return backend;
+    }
+
+    [SkippableFact]
+    public void Metal_GenericFft_MatchesDft()
+    {
+        using var backend = MetalOrSkip();
+        CheckAll(backend);
+    }
+
+    /// <summary>
+    /// #963 criterion 3: a radix-2 and a Bluestein transform run on the device with no host round trip; the only
+    /// transfers are the test's own upload before and download after.
+    /// </summary>
+    [SkippableFact]
+    public void Metal_GenericFft_StaysOnTheDevice()
+    {
+        using var backend = MetalOrSkip();
+        var fft = (IGenericFftBackend)backend;
+        foreach (int n in new[] { 64, 100 })
+        {
+            using var re = backend.AllocateBuffer(Values(Batch * n, n));
+            using var im = backend.AllocateBuffer(Values(Batch * n, n + 7));
+            using (var scope = GpuResidencyScope.Begin())
+            {
+                fft.LaunchFftGeneric(re, im, Batch, n, inverse: false, FftElementType.Float32);
+                fft.LaunchFftGeneric(re, im, Batch, n, inverse: true, FftElementType.Float32);
+                Assert.Equal(0, scope.Downloads);
+                Assert.Equal(0, scope.Uploads);
+            }
+        }
+    }
+
+    /// <summary>#963: the generic FFT through the shared IEngine contract on Metal with a tape active.</summary>
+    [SkippableFact]
+    public void Metal_GenericFft_ThroughTheEngine_KeepsTheTapeConnected()
+    {
+        using var backend = MetalOrSkip();
+        var engine = new DirectGpuTensorEngine(new DirectGpuEngine(backend));
+        Assert.True(engine.SupportsFftElementType(FftElementType.Float32));
+        const int n = 6;   // Bluestein
+        var re = Values(n, 3);
+        var im = Values(n, 9);
+        var interleaved = new float[2 * n];
+        for (int i = 0; i < n; i++) { interleaved[2 * i] = re[i]; interleaved[2 * i + 1] = im[i]; }
+        Dft(re, im, n, false, out var eRe, out var eIm);
+        var input = new Tensor<float>(interleaved, new[] { 2 * n });
+        using var tape = new GradientTape<float>();
+        Tensor<float> result = ((IEngine)engine).FftGeneric(input);
+        Assert.NotNull(result.GradFn);
+        for (int i = 0; i < n; i++)
+            Assert.True(Math.Abs(result[2 * i] - eRe[i]) <= 1e-4 && Math.Abs(result[2 * i + 1] - eIm[i]) <= 1e-4,
+                $"[{i}]: got ({result[2 * i]}, {result[2 * i + 1]}), expected ({eRe[i]}, {eIm[i]})");
+        Tensor<float> loss = engine.ReduceSum(result, new[] { 0 }, keepDims: false);
+        var gradients = tape.ComputeGradients(loss);
+        Assert.True(gradients.ContainsKey(input), "Metal FftGeneric must keep the active tape connected to its input.");
+    }
+
+    /// <summary>#963 criterion 1: the capability is reported only after every FFT pipeline compiled.</summary>
+    [SkippableFact]
+    public void Metal_GenericFft_ReportsTheCapability_AfterCompilingEveryKernel()
+    {
+        using var backend = MetalOrSkip();
+        var fft = (IGenericFftBackend)backend;
+        foreach (var type in new[] { FftElementType.Float32, FftElementType.Float16, FftElementType.BFloat16 })
+            Assert.True(fft.SupportsFftElementType(type), $"{type}: {backend.FftReadiness.Error}");
+        Assert.Null(backend.FftReadiness.Error);
+    }
+
+    // The shared batched radix-2 kernels, translated to Metal from the CUDA dialect HIP runs above.
+    [SkippableFact]
+    public void Metal_Radix2BatchedFftKernels_MatchDft()
+    {
+        using var backend = MetalOrSkip();
+        CheckRadix2(backend, (re, im, oRe, oIm, b, n, inv) => PortableGenericFft.BatchedRadix2(backend, backend.LaunchBatch, re, im, oRe, oIm, b, n, inv));
+    }
 }
 #endif

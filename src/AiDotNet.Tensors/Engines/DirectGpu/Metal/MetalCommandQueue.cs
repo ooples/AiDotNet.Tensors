@@ -250,6 +250,8 @@ public sealed class MetalCommandQueue : IDisposable
             SendMessageVoid(commandBuffer, Selectors.WaitUntilCompleted);
             // The host blocked until the command buffer finished: a synchronization for the residency probe.
             GpuLaunchProbe.OnSynchronize(GpuBackendType.Metal);
+            // Its GPU interval, when the tuned-kernel registry is timing this thread (#1116).
+            MetalGpuTiming.OnCompleted(commandBuffer);
         }
     }
 

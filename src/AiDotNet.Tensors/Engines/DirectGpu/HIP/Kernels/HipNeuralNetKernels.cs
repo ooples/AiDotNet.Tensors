@@ -701,6 +701,22 @@ extern ""C"" __global__ __launch_bounds__(256) void compute_mean_var(
     variance[f] = varSum / (float)batchSize;
 }
 
+// Max along the last axis of [outerSize, axisSize]; the value argmax_axis selects, so ReduceMax values and indices agree.
+extern ""C"" __global__ __launch_bounds__(256) void max_axis(
+    const float* input, float* output, int outerSize, int axisSize)
+{
+    int outer = blockIdx.x * blockDim.x + threadIdx.x;
+    if (outer >= outerSize) return;
+
+    int baseIdx = outer * axisSize;
+    float maxVal = input[baseIdx];
+    for (int i = 1; i < axisSize; i++) {
+        float val = input[baseIdx + i];
+        if (val > maxVal) maxVal = val;
+    }
+    output[outer] = maxVal;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void argmax_axis(
     const float* input, float* indices, int outerSize, int axisSize)
 {
@@ -2602,7 +2618,7 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
             "contrastive_loss", "contrastive_loss_backward",
             "clamp", "l2_norm_squared", "scale", "copy_buffer", "fill_buffer",
             "greater_than", "less_than", "equals", "where_cond",
-            "compute_mean_var", "argmax_axis", "argmin_axis",
+            "compute_mean_var", "max_axis", "argmax_axis", "argmin_axis",
             "sgd_step", "adam_step", "adamw_step", "rmsprop_step", "adagrad_step", "nag_step", "lars_step", "lamb_step",
             "sgd_update", "adadelta_update", "amsgrad_update", "adamax_update", "lion_update", "nadam_update", "ftrl_update",
             "proximal_gradient_step", "conjugate_gradient_step",

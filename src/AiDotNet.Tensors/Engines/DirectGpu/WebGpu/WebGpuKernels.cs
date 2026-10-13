@@ -792,7 +792,8 @@ fn gemm(@builtin(global_invocation_id) gid: vec3<u32>,
     // Write result
     if (row < params.M && col < params.N) {
         let idx = row * params.N + col;
-        C[idx] = params.alpha * acc + params.beta * C[idx];
+        // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+        C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
     }
 }
 
@@ -814,7 +815,9 @@ fn gemm_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
         acc = acc + A[row * params.K + k] * B[k * params.N + col];
     }
 
-    C[idx] = params.alpha * acc + params.beta * C[idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+
+    C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
 }
 
 // C[M,N] = A[M,K] · Bᵀ where B is stored row-major as [N, K].
@@ -833,7 +836,8 @@ fn gemm_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < params.K; k = k + 1u) {
         acc = acc + A[row * params.K + k] * B[col * params.K + k];
     }
-    C[idx] = params.alpha * acc + params.beta * C[idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+    C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
 }
 
 // C[M,N] = Aᵀ · B, where A is stored row-major as [K, M] and B as [K, N],
@@ -854,7 +858,8 @@ fn gemm_lhs_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < params.K; k = k + 1u) {
         acc = acc + A[k * params.M + row] * B[k * params.N + col];
     }
-    C[idx] = params.alpha * acc + params.beta * C[idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+    C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
 }
 ";
 
@@ -5527,7 +5532,8 @@ fn batched_gemm(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < params.K; k = k + 1u) {
         acc = acc + A[a_off + row * params.K + k] * B[b_off + k * params.N + col];
     }
-    C[c_off + local_idx] = params.alpha * acc + params.beta * C[c_off + local_idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+    C[c_off + local_idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[c_off + local_idx], params.beta != 0.0);
 }
 
 @compute @workgroup_size(256)

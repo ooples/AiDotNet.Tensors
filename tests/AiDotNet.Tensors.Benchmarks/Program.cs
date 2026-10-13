@@ -1611,6 +1611,13 @@ class Program
             return;
         }
 
+        // Run the tuned-kernel registry gate on the HIP device and export a shippable profile (#1113)
+        if (args[0] == "--hip-tuned-profile")
+        {
+            HipTunedProfileExperiment.Run(args.Skip(1).ToArray());
+            return;
+        }
+
         // Run the tuned-kernel registry gate on the Vulkan device and export a shippable profile
         if (args[0] == "--vulkan-tuned-profile")
         {

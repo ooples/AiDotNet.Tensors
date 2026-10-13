@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 public sealed class CuRand : IDeviceRng
 {
-    private readonly CpuPhiloxGenerator _cpuFallback;
+    private readonly IDeviceRng _cpuFallback;
 
     /// <summary>True when <c>libcurand</c> is loadable on this host.
     /// Useful for telemetry; the wrapper degrades gracefully either
@@ -65,14 +65,10 @@ public sealed class CuRand : IDeviceRng
     /// a #219 follow-up; this CPU-only path is stable for tests +
     /// reproducibility.</summary>
     public CuRand(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
-        if (algo != DeviceRngAlgorithm.Philox)
-            throw new NotSupportedException(
-                $"CuRand currently implements only {DeviceRngAlgorithm.Philox}; requested {algo}. " +
-                "Other algorithms (Sobol/MRG/XorWow) will be added when the native cuRAND dispatch is wired.");
         Algorithm = algo;
-        _cpuFallback = new CpuPhiloxGenerator(seed, subsequence, offset);
+        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
 
     /// <inheritdoc/>
@@ -118,7 +114,9 @@ public sealed class CuRand : IDeviceRng
         // — breaking the cross-backend determinism contract that
         // CuRand class-doc promises. Fall back to CPU so the contract
         // holds.
-        if (_cpuFallback.Subsequence != 0) return false;
+        // Only Philox has a device path here; the other algorithms run on their CPU generators, which
+        // produce cuRAND's numbers (see CpuDeviceRng).
+        if (Algorithm != DeviceRngAlgorithm.Philox || _cpuFallback.Subsequence != 0) return false;
         IntPtr dPtr = IntPtr.Zero;
         IntPtr generator = IntPtr.Zero;
         try
@@ -168,7 +166,9 @@ public sealed class CuRand : IDeviceRng
         // doesn't accept a subsequence parameter, so a non-zero
         // subsequence on this side must fall back to CPU to preserve
         // bit-equivalence.
-        if (_cpuFallback.Subsequence != 0) return false;
+        // Only Philox has a device path here; the other algorithms run on their CPU generators, which
+        // produce cuRAND's numbers (see CpuDeviceRng).
+        if (Algorithm != DeviceRngAlgorithm.Philox || _cpuFallback.Subsequence != 0) return false;
         IntPtr dPtr = IntPtr.Zero;
         IntPtr generator = IntPtr.Zero;
         try
