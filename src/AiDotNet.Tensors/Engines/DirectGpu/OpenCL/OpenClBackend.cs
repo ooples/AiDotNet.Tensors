@@ -69,6 +69,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private DirectOpenClContext? _context;
         private readonly OpenClKernelCache _kernelCache;
 
+        /// <summary>Whether a compiled program registered this kernel name (KernelLookupIntegrityTests).</summary>
+        internal bool HasCompiledKernel(string name) => _kernelCache.ContainsKey(name);
+
         /// <summary>Kernel names more than one compiled program registered (see <see cref="OpenClKernelCache.ReregisteredNames"/>).</summary>
         internal IReadOnlyCollection<string> ReregisteredKernelNames => _kernelCache.ReregisteredNames;
         private readonly List<DirectOpenClProgram> _programs;
@@ -656,6 +659,48 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in SpecializedKernels.GetKernelNames())
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, specializedProgram, name);
+                }
+
+                // The octonion backward and fused-ReLU kernels live in OctonionKernels, which nothing compiled, so
+                // OctonionLinearBackward{Input,Weights,Biases} and OctonionLinearForwardFusedReLU threw kernel-not-found
+                // and ran on the CPU. Names the specialized program already registered keep that definition. Optional:
+                // a compile failure leaves these ops on the CPU path instead of failing backend initialization.
+                try
+                {
+                    var octonionProgram = CompileOrLoadCached(OctonionKernels.GetSource(), optimizationFlags, "Octonion kernels");
+                    // Commit program + kernels together, as the Detection block does, so a kernel that fails to build
+                    // does not leave _kernelCache half-populated.
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OctonionKernels.GetKernelNames())
+                    {
+                        if (!_kernelCache.ContainsKey(name))
+                            built.Add((name, new DirectOpenClKernel(_context, octonionProgram, name)));
+                    }
+                    _programs.Add(octonionProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL octonion kernels unavailable; those ops use the CPU path: {ex.Message}");
+                }
+
+                // Kernels OpenClBackend looked up that no OpenCL program defined (the CSR segmented reductions and the
+                // SNN rbf_forward / update_traces / stdp_update). Optional, like the octonion program.
+                try
+                {
+                    var missingLookupProgram = CompileOrLoadCached(OpenClMissingLookupKernels.GetSource(), optimizationFlags, "Missing-lookup kernels");
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in OpenClMissingLookupKernels.GetKernelNames())
+                    {
+                        if (!_kernelCache.ContainsKey(name))
+                            built.Add((name, new DirectOpenClKernel(_context, missingLookupProgram, name)));
+                    }
+                    _programs.Add(missingLookupProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL missing-lookup kernels unavailable; those ops use the CPU path: {ex.Message}");
                 }
 
                 // Compile FP16 conversion kernels (half-precision float conversion)
@@ -3646,7 +3691,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             reduceKernel.SetArg(0, partialClBuf.Handle);
             reduceKernel.SetArg(1, bufR.Handle);
             reduceKernel.SetArg(2, numGroups);
-            int reduceLocal = Math.Min(localSize, numGroups);
+            // reduce_partial_sums halves its work-group in a tree, so the group size must be a power of two: min(256, numGroups)
+            // dropped partial sums whenever the group count was not one (20 groups for 5000 elements). The strided loop
+            // covers every partial at any group size.
+            int reduceLocal = 1;
+            while (reduceLocal * 2 <= Math.Min(localSize, numGroups)) reduceLocal *= 2;
             reduceKernel.SetLocalArg(3, reduceLocal * sizeof(float));
             reduceKernel.Execute1D(reduceLocal, reduceLocal);
         }
@@ -3683,7 +3732,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             reduceKernel.SetArg(0, partialClBuf.Handle);
             reduceKernel.SetArg(1, bufR.Handle);
             reduceKernel.SetArg(2, numGroups);
-            int reduceLocal = Math.Min(localSize, numGroups);
+            // reduce_partial_sums halves its work-group in a tree, so the group size must be a power of two: min(256, numGroups)
+            // dropped partial sums whenever the group count was not one (20 groups for 5000 elements). The strided loop
+            // covers every partial at any group size.
+            int reduceLocal = 1;
+            while (reduceLocal * 2 <= Math.Min(localSize, numGroups)) reduceLocal *= 2;
             reduceKernel.SetLocalArg(3, reduceLocal * sizeof(float));
             reduceKernel.Execute1D(reduceLocal, reduceLocal);
         }
@@ -3702,7 +3755,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var bufB = ((DirectOpenClGpuBuffer)b).Buffer;
             var bufR = ((DirectOpenClGpuBuffer)result).Buffer;
 
-            int localSize = Math.Min(256, vecSize);
+            // The kernel's tree reduction halves the work-group size, so it must be a power of two: min(256, vecSize)
+            // at vecSize = 255 dropped one partial sum. The strided loop covers every element at any group size.
+            int localSize = 1;
+            while (localSize * 2 <= Math.Min(256, vecSize)) localSize *= 2;
 
             var kernel = _kernelCache["batched_dot_product"];
             kernel.SetArg(0, bufA.Handle);
@@ -4233,19 +4289,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            if (repeats <= 0 || innerSize <= 0) return;
 
-            var bufferInput = ((DirectOpenClGpuBuffer)input).Buffer;
-            var bufferOutput = ((DirectOpenClGpuBuffer)output).Buffer;
-
-            var kernel = _kernelCache["tile_batch"];
-            kernel.SetArg(0, bufferInput.Handle);
-            kernel.SetArg(1, bufferOutput.Handle);
-            kernel.SetArg(2, repeats);
-            kernel.SetArg(3, innerSize);
-
-            int totalSize = repeats * innerSize;
-            int localSize = CalculateOptimalWorkGroupSize1D(totalSize);
-            kernel.Execute1D(totalSize, localSize);
+            // out[i * repeats + r] = in[i], total innerSize * repeats. This looked up "tile_batch", which no OpenCL
+            // program defines; repeat_elements launched as (outerSize: innerSize, innerSize: 1, repeats) computes
+            // output[idx] = input[idx / repeats], which is this contract (CudaBackend.TileBatch does the same).
+            RepeatElements(input, output, innerSize, 1, repeats);
         }
 
         public void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
@@ -10947,7 +10996,8 @@ KERNEL VARIANTS (A/B testing):
         public void Fma(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, IGpuBuffer D, int size)
         {
             if (size <= 0) return;
-            var k = _kernelCache["fma"];
+            // The registered kernel is fma_kernel (D = fma(A, B, C)); "fma" was defined nowhere.
+            var k = _kernelCache["fma_kernel"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);
@@ -14065,7 +14115,9 @@ KERNEL VARIANTS (A/B testing):
             _context?.Dispose();
         }
 
-        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("reduce_mean", i, o, sz); }
+        // o[0] = mean(i[0 .. sz)). This went through ExecuteActivation("reduce_mean"), a kernel no OpenCL program defines, so
+        // it threw and ran on the CPU; the row sum (split across compute units for one long row) and a scale do it.
+        public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { if (sz <= 0) return; SumAxis(i, o, 1, sz); Scale(o, o, 1f / sz, 1); }
         public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { if (_context == null) return; var k = _kernelCache["clip_kernel"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, mn); k.SetArg(3, mx); k.SetArg(4, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { if (_context == null) return; var k = _kernelCache["pow_scalar"]; k.SetArg(0, ((DirectOpenClGpuBuffer)i).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)o).Buffer.Handle); k.SetArg(2, ex); k.SetArg(3, sz); k.Execute1D(sz, CalculateOptimalWorkGroupSize1D(sz)); }
         public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("frac_kernel", i, o, sz); }

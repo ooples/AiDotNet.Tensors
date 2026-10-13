@@ -119,41 +119,58 @@ public sealed partial class HipBackend
 
     public void BroadcastDivLast(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int outerSize, int innerSize)
         => LaunchResidentAxis("broadcast_div_last", left, right, output, outerSize, innerSize, outerSize * innerSize);
+    // result = sum(a[i] * b[i]). The non-deterministic kernel accumulates block partials with atomicAdd, so the result
+    // is zeroed first (as CudaBackend does); the deterministic one is a single block that stores its sum.
     public unsafe void DotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
-        // Issue #382: deterministic variant fixes accumulation order by
-        // launching a single block (kernel itself ignores blockIdx.x — only
-        // threadIdx.x stride is used) and writing `*result = sum` instead of
-        // atomicAdd.
-        string kname = GpuDeterminism.IsActive ? "dot_product_deterministic" : "dot_product";
+        bool deterministic = GpuDeterminism.IsActive;
+        Fill(output, 0f, 1);
         if (size <= 0) return;
-        IntPtr kernel = RequireResidentKernel(kname);
+        IntPtr kernel = RequireResidentKernel(deterministic ? "dot_product_deterministic" : "dot_product");
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outputPtr = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &aPtr; args[1] = &bPtr; args[2] = &outputPtr; args[3] = &size;
-        uint grid = GpuDeterminism.IsActive ? 1u : GridFor(size);
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchKernel(kernel, deterministic ? 1u : GridFor(size), DefaultBlockSize, args);
     }
-    public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, int strideA, int strideB, int count)
+
+    // result = sum(a[i] * b[bOffset + i * bStride]) over i < aSize (IDirectGpuBackend.StridedDotProduct). The
+    // parameters used to be named (size, strideA, strideB, count); they reached the kernel in the right order, but the
+    // grid was sized from "count" (bStride), so a stride of 0 launched an empty grid, and the result was never zeroed
+    // before the atomic accumulation.
+    public unsafe void StridedDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int aSize, int bSize, int bOffset, int bStride)
     {
-        // Issue #382: deterministic variant launched single-block (kernel uses
-        // only threadIdx.x stride). Note: the kernel signature is
-        // (a, b, result, aSize, bSize, bOffset, bStride) — preserve the existing
-        // wire-up; argument-name mismatch is a separate concern.
-        string kname = GpuDeterminism.IsActive ? "strided_dot_product_deterministic" : "strided_dot_product";
-        if (size <= 0 || count <= 0) return;
-        IntPtr kernel = RequireResidentKernel(kname);
+        bool deterministic = GpuDeterminism.IsActive;
+        Fill(output, 0f, 1);
+        if (aSize <= 0) return;
+        IntPtr kernel = RequireResidentKernel(deterministic ? "strided_dot_product_deterministic" : "strided_dot_product");
         IntPtr aPtr = a.Handle, bPtr = b.Handle, outputPtr = output.Handle;
         void** args = stackalloc void*[7];
-        args[0] = &aPtr; args[1] = &bPtr; args[2] = &outputPtr; args[3] = &size;
-        args[4] = &strideA; args[5] = &strideB; args[6] = &count;
-        uint grid = GpuDeterminism.IsActive ? 1u : GridFor(count);
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        args[0] = &aPtr; args[1] = &bPtr; args[2] = &outputPtr; args[3] = &aSize;
+        args[4] = &bSize; args[5] = &bOffset; args[6] = &bStride;
+        LaunchKernel(kernel, deterministic ? 1u : GridFor(aSize), DefaultBlockSize, args);
     }
-
-    public void BatchedDotProduct(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int batchSize, int dim)
-        => LaunchResidentAxis("batched_dot_product", left, right, output, batchSize, dim, batchSize);
-
+    public unsafe void BatchedDotProduct(IGpuBuffer left, IGpuBuffer right, IGpuBuffer output, int batchSize, int dim)
+    {
+        // One block per row (blockIdx.y), block-reducing over dim -- the kernel's geometry, as CudaBackend launches it.
+        // This went through LaunchResidentAxis, a 1-D grid of one thread per row, and no compiled module defined the
+        // kernel, so every call threw GpuCapabilityUnavailableException and ran on the CPU.
+        if (batchSize <= 0) return;
+        IntPtr kernel = RequireResidentKernel("batched_dot_product");
+        // Rows go in chunks of at most 65535 (the portable gridDim.y limit), each addressed by offsetting the pointers
+        // to its first row.
+        const int MaxGridY = 65535;
+        void** args = stackalloc void*[5];
+        for (int rowStart = 0; rowStart < batchSize; rowStart += MaxGridY)
+        {
+            int rows = Math.Min(MaxGridY, batchSize - rowStart);
+            IntPtr leftPtr = (IntPtr)((long)left.Handle + (long)rowStart * dim * sizeof(float));
+            IntPtr rightPtr = (IntPtr)((long)right.Handle + (long)rowStart * dim * sizeof(float));
+            IntPtr outputPtr = (IntPtr)((long)output.Handle + (long)rowStart * sizeof(float));
+            args[0] = &leftPtr; args[1] = &rightPtr; args[2] = &outputPtr;
+            args[3] = &rows; args[4] = &dim;
+            LaunchKernel2D(kernel, 1, (uint)rows, DefaultBlockSize, 1, args);
+        }
+    }
     private IntPtr RequireResidentKernel(string kernelName)
     {
         if (!_kernelCache.TryGetValue(kernelName, out IntPtr kernel))

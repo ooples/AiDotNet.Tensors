@@ -47,6 +47,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _scalarGemmF32;
     private IntPtr _rdnaGemmWave32;
     private readonly Dictionary<string, IntPtr> _kernelCache;
+
+    /// <summary>Whether a compiled module registered this kernel name (KernelLookupIntegrityTests).</summary>
+    internal bool HasCompiledKernel(string name) => _kernelCache.ContainsKey(name);
     private readonly List<HipKernelCompilationException> _kernelCompilationFailures = new();
     private AmdGpuArchitecture _architecture;
     private string _architectureTarget = string.Empty;
@@ -78,6 +81,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
+    private IntPtr _missingLookupModule;
+    private IntPtr _octonionModule;
     private IntPtr _sparseModule;
     private IntPtr _locallyConnectedModule;
     private IntPtr _deformableConvModule;
@@ -641,8 +646,20 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile FFT kernels (Cooley-Tukey radix-2 FFT, STFT, Mel spectrogram)
             CompileKernelModule(HipFFTKernels.GetSource(), "fft", ref _fftModule,
                 HipFFTKernels.GetKernelNames());
+            // Not fast math: its approximate division put 6/12 below 0.5, so WidebandLogBinPool's bin edge
+            // (k / numBins)^2 * (usable - 1) = 1.0 truncated to 0 and the bin averaged the wrong spectrum line.
             CompileKernelModule(Kernels.HipSpectralPerfKernels.GetSource(), "spectral_perf", ref _spectralPerfModule,
-                Kernels.HipSpectralPerfKernels.GetKernelNames());
+                Kernels.HipSpectralPerfKernels.GetKernelNames(), useFastMath: false);
+
+            // Kernels HipBackend looked up that no compiled HIP module provided, so each op threw
+            // GpuCapabilityUnavailableException and ran on the CPU. Only the names missing here are loaded:
+            // squash / squash_backward and octonion_linear_forward already come from other modules.
+            CompileKernelModule(CUDA.Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup", ref _missingLookupModule,
+                new[] { "copy_2d_strided", "var_axis", "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev" });
+            CompileKernelModule(Kernels.HipOctonionKernels.GetSource(), "octonion", ref _octonionModule,
+                Kernels.HipOctonionKernels.GetKernelNames().Where(name => name != "octonion_linear_forward").ToArray());
+            CompileKernelModule(Kernels.HipDotProductKernels.GetSource(), "dot_product", ref _dotProductModule,
+                Kernels.HipDotProductKernels.GetKernelNames());
 
             // Compile Sparse kernels (CSR SpMM, GNN message passing)
             CompileKernelModule(HipSparseKernels.GetSource(), "sparse", ref _sparseModule,
@@ -3432,26 +3449,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public unsafe void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
+    public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
-        if (!_kernelCache.TryGetValue("tile_batch", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: tile_batch");
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (repeats <= 0) throw new ArgumentOutOfRangeException(nameof(repeats), repeats, "repeats must be positive.");
+        if (innerSize <= 0) throw new ArgumentOutOfRangeException(nameof(innerSize), innerSize, "innerSize must be positive.");
+        long requiredOutput = checked((long)innerSize * repeats);
+        if (input.Size < innerSize)
+            throw new ArgumentException(
+                $"input buffer too small: expected at least {innerSize} elements, got {input.Size}.",
+                nameof(input));
+        if (output.Size < requiredOutput)
+            throw new ArgumentException(
+                $"output buffer too small: expected at least {requiredOutput} elements, got {output.Size}.",
+                nameof(output));
 
-        int totalSize = repeats * innerSize;
-            {
-            IntPtr _p0 = input.Handle;
-            IntPtr _p1 = output.Handle;
-            void** args = stackalloc void*[4];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &repeats;
-            args[3] = &innerSize;
-
-
-            uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        // out[i * repeats + r] = in[i], total innerSize * repeats. This looked up "tile_batch", which no HIP source
+        // defines; bx_repeat_elements launched as (outerSize: innerSize, innerSize: 1, repeats) computes
+        // output[idx] = input[idx / repeats], which is this contract (CudaBackend.TileBatch does the same).
+        RepeatElements(input, output, innerSize, 1, repeats);
     }
 
     public unsafe void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
@@ -6882,36 +6899,35 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("copy_2d_strided", out var kernel))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: copy_2d_strided");
 
-        int gridX = (srcCols + DefaultBlockSize - 1) / DefaultBlockSize;
-        int gridY = numRows;
+        if (numRows <= 0 || srcCols <= 0) return;   // an empty grid is an invalid launch, and there is nothing to copy
 
-        var srcHandle = ((HipGpuBuffer)source).Handle;
-        var dstHandle = ((HipGpuBuffer)destination).Handle;
+        // srcCols x numRows grid, rows in chunks of at most 65535 (the portable gridY limit), each chunk addressed by
+        // offsetting both base pointers to its first row -- as CudaBackend.Copy2DStrided does.
+        const int MaxGridY = 65535;
+        uint gridX = (uint)((srcCols + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr srcBase = source.Handle;
+        IntPtr dstBase = destination.Handle;
 
-        void*[] args = new void*[6];
-        fixed (void** argsPtr = args)
+        void** args = stackalloc void*[6];
+        for (int rowStart = 0; rowStart < numRows; rowStart += MaxGridY)
         {
-            IntPtr[] handles = [srcHandle, dstHandle];
-            int[] ints = [numRows, srcCols, destTotalCols, destColOffset];
+            int rows = Math.Min(MaxGridY, numRows - rowStart);
+            IntPtr srcPtr = (IntPtr)((long)srcBase + (long)rowStart * srcCols * sizeof(float));
+            IntPtr dstPtr = (IntPtr)((long)dstBase + (long)rowStart * destTotalCols * sizeof(float));
+            args[0] = &srcPtr;
+            args[1] = &dstPtr;
+            args[2] = &rows;
+            args[3] = &srcCols;
+            args[4] = &destTotalCols;
+            args[5] = &destColOffset;
 
-            fixed (IntPtr* h = handles)
-            fixed (int* i = ints)
-            {
-                argsPtr[0] = &h[0];
-                argsPtr[1] = &h[1];
-                argsPtr[2] = &i[0];
-                argsPtr[3] = &i[1];
-                argsPtr[4] = &i[2];
-                argsPtr[5] = &i[3];
-
-                GpuLaunchProbe.OnLaunch();
-                var result = HipNativeBindings.hipModuleLaunchKernel(
-                    kernel,
-                    (uint)gridX, (uint)gridY, 1,
-                    (uint)DefaultBlockSize, 1, 1,
-                    0, _stream, (IntPtr)argsPtr, IntPtr.Zero);
-                HipNativeBindings.CheckError(result, "hipModuleLaunchKernel (copy_2d_strided)");
-            }
+            GpuLaunchProbe.OnLaunch();
+            var result = HipNativeBindings.hipModuleLaunchKernel(
+                kernel,
+                gridX, (uint)rows, 1,
+                (uint)DefaultBlockSize, 1, 1,
+                0, _stream, (IntPtr)args, IntPtr.Zero);
+            HipNativeBindings.CheckError(result, "hipModuleLaunchKernel (copy_2d_strided)");
         }
     }
 
@@ -9108,29 +9124,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Synchronize();
     }
 
-    public unsafe void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
-    {
-        if (!_kernelCache.TryGetValue("broadcast_multiply_last_axis", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: broadcast_multiply_last_axis");
-
-            {
-            IntPtr _p0 = A.Handle;
-            IntPtr _p1 = B.Handle;
-            IntPtr _p2 = C.Handle;
-            void** args = stackalloc void*[5];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &outerSize;
-            args[4] = &innerSize;
-
-
-            int totalSize = outerSize * innerSize;
-            uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
-    }
+    public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
+        // This looked up "broadcast_multiply_last_axis", which no HIP source defines, so every call threw
+        // GpuCapabilityUnavailableException and the engine fell back to the CPU. broadcast_mul_last is
+        // C[idx] = A[idx] * B[idx % innerSize] with these five arguments (CudaBackend made the same repoint).
+        => BroadcastMulLast(A, B, C, outerSize, innerSize);
 
     public unsafe void BroadcastMultiplyFirstAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
@@ -11385,6 +11383,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             HipNativeBindings.hipModuleUnload(_spectralPerfModule);
             _spectralPerfModule = IntPtr.Zero;
+        }
+        if (_missingLookupModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_missingLookupModule);
+            _missingLookupModule = IntPtr.Zero;
+        }
+        if (_octonionModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_octonionModule);
+            _octonionModule = IntPtr.Zero;
         }
         if (_locallyConnectedModule != IntPtr.Zero)
         {
