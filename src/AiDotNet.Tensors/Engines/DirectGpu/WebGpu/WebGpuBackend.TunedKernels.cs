@@ -1,0 +1,353 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
+
+// Tuned-kernel registry dispatch on WebGPU (#1117): softmax and its backward, LayerNorm forward / input gradient /
+// affine gradients and RMSNorm's gamma gradient run through TunedKernelSlots whose reference is the established
+// WGSL kernel, with the generated WebGpuTunedRowKernels variants as the alternatives (see VulkanBackend.TunedKernels).
+public sealed partial class WebGpuBackend
+{
+    private const double TunedRowTolerance = 1e-4;
+
+    private readonly object _tunedSlotsLock = new object();
+    private TunedKernelSlot<TunedSoftmaxArgs>? _softmaxSlot;
+    private TunedKernelSlot<TunedSoftmaxBackwardArgs>? _softmaxBackwardSlot;
+    private TunedKernelSlot<TunedLayerNormArgs>? _layerNormSlot;
+    private TunedKernelSlot<TunedNormBackwardArgs>? _layerNormBackwardSlot;
+    private TunedKernelSlot<TunedNormBackwardArgs>? _layerNormGradParamsSlot;
+    private TunedKernelSlot<TunedNormBackwardArgs>? _rmsNormGradGammaSlot;
+    private string? _tunedDeviceKey;
+
+    /// <summary>The registry device key, e.g. <c>webgpu:AMD Radeon RX 5500 XT</c>.</summary>
+    internal string TunedDeviceKey => _tunedDeviceKey ??= "webgpu:" + DeviceName;
+
+    private static TunedShape RowShape(int rows, int n) => TunedShape.Of2(TunedKernelDType.Float32, rows, n);
+
+    private readonly object _tuneTimingLock = new object();
+    private int _tuneTimestampQuery = -2;   // -2 = not created yet, -1 = unavailable
+
+    // Binds an unused storage slot of a reference kernel: WebGPU rejects a bind group that binds one buffer twice where
+    // either binding is writable, so an unused output cannot reuse a real one.
+    private IGpuBuffer? _tunedUnusedBinding;
+
+    private IGpuBuffer UnusedTunedBinding()
+    {
+        lock (_tunedSlotsLock) return _tunedUnusedBinding ??= AllocateBuffer(4);
+    }
+
+    /// <summary>True when timing runs on the device's timestamp clock rather than the host's.</summary>
+    internal bool TunedKernelTimingUsesDeviceClock
+    {
+        get { lock (_tuneTimingLock) return EnsureTuneTimestampQuery(); }
+    }
+
+    /// <summary>
+    /// Time of <paramref name="repetitions"/> back-to-back runs. Every WebGPU dispatch is submitted and waited for, so
+    /// the interval between a timestamp written before the first run and one written after the last is what the op
+    /// costs a caller, on the device clock. A device without the <c>timestamp-query</c> feature is timed on the host.
+    /// </summary>
+    internal double MeasureTunedKernelMilliseconds(Action run, int repetitions)
+    {
+        // Its own lock, as on Vulkan: gates of different slots tuning concurrently would overwrite each other's query.
+        lock (_tuneTimingLock)
+        {
+            if (EnsureTuneTimestampQuery())
+            {
+                WebGpuNativeBindings.WriteTimestamp(_tuneTimestampQuery, 0);
+                for (int i = 0; i < repetitions; i++) run();
+                WebGpuNativeBindings.WriteTimestamp(_tuneTimestampQuery, 1);
+                double nanoseconds = WebGpuNativeBindings.ReadTimestampQueryAsync(_tuneTimestampQuery).GetAwaiter().GetResult();
+                if (nanoseconds > 0) return nanoseconds / 1e6;
+                // A failed read, or a clock that did not advance: stop using the device clock for this backend.
+                ReleaseTuneTimestampQuery();
+                _tuneTimestampQuery = -1;
+            }
+
+            long start = Stopwatch.GetTimestamp();
+            for (int i = 0; i < repetitions; i++) run();
+            return (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
+        }
+    }
+
+    // Caller holds _tuneTimingLock.
+    private bool EnsureTuneTimestampQuery()
+    {
+        if (_tuneTimestampQuery == -2) _tuneTimestampQuery = IsAvailable ? WebGpuNativeBindings.CreateTimestampQuery() : -1;
+        return _tuneTimestampQuery >= 0;
+    }
+
+    // Caller holds _tuneTimingLock.
+    private void ReleaseTuneTimestampQuery()
+    {
+        if (_tuneTimestampQuery >= 0) WebGpuNativeBindings.DestroyTimestampQuery(_tuneTimestampQuery);
+    }
+
+    private void DisposeTunedKernelResources()
+    {
+        lock (_tuneTimingLock)
+        {
+            ReleaseTuneTimestampQuery();
+            _tuneTimestampQuery = -1;
+        }
+        lock (_tunedSlotsLock)
+        {
+            _tunedUnusedBinding?.Dispose();
+            _tunedUnusedBinding = null;
+            _tunedUnusedBinding2?.Dispose();
+            _tunedUnusedBinding2 = null;
+        }
+    }
+
+    private bool CanMeasureTunedKernels => IsAvailable;
+
+    private BackendTunedKernelHarness<TArgs> Harness<TArgs>(Func<TArgs, (IGpuBuffer Buffer, int Count)[]> outputs,
+        Func<TArgs, bool> aliased) where TArgs : struct
+        => new BackendTunedKernelHarness<TArgs>(this, TunedRowTolerance, () => CanMeasureTunedKernels, MeasureTunedKernelMilliseconds,
+            outputs, aliased);
+
+    private static float[] TunedParams(int rows, int n, float epsilon = 0f) =>
+        new[] { BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(n), epsilon, 0f };
+
+    // One generated variant: its own pipeline per source (keyed by the candidate id), the parameter block after the
+    // storage buffers, workgroupsX workgroups.
+    private void TunedDispatch(string key, string source, IGpuBuffer[] buffers, float[] uniforms, long workgroups)
+        => DispatchWorkgroupsAsync("tuned." + key, source, "main", buffers, uniforms, checked((int)workgroups)).GetAwaiter().GetResult();
+
+    private async System.Threading.Tasks.Task DispatchWorkgroupsAsync(string moduleName, string source, string entryPoint,
+        IGpuBuffer[] buffers, float[] uniformParams, int workgroupsX)
+    {
+        ThrowIfNotInitialized();
+        var wbufs = new WebGpuBuffer[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++) wbufs[i] = (WebGpuBuffer)buffers[i];
+        var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, entryPoint);
+        using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        using var bindGroup = new WebGpuBindGroup(pipelineId, wbufs);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroupsX, 1, 1);
+        await WebGpuNativeBindings.SubmitAndWaitAsync();
+    }
+    private void RowVariant(string key, string source, IGpuBuffer[] buffers, int rows, int n, int lanes, float epsilon = 0f)
+        => TunedDispatch(key, source, buffers, TunedParams(rows, n, epsilon), WebGpuTunedRowKernels.RowWorkgroups(rows, lanes));
+
+    private Func<TunedShape, bool> RowFit(int lanes) =>
+        shape => IsAvailable && WebGpuTunedRowKernels.RowLanesFit(shape[0], shape[1], lanes);
+
+    // ---------------------------------------------------------------- references (the established kernels)
+
+    private void SoftmaxReference(IGpuBuffer input, IGpuBuffer output, int rows, int n)
+        => SoftmaxAsync(input, output, rows, n).GetAwaiter().GetResult();
+
+    private void SoftmaxBackwardReference(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int rows, int n)
+        => Dispatch3BufferAsync("SoftmaxBackward", WebGpuKernels.SoftmaxBackwardSource, "softmax_backward",
+            gradOutput, output, gradInput, MakeUniformInts2(rows, n), rows).GetAwaiter().GetResult();
+
+    // The established layer_norm kernel writes only the output; the row statistics the interface promises in
+    // saveMean / saveInvVar (and the input-gradient candidates read) come from a statistics pass with the same 256-lane
+    // reduction. They used to be filled with zeros.
+    private void LayerNormReference(in TunedLayerNormArgs a)
+    {
+        LayerNormAsync(a.Input, a.Gamma, a.Beta, a.Output, a.Rows, a.N, a.Epsilon).GetAwaiter().GetResult();
+        TunedDispatch("layernorm_row_stats", WebGpuTunedRowKernels.LayerNormRowStats,
+            new[] { a.Input, a.SaveMean, a.SaveInvVar }, TunedParams(a.Rows, a.N, a.Epsilon), a.Rows);
+    }
+
+    private void LayerNormBackwardInputReference(in TunedNormBackwardArgs a)
+    {
+        var unused = UnusedTunedBinding();
+        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource, "layer_norm_backward_data",
+            a.GradOutput, a.Input, a.Gamma ?? unused, a.Out0, unused, UnusedTunedBinding2(),
+            TunedParams(a.Rows, a.N, a.Epsilon), checked(a.Rows * a.N)).GetAwaiter().GetResult();
+    }
+
+    private void LayerNormGradParamsReference(in TunedNormBackwardArgs a)
+    {
+        var unused = UnusedTunedBinding();
+        Dispatch6BufferAsync("LayerNormBackwardFull", WebGpuKernels.LayerNormBackwardFullSource, "layer_norm_backward_stats",
+            a.GradOutput, a.Input, unused, UnusedTunedBinding2(), a.Out0, a.Out1 ?? unused,
+            TunedParams(a.Rows, a.N, a.Epsilon), a.N).GetAwaiter().GetResult();
+    }
+
+    private void RmsNormGradGammaReference(in TunedNormBackwardArgs a)
+        => Dispatch4BufferAsync("RmsNormGradGamma", WebGpuKernels.RmsNormGradGammaSource, "rmsnorm_grad_gamma",
+            a.GradOutput, a.Input, a.Stat0, a.Out0, TunedParams(a.Rows, a.N), a.N).GetAwaiter().GetResult();
+
+    private IGpuBuffer? _tunedUnusedBinding2;
+
+    private IGpuBuffer UnusedTunedBinding2()
+    {
+        lock (_tunedSlotsLock) return _tunedUnusedBinding2 ??= AllocateBuffer(4);
+    }
+
+    // ---------------------------------------------------------------- slots
+
+    internal TunedKernelSlot<TunedSoftmaxArgs> SoftmaxSlot
+    {
+        get
+        {
+            if (_softmaxSlot is { } s) return s;
+            lock (_tunedSlotsLock)
+            {
+                if (_softmaxSlot is null)
+                {
+                    var candidates = new List<ITunedKernelCandidate<TunedSoftmaxArgs>>
+                    {
+                        new DelegateTunedKernelCandidate<TunedSoftmaxArgs>("webgpu.softmax.workgroup_per_row", TunedKernelOrigin.Builtin, true,
+                            _ => true, (in TunedSoftmaxArgs a) => SoftmaxReference(a.Input, a.Output, a.Rows, a.N)),
+                    };
+                    foreach (int lanes in WebGpuTunedRowKernels.RowLanes)
+                    {
+                        int l = lanes;
+                        string id = "generated.softmax.lanes" + l, source = WebGpuTunedRowKernels.Softmax(l);
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxArgs>(id, TunedKernelOrigin.Generated, true, RowFit(l),
+                            (in TunedSoftmaxArgs a) => RowVariant(id, source, new[] { a.Input, a.Output }, a.Rows, a.N, l)));
+                    }
+                    _softmaxSlot = new TunedKernelSlot<TunedSoftmaxArgs>(TunedKernelOp.Softmax, TunedDeviceKey,
+                        Harness<TunedSoftmaxArgs>(a => new[] { (a.Output, a.Rows * a.N) }, a => ReferenceEquals(a.Input, a.Output)),
+                        () => GpuDeterminism.IsActive, candidates.ToArray());
+                }
+                return _softmaxSlot;
+            }
+        }
+    }
+
+    internal TunedKernelSlot<TunedSoftmaxBackwardArgs> SoftmaxBackwardSlot
+    {
+        get
+        {
+            if (_softmaxBackwardSlot is { } s) return s;
+            lock (_tunedSlotsLock)
+            {
+                if (_softmaxBackwardSlot is null)
+                {
+                    var candidates = new List<ITunedKernelCandidate<TunedSoftmaxBackwardArgs>>
+                    {
+                        new DelegateTunedKernelCandidate<TunedSoftmaxBackwardArgs>("webgpu.softmax_backward.thread_per_row",
+                            TunedKernelOrigin.Builtin, true, _ => true,
+                            (in TunedSoftmaxBackwardArgs a) => SoftmaxBackwardReference(a.GradOutput, a.Output, a.GradInput, a.Rows, a.N)),
+                    };
+                    foreach (int lanes in WebGpuTunedRowKernels.RowLanes)
+                    {
+                        int l = lanes;
+                        string id = "generated.softmax_backward.lanes" + l, source = WebGpuTunedRowKernels.SoftmaxBackward(l);
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedSoftmaxBackwardArgs>(id, TunedKernelOrigin.Generated, true,
+                            RowFit(l), (in TunedSoftmaxBackwardArgs a) =>
+                                RowVariant(id, source, new[] { a.GradOutput, a.Output, a.GradInput }, a.Rows, a.N, l)));
+                    }
+                    _softmaxBackwardSlot = new TunedKernelSlot<TunedSoftmaxBackwardArgs>(TunedKernelOp.SoftmaxBackward, TunedDeviceKey,
+                        Harness<TunedSoftmaxBackwardArgs>(a => new[] { (a.GradInput, a.Rows * a.N) },
+                            a => ReferenceEquals(a.GradInput, a.GradOutput) || ReferenceEquals(a.GradInput, a.Output)),
+                        () => GpuDeterminism.IsActive, candidates.ToArray());
+                }
+                return _softmaxBackwardSlot;
+            }
+        }
+    }
+
+    internal TunedKernelSlot<TunedLayerNormArgs> LayerNormSlot
+    {
+        get
+        {
+            if (_layerNormSlot is { } s) return s;
+            lock (_tunedSlotsLock)
+            {
+                if (_layerNormSlot is null)
+                {
+                    var candidates = new List<ITunedKernelCandidate<TunedLayerNormArgs>>
+                    {
+                        new DelegateTunedKernelCandidate<TunedLayerNormArgs>("webgpu.layernorm_forward.workgroup_per_row",
+                            TunedKernelOrigin.Builtin, true, _ => true, (in TunedLayerNormArgs a) => LayerNormReference(a)),
+                    };
+                    foreach (int lanes in WebGpuTunedRowKernels.RowLanes)
+                    {
+                        int l = lanes;
+                        string id = "generated.layernorm_forward.lanes" + l, source = WebGpuTunedRowKernels.LayerNorm(l);
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedLayerNormArgs>(id, TunedKernelOrigin.Generated, true, RowFit(l),
+                            (in TunedLayerNormArgs a) => RowVariant(id, source,
+                                new[] { a.Input, a.Output, a.Gamma, a.Beta, a.SaveMean, a.SaveInvVar }, a.Rows, a.N, l, a.Epsilon)));
+                    }
+                    _layerNormSlot = new TunedKernelSlot<TunedLayerNormArgs>(TunedKernelOp.LayerNorm, TunedDeviceKey,
+                        Harness<TunedLayerNormArgs>(a => new[] { (a.Output, a.Rows * a.N), (a.SaveMean, a.Rows), (a.SaveInvVar, a.Rows) },
+                            a => ReferenceEquals(a.Input, a.Output)),
+                        () => GpuDeterminism.IsActive, candidates.ToArray());
+                }
+                return _layerNormSlot;
+            }
+        }
+    }
+
+    internal TunedKernelSlot<TunedNormBackwardArgs> LayerNormBackwardSlot
+    {
+        get
+        {
+            if (_layerNormBackwardSlot is { } s) return s;
+            lock (_tunedSlotsLock)
+            {
+                if (_layerNormBackwardSlot is null)
+                {
+                    var candidates = new List<ITunedKernelCandidate<TunedNormBackwardArgs>>
+                    {
+                        new DelegateTunedKernelCandidate<TunedNormBackwardArgs>("webgpu.layernorm_backward_input.thread_per_element",
+                            TunedKernelOrigin.Builtin, true, _ => true, (in TunedNormBackwardArgs a) => LayerNormBackwardInputReference(a)),
+                    };
+                    foreach (int lanes in WebGpuTunedRowKernels.RowLanes)
+                    {
+                        int l = lanes;
+                        string id = "generated.layernorm_backward_input.lanes" + l, source = WebGpuTunedRowKernels.LayerNormBackward(l);
+                        candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>(id, TunedKernelOrigin.Generated, true,
+                            shape => RowFit(l)(shape), (in TunedNormBackwardArgs a) => RowVariant(id, source,
+                                new[] { a.GradOutput, a.Input, a.Gamma ?? UnusedTunedBinding(), a.Stat0, a.Stat1 ?? UnusedTunedBinding(), a.Out0 },
+                                a.Rows, a.N, l)));
+                    }
+                    _layerNormBackwardSlot = new TunedKernelSlot<TunedNormBackwardArgs>(TunedKernelOp.LayerNormBackward, TunedDeviceKey,
+                        Harness<TunedNormBackwardArgs>(a => new[] { (a.Out0, a.Rows * a.N) },
+                            a => ReferenceEquals(a.Out0, a.GradOutput) || ReferenceEquals(a.Out0, a.Input)),
+                        () => GpuDeterminism.IsActive, candidates.ToArray());
+                }
+                return _layerNormBackwardSlot;
+            }
+        }
+    }
+
+    internal TunedKernelSlot<TunedNormBackwardArgs> LayerNormGradParametersSlot => ColumnSlot(ref _layerNormGradParamsSlot, rms: false);
+
+    internal TunedKernelSlot<TunedNormBackwardArgs> RmsNormGradGammaSlot => ColumnSlot(ref _rmsNormGradGammaSlot, rms: true);
+
+    private TunedKernelSlot<TunedNormBackwardArgs> ColumnSlot(ref TunedKernelSlot<TunedNormBackwardArgs>? field, bool rms)
+    {
+        if (field is { } s) return s;
+        lock (_tunedSlotsLock)
+        {
+            if (field is null)
+            {
+                var candidates = new List<ITunedKernelCandidate<TunedNormBackwardArgs>>
+                {
+                    rms
+                        ? new DelegateTunedKernelCandidate<TunedNormBackwardArgs>("webgpu.rmsnorm_grad_gamma.thread_per_column",
+                            TunedKernelOrigin.Builtin, true, _ => true, (in TunedNormBackwardArgs a) => RmsNormGradGammaReference(a))
+                        : new DelegateTunedKernelCandidate<TunedNormBackwardArgs>("webgpu.layernorm_grad_params.thread_per_column",
+                            TunedKernelOrigin.Builtin, true, _ => true, (in TunedNormBackwardArgs a) => LayerNormGradParamsReference(a)),
+                };
+                foreach (int rowLanes in WebGpuTunedRowKernels.ColumnRowLanes)
+                {
+                    string id = (rms ? "generated.rmsnorm_grad_gamma.rows" : "generated.layernorm_grad_params.rows") + rowLanes;
+                    string source = rms ? WebGpuTunedRowKernels.RmsNormGradGamma(rowLanes) : WebGpuTunedRowKernels.LayerNormGradParams(rowLanes);
+                    candidates.Add(new DelegateTunedKernelCandidate<TunedNormBackwardArgs>(id, TunedKernelOrigin.Generated, true,
+                        shape => IsAvailable && WebGpuTunedRowKernels.ColumnFit(shape[1]),
+                        (in TunedNormBackwardArgs a) => TunedDispatch(id, source,
+                            rms ? new[] { a.GradOutput, a.Input, a.Stat0, a.Out0 }
+                                : new[] { a.GradOutput, a.Input, a.Stat0, a.Stat1 ?? UnusedTunedBinding(), a.Out0, a.Out1 ?? UnusedTunedBinding2() },
+                            TunedParams(a.Rows, a.N), (a.N + 31L) / 32)));
+                }
+                field = new TunedKernelSlot<TunedNormBackwardArgs>(
+                    rms ? TunedKernelOp.RmsNormGradGamma : TunedKernelOp.LayerNormGradParameters, TunedDeviceKey,
+                    Harness<TunedNormBackwardArgs>(
+                        a => rms ? new[] { (a.Out0, a.N) } : new[] { (a.Out0, a.N), (a.Out1 ?? a.Out0, a.N) },
+                        a => ReferenceEquals(a.Out0, a.GradOutput) || ReferenceEquals(a.Out0, a.Input)),
+                    () => GpuDeterminism.IsActive, candidates.ToArray());
+            }
+            return field;
+        }
+    }
+}

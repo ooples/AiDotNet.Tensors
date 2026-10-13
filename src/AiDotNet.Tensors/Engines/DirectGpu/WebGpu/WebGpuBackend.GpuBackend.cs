@@ -512,7 +512,13 @@ public sealed partial class WebGpuBackend
     public void Sigmoid(IGpuBuffer A, IGpuBuffer B, int size) => SigmoidAsync(A, B, size).GetAwaiter().GetResult();
     public void Tanh(IGpuBuffer A, IGpuBuffer B, int size) => TanhAsync(A, B, size).GetAwaiter().GetResult();
     public void Gelu(IGpuBuffer A, IGpuBuffer B, int size) => GeLUAsync(A, B, size).GetAwaiter().GetResult();
-    public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features) => SoftmaxAsync(A, B, batchSize, features).GetAwaiter().GetResult();
+    public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
+    {
+        // Served by the tuned-kernel registry (#1117); the established kernel is the slot's reference.
+        if (batchSize > 0 && features > 0 && SoftmaxSlot.TryExecute(RowShape(batchSize, features), new TunedSoftmaxArgs(A, B, batchSize, features)))
+            return;
+        SoftmaxReference(A, B, batchSize, features);
+    }
 
     #endregion
 

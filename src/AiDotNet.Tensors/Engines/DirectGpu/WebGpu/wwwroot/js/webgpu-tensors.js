@@ -732,6 +732,22 @@ export function createTimestampQuery() {
 }
 
 /**
+ * Writes timestamp `index` (0 or 1) of a query, from an empty compute pass in a submission of its own, so the
+ * interval between the two writes covers exactly the work submitted between them.
+ * @param {number} queryId - Query ID from createTimestampQuery.
+ * @param {number} index - 0 for the start, 1 for the end.
+ */
+export function writeTimestamp(queryId, index) {
+    const query = timestampQueries.get(queryId);
+    if (!query) return;
+    const commandEncoder = device.createCommandEncoder();
+    const pass = commandEncoder.beginComputePass({
+        timestampWrites: { querySet: query.querySet, beginningOfPassWriteIndex: index }
+    });
+    pass.end();
+    queue.submit([commandEncoder.finish()]);
+}
+/**
  * Reads timestamp query results.
  * @param {number} queryId - Query ID.
  * @returns {Promise<number>} Duration in nanoseconds, or -1 on error.
