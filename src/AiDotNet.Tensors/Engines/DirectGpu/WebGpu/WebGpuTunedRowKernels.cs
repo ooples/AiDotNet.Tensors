@@ -33,13 +33,22 @@ internal static class WebGpuTunedRowKernels
     /// <summary>
     /// Whether the <paramref name="lanes"/>-lane variant is offered a <paramref name="rows"/> x <paramref name="n"/>
     /// problem: the widest count has no column limit, a narrow one stops past <see cref="MaxColumnsPerLane"/> columns
-    /// per lane, and the dispatch must fit one dimension's workgroup limit.
+    /// per lane, and the dispatch must fit the 2-D workgroup grid. The kernels compute each invocation's flat index in
+    /// i32, so every invocation of the padded grid (the last grid row is filled out to <see cref="MaxWorkgroups"/>)
+    /// must index below 2^31: past it the index wraps negative, passes the <c>row &lt; rows</c> liveness test and
+    /// addresses out of bounds.
     /// </summary>
     internal static bool RowLanesFit(long rows, long n, int lanes) =>
         (lanes == GroupSize || n <= (long)MaxColumnsPerLane * lanes)
-        && RowWorkgroups(rows, lanes) <= (long)MaxWorkgroups * MaxWorkgroups && rows * n <= int.MaxValue;
+        && RowWorkgroups(rows, lanes) <= (long)MaxWorkgroups * MaxWorkgroups
+        && RowGridWorkgroups(RowWorkgroups(rows, lanes)) * GroupSize <= (long)int.MaxValue + 1
+        && rows * n <= int.MaxValue;
 
     internal static long RowWorkgroups(long rows, int lanes) => (rows * lanes + GroupSize - 1) / GroupSize;
+
+    /// <summary>Workgroups the 2-D grid actually launches for <paramref name="workgroups"/>, including the padding of its last row.</summary>
+    internal static long RowGridWorkgroups(long workgroups) =>
+        workgroups <= MaxWorkgroups ? Math.Max(workgroups, 1) : (workgroups + MaxWorkgroups - 1) / MaxWorkgroups * MaxWorkgroups;
 
     internal static bool ColumnFit(long n) => (n + 31) / 32 <= MaxWorkgroups;
 

@@ -296,6 +296,29 @@ public sealed class WebGpuTunedKernelTests
         Assert.Contains("generated.layernorm_backward.lanes256", Applicable(backend.LayerNormBackwardSlot, wideShape).Select(c => c.Id));
     }
 
+    [Fact]
+    public void RowLanesFit_KeepsEveryInvocationOfThePaddedGrid_InsideI32()
+    {
+        // The row kernels compute (wid.x + wid.y * 65535) * 256 + lid in i32. 8,388,481 rows of 256 lanes need
+        // 128.002 grid rows, padded to 129 * 65535 workgroups whose last invocation indexes 2,164,227,839: past
+        // i32.MaxValue, so it wraps negative and passes the liveness test. 8,388,480 rows are exactly 128 grid rows.
+        Assert.True(WebGpuTunedRowKernels.RowLanesFit(8_388_480, 1, 256));
+        Assert.False(WebGpuTunedRowKernels.RowLanesFit(8_388_481, 1, 256));
+        Assert.False(WebGpuTunedRowKernels.RowLanesFit(8_388_609, 1, 256));
+
+        foreach (int lanes in WebGpuTunedRowKernels.RowLanes)
+        {
+            foreach (long rows in new long[] { 1, 65_535, 65_536, 8_388_480 / lanes * 256, 8_388_481L * 256 / lanes, 70_000_000 })
+            {
+                if (!WebGpuTunedRowKernels.RowLanesFit(rows, 1, lanes)) continue;
+                // Against the grid the backend actually dispatches, not the kernel class's own arithmetic.
+                long workgroups = WebGpuTunedRowKernels.RowWorkgroups(rows, lanes);
+                long lastInvocation = (long)WebGpuBackend.RowGridX(workgroups) * WebGpuBackend.RowGridY(workgroups)
+                    * WebGpuTunedRowKernels.GroupSize - 1;
+                Assert.True(lastInvocation <= int.MaxValue, $"{rows} rows x {lanes} lanes reach invocation {lastInvocation}");
+            }
+        }
+    }
     [SkippableFact]
     public void TimingHarness_MeasuresMoreTimeForMoreWork()
     {
