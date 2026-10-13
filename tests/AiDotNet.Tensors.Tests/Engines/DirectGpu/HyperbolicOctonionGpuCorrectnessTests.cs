@@ -741,6 +741,8 @@ public sealed class HipHyperbolicOctonionGpuCorrectnessTests : HyperbolicOctonio
         : base(fixture.IsAvailable ? fixture.Engine?.GetBackend() : null, fixture.IsAvailable ? null : "HIP GPU backend not available") { }
 }
 
+#if NET6_0_OR_GREATER
+// OpenClBackendTestFixture exists only on .NET 6+.
 [Collection("OpenClBackend")]
 public sealed class OpenClHyperbolicOctonionGpuCorrectnessTests : HyperbolicOctonionGpuCorrectnessTestsBase,
     IClassFixture<OpenClBackendTestFixture>
@@ -748,3 +750,4 @@ public sealed class OpenClHyperbolicOctonionGpuCorrectnessTests : HyperbolicOcto
     public OpenClHyperbolicOctonionGpuCorrectnessTests(OpenClBackendTestFixture fixture)
         : base(fixture.Backend, fixture.Backend is null ? "OpenCL GPU backend not available" : null) { }
 }
+#endif

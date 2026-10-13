@@ -9,7 +9,7 @@
 // correct while the device path did no work; TensorAll / TensorAny surfaced it only because their tests count
 // fallbacks. A static "is it defined in some source" check (CudaKernelLookupIntegrityTests) cannot see a source that
 // is never compiled, so these read the LIVE cache of a constructed backend.
-#if NETCOREAPP
+#if NET6_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.IO;
