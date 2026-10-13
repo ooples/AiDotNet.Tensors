@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Power-to-decibel conversion for issue #850, matching the NVRTC <c>power_to_db</c> kernel:
-/// <c>db[i] = max(10*log10(max(power[i], 1e-10) / refValue^2), minDb)</c>. PTX has no log10 primitive, so
+/// <c>db[i] = max(10*log10(max(power[i], 1e-10) / refValue), minDb)</c>. PTX has no log10 primitive, so
 /// the base-10 log is computed as <c>lg2.approx(ratio) * (10*log10(2))</c>; the specialization is therefore
 /// covered by a TOLERANCE-based parity spec, not bit-exact. The <c>refValue</c> and <c>minDb</c> scalars
 /// are per-launch <c>.param .f32</c>. The element <c>count</c> is baked and the launch covers it exactly
@@ -120,8 +120,7 @@ internal sealed class PtxPowerToDbF32Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
         ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");        // power
         ptx.AppendLine($"    max.f32 %f0, %f0, {tiny};");          // max(power, 1e-10)
-        ptx.AppendLine("    mul.rn.f32 %f1, %f3, %f3;");            // refSq
-        ptx.AppendLine("    div.rn.f32 %f0, %f0, %f1;");            // ratio
+        ptx.AppendLine("    div.rn.f32 %f0, %f0, %f3;");            // ratio to refValue (a power reference, #941)
         ptx.AppendLine("    lg2.approx.f32 %f0, %f0;");             // log2(ratio)
         ptx.AppendLine($"    mul.rn.f32 %f0, %f0, {tenLog10Of2};"); // 10*log10(ratio)
         ptx.AppendLine("    max.f32 %f0, %f0, %f4;");               // max(dbVal, minDb)
@@ -157,7 +156,7 @@ internal sealed class PtxPowerToDbF32Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "db[i] = max(10*log10(max(power[i],1e-10)/refValue^2), minDb)",
+                ["formula"] = "db[i] = max(10*log10(max(power[i],1e-10)/refValue), minDb)",
                 ["mode"] = "inference-forward-power-to-db",
                 ["arithmetic"] = "lg2.approx scaled by 10*log10(2); tolerance-based parity, not bit-exact",
                 ["scalars"] = "refValue and minDb are per-launch .param .f32",

@@ -161,8 +161,8 @@ extern ""C"" __global__ __launch_bounds__(256) void power_to_db(
     if (idx >= n) return;
 
     float p = power[idx];
-    float refSq = refValue * refValue;
-    float dbVal = 10.0f * log10f(fmaxf(p, 1e-10f) / refSq);
+    // refValue is a POWER reference: db = 10 log10(power / refValue), as in librosa power_to_db and torchaudio (#1236).
+    float dbVal = 10.0f * log10f(fmaxf(p, 1e-10f) / refValue);
     db[idx] = fmaxf(dbVal, minDb);
 }
 
@@ -173,8 +173,8 @@ extern ""C"" __global__ __launch_bounds__(256) void db_to_power(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
-    float refSq = refValue * refValue;
-    power[idx] = powf(10.0f, db[idx] / 10.0f) * refSq;
+    // The inverse of power_to_db: refValue is a power reference (#1236).
+    power[idx] = powf(10.0f, db[idx] / 10.0f) * refValue;
 }
 
 // Overlap-add for ISTFT

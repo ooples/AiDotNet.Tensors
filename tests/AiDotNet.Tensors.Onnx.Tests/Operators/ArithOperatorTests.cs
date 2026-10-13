@@ -107,6 +107,7 @@ public class ArithOperatorTests
         {
             var t = result.Inputs[name];
             data.AsSpan().CopyTo(t.AsWritableSpan());
+            t.MarkModified(); // raw-span writes must bump the version (#1235)
         }
         var output = result.Plan!.Execute();
         var arr = new float[output.AsSpan().Length];

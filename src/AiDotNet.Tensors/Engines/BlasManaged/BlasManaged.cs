@@ -396,6 +396,32 @@ public static partial class BlasManaged
         }
     }
 
+    // ClearOutputTile split across the pool by row bands once C is large enough for the dispatch to pay (1 MB).
+    private static unsafe void ClearOutputTileParallel<T>(Span<T> c, int ldc, int m, int n) where T : unmanaged
+    {
+        int bands = Math.Min(m, Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism));
+        if ((long)m * n * sizeof(T) < (1 << 20) || bands < 2)
+        {
+            ClearOutputTile(c, ldc, m, n);
+            return;
+        }
+        fixed (T* p = c)
+        {
+            nint addr = (nint)p;
+            int mL = m, nL = n, ldcL = ldc;
+            CpuParallelSettings.ParallelForOrSerial(0, bands, (long)m * n, band =>
+            {
+                int r0 = (int)((long)band * mL / bands), r1 = (int)((long)(band + 1) * mL / bands);
+                T* basePtr = (T*)addr;
+                if (ldcL == nL)
+                    new Span<T>(basePtr + (long)r0 * nL, (r1 - r0) * nL).Clear();
+                else
+                    for (int row = r0; row < r1; row++)
+                        new Span<T>(basePtr + (long)row * ldcL, nL).Clear();
+            }, deterministicSafe: true);
+        }
+    }
+
     // Diagnostic timing wrapper (#475 shape audit). When GemmShapeHistogram.Enabled it times
     // only the TOP-LEVEL Gemm call (a ThreadStatic guard skips internal re-dispatches so a
     // shape is attributed once, to the outer call). Disabled → a single bool read + straight
@@ -766,37 +792,23 @@ public static partial class BlasManaged
                 && (s_forceMachineKernel || !PrefersStrategyOverMachineKernel(m, n, k, typeof(T) == typeof(float)))
                 && EpilogueFlagsCompute.Compute(in epi409) == EpilogueFlags.None)
             {
-                // Machine-code kernel accumulates into a pre-zeroed C (and its Streaming M/N
-                // tails do too); under beta=0 the global clear was skipped, so zero here.
-                if (betaZero) ClearOutputTile(c, ldc, m, n);
-                int mAl = m - (m % mkMr); // interior rows (× Mr)
-                int nAl = n - (n % mkNr); // interior cols (× Nr)
+                // Machine-code kernel accumulates into a pre-zeroed C; under beta=0 the global clear was
+                // skipped, so zero here (in parallel for a large C: a serial clear of a 1000² double C was
+                // most of the 2.2 ms before the first dispatch, #1218). It takes any m, n: the partial last
+                // stripe / tile runs on zero-padded panels inside the parallel loop, where the M/N tails
+                // used to run serially through StreamingStrategy afterwards.
+                if (betaZero) ClearOutputTileParallel(c, ldc, m, n);
                 bool ran = typeof(T) == typeof(double)
                     ? MachineKernelGemm.TryGemmFp64(
                         MemoryMarshal.Cast<T, double>(a), lda, false,
                         MemoryMarshal.Cast<T, double>(b), ldb, false,
-                        MemoryMarshal.Cast<T, double>(c), ldc, mAl, nAl, k, false, false)
+                        MemoryMarshal.Cast<T, double>(c), ldc, m, n, k, false, false)
                     : MachineKernelGemm.TryGemmFp32(
                         MemoryMarshal.Cast<T, float>(a), lda, false,
                         MemoryMarshal.Cast<T, float>(b), ldb, false,
-                        MemoryMarshal.Cast<T, float>(c), ldc, mAl, nAl, k, false, false);
+                        MemoryMarshal.Cast<T, float>(c), ldc, m, n, k, false, false);
                 if (ran)
-                {
-                    int mTail = m - mAl, nTail = n - nAl;
-                    // (b) M-tail rows [mAl, m) × [0, nAl)
-                    if (mTail > 0 && nAl > 0)
-                        StreamingStrategy.Run<T>(a.Slice(mAl * lda), lda, false, b, ldb, false,
-                            c.Slice(mAl * ldc), ldc, mTail, nAl, k, in options);
-                    // (c) N-tail cols [0, mAl) × [nAl, n)
-                    if (nTail > 0 && mAl > 0)
-                        StreamingStrategy.Run<T>(a, lda, false, b.Slice(nAl), ldb, false,
-                            c.Slice(nAl), ldc, mAl, nTail, k, in options);
-                    // (d) corner [mAl, m) × [nAl, n)
-                    if (mTail > 0 && nTail > 0)
-                        StreamingStrategy.Run<T>(a.Slice(mAl * lda), lda, false, b.Slice(nAl), ldb, false,
-                            c.Slice(mAl * ldc + nAl), ldc, mTail, nTail, k, in options);
                     return;
-                }
             }
         }
 
