@@ -69,6 +69,15 @@ internal static class CuRandNative
     [DllImport(Lib)]
     public static extern Status curandGenerate(IntPtr generator, IntPtr outputPtr, ulong num);
 
+    /// <summary>The number of dimensions of a quasi-random generator (default 1).</summary>
+    [DllImport(Lib)]
+    public static extern Status curandSetQuasiRandomGeneratorDimensions(IntPtr generator, uint dimensions);
+
+    /// <summary>A pointer to cuRAND's table of 32-bit direction vectors: 20,000 dimensions of 32 words each.
+    /// <paramref name="set"/> 101 is the Joe-Kuo set (CURAND_DIRECTION_VECTORS_32_JOEKUO6).</summary>
+    [DllImport(Lib)]
+    public static extern Status curandGetDirectionVectors32(out IntPtr vectors, int set);
+
     [DllImport(Lib)]
     public static extern Status curandSetPseudoRandomGeneratorSeed(IntPtr generator, ulong seed);
 

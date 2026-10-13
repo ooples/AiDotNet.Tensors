@@ -333,9 +333,30 @@ public class CpuMrg32k3aGeneratorTests
 
         Assert.True(CpuDeviceRng.IsSupported(DeviceRngAlgorithm.Philox));
         Assert.True(CpuDeviceRng.IsSupported(DeviceRngAlgorithm.Mrg32K3A));
-        // Not yet: the two Sobol generators (tracked in #1204).
-        Assert.False(CpuDeviceRng.IsSupported(DeviceRngAlgorithm.Sobol));
-        Assert.Throws<NotSupportedException>(() => new CuRand(1, DeviceRngAlgorithm.Sobol));
-        Assert.Throws<NotSupportedException>(() => CpuDeviceRng.Create(DeviceRngAlgorithm.ScrambledSobol, 1));
+        // The pseudo-random generators have no dimensions.
+        Assert.Throws<ArgumentOutOfRangeException>(() => CpuDeviceRng.Create(DeviceRngAlgorithm.Mrg32K3A, 1, dimensions: 2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new CuRand(1, DeviceRngAlgorithm.Philox, dimensions: 3));
+
+        // The Sobol generators through the same wrappers, with their dimension count.
+        foreach (var algorithm in new[] { DeviceRngAlgorithm.Sobol, DeviceRngAlgorithm.ScrambledSobol })
+        {
+            Assert.True(CpuDeviceRng.IsSupported(algorithm));
+            var reference = Uniform(CpuDeviceRng.Create(algorithm, 5, 2, 7, dimensions: 4), 400);
+            var sobolWrappers = new IDeviceRng[]
+            {
+                new CuRand(5, algorithm, 2, 7, 4),
+                new AiDotNet.Tensors.Engines.DirectGpu.HIP.RocRand(5, algorithm, 2, 7, 4),
+                new AiDotNet.Tensors.Engines.DirectGpu.Metal.MpsRng(5, algorithm, 2, 7, 4),
+                new AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClRng(5, algorithm, 2, 7, 4),
+                new AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanRng(5, algorithm, 2, 7, 4),
+            };
+            foreach (var rng in sobolWrappers)
+            {
+                Assert.Equal(algorithm, rng.Algorithm);
+                Assert.Equal(reference, Uniform(rng, 400));
+                Assert.Equal(107UL, rng.Offset);      // 100 points of 4 dimensions from point 7
+                Assert.Equal(2UL, rng.Subsequence);
+            }
+        }
     }
 }

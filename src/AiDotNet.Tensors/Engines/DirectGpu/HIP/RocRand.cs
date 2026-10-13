@@ -47,10 +47,10 @@ public sealed class RocRand : IDeviceRng
     /// throws <see cref="NotSupportedException"/> so a caller asking for
     /// Sobol doesn't silently get Philox draws.</summary>
     public RocRand(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
         Algorithm = algo;
-        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset);
+        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
 
     /// <inheritdoc/>

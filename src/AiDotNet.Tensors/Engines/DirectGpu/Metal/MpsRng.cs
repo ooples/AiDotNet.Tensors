@@ -44,10 +44,10 @@ public sealed class MpsRng : IDeviceRng
 
     /// <summary>Constructs an MPS-backed RNG.</summary>
     public MpsRng(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
         Algorithm = algo;
-        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset);
+        _cpuFallback = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
 
     /// <inheritdoc/>

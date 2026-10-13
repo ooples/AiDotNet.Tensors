@@ -126,10 +126,10 @@ public sealed class WebGpuRng : IDeviceRng
     public static bool IsAvailable => WebGpuLoaderProbe.IsAvailable;
     /// <summary>Constructs a WebGPU-backed RNG.</summary>
     public WebGpuRng(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
         Algorithm = algo;
-        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset);
+        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
     /// <inheritdoc/>
     public void Uniform(Tensor<float> output) => _cpu.Uniform(output);
