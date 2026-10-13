@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.137.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.137.0...v0.137.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **arena:** keep arena-backed tensors out of TensorPool ([#1275](https://github.com/ooples/AiDotNet.Tensors/issues/1275)) ([b0319db](https://github.com/ooples/AiDotNet.Tensors/commit/b0319db415c92c0498f3111132a379433672adda))
+
 ## [0.137.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.136.0...v0.137.0) (2026-10-13)
 
 
