@@ -60,6 +60,15 @@ internal static class CuRandNative
     [DllImport(Lib)]
     public static extern Status curandDestroyGenerator(IntPtr generator);
 
+    /// <summary>A generator that runs on the host and writes host memory. Same output as the device generator of
+    /// the same type; needs no CUDA context.</summary>
+    [DllImport(Lib)]
+    public static extern Status curandCreateGeneratorHost(out IntPtr generator, GeneratorType type);
+
+    /// <summary>Raw 32-bit outputs.</summary>
+    [DllImport(Lib)]
+    public static extern Status curandGenerate(IntPtr generator, IntPtr outputPtr, ulong num);
+
     [DllImport(Lib)]
     public static extern Status curandSetPseudoRandomGeneratorSeed(IntPtr generator, ulong seed);
 
