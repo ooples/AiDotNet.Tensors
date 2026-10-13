@@ -26914,19 +26914,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Reuse the resident all-axis implementation above. It composes offset device copies
         // from IDirectGpuBackend instead of depending on the optional IGpuBatchExecution
         // surface, and therefore works on OpenCL as well as the other native backends.
-        if (typeof(T) == typeof(float) && tensors is { Count: 2 } && TryGetBackend(out _))
+        // Any number of inputs: TensorConcatenate composes one device copy per input. Limiting this to two sent a
+        // compiled LSTM's four-gate weight stack to the host concat, whose result then needed a synchronous upload
+        // inside CUDA graph capture (error 900), which abandoned the step's capture.
+        if (typeof(T) == typeof(float) && tensors is { Count: >= 2 } && TryGetBackend(out _))
         {
             var a = tensors[0];
-            var b = tensors[1];
             int rank = a.Rank;
             int normalizedAxis = axis < 0 ? rank + axis : axis;
-            bool compatible = normalizedAxis >= 0 && normalizedAxis < rank && b.Rank == rank
-                && a.IsContiguous && b.IsContiguous;
-            for (int i = 0; compatible && i < rank; i++)
-                compatible = i == normalizedAxis || a.Shape._dims[i] == b.Shape._dims[i];
+            bool compatible = normalizedAxis >= 0 && normalizedAxis < rank;
+            for (int t = 0; compatible && t < tensors.Count; t++)
+            {
+                var other = tensors[t];
+                compatible = other.Rank == rank && other.IsContiguous;
+                for (int i = 0; compatible && i < rank; i++)
+                    compatible = i == normalizedAxis || a.Shape._dims[i] == other.Shape._dims[i];
+            }
 
             if (compatible)
-                return ((IEngine)this).TensorConcatenate(new[] { a, b }, axis);
+                return ((IEngine)this).TensorConcatenate(tensors.ToArray(), axis);
         }
         return base.Concat(tensors,axis);
     }

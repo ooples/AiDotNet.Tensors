@@ -17545,6 +17545,28 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
 
+        // Input projection as one GEMM, then the recurrence alone (see lstm_forward_recurrence).
+        if (_kernelCache.TryGetValue("lstm_forward_recurrence", out var forwardRecurrence))
+        {
+            LstmForwardViaGemm(forwardRecurrence, input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
+                output, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
+        }
+        else
+        {
+            LaunchLstmForwardSequence(kernel, input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
+                output, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
+        }
+
+        using var _ = PushContext();
+        CopyLstmFinalState(allH, allC, hFinal, cFinal, seqLen, batch, hiddenSize);
+    }
+
+    private unsafe void LaunchLstmForwardSequence(IntPtr kernel,
+        IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit,
+        IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,
+        IGpuBuffer output, IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer cacheGates,
+        int seqLen, int batch, int inputSize, int hiddenSize)
+    {
         using var _ = PushContext();
 
         // Grid = one block per batch sample, block = hiddenSize threads per batch
@@ -17583,7 +17605,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         args[14] = &hiddenSize;
 
         LaunchKernel(kernel, grid, blockSize, args);
+    }
 
+    private void CopyLstmFinalState(IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer hFinal, IGpuBuffer cFinal,
+        int seqLen, int batch, int hiddenSize)
+    {
         // Copy the last timestep from allH and allC into hFinal and cFinal. The kernel writes timestep t's
         // state at block index t (stateOffset = t*batch*hidden, NO hInit slot at index 0), so the LAST
         // written timestep is seqLen-1. (The old code read block seqLen, which the kernel never writes —
@@ -17619,9 +17645,6 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
         int seqLen, int batch, int inputSize, int hiddenSize)
     {
-        if (!_kernelCache.TryGetValue("lstm_backward_sequence", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_sequence");
-
         // Validate hiddenSize fits in a block for correct synchronization
         if (hiddenSize > MaxRnnBlockSize)
         {
@@ -17630,6 +17653,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 "The kernel requires all hidden units of a batch to fit within a single block for " +
                 "correct synchronization. Use smaller hiddenSize or use cell-level LSTM operations.");
         }
+
+        // The recurrence kernel plus GEMMs: the sequential part alone, then the weight, bias and input gradients
+        // as dense products over all batch*seqLen rows (see lstm_backward_recurrence).
+        if (_kernelCache.TryGetValue("lstm_backward_recurrence", out var recurrence)
+            && 4L * hiddenSize * sizeof(float) <= 48 * 1024)
+        {
+            LstmBackwardViaGemm(recurrence, gradOutput, allH, allC, cacheGates, hInit, cInit, weightsIh, weightsHh, input,
+                gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
+                seqLen, batch, inputSize, hiddenSize);
+            return;
+        }
+
+        if (!_kernelCache.TryGetValue("lstm_backward_sequence", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_sequence");
 
         using var _ = PushContext();
 

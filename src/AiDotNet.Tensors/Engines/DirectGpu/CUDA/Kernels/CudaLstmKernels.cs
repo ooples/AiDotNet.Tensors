@@ -742,6 +742,173 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
 }
 
 // ===========================================================================
+// LSTM FORWARD RECURRENCE (input projection precomputed)
+// ===========================================================================
+
+// The sequential part of the forward only. The caller computes xProj = X Wi^T for all batch*timeSteps rows as one
+// GEMM first, so a step reads its input contribution instead of forming it; h_{t-1} is shared through shared
+// memory, and the recurrent weights are read transposed (WhT [hidden, 4*hidden]) so that, for a fixed input j,
+// the block's threads read consecutive addresses. Outputs and caches are exactly lstm_forward_sequence's.
+//   xProj : [batch*timeSteps, 4*hidden]   row r = b*timeSteps + t, weight-row order i,f,g,o
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_recurrence(
+    const float* xProj,
+    const float* h_init,      // [batch, hidden]
+    const float* c_init,      // [batch, hidden]
+    const float* WhT,         // [hidden, 4*hidden]
+    const float* biasIh,      // [4*hidden]
+    const float* biasHh,      // [4*hidden]
+    float* output,            // [batch, timeSteps, hidden]
+    float* h_states,          // [timeSteps, batch, hidden]
+    float* c_states,          // [timeSteps, batch, hidden]
+    float* gates,             // [timeSteps, batch, 4*hidden], role order f,i,g,o
+    int batch,
+    int timeSteps,
+    int hiddenSize)
+{
+    extern __shared__ float hPrev[];   // [hidden]
+    int b = blockIdx.x;
+    int h_idx = threadIdx.x;
+    int G = 4 * hiddenSize;
+    int gid = b * hiddenSize + h_idx;
+
+    hPrev[h_idx] = h_init[gid];
+    float c = c_init[gid];
+    float bI = biasIh[h_idx] + biasHh[h_idx];
+    float bF = biasIh[hiddenSize + h_idx] + biasHh[hiddenSize + h_idx];
+    float bG = biasIh[2 * hiddenSize + h_idx] + biasHh[2 * hiddenSize + h_idx];
+    float bO = biasIh[3 * hiddenSize + h_idx] + biasHh[3 * hiddenSize + h_idx];
+    __syncthreads();
+
+    for (int t = 0; t < timeSteps; t++) {
+        int r = b * timeSteps + t;
+        float sI = xProj[r * G + h_idx] + bI;
+        float sF = xProj[r * G + hiddenSize + h_idx] + bF;
+        float sG = xProj[r * G + 2 * hiddenSize + h_idx] + bG;
+        float sO = xProj[r * G + 3 * hiddenSize + h_idx] + bO;
+        for (int j = 0; j < hiddenSize; j++) {
+            float hj = hPrev[j];
+            const float* row = WhT + j * G;
+            sI += row[h_idx] * hj;
+            sF += row[hiddenSize + h_idx] * hj;
+            sG += row[2 * hiddenSize + h_idx] * hj;
+            sO += row[3 * hiddenSize + h_idx] * hj;
+        }
+        float f = sigmoid(sF);
+        float i_gate = sigmoid(sI);
+        float g = tanhf(sG);
+        float o = sigmoid(sO);
+        c = f * c + i_gate * g;
+        float h = o * tanhf(c);
+
+        int stateOffset = t * batch * hiddenSize + gid;
+        h_states[stateOffset] = h;
+        c_states[stateOffset] = c;
+        output[r * hiddenSize + h_idx] = h;
+        int gateOffset = t * batch * G + b * G;
+        gates[gateOffset + h_idx] = f;
+        gates[gateOffset + hiddenSize + h_idx] = i_gate;
+        gates[gateOffset + 2 * hiddenSize + h_idx] = g;
+        gates[gateOffset + 3 * hiddenSize + h_idx] = o;
+
+        __syncthreads();   // every thread has read hPrev for this step
+        hPrev[h_idx] = h;
+        __syncthreads();   // the next step reads the new hPrev
+    }
+}
+
+// ===========================================================================
+// LSTM BACKWARD RECURRENCE (no weight-gradient atomics)
+// ===========================================================================
+
+// The sequential part of BPTT only: per timestep, the gate gradients and dH_prev = Wh^T dGates. One block per
+// batch row with one thread per hidden unit; the row's 4H gate gradients are shared through shared memory, so
+// each thread forms its own dH_prev[j] as a dot product instead of atomically scattering into every j.
+// The weight, bias and input gradients are NOT formed here: the kernel writes dGates in two layouts and the
+// previous hidden states, and the caller forms them as GEMMs over all batch*timeSteps rows afterwards
+// (dWi = dGatesT X, dWh = dGatesT Hprev, dX = dGates Wi, dBias = row sums of dGatesT). The previous kernel
+// accumulated those with ~4*(input+hidden) contended atomicAdds per thread per timestep, which made it the
+// whole cost of a training step.
+//   dGates  : [batch*timeSteps, 4*hidden]   row r = b*timeSteps + t, weight-row order i,f,g,o
+//   dGatesT : [4*hidden, batch*timeSteps]   the same values transposed
+//   hPrev   : [batch*timeSteps, hidden]     h_{t-1} (h_init at t = 0)
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_recurrence(
+    const float* gradOutput,  // [batch, timeSteps, hidden]
+    const float* h_states,    // [timeSteps, batch, hidden]
+    const float* c_states,    // [timeSteps, batch, hidden]
+    const float* gates,       // [timeSteps, batch, 4*hidden], cached in role order f,i,g,o
+    const float* c_init,      // [batch, hidden]
+    const float* h_init,      // [batch, hidden]
+    const float* Wh,          // [4*hidden, hidden]
+    float* dGates,
+    float* dGatesT,
+    float* hPrev,
+    float* dH_init,           // [batch, hidden]
+    float* dC_init,           // [batch, hidden]
+    int batch,
+    int timeSteps,
+    int hiddenSize)
+{
+    extern __shared__ float dG[];   // [4*hidden]
+    int b = blockIdx.x;
+    int h_idx = threadIdx.x;
+    int G = 4 * hiddenSize;
+    int rows = batch * timeSteps;
+    int gid = b * hiddenSize + h_idx;
+
+    float dHnext = 0.0f;   // dL/dh_t carried from the later timestep
+    float dC = 0.0f;
+
+    for (int t = timeSteps - 1; t >= 0; t--) {
+        float dH = dHnext + gradOutput[(b * timeSteps + t) * hiddenSize + h_idx];
+
+        int gateOffset = t * batch * G + b * G;
+        float f = gates[gateOffset + h_idx];
+        float i_gate = gates[gateOffset + hiddenSize + h_idx];
+        float g = gates[gateOffset + 2 * hiddenSize + h_idx];
+        float o = gates[gateOffset + 3 * hiddenSize + h_idx];
+
+        float c_t = c_states[t * batch * hiddenSize + gid];
+        float c_prev = t == 0 ? c_init[gid] : c_states[(t - 1) * batch * hiddenSize + gid];
+        float h_prev = t == 0 ? h_init[gid] : h_states[(t - 1) * batch * hiddenSize + gid];
+
+        float tanh_c = tanhf(c_t);
+        float dO = dH * tanh_c * sigmoid_derivative(o);
+        dC += dH * o * tanh_derivative(tanh_c);
+        float dF = dC * c_prev * sigmoid_derivative(f);
+        float dI = dC * g * sigmoid_derivative(i_gate);
+        float dGc = dC * i_gate * tanh_derivative(g);
+        dC = dC * f;
+
+        // Weight-row order i, f, g, o (PyTorch), as lstm_backward_sequence maps it.
+        dG[h_idx] = dI;
+        dG[hiddenSize + h_idx] = dF;
+        dG[2 * hiddenSize + h_idx] = dGc;
+        dG[3 * hiddenSize + h_idx] = dO;
+
+        int r = b * timeSteps + t;
+        dGates[r * G + h_idx] = dI;
+        dGates[r * G + hiddenSize + h_idx] = dF;
+        dGates[r * G + 2 * hiddenSize + h_idx] = dGc;
+        dGates[r * G + 3 * hiddenSize + h_idx] = dO;
+        dGatesT[h_idx * rows + r] = dI;
+        dGatesT[(hiddenSize + h_idx) * rows + r] = dF;
+        dGatesT[(2 * hiddenSize + h_idx) * rows + r] = dGc;
+        dGatesT[(3 * hiddenSize + h_idx) * rows + r] = dO;
+        hPrev[r * hiddenSize + h_idx] = h_prev;
+        __syncthreads();
+
+        // dH_prev[j] = sum_k dG[k] * Wh[k, j]; for a fixed k the block reads one contiguous row of Wh.
+        float acc = 0.0f;
+        for (int k = 0; k < G; k++) acc += dG[k] * Wh[k * hiddenSize + h_idx];
+        dHnext = acc;
+        __syncthreads();   // dG is overwritten by the next timestep
+    }
+
+    dH_init[gid] = dHnext;
+    dC_init[gid] = dC;
+}
+
+// ===========================================================================
 // LSTM WEIGHT GRADIENT ACCUMULATION KERNEL
 // ===========================================================================
 
@@ -934,6 +1101,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_backward_input",
             "lstm_backward_prevh",
             "lstm_backward_sequence",
+            "lstm_backward_recurrence",
+            "lstm_forward_recurrence",
             "lstm_accumulate_weight_gradients",
             "lstm_accumulate_weight_gradients_deterministic",
             "lstm_compute_gate_gradients"

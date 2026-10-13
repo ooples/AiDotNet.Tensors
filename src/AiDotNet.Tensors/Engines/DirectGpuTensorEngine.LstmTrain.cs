@@ -129,6 +129,75 @@ public partial class DirectGpuTensorEngine
         return outputTensor;
     }
 
+    /// <summary>
+    /// Whether a compiled training trace through <c>LstmSequenceForward</c> records one fused LSTM node here (the
+    /// active backend runs the fused sequence kernels), so a caller can route its LSTM to that op rather than tracing
+    /// a per-timestep chain. An individual call can still decline (other shapes, a hidden size above the backend's
+    /// limit, an initial state) and falls back to the decomposed ops.
+    /// </summary>
+    public bool RecordsFusedLstmSequenceTraining => PlacementBackend is IFusedLstmSequenceTraining;
+
+    /// <summary>
+    /// The compiled-training counterpart of <see cref="TryLstmSequenceTrain{T}"/>: under a training trace, records ONE
+    /// node whose forward is the persistent-RNN forward kernel and whose backward is the BPTT kernel, as
+    /// <c>CpuEngine</c> records its fused LSTM node. Without it the trace kept the per-timestep op chain, which a
+    /// captured CUDA graph replayed as ~2,000 kernels, ~750 copies and ~450 memsets per step for a 32-step LSTM.
+    /// Returns null (the caller records its decomposed ops) wherever the eager fused path would also decline.
+    /// </summary>
+    /// <remarks>Two biases are summed by a recorded add before the node, as the eager path does, so each receives
+    /// the bias gradient through that add.</remarks>
+    private Tensor<T>? TryRecordLstmSequenceTrain<T>(Compilation.LazyTensorScope scope, Tensor<T> input,
+        Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh)
+    {
+        // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350),
+        // which is exactly when this records. The kernels run later, when the node executes.
+        if (typeof(T) != typeof(float) || PlacementBackend is not IFusedLstmSequenceTraining fused
+            || input.Rank != 3 || wIh.Rank != 2 || wHh.Rank != 2)
+            return null;
+        int b = input._shape[0], t = input._shape[1], inSize = input._shape[2];
+        int gateRows = wIh._shape[0], h = gateRows / 4;
+        if (gateRows % 4 != 0 || wIh._shape[1] != inSize || wHh._shape[0] != gateRows || wHh._shape[1] != h
+            || h <= 0 || h > fused.MaxFusedLstmHidden || b <= 0 || t <= 0
+            || (bIh is not null && bIh.Length != gateRows) || (bHh is not null && bHh.Length != gateRows))
+            return null;
+        if (!scope.BindEngine(this)) return null;
+
+        var bias = bIh is not null && bHh is not null ? TensorAdd(bIh, bHh)
+            : bIh ?? bHh ?? new Tensor<T>(new[] { gateRows });
+        var node = new LstmRecordedNode();
+
+        return scope.RecordVariadic(Compilation.LazyNodeType.Custom, "LstmSequenceTrain",
+            new[] { input, wIh, wHh, bias }, new[] { b, t, h },
+            (eng, output) =>
+            {
+                var gpu = (DirectGpuTensorEngine)eng;
+                var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
+                // The cache is resolved when the node runs, with the backend live; it is per layer (keyed by the
+                // weight tensor) and stable across steps, so a captured graph keeps valid pointers.
+                var cache = gpu.GetLstmTrainCache(backend, wIh, b, t, inSize, h);
+                node.Cache = cache;
+                var result = gpu.RunLstmForward(input, wIh, wHh, bias, cache);
+                StampLstmForward(cache, node.Stamp);
+                CopyResultInto(eng, result, output);
+            },
+            LstmSequenceTrainRecordedBackward<T>, new object[] { node });
+    }
+
+    // What a recorded node's forward leaves for its backward: the cache it wrote and the forward it ran.
+    private sealed class LstmRecordedNode
+    {
+        public LstmTrainCache? Cache { get; set; }
+        public LstmForwardStamp Stamp { get; } = new();
+    }
+
+    private static void LstmSequenceTrainRecordedBackward<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var node = (LstmRecordedNode)savedState[0];
+        var cache = node.Cache ?? throw new InvalidOperationException("The fused GPU LSTM node's backward ran before its forward.");
+        LstmSequenceTrainBackward(gradOutput, inputs, output, new object[] { cache, node.Stamp }, engine, grads);
+    }
     private Tensor<T> RunLstmForward<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias, LstmTrainCache c)
     {
         var backend = GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
