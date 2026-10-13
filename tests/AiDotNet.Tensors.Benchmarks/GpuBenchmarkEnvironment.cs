@@ -338,6 +338,24 @@ internal static class GpuBenchmarkEnvironment
         }
     }
 
+    /// <summary>
+    /// Waits (idle) until the GPU has cooled to <paramref name="targetCelsius"/>, so a long matrix of routes does not
+    /// heat the device past the evidence ceiling partway through. The ceiling check itself is unchanged.
+    /// </summary>
+    internal static void WaitForCooldown(string label, int targetCelsius = 62, int timeoutSeconds = 600)
+    {
+        var watch = Stopwatch.StartNew();
+        while (true)
+        {
+            string temperature = RunNvidiaSmi("--query-gpu=temperature.gpu", "--format=csv,noheader,nounits");
+            if (!int.TryParse(temperature, out int celsius) || celsius <= targetCelsius) return;
+            if (watch.Elapsed.TotalSeconds > timeoutSeconds)
+                throw new InvalidOperationException(
+                    $"[{label}] GPU stayed at {celsius} C, above the {targetCelsius} C cooldown target, for {timeoutSeconds} s.");
+            Thread.Sleep(2000);
+        }
+    }
+
     private static string RunNvidiaSmi(params string[] arguments)
     {
         var start = new ProcessStartInfo

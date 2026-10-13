@@ -65,6 +65,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             DirectPtxFeatureGate.TestOverride = false;
             DirectPtxFeatureGate.FusedLinearExperimentOverride = false;
             AiDotNetEngine.SetDeterministicMode(false);
+            GpuBenchmarkEnvironment.WaitForCooldown(operation);
             BenchmarkRoute(backend, run, operation, shape, "cuBLAS TF32 (prod default)", work,
                 () => backend.Gemm(left, right, output, m, n, k), () => RelativeError(output),
                 Resources.None, capture, tolerance: Tf32GridTolerance, deviceLaunches: launches);
@@ -72,6 +73,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             AiDotNetEngine.SetDeterministicMode(true);
             try
             {
+                GpuBenchmarkEnvironment.WaitForCooldown(operation);
                 BenchmarkRoute(backend, run, operation, shape, "cuBLAS FP32 strict", work,
                     () => backend.Gemm(left, right, output, m, n, k), () => RelativeError(output),
                     Resources.None, capture, tolerance: Fp32GridTolerance, deviceLaunches: launches);
@@ -86,6 +88,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                 backend.PrewarmDirectPtxGemmTiled(m, k, n, DirectPtxLinearWeightLayout.InputMajor) &&
                 backend.TryGetDirectPtxGemmTiledAudit(m, k, n, DirectPtxLinearWeightLayout.InputMajor, 1, out var tiledAudit))
             {
+                GpuBenchmarkEnvironment.WaitForCooldown(operation);
                 BenchmarkRoute(backend, run, operation, shape, "Direct PTX tiled 16x16x32", work, () =>
                     {
                         if (!backend.TryDirectPtxGemmTiled(left, right, output, m, k, n, DirectPtxLinearWeightLayout.InputMajor))
@@ -101,6 +104,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             if (PtxGemmKernel.IsSupportedShape(m, k, n) && backend.PrewarmDirectPtxGemm(m, k, n) &&
                 backend.TryGetDirectPtxGemmAudit(m, k, n, out var gemmAudit))
             {
+                GpuBenchmarkEnvironment.WaitForCooldown(operation);
                 BenchmarkRoute(backend, run, operation, shape, "Direct PTX gemm 64x64x8", work, () =>
                     {
                         if (!backend.TryDirectPtxGemm(left, right, output, m, k, n))
