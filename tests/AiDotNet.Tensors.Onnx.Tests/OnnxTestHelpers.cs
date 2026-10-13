@@ -26,6 +26,7 @@ internal static class OnnxTestHelpers
         {
             var t = result.Inputs[name];
             data.AsSpan().CopyTo(t.AsWritableSpan());
+            t.MarkModified(); // raw-span writes must bump the version (plans key cached snapshots on it, #1235)
         }
         var output = result.Plan!.Execute();
         var arr = new float[output.AsSpan().Length];
@@ -50,6 +51,7 @@ internal static class OnnxTestHelpers
         {
             var t = result.Inputs[name];
             data.AsSpan().CopyTo(t.AsWritableSpan());
+            t.MarkModified(); // raw-span writes must bump the version (plans key cached snapshots on it, #1235)
         }
         result.Plan!.Execute();
         Assert.True(result.Outputs.TryGetValue(outputName, out var tensor),

@@ -315,7 +315,11 @@ public static class OnnxImporter
                 tensorsByName[outputVi.Name] = wrapped;
             }
 
-            plan = scope.CompileInference<T>();
+            // Name the plan's output: without it Execute() returns the last recorded tensor, which for an op with
+            // auxiliary results (LayerNormalization's per-row statistics) is not the graph output (#1235).
+            plan = graph.Output.Count > 0 && tensorsByName.TryGetValue(graph.Output[0].Name, out var firstOutput)
+                ? scope.CompileInference<T>(firstOutput)
+                : scope.CompileInference<T>();
         }
         finally
         {
