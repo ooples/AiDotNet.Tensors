@@ -950,6 +950,7 @@ public sealed class TensorArena : IDisposable
         // calls at any size). We overwrite every element from the boundary immediately, so the
         // buffer's initial contents don't matter.
         var buf = (RentCarry(typeof(T), total) as T[]) ?? new T[total];
+        MarkIssued(buf);   // the carry pool hands this buffer out again on a later boundary
         boundary.AsSpan().CopyTo(new Span<T>(buf, 0, total));
 
         if (_pendingCarryReturn is { } prev)
