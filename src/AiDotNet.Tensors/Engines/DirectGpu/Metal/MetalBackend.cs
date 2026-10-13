@@ -5,6 +5,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.Compilation.Codegen;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
@@ -274,6 +275,17 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             System.Diagnostics.Debug.WriteLine($"Metal resident-kernel pre-compilation warning: {ex.Message}");
             _residentLibrary = IntPtr.Zero;
+        }
+
+        // Tuned-kernel registry variants and split references (#1116). Without it every tuned slot runs its reference.
+        try
+        {
+            _tunedRowLibrary = _shaderLibrary.CompileLibrary(TunedRowLibraryName, MetalTunedRowKernels.GetSource());
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal tuned-row pre-compilation warning: {ex.Message}");
+            _tunedRowLibrary = IntPtr.Zero;
         }
 
         try
@@ -1569,21 +1581,16 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     {
         ThrowIfDisposed();
 
-        if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer)
+        if (A is not MetalGpuBuffer || B is not MetalGpuBuffer)
         {
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        var pipeline = GetPipeline("Normalization", _normalizationLibrary, "softmax_row");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(batchSize);
-
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(aBuffer, 0);
-        encoder.SetBuffer(bBuffer, 1);
-        encoder.SetBytes((uint)batchSize, 2);
-        encoder.SetBytes((uint)features, 3);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        // Registry dispatch (#1116): the established kernel or a generated row variant, chosen per shape class.
+        if (batchSize > 0 && features > 0
+            && SoftmaxSlot.TryExecute(RowShape(batchSize, features), new TunedSoftmaxArgs(A, B, batchSize, features)))
+            return;
+        SoftmaxReference(A, B, batchSize, features);
     }
 
     #endregion

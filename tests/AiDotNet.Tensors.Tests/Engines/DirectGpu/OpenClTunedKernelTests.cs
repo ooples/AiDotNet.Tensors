@@ -358,6 +358,15 @@ public sealed class OpenClTunedKernelTests
             TunedKernelPolicy.PersistDecisions = previousPersist;
         }
     }
+#if NET6_0_OR_GREATER // the shared check lives in MetalTunedKernelTests
+    [SkippableFact]
+    public void PublicLayerNormAndRmsNormBackward_MatchTheCpu()
+    {
+        using var backend = RequireBackend();
+        MetalTunedKernelTests.CheckPublicNormBackward(backend);
+    }
+#endif
+
     // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.
     private static readonly (int B, int C, int H, int W, int O, int K, int S, int P, int D)[] ConvShapes =
     {

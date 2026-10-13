@@ -1,6 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Metal GPU backend - Activation functions and gradients.
 
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
@@ -258,24 +260,17 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
 
-        if (gradOutput is not MetalGpuBuffer goBuffer ||
-            output is not MetalGpuBuffer oBuffer ||
-            gradInput is not MetalGpuBuffer giBuffer)
+        if (gradOutput is not MetalGpuBuffer || output is not MetalGpuBuffer || gradInput is not MetalGpuBuffer)
         {
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        var pipeline = GetPipeline("Normalization", _normalizationLibrary, "softmax_backward");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(batchSize);
-
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(goBuffer, 0);
-        encoder.SetBuffer(oBuffer, 1);
-        encoder.SetBuffer(giBuffer, 2);
-        encoder.SetBytes((uint)batchSize, 3);
-        encoder.SetBytes((uint)features, 4);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        // Registry dispatch (#1116): the established kernel or a generated row variant, chosen per shape class.
+        if (batchSize > 0 && features > 0
+            && SoftmaxBackwardSlot.TryExecute(RowShape(batchSize, features),
+                new TunedSoftmaxBackwardArgs(gradOutput, output, gradInput, batchSize, features)))
+            return;
+        SoftmaxBackwardReference(gradOutput, output, gradInput, batchSize, features);
     }
 
     /// <summary>
