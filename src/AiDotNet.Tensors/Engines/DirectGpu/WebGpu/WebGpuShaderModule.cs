@@ -50,7 +50,11 @@ public sealed class WebGpuShaderModule : IDisposable
     {
         ThrowIfDisposed();
 
-        if (_shaderModules.TryGetValue(name, out var moduleId))
+        // A module is its name AND its source. Many call sites share one name for different sources ("SpectralPerf"
+        // names eleven of them), and a cache on the name alone handed every later kernel the first one's module,
+        // where its entry point does not exist.
+        string key = SourceKey(name, wgslSource);
+        if (_shaderModules.TryGetValue(key, out var moduleId))
         {
             return moduleId;
         }
@@ -61,8 +65,39 @@ public sealed class WebGpuShaderModule : IDisposable
             throw new InvalidOperationException($"Failed to create shader module '{name}'");
         }
 
-        _shaderModules[name] = moduleId;
+        _shaderModules[key] = moduleId;
         return moduleId;
+    }
+
+    // Sources are constants or cached statics, so the same source is the same string object on every call: its
+    // identity is looked up first and the text is only hashed the first time an object is seen.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<string, string> SourceIds = new();
+    private static readonly ConcurrentDictionary<string, int> SourceNumbers = new(StringComparer.Ordinal);
+    private static int s_nextSourceNumber;
+
+    private static readonly ConcurrentDictionary<string, int> WorkgroupSizes = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The x workgroup size <paramref name="entryPoint"/> declares in <paramref name="wgslSource"/>. A one-dimensional
+    /// dispatch has to launch ceil(work / that size) workgroups. Most kernels declare 256, but not all (64, 16, 8
+    /// and 1 occur), and sizing every dispatch for 256 left the tail of the smaller ones' work unlaunched.
+    /// </summary>
+    internal static int WorkgroupSizeX(string moduleName, string wgslSource, string entryPoint)
+        => WorkgroupSizes.GetOrAdd(SourceKey(moduleName, wgslSource) + "::" + entryPoint, _ =>
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(wgslSource,
+                @"@workgroup_size\(\s*(\d+)[^)]*\)\s*fn\s+" + System.Text.RegularExpressions.Regex.Escape(entryPoint) + @"\b",
+                System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(5));
+            return match.Success ? int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) : 256;
+        });
+
+    /// <summary>A cache key for <paramref name="name"/> compiled from <paramref name="wgslSource"/>.</summary>
+    internal static string SourceKey(string name, string wgslSource)
+    {
+        string id = SourceIds.GetValue(wgslSource, static source =>
+            SourceNumbers.GetOrAdd(source, static _ => System.Threading.Interlocked.Increment(ref s_nextSourceNumber))
+                .ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return name + "#" + id;
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> PipelineNames =
@@ -83,7 +118,7 @@ public sealed class WebGpuShaderModule : IDisposable
     {
         ThrowIfDisposed();
 
-        var pipelineKey = $"{name}::{entryPoint}";
+        var pipelineKey = $"{SourceKey(name, wgslSource)}::{entryPoint}";
 
         if (_pipelines.TryGetValue(pipelineKey, out var pipelineId))
         {
@@ -99,7 +134,7 @@ public sealed class WebGpuShaderModule : IDisposable
         }
 
         _pipelines[pipelineKey] = pipelineId;
-        PipelineNames[pipelineId] = "webgpu:" + pipelineKey;
+        PipelineNames[pipelineId] = $"webgpu:{name}::{entryPoint}";
         return pipelineId;
     }
 
@@ -152,6 +187,8 @@ public sealed class WebGpuBindGroup : IDisposable
     private readonly int _bindGroupId;
     private readonly int _pipelineId;
     private bool _disposed;
+    private System.Collections.Generic.List<WebGpuBuffer>? _snapshots;   // inputs copied because they alias an output
+    private WebGpuBuffer[]? _original;
 
     /// <summary>
     /// Gets the bind group ID.
@@ -195,6 +232,28 @@ public sealed class WebGpuBindGroup : IDisposable
             {
                 throw new ArgumentException($"Buffer at index {i} is null or invalid", nameof(buffers));
             }
+        }
+
+        // An in-place call binds one buffer twice, as the kernel's input and as its output. WebGPU rejects a pass in
+        // which a buffer is writable and also bound anywhere else, so the earlier binding (the input, by this
+        // backend's convention) gets a snapshot of the buffer taken before the dispatch.
+        for (int i = 0; i < buffers.Length; i++)
+        {
+            for (int later = i + 1; later < buffers.Length; later++)
+            {
+                if (buffers[later].BufferId != buffers[i].BufferId || buffers[later].OffsetBytes != buffers[i].OffsetBytes
+                    || buffers[later].SizeBytes != buffers[i].SizeBytes) continue;
+                if (ReferenceEquals(buffers, _original ??= buffers)) buffers = (WebGpuBuffer[])buffers.Clone();
+                var snapshot = new WebGpuBuffer(buffers[i].Size);
+                snapshot.CopyFromBuffer(buffers[i], 0, 0, buffers[i].Size);
+                (_snapshots ??= new System.Collections.Generic.List<WebGpuBuffer>()).Add(snapshot);
+                buffers[i] = snapshot;
+                break;
+            }
+        }
+
+        for (int i = 0; i < buffers.Length; i++)
+        {
             bufferIds[i] = buffers[i].BufferId;
             offsets[i] = buffers[i].OffsetBytes;
             sizes[i] = buffers[i].SizeBytes;
@@ -226,6 +285,11 @@ public sealed class WebGpuBindGroup : IDisposable
         if (_bindGroupId >= 0)
         {
             WebGpuNativeBindings.DestroyBindGroup(_bindGroupId);
+            if (_snapshots is not null)
+            {
+                foreach (var snapshot in _snapshots) snapshot.Dispose();
+                _snapshots = null;
+            }
         }
     }
 }

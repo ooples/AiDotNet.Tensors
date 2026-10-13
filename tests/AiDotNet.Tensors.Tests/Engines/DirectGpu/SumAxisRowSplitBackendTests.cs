@@ -101,8 +101,7 @@ public sealed class SumAxisRowSplitBackendTests
     [SkippableFact]
     public void WebGpu_SumAxis_ExactAndDeterministic()
     {
-        using var backend = new WebGpuBackend();
-        Skip.IfNot(backend.IsAvailable, "WebGPU is not available.");
+        var backend = DawnHostedWebGpu.BackendOrSkip();   // the real backend, executing on Dawn; shared, so not disposed
         CheckAll(backend);
     }
 #endif

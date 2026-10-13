@@ -29,6 +29,8 @@ let nextTimestampQueryId = 0;
 
 const buffers = new Map();
 const shaderModules = new Map();
+const shaderModuleUniformBindings = new Map();   // module id -> binding indices it declares a uniform buffer at
+const pipelineUniformBindings = new WeakMap();   // pipeline -> { declared, resolved: storage count -> uniform binding }
 const pipelines = new Map();
 const bindGroups = new Map();
 const bindGroupLayouts = new Map();
@@ -384,6 +386,85 @@ export async function readByteBufferAsJson(bufferId, sizeBytes, offsetBytes) {
     return JSON.stringify(Array.from(result));
 }
 
+// ----------------------------------------------------------------------------
+// Bit-exact transfers. Buffer contents cross as base64 text: a number array cannot carry every bit pattern (an int
+// stored through a float view is a NaN whenever it is negative, and a NaN's payload does not survive a JS number).
+// ----------------------------------------------------------------------------
+
+function base64ToBytes(base64, paddedLength) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(paddedLength === undefined ? binary.length : paddedLength);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+}
+
+function bytesToBase64(bytes) {
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+}
+
+/**
+ * Writes bytes, given as base64, to a GPU buffer. A length that is not a multiple of four is padded with zeros.
+ * @param {number} bufferId - Buffer handle ID.
+ * @param {string} base64 - The bytes to write.
+ * @param {number} offsetBytes - Offset in bytes.
+ */
+export function writeBufferBase64(bufferId, base64, offsetBytes) {
+    if (!device || !queue) return;
+
+    const buffer = buffers.get(bufferId);
+    if (!buffer) {
+        console.error(`Buffer ${bufferId} not found`);
+        return;
+    }
+
+    const length = atob(base64).length;
+    const bytes = base64ToBytes(base64, (length + 3) & ~3);
+    queue.writeBuffer(buffer, offsetBytes, bytes);
+}
+
+/**
+ * Reads bytes from a GPU buffer as base64.
+ * @param {number} bufferId - Buffer handle ID.
+ * @param {number} sizeBytes - Size to read in bytes.
+ * @param {number} offsetBytes - Offset in bytes.
+ * @returns {Promise<string>} The bytes, base64 encoded.
+ */
+export async function readBufferBase64(bufferId, sizeBytes, offsetBytes) {
+    if (!device) return '';
+
+    const buffer = buffers.get(bufferId);
+    if (!buffer) {
+        console.error(`Buffer ${bufferId} not found`);
+        return '';
+    }
+
+    const alignedSize = (sizeBytes + 3) & ~3;
+    let stagingBuffer = getStagingBuffer(alignedSize);
+    if (!stagingBuffer) {
+        stagingBuffer = device.createBuffer({
+            size: alignedSize,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: false
+        });
+    }
+
+    const commandEncoder = device.createCommandEncoder();
+    commandEncoder.copyBufferToBuffer(buffer, offsetBytes, stagingBuffer, 0, alignedSize);
+    queue.submit([commandEncoder.finish()]);
+
+    await stagingBuffer.mapAsync(GPUMapMode.READ, 0, alignedSize);
+    const result = new Uint8Array(stagingBuffer.getMappedRange(0, alignedSize).slice(0, sizeBytes));
+    stagingBuffer.unmap();
+    returnStagingBuffer(stagingBuffer, alignedSize);
+
+    return bytesToBase64(result);
+}
+
 /**
  * Copies data between GPU buffers.
  * @param {number} srcBufferId - Source buffer ID.
@@ -445,6 +526,12 @@ export function createShaderModule(wgslSource) {
 
         const id = nextShaderModuleId++;
         shaderModules.set(id, shaderModule);
+        // Where this module declares uniform buffers: see resolveUniformBindGroup.
+        const declared = new Set();
+        for (const match of wgslSource.matchAll(/@binding\((\d+)\)\s*var\s*<\s*uniform\s*>/g)) {
+            declared.add(Number(match[1]));
+        }
+        shaderModuleUniformBindings.set(id, Array.from(declared).sort((a, b) => a - b));
         return id;
     } catch (error) {
         console.error('Failed to create shader module:', error);
@@ -478,6 +565,10 @@ export async function createComputePipeline(shaderModuleId, entryPoint) {
 
         const id = nextPipelineId++;
         pipelines.set(id, pipeline);
+        pipelineUniformBindings.set(pipeline, {
+            declared: shaderModuleUniformBindings.get(shaderModuleId) || [],
+            resolved: new Map()
+        });
         return id;
     } catch (error) {
         console.error(`Failed to create compute pipeline for ${entryPoint}:`, error);
@@ -588,19 +679,72 @@ export function createBindGroupRanges(pipelineId, bufferIds, offsets, sizes) {
  * parameters live in a uniform buffer bound after them (binding index = storage buffer count), and that buffer is
  * only known at dispatch. A bind group has to match the pipeline's layout exactly, so it cannot be created without it.
  */
-function resolveBindGroup(record, pipeline, uniformBuffer) {
-    if (uniformBuffer) {
-        if (record.resolved && record.resolvedUniform === uniformBuffer) return record.resolved;
-        const entries = record.entries.concat([{ binding: record.entries.length, resource: { buffer: uniformBuffer } }]);
-        record.resolved = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: entries });
-        record.resolvedUniform = uniformBuffer;
-        return record.resolved;
-    }
+function resolveBindGroup(record, pipeline) {
     if (!record.resolved || record.resolvedUniform) {
         record.resolved = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: record.entries });
         record.resolvedUniform = null;
     }
     return record.resolved;
+}
+
+/**
+ * The bind group for a dispatch with a uniform buffer.
+ *
+ * The uniform buffer's binding index is the shader's choice. Usually it is the one after the storage buffers, but a
+ * module shared by several kernels declares it once, after the most storage buffers any of them takes, and a kernel
+ * that takes fewer still reads it from there (four storage declarations and a uniform at binding 4, used by an entry
+ * point that binds three buffers). A pipeline's layout cannot be read back, so the candidates are tried in order
+ * inside a validation error scope: the index after the storage buffers, then each index the module declares a uniform
+ * at. The one that validates is remembered per pipeline and storage count, so this costs one probe per kernel.
+ */
+async function resolveUniformBindGroup(record, pipeline, uniformBuffer) {
+    if (record.resolved && record.resolvedUniform === uniformBuffer) return record.resolved;
+
+    const info = pipelineUniformBindings.get(pipeline) || { declared: [], resolved: new Map() };
+    const storageCount = record.entries.length;
+    const layout = pipeline.getBindGroupLayout(0);
+    // A choice is the uniform's binding index and the storage entries to leave out. An automatic layout holds only
+    // the bindings the entry point uses, so a buffer the caller binds for a kernel that does not touch it has to be
+    // left out (the kernel then cannot have written it, which the caller's results will show).
+    const build = (choice) => device.createBindGroup({
+        layout: layout,
+        entries: record.entries.filter((_, index) => !choice.omit.includes(index))
+            .concat([{ binding: choice.uniform, resource: { buffer: uniformBuffer } }])
+    });
+
+    let group = null;
+    if (info.resolved.has(storageCount)) {
+        group = build(info.resolved.get(storageCount));
+    } else {
+        const uniforms = [storageCount].concat(info.declared.filter(b => b !== storageCount));
+        const omissions = [[]];
+        for (let i = 0; i < storageCount; i++) omissions.push([i]);
+        for (let i = 0; i < storageCount; i++) for (let j = i + 1; j < storageCount; j++) omissions.push([i, j]);
+        let firstError = null;
+        search:
+        for (const omit of omissions) {
+            for (const uniform of uniforms) {
+                const choice = { uniform: uniform, omit: omit };
+                device.pushErrorScope('validation');
+                const attempt = build(choice);
+                const error = await device.popErrorScope();
+                if (!error) {
+                    info.resolved.set(storageCount, choice);
+                    group = attempt;
+                    break search;
+                }
+                if (!firstError) firstError = error;
+            }
+        }
+        if (!group) {
+            console.error(`No bind group layout matches ${storageCount} storage buffers and a uniform buffer ` +
+                `(uniform bindings tried: ${uniforms.join(', ')}): ${firstError ? firstError.message : 'unknown error'}`);
+            return null;
+        }
+    }
+    record.resolved = group;
+    record.resolvedUniform = uniformBuffer;
+    return group;
 }
 
 export function destroyBindGroup(bindGroupId) {
@@ -630,7 +774,7 @@ export async function dispatchCompute(pipelineId, bindGroupId, workgroupsX, work
     const passEncoder = commandEncoder.beginComputePass();
 
     passEncoder.setPipeline(pipeline);
-    passEncoder.setBindGroup(0, resolveBindGroup(bindGroup, pipeline, null));
+    passEncoder.setBindGroup(0, resolveBindGroup(bindGroup, pipeline));
     passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
     passEncoder.end();
 
@@ -662,12 +806,14 @@ export async function dispatchComputeWithUniforms(pipelineId, bindGroupId, unifo
         return;
     }
 
+    const resolved = await resolveUniformBindGroup(bindGroup, pipeline, uniformBuffer);
+    if (!resolved) return;
+
     const commandEncoder = device.createCommandEncoder();
     const passEncoder = commandEncoder.beginComputePass();
 
     passEncoder.setPipeline(pipeline);
-    // The uniform buffer is the binding after the storage buffers.
-    passEncoder.setBindGroup(0, resolveBindGroup(bindGroup, pipeline, uniformBuffer));
+    passEncoder.setBindGroup(0, resolved);
     passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
     passEncoder.end();
 

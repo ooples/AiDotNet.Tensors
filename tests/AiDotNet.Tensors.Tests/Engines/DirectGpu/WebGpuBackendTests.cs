@@ -36,22 +36,11 @@ public class WebGpuBackendTests : IDisposable
         _output = output;
         _isAvailable = false;
 
-        // WebGPU requires browser/WASM environment - skip on desktop platforms
-        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Create("BROWSER")))
-        {
-            _output.WriteLine("WebGPU is only available in browser/WASM environment");
-            return;
-        }
-
-        try
-        {
-            _backend = new AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend();
-            // WebGPU requires async initialization - will be set in InitializeAsync
-        }
-        catch (Exception ex)
-        {
-            _output.WriteLine($"WebGPU initialization failed: {ex.Message}");
-        }
+        // The real backend, executing on Dawn (DawnHostedWebGpu), already initialized; null when Dawn is not set up
+        // (AIDOTNET_WEBGPU_NODE_DIR). Before the Dawn host these tests could only run in a browser, so they skipped.
+        _backend = DawnHostedWebGpu.BackendOrNull();
+        _isAvailable = _backend is not null;
+        if (_backend is not null) _output.WriteLine($"WebGPU backend: {_backend.DeviceName}");
     }
 
     private async Task EnsureInitializedAsync()
@@ -78,12 +67,12 @@ public class WebGpuBackendTests : IDisposable
     private async Task SkipIfNoWebGpuAsync()
     {
         await EnsureInitializedAsync();
-        Skip.If(!_isAvailable, "WebGPU backend not available (requires browser environment)");
+        Skip.If(!_isAvailable, "WebGPU backend not available: set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu.");
     }
 
     public void Dispose()
     {
-        _backend?.Dispose();
+        // The hosted backend is shared by the test process.
     }
 
     #region Initialization Tests
@@ -498,7 +487,9 @@ public class WebGpuBackendTests : IDisposable
 
         foreach (var v in result)
         {
-            Assert.True(v > -1 && v < 1);
+            // Inclusive: tanh(10) is 0.9999999958..., which rounds to exactly 1 in single precision, so a correct
+            // kernel returns 1. The strict form of this check could only pass on a tanh that is too small.
+            Assert.True(v >= -1 && v <= 1);
         }
     }
 

@@ -23,6 +23,20 @@ internal static class DawnHostedWebGpu
 
     public static DawnWebGpuHost? Host { get { lock (Gate) return s_host; } }
 
+    /// <summary>The backend, or null when Dawn is not set up (AIDOTNET_WEBGPU_NODE_DIR) or has no adapter.</summary>
+    public static WebGpuBackend? BackendOrNull()
+    {
+        lock (Gate)
+        {
+            if (!s_tried)
+            {
+                s_tried = true;
+                Start();
+            }
+            return s_backend;
+        }
+    }
+
     /// <summary>The backend, or a skip when Dawn is not set up (AIDOTNET_WEBGPU_NODE_DIR) or has no adapter.</summary>
     public static WebGpuBackend BackendOrSkip()
     {
