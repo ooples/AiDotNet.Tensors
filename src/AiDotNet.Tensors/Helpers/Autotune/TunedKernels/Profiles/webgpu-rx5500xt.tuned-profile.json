@@ -1,0 +1,349 @@
+{
+  "schemaVersion": 1,
+  "device": "webgpu:amd rdna-1 (radeon-rx-5500-xt)",
+  "entries": [
+    {
+      "op": "LayerNorm",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 1.875
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:2364x197",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 2.091
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes256",
+      "speedup": 1.895
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:4096x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes8",
+      "speedup": 2.316
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes32",
+      "speedup": 2.333
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:512x384",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes256",
+      "speedup": 1.945
+    },
+    {
+      "op": "LayerNorm",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_forward.lanes8",
+      "speedup": 3.105
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes256",
+      "speedup": 5.059
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:2364x197",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes256",
+      "speedup": 5.13
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 7.9
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes32",
+      "speedup": 2
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:512x384",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes16",
+      "speedup": 5.235
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:512x512",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes256",
+      "speedup": 6.238
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "generated.layernorm_backward.lanes256",
+      "speedup": 15.15
+    },
+    {
+      "op": "LayerNormBackward",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "webgpu.layernorm_backward_input.thread_per_element",
+      "speedup": 1
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 38.224
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 19.501
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 17.857
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:2364x197",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows8",
+      "speedup": 58.566
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 32.124
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:4096x128",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 65.091
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 39.113
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:512x384",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 31.749
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows8",
+      "speedup": 39.412
+    },
+    {
+      "op": "LayerNormGradParameters",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.layernorm_grad_params.rows32",
+      "speedup": 38.601
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "generated.rmsnorm_grad_gamma.rows32",
+      "speedup": 2.25
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "webgpu.rmsnorm_grad_gamma.thread_per_column",
+      "speedup": 1
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:4096x128",
+      "deterministic": true,
+      "candidate": "generated.rmsnorm_grad_gamma.rows32",
+      "speedup": 5.636
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "generated.rmsnorm_grad_gamma.rows32",
+      "speedup": 6.4
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "webgpu.rmsnorm_grad_gamma.thread_per_column",
+      "speedup": 1
+    },
+    {
+      "op": "RmsNormGradGamma",
+      "shape": "f32:8192x32",
+      "deterministic": true,
+      "candidate": "generated.rmsnorm_grad_gamma.rows32",
+      "speedup": 7.421
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:2364x197",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:4096x128",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:512x384",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:512x512",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "Softmax",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "webgpu.softmax.workgroup_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:1024x256",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:128x1024",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:2048x64",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:2364x197",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:256x768",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:4096x128",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:4096x64",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:512x384",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:512x512",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    },
+    {
+      "op": "SoftmaxBackward",
+      "shape": "f32:64x4096",
+      "deterministic": true,
+      "candidate": "webgpu.softmax_backward.thread_per_row",
+      "speedup": 1
+    }
+  ]
+}

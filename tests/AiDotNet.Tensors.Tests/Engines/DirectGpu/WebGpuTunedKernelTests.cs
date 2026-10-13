@@ -368,40 +368,48 @@ public sealed class WebGpuTunedKernelTests
     public void ShippedProfile_IsServedByThePublicOp_OnItsDevice()
     {
         var backend = RequireBackend();
-        Skip.IfNot(backend.TunedDeviceKey == "vulkan:NVIDIA GeForce RTX 3080", $"No shipped profile is asserted for {backend.TunedDeviceKey}.");
+        Skip.IfNot(backend.TunedDeviceKey == "webgpu:amd rdna-1 (radeon-rx-5500-xt)", $"No shipped profile is asserted for {backend.TunedDeviceKey}.");
         TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Pinned;
         try
         {
-            const int rows = 64, n = 4096;
+            // The shipped profile selects a generated variant for this LayerNorm shape (softmax keeps the reference on
+            // this device, so it would not show that a profile entry is what serves the op).
+            const int rows = 1024, n = 256;
+            const float eps = 1e-5f;
             var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
-            float[] x = Values(rows * n, 83, 5f);
+            float[] x = Values(rows * n, 83, 3f), gamma = Values(n, 84, 1f), beta = Values(n, 85, 1f);
             var expected = new float[x.Length];
             for (int r = 0; r < rows; r++)
             {
-                double m = double.NegativeInfinity, s = 0;
-                for (int i = 0; i < n; i++) m = Math.Max(m, x[r * n + i]);
-                for (int i = 0; i < n; i++) s += Math.Exp(x[r * n + i] - m);
-                for (int i = 0; i < n; i++) expected[r * n + i] = (float)(Math.Exp(x[r * n + i] - m) / s);
+                double m = 0, v = 0;
+                for (int i = 0; i < n; i++) m += x[r * n + i];
+                m /= n;
+                for (int i = 0; i < n; i++) v += (x[r * n + i] - m) * (x[r * n + i] - m);
+                double iv = 1.0 / Math.Sqrt(v / n + eps);
+                for (int i = 0; i < n; i++) expected[r * n + i] = (float)(gamma[i] * (x[r * n + i] - m) * iv + beta[i]);
             }
             using var input = backend.AllocateBuffer(x);
+            using var g = backend.AllocateBuffer(gamma);
+            using var b = backend.AllocateBuffer(beta);
             using var output = backend.AllocateBuffer(x.Length);
-            backend.SoftmaxSlot.InvalidateDecisions();
+            using var mean = backend.AllocateBuffer(rows);
+            using var inv = backend.AllocateBuffer(rows);
+            backend.LayerNormSlot.InvalidateDecisions();
             backend.Fill(output, float.NaN, x.Length);
-            backend.Softmax(input, output, rows, n);
+            backend.LayerNorm(input, output, g, b, mean, inv, rows, n, eps);
             backend.Synchronize();
-            AssertClose(expected, backend.DownloadBuffer(output), x.Length, "profiled softmax");
-            var decision = Assert.Single(backend.SoftmaxSlot.CachedDecisions, d => d.Shape.Equals(shape));
+            AssertClose(expected, backend.DownloadBuffer(output), x.Length, "profiled layernorm");
+            var decision = Assert.Single(backend.LayerNormSlot.CachedDecisions, d => d.Shape.Equals(shape));
             Assert.Equal(TunedKernelDecisionReason.Profile, decision.Reason);
-            Assert.Equal("generated.softmax.lanes256", decision.CandidateId);
+            Assert.Equal("generated.layernorm_forward.lanes32", decision.CandidateId);
         }
         finally
         {
-            backend.SoftmaxSlot.InvalidateDecisions();
+            backend.LayerNormSlot.InvalidateDecisions();
             TunedKernelPolicy.ModeOverride = previousMode;
         }
     }
-
     [SkippableFact]
     public void PublicSoftmax_ThroughTheRegistry_MatchesTheReferenceAndCachesADecision()
     {
