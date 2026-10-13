@@ -2628,22 +2628,24 @@ public interface IDirectGpuBackend : IDisposable
         int numFrames, int numFreqs, int nMels);
 
     /// <summary>
-    /// Converts power spectrogram to decibel scale.
+    /// Converts power spectrogram to decibel scale: <c>db = max(10 log10(max(power, 1e-10) / refValue), minDb)</c>.
     /// </summary>
     /// <param name="power">Power spectrogram.</param>
     /// <param name="db">Output in decibels.</param>
     /// <param name="n">Number of elements.</param>
-    /// <param name="refValue">Reference value for 0 dB.</param>
+    /// <param name="refValue">The power that maps to 0 dB. It is on the power scale, like the input (the
+    /// convention of librosa <c>power_to_db</c> and torchaudio), so it is not squared.</param>
     /// <param name="minDb">Minimum dB value (floor).</param>
     void PowerToDb(IGpuBuffer power, IGpuBuffer db, int n, float refValue, float minDb);
 
     /// <summary>
-    /// Converts decibel values back to power.
+    /// Converts decibel values back to power: <c>power = refValue * 10^(db / 10)</c>, the inverse of
+    /// <see cref="PowerToDb"/> above its floors.
     /// </summary>
     /// <param name="db">Input in decibels.</param>
     /// <param name="power">Output power spectrogram.</param>
     /// <param name="n">Number of elements.</param>
-    /// <param name="refValue">Reference value that was used for 0 dB.</param>
+    /// <param name="refValue">The power reference that was used for 0 dB.</param>
     void DbToPower(IGpuBuffer db, IGpuBuffer power, int n, float refValue);
 
     #endregion
