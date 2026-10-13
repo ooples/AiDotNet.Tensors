@@ -1,3 +1,4 @@
+using System;
 // Copyright (c) AiDotNet. All rights reserved.
 // Issue #301 — sparse-linear chain detection for graph-mode auto-fusion.
 
@@ -133,35 +134,123 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
     {
         var capturedInput = input;
         var capturedBias = bias;
-        var rowOffsets = weights.RowOffsets;
-        var colIndices = weights.ColIndices;
-        var values = weights.Values;
         var capturedActivation = activation;
+        var state = new SnapshotState(weights);
 
-        var inputs = capturedBias is null
-            ? new[] { capturedInput, values }
-            : new[] { capturedInput, values, capturedBias };
+        // The weight sources are the node's real inputs: they are leaves the plan does not produce, so liveness and
+        // constant folding treat them as dynamic, which they are (#1235).
+        var inputs = new List<Tensor<float>> { capturedInput };
+        inputs.AddRange(weights.Sources);
+        if (capturedBias is not null) inputs.Add(capturedBias);
 
         return new LazyNode<float>(
             LazyNodeType.FusedSparseLinear,
             "FusedSparseLinear",
-            inputs,
+            inputs.ToArray(),
             finalOutput,
             (eng, output) =>
             {
-                if (eng is DirectGpuTensorEngine gpu)
+                var csr = state.Current();
+                if (csr is null)
+                {
+                    // The weight was rewritten and is no longer sparse: dense GEMM on its current values, without the
+                    // packed-B cache (that would be another snapshot of a tensor that changes).
+                    var (inArr, outArr) = (DenseArray(capturedInput), output.GetDataArray() as float[]
+                        ?? throw new InvalidOperationException("output data array missing."));
+                    CpuFusedOperations.FusedGemmBiasActivationUnchecked(
+                        inArr, state.Dense!, capturedBias is null ? null : DenseArray(capturedBias), outArr,
+                        capturedInput._shape[0], weights.OutputFeatures, weights.InputFeatures, capturedActivation,
+                        allowCachedB: false);
+                    output.IncrementVersion();
+                }
+                else if (eng is DirectGpuTensorEngine gpu)
                 {
                     gpu.FusedSparseLinearInto(
-                        output, capturedInput, rowOffsets, colIndices, values, capturedBias, capturedActivation);
+                        output, capturedInput, csr.RowOffsets, csr.ColIndices, csr.Values, capturedBias, capturedActivation);
                 }
                 else
                 {
                     CpuFusedOperations.FusedSparseLinear(
-                        capturedInput, rowOffsets, colIndices, values, capturedBias, capturedActivation, output);
+                        capturedInput, csr.RowOffsets, csr.ColIndices, csr.Values, capturedBias, capturedActivation, output);
                 }
             },
             backwardFn: null,
-            savedState: new object[] { rowOffsets, colIndices, values, capturedActivation });
+            savedState: new object[] { weights.RowOffsets, weights.ColIndices, weights.Values, capturedActivation });
+    }
+
+    private static float[] DenseArray(Tensor<float> t)
+    {
+        if (t.TryGetContiguousSpan(out var span) && t.GetDataArray() is float[] arr && arr.Length == t.Length)
+            return arr;
+        return t.ToArray();
+    }
+
+    /// <summary>
+    /// The CSR snapshot of the weight, keyed by the weight sources' storage mutation versions (#1235). The fusion used
+    /// to snapshot any eager right-hand tensor at compile time and use that forever: an ONNX graph input (all zeros
+    /// while the plan was traced) became an empty CSR, so MatMul returned zeros whatever was fed, and a weight updated
+    /// after compile (fine-tuning, a loaded checkpoint) kept its stale values. Every execute now compares versions;
+    /// on a change it rebuilds the CSR, or switches to the dense path when the new values are not sparse.
+    /// </summary>
+    private sealed class SnapshotState
+    {
+        private readonly CsrWeights _shape;
+        private readonly int[] _versions;
+        private CsrWeights? _csr;
+        private int _rewrites;
+        internal float[]? Dense;
+
+        internal SnapshotState(CsrWeights initial)
+        {
+            _shape = initial;
+            _csr = initial;
+            _versions = new int[initial.Sources.Length];
+            for (int i = 0; i < _versions.Length; i++)
+                _versions[i] = initial.Sources[i].StorageMutationVersion;
+        }
+
+        /// <summary>The CSR to use, or null to run dense on <see cref="Dense"/>.</summary>
+        internal CsrWeights? Current()
+        {
+            bool changed = false;
+            for (int i = 0; i < _versions.Length; i++)
+                changed |= _shape.Sources[i].StorageMutationVersion != _versions[i];
+            if (!changed)
+                return _csr;
+
+            for (int i = 0; i < _versions.Length; i++)
+                _versions[i] = _shape.Sources[i].StorageMutationVersion;
+            // A weight rewritten more than once is being fed per call (a graph input): scanning it for sparsity every
+            // execute would cost more than it saves, so a single source stays on the dense path from then on.
+            if (++_rewrites >= 2 && _shape.Sources.Length == 1)
+            {
+                _csr = null;
+                Dense = DenseArray(_shape.Sources[0]);
+                return null;
+            }
+            float[] denseInOut = _shape.Sources.Length == 1
+                ? DenseArray(_shape.Sources[0])
+                : Product(DenseArray(_shape.Sources[0]), DenseArray(_shape.Sources[1]));
+            if (TryDenseInOutToCsr(denseInOut, _shape.InputFeatures, _shape.OutputFeatures, out var rebuilt))
+            {
+                _csr = rebuilt;
+                Dense = null;
+            }
+            else
+            {
+                _csr = null;
+                Dense = denseInOut; // a single weight's live array: dense reads its current values every call
+            }
+            return _csr;
+        }
+
+        private static float[] Product(float[] left, float[] right)
+        {
+            var product = new float[left.Length];
+            for (int i = 0; i < product.Length; i++)
+                product[i] = left[i] * right[i];
+            return product;
+        }
     }
 
     private static bool TryBuildCsrFromStaticWeight(LazyNode<float> matmul, out CsrWeights? weights)
@@ -172,7 +261,10 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
             return false;
         if (matmul.Input0.Rank != 2 || weight.Rank != 2)
             return false;
-        return TryDenseInOutToCsr(weight, matmul.Input0._shape[1], weight._shape[1], out weights);
+        if (!TryDenseInOutToCsr(weight, matmul.Input0._shape[1], weight._shape[1], out weights))
+            return false;
+        weights!.Sources = new[] { weight };
+        return true;
     }
 
     private static bool TryBuildCsrFromMask(
@@ -198,7 +290,10 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
         if (left is null || right is null)
             return false;
 
-        return TryProductInOutToCsr(left, right, inFeat, outFeat, out weights);
+        if (!TryProductInOutToCsr(left, right, inFeat, outFeat, out weights))
+            return false;
+        weights!.Sources = new[] { maskNode.Input0, maskNode.Input1 };
+        return true;
     }
 
     private static bool TryDenseInOutToCsr(
@@ -316,5 +411,8 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
         public Tensor<float> Values { get; }
         public int InputFeatures { get; }
         public int OutputFeatures { get; }
+
+        /// <summary>The tensors the CSR was built from (the weight, or the mask's two operands).</summary>
+        public Tensor<float>[] Sources { get; set; } = System.Array.Empty<Tensor<float>>();
     }
 }
