@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
@@ -48,6 +49,42 @@ public sealed class TensorCodecOptions
     {
         _current = options;
         BlasProvider.SetThreadLocalDeterministicMode(options?.Deterministic);
+    }
+
+    /// <summary>
+    /// Installs <paramref name="options"/> for the calling thread until the returned scope is disposed, which puts back
+    /// exactly what was there: the thread's options field (including "none") and its BLAS determinism override.
+    /// </summary>
+    /// <remarks>
+    /// Capturing <see cref="Current"/> and passing it back to <see cref="SetCurrent"/> does not restore: the getter
+    /// creates and stores an instance when none is set, and SetCurrent then installs that instance's
+    /// <see cref="Deterministic"/> (true) as a thread-local override the thread never had - so after one compile the
+    /// thread ignored BlasProvider.SetDeterministicMode(false) for good (#1221).
+    /// </remarks>
+    internal static Scope Push(TensorCodecOptions? options)
+    {
+        var scope = new Scope(_current, BlasProvider.GetThreadLocalDeterministicMode());
+        SetCurrent(options);
+        return scope;
+    }
+
+    /// <summary>Restores the options and determinism override captured by <see cref="Push"/>.</summary>
+    internal readonly struct Scope : IDisposable
+    {
+        private readonly TensorCodecOptions? _previous;
+        private readonly bool? _previousDeterministicOverride;
+
+        internal Scope(TensorCodecOptions? previous, bool? previousDeterministicOverride)
+        {
+            _previous = previous;
+            _previousDeterministicOverride = previousDeterministicOverride;
+        }
+
+        public void Dispose()
+        {
+            _current = _previous;
+            BlasProvider.SetThreadLocalDeterministicMode(_previousDeterministicOverride);
+        }
     }
 
     /// <summary>Master switch for auto-compilation. When false, all compilation is disabled

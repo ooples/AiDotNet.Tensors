@@ -6,6 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// operands into FP32 device scratch, runs the backend's own FP32 kernel, and narrows the FP16 results back (IEEE
 /// half, round to nearest even), so the outputs match the native kernels' FP32-compute contract. The capability flags
 /// stay false on these backends: the engine keeps activations in FP32 there, and these are the correct, slower forms.
+/// The exception is the direct FP16 convolution, which has a kernel of its own (<see cref="Conv2dDirectHalfWeights"/>).
 /// </summary>
 internal static class PortableFp16Activation
 {
@@ -112,6 +113,80 @@ internal static class PortableFp16Activation
         using var w = Widen(backend, weightsHalf, checked(outChannels * inChannels * kernelH * kernelW));
         backend.Conv2D(input, w, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
             kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>
+    /// The direct FP16 convolution (#682) over the shared <c>dc_p_conv2d_direct_fp16hw</c> kernel: the FP32
+    /// <paramref name="input"/> is rounded to FP16 per access, multiplied by the FP16 <paramref name="weightsHalf"/>
+    /// ([outC, inC, kH, kW], two halves per 32-bit word as <c>ConvertToFp16</c> writes them) and accumulated in FP32
+    /// into <paramref name="output"/>. The same numerics as CUDA's <c>conv2d_direct_fp16hw</c>, in one dispatch and
+    /// with no column matrix. Unlike <see cref="Conv2dHalfWeights"/>, the input is rounded.
+    /// </summary>
+    public static void Conv2dDirectHalfWeights(IDirectGpuBackend backend, PortableGenericFft.Launcher launch,
+        IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        if (input is null) throw new System.ArgumentNullException(nameof(input));
+        if (weightsHalf is null) throw new System.ArgumentNullException(nameof(weightsHalf));
+        if (output is null) throw new System.ArgumentNullException(nameof(output));
+        PositiveExtent(batch, nameof(batch));
+        PositiveExtent(inChannels, nameof(inChannels));
+        PositiveExtent(inHeight, nameof(inHeight));
+        PositiveExtent(inWidth, nameof(inWidth));
+        PositiveExtent(outChannels, nameof(outChannels));
+        PositiveExtent(outHeight, nameof(outHeight));
+        PositiveExtent(outWidth, nameof(outWidth));
+        PositiveExtent(kernelH, nameof(kernelH));
+        PositiveExtent(kernelW, nameof(kernelW));
+        PositiveExtent(strideH, nameof(strideH));
+        PositiveExtent(strideW, nameof(strideW));
+        PositiveExtent(dilationH, nameof(dilationH));
+        PositiveExtent(dilationW, nameof(dilationW));
+        if (padH < 0) throw new System.ArgumentOutOfRangeException(nameof(padH), padH, "Padding must be non-negative.");
+        if (padW < 0) throw new System.ArgumentOutOfRangeException(nameof(padW), padW, "Padding must be non-negative.");
+
+        // The kernel indexes with int and trusts these extents; an output size that does not follow from the
+        // geometry, or a short buffer, would read or write out of bounds on the device.
+        long expectedOutH = ((long)inHeight + 2L * padH - ((long)(kernelH - 1) * dilationH + 1)) / strideH + 1;
+        long expectedOutW = ((long)inWidth + 2L * padW - ((long)(kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outHeight != expectedOutH || outWidth != expectedOutW)
+            throw new System.ArgumentException(
+                $"Output extent {outHeight}x{outWidth} does not match the convolution geometry ({expectedOutH}x{expectedOutW}).");
+        long inputCount = (long)batch * inChannels * inHeight * inWidth;
+        long weightCount = (long)outChannels * inChannels * kernelH * kernelW;
+        long outputCount = (long)batch * outChannels * outHeight * outWidth;
+        if (inputCount > int.MaxValue || weightCount > int.MaxValue || outputCount > int.MaxValue)
+            throw new System.ArgumentOutOfRangeException(nameof(batch), "The convolution exceeds the kernel's int indexing.");
+        if (input.SizeInBytes < inputCount * sizeof(float))
+            throw new System.ArgumentException(
+                $"input holds {input.SizeInBytes} bytes; the convolution reads {inputCount * sizeof(float)}.", nameof(input));
+        if (weightsHalf.SizeInBytes < weightCount * 2)
+            throw new System.ArgumentException(
+                $"weightsHalf holds {weightsHalf.SizeInBytes} bytes; {weightCount} FP16 weights need {weightCount * 2}.", nameof(weightsHalf));
+        if (output.SizeInBytes < outputCount * sizeof(float))
+            throw new System.ArgumentException(
+                $"output holds {output.SizeInBytes} bytes; the convolution writes {outputCount * sizeof(float)}.", nameof(output));
+
+        // The weights are read as 32-bit words; a buffer that ends mid-word (an odd count of halves in a byte
+        // buffer) is copied into padded scratch first.
+        IGpuBuffer? scratch = null;
+        try
+        {
+            var w = PortableFusedDecodeLinear.WholeWords(backend, weightsHalf, weightCount * 2, out scratch);
+            launch(BatchExecutionCudaKernels.DcConv2dDirectFp16Hw, (int)outputCount, input, w, output,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        }
+        finally
+        {
+            scratch?.Dispose();
+        }
+    }
+
+    private static void PositiveExtent(int value, string name)
+    {
+        if (value <= 0) throw new System.ArgumentOutOfRangeException(name, value, "Must be positive.");
     }
 
     public static void GemmHalfOut(IDirectGpuBackend backend, IGpuBuffer aHalf, IGpuBuffer bHalf, IGpuBuffer cHalf,

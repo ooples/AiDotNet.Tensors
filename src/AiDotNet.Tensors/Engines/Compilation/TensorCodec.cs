@@ -49,17 +49,12 @@ internal static class TensorCodec
         // it introduces approximation error — docs describe it as opt-in).
         var opts = options ?? TensorCodecOptions.Default;
 
-        var prevOpts = TensorCodecOptions.Current;
-        TensorCodecOptions.SetCurrent(opts);
-        try
+        // Push restores the thread's exact prior state (#1221); SetCurrent(Current) would install a determinism override.
+        using (TensorCodecOptions.Push(opts))
         {
             using var scope = GraphMode.EnableInference();
             computation();
             return scope.CompileInference<T>();
-        }
-        finally
-        {
-            TensorCodecOptions.SetCurrent(prevOpts);
         }
     }
 
@@ -84,17 +79,11 @@ internal static class TensorCodec
             EnableSpectralDecomposition = false // training needs exact gradients
         };
 
-        var prevOpts = TensorCodecOptions.Current;
-        TensorCodecOptions.SetCurrent(opts);
-        try
+        using (TensorCodecOptions.Push(opts)) // restores the thread's exact prior state (#1221)
         {
             using var scope = GraphMode.EnableTraining(parameters);
             computation();
             return scope.CompileTraining(parameters);
-        }
-        finally
-        {
-            TensorCodecOptions.SetCurrent(prevOpts == TensorCodecOptions.Default ? null : prevOpts);
         }
     }
 }
