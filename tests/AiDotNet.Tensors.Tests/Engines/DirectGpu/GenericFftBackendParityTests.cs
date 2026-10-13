@@ -1,7 +1,9 @@
 #if NET6_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
@@ -161,5 +163,150 @@ public sealed class GenericFftBackendParityTests
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
         CheckAll(backend);
     }
+
+    /// <summary>
+    /// WebGPU's WGSL ports on Dawn, driven through the dispatch WebGPU ships (<see cref="DawnWebGpuBatchBackend"/>).
+    /// Needs AIDOTNET_WEBGPU_NODE_DIR and an OpenCL host for the buffers.
+    /// </summary>
+    private static DawnWebGpuBatchBackend? DawnOrSkip(out IDisposable owner)
+    {
+        owner = new NoOp();
+        var dawn = DawnWgslLauncher.TryCreate();
+        Skip.If(dawn is null, "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).");
+        var host = new AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend();
+        if (!host.IsAvailable)
+        {
+            host.Dispose();
+            dawn?.Dispose();
+            Skip.If(true, "OpenCL (the buffer host) is not available.");
+        }
+        owner = new Owned(host, dawn);
+        return dawn is null ? null : new DawnWebGpuBatchBackend(host, dawn);
+    }
+
+    private sealed class NoOp : IDisposable { public void Dispose() { } }
+
+    private sealed class Owned : IDisposable
+    {
+        private readonly IDisposable _host;
+        private readonly IDisposable? _dawn;
+        public Owned(IDisposable host, IDisposable? dawn) { _host = host; _dawn = dawn; }
+        public void Dispose() { _dawn?.Dispose(); _host.Dispose(); }
+    }
+
+    [SkippableFact]
+    public void WebGpuWgsl_GenericFft_MatchesDft_OnDawn()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            CheckAll(backend);
+        }
+    }
+
+
+    /// <summary>
+    /// #965: the generic FFT through the shared IEngine contract on WebGPU's kernels (Dawn), with a tape active: the
+    /// result matches the DFT, records its backward, and the gradient reaches the input.
+    /// </summary>
+    [SkippableFact]
+    public void WebGpuWgsl_GenericFft_ThroughTheEngine_KeepsTheTapeConnected_OnDawn()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            var engine = new DirectGpuTensorEngine(new DirectGpuEngine(backend));
+            Assert.True(engine.SupportsFftElementType(FftElementType.Float32));
+            const int n = 6;   // Bluestein
+            var re = Values(n, 3);
+            var im = Values(n, 9);
+            var interleaved = new float[2 * n];
+            for (int i = 0; i < n; i++) { interleaved[2 * i] = re[i]; interleaved[2 * i + 1] = im[i]; }
+            Dft(re, im, n, false, out var eRe, out var eIm);
+            var input = new Tensor<float>(interleaved, new[] { 2 * n });
+            using var tape = new GradientTape<float>();
+            Tensor<float> result = ((IEngine)engine).FftGeneric(input);
+            Assert.NotNull(result.GradFn);
+            for (int i = 0; i < n; i++)
+                Assert.True(Math.Abs(result[2 * i] - eRe[i]) <= 1e-4 && Math.Abs(result[2 * i + 1] - eIm[i]) <= 1e-4,
+                    $"[{i}]: got ({result[2 * i]}, {result[2 * i + 1]}), expected ({eRe[i]}, {eIm[i]})");
+            Tensor<float> loss = engine.ReduceSum(result, new[] { 0 }, keepDims: false);
+            var gradients = tape.ComputeGradients(loss);
+            Assert.True(gradients.ContainsKey(input), "WebGPU FftGeneric must keep the active tape connected to its input.");
+        }
+    }
+
+    /// <summary>#965 criterion 1 on Dawn: the capability is reported after every FFT pipeline compiled there.</summary>
+    [SkippableFact]
+    public void WebGpuWgsl_GenericFft_ReportsTheCapability_AfterDawnCompiledEveryKernel()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            var fft = (IGenericFftBackend)backend;
+            foreach (var type in new[] { FftElementType.Float32, FftElementType.Float16, FftElementType.BFloat16 })
+                Assert.True(fft.SupportsFftElementType(type), $"{type}: {backend.FftReadiness.Error}");
+            Assert.Null(backend.FftReadiness.Error);
+        }
+    }
+
+
+    /// <summary>
+    /// #965: the batched radix-2 kernels (<see cref="PortableGenericFft.BatchedRadix2"/>) against the DFT, including the
+    /// lengths Bluestein pads to and an aliased input / output, with a tolerance in line with a float FFT's error.
+    /// </summary>
+    private delegate void Radix2(IGpuBuffer inRe, IGpuBuffer inIm, IGpuBuffer outRe, IGpuBuffer outIm, int batch, int n, bool inverse);
+
+    private static void CheckRadix2(IDirectGpuBackend backend, Radix2 transform)
+    {
+        foreach (int n in new[] { 1, 2, 8, 64, 1024, 4096 })
+            foreach (bool inverse in new[] { false, true })
+                foreach (bool aliased in new[] { false, true })
+                {
+                    int batch = n >= 1024 ? 2 : Batch;
+                    var re = Values(batch * n, n + 1);
+                    var im = Values(batch * n, n + 5);
+                    Dft(re, im, n, inverse, out var eRe, out var eIm);
+                    using var bRe = backend.AllocateBuffer(re);
+                    using var bIm = backend.AllocateBuffer(im);
+                    using var oRe = aliased ? null : backend.AllocateBuffer(batch * n);
+                    using var oIm = aliased ? null : backend.AllocateBuffer(batch * n);
+                    IGpuBuffer outRe = oRe ?? bRe, outIm = oIm ?? bIm;
+                    transform(bRe, bIm, outRe, outIm, batch, n, inverse);
+                    var aRe = backend.DownloadBuffer(outRe);
+                    var aIm = backend.DownloadBuffer(outIm);
+                    double tol = (1e-3 + 1e-6 * n) * (inverse ? 1.0 / n : 1.0) + 1e-6;
+                    for (int i = 0; i < batch * n; i++)
+                        Assert.True(Math.Abs(aRe[i] - eRe[i]) <= tol && Math.Abs(aIm[i] - eIm[i]) <= tol,
+                            $"radix-2 n={n} {(inverse ? "inverse" : "forward")}{(aliased ? " aliased" : "")} [{i}]: got ({aRe[i]}, {aIm[i]}), expected ({eRe[i]}, {eIm[i]})");
+                }
+    }
+
+    [SkippableFact]
+    public void WebGpuWgsl_Radix2BatchedFft_MatchesDft_OnDawn()
+    {
+        var backend = DawnOrSkip(out var owner);
+        using (owner)
+        {
+            if (backend is null) return;
+            // Through the backend's BatchedFFT, the member WebGpuBackend routes power-of-two lengths with.
+            CheckRadix2(backend, backend.BatchedFFT);
+        }
+    }
+
+    // The shared CUDA-dialect kernels on HIP (the source CUDA compiles and Metal translates); OpenCL and Vulkan
+    // run their own radix-2 BatchedFFT and do not carry these kernels.
+    [SkippableFact]
+    public void Hip_Radix2BatchedFftKernels_MatchDft()
+    {
+        using var backend = new HipBackend();
+        Skip.IfNot(backend.IsAvailable, "HIP is not available.");
+        CheckRadix2(backend, (re, im, oRe, oIm, b, n, inv) => PortableGenericFft.BatchedRadix2(backend, backend.LaunchBatch, re, im, oRe, oIm, b, n, inv));
+    }
+
+
 }
 #endif

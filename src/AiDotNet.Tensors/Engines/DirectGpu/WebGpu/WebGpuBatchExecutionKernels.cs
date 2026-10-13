@@ -27,6 +27,21 @@ fn bx_hash(counter: u32, key: u32) -> u32 {
 }
 // Built at run time: an infinite constant expression is a shader-creation error.
 fn bx_inf() -> f32 { let bits = 0x7f800000u; return bitcast<f32>(bits); }
+// tanh built on exp, not the device's own: a shading language's tanh may carry a large error, and one D3D12 driver's
+// is off by up to 7.7e-6 (130 ulp), which 1 - tanh^2 in the LSTM backward amplifies (#1220). The same driver's exp is
+// within 8 ulp. Below 0.25 the Maclaurin series is used (truncation under 1e-10), so small arguments keep their
+// relative accuracy; above it (1 - e^-2|x|) / (1 + e^-2|x|).
+fn bx_tanh(x: f32) -> f32 {
+    let a = abs(x);
+    if (a < 0.25) {
+        let u = x * x;
+        return x * (1.0 + u * (-0.33333334 + u * (0.13333334 + u * (-0.053968254 + u * (0.021869488 + u * -0.0088632355)))));
+    }
+    let e = exp(-2.0 * a);
+    let r = (1.0 - e) / (1.0 + e);
+    if (x < 0.0) { return -r; }
+    return r;
+}
 fn bx_unit(h: u32) -> f32 { return f32(h >> 8u) * (1.0 / 16777216.0); }
 // (a * b) mod m in 32 bits; a, b < m <= 2^30.
 fn bx_mulmod(a0: u32, b0: u32, m: u32) -> u32 {
@@ -228,7 +243,7 @@ var<workgroup> scratch: array<f32, 256>;
     var act = 0.0; var dact = 0.0;
     if (p.mode == 0) { let s = 1.0 / (1.0 + exp(-g)); act = s; dact = s * (1.0 - s); }
     else if (p.mode == 1) {
-        let t = tanh(0.7978845608 * (g + 0.044715 * g * g * g));
+        let t = bx_tanh(0.7978845608 * (g + 0.044715 * g * g * g));
         act = 0.5 * g * (1.0 + t);
         dact = 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * 0.7978845608 * (1.0 + 0.134145 * g * g);
     }
@@ -423,6 +438,31 @@ var<workgroup> scratch: array<f32, 256>;
     aIm[i] = xr * yi + xi * yr;
 }");
 
+    // Batched radix-2 FFT (#965): the bit-reversal permute, scaled for the inverse, then one butterfly stage per span.
+    public static readonly string FftBitReverse = Shader(new[] { "r:inRe", "r:inIm", "rw:outRe", "rw:outIm" },
+        "batch: i32, n: i32, log2n: i32, scale: f32", Main + @"
+    if (i >= p.batch * p.n) { return; }
+    let b = i / p.n;
+    var k = u32(i % p.n);
+    var r = 0u;
+    for (var bit = 0; bit < p.log2n; bit++) { r = (r << 1u) | (k & 1u); k = k >> 1u; }
+    outRe[b * p.n + i32(r)] = inRe[i] * p.scale;
+    outIm[b * p.n + i32(r)] = inIm[i] * p.scale;
+}");
+
+    public static readonly string FftButterfly = Shader(new[] { "rw:re", "rw:im" }, "batch: i32, n: i32, span: i32, inverse: i32", Main + @"
+    let pairs = p.n / 2;
+    if (i >= p.batch * pairs) { return; }
+    let b = i / pairs; let j = i % pairs; let pos = j % p.span;
+    let i0 = b * p.n + (j / p.span) * 2 * p.span + pos; let i1 = i0 + p.span;
+    let a = select(-3.14159265358979323846, 3.14159265358979323846, p.inverse != 0) * f32(pos) / f32(p.span);
+    let wr = cos(a); let wi = sin(a);
+    let xr = re[i1]; let xi = im[i1];
+    let tr = wr * xr - wi * xi; let ti = wr * xi + wi * xr;
+    let ur = re[i0]; let ui = im[i0];
+    re[i0] = ur + tr; im[i0] = ui + ti;
+    re[i1] = ur - tr; im[i1] = ui - ti;
+}");
     public static readonly string FftBluesteinPost = Shader(new[] { "r:padRe", "r:padIm", "r:chirpRe", "r:chirpIm", "rw:re", "rw:im" },
         "batch: i32, n: i32, m: i32, scale: f32", Main + @"
     if (i >= p.batch * p.n) { return; }
@@ -798,7 +838,7 @@ fn fa_allowed(f: Fa, b: i32, h: i32, i: i32, j: i32) -> bool {
 fn fa_score(f: Fa, b: i32, h: i32, i: i32, j: i32) -> vec2<f32> {
     var s = 0.0;
     for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * f.scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
-    if (f.cap > 0.0) { let t = tanh(s / f.cap); return vec2<f32>(f.cap * t, 1.0 - t * t); }
+    if (f.cap > 0.0) { let t = bx_tanh(s / f.cap); return vec2<f32>(f.cap * t, 1.0 - t * t); }
     return vec2<f32>(s, 1.0);
 }
 ";
@@ -910,7 +950,7 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     // #974 fused decode-linear: line-for-line ports of BatchExecutionCudaKernels.DecodeLinearSource. dl_half is the
     // DL_HALF macro: one FP16 value widened to f32 on its bit pattern (zero, subnormals, infinity and NaN included).
     private const string DlCommon = @"
-fn dl_gelu(s: f32) -> f32 { return 0.5 * s * (1.0 + tanh(0.7978845608028654 * (s + 0.044715 * s * s * s))); }
+fn dl_gelu(s: f32) -> f32 { return 0.5 * s * (1.0 + bx_tanh(0.7978845608028654 * (s + 0.044715 * s * s * s))); }
 ";
 
     private const string DlHalf = @"
@@ -955,6 +995,65 @@ fn dl_half(word: i32, slot: i32) -> f32 {
     y[i] = dl_gelu(s);
 }");
 
+    // #682 direct FP16 convolution: a line-for-line port of BatchExecutionCudaKernels.DirectConvSource.
+    // dc_round_half is the DC_ROUND_HALF macro: the value a float has after rounding to FP16, ties to even, on its
+    // bit pattern.
+    private const string DcRoundHalf = @"
+fn dc_round_half(bits: i32) -> f32 {
+    var mag = bits & 2147483647;
+    let e = mag >> 23u;
+    var v = 0.0;
+    if (e == 255) {
+        v = bitcast<f32>(mag);
+    } else {
+        if (e < 113) {
+            var q = 0;
+            let s = 126 - e;
+            if (e != 0 && s <= 24) {
+                let whole = (mag & 8388607) | 8388608;
+                q = whole >> u32(s);
+                let rem = whole - (q << u32(s));
+                let tie = 1 << u32(s - 1);
+                if (rem > tie || (rem == tie && (q & 1) != 0)) { q = q + 1; }
+            }
+            v = f32(q) * 5.9604644775390625e-8;
+        } else {
+            mag = mag + 4095 + ((mag >> 13u) & 1);
+            mag = (mag >> 13u) << 13u;
+            if (mag >= 1199570944) { mag = 2139095040; }
+            v = bitcast<f32>(mag);
+        }
+    }
+    if (bits < 0) { v = -v; }
+    return v;
+}
+";
+
+    public static readonly string DcConv2dDirectFp16Hw = Shader(new[] { "r:inBits:i32", "r:wh:i32", "rw:y" },
+        "batch: i32, inC: i32, inH: i32, inW: i32, outC: i32, outH: i32, outW: i32, kH: i32, kW: i32, sH: i32, sW: i32, pH: i32, pW: i32, dH: i32, dW: i32",
+        DlHalf + DcRoundHalf + Main + @"
+    if (i >= p.batch * p.outC * p.outH * p.outW) { return; }
+    let r1 = i / p.outW; let ow = i - r1 * p.outW;
+    let r2 = r1 / p.outH; let oh = r1 - r2 * p.outH;
+    let b = r2 / p.outC; let oc = r2 - b * p.outC;
+    var acc = 0.0;
+    for (var ic = 0; ic < p.inC; ic++) {
+        for (var kh = 0; kh < p.kH; kh++) {
+            let ih = oh * p.sH - p.pH + kh * p.dH;
+            if (ih >= 0 && ih < p.inH) {
+                for (var kw = 0; kw < p.kW; kw++) {
+                    let iw = ow * p.sW - p.pW + kw * p.dW;
+                    if (iw >= 0 && iw < p.inW) {
+                        let wi = ((oc * p.inC + ic) * p.kH + kh) * p.kW + kw;
+                        acc += dc_round_half(inBits[((b * p.inC + ic) * p.inH + ih) * p.inW + iw]) * dl_half(wh[wi >> 1u], wi & 1);
+                    }
+                }
+            }
+        }
+    }
+    y[i] = acc;
+}");
+
     public static readonly string DlW8A8LinearGelu = Shader(
         new[] { "r:x8:i32", "r:w8:i32", "r:actScale", "r:wScales", "r:bias", "rw:y" }, "K: i32, N: i32", DlCommon + Main + @"
     let K = p.K;
@@ -993,7 +1092,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     var s = bih[row] + bhh[row];
     for (var k = 0; k < In; k++) { s += wih[row * In + k] * x[(b * p.T + p.t) * In + k]; }
     for (var j = 0; j < H; j++) { s += whh[row * H + j] * allH[(p.t * B + b) * H + j]; }
-    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), tanh(s), row / H == 2);
+    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), bx_tanh(s), row / H == 2);
 }");
 
     public static readonly string LstmCell = Shader(
@@ -1003,7 +1102,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     let b = i / H; let h = i - b * H;
     let gb = (t * B + b) * 4 * H;
     let c = gates[gb + H + h] * allC[(t * B + b) * H + h] + gates[gb + h] * gates[gb + 2 * H + h];
-    let hv = gates[gb + 3 * H + h] * tanh(c);
+    let hv = gates[gb + 3 * H + h] * bx_tanh(c);
     allC[((t + 1) * B + b) * H + h] = c;
     allH[((t + 1) * B + b) * H + h] = hv;
     y[(b * p.T + t) * H + h] = hv;
@@ -1016,7 +1115,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     let b = i / H; let h = i - b * H;
     let gb = (t * B + b) * 4 * H;
     let ig = gates[gb + h]; let fg = gates[gb + H + h]; let gg = gates[gb + 2 * H + h]; let og = gates[gb + 3 * H + h];
-    let tc = tanh(allC[((t + 1) * B + b) * H + h]);
+    let tc = bx_tanh(allC[((t + 1) * B + b) * H + h]);
     let dhv = gy[(b * p.T + t) * H + h] + dh[i];
     let dcv = dhv * og * (1.0 - tc * tc) + dc[i];
     dpre[gb + h] = dcv * gg * ig * (1.0 - ig);
@@ -1099,7 +1198,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         ["bx_gaussian_noise"] = GaussianNoise, ["bx_gumbel_softmax"] = GumbelSoftmax,
         ["bx_batch_outer_product"] = BatchOuterProduct, ["bx_meshgrid2d"] = Meshgrid2D,
         ["bx_fft_chirp"] = FftChirp, ["bx_fft_bluestein_pre"] = FftBluesteinPre, ["bx_fft_cmul"] = FftCmul,
-        ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
+        ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_bit_reverse"] = FftBitReverse, ["bx_fft_butterfly"] = FftButterfly, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
         [BatchExecutionCudaKernels.LaSymmetrize] = LaSymmetrize, [BatchExecutionCudaKernels.LaLuSolve] = LaLuSolve,
         [BatchExecutionCudaKernels.LaLdlFactor] = LaLdlFactor, [BatchExecutionCudaKernels.LaLdlSolve] = LaLdlSolve,
         [BatchExecutionCudaKernels.LaSolveVector] = LaSolveVector, [BatchExecutionCudaKernels.LaTriangularSolveVector] = LaTriangularSolveVector,
@@ -1114,6 +1213,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.LstmWeightHhGrad] = LstmWeightHhGrad, [BatchExecutionCudaKernels.LstmBiasGrad] = LstmBiasGrad,
         [BatchExecutionCudaKernels.DlLinearGelu] = DlLinearGelu, [BatchExecutionCudaKernels.DlLinearGeluFp16] = DlLinearGeluFp16,
         [BatchExecutionCudaKernels.DlW8A8LinearGelu] = DlW8A8LinearGelu, [BatchExecutionCudaKernels.DlW8A8Epilogue] = DlW8A8Epilogue,
+        [BatchExecutionCudaKernels.DcConv2dDirectFp16Hw] = DcConv2dDirectFp16Hw,
     };
 }
 #endif

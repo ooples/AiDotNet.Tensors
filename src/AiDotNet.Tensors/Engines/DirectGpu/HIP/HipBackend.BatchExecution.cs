@@ -11,7 +11,7 @@ public sealed partial class HipBackend : IGpuBatchExecution
     private int _batchDepth;
     private int _secondaryStreamOwnerThreadId;
 
-    private unsafe void LaunchBatch(string name, int threads, params object[] args)
+    internal unsafe void LaunchBatch(string name, int threads, params object[] args)
     {
         if (threads <= 0) return;
         if (!_kernelCache.TryGetValue(name, out var kernel))

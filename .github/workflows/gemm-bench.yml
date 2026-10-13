@@ -22,6 +22,8 @@ on:
       - 'src/AiDotNet.Tensors/Engines/Simd/SimdGemm.cs'
       - 'src/AiDotNet.Tensors/Engines/BlasManaged/**'
       - 'tools/ConvParallelProbe/**'
+      # The probe reads internals: this file's InternalsVisibleTo list decides whether it compiles.
+      - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
       - '.github/workflows/gemm-bench.yml'
   workflow_dispatch:
     inputs:
