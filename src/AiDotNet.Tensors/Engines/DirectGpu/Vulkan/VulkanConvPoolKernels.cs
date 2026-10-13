@@ -382,6 +382,66 @@ void main() {
     outp[w] = packHalf2x16(vec2(v0, v1));
 }";
 
+    // ---- DIRECT FP16 conv (#682): the Vulkan port of CUDA's conv2d_direct_fp16hw (#671), for the tiny-spatial
+    // deep convs the im2col + GEMM path skips. FP32 input rounded to FP16 per access, FP16 weights in the
+    // packed layout ConvertToFp16 produces (two halves per 32-bit word, element i in word i/2: even i the low
+    // half, odd i the high half), FP32 multiply-accumulate in the reference's (ic, kh, kw) order, FP32 output.
+    // One invocation per output element; no column matrix is materialized.
+    public const string Conv2dDirectFp16Hw = Header + @"
+layout(set=0, binding=0) readonly buffer B0 { float inp[]; };
+layout(set=0, binding=1) readonly buffer B1 { uint weightsHalf[]; };
+layout(set=0, binding=2) writeonly buffer B2 { float outp[]; };
+layout(push_constant) uniform PC {
+    int batch; int inChannels; int inHeight; int inWidth;
+    int outChannels; int outHeight; int outWidth;
+    int kernelH; int kernelW; int strideH; int strideW;
+    int padH; int padW; int dilationH; int dilationW;
+};
+float weight_at(int i) {
+    vec2 pair = unpackHalf2x16(weightsHalf[i >> 1]);
+    return (i & 1) == 0 ? pair.x : pair.y;
+}
+// The value x has after rounding to FP16 (round to nearest, ties to even), computed on the FP32 bit pattern.
+// Not unpackHalf2x16(packHalf2x16(x)): on an RTX 3080 that round trip came back unrounded (1.0001 stayed 1.0001,
+// with the packed word masked to its low half as well), which leaves the numerics those of an FP32-input
+// convolution. The bit arithmetic cannot be folded away.
+float as_half(float x) {
+    uint u = floatBitsToUint(x);
+    uint mag = u & 0x7FFFFFFFu;
+    if (mag >= 0x7F800000u) return x;                       // infinity and NaN pass through
+    if (mag < 0x38800000u)                                  // below 2^-14: FP16 subnormals, spaced 2^-24 apart
+        return roundEven(x * 16777216.0) / 16777216.0;
+    // A normal half keeps 10 of the 23 mantissa bits: drop 13, ties to even. A carry out of the mantissa bumps
+    // the exponent, which is the right result.
+    mag += 0x00000FFFu + ((mag >> 13) & 1u);
+    mag &= 0xFFFFE000u;
+    if (mag >= 0x47800000u) mag = 0x7F800000u;              // rounds to 65536 or more: overflows FP16 to infinity
+    return uintBitsToFloat((u & 0x80000000u) | mag);
+}
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    int total = batch * outChannels * outHeight * outWidth;
+    if (idx >= total) return;
+    int ow = idx % outWidth;
+    int oh = (idx / outWidth) % outHeight;
+    int oc = (idx / (outWidth * outHeight)) % outChannels;
+    int b = idx / (outWidth * outHeight * outChannels);
+    float acc = 0.0;
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            int ih = oh * strideH - padH + kh * dilationH;
+            if (ih < 0 || ih >= inHeight) continue;
+            for (int kw = 0; kw < kernelW; kw++) {
+                int iw = ow * strideW - padW + kw * dilationW;
+                if (iw < 0 || iw >= inWidth) continue;
+                float inV = inp[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                acc += as_half(inV) * weight_at(((oc * inChannels + ic) * kernelH + kh) * kernelW + kw);
+            }
+        }
+    }
+    outp[idx] = acc;
+}";
+
     // ---- Conv2D (forward, gather): one thread per output element ----
     public const string Conv2D = Header + @"
 layout(set=0, binding=0) buffer B0 { float inp[]; };
@@ -1033,4 +1093,44 @@ void main() {
     }
     gradMask[idx] = sum;
 }";
+
+    // ---- Variants for a call that leaves an optional buffer out ----
+    // Each kernel above declares the binding of its optional operand (pooling's argmax indices, a bias, a
+    // modulation mask). A call without that operand used to allocate a device buffer of the operand's full size,
+    // fill it with the neutral value and bind it. These variants are the same source with the binding gone and
+    // the neutral value written in, so such a call allocates nothing.
+
+    public static readonly string MaxPool2DNoIndices = WithoutBinding(MaxPool2D, 2, "indices[outIdx] = maxIdx;", "");
+    public static readonly string MaxPool3DNoIndices = WithoutBinding(MaxPool3D, 2, "indices[outIdx] = maxIdx;", "");
+    public static readonly string LocallyConnectedConv2DNoBias = WithoutBinding(LocallyConnectedConv2D, 2, "bias[oc]", "0.0");
+    public static readonly string DeformableConv2DNoMask = WithoutBinding(DeformableConv2D, 3, "mask[mIx]", "1.0");
+    public static readonly string DeformableConv2DBackwardInputNoMask = WithoutBinding(DeformableConv2DBackwardInput, 3, "mask[mIx]", "1.0");
+    public static readonly string DeformableConv2DBackwardWeightsNoMask = WithoutBinding(DeformableConv2DBackwardWeights, 3, "mask[mIx]", "1.0");
+    public static readonly string DeformableConv2DBackwardOffsetNoMask = WithoutBinding(DeformableConv2DBackwardOffset, 4, "mask[mIx]", "1.0");
+
+    /// <summary>
+    /// Derives the variant of <paramref name="source"/> without storage binding <paramref name="binding"/>: its
+    /// declaration is removed, the bindings after it move down by one, and every <paramref name="use"/> of it
+    /// becomes <paramref name="replacement"/>.
+    /// </summary>
+    internal static string WithoutBinding(string source, int binding, string use, string replacement)
+    {
+        string marker = "layout(set=0, binding=" + binding.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
+        int start = source.IndexOf(marker, System.StringComparison.Ordinal);
+        if (start < 0) throw new System.ArgumentException("The source declares no binding " + binding + ".", nameof(source));
+        int end = source.IndexOf(';', start);
+        end = source.IndexOf(';', end + 1); // the block's closing "};"
+        if (end < 0) throw new System.ArgumentException("Binding " + binding + " is not a complete block.", nameof(source));
+        string result = source.Remove(start, end + 1 - start);
+        for (int later = binding + 1; ; later++)
+        {
+            string from = "layout(set=0, binding=" + later.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")";
+            if (result.IndexOf(from, System.StringComparison.Ordinal) < 0) break;
+            result = result.Replace(from,
+                "layout(set=0, binding=" + (later - 1).ToString(System.Globalization.CultureInfo.InvariantCulture) + ")");
+        }
+        if (result.IndexOf(use, System.StringComparison.Ordinal) < 0)
+            throw new System.ArgumentException("The source never uses '" + use + "'.", nameof(use));
+        return result.Replace(use, replacement);
+    }
 }

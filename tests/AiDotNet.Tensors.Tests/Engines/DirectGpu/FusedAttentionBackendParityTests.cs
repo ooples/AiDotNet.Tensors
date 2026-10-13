@@ -46,9 +46,9 @@ public sealed class FusedAttentionBackendParityTests
         return mask;
     }
 
-    private static void Check(IDirectGpuBackend backend)
+    private static void Check(IDirectGpuBackend backend, IFusedAttentionBackend? fusedOverride = null)
     {
-        var fused = Assert.IsAssignableFrom<IFusedAttentionBackend>(backend);
+        var fused = fusedOverride ?? Assert.IsAssignableFrom<IFusedAttentionBackend>(backend);
         foreach (var c in Cases)
         {
             Assert.True(fused.SupportsFusedAttention(c.D));
@@ -191,5 +191,29 @@ public sealed class FusedAttentionBackendParityTests
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
         Check(backend);
     }
-}
+
+    // The shared fa_p_ kernels through a launcher (the WebGPU WGSL ports on Dawn), with buffers on the host backend.
+    private sealed class LaunchedFusedAttention : IFusedAttentionBackend
+    {
+        private readonly IDirectGpuBackend _host;
+        private readonly PortableGenericFft.Launcher _launch;
+        public LaunchedFusedAttention(IDirectGpuBackend host, PortableGenericFft.Launcher launch) { _host = host; _launch = launch; }
+        public bool SupportsFusedAttention(int headDim) => PortableFusedAttention.Supports(headDim);
+        public void FusedAttentionForward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer lse, IGpuBuffer? mask,
+            in FusedAttentionParams p, int headDim)
+            => PortableFusedAttention.Forward(_host, _launch, q, k, v, o, lse, mask, p, headDim);
+        public void FusedAttentionBackward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer dO, IGpuBuffer lse,
+            IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim)
+            => PortableFusedAttention.Backward(_host, _launch, q, k, v, o, dO, lse, mask, dQ, dK, dV, p, headDim);
+    }
+
+    [SkippableFact]
+    public void WebGpuWgsl_FusedAttention_MatchesReference_OnDawn()
+    {
+        using var dawn = DawnWgslLauncher.TryCreate();
+        Skip.If(dawn is null, "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).");
+        using var host = new OpenClBackend();
+        Skip.IfNot(host.IsAvailable, "OpenCL hosts the buffers and is not available.");
+        Check(host, new LaunchedFusedAttention(host, dawn!.For(host)));
+    }}
 #endif

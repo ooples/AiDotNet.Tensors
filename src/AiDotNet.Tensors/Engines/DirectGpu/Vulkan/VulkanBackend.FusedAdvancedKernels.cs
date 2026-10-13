@@ -6,6 +6,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend
 {
+    /// <summary>The largest rank the single-dispatch LoRA kernel holds in work-group shared memory.</summary>
+    internal const int LoRASharedMemoryRank = 256;
+
     public void FusedLoRAForward(
         IGpuBuffer input,
         IGpuBuffer baseOutput,
@@ -23,11 +26,19 @@ public sealed unsafe partial class VulkanBackend
         // ceil(dispatchSize / 256). Pass batchSize * 256 to land on exactly
         // batchSize workgroups.
         if (batchSize <= 0 || rank <= 0) return;
-        if ((uint)rank > 256u)
-            throw new NotSupportedException(
-                $"Vulkan LoRA fused kernel currently caps rank at 256 (got {rank}). " +
-                "Increase MAX_RANK in VulkanFusedAdvancedKernels.LoRAForward and " +
-                "redeploy the SPIR-V if higher ranks are required.");
+        if (rank > LoRASharedMemoryRank)
+        {
+            // The single-dispatch kernel keeps a row's projection in work-group shared memory, which holds 256
+            // entries. A larger rank runs as two dispatches with the projection in a device buffer (#1230).
+            if (inputFeatures <= 0 || outputFeatures <= 0) return;
+            using var projection = AllocateBuffer(checked(batchSize * rank));
+            GlslNaryOp(VulkanFusedAdvancedKernels.LoRAProject, new[] { input, loraA, projection }, batchSize * rank,
+                new[] { (uint)batchSize, (uint)inputFeatures, (uint)rank });
+            GlslNaryOp(VulkanFusedAdvancedKernels.LoRAApply, new[] { baseOutput, projection, loraB, output },
+                checked(batchSize * outputFeatures),
+                new[] { (uint)batchSize, (uint)rank, (uint)outputFeatures, FloatBits(scaling) });
+            return;
+        }
 
         var pushConstants = new[]
         {

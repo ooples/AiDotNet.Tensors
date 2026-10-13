@@ -16318,6 +16318,13 @@ public partial class CpuEngine : ITensorLevelEngine
                                         kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
                         }
                     }, deterministicSafe: true);
+                    // The flipped kernel lives in a buffer recycled through AutoTensorCache, and was just rewritten through
+                    // its raw array. Derived-weight caches (the im2col conv's transposed kernel, SimdGemm's packed panels)
+                    // key on the array's identity and trust its version, so without this the transposed conv below is
+                    // served the transpose of whatever kernel this buffer held last - a stale input gradient. It is reached
+                    // only where float conv dispatches through Conv2DIm2colGemm (not Windows, whose Conv2D takes the
+                    // adaptive path), which is why segmentation models trained wrong on Linux CI only (0.135.0).
+                    InferenceWeightCache.Invalidate(flippedF);
                     var destFused = (float[])(object)dest._storage.GetDataArray();
                     int destOffFused = dest._storageOffset;
                     int totalFused = batch * inChannels * height * width;

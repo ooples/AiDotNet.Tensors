@@ -22,7 +22,7 @@ internal static partial class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource;
+    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + DecodeLinearSource + DirectConvSource;
 
     private const string CoreSource = @"
 #ifndef INFINITY
@@ -392,6 +392,30 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_bluestein_post(const 
     im[i] = (xr * ci + xi * cr) * scale;
 }
 
+// Batched radix-2 FFT for a power-of-two n (#965), for a backend whose own BatchedFFT is not one: a bit-reversal permute
+// that also applies the inverse's 1/n (the butterflies are linear), then log2(n) in-place butterfly stages of span
+// half = 1, 2, 4, ... n / 2. The twiddle angle is -/+ pi * pos / half for a forward / inverse transform.
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_bit_reverse(const float* inRe, const float* inIm, float* outRe,
+    float* outIm, int batch, int n, int log2n, float scale) {
+    int i = bx_gid(); if (i >= batch * n) return;
+    int b = i / n; unsigned int k = (unsigned int)(i % n); unsigned int r = 0u;
+    for (int bit = 0; bit < log2n; bit++) { r = (r << 1) | (k & 1u); k = k >> 1; }
+    outRe[b * n + (int)r] = inRe[i] * scale;
+    outIm[b * n + (int)r] = inIm[i] * scale;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void bx_fft_butterfly(float* re, float* im, int batch, int n, int span, int inverse) {
+    int t = bx_gid(); int pairs = n / 2; if (t >= batch * pairs) return;
+    int b = t / pairs; int j = t % pairs; int pos = j % span;
+    int i0 = b * n + (j / span) * 2 * span + pos; int i1 = i0 + span;
+    float a = (inverse ? 3.14159265358979323846f : -3.14159265358979323846f) * (float)pos / (float)span;
+    float wr = cosf(a); float wi = sinf(a);
+    float xr = re[i1]; float xi = im[i1];
+    float tr = wr * xr - wi * xi; float ti = wr * xi + wi * xr;
+    float ur = re[i0]; float ui = im[i0];
+    re[i0] = ur + tr; im[i0] = ui + ti;
+    re[i1] = ur - tr; im[i1] = ui - ti;
+}
 // mode 1: IEEE binary16, mode 2: bfloat16; both round to nearest even.
 __device__ __forceinline__ unsigned int bx_to_16(float x, int mode) {
     unsigned int f = __float_as_uint(x);
@@ -449,9 +473,10 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const un
         "bx_slice_axis", "bx_set_slice_axis", "bx_stack2", "bx_window_2d", "bx_tile_last_axis", "bx_repeat_elements",
         "bx_linspace", "bx_diag", "bx_extract_diag", "bx_triangular_mask", "bx_index_select", "bx_row_loss",
         "bx_dropout_mask", "bx_gaussian_noise", "bx_gumbel_softmax", "bx_batch_outer_product", "bx_meshgrid2d", "bx_fft_chirp", "bx_fft_bluestein_pre",
-        "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage",
+        "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage", "bx_fft_bit_reverse", "bx_fft_butterfly",
         LaSymmetrize, LaLuSolve, LaLdlFactor, LaLdlSolve, LaSolveVector, LaTriangularSolveVector, LaCholeskyBackwardLower,
-        LaSolveBackwardVector, LaSvdReduced, LaQrReduced, FaLse, FaOut, FaDelta, FaDq, FaDkv,
-        LstmGates, LstmCell, LstmCellBackward, LstmHiddenBackward, LstmInputGrad, LstmWeightIhGrad, LstmWeightHhGrad, LstmBiasGrad
+        LaSolveBackwardVector, LaSvdReduced, LaQrReduced, FaLse, FaOut, FaDelta, FaDq, FaDk, FaDv,
+        LstmGates, LstmCell, LstmCellBackward, LstmHiddenBackward, LstmInputGrad, LstmWeightIhGrad, LstmWeightHhGrad, LstmBiasGrad,
+        DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue, DcConv2dDirectFp16Hw
     };
 }

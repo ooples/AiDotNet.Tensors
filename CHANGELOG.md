@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.136.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.135.0...v0.136.0) (2026-10-12)
+
+
+### Features
+
+* **#1135:** bitwise / shift / gcd / lcm / floor_divide on int64 and narrow integer tensors on the GPU ([#1144](https://github.com/ooples/AiDotNet.Tensors/issues/1144)) ([69fa161](https://github.com/ooples/AiDotNet.Tensors/commit/69fa161366331f034ac302aaf74fa2a1303a0703))
+* **#1165 phase 2:** measure GPU capability fallbacks; WebGPU LoRA takes any rank ([#1208](https://github.com/ooples/AiDotNet.Tensors/issues/1208)) ([3c72c43](https://github.com/ooples/AiDotNet.Tensors/commit/3c72c433117917f45e7aca0f622a916509f0783b))
+* **#889:** weightless tape-aware fused SDPA (FlashAttention-2 fwd/bwd, mask/causal/softcap in-kernel) -- O(S) training memory ([#1139](https://github.com/ooples/AiDotNet.Tensors/issues/1139)) ([d503c9a](https://github.com/ooples/AiDotNet.Tensors/commit/d503c9a98412b4a0c1eff97b970b7e7289ee5428))
+* **gpu:** enforce six-backend parity, implement the gaps, and five issues ([#1167](https://github.com/ooples/AiDotNet.Tensors/issues/1167)) ([1fbe3d2](https://github.com/ooples/AiDotNet.Tensors/commit/1fbe3d26e8ae2376ddc77ed04e5d1643ce363506))
+* **opencl:** device kernels for the pytorch-parity ops; vulkan device features ([#1175](https://github.com/ooples/AiDotNet.Tensors/issues/1175)) ([7bdb578](https://github.com/ooples/AiDotNet.Tensors/commit/7bdb578ec824ac7d600423d243d2407c67bf20b1))
+* **parity:** close all 387 PyTorch gaps; fix in-place autograd and Fill on views ([#1120](https://github.com/ooples/AiDotNet.Tensors/issues/1120)) ([4e7183a](https://github.com/ooples/AiDotNet.Tensors/commit/4e7183a7fc7096f99d8c184986942c74f1799ed6))
+* tuned-kernel registry dispatch on opencl and vulkan (softmax, layernorm, conv2d) ([#1168](https://github.com/ooples/AiDotNet.Tensors/issues/1168)) ([398c478](https://github.com/ooples/AiDotNet.Tensors/commit/398c478a945c1537dfe936f714aa33a1361f14d9))
+* **vulkan:** device kernels for the PyTorch-parity ops ([#1149](https://github.com/ooples/AiDotNet.Tensors/issues/1149)) ([a0d8389](https://github.com/ooples/AiDotNet.Tensors/commit/a0d8389e266bd1059f889aa7b21c2ce63e65d46f))
+* **vulkan:** generic-precision, arbitrary-length FFT ([#1151](https://github.com/ooples/AiDotNet.Tensors/issues/1151)) ([de2bc5e](https://github.com/ooples/AiDotNet.Tensors/commit/de2bc5e43203225180789dae647ee10c1facab9f))
+
+
+### Bug Fixes
+
+* **#1131, #1134:** CPU sort in PyTorch's NaN/stable order; non-finite GridSample points sample nothing on CPU and CUDA ([#1143](https://github.com/ooples/AiDotNet.Tensors/issues/1143)) ([161a262](https://github.com/ooples/AiDotNet.Tensors/commit/161a2620222afc7579583b5c6209a6b247f068dd))
+* **#1165 phase 1:** GPU dispatch falls back only for missing capabilities; faults propagate ([#1203](https://github.com/ooples/AiDotNet.Tensors/issues/1203)) ([7cd7f21](https://github.com/ooples/AiDotNet.Tensors/commit/7cd7f21b58879de6c8ef06cc920b0a2b8729a217))
+* **#1172:** implement the int64-layout parity ops on Vulkan so main compiles ([#1173](https://github.com/ooples/AiDotNet.Tensors/issues/1173)) ([c40c295](https://github.com/ooples/AiDotNet.Tensors/commit/c40c2952bd980abd84b812bd82c02281741805c6))
+* **#1196:** Vulkan LDL factorization picks the reference pivots (volatile buffers in the translated solvers) ([#1197](https://github.com/ooples/AiDotNet.Tensors/issues/1197)) ([9579ca3](https://github.com/ooples/AiDotNet.Tensors/commit/9579ca3cb929f3882aa393f622e4b5b883a25e7c))
+* **#1199:** make main build again (stale parity baseline entry, concrete-backend test) ([#1200](https://github.com/ooples/AiDotNet.Tensors/issues/1200)) ([a38a385](https://github.com/ooples/AiDotNet.Tensors/commit/a38a3859e93ffaa00ef70483b1ac8df9f542ef9e))
+* **alloc:** keep this alive in storage readers; release escaped arrays; net471 sin/cos reference ([#1187](https://github.com/ooples/AiDotNet.Tensors/issues/1187)) ([3764a7d](https://github.com/ooples/AiDotNet.Tensors/commit/3764a7d93c52f298a1d6dc71d5ccc49137726bf3))
+* compute erf and erfc to double precision ([#1180](https://github.com/ooples/AiDotNet.Tensors/issues/1180)) ([bbb00b7](https://github.com/ooples/AiDotNet.Tensors/commit/bbb00b7a954f90cf686ecbac005c11d95cd93507))
+* **conv:** stale transposed kernel in the stride-1 conv input gradient on Linux (0.135.0 regression) ([#1146](https://github.com/ooples/AiDotNet.Tensors/issues/1146)) ([8eb97ab](https://github.com/ooples/AiDotNet.Tensors/commit/8eb97abb6ea15dbbcfa67071b6a4b345f0688bc1))
+* **cuda:** ReduceSumBackward / ReduceMeanBackward launch one thread per element ([#1195](https://github.com/ooples/AiDotNet.Tensors/issues/1195)) ([4225158](https://github.com/ooples/AiDotNet.Tensors/commit/4225158b42637632380664371b8f8b8839dc39fc))
+* full reductions return rank 0 on cpu and gpu, eager and compiled ([#1145](https://github.com/ooples/AiDotNet.Tensors/issues/1145)) ([bea7504](https://github.com/ooples/AiDotNet.Tensors/commit/bea7504db2dca1fc47f3e77534b8838273c9dcc4))
+* **gpu:** device-side complex split, 12 parity elementwise kernels, scale-aware GPU/CPU comparison ([#1112](https://github.com/ooples/AiDotNet.Tensors/issues/1112), part 1) ([#1121](https://github.com/ooples/AiDotNet.Tensors/issues/1121)) ([18a119b](https://github.com/ooples/AiDotNet.Tensors/commit/18a119b998353d830a8648cc2bc1acce32c6c127))
+* **gpu:** unbreak main's parity build, fused attention and non-finite grid sample on every backend ([#1181](https://github.com/ooples/AiDotNet.Tensors/issues/1181)) ([680df86](https://github.com/ooples/AiDotNet.Tensors/commit/680df860b7cc92e5d104785e67baa7f072e16fd0))
+* **vulkan:** binary gcd and 8-byte-aligned 64-bit push pairs on amd ([#1174](https://github.com/ooples/AiDotNet.Tensors/issues/1174)) ([21a52e4](https://github.com/ooples/AiDotNet.Tensors/commit/21a52e4d4eafe45a09b2506a5882ec3ea09c424e))
+* **vulkan:** pass every push-constant word to the fused kernels ([#1147](https://github.com/ooples/AiDotNet.Tensors/issues/1147)) ([#1148](https://github.com/ooples/AiDotNet.Tensors/issues/1148)) ([91d10b6](https://github.com/ooples/AiDotNet.Tensors/commit/91d10b6a70f20578333a3cbbb7b40e47decdc592))
+
+
+### Performance
+
+* **#1141 phase 1:** tiled fused CUDA attention for SDPA and MultiHeadAttentionCore -- 11-35x faster, near PyTorch ([#1159](https://github.com/ooples/AiDotNet.Tensors/issues/1159)) ([2ce4420](https://github.com/ooples/AiDotNet.Tensors/commit/2ce442044065d0a1ea71221fd1e5c553743dee79))
+* **#1141 phase 2:** fused CUDA attention backward with atomic dQ (deterministic two-pass under DeterministicReductions) ([#1182](https://github.com/ooples/AiDotNet.Tensors/issues/1182)) ([26f3121](https://github.com/ooples/AiDotNet.Tensors/commit/26f3121a254132935a36b22ec9d5f1ddaee6e927))
+* **#1150:** split a GPU full ReduceSum across blocks -- 37.8 ms to 0.24 ms for 33.5M floats, on par with PyTorch ([#1153](https://github.com/ooples/AiDotNet.Tensors/issues/1153)) ([d2a86ae](https://github.com/ooples/AiDotNet.Tensors/commit/d2a86ae9526b0c10b34b182b458ad0bc8c46ab6c))
+* **#1157:** SumAxis takes a work-group per long row and splits few long rows on OpenCL, HIP, Metal and WebGPU ([#1209](https://github.com/ooples/AiDotNet.Tensors/issues/1209)) ([3e9dc2c](https://github.com/ooples/AiDotNet.Tensors/commit/3e9dc2c3f4ee16ef0c75c87ae36f2c8686739483))
+* **#1164:** Vulkan max pooling without indices is 9-19x faster (no per-call placeholder buffer) ([#1166](https://github.com/ooples/AiDotNet.Tensors/issues/1166)) ([11b2967](https://github.com/ooples/AiDotNet.Tensors/commit/11b2967e973de610ee14dba22e25698f3907e1bd))
+* **#1169:** Vulkan device-buffer pool (allocation 0.7-6 ms -&gt; under 1 µs; ops that allocate their result 11-52x faster) ([#1170](https://github.com/ooples/AiDotNet.Tensors/issues/1170)) ([02b9bd2](https://github.com/ooples/AiDotNet.Tensors/commit/02b9bd28170dab5c02ba921472d3c41143df756f))
+* **#1176:** Vulkan pipeline lookup without hashing the shader source (2-4 µs -&gt; ~50 ns per op) ([#1177](https://github.com/ooples/AiDotNet.Tensors/issues/1177)) ([37d1fbd](https://github.com/ooples/AiDotNet.Tensors/commit/37d1fbd1b779572e3714520700b282cce5ddb5ba))
+* **#1183:** collect on a Vulkan pool miss when no tape is open (cold stretch ~2,000 -&gt; ~256 allocations) ([#1185](https://github.com/ooples/AiDotNet.Tensors/issues/1185)) ([cbc0054](https://github.com/ooples/AiDotNet.Tensors/commit/cbc0054310a6e5f3777142c726eb4508b36a64de))
+* **#1188:** Vulkan 256-lane row variants (6-9x on 4,096-column rows), RTX 3080 profile, device-clock gate timing ([#1189](https://github.com/ooples/AiDotNet.Tensors/issues/1189)) ([0c85149](https://github.com/ooples/AiDotNet.Tensors/commit/0c851494769905101adbbdc0b2172e2f093337d6))
+* **#1190:** a pending Vulkan dispatch keeps its own descriptor set (batches no longer flush when a kernel repeats) ([#1193](https://github.com/ooples/AiDotNet.Tensors/issues/1193)) ([bd929b5](https://github.com/ooples/AiDotNet.Tensors/commit/bd929b525e73e83c02471f80c171e0c7b1360c5d))
+* **#1191:** Vulkan dispatches are submitted without waiting (small-op chains 107 -&gt; 35 µs per op) ([#1214](https://github.com/ooples/AiDotNet.Tensors/issues/1214)) ([659acc9](https://github.com/ooples/AiDotNet.Tensors/commit/659acc93dc05e9ed04057cec97cb16f59221e615))
+* **#1198:** Vulkan full-tensor sum 1,338 ms -&gt; 0.5 ms for 33.5M floats (long rows split across workgroups) ([#1201](https://github.com/ooples/AiDotNet.Tensors/issues/1201)) ([394e072](https://github.com/ooples/AiDotNet.Tensors/commit/394e0727b9ee7831382f2c2ff9c17cf9e61a31fd))
+* **#475:** MLP layers dispatch the parallel managed GEMM (AIsEval MLP 1.5 ms -&gt; 0.23 ms, torch 0.33 ms) ([#1210](https://github.com/ooples/AiDotNet.Tensors/issues/1210)) ([5f50e27](https://github.com/ooples/AiDotNet.Tensors/commit/5f50e2777796e6f77a6e9620c618aec0f8f44bd2)), closes [#475](https://github.com/ooples/AiDotNet.Tensors/issues/475)
+* **#639:** float depthwise conv and direct pointwise gradients -- every MobileNetV3 conv phase beats PyTorch on CPU ([#1140](https://github.com/ooples/AiDotNet.Tensors/issues/1140)) ([7af33e1](https://github.com/ooples/AiDotNet.Tensors/commit/7af33e10d2e7898ff4557021038337bc5797226a))
+* **#653 phase 2:** fan out broadcast, reductions, ELU, Concat and strided copies -- bit-identical at any DOP ([#1137](https://github.com/ooples/AiDotNet.Tensors/issues/1137)) ([78b68de](https://github.com/ooples/AiDotNet.Tensors/commit/78b68dec4c485989dea9a2289f829ff68d1aed26))
+* **#653 phase 3:** fan out norm backward and CPU attention across cores, bit-identical at any thread count ([#1178](https://github.com/ooples/AiDotNet.Tensors/issues/1178)) ([36b49ff](https://github.com/ooples/AiDotNet.Tensors/commit/36b49ffb622216c48b174c2f038352ac0f374cb4))
+* **alloc:** recycle undisposed large result buffers (tracked owners, escape flag, leases) ([#1118](https://github.com/ooples/AiDotNet.Tensors/issues/1118)) ([0eb9c9b](https://github.com/ooples/AiDotNet.Tensors/commit/0eb9c9b7244c5810136a1ee274b0ff66bff29506))
+* **cpu:** run the float elementwise dispatchers on every platform ([#1130](https://github.com/ooples/AiDotNet.Tensors/issues/1130)) ([8f2cc99](https://github.com/ooples/AiDotNet.Tensors/commit/8f2cc999ed6f218a8ff9346f94f4b788e897ba9c))
+* **cuda:** one-launch last-axis slices and no zero-fill on fully written outputs -- transformer step 0.7x PyTorch ([#1138](https://github.com/ooples/AiDotNet.Tensors/issues/1138)) ([2b3c718](https://github.com/ooples/AiDotNet.Tensors/commit/2b3c718f66fe2f87453babd62342f6fa3c6609f5))
+* **vulkan:** fused two-vector Meshgrid2D for the admitted shapes ([#1152](https://github.com/ooples/AiDotNet.Tensors/issues/1152)) ([7399786](https://github.com/ooples/AiDotNet.Tensors/commit/73997865df856a623ffe78185efc288e160e6baf))
+
 ## [0.135.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.4...v0.135.0) (2026-10-10)
 
 

@@ -806,6 +806,11 @@ class Program
             return;
         }
 
+        if (args[0] == "--ab-mlp-gemm")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.MlpGemmSweep.Run();
+            return;
+        }
         if (args[0] == "--ab-aiseval-floor")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.RawGemmFloor();
@@ -1390,10 +1395,49 @@ class Program
             return;
         }
 
+#if NET7_0_OR_GREATER
+        // WebGPU fused Meshgrid2D against the composed route, on Dawn (#924)
+        if (args[0] == "--webgpu-meshgrid2d-dawn")
+        {
+            Environment.ExitCode = WebGpuMeshgrid2DDawnExperiment.Run();
+            return;
+        }
+#endif
+
         // Vulkan fused Meshgrid2D against the composed route (#923)
         if (args[0] == "--vulkan-meshgrid2d")
         {
             Environment.ExitCode = VulkanMeshgrid2DExperiment.Run();
+            return;
+        }
+
+        // Per-call cost of the Vulkan ops with an optional operand when it is left out (max pooling without indices)
+        if (args[0] == "--vulkan-optional-binding")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
+            foreach (var (b, c, hw) in new[] { (1, 16, 32), (8, 64, 56), (32, 64, 112) })
+            {
+                int o = hw / 2, total = b * c * o * o;
+                using var x = vb.AllocateBuffer(new float[b * c * hw * hw]);
+                using var y = vb.AllocateBuffer(total);
+                using var idx = vb.AllocateIntBuffer(total);
+                double Time(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer? indices)
+                {
+                    for (int i = 0; i < 200; i++) vb.MaxPool2D(x, y, indices, b, c, hw, hw, o, o, 2, 2, 2, 2, 0, 0);
+                    var samples = new double[9];
+                    for (int s = 0; s < samples.Length; s++)
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < 300; i++) vb.MaxPool2D(x, y, indices, b, c, hw, hw, o, o, 2, 2, 2, 2, 0, 0);
+                        samples[s] = sw.Elapsed.TotalMilliseconds * 1000 / 300;
+                    }
+                    Array.Sort(samples);
+                    return samples[samples.Length / 2];
+                }
+                double without = Time(null), with = Time(idx), without2 = Time(null);
+                Console.WriteLine($"MAXPOOL2D [{b},{c},{hw},{hw}] out={total} no-indices={without:F1}us with-indices={with:F1}us no-indices(again)={without2:F1}us");
+            }
             return;
         }
 
@@ -1442,7 +1486,7 @@ class Program
         if (args[0] == "--vulkan-result-lifetime")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
             var a = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
             var b = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 64, 64 });
@@ -1482,7 +1526,7 @@ class Program
             if (Environment.GetEnvironmentVariable("VKENGINE_NO_MISS_COLLECT") == "1")
                 AiDotNet.Tensors.Engines.DirectGpu.DeviceMemoryReclaim.TapeOpen = () => true;
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             AiDotNet.Tensors.Engines.IEngine eng = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(vb));
             foreach (int n in new[] { 64, 1024 })
             {
@@ -1530,7 +1574,7 @@ class Program
         if (args[0] == "--vulkan-alloc")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             static double Median(Func<double> sample)
             {
                 var samples = new double[9];
@@ -1564,6 +1608,13 @@ class Program
                 });
                 Console.WriteLine($"VKALLOC n={n} allocate+free={alloc:F1}us abs-into-new-buffer={opFresh:F1}us abs-into-reused-buffer={opReused:F1}us");
             }
+            return;
+        }
+
+        // Run the tuned-kernel registry gate on the Vulkan device and export a shippable profile
+        if (args[0] == "--vulkan-tuned-profile")
+        {
+            VulkanTunedProfileExperiment.Run(args.Skip(1).ToArray());
             return;
         }
 
@@ -1605,13 +1656,71 @@ class Program
             return;
         }
 
+        // Vulkan dispatches submitted without waiting against submit-and-wait (#1191)
+        if (args[0] == "--vulkan-submit")
+        {
+            var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.ModeOverride =
+                AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelMode.Off;
+            foreach (var (rows, cols) in new[] { (64, 64), (256, 256), (1024, 1024) })
+            {
+                int n = rows * cols;
+                var data = new float[n];
+                var rng = new Random(5);
+                for (int i = 0; i < n; i++) data[i] = (float)rng.NextDouble();
+                using var a = vb.AllocateBuffer(data);
+                using var b = vb.AllocateBuffer(n);
+                // chain: `ops` softmax calls ping-ponging between two buffers, then one wait for all of them
+                // read:  the same calls, each followed by a download of its 1-row result (a host read per op)
+                var device = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.Instance;
+                // arm 0: submit and wait per op; arm 1: submit per op without waiting; arm 2: coalesced (the default)
+                double Median(int arm, int ops, bool readEach)
+                {
+                    vb.SubmitsWithoutWaiting = arm != 0;
+                    device.CoalescedDispatchLimit = arm == 1 ? 1 : AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.MaxCoalescedDispatches;
+                    var samples = new double[9];
+                    for (int s = -2; s < samples.Length; s++)
+                    {
+                        vb.Synchronize();
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int i = 0; i < ops; i++)
+                        {
+                            if ((i & 1) == 0) vb.Softmax(a, b, rows, cols); else vb.Softmax(b, a, rows, cols);
+                            if (readEach) vb.Sum(b, 16);
+                        }
+                        vb.Synchronize();
+                        if (s >= 0) samples[s] = sw.Elapsed.TotalMilliseconds * 1000 / ops;
+                    }
+                    Array.Sort(samples);
+                    return samples[4];
+                }
+                foreach (int ops in new[] { 1, 8, 64 })
+                {
+                    // Interleaved: waited, per-op, coalesced, twice.
+                    double w1 = Median(0, ops, false), d1 = Median(1, ops, false), c1 = Median(2, ops, false);
+                    double w2 = Median(0, ops, false), d2 = Median(1, ops, false), c2 = Median(2, ops, false);
+                    Console.WriteLine($"VKSUBMIT {rows}x{cols} chain of {ops}: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/op, submitted per op {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/op, coalesced {Math.Min(c1, c2):F1}-{Math.Max(c1, c2):F1} us/op");
+                }
+                {
+                    double w1 = Median(0, 16, true), d1 = Median(1, 16, true), c1 = Median(2, 16, true);
+                    double w2 = Median(0, 16, true), d2 = Median(1, 16, true), c2 = Median(2, 16, true);
+                    Console.WriteLine($"VKSUBMIT {rows}x{cols} op + host read, 16 times: waited {Math.Min(w1, w2):F1}-{Math.Max(w1, w2):F1} us/pair, submitted per op {Math.Min(d1, d2):F1}-{Math.Max(d1, d2):F1} us/pair, coalesced {Math.Min(c1, c2):F1}-{Math.Max(c1, c2):F1} us/pair");
+                }
+                device.CoalescedDispatchLimit = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanDevice.MaxCoalescedDispatches;
+            }
+            vb.SubmitsWithoutWaiting = true;
+            return;
+        }
+
         // Cost of finding an already-built Vulkan pipeline, which every dispatch pays
         if (args[0] == "--vulkan-pipeline-lookup")
         {
             var vb = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); return; }
+            if (!vb.Initialize()) { Console.WriteLine("No Vulkan device."); Environment.ExitCode = 1; return; }
             var method = typeof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend).GetMethod("GetOrCreateGlslPipeline",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                ?? throw new MissingMethodException(nameof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend), "GetOrCreateGlslPipeline");
             var lookup = (Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>)Delegate.CreateDelegate(
                 typeof(Func<string, int, uint, AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanComputePipeline?>), vb, method);
             foreach (var (name, get, bindings, push) in new (string, Func<string>, int, uint)[]
@@ -2067,7 +2176,9 @@ class Program
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
         Console.WriteLine("  --vulkan   : Run Vulkan backend diagnostics and bottleneck analysis");
+        Console.WriteLine("  --vulkan-tuned-profile [out.json] [rounds] : Tune the Vulkan kernel registry and export a profile");
         Console.WriteLine("  --vulkan-meshgrid2d : Time the Vulkan fused Meshgrid2D route against the composed route");
+        Console.WriteLine("  --webgpu-meshgrid2d-dawn : Time WebGPU's fused Meshgrid2D against the composed route on Dawn");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");
         Console.WriteLine("  --webgpu   : Run WebGPU backend diagnostics (browser GPU compute)");
         Console.WriteLine("  --memory   : Run GPU memory transfer diagnostics");

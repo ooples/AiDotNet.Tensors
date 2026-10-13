@@ -27,6 +27,21 @@ fn bx_hash(counter: u32, key: u32) -> u32 {
 }
 // Built at run time: an infinite constant expression is a shader-creation error.
 fn bx_inf() -> f32 { let bits = 0x7f800000u; return bitcast<f32>(bits); }
+// tanh built on exp, not the device's own: a shading language's tanh may carry a large error, and one D3D12 driver's
+// is off by up to 7.7e-6 (130 ulp), which 1 - tanh^2 in the LSTM backward amplifies (#1220). The same driver's exp is
+// within 8 ulp. Below 0.25 the Maclaurin series is used (truncation under 1e-10), so small arguments keep their
+// relative accuracy; above it (1 - e^-2|x|) / (1 + e^-2|x|).
+fn bx_tanh(x: f32) -> f32 {
+    let a = abs(x);
+    if (a < 0.25) {
+        let u = x * x;
+        return x * (1.0 + u * (-0.33333334 + u * (0.13333334 + u * (-0.053968254 + u * (0.021869488 + u * -0.0088632355)))));
+    }
+    let e = exp(-2.0 * a);
+    let r = (1.0 - e) / (1.0 + e);
+    if (x < 0.0) { return -r; }
+    return r;
+}
 fn bx_unit(h: u32) -> f32 { return f32(h >> 8u) * (1.0 / 16777216.0); }
 // (a * b) mod m in 32 bits; a, b < m <= 2^30.
 fn bx_mulmod(a0: u32, b0: u32, m: u32) -> u32 {
@@ -228,7 +243,7 @@ var<workgroup> scratch: array<f32, 256>;
     var act = 0.0; var dact = 0.0;
     if (p.mode == 0) { let s = 1.0 / (1.0 + exp(-g)); act = s; dact = s * (1.0 - s); }
     else if (p.mode == 1) {
-        let t = tanh(0.7978845608 * (g + 0.044715 * g * g * g));
+        let t = bx_tanh(0.7978845608 * (g + 0.044715 * g * g * g));
         act = 0.5 * g * (1.0 + t);
         dact = 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * 0.7978845608 * (1.0 + 0.134145 * g * g);
     }
@@ -423,6 +438,31 @@ var<workgroup> scratch: array<f32, 256>;
     aIm[i] = xr * yi + xi * yr;
 }");
 
+    // Batched radix-2 FFT (#965): the bit-reversal permute, scaled for the inverse, then one butterfly stage per span.
+    public static readonly string FftBitReverse = Shader(new[] { "r:inRe", "r:inIm", "rw:outRe", "rw:outIm" },
+        "batch: i32, n: i32, log2n: i32, scale: f32", Main + @"
+    if (i >= p.batch * p.n) { return; }
+    let b = i / p.n;
+    var k = u32(i % p.n);
+    var r = 0u;
+    for (var bit = 0; bit < p.log2n; bit++) { r = (r << 1u) | (k & 1u); k = k >> 1u; }
+    outRe[b * p.n + i32(r)] = inRe[i] * p.scale;
+    outIm[b * p.n + i32(r)] = inIm[i] * p.scale;
+}");
+
+    public static readonly string FftButterfly = Shader(new[] { "rw:re", "rw:im" }, "batch: i32, n: i32, span: i32, inverse: i32", Main + @"
+    let pairs = p.n / 2;
+    if (i >= p.batch * pairs) { return; }
+    let b = i / pairs; let j = i % pairs; let pos = j % p.span;
+    let i0 = b * p.n + (j / p.span) * 2 * p.span + pos; let i1 = i0 + p.span;
+    let a = select(-3.14159265358979323846, 3.14159265358979323846, p.inverse != 0) * f32(pos) / f32(p.span);
+    let wr = cos(a); let wi = sin(a);
+    let xr = re[i1]; let xi = im[i1];
+    let tr = wr * xr - wi * xi; let ti = wr * xi + wi * xr;
+    let ur = re[i0]; let ui = im[i0];
+    re[i0] = ur + tr; im[i0] = ui + ti;
+    re[i1] = ur - tr; im[i1] = ui - ti;
+}");
     public static readonly string FftBluesteinPost = Shader(new[] { "r:padRe", "r:padIm", "r:chirpRe", "r:chirpIm", "rw:re", "rw:im" },
         "batch: i32, n: i32, m: i32, scale: f32", Main + @"
     if (i >= p.batch * p.n) { return; }
@@ -774,13 +814,15 @@ fn la_lu(w: ptr<function, array<f32, 64>>, pv: ptr<function, array<i32, 8>>, n: 
 }");
     // #1179 fused attention: line-for-line ports of BatchExecutionCudaKernels.AttentionSource (WGSL reserves "meta",
     // hence "fam" for the metadata buffer on every port). -inf is tested on its bits, since WGSL lets an implementation
-    // assume floats are finite.
+    // assume floats are finite. No kernel binds more than 8 storage buffers, WebGPU's guaranteed per-stage limit.
     private const string FaLoad = @"
-struct Fa { H: i32, Sq: i32, Sk: i32, D: i32, qb: i32, qh: i32, qr: i32, kb: i32, kh: i32, kr: i32, vb: i32, vh: i32,
-    vr: i32, ob: i32, oh: i32, orw: i32, mb: i32, mh: i32, mi: i32, mj: i32, causal: i32, coff: i32, hasMask: i32 }
+struct Fa { B: i32, H: i32, Sq: i32, Sk: i32, D: i32, qb: i32, qh: i32, qr: i32, kb: i32, kh: i32, kr: i32, vb: i32,
+    vh: i32, vr: i32, ob: i32, oh: i32, orw: i32, mb: i32, mh: i32, mi: i32, mj: i32, causal: i32, coff: i32,
+    hasMask: i32, scale: f32, cap: f32 }
 fn fa_load() -> Fa {
-    return Fa(fam[1], fam[2], fam[3], fam[4], fam[5], fam[6], fam[7], fam[8], fam[9], fam[10], fam[11], fam[12], fam[13],
-        fam[14], fam[15], fam[16], fam[17], fam[18], fam[19], fam[20], fam[21], fam[22], fam[23]);
+    return Fa(fam[0], fam[1], fam[2], fam[3], fam[4], fam[5], fam[6], fam[7], fam[8], fam[9], fam[10], fam[11], fam[12],
+        fam[13], fam[14], fam[15], fam[16], fam[17], fam[18], fam[19], fam[20], fam[21], fam[22], fam[23],
+        bitcast<f32>(fam[24]), bitcast<f32>(fam[25]));
 }
 fn fa_neg_inf() -> f32 { let bits = 0xff800000u; return bitcast<f32>(bits); }
 fn fa_has_keys(lr: f32) -> bool { return bitcast<u32>(lr) != 0xff800000u; }
@@ -794,10 +836,9 @@ fn fa_allowed(f: Fa, b: i32, h: i32, i: i32, j: i32) -> bool {
 }
 // The capped score and d(capped) / d(raw).
 fn fa_score(f: Fa, b: i32, h: i32, i: i32, j: i32) -> vec2<f32> {
-    let scale = fp[0]; let cap = fp[1];
     var s = 0.0;
-    for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
-    if (cap > 0.0) { let t = tanh(s / cap); return vec2<f32>(cap * t, 1.0 - t * t); }
+    for (var d = 0; d < f.D; d++) { s += (q[b * f.qb + h * f.qh + i * f.qr + d] * f.scale) * k[b * f.kb + h * f.kh + j * f.kr + d]; }
+    if (f.cap > 0.0) { let t = bx_tanh(s / f.cap); return vec2<f32>(f.cap * t, 1.0 - t * t); }
     return vec2<f32>(s, 1.0);
 }
 ";
@@ -810,7 +851,7 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
 }
 ";
 
-    public static readonly string FaLse = Shader(new[] { "r:q", "r:k", "r:fam:i32", "r:fp", "r:mask:i32", "rw:lse" }, "total: i32",
+    public static readonly string FaLse = Shader(new[] { "r:q", "r:k", "r:fam:i32", "r:mask:i32", "rw:lse" }, "total: i32",
         FaLoad + FaScore + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
@@ -831,7 +872,7 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     lse[i] = m + log(l);
 }");
 
-    public static readonly string FaOut = Shader(new[] { "r:q", "r:k", "r:v", "r:fam:i32", "r:fp", "r:mask:i32", "r:lse", "rw:o" },
+    public static readonly string FaOut = Shader(new[] { "r:q", "r:k", "r:v", "r:fam:i32", "r:mask:i32", "r:lse", "rw:o" },
         "total: i32", FaLoad + FaScore + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
@@ -846,51 +887,197 @@ fn fa_dp(f: Fa, b: i32, h: i32, i: i32, j: i32) -> f32 {
     o[b * f.ob + h * f.oh + qi * f.orw + e] = acc;
 }");
 
-    public static readonly string FaDelta = Shader(new[] { "r:o", "r:dout", "r:fam:i32", "rw:delta" }, "total: i32", FaLoad + Main + @"
+    public static readonly string FaDelta = Shader(new[] { "r:o", "r:dout", "r:fam:i32", "rw:st" }, "total: i32", FaLoad + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
     let qi = i % f.Sq; let bh = i / f.Sq; let b = bh / f.H; let h = bh % f.H;
     var acc = 0.0;
     for (var e = 0; e < f.D; e++) { acc += dout[b * f.ob + h * f.oh + qi * f.orw + e] * o[b * f.ob + h * f.oh + qi * f.orw + e]; }
-    delta[i] = acc;
+    st[p.total + i] = acc;
 }");
 
     public static readonly string FaDq = Shader(
-        new[] { "r:q", "r:k", "r:v", "r:dout", "r:lse", "r:delta", "r:fam:i32", "r:fp", "r:mask:i32", "rw:dq" }, "total: i32",
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dq" }, "total: i32",
         FaLoad + FaScore + FaDp + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
+    let rows = f.B * f.H * f.Sq;
     let e = i % f.D; let r = i / f.D; let qi = r % f.Sq; let bh = r / f.Sq; let b = bh / f.H; let h = bh % f.H;
-    let lr = lse[r]; var acc = 0.0;
+    let lr = st[r]; var acc = 0.0;
     if (fa_has_keys(lr)) {
-        let dl = delta[r];
+        let dl = st[rows + r];
         for (var j = 0; j < f.Sk; j++) {
             if (!fa_allowed(f, b, h, qi, j)) { continue; }
             let s = fa_score(f, b, h, qi, j);
             acc += exp(s.x - lr) * (fa_dp(f, b, h, qi, j) - dl) * s.y * k[b * f.kb + h * f.kh + j * f.kr + e];
         }
     }
-    dq[b * f.qb + h * f.qh + qi * f.qr + e] = acc * fp[0];
+    dq[b * f.qb + h * f.qh + qi * f.qr + e] = acc * f.scale;
 }");
 
-    public static readonly string FaDkv = Shader(
-        new[] { "r:q", "r:k", "r:v", "r:dout", "r:lse", "r:delta", "r:fam:i32", "r:fp", "r:mask:i32", "rw:dk", "rw:dv" },
-        "total: i32", FaLoad + FaScore + FaDp + Main + @"
+    public static readonly string FaDk = Shader(
+        new[] { "r:q", "r:k", "r:v", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dk" }, "total: i32",
+        FaLoad + FaScore + FaDp + Main + @"
+    if (i >= p.total) { return; }
+    let f = fa_load();
+    let rows = f.B * f.H * f.Sq;
+    let e = i % f.D; let r = i / f.D; let j = r % f.Sk; let bh = r / f.Sk; let b = bh / f.H; let h = bh % f.H;
+    var ak = 0.0;
+    for (var qi = 0; qi < f.Sq; qi++) {
+        let lr = st[bh * f.Sq + qi];
+        if (!fa_has_keys(lr) || !fa_allowed(f, b, h, qi, j)) { continue; }
+        let s = fa_score(f, b, h, qi, j);
+        ak += exp(s.x - lr) * (fa_dp(f, b, h, qi, j) - st[rows + bh * f.Sq + qi]) * s.y * q[b * f.qb + h * f.qh + qi * f.qr + e] * f.scale;
+    }
+    dk[b * f.kb + h * f.kh + j * f.kr + e] = ak;
+}");
+
+    public static readonly string FaDv = Shader(
+        new[] { "r:q", "r:k", "r:dout", "r:st", "r:fam:i32", "r:mask:i32", "rw:dv" }, "total: i32",
+        FaLoad + FaScore + Main + @"
     if (i >= p.total) { return; }
     let f = fa_load();
     let e = i % f.D; let r = i / f.D; let j = r % f.Sk; let bh = r / f.Sk; let b = bh / f.H; let h = bh % f.H;
-    var ak = 0.0; var av = 0.0;
+    var av = 0.0;
     for (var qi = 0; qi < f.Sq; qi++) {
-        let lr = lse[bh * f.Sq + qi];
+        let lr = st[bh * f.Sq + qi];
         if (!fa_has_keys(lr) || !fa_allowed(f, b, h, qi, j)) { continue; }
-        let s = fa_score(f, b, h, qi, j);
-        let pr = exp(s.x - lr);
-        av += pr * dout[b * f.ob + h * f.oh + qi * f.orw + e];
-        ak += pr * (fa_dp(f, b, h, qi, j) - delta[bh * f.Sq + qi]) * s.y * q[b * f.qb + h * f.qh + qi * f.qr + e] * fp[0];
+        av += exp(fa_score(f, b, h, qi, j).x - lr) * dout[b * f.ob + h * f.oh + qi * f.orw + e];
     }
-    dk[b * f.kb + h * f.kh + j * f.kr + e] = ak;
     dv[b * f.vb + h * f.vh + j * f.vr + e] = av;
 }");
+
+    // #974 fused decode-linear: line-for-line ports of BatchExecutionCudaKernels.DecodeLinearSource. dl_half is the
+    // DL_HALF macro: one FP16 value widened to f32 on its bit pattern (zero, subnormals, infinity and NaN included).
+    private const string DlCommon = @"
+fn dl_gelu(s: f32) -> f32 { return 0.5 * s * (1.0 + bx_tanh(0.7978845608028654 * (s + 0.044715 * s * s * s))); }
+";
+
+    private const string DlHalf = @"
+fn dl_half(word: i32, slot: i32) -> f32 {
+    let b = (word >> (u32(slot) * 16u)) & 65535;
+    let e = (b >> 10u) & 31;
+    let m = b & 1023;
+    var v = 0.0;
+    if (e == 0) {
+        v = f32(m) * 5.9604644775390625e-8;
+    } else {
+        let exponent = select(e + 112, 255, e == 31);
+        v = bitcast<f32>((exponent << 23u) | (m << 13u));
+    }
+    if ((b & 32768) != 0) { v = -v; }
+    return v;
+}
+";
+
+    public static readonly string DlLinearGelu = Shader(new[] { "r:x", "r:w", "r:bias", "rw:y" }, "M: i32, K: i32, N: i32",
+        DlCommon + Main + @"
+    let K = p.K; let N = p.N;
+    if (i >= p.M * N) { return; }
+    let m = i / N; let n = i - m * N;
+    var s = 0.0;
+    for (var k = 0; k < K; k++) { s += x[m * K + k] * w[n * K + k]; }
+    s += bias[n];
+    y[i] = dl_gelu(s);
+}");
+
+    public static readonly string DlLinearGeluFp16 = Shader(new[] { "r:xh:i32", "r:wh:i32", "r:bias", "rw:y" }, "M: i32, K: i32, N: i32",
+        DlCommon + DlHalf + Main + @"
+    let K = p.K; let N = p.N;
+    if (i >= p.M * N) { return; }
+    let m = i / N; let n = i - m * N;
+    var s = 0.0;
+    for (var k = 0; k < K; k++) {
+        let xi = m * K + k; let wi = n * K + k;
+        s += dl_half(xh[xi >> 1u], xi & 1) * dl_half(wh[wi >> 1u], wi & 1);
+    }
+    s += bias[n];
+    y[i] = dl_gelu(s);
+}");
+
+    // #682 direct FP16 convolution: a line-for-line port of BatchExecutionCudaKernels.DirectConvSource.
+    // dc_round_half is the DC_ROUND_HALF macro: the value a float has after rounding to FP16, ties to even, on its
+    // bit pattern.
+    private const string DcRoundHalf = @"
+fn dc_round_half(bits: i32) -> f32 {
+    var mag = bits & 2147483647;
+    let e = mag >> 23u;
+    var v = 0.0;
+    if (e == 255) {
+        v = bitcast<f32>(mag);
+    } else {
+        if (e < 113) {
+            var q = 0;
+            let s = 126 - e;
+            if (e != 0 && s <= 24) {
+                let whole = (mag & 8388607) | 8388608;
+                q = whole >> u32(s);
+                let rem = whole - (q << u32(s));
+                let tie = 1 << u32(s - 1);
+                if (rem > tie || (rem == tie && (q & 1) != 0)) { q = q + 1; }
+            }
+            v = f32(q) * 5.9604644775390625e-8;
+        } else {
+            mag = mag + 4095 + ((mag >> 13u) & 1);
+            mag = (mag >> 13u) << 13u;
+            if (mag >= 1199570944) { mag = 2139095040; }
+            v = bitcast<f32>(mag);
+        }
+    }
+    if (bits < 0) { v = -v; }
+    return v;
+}
+";
+
+    public static readonly string DcConv2dDirectFp16Hw = Shader(new[] { "r:inBits:i32", "r:wh:i32", "rw:y" },
+        "batch: i32, inC: i32, inH: i32, inW: i32, outC: i32, outH: i32, outW: i32, kH: i32, kW: i32, sH: i32, sW: i32, pH: i32, pW: i32, dH: i32, dW: i32",
+        DlHalf + DcRoundHalf + Main + @"
+    if (i >= p.batch * p.outC * p.outH * p.outW) { return; }
+    let r1 = i / p.outW; let ow = i - r1 * p.outW;
+    let r2 = r1 / p.outH; let oh = r1 - r2 * p.outH;
+    let b = r2 / p.outC; let oc = r2 - b * p.outC;
+    var acc = 0.0;
+    for (var ic = 0; ic < p.inC; ic++) {
+        for (var kh = 0; kh < p.kH; kh++) {
+            let ih = oh * p.sH - p.pH + kh * p.dH;
+            if (ih >= 0 && ih < p.inH) {
+                for (var kw = 0; kw < p.kW; kw++) {
+                    let iw = ow * p.sW - p.pW + kw * p.dW;
+                    if (iw >= 0 && iw < p.inW) {
+                        let wi = ((oc * p.inC + ic) * p.kH + kh) * p.kW + kw;
+                        acc += dc_round_half(inBits[((b * p.inC + ic) * p.inH + ih) * p.inW + iw]) * dl_half(wh[wi >> 1u], wi & 1);
+                    }
+                }
+            }
+        }
+    }
+    y[i] = acc;
+}");
+
+    public static readonly string DlW8A8LinearGelu = Shader(
+        new[] { "r:x8:i32", "r:w8:i32", "r:actScale", "r:wScales", "r:bias", "rw:y" }, "K: i32, N: i32", DlCommon + Main + @"
+    let K = p.K;
+    if (i >= p.N) { return; }
+    var total = 0;
+    for (var k = 0; k < K; k++) {
+        var xi = (x8[k >> 2u] >> (u32(k & 3) * 8u)) & 255;
+        if (xi > 127) { xi -= 256; }
+        let j = i * K + k;
+        var wi = (w8[j >> 2u] >> (u32(j & 3) * 8u)) & 255;
+        if (wi > 127) { wi -= 256; }
+        total += xi * wi;
+    }
+    let s = f32(total) * actScale[0] * wScales[i] + bias[i];
+    y[i] = dl_gelu(s);
+}");
+
+    public static readonly string DlW8A8Epilogue = Shader(
+        new[] { "r:acc:i32", "r:actScale", "r:wScales", "r:bias", "rw:y" }, "N: i32", DlCommon + Main + @"
+    if (i >= p.N) { return; }
+    let s = f32(acc[i]) * actScale[0] * wScales[i] + bias[i];
+    y[i] = dl_gelu(s);
+}");
+
     // #1107 / #1108 fused LSTM: line-for-line ports of BatchExecutionCudaKernels.LstmSource.
     private const string LstmSig = @"
 fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
@@ -905,7 +1092,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     var s = bih[row] + bhh[row];
     for (var k = 0; k < In; k++) { s += wih[row * In + k] * x[(b * p.T + p.t) * In + k]; }
     for (var j = 0; j < H; j++) { s += whh[row * H + j] * allH[(p.t * B + b) * H + j]; }
-    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), tanh(s), row / H == 2);
+    gates[(p.t * B + b) * 4 * H + row] = select(lstm_sig(s), bx_tanh(s), row / H == 2);
 }");
 
     public static readonly string LstmCell = Shader(
@@ -915,7 +1102,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     let b = i / H; let h = i - b * H;
     let gb = (t * B + b) * 4 * H;
     let c = gates[gb + H + h] * allC[(t * B + b) * H + h] + gates[gb + h] * gates[gb + 2 * H + h];
-    let hv = gates[gb + 3 * H + h] * tanh(c);
+    let hv = gates[gb + 3 * H + h] * bx_tanh(c);
     allC[((t + 1) * B + b) * H + h] = c;
     allH[((t + 1) * B + b) * H + h] = hv;
     y[(b * p.T + t) * H + h] = hv;
@@ -928,7 +1115,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     let b = i / H; let h = i - b * H;
     let gb = (t * B + b) * 4 * H;
     let ig = gates[gb + h]; let fg = gates[gb + H + h]; let gg = gates[gb + 2 * H + h]; let og = gates[gb + 3 * H + h];
-    let tc = tanh(allC[((t + 1) * B + b) * H + h]);
+    let tc = bx_tanh(allC[((t + 1) * B + b) * H + h]);
     let dhv = gy[(b * p.T + t) * H + h] + dh[i];
     let dcv = dhv * og * (1.0 - tc * tc) + dc[i];
     dpre[gb + h] = dcv * gg * ig * (1.0 - ig);
@@ -1011,7 +1198,7 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         ["bx_gaussian_noise"] = GaussianNoise, ["bx_gumbel_softmax"] = GumbelSoftmax,
         ["bx_batch_outer_product"] = BatchOuterProduct, ["bx_meshgrid2d"] = Meshgrid2D,
         ["bx_fft_chirp"] = FftChirp, ["bx_fft_bluestein_pre"] = FftBluesteinPre, ["bx_fft_cmul"] = FftCmul,
-        ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
+        ["bx_fft_bluestein_post"] = FftBluesteinPost, ["bx_fft_bit_reverse"] = FftBitReverse, ["bx_fft_butterfly"] = FftButterfly, ["bx_fft_to_storage"] = FftToStorage, ["bx_fft_from_storage"] = FftFromStorage,
         [BatchExecutionCudaKernels.LaSymmetrize] = LaSymmetrize, [BatchExecutionCudaKernels.LaLuSolve] = LaLuSolve,
         [BatchExecutionCudaKernels.LaLdlFactor] = LaLdlFactor, [BatchExecutionCudaKernels.LaLdlSolve] = LaLdlSolve,
         [BatchExecutionCudaKernels.LaSolveVector] = LaSolveVector, [BatchExecutionCudaKernels.LaTriangularSolveVector] = LaTriangularSolveVector,
@@ -1019,11 +1206,14 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.LaSolveBackwardVector] = LaSolveBackwardVector, [BatchExecutionCudaKernels.LaSvdReduced] = LaSvdReduced,
         [BatchExecutionCudaKernels.LaQrReduced] = LaQrReduced,
         [BatchExecutionCudaKernels.FaLse] = FaLse, [BatchExecutionCudaKernels.FaOut] = FaOut, [BatchExecutionCudaKernels.FaDelta] = FaDelta,
-        [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDkv] = FaDkv,
+        [BatchExecutionCudaKernels.FaDq] = FaDq, [BatchExecutionCudaKernels.FaDk] = FaDk, [BatchExecutionCudaKernels.FaDv] = FaDv,
         [BatchExecutionCudaKernels.LstmGates] = LstmGates, [BatchExecutionCudaKernels.LstmCell] = LstmCell,
         [BatchExecutionCudaKernels.LstmCellBackward] = LstmCellBackward, [BatchExecutionCudaKernels.LstmHiddenBackward] = LstmHiddenBackward,
         [BatchExecutionCudaKernels.LstmInputGrad] = LstmInputGrad, [BatchExecutionCudaKernels.LstmWeightIhGrad] = LstmWeightIhGrad,
         [BatchExecutionCudaKernels.LstmWeightHhGrad] = LstmWeightHhGrad, [BatchExecutionCudaKernels.LstmBiasGrad] = LstmBiasGrad,
+        [BatchExecutionCudaKernels.DlLinearGelu] = DlLinearGelu, [BatchExecutionCudaKernels.DlLinearGeluFp16] = DlLinearGeluFp16,
+        [BatchExecutionCudaKernels.DlW8A8LinearGelu] = DlW8A8LinearGelu, [BatchExecutionCudaKernels.DlW8A8Epilogue] = DlW8A8Epilogue,
+        [BatchExecutionCudaKernels.DcConv2dDirectFp16Hw] = DcConv2dDirectFp16Hw,
     };
 }
 #endif

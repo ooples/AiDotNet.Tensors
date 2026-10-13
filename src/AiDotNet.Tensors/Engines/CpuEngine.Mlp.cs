@@ -10,6 +10,10 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class CpuEngine
 {
+    // Multiply-adds (M * K * N) at or above which an MLP layer's managed GEMM goes through the parallel Sgemm dispatch
+    // instead of the single-threaded SgemmSequential (#475).
+    internal const long MlpParallelGemmMinWork = 1L << 20;
+
     /// <summary>
     /// Fused multi-layer perceptron forward — runs a stack of dense layers
     /// (<c>activation(x @ Wᵢ + bᵢ)</c>) in a single engine call. Returns the
@@ -317,9 +321,23 @@ public partial class CpuEngine
                             // parallelism, is concurrency-safe (no shared pack-cache state),
                             // and reads wSpan directly (no GetFlattenedData() float[] copy, no
                             // pack-cache identity concerns). (wT/wSpan hoisted above.)
-                            Simd.SimdGemm.SgemmSequential(
-                                srcSpan.Slice(0, M * curK), wSpan.Slice(0, curK * n),
-                                dst.AsSpan(0, M * n), M, curK, n);
+                            // #475 (2026-10): with native BLAS off -- the default -- every layer lands here,
+                            // including the wide head. SgemmSequential is single-threaded, so the AIsEval
+                            // layer 0 (128x784x512) took ~1.45 ms at any thread budget on a 64-core Threadripper,
+                            // while the parallel Sgemm dispatch took 0.17 ms; layer 1 (128x512x128) 160 -> 40 us.
+                            // Below MlpParallelGemmMinWork the sequential kernel still wins (layer 2, 128x128x10:
+                            // 10.8 us vs 63.6 us at one thread), so only the larger layers dispatch.
+                            if ((long)M * curK * n >= MlpParallelGemmMinWork)
+                                BlasManaged.BlasManaged.Gemm<float>(
+                                    srcSpan.Slice(0, M * curK), lda: curK, transA: false,
+                                    wSpan.Slice(0, curK * n), ldb: n, transB: false,
+                                    dst.AsSpan(0, M * n), ldc: n,
+                                    M, n, curK,
+                                    new BlasManaged.BlasOptions<float> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
+                            else
+                                Simd.SimdGemm.SgemmSequential(
+                                    srcSpan.Slice(0, M * curK), wSpan.Slice(0, curK * n),
+                                    dst.AsSpan(0, M * n), M, curK, n);
                         }
                         else
                         {

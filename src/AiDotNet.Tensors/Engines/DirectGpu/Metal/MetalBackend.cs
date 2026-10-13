@@ -1792,17 +1792,72 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
+        if (outerSize <= 0 || reduceSize <= 0)
+            throw new ArgumentException("outerSize and reduceSize must be positive.");
+
+        // #1157 (the CUDA #1150 split): few long rows -- a full reduction is one -- would leave all but a handful of
+        // GPU cores idle with a threadgroup per row. Split each row into chunks of about 4 threadgroups per core, sum
+        // them into partials, then reduce the partials with this same method. Fixed partition and order.
+        int cores = Math.Max(1, ComputeUnits);
+        if (reduceSize >= SumAxisSplitMinReduce && outerSize < 2 * cores)
+        {
+            var split = GetPipeline("Reduction", _reductionLibrary, "sum_axis_rows_split");
+            if (split.MaxTotalThreadsPerThreadgroup >= 256)
+            {
+                int chunks = (int)Math.Max(2, Math.Min(((long)reduceSize + SumAxisSplitChunkMin - 1) / SumAxisSplitChunkMin,
+                    4L * cores / outerSize));
+                int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
+                chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
+                using var partial = AllocateBuffer(outerSize * chunks);
+                using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+                {
+                    encoder.SetPipelineState(split.Handle);
+                    encoder.SetBuffer(aBuffer, 0);
+                    encoder.SetBuffer((MetalGpuBuffer)partial, 1);
+                    encoder.SetBytes((uint)reduceSize, 2);
+                    encoder.SetBytes((uint)chunks, 3);
+                    encoder.SetBytes((uint)chunkLen, 4);
+                    encoder.DispatchThreadgroups(new MTLSize((ulong)chunks, (ulong)outerSize, 1), new MTLSize(256, 1, 1));
+                }
+                SumAxis(partial, B, outerSize, chunks);
+                return;
+            }
+        }
+
+        // Rows of at least SumAxisRowsMinReduce elements: a threadgroup per row (coalesced reads, parallel tree).
+        if (reduceSize >= SumAxisRowsMinReduce)
+        {
+            var rows = GetPipeline("Reduction", _reductionLibrary, "sum_axis_rows");
+            if (rows.MaxTotalThreadsPerThreadgroup >= 256)
+            {
+                using var encoder = _commandQueue.CreateScopedComputeEncoder();
+                encoder.SetPipelineState(rows.Handle);
+                encoder.SetBuffer(aBuffer, 0);
+                encoder.SetBuffer(bBuffer, 1);
+                encoder.SetBytes((uint)outerSize, 2);
+                encoder.SetBytes((uint)reduceSize, 3);
+                encoder.DispatchThreadgroups(new MTLSize((ulong)outerSize, 1, 1), new MTLSize(256, 1, 1));
+                return;
+            }
+        }
+
         var pipeline = GetPipeline("Reduction", _reductionLibrary, "sum_axis");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(outerSize);
-
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(aBuffer, 0);
-        encoder.SetBuffer(bBuffer, 1);
-        encoder.SetBytes((uint)outerSize, 2);
-        encoder.SetBytes((uint)reduceSize, 3);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        using (var encoder = _commandQueue.CreateScopedComputeEncoder())
+        {
+            encoder.SetPipelineState(pipeline.Handle);
+            encoder.SetBuffer(aBuffer, 0);
+            encoder.SetBuffer(bBuffer, 1);
+            encoder.SetBytes((uint)outerSize, 2);
+            encoder.SetBytes((uint)reduceSize, 3);
+            encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        }
     }
+
+    // SumAxis thresholds, as on CUDA, OpenCL and HIP (#1150 / #1157).
+    internal const int SumAxisRowsMinReduce = 32;
+    internal const int SumAxisSplitMinReduce = 64 * 1024;
+    internal const int SumAxisSplitChunkMin = 8 * 1024;
 
     /// <summary>
     /// Mean along axis for batched data using GPU kernel.

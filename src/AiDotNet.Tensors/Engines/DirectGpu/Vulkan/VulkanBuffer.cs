@@ -41,6 +41,21 @@ public sealed unsafe class VulkanBuffer : IDisposable
     private bool _disposed;
     private readonly ulong _offset;
     private readonly VulkanBuffer? _viewParent;
+    private long _lastSubmissionSerial;
+
+    /// <summary>
+    /// Serial of the last submission made without waiting that bound this buffer (0 when none has): until that
+    /// submission has executed, the buffer must not be destroyed or handed to another owner.
+    /// </summary>
+    internal long LastSubmissionSerial => System.Threading.Interlocked.Read(ref _lastSubmissionSerial);
+
+    /// <summary>Records that the submission with <paramref name="serial"/> reads or writes this buffer.</summary>
+    internal void MarkUsedBySubmission(long serial)
+    {
+        System.Threading.Interlocked.Exchange(ref _lastSubmissionSerial, serial);
+        // A view shares its parent's memory, so the parent is in use for as long as the view is.
+        _viewParent?.MarkUsedBySubmission(serial);
+    }
 
     /// <summary>
     /// Gets the Vulkan buffer handle.

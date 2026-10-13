@@ -163,6 +163,91 @@ public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
     }
+    // #682: the direct FP16 convolution, Vulkan's port of CUDA's conv2d_direct_fp16hw (#671).
+    private const uint Conv2dDirectFp16PushInts = 15u * sizeof(uint);
+
+    /// <summary>
+    /// True when the direct FP16 convolution shader compiled and its pipeline built on this device (the pipeline
+    /// is cached, so <see cref="Conv2dDirectFp16Hw"/> reuses it). False, without throwing, when libshaderc is
+    /// unavailable or the device rejects the shader; the engine then keeps the FP32 convolution.
+    /// </summary>
+    public bool Fp16DirectConvAvailable
+    {
+        get
+        {
+            if (!IsGlslCompilerAvailable)
+                return false;
+            return GetOrCreateGlslPipeline(VulkanConvPoolKernels.Conv2dDirectFp16Hw, 3, Conv2dDirectFp16PushInts) is not null;
+        }
+    }
+
+    /// <summary>
+    /// Direct convolution with FP16 weights: the FP32 <paramref name="input"/> is rounded to FP16 per access,
+    /// multiplied by the packed-half <paramref name="weightsHalf"/> ([outC, inC, kH, kW], as
+    /// <see cref="ConvertToFp16"/> writes them) and accumulated in FP32 into <paramref name="output"/>. The same
+    /// numerics as im2col + <see cref="GemmFp16In32fOut"/>, without the column matrix.
+    /// </summary>
+    public void Conv2dDirectFp16Hw(IGpuBuffer input, IGpuBuffer weightsHalf, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW,
+        int padH, int padW, int dilationH, int dilationW)
+    {
+        EnsureInitialized();
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (weightsHalf is null) throw new ArgumentNullException(nameof(weightsHalf));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch), "Dimensions must be positive.");
+        if (inChannels <= 0) throw new ArgumentOutOfRangeException(nameof(inChannels), "Dimensions must be positive.");
+        if (inHeight <= 0) throw new ArgumentOutOfRangeException(nameof(inHeight), "Dimensions must be positive.");
+        if (inWidth <= 0) throw new ArgumentOutOfRangeException(nameof(inWidth), "Dimensions must be positive.");
+        if (outChannels <= 0) throw new ArgumentOutOfRangeException(nameof(outChannels), "Dimensions must be positive.");
+        if (outHeight <= 0) throw new ArgumentOutOfRangeException(nameof(outHeight), "Dimensions must be positive.");
+        if (outWidth <= 0) throw new ArgumentOutOfRangeException(nameof(outWidth), "Dimensions must be positive.");
+        if (kernelH <= 0) throw new ArgumentOutOfRangeException(nameof(kernelH), "Dimensions must be positive.");
+        if (kernelW <= 0) throw new ArgumentOutOfRangeException(nameof(kernelW), "Dimensions must be positive.");
+        if (strideH <= 0) throw new ArgumentOutOfRangeException(nameof(strideH), "Stride must be positive.");
+        if (strideW <= 0) throw new ArgumentOutOfRangeException(nameof(strideW), "Stride must be positive.");
+        if (dilationH <= 0) throw new ArgumentOutOfRangeException(nameof(dilationH), "Dilation must be positive.");
+        if (dilationW <= 0) throw new ArgumentOutOfRangeException(nameof(dilationW), "Dilation must be positive.");
+        if (padH < 0) throw new ArgumentOutOfRangeException(nameof(padH), "Padding must be non-negative.");
+        if (padW < 0) throw new ArgumentOutOfRangeException(nameof(padW), "Padding must be non-negative.");
+
+        // The kernel indexes with int and trusts these extents; a caller passing an output size that does not
+        // follow from the geometry, or a short buffer, would read or write out of bounds on the device.
+        int expectedOutH = (inHeight + 2 * padH - ((kernelH - 1) * dilationH + 1)) / strideH + 1;
+        int expectedOutW = (inWidth + 2 * padW - ((kernelW - 1) * dilationW + 1)) / strideW + 1;
+        if (outHeight != expectedOutH || outWidth != expectedOutW)
+            throw new ArgumentException(
+                $"Output extent {outHeight}x{outWidth} does not match the convolution geometry ({expectedOutH}x{expectedOutW}).");
+        long inputCount = (long)batch * inChannels * inHeight * inWidth;
+        long weightCount = (long)outChannels * inChannels * kernelH * kernelW;
+        long outputCount = (long)batch * outChannels * outHeight * outWidth;
+        if (inputCount > int.MaxValue || weightCount > int.MaxValue || outputCount > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(batch), "The convolution exceeds the kernel's int indexing.");
+        if (input.Size < inputCount)
+            throw new ArgumentException($"input holds {input.Size} elements; the convolution reads {inputCount}.", nameof(input));
+        // Packed halves: two per 32-bit word.
+        if (weightsHalf.Size < (weightCount + 1) / 2)
+            throw new ArgumentException(
+                $"weightsHalf holds {weightsHalf.Size} words; {weightCount} FP16 weights need {(weightCount + 1) / 2}.", nameof(weightsHalf));
+        if (output.Size < outputCount)
+            throw new ArgumentException($"output holds {output.Size} elements; the convolution writes {outputCount}.", nameof(output));
+
+        if (!Fp16DirectConvAvailable)
+            throw new GpuCapabilityUnavailableException(
+                "The Vulkan direct FP16 convolution needs libshaderc for runtime GLSL compilation, which is unavailable.");
+
+        var push = new uint[]
+        {
+            (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
+            (uint)outChannels, (uint)outHeight, (uint)outWidth,
+            (uint)kernelH, (uint)kernelW, (uint)strideH, (uint)strideW,
+            (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW,
+        };
+        TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2dDirectFp16Hw, push, (int)outputCount, input, weightsHalf, output);
+    }
+
     // #1650/#638 FP16 conv im2col — ported to Vulkan (1-D-flattened port of the VALIDATED CUDA im2col_kn_fp16hw).
     // The col matrix is written in the packed-half layout (two halves per 32-bit word) that ConvertToFp16 produces
     // and GemmFp16In32fOut consumes, so the conv becomes a plain NN GEMM out[outC,N] = weights[outC,K] · col[K,N].

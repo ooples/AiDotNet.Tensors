@@ -20,13 +20,14 @@ public static class BatchExecutionKernels
     /// The IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C so OpenCL runs the same
     /// code HIP and Metal run: kernel qualifiers, global pointers, the thread index and the float builtins.
     /// </summary>
-    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource);
+    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.DecodeLinearSource + K.DirectConvSource);
 
     private static string TranslateSolvers(string cuda)
     {
         string body = cuda.Replace("extern \"C\" __global__ __launch_bounds__(256) void", "__kernel void")
             .Replace("bx_gid()", "(int)get_global_id(0)")
-            .Replace("__uint_as_float(", "as_float(");
+            .Replace("__uint_as_float(", "as_float(")
+            .Replace("__int_as_float(", "as_float(");
         body = Regex.Replace(body, @"(?<![\w*])(const )?(float|int)\* ", "__global $1$2* ", RegexOptions.None, RegexTimeout);
         return Regex.Replace(body, @"\b(sqrt|fmax|fabs|exp|log|tanh)f\(", "$1(", RegexOptions.None, RegexTimeout);
     }
@@ -261,9 +262,10 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             "bx_fft_chirp", "bx_fft_bluestein_pre", "bx_fft_cmul", "bx_fft_bluestein_post", "bx_fft_to_storage", "bx_fft_from_storage",
             K.LaSymmetrize, K.LaLuSolve, K.LaLdlFactor, K.LaLdlSolve, K.LaSolveVector, K.LaTriangularSolveVector,
             K.LaCholeskyBackwardLower, K.LaSolveBackwardVector, K.LaSvdReduced, K.LaQrReduced,
-            K.FaLse, K.FaOut, K.FaDelta, K.FaDq, K.FaDkv,
+            K.FaLse, K.FaOut, K.FaDelta, K.FaDq, K.FaDk, K.FaDv,
             K.LstmGates, K.LstmCell, K.LstmCellBackward, K.LstmHiddenBackward, K.LstmInputGrad, K.LstmWeightIhGrad,
-            K.LstmWeightHhGrad, K.LstmBiasGrad
+            K.LstmWeightHhGrad, K.LstmBiasGrad,
+            K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue, K.DcConv2dDirectFp16Hw
         };
     }
 }

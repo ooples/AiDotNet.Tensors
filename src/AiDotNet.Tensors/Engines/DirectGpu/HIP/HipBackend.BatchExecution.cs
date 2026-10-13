@@ -7,10 +7,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 public sealed partial class HipBackend : IGpuBatchExecution
 {
     private IntPtr _batchExecutionModule;
+    private IntPtr _torchParityModule;
     private int _batchDepth;
     private int _secondaryStreamOwnerThreadId;
 
-    private unsafe void LaunchBatch(string name, int threads, params object[] args)
+    internal unsafe void LaunchBatch(string name, int threads, params object[] args)
     {
         if (threads <= 0) return;
         if (!_kernelCache.TryGetValue(name, out var kernel))

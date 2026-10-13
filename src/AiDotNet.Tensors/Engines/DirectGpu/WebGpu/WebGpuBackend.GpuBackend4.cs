@@ -685,6 +685,13 @@ public sealed partial class WebGpuBackend
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
         int batch, int n, bool inverse)
     {
+        // #965: a power-of-two length runs the radix-2 kernels (O(n log n)); fft_1d below is a direct O(n^2) DFT, kept for
+        // the other lengths. The generic FFT's power-of-two transforms and all three Bluestein transforms land here.
+        if (n > 0 && (n & (n - 1)) == 0)
+        {
+            PortableGenericFft.BatchedRadix2(this, LaunchBatch, inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
+            return;
+        }
         // FFTSource fft_1d: batched DFT kernel
         var uniforms = new float[]
         {
@@ -888,8 +895,14 @@ public sealed partial class WebGpuBackend
         var pc = new[] { batch, seqLen, modelDim, numHeads, headDim };
         DispatchRecurrence("gla_recompute", WebGpuRecurrenceKernels.GlaRecompute, total,
             new[] { k, v, gate, traj }, pc);
+        // Q|K and gate|trajectory are packed: 8 storage bindings, WebGPU's guaranteed per-stage limit.
+        int qkCount = checked(batch * seqLen * modelDim), gateCount = checked(batch * seqLen * numHeads);
+        using var qk = PackPair(q, k, qkCount);
+        using var gateTraj = AllocateBuffer(checked(gateCount + (int)trajLenLong));
+        Copy(gate, 0, gateTraj, 0, gateCount);
+        Copy(traj, 0, gateTraj, gateCount, (int)trajLenLong);
         DispatchRecurrence("gla_backward", WebGpuRecurrenceKernels.GlaBackward, total,
-            new[] { dOut, q, k, v, gate, traj, dQ, dK, dV, dG }, pc);
+            new[] { dOut, qk, v, gateTraj, dQ, dK, dV, dG }, pc);
     }
 
     public void XLstmScanForward(
@@ -923,6 +936,23 @@ public sealed partial class WebGpuBackend
         => DispatchRecurrence("mamba", WebGpuRecurrenceKernels.MambaScan, batch * innerDim,
             new[] { x, delta, aLog, bParam, cParam, dParam, output }, new[] { batch, seqLen, innerDim, stateDim });
 
+    // first | second in one buffer of 2 * count, so a kernel reads both through one storage binding.
+    private IGpuBuffer PackPair(IGpuBuffer first, IGpuBuffer second, int count)
+    {
+        var packed = AllocateBuffer(checked(2 * count));
+        try
+        {
+            Copy(first, 0, packed, 0, count);
+            Copy(second, 0, packed, count, count);
+        }
+        catch
+        {
+            packed.Dispose();
+            throw;
+        }
+        return packed;
+    }
+
     public void ComplexDiagonalSsmScanForward(
         IGpuBuffer input, IGpuBuffer transitionReal, IGpuBuffer transitionImag,
         IGpuBuffer inputMapReal, IGpuBuffer inputMapImag,
@@ -931,9 +961,14 @@ public sealed partial class WebGpuBackend
     {
         if (batch <= 0 || time <= 0 || groups <= 0 || width <= 0 || state <= 0 || width > 256 || state > 256)
             throw new ArgumentOutOfRangeException(nameof(batch), "Complex diagonal SSM width/state must be in [1,256].");
+        // Each map's real and imaginary halves are packed into one buffer: 6 storage bindings, within WebGPU's 8.
+        int aCount = checked(groups * state), mapCount = checked(groups * state * width);
+        using var transition = PackPair(transitionReal, transitionImag, aCount);
+        using var inputMap = PackPair(inputMapReal, inputMapImag, mapCount);
+        using var outputMap = PackPair(outputMapReal, outputMapImag, mapCount);
         DispatchRecurrence("complex_diagonal_ssm", WebGpuRecurrenceKernels.ComplexDiagonalSsmScan,
-            batch * groups, new[] { input, transitionReal, transitionImag, inputMapReal, inputMapImag,
-                outputMapReal, outputMapImag, skip, output }, new[] { batch, time, groups, width, state });
+            batch * groups, new[] { input, transition, inputMap, outputMap, skip, output },
+            new[] { batch, time, groups, width, state });
     }
 
     public void MesaScanForward(
@@ -1236,9 +1271,14 @@ public sealed partial class WebGpuBackend
         int cellTotal = batch * hiddenSize;
         if (cellTotal <= 0) return;
         var uniforms = MakeUniformInts2(batch, hiddenSize);
+        // The r, z, n gates are packed so the kernel binds 7 storage buffers, within WebGPU's guaranteed 8.
+        using var gates = AllocateBuffer(checked(3 * cellTotal));
+        Copy(gateR, 0, gates, 0, cellTotal);
+        Copy(gateZ, 0, gates, cellTotal, cellTotal);
+        Copy(gateN, 0, gates, 2 * cellTotal, cellTotal);
         DispatchNBufferAsync("GruCellBackwardGates", WebGpuKernels.GruCellBackwardGatesSource,
             "gru_cell_backward_gates",
-            new[] { gradH, gateR, gateZ, gateN, prevH, weightsHh, gradGateR, gradGateZ, gradGateN },
+            new[] { gradH, gates, prevH, weightsHh, gradGateR, gradGateZ, gradGateN },
             uniforms, cellTotal).GetAwaiter().GetResult();
         DispatchNBufferAsync("GruCellBackwardHidden", WebGpuKernels.GruCellBackwardHiddenSource,
             "gru_cell_backward_hidden",

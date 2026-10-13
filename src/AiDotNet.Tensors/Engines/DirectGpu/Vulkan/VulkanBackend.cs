@@ -54,9 +54,11 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         new(SourceInstanceComparer.Instance);
     private VulkanGlslCompiler? _glslCompiler;
     private VulkanBufferTransfer? _transfer;
-    private readonly object _computeLock = new object();
+    // The device's dispatch lock: recording a dispatch into the device's open command buffer, and ending and
+    // submitting that buffer, exclude each other through it (#1192).
+    private readonly object _computeLock = VulkanDevice.Instance.DispatchLock;
     private bool _initialized;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     // Batch execution state — records multiple dispatches into a single command buffer.
     // Thread-affine: _batchOwnerThreadId tracks which thread owns the batch. Non-owning
@@ -452,6 +454,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
         {
+            // Dispose releases the backend-owned placeholder binding under this lock.
+            if (_disposed) throw new ObjectDisposedException(nameof(VulkanBackend));
             pipeline.UpdateDescriptorSet(storages);
             RecordAndExecuteWithPushData(
                 pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes, workgroupSize);
@@ -889,8 +893,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         // Immediate submit path
-        var cmdBuffer = threadRes.CommandBuffer;
-        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+        var cmdBuffer = DispatchCommandBuffer(threadRes, out bool deferred);
+        if (!deferred) VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
         var beginInfo = new VkCommandBufferBeginInfo
         {
             sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -898,9 +902,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             flags = VkCommandBufferUsageFlags.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
             pInheritanceInfo = null
         };
-        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        if (!deferred) VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        else RecordComputeMemoryBarrier(cmdBuffer);
         VulkanNativeBindings.vkCmdBindPipeline(cmdBuffer, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle);
-        var ds = pipeline.DescriptorSet;
+        var ds = deferred ? pipeline.RetainDescriptorSet() : pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(cmdBuffer, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Layout, 0, 1, &ds, 0, null);
 
         // Push the caller-provided constant values
@@ -912,8 +917,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         uint workgroupCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
         JournalDispatch(pipeline, workgroupCount, workgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
-        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
-        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
+        if (!deferred) VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        SubmitDispatch(cmdBuffer, threadRes, deferred, pipeline, ds);
     }
 
     private static uint CalculateWorkgroupCount(int elementCount, int workgroupSize)
@@ -971,9 +976,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         }
 
         // Non-batch mode: record + submit immediately (original path)
-        var cmdBuffer = threadRes.CommandBuffer;
+        var cmdBuffer = DispatchCommandBuffer(threadRes, out bool deferred);
 
-        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+        if (!deferred) VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         var beginInfo = new VkCommandBufferBeginInfo
         {
@@ -983,14 +988,15 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        if (!deferred) VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        else RecordComputeMemoryBarrier(cmdBuffer);
 
         VulkanNativeBindings.vkCmdBindPipeline(
             cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
             pipeline.Handle);
 
-        var ds = pipeline.DescriptorSet;
+        var ds = deferred ? pipeline.RetainDescriptorSet() : pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(
             cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1008,8 +1014,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         JournalDispatch(pipeline, workgroupCount, VulkanKernels.WorkgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
-        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
-        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
+        if (!deferred) VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        SubmitDispatch(cmdBuffer, threadRes, deferred, pipeline, ds);
     }
 
     /// <summary>
@@ -1017,10 +1023,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void RecordAndExecuteComputeWithScalarUnlocked(VulkanComputePipeline pipeline, int elementCount, float scalar, ThreadCommandResources threadRes)
     {
-        var cmdBuffer = threadRes.CommandBuffer;
+        var cmdBuffer = DispatchCommandBuffer(threadRes, out bool deferred);
 
         // Reset command buffer
-        VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
+        if (!deferred) VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);
 
         // Begin recording
         var beginInfo = new VkCommandBufferBeginInfo
@@ -1031,7 +1037,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pInheritanceInfo = null
         };
 
-        VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        if (!deferred) VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+        else RecordComputeMemoryBarrier(cmdBuffer);
 
         // Bind pipeline
         VulkanNativeBindings.vkCmdBindPipeline(
@@ -1040,7 +1047,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pipeline.Handle);
 
         // Bind descriptor set
-        var descriptorSet = pipeline.DescriptorSet;
+        var descriptorSet = deferred ? pipeline.RetainDescriptorSet() : pipeline.DescriptorSet;
         VulkanNativeBindings.vkCmdBindDescriptorSets(
             cmdBuffer,
             VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1071,10 +1078,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
 
         // End recording
-        VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
+        if (!deferred) VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
 
         // Submit and wait using per-thread fence
-        _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
+        SubmitDispatch(cmdBuffer, threadRes, deferred, pipeline, descriptorSet);
     }
 
     #region Batch Execution
@@ -1229,9 +1236,11 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (!_inSecondaryStream || _secondaryStreamOwnerThreadId != currentThread)
             throw new InvalidOperationException("Not in a secondary stream on this thread.");
 
-        // Submit the secondary command buffer and wait for completion
-        var cmdBuffer = _secondaryThreadRes.CommandBuffer;
-        _device.SubmitAndWait(cmdBuffer, _secondaryThreadRes.Fence);
+        // Every dispatch made inside the stream has been submitted already (each op submits its own command
+        // buffer), so ending the stream is waiting for them. This used to submit the thread's command buffer
+        // again, which re-ran whatever that buffer last recorded: harmless while that was the stream's own last
+        // op, and a stale op over the stream's output once dispatches record into buffers of their own.
+        _device.WaitForPendingSubmissions();
         _inSecondaryStream = false;
         Interlocked.Exchange(ref _secondaryStreamOwnerThreadId, 0);
     }
@@ -1248,12 +1257,24 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         _disposed = true;
 
-        // Wait for device to finish
-        _device.WaitIdle();
+        // Under the compute lock: a dispatch that already holds it finishes (every dispatch submits and waits)
+        // before the placeholder is released, and one that takes it afterwards sees _disposed and stops. Without it
+        // a call could read UnusedBinding, lose the race to this method, and then bind the released buffer.
+        lock (_computeLock)
+        {
+            // Wait for device to finish
+            _device.WaitIdle();
 
-        // Parked buffers must be freed while the device still exists.
-        VulkanGpuBuffer.PendingFrees.Drain();
-        VulkanGpuBuffer.Pool.DrainAll();
+            // Parked buffers must be freed while the device still exists. The placeholder is pooled, so it is
+            // released first and the drain frees it with the rest.
+            IGpuBuffer? placeholder;
+            lock (_unusedBindingLock)
+            {
+                placeholder = _unusedBindingBuffer;
+                _unusedBindingBuffer = null;
+            }
+            VulkanGpuBuffer.ReleaseAndDrain(placeholder);
+        }
 
         // Per-thread command resources are cleaned up by VulkanDevice.Cleanup()
 
@@ -1270,6 +1291,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             pipeline.Dispose();
         }
         _glslPipelineCache.Clear();
+        DisposeTunedKernelResources();
         _glslPipelineBySource.Clear();
         _glslPipelineByInstance.Clear();
 
