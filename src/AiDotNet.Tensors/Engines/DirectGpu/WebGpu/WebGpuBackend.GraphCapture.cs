@@ -22,6 +22,9 @@ public sealed partial class WebGpuBackend : IGpuGraphCapture
     void IGpuGraphCapture.LaunchCapturedGraph(System.IntPtr graphExec)
         => throw new System.ArgumentException("This backend never returns a graph handle.", nameof(graphExec));
 
+    void IGpuGraphCapture.EnqueueCapturedGraph(System.IntPtr graphExec)
+        => throw new System.ArgumentException("This backend never returns a graph handle.", nameof(graphExec));
+
     void IGpuGraphCapture.DestroyCapturedGraph(System.IntPtr graphExec)
         => throw new System.ArgumentException("This backend never returns a graph handle.", nameof(graphExec));
 }

@@ -5,8 +5,11 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
+public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend, IDeviceReadbackFactory
 {
+    // No asynchronous device-to-host copy is wired on this backend: the readback downloads when it is queued.
+    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new SynchronousDeviceReadback(this, byteCapacity);
+
     /// <summary>
     /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
     /// the undefined-contents contract.
@@ -27,4 +30,12 @@ public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninit
         float weightDecay, int step)
         => PerTensorMultiTensorOptimizer.Update(this, true, parameters, gradients, firstMoments, secondMoments,
             sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    public void AdamMultiTensorUpdateGuarded(bool decoupledWeightDecay,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step, IGpuBuffer finiteGuard)
+        => PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
 }

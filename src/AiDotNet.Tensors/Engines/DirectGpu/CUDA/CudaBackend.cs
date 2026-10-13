@@ -5416,6 +5416,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
         using var _ = PushContext();
         ulong byteSize = (ulong)data.Length * sizeof(float);
+        // Stream-ordered through pinned staging: the copy lands after the previous replay has finished reading this
+        // buffer, without the host waiting for it. A synchronous cuMemcpyHtoD on this blocking stream drained the
+        // device every step, so the host could never prepare the next step while the device ran this one.
+        if (TryStageUpload(buffer.Handle, data, byteSize)) return;
         fixed (float* src = data)
             CuBlasNative.CheckCudaResult(
                 CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, byteSize),
@@ -13592,7 +13596,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step)
         => MultiTensorAdamImpl("adam_multi_tensor_update", parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard: null);
 
     public void AdamWMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -13600,14 +13604,34 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step)
         => MultiTensorAdamImpl("adamw_multi_tensor_update", parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard: null);
+
+    /// <summary>
+    /// <see cref="AdamMultiTensorUpdate"/> / <see cref="AdamWMultiTensorUpdate"/> that discard the step ON THE DEVICE
+    /// when <paramref name="finiteGuard"/> (a double written by <see cref="MultiTensorSumOfSquares"/> earlier on this
+    /// stream) is not finite. The host need not read the gradients' finiteness before launching, so a training step
+    /// no longer waits for the device to decide whether to update.
+    /// </summary>
+    public void AdamMultiTensorUpdateGuarded(
+        bool decoupledWeightDecay,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step, IGpuBuffer finiteGuard)
+    {
+        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        if (finiteGuard.Size < 2) throw new ArgumentException("The double guard needs two float slots.", nameof(finiteGuard));
+        MultiTensorAdamImpl(decoupledWeightDecay ? "adamw_multi_tensor_update" : "adam_multi_tensor_update",
+            parameters, gradients, firstMoments, secondMoments, sizes, learningRate, beta1, beta2, epsilon,
+            weightDecay, step, finiteGuard);
+    }
 
     private unsafe void MultiTensorAdamImpl(
         string kernelName,
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
-        float weightDecay, int step)
+        float weightDecay, int step, IGpuBuffer? finiteGuard)
     {
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
@@ -13624,60 +13648,106 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
-        // Build the device pointer arrays (8-byte device addresses) and the chunk table.
-        var paramAddr = new byte[n * sizeof(ulong)];
-        var gradAddr = new byte[n * sizeof(ulong)];
-        var mAddr = new byte[n * sizeof(ulong)];
-        var vAddr = new byte[n * sizeof(ulong)];
-        var sizesArr = new int[n];
+        using var _ = PushContext();
+        void** args = stackalloc void*[15];
+        IntPtr guardH = finiteGuard?.Handle ?? IntPtr.Zero;
+        lock (_adamTableSync)
+        {
+            var table = GetAdamTable(parameters, gradients, firstMoments, secondMoments, sizes);
+            IntPtr pH = table.Pointers?.Handle ?? IntPtr.Zero;
+            IntPtr gH = (IntPtr)((long)pH + n * sizeof(ulong));
+            IntPtr mH = (IntPtr)((long)pH + 2L * n * sizeof(ulong));
+            IntPtr vH = (IntPtr)((long)pH + 3L * n * sizeof(ulong));
+            IntPtr szH = table.SizesBuffer?.Handle ?? IntPtr.Zero;
+            IntPtr ctH = table.ChunkTensor?.Handle ?? IntPtr.Zero;
+            IntPtr csH = table.ChunkStart?.Handle ?? IntPtr.Zero;
+            int chunkSize = MultiTensorChunk;
+            args[0] = &pH; args[1] = &gH; args[2] = &mH; args[3] = &vH;
+            args[4] = &szH; args[5] = &ctH; args[6] = &csH;
+            args[7] = &learningRate; args[8] = &beta1; args[9] = &beta2; args[10] = &epsilon;
+            args[11] = &weightDecay; args[12] = &step; args[13] = &chunkSize; args[14] = &guardH;
+            LaunchKernel(kernel, (uint)table.TotalChunks, DefaultBlockSize, args);
+        }
+    }
+
+    private MultiTensorTable? _adamTable;
+
+    // Guards _adamTable from lookup through launch, as _gradientTableSync does for the gradient table.
+    private readonly object _adamTableSync = new object();
+
+    /// <summary>
+    /// The multi-tensor Adam kernel's four pointer arrays (parameters, gradients, first and second moments, stored
+    /// back to back in one buffer), size table and chunk table, kept across calls. A compiled plan's optimizer
+    /// buffers are stable from step to step; rebuilding the tables per call cost seven synchronous allocations,
+    /// uploads and frees every step -- measured as the largest host cost of a CUDA-graph training step.
+    /// </summary>
+    private MultiTensorTable GetAdamTable(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes)
+    {
+        int n = parameters.Count;
+        if (_adamTable is { } cached && cached.Handles.Length == 4 * n)
+        {
+            bool same = true;
+            for (int t = 0; t < n && same; t++)
+            {
+                same = cached.Handles[t] == parameters[t].Handle
+                    && cached.Handles[n + t] == gradients[t].Handle
+                    && cached.Handles[2 * n + t] == firstMoments[t].Handle
+                    && cached.Handles[3 * n + t] == secondMoments[t].Handle
+                    && cached.Sizes[t] == sizes[t];
+            }
+            if (same) return cached;
+        }
+        if (IsStreamCapturing())
+            throw new InvalidOperationException(
+                "The multi-tensor Adam table must be built before stream capture; run an eager step first.");
+
+        var handles = new IntPtr[4 * n];
+        var addresses = new byte[4 * n * sizeof(ulong)];
+        var sizeArray = new int[n];
         int totalChunks = 0;
         for (int t = 0; t < n; t++)
         {
             int size = sizes[t];
             if (size <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
-            WriteAddress(paramAddr, t, parameters[t].Handle);
-            WriteAddress(gradAddr, t, gradients[t].Handle);
-            WriteAddress(mAddr, t, firstMoments[t].Handle);
-            WriteAddress(vAddr, t, secondMoments[t].Handle);
-            sizesArr[t] = size;
+            handles[t] = parameters[t].Handle;
+            handles[n + t] = gradients[t].Handle;
+            handles[2 * n + t] = firstMoments[t].Handle;
+            handles[3 * n + t] = secondMoments[t].Handle;
+            sizeArray[t] = size;
             totalChunks += (size + MultiTensorChunk - 1) / MultiTensorChunk;
         }
+        for (int i = 0; i < handles.Length; i++)
+            WriteAddress(addresses, i, handles[i]);
         var chunkTensor = new int[totalChunks];
         var chunkStart = new int[totalChunks];
         int c = 0;
         for (int t = 0; t < n; t++)
         {
-            int chunks = (sizesArr[t] + MultiTensorChunk - 1) / MultiTensorChunk;
+            int chunks = (sizeArray[t] + MultiTensorChunk - 1) / MultiTensorChunk;
             for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
         }
 
-        using var _ = PushContext();
-        IGpuBuffer? pPtrs = null, gPtrs = null, mPtrs = null, vPtrs = null, sizesBuf = null, ctBuf = null, csBuf = null;
+        // Build the replacement completely before retiring the cached table, as GetGradientTable does.
+        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
         try
         {
-            pPtrs = AllocateByteBuffer(paramAddr.Length); UploadByteBuffer(pPtrs, paramAddr);
-            gPtrs = AllocateByteBuffer(gradAddr.Length); UploadByteBuffer(gPtrs, gradAddr);
-            mPtrs = AllocateByteBuffer(mAddr.Length); UploadByteBuffer(mPtrs, mAddr);
-            vPtrs = AllocateByteBuffer(vAddr.Length); UploadByteBuffer(vPtrs, vAddr);
-            sizesBuf = AllocateIntBuffer(sizesArr);
-            ctBuf = AllocateIntBuffer(chunkTensor);
-            csBuf = AllocateIntBuffer(chunkStart);
-
-            IntPtr pH = pPtrs.Handle, gH = gPtrs.Handle, mH = mPtrs.Handle, vH = vPtrs.Handle;
-            IntPtr szH = sizesBuf.Handle, ctH = ctBuf.Handle, csH = csBuf.Handle;
-            int chunkSize = MultiTensorChunk;
-            void** args = stackalloc void*[14];
-            args[0] = &pH; args[1] = &gH; args[2] = &mH; args[3] = &vH;
-            args[4] = &szH; args[5] = &ctH; args[6] = &csH;
-            args[7] = &learningRate; args[8] = &beta1; args[9] = &beta2; args[10] = &epsilon;
-            args[11] = &weightDecay; args[12] = &step; args[13] = &chunkSize;
-            LaunchKernel(kernel, (uint)totalChunks, DefaultBlockSize, args);
+            table.Pointers = AllocateByteBuffer(addresses.Length);
+            UploadByteBuffer(table.Pointers, addresses);
+            table.SizesBuffer = AllocateIntBuffer(sizeArray);
+            table.ChunkTensor = AllocateIntBuffer(chunkTensor);
+            table.ChunkStart = AllocateIntBuffer(chunkStart);
         }
-        finally
+        catch
         {
-            pPtrs?.Dispose(); gPtrs?.Dispose(); mPtrs?.Dispose(); vPtrs?.Dispose();
-            sizesBuf?.Dispose(); ctBuf?.Dispose(); csBuf?.Dispose();
+            table.Dispose();
+            throw;
         }
+        _adamTable?.Dispose();
+        _adamTable = table;
+        return table;
     }
 
     private static void WriteAddress(byte[] dst, int index, IntPtr address)
@@ -17922,7 +17992,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         _disposed = true;
 
-        // The multi-tensor table holds device buffers: free them only on an explicit dispose, never from the
+        // The multi-tensor tables hold device buffers: free them only on an explicit dispose, never from the
         // finalizer (the context may already be gone).
         if (disposing)
         {
@@ -17930,6 +18000,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             {
                 _gradientTable?.Dispose();
                 _gradientTable = null;
+            }
+            lock (_adamTableSync)
+            {
+                _adamTable?.Dispose();
+                _adamTable = null;
             }
         }
 

@@ -58,4 +58,25 @@ public interface IMultiTensorGpuOptimizerBackend : IDirectGpuBackend
         float epsilon,
         float weightDecay,
         int step);
+
+    /// <summary>
+    /// <see cref="AdamMultiTensorUpdate"/> (or, with <paramref name="decoupledWeightDecay"/>,
+    /// <see cref="AdamWMultiTensorUpdate"/>) that writes nothing when <paramref name="finiteGuard"/> -- a double in
+    /// the buffer's first eight bytes, written earlier on this backend's queue -- is not finite. The caller need not
+    /// read the gradients' finiteness back before launching the update.
+    /// </summary>
+    void AdamMultiTensorUpdateGuarded(
+        bool decoupledWeightDecay,
+        IReadOnlyList<IGpuBuffer> parameters,
+        IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments,
+        IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes,
+        float learningRate,
+        float beta1,
+        float beta2,
+        float epsilon,
+        float weightDecay,
+        int step,
+        IGpuBuffer finiteGuard);
 }

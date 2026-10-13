@@ -79,9 +79,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public bool ReplayedAGraph;
         public string[] StepStates = Array.Empty<string>();
         public float[][] LastGradients = Array.Empty<float[]>();
+        public float[][] WeightsBeforeNonFiniteStep = Array.Empty<float[]>();
+        public float[][] WeightsAfterNonFiniteStep = Array.Empty<float[]>();
+        public bool SkipReportedAtNonFiniteStep;
+        public bool SkipReportedAfterNonFiniteStep;
+        public int NonFiniteStepsSkipped;
+        public int OptimizerStep;
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -121,9 +127,16 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             var losses = new double[Steps];
             float[][] lastGradients = Array.Empty<float[]>();
             var states = new string[Steps];
+            var run = new Run();
             for (int s = 0; s < Steps; s++)
             {
                 FeedBatch(x, y, s);
+                if (s == nonFiniteStep)
+                {
+                    // One non-finite input makes every gradient non-finite: the whole step must be discarded.
+                    x.AsWritableSpan()[0] = float.NaN;
+                    run.WeightsBeforeNonFiniteStep = parameters.Select(p => p.ToArray()).ToArray();
+                }
                 if (releasedInputBinding && s == 3)
                 {
                     // An earlier eager step can leave an input bound to a buffer that is no longer its to use: released
@@ -159,17 +172,23 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 states[s] = $"resident={lossTensor.IsGpuResident} pending={lossTensor.HasPendingGpuData} cpuRef={reference:G6}";
                 losses[s] = lossTensor.ToArray()[0];
                 if (s == Steps - 1) lastGradients = plan.Gradients.Select(g => g.ToArray()).ToArray();
+                if (s == nonFiniteStep)
+                {
+                    run.WeightsAfterNonFiniteStep = parameters.Select(p => p.ToArray()).ToArray();
+                    run.SkipReportedAtNonFiniteStep = plan.LastStepSkippedNonFiniteGradients;
+                }
+                if (nonFiniteStep >= 0 && s == nonFiniteStep + 1) run.SkipReportedAfterNonFiniteStep = plan.LastStepSkippedNonFiniteGradients;
             }
             var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
-            return new Run
-            {
-                Losses = losses,
-                FinalWeights = parameters.Select(p => p.ToArray()).ToArray(),
-                ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead,
-                LastGradients = lastGradients,
-                StepStates = states,
-            };
+            run.Losses = losses;
+            run.FinalWeights = parameters.Select(p => p.ToArray()).ToArray();
+            run.ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead;
+            run.LastGradients = lastGradients;
+            run.StepStates = states;
+            run.NonFiniteStepsSkipped = plan.NonFiniteStepsSkipped;
+            run.OptimizerStep = concrete.OptimizerStep;
+            return run;
         }
     }
 
@@ -199,6 +218,51 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6} (captured {captured.StepStates[s]}, eager {eager.StepStates[s]})");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A non-finite gradient on a replayed step must discard that step entirely - no moment or weight written - and
+    /// report it, exactly as an eager step does. On CUDA the decision is made on the device (the multi-tensor Adam
+    /// kernel reads the gradients' sum of squares) and the host learns of it from an asynchronous readback, so the
+    /// skip report and the step counter must still come out as if the host had checked before launching.
+    /// </summary>
+    [SkippableFact]
+    public void A_non_finite_gradient_discards_the_replayed_step_like_the_eager_step()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            const int nonFiniteStep = 6;   // after warm-up and capture: a replay
+            var eager = Train(gpu, capture: false, nonFiniteStep: nonFiniteStep);
+            var captured = Train(gpu, capture: true, nonFiniteStep: nonFiniteStep);
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+
+            foreach (var (name, run) in new[] { ("eager", eager), ("captured", captured) })
+            {
+                Assert.True(run.SkipReportedAtNonFiniteStep, $"{name}: the non-finite step was not reported as skipped");
+                Assert.False(run.SkipReportedAfterNonFiniteStep, $"{name}: the finite step after it was reported as skipped");
+                Assert.Equal(1, run.NonFiniteStepsSkipped);
+                Assert.Equal(Steps - 1, run.OptimizerStep);
+                for (int p = 0; p < run.WeightsBeforeNonFiniteStep.Length; p++)
+                    Assert.Equal(run.WeightsBeforeNonFiniteStep[p], run.WeightsAfterNonFiniteStep[p]);
+            }
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s == nonFiniteStep) continue;
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            }
             for (int p = 0; p < eager.FinalWeights.Length; p++)
                 for (int i = 0; i < eager.FinalWeights[p].Length; i++)
                     Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,

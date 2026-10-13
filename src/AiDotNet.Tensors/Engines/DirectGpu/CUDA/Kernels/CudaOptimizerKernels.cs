@@ -161,8 +161,12 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update(
     const int* __restrict__ chunkTensor,
     const int* __restrict__ chunkStart,
     float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int chunkSize)
+    float weightDecay, int step, int chunkSize,
+    const double* __restrict__ finiteGuard)
 {
+    // A non-finite gradient sum of squares (written on the device before this launch) discards the whole
+    // step: no moment or parameter is written, exactly as the host-side check skipped the launch.
+    if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
     int t = chunkTensor[blockIdx.x];
     int base = chunkStart[blockIdx.x];
     int i = base + threadIdx.x;
@@ -196,8 +200,12 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
     const int* __restrict__ chunkTensor,
     const int* __restrict__ chunkStart,
     float learningRate, float beta1, float beta2, float epsilon,
-    float weightDecay, int step, int chunkSize)
+    float weightDecay, int step, int chunkSize,
+    const double* __restrict__ finiteGuard)
 {
+    // A non-finite gradient sum of squares (written on the device before this launch) discards the whole
+    // step: no moment or parameter is written, exactly as the host-side check skipped the launch.
+    if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
     int t = chunkTensor[blockIdx.x];
     int base = chunkStart[blockIdx.x];
     int i = base + threadIdx.x;

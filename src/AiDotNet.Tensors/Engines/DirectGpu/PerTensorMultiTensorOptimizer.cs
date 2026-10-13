@@ -39,4 +39,22 @@ internal static class PerTensorMultiTensorOptimizer
                     learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
         }
     }
+
+    /// <summary>
+    /// The guarded update for a backend whose kernels cannot read the guard: the guard is read on the host (a
+    /// download, which waits for the queue) and the update is skipped when it is not finite.
+    /// </summary>
+    public static void UpdateGuarded(IDirectGpuBackend backend, bool decoupledWeightDecay,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step, IGpuBuffer finiteGuard)
+    {
+        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        double guard = BitConverter.ToDouble(backend.DownloadByteBuffer(finiteGuard, sizeof(double)), 0);
+        if (double.IsNaN(guard) || double.IsInfinity(guard)) return;
+        Update(backend, decoupledWeightDecay, parameters, gradients, firstMoments, secondMoments, sizes,
+            learningRate, beta1, beta2, epsilon, weightDecay, step);
+    }
+
 }

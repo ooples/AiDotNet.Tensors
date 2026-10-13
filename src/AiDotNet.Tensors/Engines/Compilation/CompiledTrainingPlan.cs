@@ -307,9 +307,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _clipSumSq = null;
         _clipTmp = null;
         _clipSquares = null;
+        _finitenessDeferred = false;
+        _finitenessReadback?.Dispose();
+        _finitenessReadback = null;
+        _finitenessReadbackOwner = null;
         _finitenessSumSquares?.Dispose();
         _finitenessSumSquares = null;
         _finitenessBackend = null;
+        if (_lossReadback is { } lossReadback)
+        {
+            // The loss tensor outlives the plan: a pending read of it would otherwise wait on a freed readback slot.
+            if (lossReadback.HasUnreadValue && _lossOutput.GetBackingArrayForCacheLookupUnsafe() is { } lossHost)
+            {
+                try { Helpers.HostSync.TryMaterialize(lossHost); }
+                catch (InvalidOperationException) { /* released or unreadable: nothing left to preserve */ }
+            }
+            lossReadback.Dispose();
+            _lossReadback = null;
+        }
 
         // Free the captured training-step graph, if any.
         InvalidateCapturedStepGraph();
@@ -483,9 +498,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// a plan that recaptures every warmup cycle instead of replaying never advances this.</summary>
     internal static long GraphReplayCount => System.Threading.Interlocked.Read(ref s_graphReplays);
 
+    /// <summary>
+    /// Launches the captured step. On CUDA it is only enqueued, without LaunchCapturedGraph's host barrier: a graph
+    /// launch is one stream-ordered operation, so every node -- including branches captured on BLAS lease streams,
+    /// which capture joins back before it ends -- completes before anything queued on the stream after it, and work
+    /// the eager optimizer queues on another stream is ordered after the compute stream first. Nothing the step reads
+    /// on the host afterwards skips a wait: the loss and finiteness readbacks wait on their own events. The barrier
+    /// only stopped the host preparing the next step while the device ran this one.
+    /// </summary>
+    private static void LaunchStepGraph(Engines.DirectGpu.IGpuGraphCapture cb, IntPtr exec)
+    {
+        cb.EnqueueCapturedGraph(exec);
+    }
+
     private void RefreshLossFromCapturedGraph(Engines.DirectGpuTensorEngine gte)
     {
         if (typeof(T) != typeof(float)) return;
+        if (TryDeferLossReadback(gte)) return;
         var fresh = gte.DownloadResidentBuffer(_lossOutput);
         if (fresh is null) return;
         var key = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
@@ -494,6 +523,53 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var dst = dstLease.Span;
         int n = Math.Min(dst.Length, fresh.Length);
         for (int i = 0; i < n; i++) dst[i] = (T)(object)fresh[i];
+    }
+
+    // Page-locked slot the captured step's loss is copied into after each launch (CUDA).
+    private Engines.DirectGpu.IDeviceReadback? _lossReadback;
+
+    /// <summary>
+    /// Queues the loss's device-to-host copy behind the step instead of waiting for it, and makes the copy the loss
+    /// tensor's pending host download: the host waits for the step only if something reads the loss. A blocking
+    /// download here drained the device every step, so the host could never prepare the next step while the device
+    /// ran this one. False when the backend has no readback or the loss is not on it; the caller downloads then.
+    /// </summary>
+    private bool TryDeferLossReadback(Engines.DirectGpuTensorEngine gte)
+    {
+        if (gte.GetBackend() is not { } backend || backend is not Engines.DirectGpu.IDeviceReadbackFactory factory)
+            return false;
+        var buffer = _lossOutput._gpuBuffer;
+        int count = _lossOutput.Length;
+        if (buffer is null || !ReferenceEquals(_lossOutput._gpuBackend, backend) || buffer.Handle == IntPtr.Zero
+            || count <= 0 || buffer.Size < count)
+            return false;
+        if (_lossOutput.GetBackingArrayForCacheLookupUnsafe() is not float[] host || host.Length < count)
+            return false;
+        _lossReadback ??= factory.CreateReadback(count * sizeof(float));
+        _lossReadback.Enqueue(buffer, count * sizeof(float));
+        ArmLossReadback(host);
+        return true;
+    }
+
+    /// <summary>Makes the queued loss readback the loss tensor's pending host download.</summary>
+    private void ArmLossReadback(float[] host)
+    {
+        if (_lossReadback is not { } readback) return;
+        Helpers.HostSync.Register(host, array =>
+        {
+            var values = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(readback.Read());
+            values.Slice(0, Math.Min(values.Length, ((float[])array).Length)).CopyTo((float[])array);
+        });
+    }
+
+    /// <summary>
+    /// Re-arms an unread loss readback after the step's end-of-step cleanup dropped the loss tensor's pending
+    /// download along with its device binding. The readback holds its own copy, so the binding is not needed.
+    /// </summary>
+    private void RearmUnreadLossReadback()
+    {
+        if (_lossReadback is { HasUnreadValue: true } && _lossOutput.GetBackingArrayForCacheLookupUnsafe() is float[] host)
+            ArmLossReadback(host);
     }
 
     private void InvalidateCapturedStepGraph()
@@ -1202,7 +1278,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private int _optimizerStep;
 
     /// <inheritdoc/>
-    public int OptimizerStep => _optimizerStep;
+    public int OptimizerStep
+    {
+        get
+        {
+            ResolveDeferredFiniteness();
+            return _optimizerStep;
+        }
+    }
 
     /// <inheritdoc/>
     public IReadOnlyList<Tensor<T>> OptimizedParameters => _optimizedParametersView ??= Array.AsReadOnly(_parameters);
@@ -1227,13 +1310,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// not learning" apart from "the model is diverging and its steps are being discarded" -- those
     /// look identical from the loss alone once the weights are already poisoned.
     /// </remarks>
-    public int NonFiniteStepsSkipped => _nonFiniteStepsSkipped;
+    public int NonFiniteStepsSkipped
+    {
+        get
+        {
+            ResolveDeferredFiniteness();
+            return _nonFiniteStepsSkipped;
+        }
+    }
 
     /// <summary>
     /// True when the most recent <see cref="Step"/> discarded its optimizer update because the
     /// gradients were not finite.
     /// </summary>
-    public bool LastStepSkippedNonFiniteGradients { get; private set; }
+    public bool LastStepSkippedNonFiniteGradients
+    {
+        get
+        {
+            ResolveDeferredFiniteness();
+            return _lastStepSkippedNonFiniteGradients;
+        }
+        private set => _lastStepSkippedNonFiniteGradients = value;
+    }
+
+    private bool _lastStepSkippedNonFiniteGradients;
 
     /// <summary>
     /// Resolves the authoritative gradient for every GPU-resident parameter before the optimizer
@@ -1336,7 +1436,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int[] lengths,
         OptimizerType optimizerType,
         float[][] paramArrays,
-        float[][] scheduleFreeEvalCopies)
+        float[][] scheduleFreeEvalCopies,
+        bool deferToDeviceGuard = false)
     {
         bool gradientsFinite = true;
         // Inspect host-authoritative gradients first. If one is already bad, avoid launching any
@@ -1358,7 +1459,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
         }
 
-        if (gradientsFinite && TryMultiTensorFiniteness(gpuGradients, gpuBackends, lengths, out bool deviceGradientsFinite))
+        if (gradientsFinite && TryMultiTensorFiniteness(gpuGradients, gpuBackends, lengths, deferToDeviceGuard, out bool deviceGradientsFinite))
         {
             gradientsFinite = deviceGradientsFinite;
         }
@@ -1450,6 +1551,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
+
+    // Device-guarded finiteness (CUDA multi-tensor Adam): the step's verdict is read back asynchronously and applied
+    // to the host bookkeeping by ResolveDeferredFiniteness before anything reads it.
+    private Engines.DirectGpu.IDeviceReadback? _finitenessReadback;
+    private object? _finitenessReadbackOwner;
+    private bool _finitenessDeferred;
+
+    /// <summary>
+    /// Applies a device-guarded step's finiteness verdict to the host bookkeeping. The kernel already discarded a
+    /// non-finite step on the device; this undoes its step-counter increment and records the skip, exactly as the
+    /// host-side check does before launching. Runs before the next optimizer step and before any read of the step
+    /// counter or skip state, so neither is ever observed unresolved.
+    /// </summary>
+    private void ResolveDeferredFiniteness()
+    {
+        if (!_finitenessDeferred) return;
+        _finitenessDeferred = false;
+        if (_finitenessReadback is not { } readback) return;
+        double sumSquares = System.Runtime.InteropServices.MemoryMarshal.Read<double>(readback.Read());
+        if (double.IsNaN(sumSquares) || double.IsInfinity(sumSquares))
+            MarkOptimizerStepDiscarded();
+    }
     private Engines.DirectGpu.IDirectGpuBackend? _finitenessBackend;
     private readonly List<Engines.DirectGpu.IGpuBuffer> _finitenessBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
     private readonly List<int> _finitenessSizes = new List<int>();
@@ -1469,6 +1592,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         Engines.DirectGpu.IGpuBuffer?[] gpuGradients,
         Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
         int[] lengths,
+        bool deferToDeviceGuard,
         out bool allFinite)
     {
         allFinite = true;
@@ -1499,6 +1623,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             _finitenessBackend = cuda;
         }
         ((Engines.DirectGpu.IDeviceScalarOps)cuda).MultiTensorSumOfSquares(buffers, sizes, _finitenessSumSquares);
+        if (deferToDeviceGuard && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
+        {
+            // The update kernel reads the sum itself and writes nothing when it is not finite; the host learns the
+            // outcome from a readback it waits on only at the next step (or when asked), so this step never blocks.
+            if (_finitenessReadback is null || !ReferenceEquals(_finitenessReadbackOwner, cuda))
+            {
+                _finitenessReadback?.Dispose();
+                _finitenessReadback = factory.CreateReadback(sizeof(double));
+                _finitenessReadbackOwner = cuda;
+            }
+            _finitenessReadback.Enqueue(_finitenessSumSquares, sizeof(double));
+            _finitenessDeferred = true;
+            return true;
+        }
         double sumSquares = BitConverter.ToDouble(cuda.DownloadByteBuffer(_finitenessSumSquares, sizeof(double)), 0);
         allFinite = !double.IsNaN(sumSquares) && !double.IsInfinity(sumSquares);
         return true;
@@ -1885,6 +2023,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
 
         var target = _optimizerRuntimeState!;
+        source.ResolveDeferredFiniteness();
         _optimizerStep = source._optimizerStep;
         _maxGradNorm = source._maxGradNorm;
         target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
@@ -2476,7 +2615,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         return StepResidentOrEager();
                     }
                     _stepGraphExec = exec;
-                    cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded indices
+                    LaunchStepGraph(cb, exec);   // executes THIS step on the just-uploaded indices
                     RefreshLossFromCapturedGraph(gte);
                     // The optimizer update is run eagerly (NOT captured): its closure
                     // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
@@ -2507,7 +2646,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     _graphStepDisabled = true;
                     return StepEager();
                 }
-                cb.LaunchCapturedGraph(_stepGraphExec);
+                LaunchStepGraph(cb, _stepGraphExec);
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
                 RefreshLossFromCapturedGraph(gte);
                 ApplyL2Regularization();
@@ -2573,7 +2712,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     // Forward outputs borrow the buffers of the results they alias; those are this step's
                     // activations and are released next. Drop the borrowed bindings first (the outputs are
-                    // recomputed next step, and the loss was already copied to the host), so nothing is left
+                    // recomputed next step, and the loss is held by its readback), so nothing is left
                     // pointing at a released buffer. Gradients, seed and loss-gradient destination own their
                     // buffers and are protected.
                     if (_forwardSteps != null)
@@ -2581,6 +2720,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             if (!ReferenceEquals(step.OutputBuffer, _lossGradDest)) DetachDeviceBinding(step.OutputBuffer);
                     gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false);
                     gte.ReclaimGpuMemoryUnderPressure();
+                    RearmUnreadLossReadback();
                 }
             }
         }
@@ -4198,6 +4338,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             gpuBackends, lengths, gpuFinitenessScratch,
             gpuFinitenessAggregate, gpuFinitenessReductionLengths);
 
+        _finitenessDeferred = false;
         _optimizerStep = 0;
         var b1 = beta1;
         var b2 = beta2;
@@ -4319,13 +4460,49 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try
             {
+            ResolveDeferredFiniteness();
             _optimizerStep++;
             ResolveAuthoritativeGpuGradients(
                 gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
+            // The multi-tensor Adam/AdamW launch is decided before the finiteness check: on CUDA its kernel discards a
+            // non-finite step itself, so the check need not wait for the device.
+            Engines.DirectGpu.IMultiTensorGpuOptimizerBackend? mtBackend = null;
+            List<Engines.DirectGpu.IGpuBuffer>? mtParams = null, mtGrads = null, mtM = null, mtV = null;
+            List<int>? mtSizes = null;
+            if ((optType == OptimizerType.Adam || optType == OptimizerType.AdamW)
+                && paramCount > 0
+                && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend mtCandidate
+                && !(gpuBackends[0] is Engines.DirectGpu.IGpuGraphCapture cbMt && cbMt.IsStreamCapturing()))
+            {
+                var candidateParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var candidateGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var candidateM = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var candidateV = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var candidateSizes = new List<int>(paramCount);
+                bool eligible = true;
+                for (int p = 0; eligible && p < paramCount; p++)
+                {
+                    if (!ReferenceEquals(gpuBackends[p], mtCandidate)) { eligible = false; break; }
+                    if (gpuParam[p] is not { } gp) { eligible = false; break; }
+                    if (gpuMomentStorage[p] != FusedMomentStorageMode.Float32) { eligible = false; break; }
+                    if (gpuM[p] is not { } gm || gpuV[p] is not { } gv) { eligible = false; break; }
+                    int lp = lengths[p];
+                    if (lp <= 0) { eligible = false; break; }
+                    var gradResident = gpuGrad[p];
+                    if (gradResident is null) { eligible = false; break; }
+                    candidateParams.Add(gp); candidateGrads.Add(gradResident); candidateM.Add(gm); candidateV.Add(gv); candidateSizes.Add(lp);
+                }
+                if (eligible && candidateParams.Count == paramCount)
+                {
+                    mtBackend = mtCandidate;
+                    mtParams = candidateParams; mtGrads = candidateGrads; mtM = candidateM; mtV = candidateV; mtSizes = candidateSizes;
+                }
+            }
+            bool deviceGuarded = mtBackend is not null;
             if (TryDiscardNonFiniteOptimizerStep(
                 gradArrays, gradOffsets, gpuGrad, gpuBackends, gpuFinitenessScratch,
                 gpuFinitenessAggregate, gpuFinitenessReductionLengths,
-                paramOffsets, lengths, optimizerType, paramArrays, v))
+                paramOffsets, lengths, optimizerType, paramArrays, v, deferToDeviceGuard: deviceGuarded))
             {
                 return;
             }
@@ -4678,47 +4855,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // zero length, mixed backends) falls through to the per-tensor loop below, which is
             // unchanged and remains the fallback. Numerically identical to that loop — same kernel
             // math per element, only the launch batching differs.
-            if ((optType == OptimizerType.Adam || optType == OptimizerType.AdamW)
-                && paramCount > 0
-                && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend mtBackend)
+            if (mtBackend is not null && mtParams is not null && mtGrads is not null && mtM is not null
+                && mtV is not null && mtSizes is not null)
             {
-                bool eligible = !(gpuBackends[0] is Engines.DirectGpu.IGpuGraphCapture cbMt && cbMt.IsStreamCapturing());
-                var mtParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
-                var mtGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
-                var mtM = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
-                var mtV = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
-                var mtSizes = new List<int>(paramCount);
-                for (int p = 0; eligible && p < paramCount; p++)
+                if (_finitenessDeferred && _finitenessSumSquares is { } finiteGuard)
+                    mtBackend.AdamMultiTensorUpdateGuarded(optType == OptimizerType.AdamW,
+                        mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep, finiteGuard);
+                else if (optType == OptimizerType.AdamW)
+                    mtBackend.AdamWMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
+                else
+                    mtBackend.AdamMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
+                // Per-param post-update bookkeeping (version sync + re-arm deferred download),
+                // mirroring the per-tensor GPU path so eval/forward see the fresh resident weights.
+                for (int p = 0; p < paramCount; p++)
                 {
-                    if (!ReferenceEquals(gpuBackends[p], mtBackend)) { eligible = false; break; }
-                    if (gpuParam[p] is not { } gp) { eligible = false; break; }
-                    if (gpuMomentStorage[p] != FusedMomentStorageMode.Float32) { eligible = false; break; }
-                    if (gpuM[p] is not { } gm || gpuV[p] is not { } gv) { eligible = false; break; }
-                    int lp = lengths[p];
-                    if (lp <= 0) { eligible = false; break; }
-                    var gradResident = gpuGrad[p];
-                    if (gradResident is null) { eligible = false; break; }
-                    mtParams.Add(gp); mtGrads.Add(gradResident); mtM.Add(gm); mtV.Add(gv); mtSizes.Add(lp);
-                }
-                if (eligible && mtParams.Count == paramCount)
-                {
-                    if (optType == OptimizerType.AdamW)
-                        mtBackend.AdamWMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
-                    else
-                        mtBackend.AdamMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
-                    // Per-param post-update bookkeeping (version sync + re-arm deferred download),
-                    // mirroring the per-tensor GPU path so eval/forward see the fresh resident weights.
-                    for (int p = 0; p < paramCount; p++)
+                    _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+                    if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
                     {
-                        _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
-                        if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
-                        {
-                            rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
-                            CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
-                        }
+                        rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                        CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
                     }
-                    return;
                 }
+                return;
             }
 
             for (int p = 0; p < paramCount; p++)
@@ -5373,6 +5531,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             gpuBackends, lengths, gpuFinitenessScratch,
             gpuFinitenessAggregate, gpuFinitenessReductionLengths);
 
+        _finitenessDeferred = false;
         _optimizerStep = 0;
         var b1 = beta1;
         var b2 = beta2;
@@ -5427,6 +5586,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try
             {
+            ResolveDeferredFiniteness();
             _optimizerStep++;
             ResolveAuthoritativeGpuGradients(
                 gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
@@ -5887,6 +6047,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try
             {
+            ResolveDeferredFiniteness();
             _optimizerStep++;
             if (TryDiscardNonFiniteOptimizerStep(gradArrays, gradOffsets, paramArrays, lengths))
             {
@@ -6090,6 +6251,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try
             {
+            ResolveDeferredFiniteness();
             _optimizerStep++;
             if (TryDiscardNonFiniteOptimizerStep(gradArrays, gradOffsets, paramArrays, lengths))
             {
