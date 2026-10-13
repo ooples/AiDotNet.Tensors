@@ -314,8 +314,9 @@ export async function readBuffer(bufferId, sizeBytes, offsetBytes) {
 
     // Map and read
     await stagingBuffer.mapAsync(GPUMapMode.READ);
-    const arrayBuffer = stagingBuffer.getMappedRange();
-    const result = new Float32Array(arrayBuffer.slice(0));
+    // A pooled staging buffer can be larger than this read: map and return only the requested range.
+    const arrayBuffer = stagingBuffer.getMappedRange(0, alignedSize);
+    const result = new Float32Array(arrayBuffer.slice(0, alignedSize));
     stagingBuffer.unmap();
 
     // Return staging buffer to pool
@@ -337,8 +338,9 @@ export async function readBufferAsJson(bufferId, sizeBytes, offsetBytes) {
     if (!result || result.length === 0) {
         return '[]';
     }
-    // Convert Float32Array to regular array for JSON serialization
-    return JSON.stringify(Array.from(result));
+    // JSON has no NaN or Infinity (JSON.stringify writes null for them) and writes -0 as 0, so those travel as the
+    // strings "NaN", "Infinity", "-Infinity" and "-0", which the C# side reads back as numbers.
+    return JSON.stringify(Array.from(result, v => Number.isFinite(v) ? (Object.is(v, -0) ? '-0' : v) : String(v)));
 }
 
 /**
@@ -373,7 +375,7 @@ export async function readByteBufferAsJson(bufferId, sizeBytes, offsetBytes) {
     queue.submit([commandEncoder.finish()]);
 
     await stagingBuffer.mapAsync(GPUMapMode.READ);
-    const arrayBuffer = stagingBuffer.getMappedRange();
+    const arrayBuffer = stagingBuffer.getMappedRange(0, alignedSize);
     const result = new Uint8Array(arrayBuffer.slice(0, sizeBytes));
     stagingBuffer.unmap();
 
@@ -530,13 +532,8 @@ export function createBindGroup(pipelineId, bufferIds) {
             };
         });
 
-        const bindGroup = device.createBindGroup({
-            layout: pipeline.getBindGroupLayout(0),
-            entries: entries
-        });
-
         const id = nextBindGroupId++;
-        bindGroups.set(id, bindGroup);
+        bindGroups.set(id, { entries: entries, resolved: null, resolvedUniform: null });
         return id;
     } catch (error) {
         console.error('Failed to create bind group:', error);
@@ -574,13 +571,8 @@ export function createBindGroupRanges(pipelineId, bufferIds, offsets, sizes) {
             };
         });
 
-        const bindGroup = device.createBindGroup({
-            layout: pipeline.getBindGroupLayout(0),
-            entries: entries
-        });
-
         const id = nextBindGroupId++;
-        bindGroups.set(id, bindGroup);
+        bindGroups.set(id, { entries: entries, resolved: null, resolvedUniform: null });
         return id;
     } catch (error) {
         console.error('Failed to create ranged bind group:', error);
@@ -591,6 +583,26 @@ export function createBindGroupRanges(pipelineId, bufferIds, offsets, sizes) {
  * Destroys a bind group.
  * @param {number} bindGroupId - Bind group ID.
  */
+/**
+ * The GPU bind group for a recorded set of entries. createBindGroup only records the storage buffers: a kernel's
+ * parameters live in a uniform buffer bound after them (binding index = storage buffer count), and that buffer is
+ * only known at dispatch. A bind group has to match the pipeline's layout exactly, so it cannot be created without it.
+ */
+function resolveBindGroup(record, pipeline, uniformBuffer) {
+    if (uniformBuffer) {
+        if (record.resolved && record.resolvedUniform === uniformBuffer) return record.resolved;
+        const entries = record.entries.concat([{ binding: record.entries.length, resource: { buffer: uniformBuffer } }]);
+        record.resolved = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: entries });
+        record.resolvedUniform = uniformBuffer;
+        return record.resolved;
+    }
+    if (!record.resolved || record.resolvedUniform) {
+        record.resolved = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: record.entries });
+        record.resolvedUniform = null;
+    }
+    return record.resolved;
+}
+
 export function destroyBindGroup(bindGroupId) {
     bindGroups.delete(bindGroupId);
 }
@@ -618,7 +630,7 @@ export async function dispatchCompute(pipelineId, bindGroupId, workgroupsX, work
     const passEncoder = commandEncoder.beginComputePass();
 
     passEncoder.setPipeline(pipeline);
-    passEncoder.setBindGroup(0, bindGroup);
+    passEncoder.setBindGroup(0, resolveBindGroup(bindGroup, pipeline, null));
     passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
     passEncoder.end();
 
@@ -645,17 +657,17 @@ export async function dispatchComputeWithUniforms(pipelineId, bindGroupId, unifo
         console.error('Pipeline or bind group not found');
         return;
     }
+    if (!uniformBuffer) {
+        console.error(`Uniform buffer ${uniformBufferId} not found`);
+        return;
+    }
 
     const commandEncoder = device.createCommandEncoder();
     const passEncoder = commandEncoder.beginComputePass();
 
     passEncoder.setPipeline(pipeline);
-    passEncoder.setBindGroup(0, bindGroup);
-
-    // Set uniform buffer in group 0 at the next available binding
-    // Note: This assumes uniforms are at binding index equal to storage buffer count
-    // For proper production use, uniform bindings should be explicit in the bind group
-
+    // The uniform buffer is the binding after the storage buffers.
+    passEncoder.setBindGroup(0, resolveBindGroup(bindGroup, pipeline, uniformBuffer));
     passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
     passEncoder.end();
 

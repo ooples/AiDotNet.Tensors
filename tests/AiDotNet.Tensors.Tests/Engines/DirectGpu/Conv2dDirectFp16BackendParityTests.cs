@@ -270,11 +270,55 @@ public sealed class Conv2dDirectFp16BackendParityTests
 
 #if NET7_0_OR_GREATER
     [SkippableFact]
-    public void WebGpu_DirectFp16Conv_MatchesTheFp16RoundedCpuReference()
+    public void WebGpu_ReportsNoDirectFp16Conv_AndItsRouteIsTheConvolutionOverItsOwnFp16Weights()
     {
-        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend();
-        Skip.IfNot(backend.IsAvailable, "WebGPU is not available.");
-        Check(backend);
+        // The real backend, executing on Dawn (see DawnHostedWebGpu). WebGPU models FP16 as f32 values with a 10-bit
+        // mantissa, one per element, so the shared kernel (packed halves) does not apply: the capability is false and
+        // the route is the FP32 convolution over the weights its own ConvertToFp16 produced. Running the backend on
+        // Dawn is what showed the shared kernel returning garbage for those buffers.
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        var route = (IFp16ActivationBackend)backend;
+        Assert.False(route.Fp16DirectConvAvailable);
+
+        const int inC = 5, size = 6, outC = 3, k = 3;
+        int outSize = OutExtent(size, k, 1, 1, 1);
+        var rng = new Random(99);
+        var input = new float[inC * size * size];
+        var weights = new float[outC * inC * k * k];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < weights.Length; i++) weights[i] = (float)(rng.NextDouble() * 2 - 1);
+        using var dInput = backend.AllocateBuffer(input);
+        using var dWeights = backend.AllocateBuffer(weights);
+        using var dWeightsHalf = backend.AllocateBuffer(weights.Length);   // one f32 per element on this backend
+        backend.ConvertToFp16(dWeights, dWeightsHalf, weights.Length);
+        float[] stored = backend.DownloadBuffer(dWeightsHalf);
+        // Each stored weight is a value FP16 can hold, within one FP16 step of the original.
+        for (int i = 0; i < weights.Length; i++)
+        {
+            Assert.Equal(stored[i], AsHalf(stored[i]));
+            Assert.True(Math.Abs(stored[i] - weights[i]) <= 1e-3 * Math.Max(1f, Math.Abs(weights[i])), $"weight {i}: {weights[i]} stored as {stored[i]}");
+        }
+
+        using var dOut = backend.AllocateBuffer(outC * outSize * outSize);
+        backend.Fill(dOut, float.NaN, outC * outSize * outSize);
+        route.Conv2dDirectFp16Hw(dInput, dWeightsHalf, dOut, 1, inC, size, size, outC, outSize, outSize, k, k, 1, 1, 1, 1, 1, 1);
+        float[] got = backend.DownloadBuffer(dOut);
+        for (int oc = 0; oc < outC; oc++)
+            for (int oh = 0; oh < outSize; oh++)
+                for (int ow = 0; ow < outSize; ow++)
+                {
+                    double acc = 0;
+                    for (int ic = 0; ic < inC; ic++)
+                        for (int r = 0; r < k; r++)
+                            for (int c = 0; c < k; c++)
+                            {
+                                int ih = oh - 1 + r, iw = ow - 1 + c;
+                                if (ih < 0 || ih >= size || iw < 0 || iw >= size) continue;
+                                acc += (double)input[(ic * size + ih) * size + iw] * stored[((oc * inC + ic) * k + r) * k + c];
+                            }
+                    float actual = got[(oc * outSize + oh) * outSize + ow];
+                    Assert.True(Math.Abs(acc - actual) <= 1e-5 * Math.Max(1.0, Math.Abs(acc)), $"[{oc},{oh},{ow}] expected {acc}, got {actual}");
+                }
     }
 
     // The shared kernel through a launcher (the WebGPU WGSL port on Dawn), with buffers on the host backend.
