@@ -269,9 +269,9 @@ public sealed class FusedDecodeLinearBackendParityTests
     [SkippableFact]
     public void WebGpu_FusedDecodeLinear_MatchesTheCpuOracle()
     {
-        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend();
-        Skip.IfNot(backend.IsAvailable, "WebGPU is not available.");
-        Check(backend);
+        // The real backend, executing on Dawn (see DawnHostedWebGpu). A freshly constructed WebGpuBackend is never
+        // available outside a browser, so the old form of this test could only skip.
+        Check(DawnHostedWebGpu.BackendOrSkip());
     }
 
     // The shared dl_p_ kernels through a launcher (the WebGPU WGSL ports on Dawn), with buffers on the host backend.

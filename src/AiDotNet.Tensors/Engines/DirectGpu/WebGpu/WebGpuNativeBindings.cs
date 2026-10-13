@@ -31,38 +31,76 @@ public static partial class WebGpuNativeBindings
 {
     private const string ModuleName = "./js/webgpu-tensors.js";
 
+    /// <summary>
+    /// When set, every call below goes to this host and not to the browser's JS runtime. A host runs the same
+    /// <c>webgpu-tensors.js</c> module somewhere other than a Blazor WebAssembly page (the tests run it in Node on
+    /// Dawn), which is the only way the backend's own dispatch executes outside a browser. Null in production.
+    /// </summary>
+    internal static IWebGpuJsHost? Host { get; set; }
+
+    // NaN and the infinities have no JSON number form; both sides carry them as the strings "NaN", "Infinity" and
+    // "-Infinity", which is also what a JS typed array constructor turns back into the right value. A read also
+    // sends negative zero as the string "-0", because JSON.stringify writes it as 0.
+    private static readonly System.Text.Json.JsonSerializerOptions HostJson = new()
+    {
+        NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
+            | System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString,
+    };
+
+    private static string Args(params object?[] arguments) => System.Text.Json.JsonSerializer.Serialize(arguments, HostJson);
+
+    private static T HostValue<T>(string json) => System.Text.Json.JsonSerializer.Deserialize<T>(json, HostJson)!;
+
     #region Initialization
 
     /// <summary>
     /// Checks if WebGPU is supported in the current browser.
     /// </summary>
+    public static bool IsWebGpuSupported()
+        => Host is { } host ? HostValue<bool>(host.Invoke("isWebGpuSupported", Args())) : JsIsWebGpuSupported();
+
     [JSImport("isWebGpuSupported", ModuleName)]
-    public static partial bool IsWebGpuSupported();
+    private static partial bool JsIsWebGpuSupported();
 
     /// <summary>
     /// Initializes WebGPU and requests an adapter and device.
     /// </summary>
     /// <returns>True if initialization succeeded.</returns>
+    public static Task<bool> InitializeWebGpuAsync()
+        => Host is { } host ? Task.FromResult(HostValue<bool>(host.Invoke("initializeWebGpu", Args()))) : JsInitializeWebGpuAsync();
+
     [JSImport("initializeWebGpu", ModuleName)]
-    public static partial Task<bool> InitializeWebGpuAsync();
+    private static partial Task<bool> JsInitializeWebGpuAsync();
 
     /// <summary>
     /// Gets the adapter name/description.
     /// </summary>
+    public static string GetAdapterInfo()
+        => Host is { } host ? HostValue<string>(host.Invoke("getAdapterInfo", Args())) : JsGetAdapterInfo();
+
     [JSImport("getAdapterInfo", ModuleName)]
-    public static partial string GetAdapterInfo();
+    private static partial string JsGetAdapterInfo();
 
     /// <summary>
     /// Gets device limits (max buffer size, max compute invocations, etc.).
     /// </summary>
-    [JSImport("getDeviceLimits", ModuleName)]
-    public static partial string GetDeviceLimitsJson();
+    public static string GetDeviceLimitsJson()
+        => Host is { } host ? HostValue<string>(host.Invoke("getDeviceLimitsJson", Args())) : JsGetDeviceLimitsJson();
+
+    [JSImport("getDeviceLimitsJson", ModuleName)]
+    private static partial string JsGetDeviceLimitsJson();
 
     /// <summary>
     /// Destroys the WebGPU device and releases resources.
     /// </summary>
+    public static void DestroyDevice()
+    {
+        if (Host is { } host) host.Invoke("destroyDevice", Args());
+        else JsDestroyDevice();
+    }
+
     [JSImport("destroyDevice", ModuleName)]
-    public static partial void DestroyDevice();
+    private static partial void JsDestroyDevice();
 
     #endregion
 
@@ -74,21 +112,36 @@ public static partial class WebGpuNativeBindings
     /// <param name="sizeBytes">Size in bytes.</param>
     /// <param name="usage">Buffer usage flags (STORAGE, COPY_SRC, COPY_DST, MAP_READ, MAP_WRITE).</param>
     /// <returns>Buffer handle ID.</returns>
+    public static int CreateBuffer(int sizeBytes, int usage)
+        => Host is { } host ? HostValue<int>(host.Invoke("createBuffer", Args(sizeBytes, usage))) : JsCreateBuffer(sizeBytes, usage);
+
     [JSImport("createBuffer", ModuleName)]
-    public static partial int CreateBuffer(int sizeBytes, int usage);
+    private static partial int JsCreateBuffer(int sizeBytes, int usage);
 
     /// <summary>
     /// Destroys a GPU buffer.
     /// </summary>
     /// <param name="bufferId">Buffer handle ID.</param>
+    public static void DestroyBuffer(int bufferId)
+    {
+        if (Host is { } host) host.Invoke("destroyBuffer", Args(bufferId));
+        else JsDestroyBuffer(bufferId);
+    }
+
     [JSImport("destroyBuffer", ModuleName)]
-    public static partial void DestroyBuffer(int bufferId);
+    private static partial void JsDestroyBuffer(int bufferId);
 
     /// <summary>
     /// Writes data to a GPU buffer (internal double[] version for JS interop).
     /// </summary>
+    internal static void WriteBufferInternal(int bufferId, double[] data, int offsetBytes)
+    {
+        if (Host is { } host) host.Invoke("writeBuffer", Args(bufferId, data, offsetBytes));
+        else JsWriteBufferInternal(bufferId, data, offsetBytes);
+    }
+
     [JSImport("writeBuffer", ModuleName)]
-    internal static partial void WriteBufferInternal(int bufferId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] data, int offsetBytes);
+    private static partial void JsWriteBufferInternal(int bufferId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] data, int offsetBytes);
 
     /// <summary>
     /// Writes data to a GPU buffer.
@@ -109,8 +162,14 @@ public static partial class WebGpuNativeBindings
     /// <summary>
     /// Writes raw bytes to a GPU buffer (internal double[] version for JS interop).
     /// </summary>
+    internal static void WriteByteBufferInternal(int bufferId, double[] data, int offsetBytes)
+    {
+        if (Host is { } host) host.Invoke("writeByteBuffer", Args(bufferId, data, offsetBytes));
+        else JsWriteByteBufferInternal(bufferId, data, offsetBytes);
+    }
+
     [JSImport("writeByteBuffer", ModuleName)]
-    internal static partial void WriteByteBufferInternal(int bufferId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] data, int offsetBytes);
+    private static partial void JsWriteByteBufferInternal(int bufferId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] data, int offsetBytes);
 
     /// <summary>
     /// Writes raw bytes to a GPU buffer.
@@ -132,16 +191,22 @@ public static partial class WebGpuNativeBindings
     /// Since Task{T[]} is not supported by JS interop for complex types,
     /// we return a JSON string that can be parsed on the C# side.
     /// </remarks>
+    internal static Task<string> ReadBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes)
+        => Host is { } host ? Task.FromResult(HostValue<string>(host.Invoke("readBufferAsJson", Args(bufferId, sizeBytes, offsetBytes)))) : JsReadBufferAsJsonAsync(bufferId, sizeBytes, offsetBytes);
+
     [JSImport("readBufferAsJson", ModuleName)]
     [return: JSMarshalAs<JSType.Promise<JSType.String>>]
-    internal static partial Task<string> ReadBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
+    private static partial Task<string> JsReadBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
 
     /// <summary>
     /// Reads raw bytes from a GPU buffer. Returns JSON string of byte values.
     /// </summary>
+    internal static Task<string> ReadByteBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes)
+        => Host is { } host ? Task.FromResult(HostValue<string>(host.Invoke("readByteBufferAsJson", Args(bufferId, sizeBytes, offsetBytes)))) : JsReadByteBufferAsJsonAsync(bufferId, sizeBytes, offsetBytes);
+
     [JSImport("readByteBufferAsJson", ModuleName)]
     [return: JSMarshalAs<JSType.Promise<JSType.String>>]
-    internal static partial Task<string> ReadByteBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
+    private static partial Task<string> JsReadByteBufferAsJsonAsync(int bufferId, int sizeBytes, int offsetBytes);
 
     /// <summary>
     /// Reads data from a GPU buffer.
@@ -159,7 +224,7 @@ public static partial class WebGpuNativeBindings
         }
 
         // Parse JSON array of numbers
-        var values = System.Text.Json.JsonSerializer.Deserialize<double[]>(jsonData);
+        var values = System.Text.Json.JsonSerializer.Deserialize<double[]>(jsonData, HostJson);
         if (values is null)
         {
             return Array.Empty<float>();
@@ -184,7 +249,7 @@ public static partial class WebGpuNativeBindings
             return Array.Empty<byte>();
         }
 
-        var values = System.Text.Json.JsonSerializer.Deserialize<double[]>(jsonData);
+        var values = System.Text.Json.JsonSerializer.Deserialize<double[]>(jsonData, HostJson);
         if (values is null)
         {
             return Array.Empty<byte>();
@@ -201,8 +266,14 @@ public static partial class WebGpuNativeBindings
     /// <summary>
     /// Copies data between GPU buffers.
     /// </summary>
+    public static void CopyBufferToBuffer(int srcBufferId, int srcOffset, int dstBufferId, int dstOffset, int sizeBytes)
+    {
+        if (Host is { } host) host.Invoke("copyBufferToBuffer", Args(srcBufferId, srcOffset, dstBufferId, dstOffset, sizeBytes));
+        else JsCopyBufferToBuffer(srcBufferId, srcOffset, dstBufferId, dstOffset, sizeBytes);
+    }
+
     [JSImport("copyBufferToBuffer", ModuleName)]
-    public static partial void CopyBufferToBuffer(int srcBufferId, int srcOffset, int dstBufferId, int dstOffset, int sizeBytes);
+    private static partial void JsCopyBufferToBuffer(int srcBufferId, int srcOffset, int dstBufferId, int dstOffset, int sizeBytes);
 
     #endregion
 
@@ -213,8 +284,11 @@ public static partial class WebGpuNativeBindings
     /// </summary>
     /// <param name="wgslSource">WGSL shader source code.</param>
     /// <returns>Shader module ID.</returns>
+    public static int CreateShaderModule(string wgslSource)
+        => Host is { } host ? HostValue<int>(host.Invoke("createShaderModule", Args(wgslSource))) : JsCreateShaderModule(wgslSource);
+
     [JSImport("createShaderModule", ModuleName)]
-    public static partial int CreateShaderModule(string wgslSource);
+    private static partial int JsCreateShaderModule(string wgslSource);
 
     /// <summary>
     /// Creates a compute pipeline from a shader module.
@@ -222,20 +296,35 @@ public static partial class WebGpuNativeBindings
     /// <param name="shaderModuleId">Shader module ID.</param>
     /// <param name="entryPoint">Entry point function name.</param>
     /// <returns>Pipeline ID.</returns>
+    public static Task<int> CreateComputePipelineAsync(int shaderModuleId, string entryPoint)
+        => Host is { } host ? Task.FromResult(HostValue<int>(host.Invoke("createComputePipeline", Args(shaderModuleId, entryPoint)))) : JsCreateComputePipelineAsync(shaderModuleId, entryPoint);
+
     [JSImport("createComputePipeline", ModuleName)]
-    public static partial Task<int> CreateComputePipelineAsync(int shaderModuleId, string entryPoint);
+    private static partial Task<int> JsCreateComputePipelineAsync(int shaderModuleId, string entryPoint);
 
     /// <summary>
     /// Destroys a shader module.
     /// </summary>
+    public static void DestroyShaderModule(int shaderModuleId)
+    {
+        if (Host is { } host) host.Invoke("destroyShaderModule", Args(shaderModuleId));
+        else JsDestroyShaderModule(shaderModuleId);
+    }
+
     [JSImport("destroyShaderModule", ModuleName)]
-    public static partial void DestroyShaderModule(int shaderModuleId);
+    private static partial void JsDestroyShaderModule(int shaderModuleId);
 
     /// <summary>
     /// Destroys a compute pipeline.
     /// </summary>
+    public static void DestroyPipeline(int pipelineId)
+    {
+        if (Host is { } host) host.Invoke("destroyPipeline", Args(pipelineId));
+        else JsDestroyPipeline(pipelineId);
+    }
+
     [JSImport("destroyPipeline", ModuleName)]
-    public static partial void DestroyPipeline(int pipelineId);
+    private static partial void JsDestroyPipeline(int pipelineId);
 
     #endregion
 
@@ -244,8 +333,11 @@ public static partial class WebGpuNativeBindings
     /// <summary>
     /// Creates a bind group for a compute operation (internal double[] version for JS interop).
     /// </summary>
+    internal static int CreateBindGroupInternal(int pipelineId, double[] bufferIds)
+        => Host is { } host ? HostValue<int>(host.Invoke("createBindGroup", Args(pipelineId, bufferIds))) : JsCreateBindGroupInternal(pipelineId, bufferIds);
+
     [JSImport("createBindGroup", ModuleName)]
-    internal static partial int CreateBindGroupInternal(int pipelineId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] bufferIds);
+    private static partial int JsCreateBindGroupInternal(int pipelineId, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] bufferIds);
 
     /// <summary>
     /// Creates a bind group for a compute operation.
@@ -263,8 +355,11 @@ public static partial class WebGpuNativeBindings
         return CreateBindGroupInternal(pipelineId, doubleIds);
     }
 
+    internal static int CreateBindGroupRangesInternal(int pipelineId, double[] bufferIds, double[] offsetBytes, double[] sizeBytes)
+        => Host is { } host ? HostValue<int>(host.Invoke("createBindGroupRanges", Args(pipelineId, bufferIds, offsetBytes, sizeBytes))) : JsCreateBindGroupRangesInternal(pipelineId, bufferIds, offsetBytes, sizeBytes);
+
     [JSImport("createBindGroupRanges", ModuleName)]
-    internal static partial int CreateBindGroupRangesInternal(int pipelineId,
+    private static partial int JsCreateBindGroupRangesInternal(int pipelineId,
         [JSMarshalAs<JSType.Array<JSType.Number>>] double[] bufferIds,
         [JSMarshalAs<JSType.Array<JSType.Number>>] double[] offsetBytes,
         [JSMarshalAs<JSType.Array<JSType.Number>>] double[] sizeBytes);
@@ -290,8 +385,14 @@ public static partial class WebGpuNativeBindings
     /// <summary>
     /// Destroys a bind group.
     /// </summary>
+    public static void DestroyBindGroup(int bindGroupId)
+    {
+        if (Host is { } host) host.Invoke("destroyBindGroup", Args(bindGroupId));
+        else JsDestroyBindGroup(bindGroupId);
+    }
+
     [JSImport("destroyBindGroup", ModuleName)]
-    public static partial void DestroyBindGroup(int bindGroupId);
+    private static partial void JsDestroyBindGroup(int bindGroupId);
 
     /// <summary>
     /// Dispatches a compute operation.
@@ -301,8 +402,15 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsX">Number of workgroups in X dimension.</param>
     /// <param name="workgroupsY">Number of workgroups in Y dimension.</param>
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
+    public static Task DispatchComputeAsync(int pipelineId, int bindGroupId, int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        if (Host is not { } host) return JsDispatchComputeAsync(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ);
+        host.Invoke("dispatchCompute", Args(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ));
+        return Task.CompletedTask;
+    }
+
     [JSImport("dispatchCompute", ModuleName)]
-    public static partial Task DispatchComputeAsync(int pipelineId, int bindGroupId, int workgroupsX, int workgroupsY, int workgroupsZ);
+    private static partial Task JsDispatchComputeAsync(int pipelineId, int bindGroupId, int workgroupsX, int workgroupsY, int workgroupsZ);
 
     /// <summary>
     /// Dispatches a compute operation with uniform buffer.
@@ -313,14 +421,28 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsX">Number of workgroups in X dimension.</param>
     /// <param name="workgroupsY">Number of workgroups in Y dimension.</param>
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
+    public static Task DispatchComputeWithUniformsAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        if (Host is not { } host) return JsDispatchComputeWithUniformsAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ);
+        host.Invoke("dispatchComputeWithUniforms", Args(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ));
+        return Task.CompletedTask;
+    }
+
     [JSImport("dispatchComputeWithUniforms", ModuleName)]
-    public static partial Task DispatchComputeWithUniformsAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroupsX, int workgroupsY, int workgroupsZ);
+    private static partial Task JsDispatchComputeWithUniformsAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroupsX, int workgroupsY, int workgroupsZ);
 
     /// <summary>
     /// Submits all pending GPU commands and waits for completion.
     /// </summary>
+    public static Task SubmitAndWaitAsync()
+    {
+        if (Host is not { } host) return JsSubmitAndWaitAsync();
+        host.Invoke("submitAndWait", Args());
+        return Task.CompletedTask;
+    }
+
     [JSImport("submitAndWait", ModuleName)]
-    public static partial Task SubmitAndWaitAsync();
+    private static partial Task JsSubmitAndWaitAsync();
 
     #endregion
 
@@ -329,20 +451,32 @@ public static partial class WebGpuNativeBindings
     /// <summary>
     /// Creates a GPU timestamp query for profiling.
     /// </summary>
+    public static int CreateTimestampQuery()
+        => Host is { } host ? HostValue<int>(host.Invoke("createTimestampQuery", Args())) : JsCreateTimestampQuery();
+
     [JSImport("createTimestampQuery", ModuleName)]
-    public static partial int CreateTimestampQuery();
+    private static partial int JsCreateTimestampQuery();
 
     /// <summary>
     /// Reads timestamp query results in nanoseconds.
     /// </summary>
+    public static Task<double> ReadTimestampQueryAsync(int queryId)
+        => Host is { } host ? Task.FromResult(HostValue<double>(host.Invoke("readTimestampQuery", Args(queryId)))) : JsReadTimestampQueryAsync(queryId);
+
     [JSImport("readTimestampQuery", ModuleName)]
-    public static partial Task<double> ReadTimestampQueryAsync(int queryId);
+    private static partial Task<double> JsReadTimestampQueryAsync(int queryId);
 
     /// <summary>
     /// Destroys a timestamp query.
     /// </summary>
+    public static void DestroyTimestampQuery(int queryId)
+    {
+        if (Host is { } host) host.Invoke("destroyTimestampQuery", Args(queryId));
+        else JsDestroyTimestampQuery(queryId);
+    }
+
     [JSImport("destroyTimestampQuery", ModuleName)]
-    public static partial void DestroyTimestampQuery(int queryId);
+    private static partial void JsDestroyTimestampQuery(int queryId);
 
     #endregion
 }
