@@ -133,28 +133,40 @@ public class PerformanceComparison
         var a = new float[M * K];
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
 
-        using var session = new InferenceSession(bytes);
+        // Fair method (#1248): ORT's intra-op pool keeps spinning after Run by default, which takes the cores our
+        // pool is about to use, so the arm measured right after ORT paid a one-off multi-millisecond stall that a
+        // 100-call mean then reported as a 10x gap. Spinning is off, both arms warm up past tiered JIT, and the
+        // comparison uses per-call medians.
+        using var sessionOptions = new SessionOptions();
+        sessionOptions.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
+        using var session = new InferenceSession(bytes, sessionOptions);
         var ortFeed = new[] { Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(
             "A", new Microsoft.ML.OnnxRuntime.Tensors.DenseTensor<float>(a, new[] { M, K })) };
-        for (int i = 0; i < 3; i++) { using var _ = session.Run(ortFeed); }
+        for (int i = 0; i < 30; i++) { using var _ = session.Run(ortFeed); }
 
         using var stream = new MemoryStream(bytes);
         var result = OnnxImporter.Import<float>(stream, new CpuEngine());
         a.AsSpan().CopyTo(result.Inputs["A"].AsWritableSpan());
-        for (int i = 0; i < 5; i++) result.Plan!.Execute();
+        result.Inputs["A"].MarkModified();
+        for (int i = 0; i < 50; i++) result.Plan!.Execute();
 
         const int iters = 100;
-        var ortTimer = Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++) { using var _ = session.Run(ortFeed); }
-        ortTimer.Stop();
-        var oursTimer = Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++) result.Plan!.Execute();
-        oursTimer.Stop();
-
-        double ortMs = ortTimer.Elapsed.TotalMilliseconds / iters;
-        double oursMs = oursTimer.Elapsed.TotalMilliseconds / iters;
+        double MedianMs(Action run)
+        {
+            var samples = new double[iters];
+            for (int i = 0; i < iters; i++)
+            {
+                long start = Stopwatch.GetTimestamp();
+                run();
+                samples[i] = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
+            }
+            Array.Sort(samples);
+            return samples[iters / 2];
+        }
+        double ortMs = MedianMs(() => { using var _ = session.Run(ortFeed); });
+        double oursMs = MedianMs(() => result.Plan!.Execute());
         _output.WriteLine(
-            $"MatMul+Add+Relu chain (M={M}, K={K}, N={N}) — ORT: {ortMs:F3} ms/iter, " +
+            $"MatMul+Add+Relu chain (M={M}, K={K}, N={N}) — median ORT: {ortMs:F3} ms/iter, " +
             $"Ours: {oursMs:F3} ms/iter, ratio: {oursMs / ortMs:F2}x");
         // Same regression-only cap: within 5× of ORT on the fused-linear
         // pattern that transformer FFN blocks hit.
