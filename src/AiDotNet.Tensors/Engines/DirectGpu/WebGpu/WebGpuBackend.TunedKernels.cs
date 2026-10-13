@@ -1,3 +1,4 @@
+#if NET7_0_OR_GREATER
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -392,3 +393,4 @@ public sealed partial class WebGpuBackend
         }
     }
 }
+#endif

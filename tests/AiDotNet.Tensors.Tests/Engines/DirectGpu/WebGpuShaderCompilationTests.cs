@@ -24,6 +24,7 @@ public sealed class WebGpuShaderCompilationTests
     {
         "WebGpuBatchExecutionKernels.Main",   // the shared main() prologue every batch-execution shader appends to
         "WebGpuKernels.RnnCellSource",        // concatenated after the common header that defines fast_tanh
+        "WebGpuTunedRowKernels.RowPrologue",  // the row kernels' shared main() prologue, closed by each family's body
     };
 
     private const string Validator = @"

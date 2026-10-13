@@ -1,3 +1,4 @@
+#if NET7_0_OR_GREATER
 using System.Globalization;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
@@ -214,3 +215,4 @@ fn main(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wi
 
     internal static string RmsNormGradGamma(int rowLanes) => ColumnGrad(rowLanes, rms: true);
 }
+#endif

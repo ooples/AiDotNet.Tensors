@@ -1,3 +1,4 @@
+#if NET7_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
@@ -111,3 +112,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
     }
 }
+#endif
