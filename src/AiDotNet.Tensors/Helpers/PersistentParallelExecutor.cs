@@ -64,6 +64,13 @@ internal sealed class PersistentParallelExecutor
     // GEMM arrays a thread-local body closes over) are released for GC between dispatches.
     private volatile Job? _job;
 
+    // Plain-mode chunk cursors, one per participant on its own cache line (stride 8 longs = 64 bytes): the high 32 bits
+    // hold the dispatch's sequence (low 32 bits of Job.Id), the low 32 bits the next index into that participant's
+    // strided set. A claim is a compare-exchange that also checks the sequence, so a worker that wakes late, holding a
+    // finished dispatch, can never take a chunk of a later one. Reused across dispatches: no allocation per op.
+    private const int CursorStride = 8;
+    private long[] _cursors = Array.Empty<long>();
+
     /// <summary>
     /// Immutable snapshot of one dispatch. Either <see cref="Action"/> (plain mode) OR the
     /// <see cref="LocalInit"/>/<see cref="LocalBody"/>/<see cref="LocalFinally"/> trio (thread-local
@@ -81,8 +88,6 @@ internal sealed class PersistentParallelExecutor
         public readonly int Stride;
         /// <summary>Distinct per dispatch: a worker joins a dispatch at most once.</summary>
         public readonly long Id;
-        /// <summary>Plain mode: 1 once a participant has taken the chunk (Interlocked.Exchange), so each runs once.</summary>
-        public readonly int[]? Claimed;
         /// <summary>Plain mode: chunks not yet finished; the dispatch completes when this reaches zero.</summary>
         public int Pending;
 
@@ -99,8 +104,6 @@ internal sealed class PersistentParallelExecutor
             Stride = stride;
             Id = Interlocked.Increment(ref s_ids);
             Pending = numChunks;
-            if (localBody is null)
-                Claimed = new int[numChunks];
         }
     }
 
@@ -398,30 +401,51 @@ internal sealed class PersistentParallelExecutor
     {
         Exception? first = null;
         var action = job.Action!;
-        var claimed = job.Claimed!;
-        int numChunks = job.NumChunks, stride = job.Stride;
-        if (participant < stride)
+        int numChunks = job.NumChunks, stride = job.Stride, seq = (int)job.Id;
+        long[] cursors = _cursors;
+        int done = 0;
+        // Own set first, then the others' unstarted chunks, starting with the next participant so thieves spread out.
+        for (int k = 0; k < stride; k++)
         {
-            for (int c = participant; c < numChunks; c += stride)
-                if (Interlocked.Exchange(ref claimed[c], 1) == 0)
-                    RunOne(c);
-        }
-        for (int c = numChunks - 1; c >= 0 && Volatile.Read(ref job.Pending) > 0; c--)
-            if (Volatile.Read(ref claimed[c]) == 0 && Interlocked.Exchange(ref claimed[c], 1) == 0)
-                RunOne(c);
-        return first;
-
-        void RunOne(int c)
-        {
-            try { action(c); }
-            catch (Exception ex)
+            int owner = (participant + k) % stride;
+            int count = (numChunks - owner + stride - 1) / stride;
+            while (TryClaim(cursors, owner, seq, count, out int i))
             {
-                first ??= ex;
-                if (publish)
-                    Interlocked.CompareExchange(ref _workerException, ex, null);
+                int c = owner + i * stride;
+                try { action(c); }
+                catch (Exception ex)
+                {
+                    first ??= ex;
+                    if (publish)
+                        Interlocked.CompareExchange(ref _workerException, ex, null);
+                }
+                done++;
             }
-            if (Interlocked.Decrement(ref job.Pending) == 0)
-                _allDone.Set();
+        }
+        // One update of the shared count per participant, not per chunk.
+        if (done > 0 && Interlocked.Add(ref job.Pending, -done) == 0)
+            _allDone.Set();
+        return first;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryClaim(long[] cursors, int owner, int seq, int count, out int index)
+    {
+        ref long slot = ref cursors[owner * CursorStride];
+        while (true)
+        {
+            long cur = Volatile.Read(ref slot);
+            int idx = (int)cur;
+            if ((int)(cur >> 32) != seq || idx >= count)
+            {
+                index = 0;
+                return false;
+            }
+            if (Interlocked.CompareExchange(ref slot, cur + 1, cur) == cur)
+            {
+                index = idx;
+                return true;
+            }
         }
     }
 
@@ -822,8 +846,13 @@ internal sealed class PersistentParallelExecutor
                 // too, so a woken worker reads a fully-consistent dispatch.
                 _workerException = null;
                 _allDone.Reset();
-                _job = new Job(action, null, null, null, numChunks, stride); // publish BEFORE waking any worker
-                var job = _job;
+                var job = new Job(action, null, null, null, numChunks, stride);
+                if (_cursors.Length < stride * CursorStride)
+                    _cursors = new long[(_numWorkers + 1) * CursorStride];
+                long stamp = (long)(int)job.Id << 32;
+                for (int p = 0; p < stride; p++)
+                    Volatile.Write(ref _cursors[p * CursorStride], stamp);
+                _job = job; // publish BEFORE waking any worker (the volatile write also publishes the cursors)
 
                 // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
                 for (int i = 0; i < workersNeeded; i++)
