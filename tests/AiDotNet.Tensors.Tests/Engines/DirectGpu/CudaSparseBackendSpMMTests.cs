@@ -16,8 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <para>These run only where the CUDA driver + NVRTC are present (the self-hosted
 /// runner) — on a host without them they skip. The CPU reference is the oracle and
 /// uses the same per-output reduction order as the kernels, so an indexing/launch bug
-/// shows up as O(1) error, not rounding. (The HIP mirror is implemented but not yet
-/// wired/validated — it needs a healthy ROCm runner; see HipCustomSparseBackend.)</para>
+/// shows up as O(1) error, not rounding. The HIP mirror is <see cref="HipCustomSparseBackendSpMMTests"/>.</para>
 /// </summary>
 [Collection("DirectGpuSerial")]
 public class CudaSparseBackendSpMMTests

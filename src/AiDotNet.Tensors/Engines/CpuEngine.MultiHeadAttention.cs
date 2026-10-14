@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.Engines.Simd;
@@ -55,10 +56,8 @@ public partial class CpuEngine
     /// </para>
     ///
     /// <para>
-    /// <b>Forward-only.</b> Backward is not yet implemented; calling this
-    /// inside a <c>GradientTape</c> scope throws. Training paths should
-    /// keep using the decomposed primitive chain (which records each op on
-    /// the tape) until a fused backward lands in a follow-up PR.
+    /// <b>Training.</b> Under an active <c>GradientTape</c> the call runs the decomposed, differentiable chain
+    /// (projections, SDPA, output projection), so gradients reach the input and all four weights.
     /// </para>
     /// </summary>
     /// <param name="input">[B, seq, dModel] input sequence.</param>
@@ -142,6 +141,17 @@ public partial class CpuEngine
                         graphInputs[0], graphInputs[1], graphInputs[2], graphInputs[3], graphInputs[4],
                         numHeads, capturedMask)),
                 savedState);
+        }
+
+        // Under an eager gradient tape the fused kernels below would return a tensor with no backward edge: every
+        // gradient through the attention (input and all four weights) silently became zero. The decomposed chain
+        // records each step, so a training call gets the gradients the composition defines.
+        if (DifferentiableOps.ThreadTapeActive())
+        {
+            var expandedMask = ExpandAttentionMaskForGraph(mask, batch, numHeads, seqLen, seqLen);
+            return MultiHeadAttentionForwardGraph(
+                input, qWeight, kWeight, vWeight, outWeight,
+                expandedMask, batch, seqLen, dModel, numHeads, dHead);
         }
 
         // Float fast path: direct SimdGemm + in-layout Q/K/V scratch + a
