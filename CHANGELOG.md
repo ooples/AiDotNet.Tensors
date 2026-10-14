@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.138.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.137.1...v0.138.0) (2026-10-14)
+
+
+### Features
+
+* **#1262:** parameterized direct-PTX SGEMM generator with runtime shapes ([#1283](https://github.com/ooples/AiDotNet.Tensors/issues/1283)) ([ce7e55a](https://github.com/ooples/AiDotNet.Tensors/commit/ce7e55a6da683b5902a856a22e9608ea9b0e2b23))
+* **curand:** generate MRG32k3a and Sobol32 uniforms on the CUDA device ([#1273](https://github.com/ooples/AiDotNet.Tensors/issues/1273)) ([cb44cb7](https://github.com/ooples/AiDotNet.Tensors/commit/cb44cb7151f3e8725245ec80005350af4fd7d814))
+
+
+### Bug Fixes
+
+* **#1285:** tuning rejections carry compilation, resource and benchmark statuses ([#1286](https://github.com/ooples/AiDotNet.Tensors/issues/1286)) ([510049b](https://github.com/ooples/AiDotNet.Tensors/commit/510049b004d9c8843896b75dd620c500cd88462d))
+* **autodiff:** differentiate TensorGatherClassValues' backward under create-graph ([#1278](https://github.com/ooples/AiDotNet.Tensors/issues/1278)) ([b6aaae2](https://github.com/ooples/AiDotNet.Tensors/commit/b6aaae25d689cab7580c490925e6009a6964119e))
+* **autodiff:** seed the graph backward with the loss's own shape ([#1287](https://github.com/ooples/AiDotNet.Tensors/issues/1287)) ([e1bc334](https://github.com/ooples/AiDotNet.Tensors/commit/e1bc33421db2ebffd6ebe75333677dc451ec6c81))
+* **conv:** make the implicit-vs-full conv parity test compare the two routes ([#1279](https://github.com/ooples/AiDotNet.Tensors/issues/1279)) ([53f9740](https://github.com/ooples/AiDotNet.Tensors/commit/53f9740eabfa0db67b0e524cec135907b5db3957))
+* page a dropped streaming weight back in before GetFlattenedData reads it ([#1277](https://github.com/ooples/AiDotNet.Tensors/issues/1277)) ([96096cd](https://github.com/ooples/AiDotNet.Tensors/commit/96096cdefdc68ae22f17536ecf926011cd416948))
+* **spectral:** compute widebandlogbinpool bin edges in exact integers everywhere ([#1280](https://github.com/ooples/AiDotNet.Tensors/issues/1280)) ([c6b5025](https://github.com/ooples/AiDotNet.Tensors/commit/c6b5025985465d1bae6f1421643e625837be5e80))
+
 ## [0.137.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.137.0...v0.137.1) (2026-10-13)
 
 
