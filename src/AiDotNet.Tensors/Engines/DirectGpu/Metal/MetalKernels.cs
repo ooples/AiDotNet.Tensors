@@ -1696,13 +1696,16 @@ kernel void sum_axis_rows_split(
     constant uint& chunks [[buffer(3)]],
     constant uint& chunk_len [[buffer(4)]],
     uint2 group [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint lsz [[threads_per_threadgroup]])
+    uint2 lid2 [[thread_position_in_threadgroup]],
+    uint2 lsz2 [[threads_per_threadgroup]])
 {
+    // Metal wants the thread-position inputs all scalar or all the same vector width; the threadgroup is (256, 1, 1).
+    uint lid = lid2.x, lsz = lsz2.x;
     threadgroup float scratch[256];
     uint chunk = group.x, row = group.y;
     ulong start = (ulong)chunk * (ulong)chunk_len;
-    ulong end = min(start + (ulong)chunk_len, (ulong)reduce_size);
+    ulong stop = start + (ulong)chunk_len;
+    ulong end = stop < (ulong)reduce_size ? stop : (ulong)reduce_size;
     device const float* rowPtr = input + (ulong)row * (ulong)reduce_size;
     float sum = 0.0f;
     for (ulong i = start + lid; i < end; i += lsz) sum += rowPtr[i];

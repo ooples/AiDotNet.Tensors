@@ -430,8 +430,8 @@ __device__ __forceinline__ unsigned int bx_to_16(float x, int mode) {
     if (ex <= 0) {
         if (ex < -10) return sign;
         mant |= 0x800000u; unsigned int shift = (unsigned int)(14 - ex);
-        unsigned int h = mant >> shift; unsigned int rem = mant & ((1u << shift) - 1u); unsigned int half = 1u << (shift - 1u);
-        if (rem > half || (rem == half && (h & 1u) != 0u)) h++;
+        unsigned int h = mant >> shift; unsigned int rem = mant & ((1u << shift) - 1u); unsigned int halfUlp = 1u << (shift - 1u);
+        if (rem > halfUlp || (rem == halfUlp && (h & 1u) != 0u)) h++;
         return sign | h;
     }
     unsigned int h = sign | ((unsigned int)ex << 10) | (mant >> 13); unsigned int rem = mant & 0x1fffu;

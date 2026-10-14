@@ -38,6 +38,77 @@ using namespace metal;
 
 constant float PARITY210_PI = 3.14159265358979323846f;
 
+// The Metal standard library has no erf, erfc, lgamma or log1p, and no precise::hypot, so they are written out
+// here (the Vulkan Parity210 kernels do the same in GLSL). Metal does not allow recursion either.
+
+// erfc as Numerical Recipes' Chebyshev fit, fractional error < 1.2e-7 everywhere, so the tail keeps its
+// relative accuracy (1 - erf(x) would round to 0 from x ~ 4).
+inline float p210_erfc(float x)
+{
+    float z = fabs(x);
+    float t = 1.0f / (1.0f + 0.5f * z);
+    float r = t * exp(-z * z - 1.26551223f + t * (1.00002368f + t * (0.37409196f + t * (0.09678418f
+        + t * (-0.18628806f + t * (0.27886807f + t * (-1.13520398f + t * (1.48851587f
+        + t * (-0.82215223f + t * 0.17087277f)))))))));
+    return x >= 0.0f ? r : 2.0f - r;
+}
+
+// erf: its Maclaurin series near 0, where 1 - erfc would lose the relative accuracy of small results, else 1 - erfc.
+inline float p210_erf(float x)
+{
+    if (fabs(x) < 0.5f)
+    {
+        float x2 = x * x;
+        return 1.12837916709551257f * x * (1.0f + x2 * (-1.0f / 3.0f + x2 * (1.0f / 10.0f + x2 * (-1.0f / 42.0f
+            + x2 * (1.0f / 216.0f + x2 * (-1.0f / 1320.0f))))));
+    }
+    return 1.0f - p210_erfc(x);
+}
+
+// log(1 + x) without the cancellation of log(1.0f + x) for small x (Goldberg's correction).
+inline float p210_log1p(float x)
+{
+    float u = 1.0f + x;
+    if (u == 1.0f) return x;
+    if (isinf(u)) return u;
+    return log(u) * (x / (u - 1.0f));
+}
+
+// sqrt(a^2 + b^2) without overflow or underflow in the squares; infinite if either is, even with a NaN.
+inline float p210_hypot(float a, float b)
+{
+    float ax = fabs(a), bx = fabs(b);
+    if (isinf(ax) || isinf(bx)) return INFINITY;
+    if (isnan(ax) || isnan(bx)) return NAN;
+    float big = max(ax, bx), small = min(ax, bx);
+    if (big == 0.0f) return 0.0f;
+    float r = small / big;
+    return big * sqrt(1.0f + r * r);
+}
+
+// lgamma: 8-term Lanczos (g = 7) for x >= 0.5, reflection below (as the Vulkan kernels).
+inline float p210_lgamma_positive(float x)
+{
+    const float lc[8] = { 676.5203681218851f, -1259.1392167224028f, 771.32342877765313f, -176.61502916214059f,
+        12.507343278686905f, -0.13857109526572012f, 9.9843695780195716e-6f, 1.5056327351493116e-7f };
+    float t = x - 1.0f;
+    float hi = t + 7.5f;
+    float sum = 0.99999999999980993f;
+    for (int i = 0; i < 8; ++i) sum += lc[i] / (t + (float)(i + 1));
+    return 0.91893853320467274f + (t + 0.5f) * log(hi) - hi + log(sum);
+}
+
+inline float p210_lgamma(float x)
+{
+    // +inf at +-infinity and at the poles (zero and the negative integers), as C lgamma and CUDA's. Without this the
+    // reflection sees sin(pi * x) ~ 1e-7 rather than 0 at a negative integer and returns a finite value, and the
+    // Lanczos sum turns +infinity into inf - inf = NaN.
+    if ((as_type<uint>(x) & 0x7FFFFFFFu) == 0x7F800000u) return INFINITY;
+    if (x <= 0.0f && x == floor(x)) return INFINITY;
+    if (x < 0.5f) return log(PARITY210_PI / fabs(sin(PARITY210_PI * x))) - p210_lgamma_positive(1.0f - x);
+    return p210_lgamma_positive(x);
+}
+
 // Local helper: positive modulo for int.
 inline int p210_pmod(int a, int m) {
     int r = a % m;
@@ -436,7 +507,7 @@ kernel void parity210_hypot(
     uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= size) return;
-    out[gid] = precise::hypot(a[gid], b[gid]);
+    out[gid] = p210_hypot(a[gid], b[gid]);
 }
 
 kernel void parity210_copysign(
@@ -490,7 +561,7 @@ kernel void parity210_log_add_exp(
     if (av == bv && isinf(av)) { out[gid] = av; return; }
     float m = max(av, bv);
     float s = min(av, bv);
-    out[gid] = m + log1p(exp(s - m));
+    out[gid] = m + p210_log1p(exp(s - m));
 }
 
 kernel void parity210_log_add_exp2(
@@ -523,7 +594,7 @@ kernel void parity210_xlog1py(
 {
     if ((int)gid >= size) return;
     float xv = x[gid];
-    out[gid] = (xv == 0.0f) ? 0.0f : xv * log1p(y[gid]);
+    out[gid] = (xv == 0.0f) ? 0.0f : xv * p210_log1p(y[gid]);
 }
 
 // ==========================================================================
@@ -535,7 +606,7 @@ kernel void parity210_erfc(
     constant int& size [[buffer(2)]], uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= size) return;
-    output[gid] = erfc(input[gid]);
+    output[gid] = p210_erfc(input[gid]);
 }
 
 kernel void parity210_erfinv(
@@ -553,7 +624,7 @@ kernel void parity210_erfinv(
     float t = 2.0f / (PARITY210_PI * a) + ln * 0.5f;
     float xs = copysign(sqrt(sqrt(t * t - ln / a) - t), y);
     for (int k = 0; k < 2; ++k) {
-        float e = erf(xs);
+        float e = p210_erf(xs);
         float df = 2.0f / sqrt(PARITY210_PI) * exp(-xs * xs);
         xs -= (e - y) / df;
     }
@@ -565,7 +636,7 @@ kernel void parity210_lgamma_approx(
     constant int& size [[buffer(2)]], uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= size) return;
-    output[gid] = lgamma(input[gid]);
+    output[gid] = p210_lgamma(input[gid]);
 }
 
 kernel void parity210_digamma(
@@ -861,12 +932,12 @@ float p210_zeta_scalar(float x, float q) {
 float p210_polygamma_scalar(int n, float x) {
     if (x <= 0.0f && x == floor(x)) return INFINITY;
     float recurrence = 0.0f; float xd = x; int signN = (n & 1) == 1 ? 1 : -1;
-    while (xd < 10.0f) { recurrence += (float)signN * exp(lgamma((float)(n+1)) - (float)(n+1) * log(xd)); xd += 1.0f; }
+    while (xd < 10.0f) { recurrence += (float)signN * exp(p210_lgamma((float)(n+1)) - (float)(n+1) * log(xd)); xd += 1.0f; }
     float lnX = log(xd);
-    float asympt = exp(lgamma((float)n) - (float)n * lnX) + 0.5f * exp(lgamma((float)(n+1)) - (float)(n+1) * lnX);
+    float asympt = exp(p210_lgamma((float)n) - (float)n * lnX) + 0.5f * exp(p210_lgamma((float)(n+1)) - (float)(n+1) * lnX);
     const float b2k[8] = { 1.0f/6.0f, -1.0f/30.0f, 1.0f/42.0f, -1.0f/30.0f, 5.0f/66.0f, -691.0f/2730.0f, 7.0f/6.0f, -3617.0f/510.0f };
     float invX2 = 1.0f / (xd * xd); float xPow = exp(-(float)n * lnX);
-    for (int k = 1; k <= 8; k++) { xPow *= invX2; asympt += b2k[k-1] * exp(lgamma((float)(2*k+n)) - lgamma((float)(2*k+1))) * xPow; }
+    for (int k = 1; k <= 8; k++) { xPow *= invX2; asympt += b2k[k-1] * exp(p210_lgamma((float)(2*k+n)) - p210_lgamma((float)(2*k+1))) * xPow; }
     return recurrence + (float)signN * asympt;
 }
 
