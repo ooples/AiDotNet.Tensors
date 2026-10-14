@@ -7,6 +7,8 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+// HipBackendTestFixture is .NET 6+ only (as are the other HIP hardware tests); the key tests below run everywhere.
+#if NET6_0_OR_GREATER
 /// <summary>
 /// The CLBlast indirect GEMM on HIP (#1266) against a double-precision CPU reference, through
 /// <see cref="HipBackend.Gemm"/> itself, with a run counter proving which shapes took the indirect route.
@@ -112,6 +114,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         }
     }
 }
+#endif
 
 /// <summary>The CLBlast database key a HIP backend builds must be the one OpenCL builds for the same card.</summary>
 public sealed class HipClBlastDeviceKeyTests
