@@ -149,10 +149,10 @@ public class Conv2DImplicitGemmParityTests
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
         }
-        // Where oneDNN is installed and accepts the shape (the Linux CI runners) it takes the conv before the full/implicit
-        // choice is made, so neither route runs and there is no choice to check.
+        // The full/implicit choice is made only on the Windows adaptive route chain, and there only when oneDNN does not take
+        // the conv first; elsewhere neither route runs and there is no choice to check.
         Skip.If(CpuEngine.FullIm2ColConvRunsOnThisThread == fullBefore && CpuEngine.ImplicitGemmConvRunsOnThisThread == implicitBefore,
-            "oneDNN handled the convolution on this host.");
+            "Another route (non-Windows im2col, or oneDNN) handled the convolution on this host.");
         Assert.Equal(expectFull ? 1 : 0, CpuEngine.FullIm2ColConvRunsOnThisThread - fullBefore);
         Assert.Equal(expectFull ? 0 : 1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }

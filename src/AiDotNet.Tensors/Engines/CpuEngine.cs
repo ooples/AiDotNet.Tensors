@@ -10812,7 +10812,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
             return;
         }
-        if (ShouldUseAdaptiveFloatConv2D(
+        // The adaptive route chain (Conv2DWithIm2ColFloat) runs on Windows only; a pinned route reaches it on every platform,
+        // or on Linux the pinned comparison would test Conv2DIm2colGemm against itself.
+        if (ShouldUseAdaptiveFloatConv2DForPlatform(IsWindowsPlatform || routePinned,
             input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
         {
             Conv2DWithIm2ColFloat(
