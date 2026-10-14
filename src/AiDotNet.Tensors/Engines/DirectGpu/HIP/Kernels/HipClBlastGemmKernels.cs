@@ -60,6 +60,12 @@ typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sA, sB, sC, sD, s
 
     internal static readonly string[] PackingKernelNames = { "CopyPadMatrix", "CopyMatrix", "TransposePadMatrix" };
 
+    internal const string IndirectKernelName = "clblast_xgemm";
+
+    /// <summary>Whether <paramref name="name"/> belongs to the modules HipBackend builds on first use.</summary>
+    internal static bool IsLazyKernel(string name) =>
+        name == IndirectKernelName || Array.IndexOf(PackingKernelNames, name) >= 0;
+
     private static string Translate(string source)
     {
         string openCl = source.Replace("#define RELAX_WORKGROUP_SIZE 0", "#define RELAX_WORKGROUP_SIZE 1");

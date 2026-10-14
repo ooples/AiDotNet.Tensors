@@ -49,7 +49,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private readonly Dictionary<string, IntPtr> _kernelCache;
 
     /// <summary>Whether a compiled module registered this kernel name (KernelLookupIntegrityTests).</summary>
-    internal bool HasCompiledKernel(string name) => _kernelCache.ContainsKey(name);
+    // The CLBlast GEMM modules compile on first use rather than at startup, so a name of theirs is built before it is
+    // judged; an unbuildable one is reported missing like any other.
+    internal bool HasCompiledKernel(string name) =>
+        _kernelCache.ContainsKey(name) ||
+        (HipClBlastGemmKernels.IsLazyKernel(name) && EnsureClBlastIndirectGemm() && _kernelCache.ContainsKey(name));
     private readonly List<HipKernelCompilationException> _kernelCompilationFailures = new();
     private AmdGpuArchitecture _architecture;
     private string _architectureTarget = string.Empty;
