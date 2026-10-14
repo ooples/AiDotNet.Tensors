@@ -64,10 +64,12 @@ internal sealed class PersistentParallelExecutor
     // GEMM arrays a thread-local body closes over) are released for GC between dispatches.
     private volatile Job? _job;
 
-    // Plain-mode set claims, one per participant on its own cache line (stride 8 longs = 64 bytes): the high 32 bits hold
-    // the dispatch's sequence (low 32 bits of Job.Id), the low 32 bits 0 while the set is untouched, else its chunk
-    // count. A claim is one compare-exchange that also checks the sequence, so a worker that wakes late, holding a
-    // finished dispatch, can never take a set of a later one. Reused across dispatches: no allocation per op.
+    // Plain-mode set claims, one per participant on its own cache line (stride 8 longs = 64 bytes), each holding the Id
+    // of the last dispatch that claimed that participant's set. Ids only increase, so "older than this dispatch" means
+    // unclaimed: nobody re-initialises the slots before a dispatch (writing every participant's line on the calling
+    // thread cost the shortest ops ~0.6 us), a claim is one compare-exchange from an older Id to this one, and a worker
+    // that wakes late holding a finished dispatch can never claim for a later one (its Id is smaller). Reused across
+    // dispatches: no allocation per op.
     private const int CursorStride = 8;
 
     /// <summary>Tests only: runs on a worker after it wakes for a plain dispatch and before it claims its set, to stand
@@ -402,10 +404,11 @@ internal sealed class PersistentParallelExecutor
     {
         Exception? first = null;
         var action = job.Action!;
-        int numChunks = job.NumChunks, stride = job.Stride, seq = (int)job.Id;
+        int numChunks = job.NumChunks, stride = job.Stride;
+        long id = job.Id;
         long[] cursors = _cursors;
         int count = owner < stride ? (numChunks - owner + stride - 1) / stride : 0;
-        if (count == 0 || !TryClaimSet(cursors, owner, seq, count))
+        if (count == 0 || !TryClaimSet(cursors, owner, id))
             return null;
         for (int c = owner; c < numChunks; c += stride)
         {
@@ -471,13 +474,11 @@ internal sealed class PersistentParallelExecutor
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool TryClaimSet(long[] cursors, int owner, int seq, int count)
+    private static bool TryClaimSet(long[] cursors, int owner, long id)
     {
-        // Untouched set of this dispatch: (seq << 32) | 0. Taken: (seq << 32) | count.
-        long untouched = (long)seq << 32;
         ref long slot = ref cursors[owner * CursorStride];
-        return Volatile.Read(ref slot) == untouched
-            && Interlocked.CompareExchange(ref slot, untouched + count, untouched) == untouched;
+        long seen = Volatile.Read(ref slot);
+        return seen < id && Interlocked.CompareExchange(ref slot, id, seen) == seen;
     }
 
     [MethodImpl(Hot)]
@@ -881,9 +882,6 @@ internal sealed class PersistentParallelExecutor
                 var job = new Job(action, null, null, null, numChunks, stride);
                 if (_cursors.Length < stride * CursorStride)
                     _cursors = new long[(_numWorkers + 1) * CursorStride];
-                long stamp = (long)(int)job.Id << 32;
-                for (int p = 0; p < stride; p++)
-                    Volatile.Write(ref _cursors[p * CursorStride], stamp);
                 _job = job; // publish BEFORE waking any worker (the volatile write also publishes the cursors)
 
                 // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
