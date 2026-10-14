@@ -1363,6 +1363,33 @@ public class GradientCorrectnessTests : IDisposable
         Assert.Equal(24f, g2[3], 2);
     }
 
+    /// <summary>
+    /// Double backward through a class-index gather (the core of a class-index cross-entropy), as a meta-learner
+    /// differentiates its inner-loop gradient. v = gather(x, idx); g1 = d sum(v^2)/dx is 2x on the gathered entries,
+    /// so d sum(g1)/dx is 2 there and 0 elsewhere. The scatter kernel the first backward used records nothing, so the
+    /// second backward lost the edge from the upstream gradient (2v) and saw no dependence on x.
+    /// </summary>
+    [Fact]
+    public void GatherClassValues_DoubleBackward_DifferentiatesTheScatter()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f, 9f }, [3, 3]);
+        var classes = new Tensor<float>(new float[] { 2f, 0f, -1f }, [3]);   // the last row is ignored
+
+        using var tape = new GradientTape<float>();
+        var v = _engine.TensorGatherClassValues(x, classes);
+        var loss1 = _engine.ReduceSum(_engine.TensorMultiply(v, v), axes: null);
+        var g1 = tape.ComputeGradients(loss1, sources: new[] { x }, createGraph: true)[x];
+
+        var first = g1.Contiguous().AsSpan().ToArray();
+        Assert.Equal(new float[] { 0f, 0f, 6f, 8f, 0f, 0f, 0f, 0f, 0f }, first);
+
+        var loss2 = _engine.ReduceSum(g1, axes: null);
+        var grads2 = tape.ComputeGradients(loss2, sources: new[] { x }, createGraph: false);
+        Assert.True(grads2.ContainsKey(x));
+        var second = grads2[x].Contiguous().AsSpan().ToArray();
+        Assert.Equal(new float[] { 0f, 0f, 2f, 2f, 0f, 0f, 0f, 0f, 0f }, second);
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Loss function gradient tests
     // ──────────────────────────────────────────────────────────────
