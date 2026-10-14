@@ -30,7 +30,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         return false;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(448, 448, 448, 1f, 0f)]      // exactly MinIndirectSize: no padding on this device's tiles
     [InlineData(447, 448, 61, 1f, 0f)]       // N alone reaches the threshold; M and K pad
     [InlineData(500, 700, 300, 0.5f, 0.25f)] // every dimension pads; beta reads C through the padded copy
@@ -38,7 +38,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     [InlineData(4096, 64, 257, 2f, -1f)]     // skinny N, ragged K
     public void Gemm_LargeShapes_TakeTheIndirectRoute_AndMatchReference(int m, int n, int k, float alpha, float beta)
     {
-        if (!EnsureReady()) return;
+        Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
         var (a, b, c0) = Inputs(m, n, k, seed: m * 31 + n * 7 + k);
         using var ga = Backend.AllocateBuffer(a);
         using var gb = Backend.AllocateBuffer(b);
@@ -50,7 +50,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         AssertMatches(Backend.DownloadBuffer(gc), a, b, c0, m, n, k, alpha, beta);
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(447, 447, 512)]
     [InlineData(1, 4096, 512)]               // vector products stay on the HIP kernels
     [InlineData(4096, 1, 512)]
@@ -60,7 +60,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     [InlineData(3, 2000, 5)]
     public void Gemm_ShapesTheIndirectPathWouldLose_KeepTheHipKernels(int m, int n, int k)
     {
-        if (!EnsureReady()) return;
+        Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
         var (a, b, c0) = Inputs(m, n, k, seed: 11);
         using var ga = Backend.AllocateBuffer(a);
         using var gb = Backend.AllocateBuffer(b);
@@ -72,10 +72,10 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         AssertMatches(Backend.DownloadBuffer(gc), a, b, c0, m, n, k, 1f, 0f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Gemm_ReusedScratch_ShrinkingThenGrowingShapes_StayCorrect()
     {
-        if (!EnsureReady()) return;
+        Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
         foreach (var (m, n, k) in new[] { (1024, 1024, 512), (480, 520, 100), (1100, 900, 700) })
         {
             var (a, b, c0) = Inputs(m, n, k, seed: m + n + k);
@@ -87,10 +87,10 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void HipBlas_IsNotLoadedUntilAGemmAsksForIt()
     {
-        if (!EnsureReady()) return;
+        Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
         using var backend = new HipBackend();
         Assert.True(backend.IsAvailable);
         Assert.False(backend.HipBlasInitializationAttempted);

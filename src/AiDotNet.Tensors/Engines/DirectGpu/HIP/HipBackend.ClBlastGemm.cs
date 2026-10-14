@@ -141,8 +141,13 @@ public sealed partial class HipBackend
     private IGpuBuffer ClBlastScratch(ref IGpuBuffer? buffer, long size)
     {
         if (buffer is not null && buffer.Size >= size) return buffer;
-        // hipFree waits for the device, so the old buffer outlives every launch already queued against it.
-        buffer?.Dispose();
+        // Dispose hands the buffer back to the shared pool without synchronizing, and another caller could rent it while
+        // launches queued against it are still running; drain them first. This only happens when a shape outgrows it.
+        if (buffer is not null)
+        {
+            HipNativeBindings.CheckError(HipNativeBindings.hipStreamSynchronize(_stream), "hipStreamSynchronize");
+            buffer.Dispose();
+        }
         buffer = AllocateBufferUninitialized((int)size);
         return buffer;
     }
