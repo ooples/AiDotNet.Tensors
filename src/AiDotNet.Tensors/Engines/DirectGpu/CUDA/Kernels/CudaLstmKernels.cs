@@ -31,6 +31,16 @@ internal static class CudaLstmKernels
 // ACTIVATION FUNCTIONS
 // ===========================================================================
 
+// tanhf is accurate only to about 1e-6 here (measured: the CUDA LSTM forward was 25-60x less accurate than an
+// fp32 implementation of the same math, all of it from tanhf, with or without --use_fast_math), and BPTT compounds
+// it through every timestep. expm1f keeps small arguments exact, and |x| > 9 already rounds to +-1 in fp32.
+__device__ __forceinline__ float lstm_tanh(float x) {
+    float ax = fabsf(x);
+    if (ax > 9.0f) return copysignf(1.0f, x);
+    float e = expm1f(2.0f * ax);
+    return copysignf(e / (e + 2.0f), x);
+}
+
 __device__ __forceinline__ float sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
@@ -108,7 +118,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_forward(
     // Apply activations
     float f = sigmoid(sumF);
     float i_gate = sigmoid(sumI);
-    float c_candidate = tanhf(sumC);
+    float c_candidate = lstm_tanh(sumC);
     float o = sigmoid(sumO);
 
     // Compute new cell state: newC = f * prevC + i * c_candidate
@@ -116,7 +126,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_forward(
     float newCVal = f * prevCVal + i_gate * c_candidate;
 
     // Compute new hidden state: newH = o * tanh(newC)
-    float newHVal = o * tanhf(newCVal);
+    float newHVal = o * lstm_tanh(newCVal);
 
     // Store outputs
     newC[gid] = newCVal;
@@ -222,7 +232,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
             // Apply activations
             f = sigmoid(sumF);
             i_gate = sigmoid(sumI);
-            c_candidate = tanhf(sumC);
+            c_candidate = lstm_tanh(sumC);
             o = sigmoid(sumO);
 
             // Previous cell state
@@ -236,7 +246,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_sequence(
             c_val = f * prev_c + i_gate * c_candidate;
 
             // Update hidden state
-            h_val = o * tanhf(c_val);
+            h_val = o * lstm_tanh(c_val);
 
             // Store states for output and caching
             int stateOffset = t * batch * hiddenSize + gid;
@@ -311,7 +321,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward(
     float dh = dH[gid];
 
     // tanh(c_t)
-    float tanh_c = tanhf(newCVal);
+    float tanh_c = lstm_tanh(newCVal);
 
     // Gradient through output gate
     float dO = dh * tanh_c * sigmoid_derivative(o);
@@ -393,7 +403,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_cell_backward_compute_
     float prevCVal = prevC[gid];
     float newCVal = newC[gid];
     float dh = dH[gid];
-    float tanh_c = tanhf(newCVal);
+    float tanh_c = lstm_tanh(newCVal);
     float dO = dh * tanh_c * sigmoid_derivative(o);
     float dC_from_H = dh * o * tanh_derivative(tanh_c);
     float dC = dC_next[gid] + dC_from_H;
@@ -629,7 +639,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
             }
 
             // tanh(c_t)
-            float tanh_c = tanhf(c_t);
+            float tanh_c = lstm_tanh(c_t);
 
             // Gradient through output gate
             float dO = dH * tanh_c * sigmoid_derivative(o);
@@ -795,10 +805,10 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_forward_recurrence(
         }
         float f = sigmoid(sF);
         float i_gate = sigmoid(sI);
-        float g = tanhf(sG);
+        float g = lstm_tanh(sG);
         float o = sigmoid(sO);
         c = f * c + i_gate * g;
-        float h = o * tanhf(c);
+        float h = o * lstm_tanh(c);
 
         int stateOffset = t * batch * hiddenSize + gid;
         h_states[stateOffset] = h;
@@ -871,7 +881,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_recurrence(
         float c_prev = t == 0 ? c_init[gid] : c_states[(t - 1) * batch * hiddenSize + gid];
         float h_prev = t == 0 ? h_init[gid] : h_states[(t - 1) * batch * hiddenSize + gid];
 
-        float tanh_c = tanhf(c_t);
+        float tanh_c = lstm_tanh(c_t);
         float dO = dH * tanh_c * sigmoid_derivative(o);
         dC += dH * o * tanh_derivative(tanh_c);
         float dF = dC * c_prev * sigmoid_derivative(f);
@@ -1055,7 +1065,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
     float dh = dH[gid];
 
     // tanh(c_t)
-    float tanh_c = tanhf(newCVal);
+    float tanh_c = lstm_tanh(newCVal);
 
     // Gradient through output gate
     float dO = dh * tanh_c * sigmoid_derivative(o);

@@ -1390,7 +1390,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Compile LSTM sequence kernels (forward/backward for BPTT training)
         try
         {
-            _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames());
+            // Accurate expf and division for the gates (lstm_tanh, sigmoid): --use_fast_math swaps them for approximations.
+            _lstmModule = CompileKernelModule(device, CudaLstmKernels.GetSource(), "lstm_kernels", CudaLstmKernels.GetKernelNames(), useFastMath: false);
         }
         catch
         {
