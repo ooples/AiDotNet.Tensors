@@ -87,7 +87,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public int OptimizerStep;
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -124,6 +124,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             concrete.FailNextCaptureForTesting = failCapture;
             concrete.FailInsideNextCaptureForTesting = failInsideCapture;
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            plan.SetMaxGradNorm(maxGradNorm);
             var losses = new double[Steps];
             float[][] lastGradients = Array.Empty<float[]>();
             var states = new string[Steps];
@@ -131,6 +132,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             for (int s = 0; s < Steps; s++)
             {
                 FeedBatch(x, y, s);
+                if (s == clipOffFromStep) plan.SetMaxGradNorm(0);
                 if (s == nonFiniteStep)
                 {
                     // One non-finite input makes every gradient non-finite: the whole step must be discarded.
@@ -230,9 +232,14 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// report it, exactly as an eager step does. On CUDA the decision is made on the device (the multi-tensor Adam
     /// kernel reads the gradients' sum of squares) and the host learns of it from an asynchronous readback, so the
     /// skip report and the step counter must still come out as if the host had checked before launching.
+    /// <para>With gradient clipping on, the guard reuses the clip's sum of squares of the same gradients; clipping
+    /// switched off at the non-finite step must not let the previous step's (finite) clip sum stand in for it.</para>
     /// </summary>
-    [SkippableFact]
-    public void A_non_finite_gradient_discards_the_replayed_step_like_the_eager_step()
+    [SkippableTheory]
+    [InlineData(0.0, int.MaxValue)]
+    [InlineData(0.5, int.MaxValue)]
+    [InlineData(0.5, 6)]
+    public void A_non_finite_gradient_discards_the_replayed_step_like_the_eager_step(double maxGradNorm, int clipOffFromStep)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -244,8 +251,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 "Graph capture is disabled for this process.");
 
             const int nonFiniteStep = 6;   // after warm-up and capture: a replay
-            var eager = Train(gpu, capture: false, nonFiniteStep: nonFiniteStep);
-            var captured = Train(gpu, capture: true, nonFiniteStep: nonFiniteStep);
+            var eager = Train(gpu, capture: false, nonFiniteStep: nonFiniteStep, maxGradNorm: maxGradNorm, clipOffFromStep: clipOffFromStep);
+            var captured = Train(gpu, capture: true, nonFiniteStep: nonFiniteStep, maxGradNorm: maxGradNorm, clipOffFromStep: clipOffFromStep);
             Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
 
             foreach (var (name, run) in new[] { ("eager", eager), ("captured", captured) })

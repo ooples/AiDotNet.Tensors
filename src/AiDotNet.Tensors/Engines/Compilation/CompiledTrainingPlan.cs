@@ -1621,6 +1621,55 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
 
+    // The device double the multi-tensor Adam guard and the deferred finiteness readback read this step: the plan's own
+    // sum of squares, or the clip's when it covered the same gradients.
+    private Engines.DirectGpu.IGpuBuffer? _finitenessGuard;
+
+    // The gradients the multi-tensor clip's sum of squares (_clipSumSq) covers this step, recorded by the clip and
+    // cleared after every optimizer update, so the record never outlives the step whose gradients it describes.
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _clipSumCoveredBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
+    private readonly List<int> _clipSumCoveredSizes = new List<int>();
+    private object? _clipSumCoveredBackend;
+
+    private void RecordClipSumOfSquares(object backend, List<Engines.DirectGpu.IGpuBuffer> buffers, List<int> sizes)
+    {
+        _clipSumCoveredBuffers.Clear();
+        _clipSumCoveredSizes.Clear();
+        _clipSumCoveredBuffers.AddRange(buffers);
+        _clipSumCoveredSizes.AddRange(sizes);
+        _clipSumCoveredBackend = backend;
+    }
+
+    // The clip's sum of squares when this step's clip covered exactly these gradients on this backend, else null.
+    private Engines.DirectGpu.IGpuBuffer? ClipSumOfSquaresCovers(object backend, List<Engines.DirectGpu.IGpuBuffer> buffers,
+        List<int> sizes)
+    {
+        if (_clipSumSq is not { Size: >= 2 } clipSum || !ReferenceEquals(_clipSumCoveredBackend, backend)
+            || _clipSumCoveredBuffers.Count != buffers.Count)
+            return null;
+        for (int i = 0; i < buffers.Count; i++)
+        {
+            if (_clipSumCoveredBuffers[i].Handle != buffers[i].Handle || _clipSumCoveredSizes[i] != sizes[i])
+                return null;
+        }
+        return clipSum;
+    }
+
+    /// <summary>Runs the configured optimizer update, then forgets the clip's record (see RecordClipSumOfSquares).</summary>
+    private void InvokeOptimizerUpdate()
+    {
+        try
+        {
+            _optimizerUpdate?.Invoke();
+        }
+        finally
+        {
+            _clipSumCoveredBuffers.Clear();
+            _clipSumCoveredSizes.Clear();
+            _clipSumCoveredBackend = null;
+        }
+    }
+
     // Device-guarded finiteness (CUDA multi-tensor Adam): the step's verdict is read back asynchronously and applied
     // to the host bookkeeping by ResolveDeferredFiniteness before anything reads it.
     private Engines.DirectGpu.IDeviceReadback? _finitenessReadback;
@@ -1685,13 +1734,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (cuda is null)
             return false;
 
-        if (_finitenessSumSquares is null || !ReferenceEquals(_finitenessBackend, cuda))
+        Engines.DirectGpu.IGpuBuffer guard;
+        if (ClipSumOfSquaresCovers(cuda, buffers, sizes) is { } clipSum)
         {
-            _finitenessSumSquares?.Dispose();
-            _finitenessSumSquares = cuda.AllocateBuffer(2);
-            _finitenessBackend = cuda;
+            // The clip just reduced these same gradients. A float gradient is finite exactly when the double sum of
+            // squares is, and scaling by the finite coefficient a finite sum yields keeps it finite (a non-finite sum
+            // gives a non-finite coefficient, so the clipped gradients are non-finite too): the verdict is the same.
+            guard = clipSum;
         }
-        ((Engines.DirectGpu.IDeviceScalarOps)cuda).MultiTensorSumOfSquares(buffers, sizes, _finitenessSumSquares);
+        else
+        {
+            if (_finitenessSumSquares is null || !ReferenceEquals(_finitenessBackend, cuda))
+            {
+                _finitenessSumSquares?.Dispose();
+                _finitenessSumSquares = cuda.AllocateBuffer(2);
+                _finitenessBackend = cuda;
+            }
+            ((Engines.DirectGpu.IDeviceScalarOps)cuda).MultiTensorSumOfSquares(buffers, sizes, _finitenessSumSquares);
+            guard = _finitenessSumSquares;
+        }
+        _finitenessGuard = guard;
         if (deferToDeviceGuard && cuda is Engines.DirectGpu.IDeviceReadbackFactory factory)
         {
             // The update kernel reads the sum itself and writes nothing when it is not finite; the host learns the
@@ -1702,11 +1764,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 _finitenessReadback = factory.CreateReadback(sizeof(double));
                 _finitenessReadbackOwner = cuda;
             }
-            _finitenessReadback.Enqueue(_finitenessSumSquares, sizeof(double));
+            _finitenessReadback.Enqueue(guard, sizeof(double));
             _finitenessDeferred = true;
             return true;
         }
-        double sumSquares = BitConverter.ToDouble(cuda.DownloadByteBuffer(_finitenessSumSquares, sizeof(double)), 0);
+        double sumSquares = BitConverter.ToDouble(cuda.DownloadByteBuffer(guard, sizeof(double)), 0);
         allFinite = !double.IsNaN(sumSquares) && !double.IsInfinity(sumSquares);
         return true;
     }
@@ -2697,7 +2759,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     CommitHostOptimizerGradients();
-                    _optimizerUpdate?.Invoke();
+                    InvokeOptimizerUpdate();
                     return _lossOutput;
                 }
                 // REPLAY: SetInput copied THIS step's batch into the (host) input tensor, bumping its
@@ -2722,7 +2784,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                 CommitHostOptimizerGradients();
-                _optimizerUpdate?.Invoke();
+                InvokeOptimizerUpdate();
                 return _lossOutput;
             }
         }
@@ -2770,7 +2832,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     CommitHostOptimizerGradients();
-                    _optimizerUpdate?.Invoke();
+                    InvokeOptimizerUpdate();
                     return _lossOutput;
                 }
             }
@@ -3611,7 +3673,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
         // Fused optimizer update (if configured via ConfigureOptimizer)
         long optStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
-        _optimizerUpdate?.Invoke();
+        InvokeOptimizerUpdate();
         if (bwdProbe != null) bwdProbe("END-OPT");
         long t4 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
@@ -4942,7 +5004,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (mtBackend is not null && mtParams is not null && mtGrads is not null && mtM is not null
                 && mtV is not null && mtSizes is not null)
             {
-                if (_finitenessDeferred && _finitenessSumSquares is { } finiteGuard)
+                if (_finitenessDeferred && _finitenessGuard is { } finiteGuard)
                     mtBackend.AdamMultiTensorUpdateGuarded(optType == OptimizerType.AdamW,
                         mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep, finiteGuard);
                 else if (optType == OptimizerType.AdamW)
@@ -10122,6 +10184,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             var scale = _clipTmp ??= cb.AllocateBuffer(1);
             multi.MultiTensorSumOfSquares(buffers, sizes, sumSquares);
+            RecordClipSumOfSquares(cb, buffers, sizes);
             multi.ClipScaleFromSumOfSquares(sumSquares, (float)maxNorm, scale);
             multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
             for (int p = 0; p < owners.Count; p++)
