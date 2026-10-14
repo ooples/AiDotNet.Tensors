@@ -15,18 +15,24 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
 
     internal PtxTensorCoreGemmConfiguration Configuration { get; }
     internal PtxGemmLayout Layout { get; }
+    internal PtxTensorCorePrecision Precision { get; }
+    internal bool HalfOutput { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
-    internal PtxTensorCoreGemmKernel(DirectPtxRuntime runtime, PtxTensorCoreGemmConfiguration configuration, PtxGemmLayout layout)
+    internal PtxTensorCoreGemmKernel(DirectPtxRuntime runtime, PtxTensorCoreGemmConfiguration configuration, PtxGemmLayout layout,
+        PtxTensorCorePrecision precision = PtxTensorCorePrecision.Tf32, bool halfOutput = false)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         Configuration = configuration;
         Layout = layout;
-        Ptx = PtxTensorCoreGemmGenerator.Emit(configuration, layout, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        _sharedBytes = (uint)configuration.SharedBytes(layout);
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, configuration, layout);
+        Precision = precision;
+        HalfOutput = halfOutput;
+        Ptx = PtxTensorCoreGemmGenerator.Emit(configuration, layout, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
+            precision, halfOutput);
+        _sharedBytes = (uint)configuration.SharedBytes(layout, precision);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, configuration, layout, precision, halfOutput);
         DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
             runtime, Ptx, PtxTensorCoreGemmGenerator.EntryPoint, configuration.Threads, Blueprint);
         _module = loaded.Module;
@@ -42,7 +48,7 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
         float alpha, float beta, int batch = 1, long strideA = 0, long strideB = 0, long strideC = 0)
     {
         if (batch < 1 || batch > 65535) throw new ArgumentOutOfRangeException(nameof(batch));
-        if (!PtxTensorCoreGemmGenerator.Admits(Configuration, Layout, m, n, k, lda, ldb, ldc, strideA, strideB, strideC))
+        if (!PtxTensorCoreGemmGenerator.Admits(Configuration, Layout, m, n, k, lda, ldb, ldc, strideA, strideB, strideC, Precision))
             throw new ArgumentException($"Tensor-Core GEMM {Configuration.Name} ({Layout.Name}) does not admit M={m} N={n} K={k}.");
         if ((((long)a | (long)b | (long)c) & 15) != 0)
             throw new ArgumentException("The Tensor-Core GEMM needs 16-byte-aligned operands.");
@@ -73,21 +79,26 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
     public void Dispose() => _module.Dispose();
 
     private static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture,
-        PtxTensorCoreGemmConfiguration configuration, PtxGemmLayout layout)
+        PtxTensorCoreGemmConfiguration configuration, PtxGemmLayout layout, PtxTensorCorePrecision precision, bool halfOutput)
     {
+        var operandType = precision == PtxTensorCorePrecision.Fp16 ? DirectPtxPhysicalType.Float16 : DirectPtxPhysicalType.Float32;
+        var outputType = halfOutput ? DirectPtxPhysicalType.Float16 : DirectPtxPhysicalType.Float32;
+        string math = precision == PtxTensorCorePrecision.Fp16
+            ? "FP16 Tensor Core (mma.sync m16n8k16), FP32 accumulate"
+            : "TF32 Tensor Core (mma.sync m16n8k8), FP32 accumulate; operands rounded to TF32 (cvt.rna)";
         var any = new DirectPtxExtent(1, 1);
         return new DirectPtxKernelBlueprint(
             Operation: "tc-sgemm",
             Version: 1,
             Architecture: architecture,
-            Variant: configuration.Name + "-" + layout.Name,
+            Variant: configuration.Name + "-" + layout.Name + "-" + precision.ToString().ToLowerInvariant() + (halfOutput ? "-f16out" : ""),
             Tensors:
             [
-                new("a", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                new("a", operandType, DirectPtxPhysicalLayout.RowMajor2D,
                     any, any, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.AtLeast),
-                new("b", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                new("b", operandType, DirectPtxPhysicalLayout.RowMajor2D,
                     any, any, 16, DirectPtxTensorAccess.Read, DirectPtxExtentMode.AtLeast),
-                new("c", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
+                new("c", outputType, DirectPtxPhysicalLayout.RowMajor2D,
                     any, any, 16, DirectPtxTensorAccess.Read | DirectPtxTensorAccess.Write, DirectPtxExtentMode.AtLeast),
             ],
             // Shared memory is dynamic (sized per launch), so the static budget is zero.
@@ -99,10 +110,10 @@ internal sealed class PtxTensorCoreGemmKernel : IDisposable
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "C = alpha * op(A) @ op(B) + beta * C, batched over grid z",
-                ["math"] = "TF32 Tensor Core (mma.sync m16n8k8), FP32 accumulate; operands rounded to TF32 (cvt.rna)",
+                ["math"] = math,
                 ["configuration"] = configuration.Name,
                 ["layout"] = layout.Name,
-                ["dynamic-shared-bytes"] = configuration.SharedBytes(layout).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["dynamic-shared-bytes"] = configuration.SharedBytes(layout, precision).ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["edges"] = "cp.async zero-fill outside the matrix; out-of-range stores skipped",
                 ["beta-zero"] = "C is not read",
                 ["global-intermediates"] = "none",

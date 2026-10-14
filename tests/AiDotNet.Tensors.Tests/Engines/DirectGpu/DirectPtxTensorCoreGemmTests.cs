@@ -159,6 +159,109 @@ public sealed class DirectPtxTensorCoreGemmTests
         }
     }
 
+    // FP16: every contiguous extent and N a multiple of 8 (one 16-byte chunk of halves).
+    private static readonly (int M, int N, int K)[] Fp16Shapes =
+    {
+        (8, 8, 8), (16, 24, 40), (128, 128, 128), (200, 136, 40), (64, 256, 96), (40, 48, 1000), (264, 8, 72),
+    };
+
+    private static void CheckFp16(DirectPtxRuntime runtime, PtxTensorCoreGemmKernel kernel, int batch, int m, int n, int k,
+        float alpha, float beta, bool poisonC)
+    {
+        var layout = kernel.Layout;
+        bool halfOut = kernel.HalfOutput;
+        int lda = layout.TransposeA ? m : k, ldb = layout.TransposeB ? k : n;
+        Half[] a = Values(batch * m * k, m * 31 + k).Select(v => (Half)v).ToArray();
+        Half[] b = Values(batch * k * n, n * 17 + k).Select(v => (Half)v).ToArray();
+        float[] cFloat = poisonC ? Enumerable.Repeat(float.NaN, batch * m * n).ToArray() : Values(batch * m * n, m + n);
+        // The oracle reads C as the kernel will: rounded to FP16 when the output is FP16.
+        double[] cSeen = cFloat.Select(v => halfOut ? (double)(float)(Half)v : v).ToArray();
+        var expected = new double[batch * m * n];
+        for (int z = 0; z < batch; z++)
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                {
+                    double sum = 0;
+                    for (int p = 0; p < k; p++)
+                    {
+                        double av = (double)(layout.TransposeA ? a[z * m * k + p * lda + i] : a[z * m * k + i * lda + p]);
+                        double bv = (double)(layout.TransposeB ? b[z * k * n + j * ldb + p] : b[z * k * n + p * ldb + j]);
+                        sum += av * bv;
+                    }
+                    int index = z * m * n + i * n + j;
+                    expected[index] = alpha * sum + (beta == 0 ? 0 : beta * cSeen[index]);
+                }
+        using var da = runtime.AllocateBytes((nuint)(Math.Max(1, a.Length) * 2));
+        using var db = runtime.AllocateBytes((nuint)(Math.Max(1, b.Length) * 2));
+        using var dc = runtime.AllocateBytes((nuint)(cFloat.Length * (halfOut ? 2 : 4)));
+        if (a.Length > 0) da.Upload<Half>(a);
+        if (b.Length > 0) db.Upload<Half>(b);
+        if (halfOut) dc.Upload<Half>(cFloat.Select(v => (Half)v).ToArray());
+        else dc.Upload<float>(cFloat);
+        kernel.Launch(da.Pointer, db.Pointer, dc.Pointer, m, n, k, lda, ldb, n, alpha, beta, batch,
+            (long)m * k, (long)k * n, (long)m * n);
+        runtime.Synchronize();
+        double[] actual;
+        if (halfOut)
+        {
+            var raw = new Half[cFloat.Length];
+            dc.Download<Half>(raw);
+            actual = raw.Select(v => (double)(float)v).ToArray();
+        }
+        else
+        {
+            var raw = new float[cFloat.Length];
+            dc.Download<float>(raw);
+            actual = raw.Select(v => (double)v).ToArray();
+        }
+        // FP16 operands are exact; products accumulate in FP32. An FP16 output adds one rounding (2^-11 relative).
+        double bound = 1e-4 * Math.Abs(alpha) * Math.Max(1, k) + 1e-5 * (1 + Math.Abs(beta));
+        string what = $"{kernel.Configuration.Name} {layout.Name} fp16{(halfOut ? "->fp16" : "->fp32")} b{batch} M{m} N{n} K{k} alpha{alpha} beta{beta}";
+        for (int i = 0; i < actual.Length; i++)
+        {
+            double allowed = bound + (halfOut ? Math.Abs(expected[i]) * 1e-3 : 0);
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= allowed, $"{what}: [{i}] got {actual[i]}, expected {expected[i]}");
+        }
+    }
+
+    [SkippableFact]
+    public void Fp16_SampledConfigurations_MatchTheOracle_BothOutputs()
+    {
+        using var runtime = RequireAmpere();
+        var configs = Sampled.Where(c => Layouts.All(l => c.Invalidity(l, PtxTensorCorePrecision.Fp16) is null)).ToList();
+        Assert.True(configs.Count >= 2, "too few sampled configurations are valid for FP16");
+        foreach (var config in configs)
+            foreach (var layout in Layouts)
+                foreach (bool halfOut in new[] { false, true })
+                {
+                    using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16, halfOut);
+                    Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
+                    foreach (var (m, n, k) in Fp16Shapes)
+                    {
+                        CheckFp16(runtime, kernel, 1, m, n, k, 1f, 0f, poisonC: false);
+                        CheckFp16(runtime, kernel, 1, m, n, k, 0.5f, 2f, poisonC: false);
+                    }
+                    CheckFp16(runtime, kernel, 3, 40, 48, 56, -1.5f, 0.25f, poisonC: false);
+                    CheckFp16(runtime, kernel, 1, 64, 64, 64, 1f, 0f, poisonC: true);
+                    CheckFp16(runtime, kernel, 1, 64, 64, 0, 1f, 3f, poisonC: false);
+                }
+    }
+
+    [Fact]
+    public void Fp16_SearchSpaceEmits_AndHalfOutputNeedsFp16Operands()
+    {
+        foreach (var layout in Layouts)
+        {
+            var space = PtxTensorCoreGemmConfiguration.SearchSpace(layout, PtxTensorCorePrecision.Fp16).ToList();
+            Assert.True(space.Count > 50, $"{layout.Name}: the FP16 search space shrank to {space.Count}");
+            foreach (var config in space.Take(40))
+                Assert.Contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32",
+                    PtxTensorCoreGemmGenerator.Emit(config, layout, 8, 6, PtxTensorCorePrecision.Fp16, halfOutput: true));
+        }
+        Assert.Throws<ArgumentException>(() =>
+            PtxTensorCoreGemmGenerator.Emit(Sampled[0], Layouts[0], 8, 6, PtxTensorCorePrecision.Tf32, halfOutput: true));
+    }
+
     /// <summary>
     /// Opt-in seconds-long timing probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): one large shape, the large-tile configurations
     /// against cuBLAS's default (TF32) GEMM on the same device and stream, timed with CUDA events; each PTX output is also
@@ -216,6 +319,49 @@ public sealed class DirectPtxTensorCoreGemmTests
             _output.WriteLine($"{config.Name}: {ms:F3} ms, {flops / ms / 1e9:F1} TFLOP/s ({cublas / ms:F2}x cuBLAS), " +
                 $"max |PTX - cuBLAS| / max|C| = {diff / scale:E1}");
             Assert.True(diff / scale < 5e-3, $"{config.Name} disagrees with cuBLAS TF32: {diff / scale:E2}");
+        }
+
+        // FP16 operands, FP32 output, against cuBLAS's GemmFp16In32fOut (cublasGemmEx) on the same operands.
+        static byte[] HalfBytes(float[] values)
+        {
+            var bytes = new byte[values.Length * 2];
+            for (int i = 0; i < values.Length; i++)
+            {
+                ushort bits = BitConverter.HalfToUInt16Bits((Half)values[i]);
+                bytes[2 * i] = (byte)bits;
+                bytes[2 * i + 1] = (byte)(bits >> 8);
+            }
+            return bytes;
+        }
+        using var ah = backend.AllocateByteBuffer(m * k * 2);
+        using var bh = backend.AllocateByteBuffer(k * n * 2);
+        backend.UploadBytes(ah, HalfBytes(Values(m * k, 3)));
+        backend.UploadBytes(bh, HalfBytes(Values(k * n, 4)));
+        double cublasHalf = Time(() => backend.GemmFp16In32fOut(ah, bh, reference, m, n, k));
+        float[] expectedHalf = backend.DownloadBuffer(reference);
+        double scaleHalf = expectedHalf.Max(v => Math.Abs((double)v));
+        _output.WriteLine($"cuBLAS FP16 -> FP32: {cublasHalf:F3} ms, {flops / cublasHalf / 1e9:F1} TFLOP/s");
+        foreach (var config in PtxTensorCoreGemmConfiguration.SearchSpace(layout, PtxTensorCorePrecision.Fp16)
+                     .Where(x => x.BlockM >= 128 && x.BlockN >= 128))
+        {
+            PtxTensorCoreGemmKernel kernel;
+            try
+            {
+                kernel = new PtxTensorCoreGemmKernel(runtime, config, layout, PtxTensorCorePrecision.Fp16);
+            }
+            catch (InvalidOperationException rejected)
+            {
+                _output.WriteLine($"fp16 {config.Name}: rejected ({rejected.Message})");
+                continue;
+            }
+            using var _ = kernel;
+            double ms = Time(() => kernel.Launch(ah.Handle, bh.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f));
+            float[] actual = backend.DownloadBuffer(c);
+            double diff = 0;
+            for (int i = 0; i < actual.Length; i += 97) diff = Math.Max(diff, Math.Abs(actual[i] - expectedHalf[i]));
+            _output.WriteLine($"fp16 {config.Name}: {ms:F3} ms, {flops / ms / 1e9:F1} TFLOP/s ({cublasHalf / ms:F2}x cuBLAS), " +
+                $"max |PTX - cuBLAS| / max|C| = {diff / scaleHalf:E1}");
+            Assert.True(diff / scaleHalf < 1e-3, $"fp16 {config.Name} disagrees with cuBLAS: {diff / scaleHalf:E2}");
         }
     }
 }
