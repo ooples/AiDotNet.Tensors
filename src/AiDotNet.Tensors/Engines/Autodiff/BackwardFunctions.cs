@@ -6913,13 +6913,27 @@ internal static class BackwardFunctions<T>
 
                 if (inputs.Length > 2)
                 {
-                    // Pass the original-rank gradOutput (not the leading-dim-flattened
-                    // gFlat) so rank-promoted biases like [1, 1, N] reduce correctly
-                    // — SumToShape needs to see the same rank it's reducing into,
-                    // matching the slow-path behaviour below. Flattening here would
-                    // drop broadcast axes and produce [1, 1] for a [1, 1, N] bias.
-                    var biasGradFast = SumToShape(gradOutput, inputs[2]._shape, engine);
-                    DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGradFast, engine);
+                    // A bias of N elements (any rank) gets the column sums of [rowsG, N]; in a resident step they are
+                    // summed straight into its accumulator.
+                    if (engine is DirectGpuTensorEngine gpuBias
+                        && inputs[2].Length == N
+                        && !DifferentiableOps.IsRecording<T>()
+                        && !Compilation.GraphMode.IsActive
+                        && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[2], engine, out bool addBias) is { } intoBias
+                        && gpuBias.TrySumRowsIntoGradient(gradOutput, rowsG, N, intoBias, addBias))
+                    {
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[2], intoBias);
+                    }
+                    else
+                    {
+                        // Pass the original-rank gradOutput (not the leading-dim-flattened
+                        // gFlat) so rank-promoted biases like [1, 1, N] reduce correctly
+                        // — SumToShape needs to see the same rank it's reducing into,
+                        // matching the slow-path behaviour below. Flattening here would
+                        // drop broadcast axes and produce [1, 1] for a [1, 1, N] bias.
+                        var biasGradFast = SumToShape(gradOutput, inputs[2]._shape, engine);
+                        DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGradFast, engine);
+                    }
                 }
                 return;
             }

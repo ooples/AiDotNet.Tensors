@@ -15321,7 +15321,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             var giT = new Tensor<T>(new T[input.Length], input.Shape.ToArray());
                             var ggT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
                             var gbT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
-                            var giBuf = GetOrCreateResidentBuffer(backend, giT, input.Length);
+                            // As in the eager path below: gradInput is fully written; gradGamma / gradBeta stay
+                            // zero-filled, since they reduce across rows and a tuned candidate may accumulate.
+                            var giBuf = GetOrCreateResidentBuffer(backend, giT, input.Length, fullyWritten: true);
                             var ggBuf = GetOrCreateResidentBuffer(backend, ggT, normalizedSize);
                             var gbBuf = GetOrCreateResidentBuffer(backend, gbT, normalizedSize);
                             if (giBuf.Handle != System.IntPtr.Zero && ggBuf.Handle != System.IntPtr.Zero && gbBuf.Handle != System.IntPtr.Zero)
@@ -20468,6 +20470,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             gradB = null;
             return false;
         }
+    }
+
+    /// <summary>
+    /// A linear layer's bias gradient written straight into its accumulator in a resident step: the column sums of the
+    /// contiguous <paramref name="gradOutput"/> viewed as [rows, cols], as one GEMM against a cached ones row, added to
+    /// <paramref name="into"/> (GEMM beta 1) or overwriting it (beta 0). Saves the separate reduction output and the
+    /// copy or add that accumulated it. False -- nothing launched -- when the target or the shapes do not qualify.
+    /// </summary>
+    internal bool TrySumRowsIntoGradient<T>(Tensor<T> gradOutput, int rows, int cols, Tensor<T> into, bool add)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (rows <= 1 || cols <= 0 || gradOutput.Length != (long)rows * cols || !gradOutput.IsContiguous
+            || gradOutput._storageOffset != 0) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        var inBuf = ResolveResidentBufferNoUpload(backend, gradOutput, rows * cols);
+        // Filled outside capture by the warm-up steps; null while capturing an unwarmed size.
+        var ones = GetCachedOnesBuffer(backend, rows);
+        if (inBuf is null || ones is null) return false;
+        var target = ResolveDirectGradTarget(backend, into, cols, inBuf, ones, null);
+        if (target is null) return false;
+        try
+        {
+            backend.Gemm(ones, inBuf, target, 1, cols, rows, 1f, add ? 1f : 0f);   // [1, rows] · [rows, cols]
+        }
+        catch (NotSupportedException ex)
+        {
+            GpuLaunchProbe.OnFallback("TrySumRowsIntoGradient", ex);
+            return false;
+        }
+        ResidentSyncCheck("SumRowsIntoGradient");
+        into.IncrementVersion();
+        BindResidentBuffer(into, target, backend);
+        return true;
     }
 
     /// <summary>
