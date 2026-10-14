@@ -7,8 +7,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Helpers;
 
 /// <summary>
-/// #1248: in a plain dispatch each participant runs its own chunk set through a cursor, and the calling thread, after a
-/// short grace period, runs any chunk a woken worker has not started; the dispatch completes when every chunk has
+/// #1248: in a plain dispatch each participant takes its own chunk set with one claim, and the calling thread, after a
+/// short grace period, takes any set a woken worker has not started; the dispatch completes when every chunk has
 /// finished, so a worker that never gets a core no longer holds it. That lets a worker wake late, after its dispatch
 /// ended or into the next one; these pin that it still runs every chunk exactly once, never joins a dispatch twice,
 /// never runs a thread-local dispatch's chunks as a slot that dispatch did not wake, and that a chunk's exception
@@ -62,36 +62,29 @@ public sealed class PersistentExecutorClaimedChunksTests
     }
 
     [Fact]
-    public void ASlowWorker_DoesNotKeepItsUnstartedChunks()
+    public void AWorkerThatDoesNotStart_DoesNotHoldTheDispatch()
     {
-        // The first worker thread to run a chunk takes 20 ms on every chunk it runs -- the shape of a worker that keeps
-        // losing its core. With fixed sets it ran all 8 of its 32 chunks (~160 ms); now the calling thread, after a
-        // short grace period, runs the ones it has not started, so the dispatch costs about one slow chunk.
+        // Worker slot 0 waits 200 ms after waking before it claims its set -- a worker the OS has not scheduled (in the
+        // ONNX case, ONNX Runtime's spinning pool held the cores). With fixed sets the dispatch waited for it (~200 ms);
+        // now the calling thread takes the untouched set after its 50 us grace period and the dispatch ends early.
         int priorDop = CpuParallelSettings.MaxDegreeOfParallelism;
         try
         {
             CpuParallelSettings.MaxDegreeOfParallelism = 4;
-            int caller = Environment.CurrentManagedThreadId;
-            int slow = 0;
+            PersistentParallelExecutor.TestWorkerStartDelay = slot => { if (slot == 0) Thread.Sleep(200); };
             var hits = new int[32];
             var sw = Stopwatch.StartNew();
-            PersistentParallelExecutor.Instance.Execute(32, c =>
-            {
-                int me = Environment.CurrentManagedThreadId;
-                if (me != caller)
-                {
-                    Interlocked.CompareExchange(ref slow, me, 0);
-                    if (Volatile.Read(ref slow) == me) Thread.Sleep(20);
-                }
-                Interlocked.Increment(ref hits[c]);
-            });
+            PersistentParallelExecutor.Instance.Execute(32, c => Interlocked.Increment(ref hits[c]));
             sw.Stop();
             Assert.All(hits, h => Assert.Equal(1, h));
-            Assert.True(sw.ElapsedMilliseconds < 100, $"dispatch took {sw.ElapsedMilliseconds} ms (fixed sets: ~160 ms)");
+            Assert.True(sw.ElapsedMilliseconds < 100, $"dispatch took {sw.ElapsedMilliseconds} ms (fixed sets: ~200 ms)");
         }
         finally
         {
+            PersistentParallelExecutor.TestWorkerStartDelay = null;
             CpuParallelSettings.MaxDegreeOfParallelism = priorDop;
+            // Let the delayed worker finish its sleep and find its set taken before other tests dispatch.
+            Thread.Sleep(250);
         }
     }
 
