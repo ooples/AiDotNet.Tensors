@@ -2885,7 +2885,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 using var leafDataLease = leaf.LeaseArray();
                 var leafData = leafDataLease.Array;
                 if (leafBuffer.Size < leaf.Length) continue;
-                cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
+                UploadForReplay(cb, (float[])(object)leafData, leafBuffer);
                 leaf._gpuBufferVersion = leaf.GpuCacheVersion;
             }
         }
@@ -2911,9 +2911,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var dataLease = inT.LeaseArray();
         var data = dataLease.Array;                 // host backing (T==float on the graph path)
         if (buf.Size < inT.Length) return allLive;
-        cb.UploadBufferInPlace((float[])(object)data, buf);
+        UploadForReplay(cb, (float[])(object)data, buf);
         inT._gpuBufferVersion = inT.GpuCacheVersion;
         return allLive;
+    }
+
+    /// <summary>A replay's input refresh: overlapped with the previous step on a copy stream where the backend can
+    /// (<see cref="Engines.DirectGpu.IOverlappedUploadBackend"/>), else in place on the compute stream. Queued in
+    /// stream order before the replay either way. On the parity Transformer (CUDA) the in-stream copy of each step's
+    /// batch left the device idle ~135 us between replays.</summary>
+    private static void UploadForReplay(Engines.DirectGpu.IGpuGraphCapture cb, float[] data, Engines.DirectGpu.IGpuBuffer buffer)
+    {
+        if (cb is Engines.DirectGpu.IOverlappedUploadBackend overlapped && overlapped.TryUploadOverlapped(data, buffer))
+            return;
+        cb.UploadBufferInPlace(data, buffer);
     }
 
     /// <summary>

@@ -18085,6 +18085,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // In-flight staged uploads still own pinned slots; wait for them before the pool frees its memory.
         try { DrainStagedUploads(blockAll: true); } catch { }
+        try { DisposeOverlappedUploads(); } catch { }
         if (_streamOrderEvent != IntPtr.Zero)
         {
             try { CudaNativeBindings.cuEventDestroy(_streamOrderEvent); } catch { }
