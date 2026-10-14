@@ -200,16 +200,63 @@ __device__ void fa_forward(const float* __restrict__ q, const float* __restrict_
 // delta[bh, i] = sum_d dO[i, d] * O[i, d]   (one thread per query row)
 // ---------------------------------------------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void fa_backward_delta(const float* __restrict__ dO,
-    const float* __restrict__ o, float* __restrict__ delta, FaParams p, int D)
+    const float* __restrict__ o, float* __restrict__ delta, FaParams p, int D, int lanes)
 {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     long long rows = (long long)p.B * p.H * p.Sq;
+    // lanes > 1 (the host's choice: D a multiple of 4, lanes = D / 4 dividing 32, rows 16-byte aligned): each row is
+    // split over `lanes` adjacent threads, one float4 each, combined by a fixed xor-shuffle tree. A thread per row
+    // made each thread's eight dependent loads the critical path.
+    if (lanes > 1)
+    {
+        long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        long long ridx = t / lanes;
+        int part = (int)(t % lanes);
+        float acc = 0.0f;
+        int rb = 0, rh = 0, ri = 0;
+        if (ridx < rows)
+        {
+            if (p.oh <= p.orow) { rh = (int)(ridx % p.H); long long q = ridx / p.H; ri = (int)(q % p.Sq); rb = (int)(q / p.Sq); }
+            else { ri = (int)(ridx % p.Sq); long long q = ridx / p.Sq; rb = (int)(q / p.H); rh = (int)(q % p.H); }
+            long long base = rb * p.ob + rh * p.oh + (long long)ri * p.orow;
+            float4 g = ((const float4*)(dO + base))[part];
+            float4 v = ((const float4*)(o + base))[part];
+            acc = g.x * v.x + g.y * v.y + g.z * v.z + g.w * v.w;
+        }
+        for (int off = lanes >> 1; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
+        if (ridx < rows && part == 0) delta[((long long)rb * p.H + rh) * p.Sq + ri] = acc;
+        return;
+    }
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= rows) return;
-    int i = (int)(idx % p.Sq); int bh = (int)(idx / p.Sq); int b = bh / p.H, h = bh % p.H;
+    // Threads take rows in MEMORY order, so a warp reads one contiguous span: with heads interleaved in a row
+    // ([B, S, H * D]) that is (b, i, h), not (b, h, i) -- which put adjacent threads a whole row (H * D floats)
+    // apart and left the loads uncoalesced (~17 us for 8192 rows of 16 on a GTX 1660 Ti).
+    int b, h, i;
+    if (p.oh <= p.orow)
+    {
+        h = (int)(idx % p.H); long long t = idx / p.H; i = (int)(t % p.Sq); b = (int)(t / p.Sq);
+    }
+    else
+    {
+        i = (int)(idx % p.Sq); long long bh = idx / p.Sq; b = (int)(bh / p.H); h = (int)(bh % p.H);
+    }
     long long base = b * p.ob + h * p.oh + (long long)i * p.orow;   // dO shares O's layout
     float sum = 0.0f;
-    for (int d = 0; d < D; d++) sum += dO[base + d] * o[base + d];
-    delta[idx] = sum;
+    if ((D & 3) == 0 && (base & 3) == 0)
+    {
+        const float4* g4 = (const float4*)(dO + base);
+        const float4* o4 = (const float4*)(o + base);
+        for (int d = 0; d < D / 4; d++)
+        {
+            float4 g = g4[d], v = o4[d];
+            sum += g.x * v.x; sum += g.y * v.y; sum += g.z * v.z; sum += g.w * v.w;   // the scalar loop's order
+        }
+    }
+    else
+    {
+        for (int d = 0; d < D; d++) sum += dO[base + d] * o[base + d];
+    }
+    delta[((long long)b * p.H + h) * p.Sq + i] = sum;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
