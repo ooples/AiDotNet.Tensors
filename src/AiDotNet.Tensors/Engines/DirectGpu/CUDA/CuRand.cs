@@ -174,7 +174,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
     }
 
     /// <summary>Where a device call starts and how far it moves the CPU generator.</summary>
-    private readonly struct DevicePlan
+    internal readonly struct DevicePlan
     {
         public DevicePlan(CuRandNative.GeneratorType type, ulong offset, uint dimensions, ulong advance)
         {
@@ -189,7 +189,12 @@ public sealed class CuRand : IDeviceRng, IDisposable
 
     /// <summary>Whether a uniform call of <paramref name="length"/> values can be generated on the device with the
     /// CPU generator's exact numbers, and from where.</summary>
-    private bool TryPlanExactDevice(int length, out DevicePlan plan)
+    /// <summary>
+    /// Decides whether a call of <paramref name="length"/> values goes to the device, and where. Pure: it reads the CPU
+    /// generator's position and this instance's setup bookkeeping and touches no CUDA state, so the routing rules are
+    /// tested on machines without a GPU.
+    /// </summary>
+    internal bool TryPlanExactDevice(int length, out DevicePlan plan)
     {
         plan = default;
         if (length == 0) return false;
@@ -247,7 +252,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
                     generated = GenerateOnDevice(plan, (IntPtr)host, (ulong)output.Length, isDouble: false);
             }
         }
-        if (generated) _cpuFallback.Offset = plan.Offset + plan.Advance;
+        if (generated) CommitPlan(plan);
         return generated;
     }
 
@@ -263,7 +268,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
                     generated = GenerateOnDevice(plan, (IntPtr)host, (ulong)output.Length, isDouble: true);
             }
         }
-        if (generated) _cpuFallback.Offset = plan.Offset + plan.Advance;
+        if (generated) CommitPlan(plan);
         return generated;
     }
 
@@ -278,6 +283,12 @@ public sealed class CuRand : IDeviceRng, IDisposable
     /// where the device generator already stands; consecutive device calls just continue. Everything runs in the
     /// primary context, which is never released, so the generator and its buffer can be freed from any thread.
     /// </remarks>
+    /// <summary>
+    /// Moves the CPU generator past the values the device produced, so both stay in lockstep: by the value count for
+    /// MRG32k3a, by whole points for Sobol (see <see cref="DevicePlan.Advance"/>).
+    /// </summary>
+    internal void CommitPlan(DevicePlan plan) => _cpuFallback.Offset = plan.Offset + plan.Advance;
+
     private bool GenerateOnDevice(DevicePlan plan, IntPtr host, ulong count, bool isDouble)
     {
         var primary = PrimaryContext.Value;
