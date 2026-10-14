@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal static class PtxGemmEvolution
 {
     internal static readonly KernelId EvolutionKernelId = new("gemm", "cuda-ptx-typed-evolution");
-    internal static readonly KernelSearchSpaceVersion SearchSpaceVersion = new(1);
+    internal static readonly KernelSearchSpaceVersion SearchSpaceVersion = new(2);
     internal static readonly KernelBenchmarkProtocolVersion BenchmarkProtocolVersion = new(1);
 
     /// <summary>
@@ -466,26 +466,32 @@ internal static class PtxGemmEvolution
     private sealed class Codec : IEvolutionGenomeCodec<PtxGemmConfiguration>
     {
         public string Id => "cuda-ptx-gemm-typed";
-        public string VersionHash => "1";
+        public string VersionHash => "2";
 
         public string Serialize(PtxGemmConfiguration genome) => string.Join("|", new[]
         {
             F(genome.BlockM), F(genome.BlockN), F(genome.BlockK), F(genome.ThreadM), F(genome.ThreadN),
-            F(genome.VectorWidth), F(genome.SharedPad), genome.DoubleBuffer ? "1" : "0",
+            F(genome.VectorWidth), F(genome.SharedPad), genome.DoubleBuffer ? "1" : "0", genome.SplitTile ? "1" : "0",
+            F(genome.Swizzle), F(genome.MinBlocksPerSM),
         });
 
         public PtxGemmConfiguration Deserialize(string payload)
         {
             if (payload is null) throw new ArgumentNullException(nameof(payload));
             string[] v = payload.Split('|');
-            if (v.Length != 8) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
-            var genome = new PtxGemmConfiguration(P(v[0]), P(v[1]), P(v[2]), P(v[3]), P(v[4]), P(v[5]), P(v[6]),
-                v[7] switch { "0" => false, "1" => true, _ => throw new InvalidDataException("Invalid Boolean.") });
+            // Eight fields is the version-1 genome (no fragment split, plain rasterization, no occupancy floor).
+            if (v.Length is not (8 or 11)) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
+            bool v2 = v.Length == 11;
+            var genome = new PtxGemmConfiguration(P(v[0]), P(v[1]), P(v[2]), P(v[3]), P(v[4]), P(v[5]), P(v[6]), B(v[7]),
+                v2 && B(v[8]), v2 ? P(v[9]) : 1, v2 ? P(v[10]) : 1);
             if (genome.Invalidity() is { } reason) throw new InvalidDataException("Invalid PTX GEMM genome: " + reason);
             return genome;
         }
 
         private static string F(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+        private static bool B(string value) =>
+            value switch { "0" => false, "1" => true, _ => throw new InvalidDataException("Invalid Boolean.") };
 
         private static int P(string value) =>
             int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)
@@ -511,7 +517,7 @@ internal static class PtxGemmEvolution
         }
 
         public string Id => "cuda-ptx-gemm-constrained-variation";
-        public string VersionHash => "1";
+        public string VersionHash => "2";
 
         public ValueTask<PtxGemmConfiguration> ProposeAsync(
             EvolutionVariationContext<PtxGemmConfiguration> context, CancellationToken cancellationToken = default)
@@ -532,7 +538,7 @@ internal static class PtxGemmEvolution
         }
 
         private static PtxGemmConfiguration Mutate(PtxGemmConfiguration value, StableRandom random) =>
-            random.NextInt(8) switch
+            random.NextInt(11) switch
             {
                 0 => value with { BlockM = Pick(Tiles, random) },
                 1 => value with { BlockN = Pick(Tiles, random) },
@@ -542,6 +548,9 @@ internal static class PtxGemmEvolution
                 5 => value with { VectorWidth = value.VectorWidth == 4 ? 1 : 4 },
                 6 => value with { SharedPad = value.SharedPad == 0 ? 4 : 0 },
                 7 => value with { DoubleBuffer = !value.DoubleBuffer },
+                8 => value with { SplitTile = !value.SplitTile },
+                9 => value with { Swizzle = Pick(PtxGemmConfiguration.Swizzles, random) },
+                10 => value with { MinBlocksPerSM = value.MinBlocksPerSM == 1 ? 2 : 1 },
                 _ => throw new InvalidOperationException(),
             };
 

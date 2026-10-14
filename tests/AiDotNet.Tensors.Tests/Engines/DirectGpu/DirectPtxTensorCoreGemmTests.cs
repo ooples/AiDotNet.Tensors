@@ -549,5 +549,91 @@ public sealed class DirectPtxTensorCoreGemmTests
         }
         _output.WriteLine($"max |as-created - strict| {MaxDiff(created, strict):G3}, max |after-toggle - strict| {MaxDiff(toggled, strict):G3}");
     }
+
+    /// <summary>
+    /// Opt-in strict-FP32 probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): CUDA-core generated SGEMM variants against cuBLAS in the
+    /// library's default deterministic mode (strict FP32), cuBLAS and each variant alternating per round on CUDA events.
+    /// Seconds long; it steers the kernel work, it is not evidence.
+    /// </summary>
+    [SkippableFact]
+    public void Probe_StrictFp32VariantsAgainstCublas()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_RUN_TC_GEMM_PROBE") == "1", "Set AIDOTNET_RUN_TC_GEMM_PROBE=1.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is unavailable.");
+        DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
+        var layout = new PtxGemmLayout(false, false);
+        PtxGemmConfiguration[] variants =
+        {
+            new(128, 128, 8, 8, 8, 4, 4, true),
+            new(128, 128, 16, 8, 8, 4, 4, false, true, 8),
+            new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2),
+            new(128, 128, 16, 8, 8, 4, 4, true, true, 8, 2),
+            new(128, 128, 8, 8, 8, 4, 4, true, true, 8, 2),
+            new(128, 128, 32, 8, 8, 4, 4, false, true, 8, 2),
+            new(128, 64, 16, 8, 4, 4, 4, true, true, 8, 2),
+            new(256, 128, 8, 8, 8, 4, 4, true, true, 8),
+        };
+        variants = Array.FindAll(variants, v => v.Invalidity() is null);
+        (int M, int N, int K)[] shapes = { (1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (2048, 4096, 4096) };
+        double Round(Action launch, int reps)
+        {
+            using var start = backend.CreateEvent(enableTiming: true);
+            using var end = backend.CreateEvent(enableTiming: true);
+            backend.RecordEvent(start, backend.DefaultStream);
+            for (int i = 0; i < reps; i++) launch();
+            backend.RecordEvent(end, backend.DefaultStream);
+            end.Synchronize();
+            return backend.GetEventElapsedTime(start, end) * 1000.0 / reps;
+        }
+        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
+        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(true);
+        try
+        {
+            foreach (var (m, n, k) in shapes)
+            {
+                using var a = backend.AllocateBuffer(Values(m * k, 1));
+                using var b = backend.AllocateBuffer(Values(k * n, 2));
+                using var c = backend.AllocateBuffer(m * n);
+                int reps = (int)Math.Clamp(Math.Ceiling(2e10 / (2d * m * n * k)), 2, 50);
+                Action cublas = () => backend.Gemm(a, b, c, m, n, k);
+                for (int i = 0; i < 3; i++) cublas();
+                foreach (var config in variants)
+                {
+                    PtxSgemmKernel loaded;
+                    try
+                    {
+                        loaded = new PtxSgemmKernel(runtime, config, layout);
+                    }
+                    catch (InvalidOperationException rejected)
+                    {
+                        // The loader enforces zero local memory: a configuration that spills is refused, as tuning would.
+                        _output.WriteLine($"{config.Name}: rejected ({rejected.Message})");
+                        continue;
+                    }
+                    using var kernel = loaded;
+                    Action ptx = () => kernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f);
+                    for (int i = 0; i < 3; i++) ptx();
+                    var ratios = new System.Collections.Generic.List<double>();
+                    double bestPtx = double.MaxValue, bestCublas = double.MaxValue;
+                    for (int r = 0; r < 4; r++)
+                    {
+                        double c1 = Round(cublas, reps), p1 = Round(ptx, reps), p2 = Round(ptx, reps), c2 = Round(cublas, reps);
+                        ratios.Add((c1 + c2) / (p1 + p2));
+                        bestPtx = Math.Min(bestPtx, Math.Min(p1, p2));
+                        bestCublas = Math.Min(bestCublas, Math.Min(c1, c2));
+                    }
+                    ratios.Sort();
+                    _output.WriteLine($"M{m} N{n} K{k} {config.Name,-40} regs {kernel.Audit.Function.RegistersPerThread,3}: " +
+                        $"cuBLAS {bestCublas,9:F1} us, PTX {bestPtx,9:F1} us ({2d * m * n * k / bestPtx / 1e6:F1} TFLOP/s), " +
+                        $"cuBLAS/PTX median {ratios[ratios.Count / 2]:F3} ({ratios[0]:F3} .. {ratios[^1]:F3})");
+                }
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous);
+        }
+    }
 }
 #endif

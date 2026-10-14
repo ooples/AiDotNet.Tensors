@@ -31,6 +31,11 @@ public sealed class DirectPtxSgemmGeneratorTests
         new(128, 128, 8, 8, 8, 4, 4, true),
         new(64, 128, 16, 4, 8, 1, 4, false),
         new(256, 128, 16, 8, 8, 4, 0, true),
+        // Split fragments and grouped rasterization, scalar and vector, on grids whose row count no group divides.
+        new(128, 128, 8, 8, 8, 4, 4, true, true, 8),
+        new(64, 128, 16, 4, 8, 1, 4, false, true, 4),
+        new(128, 64, 16, 8, 4, 4, 0, true, false, 16),
+        new(32, 32, 8, 8, 4, 1, 0, true, true, 4),
     };
 
     // (M, N, K): degenerate, odd (no tile divides), exact tiles, tall / wide / deep, and vector-aligned odd.
@@ -66,6 +71,8 @@ public sealed class DirectPtxSgemmGeneratorTests
         Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 3, 4, 1, 0, false).Invalidity());   // TM not a multiple of 4
         Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 4, 4, 2, 0, false).Invalidity());   // vector width 2
         Assert.NotNull(new PtxGemmConfiguration(256, 256, 32, 8, 8, 4, 4, true).Invalidity()); // > 48 KiB shared
+        Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 4, 4, 1, 0, false, true).Invalidity());       // 4x4 split
+        Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 4, 8, 1, 0, false, false, 3).Invalidity());  // swizzle 3
         Assert.Throws<ArgumentException>(() =>
             PtxSgemmGenerator.Emit(new PtxGemmConfiguration(64, 64, 8, 4, 4, 2, 0, false), new PtxGemmLayout(false, false), 8, 6));
     }
@@ -189,7 +196,7 @@ public sealed class DirectPtxSgemmGeneratorTests
     public void Batched_MatchesTheOracle()
     {
         using var runtime = RequireRuntime();
-        foreach (var config in new[] { Sampled[0], Sampled[2] })
+        foreach (var config in new[] { Sampled[0], Sampled[2], Sampled[6], Sampled[9] })
             foreach (var layout in Layouts)
             {
                 using var kernel = new PtxSgemmKernel(runtime, config, layout);

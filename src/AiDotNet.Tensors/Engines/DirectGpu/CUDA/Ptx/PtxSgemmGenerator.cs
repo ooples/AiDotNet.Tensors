@@ -18,8 +18,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// <param name="VectorWidth">Elements per global load / store: 1 (any shape) or 4 (16-byte, needs aligned shapes).</param>
 /// <param name="SharedPad">Extra floats per shared-memory row, to spread bank accesses.</param>
 /// <param name="DoubleBuffer">Prefetch the next K tile into registers while computing the current one.</param>
+/// <param name="SplitTile">Split each thread's TM x TN tile into 4 x 4 fragments spread across the block (fragment g of
+/// a thread sits g * Threads * 4 rows or columns from its first), so a warp's 16-byte shared reads cover consecutive
+/// banks and its stores consecutive addresses, instead of each thread owning one contiguous run.</param>
+/// <param name="Swizzle">Grouped block rasterization: consecutive blocks walk <c>Swizzle</c> block rows before moving
+/// to the next block column, so they share A and B tiles in L2. 1 is plain row order.</param>
+/// <param name="MinBlocksPerSM">Blocks each multiprocessor must be able to hold (<c>.minnctapersm</c>): 2 caps the
+/// registers ptxas may allocate so two blocks are resident; 1 leaves the register count to ptxas.</param>
 internal readonly record struct PtxGemmConfiguration(
-    int BlockM, int BlockN, int BlockK, int ThreadM, int ThreadN, int VectorWidth, int SharedPad, bool DoubleBuffer)
+    int BlockM, int BlockN, int BlockK, int ThreadM, int ThreadN, int VectorWidth, int SharedPad, bool DoubleBuffer,
+    bool SplitTile = false, int Swizzle = 1, int MinBlocksPerSM = 1)
 {
     internal int ThreadsN => BlockN / ThreadN;
     internal int ThreadsM => BlockM / ThreadM;
@@ -30,8 +38,18 @@ internal readonly record struct PtxGemmConfiguration(
     internal int SharedBytes => checked(Stages * BlockK * (PitchA + PitchB) * sizeof(float));
 
     /// <summary>A short stable name, used in kernel identities and evolution records.</summary>
-    internal string Name => string.Format(CultureInfo.InvariantCulture, "b{0}x{1}x{2}-t{3}x{4}-v{5}-p{6}-{7}",
-        BlockM, BlockN, BlockK, ThreadM, ThreadN, VectorWidth, SharedPad, DoubleBuffer ? "db" : "sb");
+    internal string Name => string.Format(CultureInfo.InvariantCulture, "b{0}x{1}x{2}-t{3}x{4}-v{5}-p{6}-{7}{8}{9}{10}",
+        BlockM, BlockN, BlockK, ThreadM, ThreadN, VectorWidth, SharedPad, DoubleBuffer ? "db" : "sb",
+        SplitTile ? "-split" : "", Swizzle > 1 ? "-g" + Swizzle.ToString(CultureInfo.InvariantCulture) : "",
+        MinBlocksPerSM > 1 ? "-o" + MinBlocksPerSM.ToString(CultureInfo.InvariantCulture) : "");
+
+    // The thread tile's fragment granularity: 4 x 4 fragments when split, one TM x TN run otherwise.
+    internal int FragmentM => SplitTile ? 4 : ThreadM;
+    internal int FragmentN => SplitTile ? 4 : ThreadN;
+
+    // Offset, in rows of the block tile, of a thread's i-th accumulator row from its first (likewise columns).
+    internal int RowOffset(int i) => i / FragmentM * ThreadsM * FragmentM + i % FragmentM;
+    internal int ColumnOffset(int j) => j / FragmentN * ThreadsN * FragmentN + j % FragmentN;
 
     /// <summary>
     /// The emit-able configurations over the genome's axes: the domain the evolutionary search (#1263) explores.
@@ -46,11 +64,16 @@ internal readonly record struct PtxGemmConfiguration(
         foreach (int vw in new[] { 1, 4 })
         foreach (int pad in new[] { 0, 4 })
         foreach (bool db in new[] { false, true })
+        foreach (bool split in new[] { false, true })
+        foreach (int swizzle in Swizzles)
+        foreach (int occupancy in new[] { 1, 2 })
         {
-            var config = new PtxGemmConfiguration(bm, bn, bk, tm, tn, vw, pad, db);
+            var config = new PtxGemmConfiguration(bm, bn, bk, tm, tn, vw, pad, db, split, swizzle, occupancy);
             if (config.Invalidity() is null) yield return config;
         }
     }
+
+    internal static readonly int[] Swizzles = { 1, 4, 8, 16 };
 
     /// <summary>Why this configuration cannot be emitted, or null when it can.</summary>
     internal string? Invalidity()
@@ -66,6 +89,11 @@ internal readonly record struct PtxGemmConfiguration(
             return "each thread must load a whole number of vectors of both tiles";
         if (SharedBytes > 48 * 1024) return "shared memory exceeds 48 KiB";
         if (ThreadM * ThreadN > 128) return "more than 128 accumulators per thread";
+        if (Array.IndexOf(Swizzles, Swizzle) < 0) return "swizzle must be 1, 4, 8 or 16";
+        if (SplitTile && ThreadM == 4 && ThreadN == 4) return "a 4 x 4 thread tile is already one fragment";
+        if (MinBlocksPerSM is not (1 or 2)) return "min blocks per multiprocessor must be 1 or 2";
+        if (MinBlocksPerSM > 1 && (Threads * MinBlocksPerSM > 1024 || SharedBytes * MinBlocksPerSM > 96 * 1024))
+            return "two blocks of this size do not fit one multiprocessor";
         return null;
     }
 }
@@ -189,6 +217,25 @@ internal static class PtxSgemmGenerator
             L($"mov.u32 {ctaX}, %ctaid.x;");
             L($"mov.u32 {ctaY}, %ctaid.y;");
             L($"mov.u32 {batch}, %ctaid.z;");
+            if (_c.Swizzle > 1)
+            {
+                // Grouped rasterization over the launch's linear block index: groups of Swizzle block rows, walked
+                // column by column, so blocks that run together share A rows and B columns in L2.
+                string gridX = R(), gridY = R(), linear = R(), perGroup = R(), group = R(), firstRow = R(), rows = R(),
+                    inGroup = R();
+                L($"mov.u32 {gridX}, %nctaid.x;");
+                L($"mov.u32 {gridY}, %nctaid.y;");
+                L($"mad.lo.u32 {linear}, {ctaY}, {gridX}, {ctaX};");
+                L($"mul.lo.u32 {perGroup}, {gridX}, {I(_c.Swizzle)};");
+                L($"div.u32 {group}, {linear}, {perGroup};");
+                L($"mul.lo.u32 {firstRow}, {group}, {I(_c.Swizzle)};");
+                L($"sub.u32 {rows}, {gridY}, {firstRow};");
+                L($"min.u32 {rows}, {rows}, {I(_c.Swizzle)};");
+                L($"rem.u32 {inGroup}, {linear}, {perGroup};");
+                L($"rem.u32 {ctaY}, {inGroup}, {rows};");
+                L($"add.u32 {ctaY}, {ctaY}, {firstRow};");
+                L($"div.u32 {ctaX}, {inGroup}, {rows};");
+            }
             L($"mul.lo.u32 {bn}, {ctaX}, {I(_c.BlockN)};");
             L($"mul.lo.u32 {bm}, {ctaY}, {I(_c.BlockM)};");
 
@@ -227,10 +274,11 @@ internal static class PtxSgemmGenerator
             for (int i = 0; i < fa.Length; i++) fa[i] = F();
             for (int i = 0; i < fb.Length; i++) fb[i] = F();
 
-            // Per-thread shared read offsets for the inner product: A row ty*TM, B column tx*TN (bytes).
+            // Per-thread shared read offsets for the inner product: the thread's first A row ty*FM and B column tx*FN
+            // (bytes); its other fragments sit at compile-time offsets (RowOffset / ColumnOffset).
             string aRead = R(), bRead = R();
-            L($"mul.lo.u32 {aRead}, {ty}, {I(_c.ThreadM * sizeof(float))};");
-            L($"mul.lo.u32 {bRead}, {tx}, {I(_c.ThreadN * sizeof(float))};");
+            L($"mul.lo.u32 {aRead}, {ty}, {I(_c.FragmentM * sizeof(float))};");
+            L($"mul.lo.u32 {bRead}, {tx}, {I(_c.FragmentN * sizeof(float))};");
 
             // Tile count; K == 0 skips the main loop (C = beta * C).
             string tiles = R(), tile = R(), k0 = R();
@@ -316,6 +364,7 @@ internal static class PtxSgemmGenerator
             ptx.AppendLine("    .param .f32 alpha, .param .f32 beta,");
             ptx.AppendLine("    .param .u64 stride_a, .param .u64 stride_b, .param .u64 stride_c)");
             ptx.Append(".maxntid ").Append(I(threads)).AppendLine(", 1, 1");
+            if (_c.MinBlocksPerSM > 1) ptx.Append(".minnctapersm ").AppendLine(I(_c.MinBlocksPerSM));
             ptx.AppendLine("{");
             ptx.Append("    .reg .pred %p<").Append(I(Math.Max(1, _pred))).AppendLine(">;");
             ptx.Append("    .reg .b32 %r<").Append(I(Math.Max(1, _r32))).AppendLine(">;");
@@ -458,9 +507,9 @@ internal static class PtxSgemmGenerator
             {
                 int aRow = kk * _c.PitchA * sizeof(float), bRow = kk * _c.PitchB * sizeof(float);
                 for (int i = 0; i < fa.Length; i += 4)
-                    L($"ld.shared.v4.f32 {{{fa[i]}, {fa[i + 1]}, {fa[i + 2]}, {fa[i + 3]}}}, [{aBase}+{I(aRow + i * sizeof(float))}];");
+                    L($"ld.shared.v4.f32 {{{fa[i]}, {fa[i + 1]}, {fa[i + 2]}, {fa[i + 3]}}}, [{aBase}+{I(aRow + _c.RowOffset(i) * sizeof(float))}];");
                 for (int j = 0; j < fb.Length; j += 4)
-                    L($"ld.shared.v4.f32 {{{fb[j]}, {fb[j + 1]}, {fb[j + 2]}, {fb[j + 3]}}}, [{bBase}+{I(bRow + j * sizeof(float))}];");
+                    L($"ld.shared.v4.f32 {{{fb[j]}, {fb[j + 1]}, {fb[j + 2]}, {fb[j + 3]}}}, [{bBase}+{I(bRow + _c.ColumnOffset(j) * sizeof(float))}];");
                 for (int i = 0; i < fa.Length; i++)
                     for (int j = 0; j < fb.Length; j++)
                     {
@@ -477,14 +526,14 @@ internal static class PtxSgemmGenerator
             string useBeta = P();
             L($"setp.neu.f32 {useBeta}, {beta}, 0f00000000;");
             string row0 = R(), col0 = R(), ldc64 = Rd();
-            L($"mad.lo.u32 {row0}, {ty}, {I(_c.ThreadM)}, {bm};");
-            L($"mad.lo.u32 {col0}, {tx}, {I(_c.ThreadN)}, {bn};");
+            L($"mad.lo.u32 {row0}, {ty}, {I(_c.FragmentM)}, {bm};");
+            L($"mad.lo.u32 {col0}, {tx}, {I(_c.FragmentN)}, {bn};");
             L($"cvt.u64.u32 {ldc64}, {ldc};");
             bool vector = _c.VectorWidth == 4;
             for (int i = 0; i < _c.ThreadM; i++)
             {
                 string row = R(), rowOk = P(), row64 = Rd(), rowPtr = Rd();
-                L($"add.u32 {row}, {row0}, {I(i)};");
+                L($"add.u32 {row}, {row0}, {I(_c.RowOffset(i))};");
                 L($"setp.lt.u32 {rowOk}, {row}, {m};");
                 L($"cvt.u64.u32 {row64}, {row};");
                 L($"mul.lo.u64 {rowPtr}, {row64}, {ldc64};");
@@ -494,7 +543,7 @@ internal static class PtxSgemmGenerator
                 for (int j = 0; j < _c.ThreadN; j += step)
                 {
                     string col = R(), ok = P(), col64 = Rd(), ptr = Rd(), okBeta = P();
-                    L($"add.u32 {col}, {col0}, {I(j)};");
+                    L($"add.u32 {col}, {col0}, {I(_c.ColumnOffset(j))};");
                     L($"setp.lt.and.u32 {ok}, {col}, {n}, {rowOk};");
                     L($"cvt.u64.u32 {col64}, {col};");
                     L($"shl.b64 {col64}, {col64}, 2;");
