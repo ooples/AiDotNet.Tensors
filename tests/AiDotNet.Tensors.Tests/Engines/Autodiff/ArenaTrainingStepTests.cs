@@ -91,6 +91,14 @@ public class ArenaTrainingStepTests
             Assert.NotNull(produced.GradFn);
         }
 
+        // Every piece of per-owner state the reissue must drop, so removing any one reset fails the test.
+        produced.Grad = new Tensor<float>(new[] { 4 });
+        AiDotNet.Tensors.Engines.Compilation.ILazyNode? lazyNode;
+        using (AiDotNet.Tensors.Engines.Compilation.GraphMode.Enable())
+            lazyNode = _engine.TensorAdd(x, x).LazySource;
+        Assert.NotNull(lazyNode);
+        produced.LazySource = lazyNode;
+
         arena.Reset();
         var reissued = TensorAllocator.RentUninitialized<float>(new[] { 4 });
 
@@ -98,6 +106,7 @@ public class ArenaTrainingStepTests
         Assert.Same(produced, reissued);
         Assert.Null(reissued.GradFn);
         Assert.Null(reissued.Grad);
+        Assert.Null(reissued.LazySource);
     }
 
     /// <summary>
