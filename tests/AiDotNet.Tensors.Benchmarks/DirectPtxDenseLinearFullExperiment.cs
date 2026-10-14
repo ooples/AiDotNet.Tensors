@@ -96,11 +96,13 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                     RunDenseVectors(backend, run, onlyOperation);
                 // Opt-in only: the #1261 shape grid is far longer than the default matrix.
                 if (onlyOperation == GemmGridOperation) RunGemmGrid(backend, run);
+                if (onlyOperation == GemmGridEvolvedOperation) RunGemmGrid(backend, run, evolve: true);
             }
             if (includePython)
             {
                 GpuBenchmarkEnvironment.RequireIdleGpu("dense-linear-pytorch-start");
-                RunPython(independentRuns, onlyOperation);
+                // The evolved grid's competitors are the plain grid's PyTorch lanes.
+                RunPython(independentRuns, onlyOperation == GemmGridEvolvedOperation ? GemmGridOperation : onlyOperation);
             }
             // WDDM can attribute the just-finished process sample to an unrelated
             // desktop C+G process. The outer evidence runner repeats the post-suite
