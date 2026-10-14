@@ -26,11 +26,11 @@ public sealed class DirectPtxSgemmGeneratorTests
     private static readonly PtxGemmConfiguration[] Sampled =
     {
         new(32, 32, 8, 4, 4, 1, 0, false),
-        new(64, 64, 8, 4, 4, 4, 4, true),
+        new(64, 64, 16, 4, 4, 4, 4, true),
         new(128, 64, 16, 8, 4, 4, 0, true),
         new(128, 128, 8, 8, 8, 4, 4, true),
         new(64, 128, 16, 4, 8, 1, 4, false),
-        new(256, 128, 8, 8, 8, 4, 0, true),
+        new(256, 128, 16, 8, 8, 4, 0, true),
     };
 
     // (M, N, K): degenerate, odd (no tile divides), exact tiles, tall / wide / deep, and vector-aligned odd.
@@ -55,6 +55,12 @@ public sealed class DirectPtxSgemmGeneratorTests
     }
 
     [Fact]
+    public void SampledConfigurations_AreValid()
+    {
+        foreach (var config in Sampled) Assert.True(config.Invalidity() is null, config.Name + ": " + config.Invalidity());
+    }
+
+    [Fact]
     public void InvalidConfigurations_AreRejectedWithAReason()
     {
         Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 3, 4, 1, 0, false).Invalidity());   // TM not a multiple of 4
@@ -67,7 +73,7 @@ public sealed class DirectPtxSgemmGeneratorTests
     [Fact]
     public void VectorConfigurations_AdmitOnlyAlignedProblems()
     {
-        var v4 = new PtxGemmConfiguration(64, 64, 8, 4, 4, 4, 0, true);
+        var v4 = new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 0, true);
         var nn = new PtxGemmLayout(false, false);
         Assert.True(PtxSgemmGenerator.Admits(v4, nn, 64, 64, 64, 64, 64, 64, 0, 0, 0));
         Assert.False(PtxSgemmGenerator.Admits(v4, nn, 64, 63, 64, 64, 63, 63, 0, 0, 0));  // N not a multiple of 4
