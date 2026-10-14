@@ -541,6 +541,14 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // In a resident step a first contribution is written straight into the input's gradient accumulator.
+        if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+            && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add) is { } into && !add
+            && gpu.TryReluBackwardInto(gradOutput, inputs[0], into))
+        {
+            DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], into);
+            return;
+        }
         var grad = engine.ReluBackward(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }

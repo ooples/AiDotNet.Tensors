@@ -677,6 +677,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [InlineData(true, TwoPathNetwork.SharedBias)]
     [InlineData(false, TwoPathNetwork.SoftmaxCrossEntropy)]
     [InlineData(true, TwoPathNetwork.SoftmaxCrossEntropy)]
+    [InlineData(false, TwoPathNetwork.StandaloneRelu)]
+    [InlineData(true, TwoPathNetwork.StandaloneRelu)]
     public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
         Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
@@ -686,6 +688,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             TwoPathNetwork.ResidualLayerNorm => ResidualLayerNormLoss,
             TwoPathNetwork.SharedBias => SharedBiasLoss,
             TwoPathNetwork.SoftmaxCrossEntropy => SoftmaxCrossEntropyLoss,
+            TwoPathNetwork.StandaloneRelu => StandaloneReluLoss,
             _ => SharedLoss,
         };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
@@ -709,6 +712,9 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([Hidden, Outputs], 6, 0.3f) },
                 TwoPathNetwork.ResidualLayerNorm => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
                     Ones(Hidden, 8, 0.2f), Rand([Hidden], 9, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+                TwoPathNetwork.StandaloneRelu => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f),
+                    Rand([Hidden, Outputs], 11, 0.3f) },
                 TwoPathNetwork.WideLogSoftmax => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
                     Rand([Hidden, WideClasses], 6, 0.3f), Rand([WideClasses], 7, 0.1f), Rand([WideClasses, Outputs], 4, 0.1f), Rand([Outputs], 5, 0.1f) },
                 _ => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
@@ -832,6 +838,17 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorSoftmaxCrossEntropy(logits, e.TensorMultiply(y, IgnoreFirstRow));
     }
 
+    /// <summary>MSE of <c>ReLU(ReLU(p) · w2 + b2) · w4 + b4 + p · w6</c> with <c>p = x · w0 + b0</c>, the ReLUs separate
+    /// ops: the outer ReLU's input gradient is its accumulator's first contribution of the step (written straight
+    /// in), while p's already holds the later matmul's contribution when the inner ReLU's backward runs (added).</summary>
+    private static Tensor<float> StandaloneReluLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var p = e.FusedLinear(x, w[0], w[1], FusedActivationType.None);
+        var c = e.TensorReLU(e.FusedLinear(e.TensorReLU(p), w[2], w[3], FusedActivationType.None));
+        var pred = e.TensorAdd(e.FusedLinear(c, w[4], w[5], FusedActivationType.None), e.TensorMatMul(p, w[6]));
+        return e.TensorMSELoss(pred, y);
+    }
+
     // A LayerNorm gain near one: 1 + noise.
     private static Tensor<float> Ones(int length, int seed, float noise)
     {
@@ -855,6 +872,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         SharedBias,
         /// <summary>A classifier trained with the fused softmax cross-entropy (soft, negative and ignored targets).</summary>
         SoftmaxCrossEntropy,
+        /// <summary>Separate ReLU ops: one gradient written into its accumulator, one added to an earlier contribution.</summary>
+        StandaloneRelu,
     }
 
     /// <summary>

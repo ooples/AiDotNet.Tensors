@@ -20482,6 +20482,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// ReLU's backward written straight into a gradient accumulator receiving its first contribution of a resident step
+    /// (the kernel overwrites every element): on the parity Transformer the FFN's 1 MB ReLU gradient was otherwise
+    /// produced into a fresh buffer and copied in. False -- nothing launched -- when the target does not qualify.
+    /// </summary>
+    internal bool TryReluBackwardInto<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> into)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (gradOutput.Length != input.Length || !gradOutput.IsContiguous || !input.IsContiguous) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        int n = input.Length;
+        var gR = ResolveResidentBufferNoUpload(backend, gradOutput, n);
+        var iR = ResolveResidentBufferNoUpload(backend, input, n);
+        if (gR is null || iR is null) return false;
+        var target = ResolveDirectGradTarget(backend, into, n, gR, iR, null);
+        if (target is null) return false;
+        try
+        {
+            backend.ReluBackward(gR, iR, target, n);
+        }
+        catch (NotSupportedException ex)
+        {
+            GpuLaunchProbe.OnFallback("TryReluBackwardInto", ex);
+            return false;
+        }
+        ResidentSyncCheck("ReluBackwardInto");
+        into.IncrementVersion();
+        BindResidentBuffer(into, target, backend);
+        return true;
+    }
+
+    /// <summary>
     /// The device buffer a resident-step kernel may write a gradient straight into: <paramref name="target"/>'s own
     /// bound buffer (never a persistent weight-cache copy, see <see cref="TryRunBinaryInPlace"/>), whole and dense, and
     /// distinct from every buffer the kernel reads. Null when there is no target or it does not qualify.
