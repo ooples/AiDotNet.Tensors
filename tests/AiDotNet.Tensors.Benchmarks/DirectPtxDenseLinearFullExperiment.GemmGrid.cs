@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -22,6 +23,29 @@ internal static partial class DirectPtxDenseLinearFullExperiment
 {
     internal const string GemmGridOperation = "gemm-grid";
 
+    /// <summary>
+    /// #1263: the same grid with the generated GEMM evolved per shape (AiDotNet.Evolution) in place of the fixed PTX
+    /// kernels. Tuning runs once per shape (its trials and winner are logged as JSON) and is not timed; the winner is then
+    /// measured like every other lane.
+    /// </summary>
+    internal const string GemmGridEvolvedOperation = "gemm-grid-evolved";
+
+    private static readonly Dictionary<string, PtxGemmConfiguration> EvolvedWinners = new(StringComparer.Ordinal);
+
+    private static AiDotNet.Evolution.EvolutionEngineOptions EvolutionOptions(string shape) => new()
+    {
+        RunId = "gemm-grid-" + shape,
+        Seed = 1263,
+        MaxEvaluationAttempts = 40,
+        MaxProposals = 64,
+        MaxGenerations = 24,
+        ProposalBatchSize = 8,
+        MaxDegreeOfParallelism = 1,
+        IslandCount = 1,
+        MigrationInterval = 0,
+        MigrantsPerIsland = 1,
+    };
+
     // (name, M, K, N): square, decode / skinny, LLM projections, vision im2col, and odd sizes no tile divides.
     internal static readonly (string Name, int M, int K, int N)[] GemmGrid =
     {
@@ -40,7 +64,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
     private const double Fp32GridTolerance = 2e-4;
     private const double Tf32GridTolerance = 1e-2;
 
-    private static void RunGemmGrid(CudaBackend backend, int run)
+    private static void RunGemmGrid(CudaBackend backend, int run, bool evolve = false)
     {
         foreach (var (name, m, k, n) in GemmGrid)
         {
@@ -86,6 +110,13 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                 AiDotNetEngine.SetDeterministicMode(false);
             }
 
+            if (evolve)
+            {
+                RunEvolvedLane(backend, run, name, operation, shape, m, n, k, work, launches, capture,
+                    left, right, output, RelativeError);
+                continue;
+            }
+
             EnableDirectExperiment();
             if (PtxFusedLinearTiledKernel.IsSupportedShape(m, k, n) &&
                 backend.PrewarmDirectPtxGemmTiled(m, k, n, DirectPtxLinearWeightLayout.InputMajor) &&
@@ -120,6 +151,68 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                 PrintUnsupported(run, operation, shape, "Direct PTX gemm 64x64x8", backend.DirectPtxLastError);
             }
         }
+    }
+
+    private static void RunEvolvedLane(CudaBackend backend, int run, string name, string operation, string shape,
+        int m, int n, int k, double work, int launches, bool capture, IGpuBuffer left, IGpuBuffer right, IGpuBuffer output,
+        Func<IGpuBuffer, double> relativeError)
+    {
+        var layout = new PtxGemmLayout(false, false);
+        DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
+        if (!EvolvedWinners.TryGetValue(name, out PtxGemmConfiguration winner))
+        {
+            GpuBenchmarkEnvironment.WaitForCooldown(operation + "-tune");
+            // A fresh store and registry: each benchmark tunes from scratch instead of hydrating a deployment persisted by an
+            // earlier run (which then stands as the incumbent).
+            var tuning = PtxGemmEvolution.TuneAsync(runtime, layout, m, n, k, engineOptions: EvolutionOptions(name),
+                deploymentRegistry: new KernelTuningDeploymentRegistry<PtxGemmConfiguration>(),
+                store: new FreshTuningStore(),
+                onTrial: (configuration, trial) => Console.WriteLine("gemm_grid_evolution_trial_json=" +
+                    JsonSerializer.Serialize(new
+                    {
+                        run,
+                        operation,
+                        configuration = configuration.Name,
+                        status = trial.Status.ToString(),
+                        gflops = trial.Measurement?.ThroughputGflops,
+                        diagnostic = trial.Diagnostic,
+                    }))).GetAwaiter().GetResult();
+            // Time the search's best (the paired-replay candidate). Whether it would also pass the deployment gate,
+            // whose P95 test is noise-bound at microsecond scale, is reported separately as "promoted".
+            winner = tuning.ProposedWinner.Configuration;
+            EvolvedWinners[name] = winner;
+            Console.WriteLine("gemm_grid_evolution_winner_json=" + JsonSerializer.Serialize(new
+            {
+                operation,
+                configuration = winner.Name,
+                incumbent = tuning.IncumbentDeployment.Configuration.Name,
+                incumbent_gflops = tuning.IncumbentDeployment.Measurement.ThroughputGflops,
+                proposed = tuning.ProposedWinner.Configuration.Name,
+                proposed_gflops = tuning.ProposedWinner.Measurement.ThroughputGflops,
+                promoted = tuning.WasPromoted,
+                evaluations = tuning.Run.Counters.EvaluationAttempts,
+            }));
+        }
+        using var kernel = new PtxSgemmKernel(runtime, winner, layout);
+        GpuBenchmarkEnvironment.WaitForCooldown(operation);
+        BenchmarkRoute(backend, run, operation, shape, "Direct PTX evolved " + winner.Name, work,
+            () => kernel.Launch(left.Handle, right.Handle, output.Handle, m, n, k, k, n, n, 1f, 0f),
+            () => relativeError(output), Resource(kernel.Audit), capture,
+            tolerance: Fp32GridTolerance, deviceLaunches: launches);
+    }
+
+    // Loads nothing and keeps winners only in memory, so benchmark tuning neither reads nor writes the shared cache.
+    private sealed class FreshTuningStore : IKernelTuningStore<PtxGemmConfiguration>
+    {
+        public bool TryLoad(KernelTuningIdentity identity, AiDotNet.Evolution.IEvolutionGenomeCodec<PtxGemmConfiguration> codec,
+            out KernelTuningDeploymentSnapshot<PtxGemmConfiguration>? snapshot)
+        {
+            snapshot = null;
+            return false;
+        }
+
+        public bool TryStore(KernelTuningDeploymentSnapshot<PtxGemmConfiguration> snapshot,
+            AiDotNet.Evolution.IEvolutionGenomeCodec<PtxGemmConfiguration> codec) => true;
     }
 
     private static void PrintUnsupported(int run, string operation, string shape, string method, string? reason)
