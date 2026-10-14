@@ -11423,7 +11423,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int rowsPerTile = ImplicitGemmTileColumns / Gcd(outputWidth, ImplicitGemmTileColumns);
         ohRows = Math.Min(outputHeight, (ohRows + rowsPerTile - 1) / rowsPerTile * rowsPerTile);
         int blocksPerImage = (outputHeight + ohRows - 1) / ohRows;
-        int units = checked(batch * blocksPerImage);
+        int blocks = checked(batch * blocksPerImage);
+        // A small plane has few row blocks (an 8x8 output is one 64-column block), so the output channels are split too
+        // until there are two units per thread. Chunks are multiples of ImplicitGemmRowGrain rows, a multiple of every
+        // packed tile height, so only the last chunk holds a partial tile and it is the full GEMM's (same rounding).
+        int mChunkRows = outChannels;
+        if (blocks < 2 * threads && outChannels > ImplicitGemmRowGrain)
+        {
+            int wantChunks = Math.Min((2 * threads + blocks - 1) / blocks, (outChannels + ImplicitGemmRowGrain - 1) / ImplicitGemmRowGrain);
+            mChunkRows = ((outChannels + wantChunks - 1) / wantChunks + ImplicitGemmRowGrain - 1) / ImplicitGemmRowGrain * ImplicitGemmRowGrain;
+        }
+        int mChunks = (outChannels + mChunkRows - 1) / mChunkRows;
+        int units = checked(blocks * mChunks);
         int inputSliceSize = checked(inChannels * height * width);
         int panelFloats = checked(colH * ohRows * outputWidth);
 
@@ -11439,8 +11450,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Helpers.CpuParallelSettings.ParallelForOrSerial(0, units, work, u =>
         {
-            int b = u / blocksPerImage;
-            int oh0 = (u % blocksPerImage) * ohRows;
+            int block = u / mChunks, m0 = (u % mChunks) * mChunkRows;
+            int mRows = Math.Min(mChunkRows, outChannels - m0);
+            int b = block / blocksPerImage;
+            int oh0 = (block % blocksPerImage) * ohRows;
             int oh1 = Math.Min(outputHeight, oh0 + ohRows);
             int ncBlock = (oh1 - oh0) * outputWidth;
             float[] panel = System.Buffers.ArrayPool<float>.Shared.Rent(panelFloats);
@@ -11451,12 +11464,12 @@ public partial class CpuEngine : ITensorLevelEngine
                     inChannels, height, width,
                     kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
                     outputHeight, outputWidth, oh0, oh1);
-                long cOffset = (long)b * outChannels * colW + (long)oh0 * outputWidth;
+                long cOffset = (long)b * outChannels * colW + (long)m0 * colW + (long)oh0 * outputWidth;
                 Engines.BlasManaged.BlasManaged.Gemm<float>(
-                    new ReadOnlySpan<float>((float*)pK, (int)kernelLength), colH, false,   // A = kernel [outC x colH]
+                    new ReadOnlySpan<float>((float*)pK + (long)m0 * colH, (int)(kernelLength - (long)m0 * colH)), colH, false,   // A = kernel rows [m0, m0 + mRows)
                     new ReadOnlySpan<float>(panel, 0, colH * ncBlock), ncBlock, false,     // B = panel [colH x ncBlock]
                     new Span<float>((float*)pOut + cOffset, (int)(outputLength - cOffset)), colW,
-                    outChannels, ncBlock, colH,
+                    mRows, ncBlock, colH,
                     ImplicitConvGemmOptions());
             }
             finally
@@ -11481,6 +11494,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
     // Widest column tile of the packed FP32 GEMM kernels (16 on AVX2 and AVX-512 builds; the 8-wide tiles divide it).
     private const int ImplicitGemmTileColumns = 16;
+
+    // Output-channel chunk granularity of the implicit conv GEMM: a multiple of every packed FP32 tile height (6, 8, 16).
+    private const int ImplicitGemmRowGrain = 48;
 
     /// <summary>
     /// Fallback (no BLAS) GEMM for the fused-conv block: C[m, ncBlock] written into a
