@@ -100,6 +100,11 @@ inline float p210_lgamma_positive(float x)
 
 inline float p210_lgamma(float x)
 {
+    // +inf at +-infinity and at the poles (zero and the negative integers), as C lgamma and CUDA's. Without this the
+    // reflection sees sin(pi * x) ~ 1e-7 rather than 0 at a negative integer and returns a finite value, and the
+    // Lanczos sum turns +infinity into inf - inf = NaN.
+    if ((as_type<uint>(x) & 0x7FFFFFFFu) == 0x7F800000u) return INFINITY;
+    if (x <= 0.0f && x == floor(x)) return INFINITY;
     if (x < 0.5f) return log(PARITY210_PI / fabs(sin(PARITY210_PI * x))) - p210_lgamma_positive(1.0f - x);
     return p210_lgamma_positive(x);
 }

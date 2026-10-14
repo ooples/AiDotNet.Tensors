@@ -62,14 +62,14 @@ public sealed class MetalShaderCompilationTests
         yield return ("Resident", () => MetalResidentKernels.Source, false);
         yield return ("Roi", () => MetalRoiKernels.Source, false);
         yield return ("Sparse", () => MetalSparseKernels.Source, false);
-        yield return ("Parity210", () => MetalParity210Kernels.Source, false);
+        yield return ("Parity210", () => MetalParity210Kernels.Source, true);
         yield return ("Linalg", () => MetalLinalgKernels.Source, false);
         yield return ("Detection", () => MetalDetectionKernels.Source, false);
         yield return ("Geometry", () => MetalGeometryKernels.Source, false);
         yield return ("TunedRow", () => MetalTunedRowKernels.GetSource(), false);
         yield return ("Categorical", () => MetalCategoricalKernels.Source, true);
         yield return ("BatchExecution",() => MetalBatchExecutionKernels.Source, true);
-        yield return ("TorchParity", () => MetalBatchExecutionKernels.TorchParitySource, true);
+        yield return ("TorchParityF32", () => MetalBatchExecutionKernels.TorchParitySource, true);
     }
 
     internal static string? FindCompiler()
@@ -110,13 +110,17 @@ public sealed class MetalShaderCompilationTests
                 WorkingDirectory = dir,
             };
             using var process = Process.Start(start)!;
+            // Both streams are read asynchronously so a compiler that hangs with its pipes open cannot block the
+            // test before the timeout is reached.
             var stderr = process.StandardError.ReadToEndAsync();
-            string stdout = process.StandardOutput.ReadToEnd();
+            var stdoutRead = process.StandardOutput.ReadToEndAsync();
             if (!process.WaitForExit(180_000))
             {
-                process.Kill();
+                try { process.Kill(); } catch (InvalidOperationException) { }
                 return "the Metal compiler did not finish within 3 minutes";
             }
+            process.WaitForExit();   // drains the redirected streams
+            string stdout = stdoutRead.Result;
             if (process.ExitCode == 0) return null;
             // Keep the source so the line numbers in the diagnostics can be looked up.
             string kept = Path.Combine(Path.GetTempPath(), "aidotnet-metal-failed", name + ".metal");
@@ -144,21 +148,30 @@ public sealed class MetalShaderCompilationTests
     [SkippableFact]
     public void TheCatalog_CoversEveryLibraryTheBackendCompiles()
     {
-        // Every CompileLibrary("Name", ...) in the Metal backend's sources (named constants resolved by hand below).
+        // Every CompileLibrary(name, ...) in the Metal backend's sources, whether the name is a string literal or a
+        // string constant. MetalShaderLibrary.cs is skipped: it defines CompileLibrary and forwards its own parameter.
         string? root = RepositoryRoot();
         Skip.If(root is null, "The repository sources are not next to the test binaries.");
         string metal = Path.Combine(root!, "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Metal");
+        var timeout = TimeSpan.FromSeconds(5);
+        var sources = Directory.GetFiles(metal, "*.cs")
+            .Where(f => !string.Equals(Path.GetFileName(f), "MetalShaderLibrary.cs", StringComparison.Ordinal))
+            .Select(File.ReadAllText).ToArray();
+        var constants = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (string text in sources)
+            foreach (Match m in Regex.Matches(text, @"const\s+string\s+(\w+)\s*=\s*""(\w+)""\s*;", RegexOptions.None, timeout))
+                constants[m.Groups[1].Value] = m.Groups[2].Value;
         var compiled = new HashSet<string>(StringComparer.Ordinal);
-        foreach (string file in Directory.GetFiles(metal, "*.cs"))
-        {
-            string text = File.ReadAllText(file);
-            foreach (Match m in Regex.Matches(text, @"CompileLibrary\(\s*""(\w+)""", RegexOptions.None, TimeSpan.FromSeconds(5)))
-                compiled.Add(m.Groups[1].Value);
-        }
-        // Libraries compiled under a named constant.
-        compiled.Add("TunedRow");
-        compiled.Add("BatchExecution");
-        compiled.Add("TorchParity");
+        var unresolved = new List<string>();
+        foreach (string text in sources)
+            foreach (Match m in Regex.Matches(text, @"CompileLibrary\(\s*(?:""(\w+)""|(\w+))\s*,", RegexOptions.None, timeout))
+            {
+                if (m.Groups[1].Success) compiled.Add(m.Groups[1].Value);
+                else if (constants.TryGetValue(m.Groups[2].Value, out string? name)) compiled.Add(name);
+                else unresolved.Add(m.Groups[2].Value);
+            }
+        Assert.True(unresolved.Count == 0,
+            "CompileLibrary is called with a name this test cannot resolve to a constant: " + string.Join(", ", unresolved));
         var catalogued = new HashSet<string>(Catalog().Select(e => e.Name), StringComparer.Ordinal);
         var missing = compiled.Where(n => !catalogued.Contains(n)).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Assert.True(missing.Length == 0, "Metal libraries compiled by the backend but not by this test: " + string.Join(", ", missing));
