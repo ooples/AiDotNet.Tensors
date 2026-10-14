@@ -132,6 +132,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _audioModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
+    // 0 = not tried, 1 = loading, 2 = settled. An int rather than a lock object: tests build capability-only backends
+    // with GetUninitializedObject, where field initializers never run.
+    private int _hipblasInitState;
 
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
@@ -340,7 +343,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 return;
             }
 
-            TryInitializeHipBlas();
+            // hipBLAS loads on the first call that wants it (HipBlasReady), not here: rocBLAS's Tensile libraries cost
+            // startup time and memory that a process whose GEMMs never reach the vendor path should not pay (#1266).
 
             // Compile MFMA kernels
             CompileKernels();
@@ -431,6 +435,41 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _ => AmdGpuArchitecture.GCN
         };
         return true;
+    }
+
+    /// <summary>Whether the vendor BLAS is usable, loading it on the first ask.</summary>
+    private bool HipBlasReady
+    {
+        get
+        {
+            if (Volatile.Read(ref _hipblasInitState) != 2) SettleHipBlas(load: true);
+            return _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
+        }
+    }
+
+    /// <summary>Whether this backend has tried to load hipBLAS yet (lets tests prove the load is lazy).</summary>
+    internal bool HipBlasInitializationAttempted => Volatile.Read(ref _hipblasInitState) != 0;
+
+    /// <summary>
+    /// Moves hipBLAS to settled exactly once: the first caller loads it (or, from Dispose, rules it out) and any caller
+    /// that arrives while it loads waits for the result.
+    /// </summary>
+    private void SettleHipBlas(bool load)
+    {
+        if (Interlocked.CompareExchange(ref _hipblasInitState, 1, 0) == 0)
+        {
+            try
+            {
+                if (load && IsAvailable && !_disposed) TryInitializeHipBlas();
+            }
+            finally
+            {
+                Volatile.Write(ref _hipblasInitState, 2);
+            }
+            return;
+        }
+        var spin = new SpinWait();
+        while (Volatile.Read(ref _hipblasInitState) != 2) spin.SpinOnce();
     }
 
     private void TryInitializeHipBlas()
@@ -1714,7 +1753,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public unsafe void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!_hipblasAvailable || _hipblasHandle == IntPtr.Zero)
+        if (!HipBlasReady)
         {
             // No vendor BLAS: route through Gemm with a materialized
             // transpose (slower fallback; the win exists when hipBLAS is
@@ -1766,7 +1805,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private bool TryExecuteHipBlasGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
-        if (!_hipblasAvailable || _hipblasHandle == IntPtr.Zero)
+        if (!HipBlasReady)
         {
             return false;
         }
@@ -11539,12 +11578,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
         _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = IntPtr.Zero;
 
+        // Settle first (ruling the load out if it never ran, or waiting out one in flight), so no handle appears after this.
+        SettleHipBlas(load: false);
         if (_hipblasHandle != IntPtr.Zero)
         {
             HipBlasNative.hipblasDestroy(_hipblasHandle); // lgtm[cs/call-to-unmanaged-code] HIP BLAS uses native bindings.
             _hipblasHandle = IntPtr.Zero;
-            _hipblasAvailable = false;
         }
+        _hipblasAvailable = false;
 
         if (_stream != IntPtr.Zero)
         {

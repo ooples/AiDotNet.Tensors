@@ -29,7 +29,7 @@ public sealed partial class HipBackend
     internal long ClBlastIndirectGemmRuns => Interlocked.Read(ref _clblastIndirectGemmRuns);
 
     /// <summary>Whether Gemm goes to hipBLAS first (and so never reaches the CLBlast kernels).</summary>
-    internal bool IsHipBlasAvailable => _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
+    internal bool IsHipBlasAvailable => HipBlasReady;
 
     /// <summary>
     /// Builds the indirect GEMM (clblast_xgemm) and its packing kernels once, with the database configuration unless

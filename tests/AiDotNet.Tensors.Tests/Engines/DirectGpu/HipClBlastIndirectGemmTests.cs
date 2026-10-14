@@ -87,6 +87,22 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         }
     }
 
+    [Fact]
+    public void HipBlas_IsNotLoadedUntilAGemmAsksForIt()
+    {
+        if (!EnsureReady()) return;
+        using var backend = new HipBackend();
+        Assert.True(backend.IsAvailable);
+        Assert.False(backend.HipBlasInitializationAttempted);
+
+        using var a = backend.AllocateBuffer(new float[4]);
+        using var b = backend.AllocateBuffer(new float[4]);
+        using var c = backend.AllocateBuffer(new float[4]);
+        Assert.False(backend.HipBlasInitializationAttempted);
+
+        backend.Gemm(a, b, c, 2, 2, 2);
+        Assert.True(backend.HipBlasInitializationAttempted);
+    }
     private static (float[] A, float[] B, float[] C) Inputs(int m, int n, int k, int seed)
     {
         var rng = RandomHelper.CreateSeededRandom(seed);
