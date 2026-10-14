@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.137.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.137.0...v0.137.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **arena:** keep arena-backed tensors out of TensorPool ([#1275](https://github.com/ooples/AiDotNet.Tensors/issues/1275)) ([b0319db](https://github.com/ooples/AiDotNet.Tensors/commit/b0319db415c92c0498f3111132a379433672adda))
+
+## [0.137.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.136.0...v0.137.0) (2026-10-13)
+
+
+### Features
+
+* **#1116:** Metal through the tuned-kernel registry, from a template shared with OpenCL ([#1255](https://github.com/ooples/AiDotNet.Tensors/issues/1255)) ([820ad93](https://github.com/ooples/AiDotNet.Tensors/commit/820ad938d2d3fd9d518a4018c087322747567109))
+* **#1216:** direct FP16 convolution kernel on Vulkan ([#1217](https://github.com/ooples/AiDotNet.Tensors/issues/1217)) ([37b56e2](https://github.com/ooples/AiDotNet.Tensors/commit/37b56e2ebfb0e9794c8304b8645cb57ff6f2c2a2))
+* **#974:** fused decode-linear routes on every GPU backend ([#1219](https://github.com/ooples/AiDotNet.Tensors/issues/1219)) ([c106175](https://github.com/ooples/AiDotNet.Tensors/commit/c10617534c22080a51bfdb85ab542dd16385713b))
+* **rng:** MRG32k3a on every backend, bit-equal to cuRAND ([#1251](https://github.com/ooples/AiDotNet.Tensors/issues/1251)) ([1cfd24b](https://github.com/ooples/AiDotNet.Tensors/commit/1cfd24be96195a94eac907e1cebf0e177d2f27bd)), closes [#1250](https://github.com/ooples/AiDotNet.Tensors/issues/1250)
+* **rng:** Sobol and seeded scrambled Sobol on every backend ([#1259](https://github.com/ooples/AiDotNet.Tensors/issues/1259)) ([7ed7721](https://github.com/ooples/AiDotNet.Tensors/commit/7ed772100b1d755337d3dc82821ae5d3d9766bb9)), closes [#1257](https://github.com/ooples/AiDotNet.Tensors/issues/1257) [#1258](https://github.com/ooples/AiDotNet.Tensors/issues/1258)
+* target net462 and netstandard2.0 (Tensors + Onnx) ([#1243](https://github.com/ooples/AiDotNet.Tensors/issues/1243)) ([55bfa58](https://github.com/ooples/AiDotNet.Tensors/commit/55bfa5830f48fe2f6d82afb43a421f31758ff471))
+
+
+### Bug Fixes
+
+* **#1211:** reduce over the requested axis in MaxOverAxis / SumOverAxisDirect / MeanOverAxisDirect ([#1215](https://github.com/ooples/AiDotNet.Tensors/issues/1215)) ([d843df5](https://github.com/ooples/AiDotNet.Tensors/commit/d843df5c027a8643f110b89ec9bcecd518a37bf5))
+* **#1221:** restore the thread's exact codec options and determinism override after compile/import ([#1226](https://github.com/ooples/AiDotNet.Tensors/issues/1226)) ([6724751](https://github.com/ooples/AiDotNet.Tensors/commit/67247513f310f230e82cffcdce94b18c5cbaefa5))
+* **#1223:** let tools/ConvParallelProbe see the library's internals so gemm-bench builds ([#1224](https://github.com/ooples/AiDotNet.Tensors/issues/1224)) ([1bfab31](https://github.com/ooples/AiDotNet.Tensors/commit/1bfab318e23e26e2da1423642b3de1569df53493))
+* **#1235:** version-guard the sparse-linear CSR snapshot; ONNX plans name their output (MatMul/Gemm imports returned zeros) ([#1240](https://github.com/ooples/AiDotNet.Tensors/issues/1240)) ([753ae14](https://github.com/ooples/AiDotNet.Tensors/commit/753ae1403172be3f244dcb61eda3eebff8119b1a))
+* **build:** grant AiDotNet benchmark and serving assemblies internals access ([#1249](https://github.com/ooples/AiDotNet.Tensors/issues/1249)) ([1c27ccf](https://github.com/ooples/AiDotNet.Tensors/commit/1c27ccfb7f5e36140e6db614a496801386b33b09))
+* compile the gpu kernels backends looked up but never loaded, and the bugs that hid ([#1260](https://github.com/ooples/AiDotNet.Tensors/issues/1260)) ([90ed603](https://github.com/ooples/AiDotNet.Tensors/commit/90ed6034e77adb03c455d1e4918fdcd3ef9156c8))
+* **gpu:** PowerToDb and DbToPower take a power reference on every backend ([#1237](https://github.com/ooples/AiDotNet.Tensors/issues/1237)) ([b2c95e2](https://github.com/ooples/AiDotNet.Tensors/commit/b2c95e26bf1fc07aa371e759b1f8cb7744c79bb8)), closes [#1236](https://github.com/ooples/AiDotNet.Tensors/issues/1236)
+* **parallel:** claim plain dispatch chunks so a starved worker cannot stall it ([#1267](https://github.com/ooples/AiDotNet.Tensors/issues/1267)) ([80df3fd](https://github.com/ooples/AiDotNet.Tensors/commit/80df3fdc06accb56ea631766af79a1826cb538f9))
+* **webgpu:** run the real backend on Dawn in tests, and fix the JS glue so parameterized kernels dispatch ([#1245](https://github.com/ooples/AiDotNet.Tensors/issues/1245)) ([9a8ca15](https://github.com/ooples/AiDotNet.Tensors/commit/9a8ca1552c7bebb7224be3fb1078e40fabb957e0))
+* **webgpu:** run the remaining WebGPU tests on the Dawn-hosted backend and fix what they found ([#1272](https://github.com/ooples/AiDotNet.Tensors/issues/1272)) ([a500ef9](https://github.com/ooples/AiDotNet.Tensors/commit/a500ef9ee1a7b1114489d5e580d9208f33aba12a)), closes [#1271](https://github.com/ooples/AiDotNet.Tensors/issues/1271)
+
+
+### Performance
+
+* **#1113:** hip serves softmax, layernorm, rmsnorm and conv2d through the tuned-kernel registry ([#1252](https://github.com/ooples/AiDotNet.Tensors/issues/1252)) ([54da857](https://github.com/ooples/AiDotNet.Tensors/commit/54da857c263f21357100aaa4a02ce6334c1c2537))
+* **#1192:** coalesce Vulkan dispatches into one submission (64-op chains 33 -&gt; 17.5 µs per op) ([#1225](https://github.com/ooples/AiDotNet.Tensors/issues/1225)) ([fd49e4a](https://github.com/ooples/AiDotNet.Tensors/commit/fd49e4a5200f57371cdb7d80aa34cc8742bed88c))
+* **#1218:** pack A/B, clear C and run the M/N edges in parallel in the machine-kernel GEMM (FP64 1000³ 16.2 -&gt; 10.2 ms) ([#1222](https://github.com/ooples/AiDotNet.Tensors/issues/1222)) ([5276a4d](https://github.com/ooples/AiDotNet.Tensors/commit/5276a4dfe0ec83deb8f8548b0d72ca9a48298b12))
+* **#1241:** zero large rented buffers in parallel (Softmax_ZeroAlloc 363 -&gt; 198 µs) ([#1242](https://github.com/ooples/AiDotNet.Tensors/issues/1242)) ([a23db0a](https://github.com/ooples/AiDotNet.Tensors/commit/a23db0aa7788fb7ef3cb46da649c620fcf1ab473))
+* **blas:** symm reads the stored triangle in place for a narrow panel ([#1253](https://github.com/ooples/AiDotNet.Tensors/issues/1253)) ([45536e4](https://github.com/ooples/AiDotNet.Tensors/commit/45536e477a08ee7875c3c5590f866aaa69cc88b7)), closes [#517](https://github.com/ooples/AiDotNet.Tensors/issues/517)
+* **conv:** use the full-matrix im2col gemm for high-channel 3x3 convs at 8+ threads ([#1270](https://github.com/ooples/AiDotNet.Tensors/issues/1270)) ([14a91a1](https://github.com/ooples/AiDotNet.Tensors/commit/14a91a195f7cfce15dba1641bfc98239022c67e0))
+* **registry:** tuned-kernel registry dispatch on webgpu ([#1268](https://github.com/ooples/AiDotNet.Tensors/issues/1268)) ([a74fe76](https://github.com/ooples/AiDotNet.Tensors/commit/a74fe76b45f330ac67f5e9497a1d4e7476f6ed94))
+
+
+### Build System
+
+* restore AiDotNet.Tensors.Onnx before its net462 build, since the solution does not include it ([55bfa58](https://github.com/ooples/AiDotNet.Tensors/commit/55bfa5830f48fe2f6d82afb43a421f31758ff471))
+
 ## [0.136.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.135.0...v0.136.0) (2026-10-12)
 
 

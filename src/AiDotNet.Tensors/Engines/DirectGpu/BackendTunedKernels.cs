@@ -136,10 +136,10 @@ internal readonly struct TunedLayerNormArgs
 internal readonly struct TunedNormBackwardArgs
 {
     internal TunedNormBackwardArgs(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer? gamma,
-        IGpuBuffer stat0, IGpuBuffer? stat1, IGpuBuffer out0, IGpuBuffer? out1, int rows, int n)
+        IGpuBuffer stat0, IGpuBuffer? stat1, IGpuBuffer out0, IGpuBuffer? out1, int rows, int n, float epsilon = 0f)
     {
         GradOutput = gradOutput; Input = input; Gamma = gamma; Stat0 = stat0; Stat1 = stat1; Out0 = out0; Out1 = out1;
-        Rows = rows; N = n;
+        Rows = rows; N = n; Epsilon = epsilon;
     }
     internal IGpuBuffer GradOutput { get; }
     internal IGpuBuffer Input { get; }
@@ -150,6 +150,12 @@ internal readonly struct TunedNormBackwardArgs
     internal IGpuBuffer? Out1 { get; }
     internal int Rows { get; }
     internal int N { get; }
+
+    /// <summary>
+    /// The forward pass's epsilon, for a reference kernel that recomputes the row statistics instead of reading the saved
+    /// ones (WebGPU's). Zero where no reference needs it.
+    /// </summary>
+    internal float Epsilon { get; }
 }
 /// <summary>2-D convolution arguments (any backend): NCHW input, [Cout, Cin, kH, kW] filter.</summary>
 internal readonly struct TunedConv2DArgs
