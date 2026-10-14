@@ -25,6 +25,11 @@ public sealed partial class HipBackend
     /// Runs correctness-gated evolutionary tuning of the CLBlast GEMM for one shape on this device, seeded by the
     /// database configuration, and deploys the winner so <see cref="Gemm"/> runs that shape with it.
     /// </summary>
+    /// <remarks>
+    /// The deployment replaces the database configuration for that shape; it does not widen which shapes take the
+    /// indirect path. A shape <see cref="Gemm"/> keeps on the HIP kernels (below MinIndirectSize, or padded past 1.5x)
+    /// is tuned and stored, but runs only through <see cref="TryExecuteClBlastIndirectGemm(IGpuBuffer, IGpuBuffer, IGpuBuffer, int, int, int, float, float)"/>.
+    /// </remarks>
     public async Task<EvolutionKernelTuningResult<OpenClGemmConfiguration>> TuneGemmWithEvolutionAsync(
         int m,
         int n,
@@ -233,9 +238,10 @@ public sealed partial class HipBackend
             GemmConfig config = configuration.ToGemmConfig();
             if (!HipClBlastGemmKernels.Supports(config))
             {
+                // KernelTuningValidationException admits no InvalidConfiguration; HIP cannot build it, so it fails to compile.
                 throw new KernelTuningValidationException(
-                    KernelTuningTrialStatus.InvalidConfiguration,
-                    "HIP builds the CLBlast GEMM only for GEMMK 0 with vector widths 1, 2 or 4.");
+                    KernelTuningTrialStatus.CompilationFailed,
+                    "HIP builds the CLBlast GEMM only for GEMMK 0 configurations within CLBlast's xgemm constraints.");
             }
             if (!_owner.TryPrepareClBlastGemm(config))
             {

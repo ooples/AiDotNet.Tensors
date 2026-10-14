@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Helpers;
 using Xunit;
@@ -183,5 +184,42 @@ public sealed class HipClBlastDeviceKeyTests
     public void ForAmdGpu_NameAlreadyCarryingTheVendor_IsNotPrefixedTwice()
     {
         Assert.Equal("AMD Radeon RX 5500 XT", ClBlastDeviceInfo.ForAmdGpu("gfx1012:xnack-", "AMD Radeon RX 5500 XT").DeviceName);
+    }
+}
+
+/// <summary>HIP builds only CLBlast GEMMK 0 configurations within CLBlast's own xgemm constraints.</summary>
+public sealed class HipClBlastGemmConstraintTests
+{
+    private static readonly GemmConfig RadeonRx5500Xt = new()
+    {
+        KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0, KernelName = "test",
+        TileM = 64, TileN = 64, TileK = 16, ThreadTileM = 8, ThreadTileN = 8, MdimaSize = 16, NdimbSize = 8,
+        KUnroll = 2, KReg = 1, VectorWidthM = 4, VectorWidthN = 4, StrideN = true, CacheA = true, CacheB = true
+    };
+
+    [Fact]
+    public void DatabaseConfiguration_IsBuildable()
+    {
+        Assert.True(HipClBlastGemmKernels.Supports(RadeonRx5500Xt));
+        Assert.True(ClBlastXgemmDatabase.TryGetConfig(ClBlastDeviceInfo.ForAmdGpu("gfx1012:xnack-", "Radeon RX 5500 XT"), out var database));
+        Assert.True(HipClBlastGemmKernels.Supports(database));
+    }
+
+    [Fact]
+    public void ConfigurationsOutsideClBlastsConstraints_AreRejected()
+    {
+        // HIP has no 8-wide float vector.
+        Assert.False(HipClBlastGemmKernels.Supports(RadeonRx5500Xt with { VectorWidthM = 8 }));
+        // GEMMK 1 is a different kernel.
+        Assert.False(HipClBlastGemmKernels.Supports(RadeonRx5500Xt with { KernelTemplate = GemmKernelTemplate.ClBlastBaselineK1 }));
+        // KWG % KWI.
+        Assert.False(HipClBlastGemmKernels.Supports(RadeonRx5500Xt with { TileK = 16, KUnroll = 32 }));
+        // MWG % (MDIMC * VWM): 64 % (32 * 4).
+        Assert.False(HipClBlastGemmKernels.Supports(RadeonRx5500Xt with { ThreadTileM = 32 }));
+        // MWG % (MDIMA * VWM): 64 % (32 * 4), the cooperative load DynamicGemmKernel.ValidateConfig does not check.
+        Assert.False(HipClBlastGemmKernels.Supports(RadeonRx5500Xt with { MdimaSize = 32 }));
+        Assert.Null(DynamicGemmKernel.ValidateConfig(RadeonRx5500Xt with { MdimaSize = 32 }));
+        // KWG % ((MDIMC * NDIMC) / NDIMB): 16 % (64 / 2).
+        Assert.False(HipClBlastGemmKernels.Supports(RadeonRx5500Xt with { NdimbSize = 2, VectorWidthN = 1 }));
     }
 }
