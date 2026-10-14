@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.138.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.138.0...v0.138.1) (2026-10-14)
+
+
+### Bug Fixes
+
+* **#1293:** keep chunk ownership in the parallel executor (1M elementwise ops 4-11x faster than 0.138.0), steal only unstarted chunks ([#1294](https://github.com/ooples/AiDotNet.Tensors/issues/1294)) ([9cf0b43](https://github.com/ooples/AiDotNet.Tensors/commit/9cf0b43b72ecc79dd588c8c4d71c3a36b042be1b))
+* **arena:** clear autograd state when the tensor ring reissues a tensor ([#1301](https://github.com/ooples/AiDotNet.Tensors/issues/1301)) ([8a3f409](https://github.com/ooples/AiDotNet.Tensors/commit/8a3f409f9aba9bb2c0a2f97ba4e8a03cb604bb04))
+* **autodiff:** multi-head attention forward lost every gradient under an eager tape ([#1290](https://github.com/ooples/AiDotNet.Tensors/issues/1290)) ([e0cacb9](https://github.com/ooples/AiDotNet.Tensors/commit/e0cacb975d1843663d195ce487e7efd6f8afbf3a))
+* **gpu-sparse:** fix cuSPARSE bindings, freeze the GPU SpMM bar, share one CUDA backend ([#1297](https://github.com/ooples/AiDotNet.Tensors/issues/1297)) ([486e0f9](https://github.com/ooples/AiDotNet.Tensors/commit/486e0f974f61251872bd7de10afc1f7448019beb))
+* **hip:** make the managed sparse kernels run and route them ahead of rocsparse ([#1289](https://github.com/ooples/AiDotNet.Tensors/issues/1289)) ([e361613](https://github.com/ooples/AiDotNet.Tensors/commit/e36161367416697e6da574302aa7b9143f79540c))
+
+
+### Performance
+
+* **#1263:** evolve the generated PTX GEMM with AiDotNet.Evolution ([#1291](https://github.com/ooples/AiDotNet.Tensors/issues/1291)) ([08c0cf8](https://github.com/ooples/AiDotNet.Tensors/commit/08c0cf80088d4756791156c23149e225c3efc7d9))
+* **#1264:** Tensor-Core PTX GEMM (TF32 and FP16), evolved; TF32 parity with cuBLAS at 4096^3 ([#1296](https://github.com/ooples/AiDotNet.Tensors/issues/1296)) ([70d1e72](https://github.com/ooples/AiDotNet.Tensors/commit/70d1e723419e5f26c3699ba27f7ed6c9c34a7cc2))
+* **cuda-attention:** walk causal grids heaviest-first across every head ([#1300](https://github.com/ooples/AiDotNet.Tensors/issues/1300)) ([f88d978](https://github.com/ooples/AiDotNet.Tensors/commit/f88d978b646e6eebb1893f655e3f019889a0e2e8)), closes [#1184](https://github.com/ooples/AiDotNet.Tensors/issues/1184)
+* **hip:** run clblast's indirect gemm on hip, 3-8x the hip kernels ([#1288](https://github.com/ooples/AiDotNet.Tensors/issues/1288)) ([24ddfaa](https://github.com/ooples/AiDotNet.Tensors/commit/24ddfaab4e28281d8a24ca1d8b28dff2d9fb156b))
+
 ## [0.138.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.137.1...v0.138.0) (2026-10-14)
 
 
