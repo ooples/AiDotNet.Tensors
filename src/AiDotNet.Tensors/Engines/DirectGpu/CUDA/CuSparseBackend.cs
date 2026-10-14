@@ -92,10 +92,10 @@ internal static class CuSparseBackend
                 idxBase: 0, CuSparseNative.DataType.R32F),
                 "cusparseCreateCsr");
             CheckSp(CuSparseNative.cusparseCreateDnMat(out matB,
-                cols, n, n, bBuf.Handle, CuSparseNative.DataType.R32F, order: 0 /* row-major */),
+                cols, n, n, bBuf.Handle, CuSparseNative.DataType.R32F, CuSparseNative.DnMatDescr_Order.RowMajor),
                 "cusparseCreateDnMat(B)");
             CheckSp(CuSparseNative.cusparseCreateDnMat(out matC,
-                rows, n, n, outBuf.Handle, CuSparseNative.DataType.R32F, order: 0),
+                rows, n, n, outBuf.Handle, CuSparseNative.DataType.R32F, CuSparseNative.DnMatDescr_Order.RowMajor),
                 "cusparseCreateDnMat(C)");
 
             CheckSp(CuSparseNative.cusparseSpMM_bufferSize(handle,

@@ -11,12 +11,13 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// Authoritative GPU SpMM bench (#515, P6 final step): times AiDotNet's managed CUDA
+/// Host-array GPU SpMM bench (#515): times AiDotNet's managed CUDA
 /// CSR kernels (csr_spmm / _warp / _vec4, picked by <see cref="CudaSparseBackend"/>'s
 /// heuristic) against native cuSPARSE <c>cusparseSpMM</c> over the
-/// <see cref="SpecializedShapeCatalog.SpMM"/> workload shapes, and prints the win rate
-/// + max-loss multiple the owner freezes into <see cref="SpecializedPerfBar"/>'s
-/// <c>GpuSpMM*</c> constants. Once frozen, this also gates: custom must clear the bar.
+/// <see cref="SpecializedShapeCatalog.SpMM"/> workload shapes through the host-array entry
+/// points (allocate, upload, launch, download per call), and prints milliseconds per call.
+/// Informational: the frozen <see cref="SpecializedPerfBar"/> <c>GpuSpMM*</c> bar is about the
+/// kernels and is gated by <see cref="GpuSpMMResidentBench"/>.
 ///
 /// <para>Runner-only: gated on <c>AIDOTNET_PERF_RUNNER=1</c> (the authoritative GPU
 /// runner) AND a usable CUDA driver — it no-ops/skips everywhere else, so it can't
@@ -40,7 +41,7 @@ public class GpuSpMMBenchHarness
 
         bool haveCuSparse = CuSparseBackend.IsAvailable;
         _out.WriteLine($"custom = managed CUDA csr_spmm/_warp/_vec4 ; cuSPARSE available = {haveCuSparse}");
-        _out.WriteLine($"{"shape",-32}{"nnz",11}{"custom GF/s",14}{"cuSPARSE GF/s",16}{"ratio",9}");
+        _out.WriteLine($"{"shape",-32}{"nnz",11}{"custom ms",12}{"cuSPARSE ms",13}{"ratio",9}");
 
         var rng = RandomHelper.CreateSeededRandom(515);
         int wins = 0, compared = 0;
@@ -52,25 +53,23 @@ public class GpuSpMMBenchHarness
             var (rowPtr, colIdx) = BuildCsr(s.Rows, s.Cols, density, rng, out int nnz);
             var vals = RandF(nnz, rng);
             var b = RandF(s.Cols * s.N, rng);
-            double flop = 2.0 * nnz * s.N;
 
             double customMs = MinMs(20, () => CudaSparseBackend.SpMM(rowPtr, colIdx, vals, b, s.Rows, s.Cols, s.N));
-            double customGf = flop / (customMs * 1e6);
 
-            double cuGf = double.NaN;
+            double cuMs = double.NaN;
             string ratio = "    --";
             if (haveCuSparse)
             {
-                double cuMs = MinMs(20, () => CuSparseBackend.SpMM(rowPtr, colIdx, vals, b, s.Rows, s.Cols, s.N));
-                cuGf = flop / (cuMs * 1e6);
+                cuMs = MinMs(20, () => CuSparseBackend.SpMM(rowPtr, colIdx, vals, b, s.Rows, s.Cols, s.N));
                 double r = cuMs / customMs;   // > 1 => custom faster (a win)
                 ratio = $"{r,7:F2}x";
                 compared++;
                 if (r >= 1.0) wins++; else maxLoss = Math.Max(maxLoss, 1.0 / r);
             }
 
-            string cuCol = double.IsNaN(cuGf) ? "--" : cuGf.ToString("F1");
-            _out.WriteLine($"{s.Name,-32}{nnz,11}{customGf,14:F1}{cuCol,16}{ratio,9}");
+            // Milliseconds, not GF/s: a call here is dominated by allocation and transfers, not the flops.
+            string cuCol = double.IsNaN(cuMs) ? "--" : cuMs.ToString("F3");
+            _out.WriteLine($"{s.Name,-32}{nnz,11}{customMs,12:F3}{cuCol,13}{ratio,9}");
         }
 
         if (compared == 0)
@@ -82,19 +81,11 @@ public class GpuSpMMBenchHarness
         int winRate = (int)Math.Round(100.0 * wins / compared);
         _out.WriteLine("");
         _out.WriteLine($"=> custom wins {wins}/{compared} = {winRate}% ; max loss {maxLoss:F2}x");
-        _out.WriteLine($"=> FREEZE into SpecializedPerfBar: GpuSpMMMinWinRatePercent = {winRate}; GpuSpMMMaxLossMultiple = {maxLoss:F2}");
+        _out.WriteLine($"=> host-array round trip, not the kernel bar: win rate {winRate}%, max loss {maxLoss:F2}x");
 
-        if (SpecializedPerfBar.GpuSpMMBarFrozen)
-        {
-            Assert.True(winRate >= SpecializedPerfBar.GpuSpMMMinWinRatePercent,
-                $"GPU SpMM win rate {winRate}% < frozen bar {SpecializedPerfBar.GpuSpMMMinWinRatePercent}%.");
-            Assert.True(maxLoss <= SpecializedPerfBar.GpuSpMMMaxLossMultiple,
-                $"GPU SpMM max loss {maxLoss:F2}x > frozen bar {SpecializedPerfBar.GpuSpMMMaxLossMultiple}x.");
-        }
-        else
-        {
-            _out.WriteLine("(GpuSpMM bar not yet frozen — informational run; set the constants above to start gating.)");
-        }
+        // Informational only: these are the host-array calls, which allocate, upload and download every time, so
+        // the ratio measures transfers more than kernels. GpuSpMMResidentBench is the one that gates on the bar.
+        _out.WriteLine("(informational: the bar is gated by GpuSpMMResidentBench, which times the kernels on resident buffers)");
     }
 
     private static double MinMs(int iters, Action f)
