@@ -187,8 +187,6 @@ public sealed class CuRand : IDeviceRng, IDisposable
         public ulong Advance { get; }
     }
 
-    /// <summary>Whether a uniform call of <paramref name="length"/> values can be generated on the device with the
-    /// CPU generator's exact numbers, and from where.</summary>
     /// <summary>
     /// Decides whether a call of <paramref name="length"/> values goes to the device, and where. Pure: it reads the CPU
     /// generator's position and this instance's setup bookkeeping and touches no CUDA state, so the routing rules are
@@ -273,6 +271,12 @@ public sealed class CuRand : IDeviceRng, IDisposable
     }
 
     /// <summary>
+    /// Moves the CPU generator past the values the device produced, so both stay in lockstep: by the value count for
+    /// MRG32k3a, by whole points for Sobol (see <see cref="DevicePlan.Advance"/>).
+    /// </summary>
+    internal void CommitPlan(DevicePlan plan) => _cpuFallback.Offset = plan.Offset + plan.Advance;
+
+    /// <summary>
     /// Generates <paramref name="count"/> uniforms into host memory with this instance's cuRAND device generator.
     /// False, with the host memory unspecified, when any step fails; the caller then fills it on the CPU.
     /// </summary>
@@ -283,12 +287,6 @@ public sealed class CuRand : IDeviceRng, IDisposable
     /// where the device generator already stands; consecutive device calls just continue. Everything runs in the
     /// primary context, which is never released, so the generator and its buffer can be freed from any thread.
     /// </remarks>
-    /// <summary>
-    /// Moves the CPU generator past the values the device produced, so both stay in lockstep: by the value count for
-    /// MRG32k3a, by whole points for Sobol (see <see cref="DevicePlan.Advance"/>).
-    /// </summary>
-    internal void CommitPlan(DevicePlan plan) => _cpuFallback.Offset = plan.Offset + plan.Advance;
-
     private bool GenerateOnDevice(DevicePlan plan, IntPtr host, ulong count, bool isDouble)
     {
         var primary = PrimaryContext.Value;
