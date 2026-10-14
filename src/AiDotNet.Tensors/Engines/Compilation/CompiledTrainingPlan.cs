@@ -275,6 +275,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (_disposed) return;
         _disposed = true;
         GC.SuppressFinalize(this);
+        LandGradientsOnHost();
         if (StepTiming.Enabled)
             try { StepTiming.DumpAndReset(s => System.IO.File.AppendAllText(
                 System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_steptiming.txt"), s + System.Environment.NewLine)); }
@@ -570,6 +571,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (_lossReadback is { HasUnreadValue: true } && _lossOutput.GetBackingArrayForCacheLookupUnsafe() is float[] host)
             ArmLossReadback(host);
+    }
+
+    /// <summary>
+    /// Lands the last step's device gradients on the host before the plan frees anything. A model may hold the plan's
+    /// gradient tensors past the plan (publishing them by reference instead of copying every one every step), and a
+    /// read after retirement must still see that step's values.
+    /// </summary>
+    private void LandGradientsOnHost()
+    {
+        if (_engine is not Engines.DirectGpuTensorEngine gte
+            || gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true })
+            return;
+        foreach (var gradient in Gradients)
+        {
+            if (gradient?.GetBackingArrayForCacheLookupUnsafe() is not { } backing) continue;
+            try { Helpers.HostSync.TryMaterialize(backing); }
+            catch (InvalidOperationException) { /* released without a host copy: nothing left to preserve */ }
+        }
     }
 
     private void InvalidateCapturedStepGraph()
