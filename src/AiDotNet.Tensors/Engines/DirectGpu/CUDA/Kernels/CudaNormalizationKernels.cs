@@ -504,6 +504,19 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_inverse_std(
     invStd[i] = 1.0f / s;
 }
 
+// The inverse: LayerNorm's forward reports true variance, var = 1 / (invStd * invStd) - eps, in place -- the
+// multiply_vectors, reciprocal_vector and sub_scalar kernels' arithmetic (same compile flags) in one launch.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_variance_from_inverse_std(
+    float* __restrict__ values, int rows, float epsilon)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    float inv = values[i];
+    float squared = inv * inv;
+    float r = 1.0f / squared;
+    values[i] = r - epsilon;
+}
+
 // LayerNorm's affine gradients over [rows, cols], pass 1 of a deterministic two-pass column reduction. Block (32, 8)
 // covers 32 columns of one chunk of rows: each warp reads 32 consecutive floats of a row (coalesced), each of the 8 row
 // lanes sums its rows in order, and lane 0 adds the 8 lanes in a fixed order into partials[chunk][col] (gamma) and
@@ -695,6 +708,7 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "rmsnorm_backward",
                 "rmsnorm_grad_gamma",
                 "layernorm_inverse_std",
+                "layernorm_variance_from_inverse_std",
                 "layernorm_grad_params_partial",
                 "layernorm_grad_params_finish",
                 "column_sum_partial",

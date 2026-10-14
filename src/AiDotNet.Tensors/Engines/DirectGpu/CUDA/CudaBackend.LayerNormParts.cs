@@ -62,6 +62,21 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         return true;
     }
 
+    unsafe bool ILayerNormBackwardPartsBackend.TryLayerNormVarianceFromInverseStd(IGpuBuffer values, int rows, float epsilon)
+    {
+        if (!IsAvailable || rows <= 0 || values.Size < rows
+            || !_kernelCache.TryGetValue("layernorm_variance_from_inverse_std", out var kernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr v = values.Handle;
+        int n = rows;
+        float eps = epsilon;
+        void** args = stackalloc void*[3];
+        args[0] = &v; args[1] = &n; args[2] = &eps;
+        LaunchKernel(kernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        return true;
+    }
+
     bool ILayerNormBackwardPartsBackend.TryLayerNormInputGradient(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer inverseStd, IGpuBuffer gradInput, int rows, int cols)
     {

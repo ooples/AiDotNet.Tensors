@@ -15,6 +15,11 @@ internal interface ILayerNormBackwardPartsBackend
     /// compute it. False -- nothing launched -- when unavailable.</summary>
     bool TryLayerNormInverseStd(IGpuBuffer variance, IGpuBuffer inverseStd, int rows, float epsilon);
 
+    /// <summary>In place, the forward's reverse: <c>values[i] = 1 / (values[i] * values[i]) - epsilon</c>, turning the
+    /// LayerNorm kernel's inverse std into the variance IEngine.LayerNorm reports, as Multiply, Reciprocal and SubScalar
+    /// compute it. False -- nothing launched -- when unavailable.</summary>
+    bool TryLayerNormVarianceFromInverseStd(IGpuBuffer values, int rows, float epsilon);
+
     /// <summary>The input gradient of LayerNorm over [rows, cols] (every element of <paramref name="gradInput"/>
     /// overwritten), from the saved mean and inverse std. False -- nothing launched -- when unavailable.</summary>
     bool TryLayerNormInputGradient(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean,

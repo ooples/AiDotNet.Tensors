@@ -5542,9 +5542,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // The kernel saves 1/sqrt(var + eps); the backward (LayerNormBackward) takes the VARIANCE, like the CPU
             // path's out-parameter. Handing it the inverse std-dev gave wrong gradients on every resident step
             // (measured: dW[0] -0.0019 vs -0.0174). Convert in place: var = 1/invStd^2 - eps.
-            backend.Multiply(stats.var, stats.var, stats.var, outerSize);
-            backend.Reciprocal(stats.var, stats.var, outerSize);
-            backend.AddScalar(stats.var, stats.var, -(float)epsilon, outerSize);
+            // One launch where the backend has it (the same arithmetic as the three kernels).
+            if (!(backend is ILayerNormBackwardPartsBackend parts
+                && parts.TryLayerNormVarianceFromInverseStd(stats.var, outerSize, (float)epsilon)))
+            {
+                backend.Multiply(stats.var, stats.var, stats.var, outerSize);
+                backend.Reciprocal(stats.var, stats.var, outerSize);
+                backend.AddScalar(stats.var, stats.var, -(float)epsilon, outerSize);
+            }
             ResidentSyncCheck("LayerNorm");
             BindResidentBuffer(output, outBuf, backend);
             var meanT = new Tensor<T>(new T[outerSize], new[] { outerSize });
@@ -15206,9 +15211,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // variance — LayerNormBackward re-derives invVar as 1/sqrt(variance+eps). Returning
             // invVar here made the backward double-convert, so GPU norm-backward gradients diverged
             // strongly from CPU/oracle (op-parity #775). Convert invVar -> var = 1/invVar^2 - eps.
-            backend.Multiply(saveVarBuffer.Buffer, saveVarBuffer.Buffer, trueVarBuffer.Buffer, batchSize);
-            backend.Reciprocal(trueVarBuffer.Buffer, trueVarBuffer.Buffer, batchSize);
-            backend.AddScalar(trueVarBuffer.Buffer, trueVarBuffer.Buffer, -(float)epsilon, batchSize);
+            if (backend is ILayerNormBackwardPartsBackend parts)
+            {
+                // One launch (the same arithmetic as the three kernels below), in place on a copy of the inverse std.
+                backend.Copy(saveVarBuffer.Buffer, trueVarBuffer.Buffer, batchSize);
+                if (!parts.TryLayerNormVarianceFromInverseStd(trueVarBuffer.Buffer, batchSize, (float)epsilon))
+                {
+                    backend.Multiply(saveVarBuffer.Buffer, saveVarBuffer.Buffer, trueVarBuffer.Buffer, batchSize);
+                    backend.Reciprocal(trueVarBuffer.Buffer, trueVarBuffer.Buffer, batchSize);
+                    backend.AddScalar(trueVarBuffer.Buffer, trueVarBuffer.Buffer, -(float)epsilon, batchSize);
+                }
+            }
+            else
+            {
+                backend.Multiply(saveVarBuffer.Buffer, saveVarBuffer.Buffer, trueVarBuffer.Buffer, batchSize);
+                backend.Reciprocal(trueVarBuffer.Buffer, trueVarBuffer.Buffer, batchSize);
+                backend.AddScalar(trueVarBuffer.Buffer, trueVarBuffer.Buffer, -(float)epsilon, batchSize);
+            }
             backend.Synchronize();
 
             // Resolved (#775 merge): keep the fully GPU-RESIDENT return — trueVarBuffer is computed
@@ -22946,8 +22965,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bufVar = AllocateFullyWrittenOutputBuffer(backend, outerSize);
             backend.LayerNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, outerSize, normSize, (float)epsilon);
-            ConvertInverseStandardDeviationToVariance(
-                backend, bufVar.Buffer, outerSize, (float)epsilon);
+            // One launch where the backend has it (the same arithmetic as the three-kernel conversion).
+            if (!(backend is ILayerNormBackwardPartsBackend parts
+                && parts.TryLayerNormVarianceFromInverseStd(bufVar.Buffer, outerSize, (float)epsilon)))
+                ConvertInverseStandardDeviationToVariance(
+                    backend, bufVar.Buffer, outerSize, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, outerSize, batchShape);
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, outerSize, batchShape);
