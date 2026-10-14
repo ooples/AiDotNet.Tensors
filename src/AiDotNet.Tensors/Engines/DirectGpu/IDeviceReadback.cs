@@ -34,12 +34,17 @@ internal interface IDeviceReadbackFactory
 /// <summary>
 /// The readback for a backend without an asynchronous device-to-host copy: <see cref="Enqueue"/> downloads at once
 /// (the download waits for the submitted work, so the value is the same), and <see cref="Read"/> returns it.
+/// <para>The source is a float buffer (a training step's loss). Its prefix is copied on the device into this
+/// readback's own float buffer, which is downloaded: a backend's byte download accepts only its byte buffers (OpenCL
+/// threw "Buffer must be a DirectOpenClGpuByteBuffer", failing every compiled GPU training step off CUDA), and its
+/// float download reads a whole buffer, where the loss sits in a larger pooled one.</para>
 /// </summary>
 internal sealed class SynchronousDeviceReadback : IDeviceReadback
 {
     private readonly IDirectGpuBackend _backend;
     private readonly int _capacity;
     private byte[] _bytes = Array.Empty<byte>();
+    private IGpuBuffer? _staging;
     private bool _queued;
     private bool _disposed;
 
@@ -58,7 +63,16 @@ internal sealed class SynchronousDeviceReadback : IDeviceReadback
         if (_disposed) throw new ObjectDisposedException(nameof(SynchronousDeviceReadback));
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (byteCount <= 0 || byteCount > _capacity) throw new ArgumentOutOfRangeException(nameof(byteCount));
-        _bytes = _backend.DownloadByteBuffer(source, byteCount);
+        int floats = (byteCount + sizeof(float) - 1) / sizeof(float);
+        if (source.Size < floats)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), $"The buffer holds {source.Size} floats, fewer than {byteCount} bytes.");
+        // A backend's float download reads a whole buffer, and the source is usually a larger pooled one: copy the
+        // requested prefix into this readback's own buffer on the device and download only that.
+        var staging = _staging ??= _backend.AllocateBuffer((_capacity + sizeof(float) - 1) / sizeof(float));
+        _backend.Copy(source, 0, staging, 0, floats);
+        var values = _backend.DownloadBuffer(staging);
+        if (_bytes.Length != byteCount) _bytes = new byte[byteCount];
+        Buffer.BlockCopy(values, 0, _bytes, 0, byteCount);
         _queued = true;
         HasUnreadValue = true;
     }
@@ -71,5 +85,12 @@ internal sealed class SynchronousDeviceReadback : IDeviceReadback
         return _bytes;
     }
 
-    public void Dispose() => _disposed = true;
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        // A backend that is already gone took its buffers with it.
+        if (_backend.IsAvailable) _staging?.Dispose();
+        _staging = null;
+    }
 }
