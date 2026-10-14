@@ -1390,6 +1390,25 @@ public class GradientCorrectnessTests : IDisposable
         Assert.Equal(new float[] { 0f, 0f, 2f, 2f, 0f, 0f, 0f, 0f, 0f }, second);
     }
 
+    /// <summary>
+    /// An infinite upstream gradient under create-graph: the selected class gets it and every other class stays exactly
+    /// 0, as the scatter kernel of the plain backward writes. A mask * gradient formulation turned 0 * Inf into NaN at
+    /// every unselected class.
+    /// </summary>
+    [Fact]
+    public void GatherClassValues_CreateGraph_NonFiniteUpstream_LeavesUnselectedClassesZero()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        var classes = new Tensor<float>(new float[] { 1f, 2f }, [2]);
+        var scale = new Tensor<float>(new float[] { float.PositiveInfinity, 1f }, [2]);
+
+        using var tape = new GradientTape<float>();
+        var v = _engine.TensorGatherClassValues(x, classes);
+        var loss = _engine.ReduceSum(_engine.TensorMultiply(v, scale), axes: null);   // d loss / d v = [Inf, 1]
+        var g = tape.ComputeGradients(loss, sources: new[] { x }, createGraph: true)[x].Contiguous().AsSpan().ToArray();
+
+        Assert.Equal(new float[] { 0f, float.PositiveInfinity, 0f, 0f, 0f, 1f }, g);
+    }
     // ──────────────────────────────────────────────────────────────
     // Loss function gradient tests
     // ──────────────────────────────────────────────────────────────

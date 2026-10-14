@@ -2030,7 +2030,7 @@ internal static class BackwardFunctions<T>
         // Under create-graph the gradient is itself differentiated (a meta-learner's inner-loop gradient), so it has
         // to come from recorded ops: the scatter kernel below records nothing, and the outer tape lost the edge from
         // the upstream gradient (LEO's meta-gradient through a class-index cross-entropy failed in TransposeBackward).
-        // The same scatter as a constant one-hot mask times the upstream gradient broadcast over the class axis.
+        // The same scatter as a constant one-hot mask selecting the upstream gradient broadcast over the class axis.
         if (DifferentiableOps._isBackwardCreateGraph)
         {
             DifferentiableOps.AccumulateGrad(grads, values, ClassValuesGradRecorded(gradOutput, classIndices, values._shape, engine), engine);
@@ -2060,7 +2060,10 @@ internal static class BackwardFunctions<T>
 
         var rowShape = (int[])valuesShape.Clone();
         rowShape[rowShape.Length - 1] = 1;
-        return engine.TensorMultiply(mask, engine.Reshape(gradOutput, rowShape));
+        // A recorded select, not mask * gradient: an upstream Inf or NaN would turn 0 * g into NaN at every unselected class,
+        // where ScatterClassValuesGrad (the non-create-graph path) writes exactly 0.
+        var broadcastGrad = engine.TensorBroadcastTo(engine.Reshape(gradOutput, rowShape), (int[])valuesShape.Clone());
+        return engine.TensorWhere(mask, broadcastGrad, new Tensor<T>((int[])valuesShape.Clone()));
     }
 
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
