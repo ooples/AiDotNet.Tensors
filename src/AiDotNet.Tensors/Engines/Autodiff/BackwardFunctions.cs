@@ -1747,6 +1747,34 @@ internal static class BackwardFunctions<T>
             : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
 
+        // In a resident step the three gradients land in their accumulators directly (the input's only on its first
+        // contribution: that kernel overwrites).
+        if (engine is DirectGpuTensorEngine gpuNorm
+            && !DifferentiableOps.IsRecording<T>()
+            && !Compilation.GraphMode.IsActive)
+        {
+            var intoInput = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool addInput);
+            var intoGamma = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out bool addGamma);
+            var intoBeta = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[2], engine, out bool addBeta);
+            if (gpuNorm.TryLayerNormBackwardResident(gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
+                    addInput ? null : intoInput, intoGamma, addGamma, intoBeta, addBeta,
+                    out var residentInput, out var residentGamma, out var residentBeta)
+                && residentInput is not null && residentGamma is not null && residentBeta is not null)
+            {
+                void Land(Tensor<T> input, Tensor<T>? into, Tensor<T> grad)
+                {
+                    if (into is not null && ReferenceEquals(grad, into))
+                        DifferentiableOps.CommitDirectGradWrite(grads, input, into);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+                }
+                Land(inputs[0], addInput ? null : intoInput, residentInput);
+                Land(inputs[1], intoGamma, residentGamma);
+                Land(inputs[2], intoBeta, residentBeta);
+                return;
+            }
+        }
+
         var gradInput = engine.LayerNormBackward(
             gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
             out var gradGamma, out var gradBeta);

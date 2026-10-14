@@ -15233,6 +15233,86 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// GPU-accelerated LayerNorm backward operation.
     /// </summary>
+    /// <summary>
+    /// Resident-step LayerNorm backward through a backend that runs it as placeable pieces
+    /// (<see cref="ILayerNormBackwardPartsBackend"/>): the inverse std in one launch, the input gradient, and gamma's
+    /// and beta's gradients from a device-wide deterministic column reduction. <paramref name="intoInput"/> (written
+    /// only on its first contribution: the kernel overwrites), <paramref name="intoGamma"/> and
+    /// <paramref name="intoBeta"/> (overwritten, or added to when <paramref name="addGamma"/> /
+    /// <paramref name="addBeta"/>) are gradient accumulators the results land in directly; a result that did is
+    /// returned as that accumulator. Elsewhere the outputs are fresh, fully written buffers -- the previous resident
+    /// path zero-filled gamma's and beta's because a tuned candidate may accumulate, and the caller then copied them.
+    /// False when the route does not apply; anything already written then was an overwrite of a first contribution
+    /// the caller's fallback overwrites again.
+    /// </summary>
+    internal bool TryLayerNormBackwardResident<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma,
+        Tensor<T> mean, Tensor<T> variance, double epsilon,
+        Tensor<T>? intoInput, Tensor<T>? intoGamma, bool addGamma, Tensor<T>? intoBeta, bool addBeta,
+        out Tensor<T>? gradInput, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta)
+    {
+        gradInput = null; gradGamma = null; gradBeta = null;
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend) || backend is not ILayerNormBackwardPartsBackend parts) return false;
+        int cols = gamma.Length;
+        if (cols <= 0 || input.Length % cols != 0 || gradOutput.Length != input.Length) return false;
+        int rows = input.Length / cols;
+        int scratchFloats = parts.LayerNormAffineGradientScratchFloats(rows, cols);
+        if (rows <= 0 || scratchFloats <= 0) return false;
+
+        var gR = ResolveResidentBufferNoUpload(backend, gradOutput, input.Length);
+        var iR = ResolveResidentBufferNoUpload(backend, input, input.Length);
+        var gamR = ResolveResidentBufferNoUpload(backend, gamma, cols);
+        var meanR = ResolveResidentBufferNoUpload(backend, mean, rows);
+        var varR = ResolveResidentBufferNoUpload(backend, variance, rows);
+        if (gR is null || iR is null || gamR is null || meanR is null || varR is null) return false;
+
+        var inputTarget = ResolveDirectGradTarget(backend, intoInput, input.Length, gR, iR, gamR);
+        var gammaTarget = ResolveDirectGradTarget(backend, intoGamma, cols, gR, iR, gamR);
+        var betaTarget = ResolveDirectGradTarget(backend, intoBeta, cols, gR, iR, gamR);
+        if (gammaTarget is not null && betaTarget is not null && gammaTarget.Handle == betaTarget.Handle) betaTarget = null;
+
+        bool pooled = ScratchPoolingActive;
+        IGpuBuffer Scratch(int length) => pooled ? RentActionScratch(backend, length, fullyWritten: true) : backend.AllocateBuffer(length);
+        var invStd = Scratch(rows);
+        var partials = Scratch(scratchFloats);
+        try
+        {
+            var giT = inputTarget is null ? new Tensor<T>(new T[input.Length], input.Shape.ToArray()) : intoInput;
+            var ggT = gammaTarget is null ? new Tensor<T>(new T[cols], gamma.Shape.ToArray()) : intoGamma;
+            var gbT = betaTarget is null ? new Tensor<T>(new T[cols], gamma.Shape.ToArray()) : intoBeta;
+            if (giT is null || ggT is null || gbT is null) return false;
+            var giBuf = inputTarget ?? GetOrCreateResidentBuffer(backend, giT, input.Length, fullyWritten: true);
+            var ggBuf = gammaTarget ?? GetOrCreateResidentBuffer(backend, ggT, cols, fullyWritten: true);
+            var gbBuf = betaTarget ?? GetOrCreateResidentBuffer(backend, gbT, cols, fullyWritten: true);
+            if (giBuf.Handle == IntPtr.Zero || ggBuf.Handle == IntPtr.Zero || gbBuf.Handle == IntPtr.Zero) return false;
+
+            // Order matters for the false return: nothing is added anywhere until the last launch.
+            if (!parts.TryLayerNormInverseStd(varR, invStd, rows, (float)epsilon)) return false;
+            if (!parts.TryLayerNormInputGradient(gR, iR, gamR, meanR, invStd, giBuf, rows, cols)) return false;
+            if (!parts.TryLayerNormAffineGradients(gR, iR, meanR, invStd, partials, ggBuf, gbBuf, rows, cols,
+                    gammaTarget is not null && addGamma, betaTarget is not null && addBeta))
+                return false;
+            ResidentSyncCheck("LayerNormBackwardParts");
+            if (inputTarget is not null) giT.IncrementVersion();
+            if (gammaTarget is not null) ggT.IncrementVersion();
+            if (betaTarget is not null) gbT.IncrementVersion();
+            BindResidentBuffer(giT, giBuf, backend);
+            BindResidentBuffer(ggT, ggBuf, backend);
+            BindResidentBuffer(gbT, gbBuf, backend);
+            gradInput = giT; gradGamma = ggT; gradBeta = gbT;
+            return true;
+        }
+        catch (NotSupportedException ex)
+        {
+            GpuLaunchProbe.OnFallback("TryLayerNormBackwardResident", ex);
+            return false;
+        }
+        finally
+        {
+            if (!pooled) { invStd.Dispose(); partials.Dispose(); }
+        }
+    }
+
     Tensor<T> IEngine.LayerNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
         if (!TryGetBackend(out var backend))
@@ -15290,6 +15370,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     meanOwned?.Dispose(); varianceOwned?.Dispose(); invVarBuf?.Dispose();
                     if (!ok) { giOut?.Dispose(); ggOut?.Dispose(); gbOut?.Dispose(); }
                 }
+            }
+
+            if (TryLayerNormBackwardResident(gradOutput, input, gamma, mean, variance, epsilon, null, null, false, null, false,
+                    out var partsInput, out var partsGamma, out var partsBeta)
+                && partsInput is not null && partsGamma is not null && partsBeta is not null)
+            {
+                gradGamma = partsGamma; gradBeta = partsBeta;
+                return partsInput;
             }
 
             // PR #638 A1: resident-step LayerNorm backward — all 3 grads (gradInput/gradGamma/gradBeta) into

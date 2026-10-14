@@ -492,6 +492,74 @@ extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_grad_gamma(
     }
     gradGamma[i] = dGamma;
 }
+
+// LayerNorm's inverse std from the saved variance, invStd = 1 / sqrt(var + eps): the same three operations as the
+// add_scalar, sqrt_vector and reciprocal_vector kernels (same compile flags), in one launch instead of three.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_inverse_std(
+    const float* __restrict__ variance, float* __restrict__ invStd, int rows, float epsilon)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    float s = sqrtf(variance[i] + epsilon);
+    invStd[i] = 1.0f / s;
+}
+
+// LayerNorm's affine gradients over [rows, cols], pass 1 of a deterministic two-pass column reduction. Block (32, 8)
+// covers 32 columns of one chunk of rows: each warp reads 32 consecutive floats of a row (coalesced), each of the 8 row
+// lanes sums its rows in order, and lane 0 adds the 8 lanes in a fixed order into partials[chunk][col] (gamma) and
+// partials[chunks + chunk][col] (beta). The thread-per-column kernel ran on cols / 32 blocks -- 2 for a 64-wide model.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_partial(
+    const float* __restrict__ gradOutput, const float* __restrict__ input,
+    const float* __restrict__ saveMean, const float* __restrict__ saveInvVar,
+    float* __restrict__ partials, int rows, int cols, int rowsPerChunk)
+{
+    __shared__ float sg[8][33];
+    __shared__ float sb[8][33];
+    int col = blockIdx.x * 32 + threadIdx.x;
+    int chunk = blockIdx.y;
+    int r0 = chunk * rowsPerChunk;
+    int r1 = min(rows, r0 + rowsPerChunk);
+    float g = 0.0f, b = 0.0f;
+    if (col < cols)
+    {
+        for (int r = r0 + threadIdx.y; r < r1; r += 8)
+        {
+            int idx = r * cols + col;
+            float dy = gradOutput[idx];
+            float normalized = (input[idx] - saveMean[r]) * saveInvVar[r];
+            g += dy * normalized;
+            b += dy;
+        }
+    }
+    sg[threadIdx.y][threadIdx.x] = g;
+    sb[threadIdx.y][threadIdx.x] = b;
+    __syncthreads();
+    if (threadIdx.y == 0 && col < cols)
+    {
+        float tg = 0.0f, tb = 0.0f;
+        for (int y = 0; y < 8; y++) { tg += sg[y][threadIdx.x]; tb += sb[y][threadIdx.x]; }
+        partials[chunk * cols + col] = tg;
+        partials[(gridDim.y + chunk) * cols + col] = tb;
+    }
+}
+
+// Pass 2: each column's chunk partials summed in chunk order, then written to (or added to, for a gradient that
+// already holds this step's contributions) gradGamma / gradBeta.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_finish(
+    const float* __restrict__ partials, float* __restrict__ gradGamma, float* __restrict__ gradBeta,
+    int cols, int chunks, int addGamma, int addBeta)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float g = 0.0f, b = 0.0f;
+    for (int c = 0; c < chunks; c++)
+    {
+        g += partials[c * cols + col];
+        b += partials[(chunks + c) * cols + col];
+    }
+    gradGamma[col] = addGamma ? gradGamma[col] + g : g;
+    gradBeta[col] = addBeta ? gradBeta[col] + b : b;
+}
 ";
         }
 
@@ -508,7 +576,10 @@ extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_grad_gamma(
                 "instancenorm_forward",
                 "rmsnorm_forward",
                 "rmsnorm_backward",
-                "rmsnorm_grad_gamma"
+                "rmsnorm_grad_gamma",
+                "layernorm_inverse_std",
+                "layernorm_grad_params_partial",
+                "layernorm_grad_params_finish"
             };
         }
     }
