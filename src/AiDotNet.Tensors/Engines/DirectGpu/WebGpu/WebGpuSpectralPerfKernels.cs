@@ -144,6 +144,13 @@ fn zero_buffer(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 struct Params { totalSegBatch: u32, fftSize: u32, numBins: u32, usable: u32 }
 @group(0) @binding(2) var<uniform> p: Params;
+// floor(k^2 m / n^2) without int64: floor(k * (k*m) / n) / n, with k*m = q*n + r.
+fn wb_edge(k: u32, n: u32, m: u32) -> u32 {
+    let km = k * m;
+    let q = km / n;
+    let r = km % n;
+    return (k * q + (k * r) / n) / n;
+}
 @compute @workgroup_size(256)
 fn wideband_log_bin_pool(@builtin(global_invocation_id) gid: vec3<u32>) {
     let outIdx = gid.x;
@@ -151,10 +158,10 @@ fn wideband_log_bin_pool(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (outIdx >= total) { return; }
     let seg = outIdx / p.numBins;
     let k = outIdx % p.numBins;
-    let r0 = f32(k) / f32(p.numBins);
-    let r1 = f32(k + 1u) / f32(p.numBins);
-    var binStart = 1 + i32(r0 * r0 * f32(p.usable - 1u));
-    var binEnd = 1 + i32(r1 * r1 * f32(p.usable - 1u));
+    // binStart = 1 + floor(k^2 (usable-1) / numBins^2) exactly, in 32-bit integers (WGSL has no int64): see wb_edge. The
+    // host checks numBins * usable < 2^31 and numBins <= 46340.
+    var binStart = 1 + i32(wb_edge(k, p.numBins, p.usable - 1u));
+    var binEnd = 1 + i32(wb_edge(k + 1u, p.numBins, p.usable - 1u));
     if (binEnd <= binStart) { binEnd = binStart + 1; }
     if (binEnd > i32(p.usable)) { binEnd = i32(p.usable); }
     let magOff = seg * p.fftSize;

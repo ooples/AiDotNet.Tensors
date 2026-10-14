@@ -1431,6 +1431,10 @@ public sealed partial class WebGpuBackend
         long totalL = (long)totalSegBatch * numBins;
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
+        // The shader computes the bin edges exactly in 32-bit integers (no int64 in the shading language); its products
+        // stay below 2^32 only while numBins * usable < 2^31 and numBins <= 46340. Larger shapes run on the CPU.
+        if ((long)numBins * usable >= int.MaxValue || numBins > 46340)
+            throw new GpuCapabilityUnavailableException("WidebandLogBinPool: numBins * usable exceeds the shader's exact 32-bit bin-edge range.");
         Dispatch2BufferAsync("SpectralPerf", WebGpuSpectralPerfKernels.WidebandLogBinPoolSource,
             "wideband_log_bin_pool", magBuf, output,
             new float[] { BitConverter.Int32BitsToSingle(totalSegBatch), BitConverter.Int32BitsToSingle(fftSize),

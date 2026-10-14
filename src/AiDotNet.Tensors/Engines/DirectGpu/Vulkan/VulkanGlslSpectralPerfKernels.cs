@@ -156,16 +156,24 @@ void main() {
 
         public static string WidebandLogBinPool => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint totalSegBatch; uint fftSize; uint numBins; uint usable; };
+// floor(k^2 m / n^2) without int64: floor(k * (k*m) / n) / n, with k*m = q*n + r.
+uint wb_edge(uint k, uint n, uint m) {
+    uint km = k * m;
+    uint q = km / n;
+    uint r = km % n;
+    return (k * q + (k * r) / n) / n;
+}
 void main() {
     uint outIdx = gl_GlobalInvocationID.x;
     uint total = totalSegBatch * numBins;
     if (outIdx >= total) return;
     uint seg = outIdx / numBins;
     uint k = outIdx % numBins;
-    float r0 = float(k) / float(numBins);
-    float r1 = float(k + 1u) / float(numBins);
-    int binStart = 1 + int(r0 * r0 * float(usable - 1u));
-    int binEnd = 1 + int(r1 * r1 * float(usable - 1u));
+    // binStart = 1 + floor(k^2 (usable-1) / numBins^2) exactly, in 32-bit integers (GLSL has no portable int64):
+    // floor(k * (k*m) / n) then / n, splitting k*m = q*n + r so no product exceeds k*m or n^2. The host checks
+    // numBins * usable < 2^31 and numBins <= 46340.
+    int binStart = 1 + int(wb_edge(k, numBins, usable - 1u));
+    int binEnd = 1 + int(wb_edge(k + 1u, numBins, usable - 1u));
     if (binEnd <= binStart) binEnd = binStart + 1;
     if (binEnd > int(usable)) binEnd = int(usable);
     uint magOff = seg * fftSize;

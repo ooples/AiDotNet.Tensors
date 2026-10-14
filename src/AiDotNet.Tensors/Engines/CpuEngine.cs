@@ -52549,8 +52549,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 int usable = fftSize / 2;
                 for (int k = 0; k < numBins; k++)
                 {
-                    int binStart = 1 + (int)(Math.Pow((double)k / numBins, 2) * (usable - 1));
-                    int binEnd = 1 + (int)(Math.Pow((double)(k + 1) / numBins, 2) * (usable - 1));
+                    // binStart = 1 + floor(k^2 (usable-1) / numBins^2) in exact integers: Math.Pow((double)k / numBins, 2)
+                    // truncated exact integer edges to the bin below (numBins=7, usable=50, k=1: 1 -> 0), and every GPU
+                    // backend computes the same exact edges.
+                    long binDen = (long)numBins * numBins;
+                    int binStart = 1 + (int)((long)k * k * (usable - 1) / binDen);
+                    int binEnd = 1 + (int)((long)(k + 1) * (k + 1) * (usable - 1) / binDen);
                     if (binEnd <= binStart) binEnd = binStart + 1;
                     if (binEnd > usable) binEnd = usable;
 
