@@ -229,6 +229,17 @@ class Program
                 runs, includePython, onlyOperation, tuneFp16TensorCore);
             return;
         }
+        if (args.Length > 0 && args[0] == "--list-gemm-grid")
+        {
+            foreach (GemmGridCase gridCase in DirectPtxDenseLinearFullExperiment.GemmGrid)
+                Console.WriteLine(gridCase.Name);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--audit-direct-ptx-gemm-resources")
+        {
+            Environment.ExitCode = DirectPtxGemmResourceAuditTool.Run(args.Skip(1).ToArray());
+            return;
+        }
         if (args.Length > 0 && args[0] == "--export-direct-ptx-dense-linear-cubins")
         {
             string outputDirectory = args.Length > 1
@@ -2105,6 +2116,9 @@ class Program
         Console.WriteLine("  --direct-ptx-gpu-matrix: NVIDIA-only S16/S32/S64/S128 attention matrix");
         Console.WriteLine("  --direct-ptx-fused-linear [runs]: FP32 M=1 linear+bias+GELU championship matrix");
         Console.WriteLine("  --direct-ptx-dense-linear-full [runs] [--no-python] [--only=operation] [--autotune-fp16-m16]: complete #836 resident NVIDIA matrix");
+        Console.WriteLine("  --direct-ptx-dense-linear-full [runs] --only=gemm-grid[-NAME]: #1261 CUDA GEMM grid (cuBLAS, cuBLASLt, direct PTX, PyTorch)");
+        Console.WriteLine("  --audit-direct-ptx-gemm-resources <CUDA bin dir> [out dir]: #1261 ptxas -v and SASS widths of the PTX GEMM kernels");
+        Console.WriteLine("  --list-gemm-grid: print the #1261 GEMM grid shape names, one per line");
         Console.WriteLine("  --export-direct-ptx-dense-linear-cubins [dir]: link and export exact SM86 cubins");
         Console.WriteLine("  --verify-direct-ptx-dense-linear-cubins [dir]: reject stale/missing dense-linear artifacts");
         Console.WriteLine("  --audit-direct-ptx-dense-linear-sass <nvdisasm> [cubins] [evidence]: reject final-SASS LDL/STL");

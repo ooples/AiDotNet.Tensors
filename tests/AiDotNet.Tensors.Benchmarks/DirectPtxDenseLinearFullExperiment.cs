@@ -95,7 +95,8 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                 if (onlyOperation is null || onlyOperation is "dot" or "outer" or "batched-dot" or "strided-dot")
                     RunDenseVectors(backend, run, onlyOperation);
                 // Opt-in only: the #1261 shape grid is far longer than the default matrix.
-                if (onlyOperation == GemmGridOperation) RunGemmGrid(backend, run);
+                if (onlyOperation is { } gridSelection && SelectsGemmGrid(gridSelection))
+                    RunGemmGrid(backend, cublasLt, run, gridSelection);
             }
             if (includePython)
             {

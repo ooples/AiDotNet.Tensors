@@ -35,8 +35,13 @@ GRAPH_LOGICAL_OPERATIONS_PER_SAMPLE = (
 
 
 def foreign_python_processes():
-    """Return other Python processes without requiring a third-party package."""
+    """Return other Python processes without requiring a third-party package.
+
+    The parent process is exempt: a Windows virtual environment's python.exe is a launcher that starts the base
+    interpreter as its child and waits for it, so it is this process, not a foreign workload.
+    """
     current_pid = os.getpid()
+    launcher_pid = os.getppid()
     conflicts = []
     if os.name == "nt":
         result = subprocess.run(
@@ -53,7 +58,7 @@ def foreign_python_processes():
                 pid = int(row[1])
             except ValueError:
                 continue
-            if pid != current_pid and name in ("python.exe", "python3.exe", "pythonw.exe"):
+            if pid not in (current_pid, launcher_pid) and name in ("python.exe", "python3.exe", "pythonw.exe"):
                 conflicts.append(f"pid={pid} {row[0]}")
         return conflicts
 
@@ -61,7 +66,7 @@ def foreign_python_processes():
     if not os.path.isdir(proc_root):
         raise RuntimeError("Cannot enumerate OS processes for clean evidence.")
     for entry in os.scandir(proc_root):
-        if not entry.name.isdigit() or int(entry.name) == current_pid:
+        if not entry.name.isdigit() or int(entry.name) in (current_pid, launcher_pid):
             continue
         try:
             with open(os.path.join(entry.path, "comm"), encoding="utf-8") as stream:
@@ -174,11 +179,11 @@ def divide_round_up(value, divisor):
     return (value + divisor - 1) // divisor
 
 
-def measure_device(operation, logical_operations_per_call=1):
+def measure_device(operation, logical_operations_per_call=1, device_launches=DEVICE_LAUNCHES):
     warmup_calls = divide_round_up(WARMUPS, logical_operations_per_call)
     minimum_operations = (
         GRAPH_LOGICAL_OPERATIONS_PER_SAMPLE
-        if logical_operations_per_call > 1 else DEVICE_LAUNCHES
+        if logical_operations_per_call > 1 else device_launches
     )
     calls_per_sample = divide_round_up(
         minimum_operations, logical_operations_per_call)
@@ -288,13 +293,7 @@ def make_case(name, run, device):
         return "M1 K512 N2048", 2.0 * m * k * n, op, expected
 
     if name.startswith(GEMM_GRID_PREFIX):
-        m, k, n = GEMM_GRID[name[len(GEMM_GRID_PREFIX):]]
-        left, right = values((m, k)), values((k, n), 0.0625)
-
-        def op():
-            return left @ right
-
-        return f"M{m} K{k} N{n}", 2.0 * m * k * n, op, left.double() @ right.double()
+        return make_gemm_grid_case(name[len(GEMM_GRID_PREFIX):], values)
 
     if name == "gemm-fp32":
         m, k, n = 64, 256, 256
@@ -457,19 +456,97 @@ def make_mixed_backward_case(run, device):
     return op
 
 
-# #1261: the GEMM shape grid, mirroring DirectPtxDenseLinearFullExperiment.GemmGrid (name -> (M, K, N)).
+# #1261: the GEMM shape grid, mirroring DirectPtxDenseLinearFullExperiment.GemmGrid:
+# name -> (variant, batch, M, K, N). Variants: "nn" A @ B, "nt" A @ B^T (B stored [N,K]), "tn" A^T @ B
+# (A stored [K,M]), "alphabeta" 0.5 A @ B + 0.75 C, "batched" strided-batched A[b] @ B[b].
 GEMM_GRID_PREFIX = "gemm-grid-"
 GEMM_GRID = {
-    "sq128": (128, 128, 128), "sq256": (256, 256, 256), "sq512": (512, 512, 512),
-    "sq1024": (1024, 1024, 1024), "sq2048": (2048, 2048, 2048), "sq4096": (4096, 4096, 4096),
-    "decode-m1-4096": (1, 4096, 4096), "decode-m16-4096": (16, 4096, 4096),
-    "decode-m1-mlp-up": (1, 4096, 11008), "decode-m16-mlp-up": (16, 4096, 11008),
-    "prefill-m128-qkv": (128, 4096, 4096), "prefill-m2048-qkv": (2048, 4096, 4096),
-    "prefill-m2048-mlp-up": (2048, 4096, 11008), "prefill-m2048-mlp-down": (2048, 11008, 4096),
-    "vision-56x56-c64": (3136, 576, 64), "vision-28x28-c128": (784, 1152, 128),
-    "odd-1000": (1000, 1000, 1000), "odd-127x513x255": (127, 513, 255),
+    "sq64": ("nn", 1, 64, 64, 64), "sq128": ("nn", 1, 128, 128, 128),
+    "sq256": ("nn", 1, 256, 256, 256), "sq512": ("nn", 1, 512, 512, 512),
+    "sq1024": ("nn", 1, 1024, 1024, 1024), "sq2048": ("nn", 1, 2048, 2048, 2048),
+    "sq4096": ("nn", 1, 4096, 4096, 4096), "sq8192": ("nn", 1, 8192, 8192, 8192),
+    "skinny-m4": ("nn", 1, 4, 4096, 4096), "skinny-m64": ("nn", 1, 64, 4096, 4096),
+    "tall-n16": ("nn", 1, 4096, 4096, 16),
+    "llm-qkv-m1": ("nn", 1, 1, 4096, 4096), "llm-qkv-m16": ("nn", 1, 16, 4096, 4096),
+    "llm-qkv-m128": ("nn", 1, 128, 4096, 4096), "llm-qkv-m2048": ("nn", 1, 2048, 4096, 4096),
+    "llm-up-m1": ("nn", 1, 1, 4096, 11008), "llm-up-m16": ("nn", 1, 16, 4096, 11008),
+    "llm-up-m128": ("nn", 1, 128, 4096, 11008), "llm-up-m2048": ("nn", 1, 2048, 4096, 11008),
+    "llm-down-m1": ("nn", 1, 1, 11008, 4096), "llm-down-m16": ("nn", 1, 16, 11008, 4096),
+    "llm-down-m128": ("nn", 1, 128, 11008, 4096), "llm-down-m2048": ("nn", 1, 2048, 11008, 4096),
+    "vision-stem-112x112-c64": ("nn", 1, 12544, 147, 64), "vision-56x56-c64": ("nn", 1, 3136, 576, 64),
+    "vision-28x28-c128": ("nn", 1, 784, 1152, 128), "vision-14x14-c256": ("nn", 1, 196, 2304, 256),
+    "vision-7x7-c512": ("nn", 1, 49, 4608, 512),
+    "odd-1000": ("nn", 1, 1000, 1000, 1000), "odd-127x513x255": ("nn", 1, 127, 513, 255),
+    "batched-attn-qk-b32": ("batched", 32, 512, 64, 512),
+    "batched-attn-pv-b32": ("batched", 32, 512, 512, 64),
+    "batched-b16-256": ("batched", 16, 256, 256, 256),
+    "nt-1024": ("nt", 1, 1024, 1024, 1024), "nt-llm-m2048": ("nt", 1, 2048, 4096, 4096),
+    "tn-1024": ("tn", 1, 1024, 1024, 1024), "tn-wgrad-4096": ("tn", 1, 4096, 2048, 4096),
+    "alphabeta-1024": ("alphabeta", 1, 1024, 1024, 1024),
+    "alphabeta-llm-m2048": ("alphabeta", 1, 2048, 4096, 4096),
 }
 GEMM_GRID_CASES = tuple(GEMM_GRID_PREFIX + name for name in GEMM_GRID)
+GEMM_GRID_ALPHA = 0.5
+GEMM_GRID_BETA = 0.75
+# Same policy as the .NET grid: a device sample spans ~2e10 FLOP (at most DEVICE_LAUNCHES launches), and the
+# 1,000-operation CUDA-graph lane runs only up to 0.2 GFLOP, where launch overhead is a real share of the time.
+GEMM_GRID_FLOPS_PER_DEVICE_SAMPLE = 2e10
+GEMM_GRID_GRAPH_WORK_CEILING = 2e8
+GEMM_GRID_TOLERANCE = 2e-4
+
+
+def gemm_grid_device_launches(work):
+    return max(1, min(DEVICE_LAUNCHES, math.ceil(GEMM_GRID_FLOPS_PER_DEVICE_SAMPLE / work)))
+
+
+def make_gemm_grid_case(name, values):
+    """Builds one grid shape: (shape label, FLOPs, operation, fp64 oracle)."""
+    variant, batch, m, k, n = GEMM_GRID[name]
+    work = 2.0 * batch * m * k * n
+    if variant == "batched":
+        left, right = values((batch, m, k)), values((batch, k, n), 0.0625)
+
+        def op():
+            return torch.bmm(left, right)
+
+        return f"B{batch} M{m} K{k} N{n}", work, op, torch.bmm(left.double(), right.double())
+
+    left, right = values((m, k)), values((k, n), 0.0625)
+    expected = left.double() @ right.double()
+    if variant == "nn":
+        def op():
+            return left @ right
+
+        return f"M{m} K{k} N{n}", work, op, expected
+    if variant == "nt":
+        right_stored = right.t().contiguous()
+
+        def op():
+            return left @ right_stored.t()
+
+        return f"M{m} K{k} N{n} A@B^T", work, op, expected
+    if variant == "tn":
+        left_stored = left.t().contiguous()
+
+        def op():
+            return left_stored.t() @ right
+
+        return f"M{m} K{k} N{n} A^T@B", work, op, expected
+    if variant == "alphabeta":
+        initial = values((m, n))
+
+        def op():
+            return torch.addmm(initial, left, right, beta=GEMM_GRID_BETA, alpha=GEMM_GRID_ALPHA)
+
+        return (f"M{m} K{k} N{n} a=0.5 b=0.75", work, op,
+                GEMM_GRID_ALPHA * expected + GEMM_GRID_BETA * initial.double())
+    raise ValueError(f"unknown GEMM grid variant {variant!r}")
+
+
+def relative_error(actual, expected):
+    """Max absolute error relative to the largest oracle magnitude, as the .NET grid reports it."""
+    scale = max(expected.abs().max().item(), 1e-30)
+    return (actual.double() - expected).abs().max().item() / scale
 
 CASES = (
     "decode-gelu",
@@ -526,12 +603,15 @@ def main():
         for operation in operations:
             require_no_foreign_compute(f"{operation}-start")
             shape, work, eager, expected = make_case(operation, run, device)
+            grid = operation.startswith(GEMM_GRID_PREFIX)
+            device_launches = gemm_grid_device_launches(work) if grid else DEVICE_LAUNCHES
+            capture = not grid or work <= GEMM_GRID_GRAPH_WORK_CEILING
 
-            graph_operation, eager_graph, eager_capture_stream = capture_graph(eager)
-            competitors = [
-                ("PyTorch CUDA eager", eager, 1),
-                ("PyTorch CUDA graph", graph_operation, GRAPH_OPERATIONS_PER_REPLAY),
-            ]
+            graph_operation, eager_graph, eager_capture_stream = (
+                capture_graph(eager) if capture else (None, None, None))
+            competitors = [("PyTorch CUDA eager", eager, 1)]
+            if capture:
+                competitors.append(("PyTorch CUDA graph", graph_operation, GRAPH_OPERATIONS_PER_REPLAY))
             compiled = None
             compiled_graph = None
             compiled_graph_operation = None
@@ -549,12 +629,11 @@ def main():
                     eager, fullgraph=True, mode="max-autotune-no-cudagraphs")
                 compiled_probe = compiled()
                 torch.cuda.synchronize()
-                compiled_graph_operation, compiled_graph, compiled_capture_stream = capture_graph(compiled)
-                competitors.extend((
-                    ("PyTorch compile max-autotune", compiled, 1),
-                    ("PyTorch compile max-autotune graph", compiled_graph_operation,
-                     GRAPH_OPERATIONS_PER_REPLAY),
-                ))
+                competitors.append(("PyTorch compile max-autotune", compiled, 1))
+                if capture:
+                    compiled_graph_operation, compiled_graph, compiled_capture_stream = capture_graph(compiled)
+                    competitors.append(("PyTorch compile max-autotune graph", compiled_graph_operation,
+                                        GRAPH_OPERATIONS_PER_REPLAY))
                 del compiled_probe
             except Exception as exception:
                 print(json.dumps({
@@ -610,8 +689,9 @@ def main():
                 require_no_foreign_compute(f"{operation}-{method}-start")
                 correctness_probe = measured()
                 torch.cuda.synchronize()
-                error = maximum_error(correctness_probe, expected)
-                device_values = measure_device(measured, logical_operations_per_call)
+                error = (relative_error(correctness_probe, expected) if grid
+                         else maximum_error(correctness_probe, expected))
+                device_values = measure_device(measured, logical_operations_per_call, device_launches)
                 e2e_values = measure_e2e(measured, logical_operations_per_call)
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
@@ -647,7 +727,8 @@ def main():
                     "temporary_device_bytes": temporary_bytes,
                     "peak_device_bytes": peak_bytes,
                     "max_error": error,
-                    "tolerance": 2e-3 if operation.startswith("fused-gelu-fp16-m16-") else 2e-4,
+                    "tolerance": (GEMM_GRID_TOLERANCE if grid
+                                  else 2e-3 if operation.startswith("fused-gelu-fp16-m16-") else 2e-4),
                     **software_fingerprint,
                 }
                 print(json.dumps(record, separators=(",", ":")))
@@ -664,7 +745,11 @@ def main():
                 del mixed_graph_operation
             if mixed_compiled_graph_operation is not None:
                 del mixed_compiled_graph_operation
-            del expected, eager_graph, eager_capture_stream
+            del expected
+            if eager_graph is not None:
+                del eager_graph
+            if eager_capture_stream is not None:
+                del eager_capture_stream
             if compiled_graph is not None:
                 del compiled_graph
             if compiled_capture_stream is not None:
