@@ -1409,6 +1409,28 @@ public class GradientCorrectnessTests : IDisposable
 
         Assert.Equal(new float[] { 0f, float.PositiveInfinity, 0f, 0f, 0f, 1f }, g);
     }
+    /// <summary>
+    /// A rank-0 loss whose terms reach one tensor along two paths. The graph-compiled backward (the default for a
+    /// non-persistent tape) seeded every one-element loss with a [1] gradient while the tape seeds the loss's own
+    /// shape, so the [1] and [] contributions to the shared rank-0 tensor could not be accumulated
+    /// ("Tensor shapes must match. Got [] and [1]", AiDotNet's DBNet).
+    /// </summary>
+    [Fact]
+    public void RankZeroLoss_GraphBackward_AccumulatesLikeTheTape()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f }, [3]);
+
+        using var tape = new GradientTape<float>();
+        var total = _engine.ReduceSum(x, axes: null);                        // rank 0
+        Assert.Empty(total.Shape.ToArray());
+        // 2t + t^2: the scalar-multiply path carries the seed's shape, the product's backward the input's.
+        var loss = _engine.TensorAdd(_engine.TensorMultiplyScalar(total, 2f), _engine.TensorMultiply(total, total));
+        var grads = tape.ComputeGradients(loss, sources: new[] { x });
+
+        // d/dx (2t + t^2) = 2 + 2t = 14 at t = 6.
+        Assert.Equal(new float[] { 14f, 14f, 14f }, grads[x].Contiguous().AsSpan().ToArray());
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Loss function gradient tests
     // ──────────────────────────────────────────────────────────────
