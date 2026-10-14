@@ -25,6 +25,16 @@ internal interface ILayerNormBackwardPartsBackend
     bool TryLayerNormInputGradient(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean,
         IGpuBuffer inverseStd, IGpuBuffer gradInput, int rows, int cols);
 
+    /// <summary>True when <see cref="TryLayerNormInputGradientAdd"/> is available, so a caller can commit to it before
+    /// launching anything that adds elsewhere.</summary>
+    bool SupportsLayerNormInputGradientAdd { get; }
+
+    /// <summary>As <see cref="TryLayerNormInputGradient"/>, ADDED to <paramref name="gradInput"/> in the same pass: a
+    /// LayerNorm on a residual stream adds its input gradient to what the stream's other consumers left there, which
+    /// took the overwriting kernel, a temporary and an add kernel. False -- nothing launched -- when unavailable.</summary>
+    bool TryLayerNormInputGradientAdd(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean,
+        IGpuBuffer inverseStd, IGpuBuffer gradInput, int rows, int cols);
+
     /// <summary>Floats of scratch <see cref="TryLayerNormAffineGradients"/> needs for [rows, cols].</summary>
     int LayerNormAffineGradientScratchFloats(int rows, int cols);
 

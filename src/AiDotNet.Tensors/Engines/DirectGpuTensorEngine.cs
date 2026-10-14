@@ -15276,12 +15276,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal bool TryLayerNormBackwardResident<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma,
         Tensor<T> mean, Tensor<T> variance, double epsilon,
-        Tensor<T>? intoInput, Tensor<T>? intoGamma, bool addGamma, Tensor<T>? intoBeta, bool addBeta,
+        Tensor<T>? intoInput, bool addInput, Tensor<T>? intoGamma, bool addGamma, Tensor<T>? intoBeta, bool addBeta,
         out Tensor<T>? gradInput, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta)
     {
         gradInput = null; gradGamma = null; gradBeta = null;
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || backend is not ILayerNormBackwardPartsBackend parts) return false;
+        // An input gradient to ADD lands in its accumulator only where the backend adds in the same pass; otherwise it
+        // is formed in a temporary and the caller accumulates it.
+        if (addInput && !parts.SupportsLayerNormInputGradientAdd) intoInput = null;
         int cols = gamma.Length;
         if (cols <= 0 || input.Length % cols != 0 || gradOutput.Length != input.Length) return false;
         int rows = input.Length / cols;
@@ -15315,12 +15318,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var gbBuf = betaTarget ?? GetOrCreateResidentBuffer(backend, gbT, cols, fullyWritten: true);
             if (giBuf.Handle == IntPtr.Zero || ggBuf.Handle == IntPtr.Zero || gbBuf.Handle == IntPtr.Zero) return false;
 
-            // Order matters for the false return: nothing is added anywhere until the last launch.
+            // Order matters for the false return: nothing is added anywhere until the last launch -- so an input
+            // gradient added into its accumulator goes last (its availability was settled above).
+            bool addingInput = addInput && inputTarget is not null;
             if (!parts.TryLayerNormInverseStd(varR, invStd, rows, (float)epsilon)) return false;
-            if (!parts.TryLayerNormInputGradient(gR, iR, gamR, meanR, invStd, giBuf, rows, cols)) return false;
+            if (!addingInput && !parts.TryLayerNormInputGradient(gR, iR, gamR, meanR, invStd, giBuf, rows, cols)) return false;
             if (!parts.TryLayerNormAffineGradients(gR, iR, meanR, invStd, partials, ggBuf, gbBuf, rows, cols,
                     gammaTarget is not null && addGamma, betaTarget is not null && addBeta))
                 return false;
+            if (addingInput && !parts.TryLayerNormInputGradientAdd(gR, iR, gamR, meanR, invStd, giBuf, rows, cols))
+                throw new InvalidOperationException("LayerNorm's input-gradient add was refused after its affine gradients landed.");
             ResidentSyncCheck("LayerNormBackwardParts");
             if (inputTarget is not null) giT.IncrementVersion();
             if (gammaTarget is not null) ggT.IncrementVersion();
@@ -15401,7 +15408,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
 
-            if (TryLayerNormBackwardResident(gradOutput, input, gamma, mean, variance, epsilon, null, null, false, null, false,
+            if (TryLayerNormBackwardResident(gradOutput, input, gamma, mean, variance, epsilon, null, false, null, false, null, false,
                     out var partsInput, out var partsGamma, out var partsBeta)
                 && partsInput is not null && partsGamma is not null && partsBeta is not null)
             {

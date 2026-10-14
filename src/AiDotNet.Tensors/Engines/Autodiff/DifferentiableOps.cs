@@ -987,6 +987,11 @@ internal static class DifferentiableOps
                     }
                     else
                     {
+                        if (_graphCaptureDebug)
+                        {
+                            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                                $"[ALIAS] inplace-add op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length}" + System.Environment.NewLine); } catch { }
+                        }
                         using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
                             engine.TensorAddInPlace(existing, GradForInPlace());
                         accumulated = existing;
@@ -1045,6 +1050,11 @@ internal static class DifferentiableOps
                 }
                 else
                 {
+                    if (_graphCaptureDebug)
+                    {
+                        try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                            $"[ALIAS] inplace-add op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length} rank={tensor.Rank}" + System.Environment.NewLine); } catch { }
+                    }
                     using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
                         engine.TensorAddInPlace(existingDict, GradForInPlace());
                     tensor.Grad = existingDict;

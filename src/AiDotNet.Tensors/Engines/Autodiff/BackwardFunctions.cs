@@ -1755,8 +1755,8 @@ internal static class BackwardFunctions<T>
             : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
 
-        // In a resident step the three gradients land in their accumulators directly (the input's only on its first
-        // contribution: that kernel overwrites).
+        // In a resident step the three gradients land in their accumulators directly (the input's added in the same
+        // pass when it is not its first contribution, where the backend can).
         if (engine is DirectGpuTensorEngine gpuNorm
             && !DifferentiableOps.IsRecording<T>()
             && !Compilation.GraphMode.IsActive)
@@ -1765,7 +1765,7 @@ internal static class BackwardFunctions<T>
             var intoGamma = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out bool addGamma);
             var intoBeta = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[2], engine, out bool addBeta);
             if (gpuNorm.TryLayerNormBackwardResident(gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
-                    addInput ? null : intoInput, intoGamma, addGamma, intoBeta, addBeta,
+                    intoInput, addInput, intoGamma, addGamma, intoBeta, addBeta,
                     out var residentInput, out var residentGamma, out var residentBeta)
                 && residentInput is not null && residentGamma is not null && residentBeta is not null)
             {
@@ -1776,7 +1776,7 @@ internal static class BackwardFunctions<T>
                     else
                         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
                 }
-                Land(inputs[0], addInput ? null : intoInput, residentInput);
+                Land(inputs[0], intoInput, residentInput);
                 Land(inputs[1], intoGamma, residentGamma);
                 Land(inputs[2], intoBeta, residentBeta);
                 return;

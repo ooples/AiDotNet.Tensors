@@ -112,6 +112,27 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         return true;
     }
 
+    bool ILayerNormBackwardPartsBackend.SupportsLayerNormInputGradientAdd =>
+        IsAvailable && _kernelCache.ContainsKey("layernorm_input_grad_add");
+
+    unsafe bool ILayerNormBackwardPartsBackend.TryLayerNormInputGradientAdd(IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer inverseStd, IGpuBuffer gradInput, int rows, int cols)
+    {
+        long n = (long)rows * cols;
+        if (!IsAvailable || rows <= 0 || cols <= 0 || gradOutput.Size < n || input.Size < n || gradInput.Size < n
+            || gamma.Size < cols || mean.Size < rows || inverseStd.Size < rows
+            || !_kernelCache.TryGetValue("layernorm_input_grad_add", out var kernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr g = gradOutput.Handle, x = input.Handle, ga = gamma.Handle, mu = mean.Handle, inv = inverseStd.Handle,
+            dx = gradInput.Handle;
+        int r = rows, cl = cols;
+        void** args = stackalloc void*[8];
+        args[0] = &g; args[1] = &x; args[2] = &ga; args[3] = &mu; args[4] = &inv; args[5] = &dx; args[6] = &r; args[7] = &cl;
+        // One warp per row: 8 rows per 256-thread block.
+        LaunchKernel(kernel, (uint)((rows + 7) / 8), DefaultBlockSize, args);
+        return true;
+    }
     unsafe bool ILayerNormBackwardPartsBackend.TryLayerNormAffineGradients(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer mean, IGpuBuffer inverseStd, IGpuBuffer scratch, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int rows, int cols, bool addGamma, bool addBeta)

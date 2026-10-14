@@ -599,6 +599,43 @@ extern ""C"" __global__ __launch_bounds__(256) void column_sum_partial(
     }
 }
 
+// LayerNorm's input gradient ADDED into gradInput, one warp per row of [rows, cols]:
+// dx += invStd * (g*dy - mean_c(g*dy) - xhat * mean_c(g*dy*xhat)), xhat = (x - mean) * invStd. Lane-strided sums
+// reduced by a fixed xor-shuffle tree: deterministic.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_input_grad_add(
+    const float* __restrict__ dy, const float* __restrict__ x, const float* __restrict__ gamma,
+    const float* __restrict__ mean, const float* __restrict__ invStd, float* __restrict__ dx, int rows, int cols)
+{
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const float* dyr = dy + (long long)row * cols;
+    const float* xr = x + (long long)row * cols;
+    float* dxr = dx + (long long)row * cols;
+    float mu = mean[row], is = invStd[row];
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int c = lane; c < cols; c += 32)
+    {
+        float gdy = gamma[c] * dyr[c];
+        s1 += gdy;
+        s2 += gdy * ((xr[c] - mu) * is);
+    }
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        s1 += __shfl_xor_sync(0xffffffff, s1, o);
+        s2 += __shfl_xor_sync(0xffffffff, s2, o);
+    }
+    float invCols = 1.0f / cols;
+    s1 *= invCols;
+    s2 *= invCols;
+    for (int c = lane; c < cols; c += 32)
+    {
+        float gdy = gamma[c] * dyr[c];
+        float xh = (xr[c] - mu) * is;
+        dxr[c] += is * (gdy - s1 - xh * s2);
+    }
+}
+
 // The gradient of a sum or mean over one middle block of axes: output[o, r, i] = scale * g[o, i] for an input viewed as
 // [outer, reduced, inner], written (or added) in one pass -- a float4 per thread when inner is a multiple of four.
 extern ""C"" __global__ __launch_bounds__(256) void broadcast_reduced_middle(
@@ -746,6 +783,7 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "column_sum_partial",
                 "column_sum_finish",
                 "broadcast_reduced_middle",
+                "layernorm_input_grad_add",
                 "softmax_xent_rows",
                 "softmax_xent_total",
                 "softmax_xent_backward"
