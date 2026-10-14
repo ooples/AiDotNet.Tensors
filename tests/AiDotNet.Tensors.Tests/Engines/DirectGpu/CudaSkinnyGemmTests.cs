@@ -48,6 +48,41 @@ public class CudaSkinnyGemmTests
         }
     }
 
+    /// <summary>
+    /// A linear layer's forward in one kernel (bias and ReLU in skinny_gemm's epilogue) must equal the GEMM followed by
+    /// BiasAdd and Relu bit for bit -- including a NaN input, which the ReLU passes through.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2048, 64, 64, true)]
+    [InlineData(2048, 128, 64, false)]
+    [InlineData(300, 4, 8, true)]
+    public void GemmBiasActivation_EqualsGemmThenBiasAddThenRelu(int m, int n, int k, bool relu)
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        float[] a = Fill(m * k, 9), w = Fill(k * n, 10), bias = Fill(n, 11);
+        a[k + 1] = float.NaN;   // row 1 of the output is NaN throughout
+        using var aBuf = backend.AllocateBuffer(a);
+        using var wBuf = backend.AllocateBuffer(w);
+        using var biasBuf = backend.AllocateBuffer(bias);
+        using var fused = backend.AllocateBuffer(m * n);
+        using var separate = backend.AllocateBuffer(m * n);
+        var activation = relu ? AiDotNet.Tensors.Engines.FusedActivationType.ReLU : AiDotNet.Tensors.Engines.FusedActivationType.None;
+
+        Assert.True(((AiDotNet.Tensors.Engines.DirectGpu.IGemmBiasActivationBackend)backend)
+            .TryGemmBiasActivation(aBuf, wBuf, biasBuf, fused, m, n, k, activation), $"declined {m}x{n}x{k}");
+        backend.Gemm(aBuf, wBuf, separate, m, n, k);
+        backend.BiasAdd(separate, biasBuf, separate, m, n);
+        if (relu) backend.Relu(separate, separate, m * n);
+
+        var got = backend.DownloadBuffer(fused);
+        var expected = backend.DownloadBuffer(separate);
+        Assert.True(float.IsNaN(got[n]), "the NaN row did not stay NaN");
+        for (int i = 0; i < got.Length; i++)
+            if (TestHelpers.MathCompat.SingleToInt32Bits(got[i]) != TestHelpers.MathCompat.SingleToInt32Bits(expected[i]))
+                Assert.Fail($"element {i}: one kernel {got[i]} != gemm + bias{(relu ? " + relu" : "")} {expected[i]}");
+    }
+
     [SkippableTheory]
     [InlineData(64, 64, 2048)]     // a projection's weight gradient: two tiles, 32 splits
     [InlineData(64, 128, 2048)]

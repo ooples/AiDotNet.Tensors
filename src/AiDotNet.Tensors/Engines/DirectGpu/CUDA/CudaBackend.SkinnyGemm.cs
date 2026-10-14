@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // Row-major FP32 GEMMs for narrow products (see CudaSkinnyGemmKernels): Gemm, MatMulTransposed and MatMulTransposedA
 // try these before cuBLAS. Strict fp32 and deterministic (fixed summation order, no atomics on values), so they serve
 // GpuDeterminism as well as the default mode.
-public sealed partial class CudaBackend
+public sealed partial class CudaBackend : IGemmBiasActivationBackend
 {
     // AIDOTNET_SKINNY_GEMM=0: every GEMM goes to cuBLAS as before.
     private static readonly bool SkinnyGemmEnabled =
@@ -27,19 +27,21 @@ public sealed partial class CudaBackend
     /// launched -- for any other shape, an unaligned operand or a missing kernel; the caller then runs cuBLAS.
     /// </summary>
     internal unsafe bool TrySkinnyGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, bool transB,
-        float alpha, float beta)
+        float alpha, float beta, IGpuBuffer? bias = null, bool relu = false)
     {
+        if (bias is not null && (bias.Size < N || (bias.Handle.ToInt64() & 15) != 0)) return false;
         if (!SkinnyGemmEnabled || M < 256 || M > 65535 * SkinnyTileRows || N > SkinnyMaxNarrow || K > SkinnyMaxNarrow
             || (N & 3) != 0 || (K & 3) != 0 || !SkinnyAligned(A, B, C)
             || !_kernelCache.TryGetValue("skinny_gemm", out var kernel))
             return false;
         using var _ = PushContext();
         IntPtr a = A.Handle, b = B.Handle, c = C.Handle;
-        int m = M, n = N, k = K, tb = transB ? 1 : 0;
+        int m = M, n = N, k = K, tb = transB ? 1 : 0, re = relu ? 1 : 0;
         float al = alpha, be = beta;
-        void** args = stackalloc void*[9];
+        IntPtr bi = bias?.Handle ?? IntPtr.Zero;
+        void** args = stackalloc void*[11];
         args[0] = &a; args[1] = &b; args[2] = &c; args[3] = &m; args[4] = &n; args[5] = &k; args[6] = &tb;
-        args[7] = &al; args[8] = &be;
+        args[7] = &al; args[8] = &be; args[9] = &bi; args[10] = &re;
         LaunchKernel2D(kernel, (uint)((N + SkinnyTileColumns - 1) / SkinnyTileColumns),
             (uint)((M + SkinnyTileRows - 1) / SkinnyTileRows), 1, SkinnyBlockThreads, 1, args);
         return true;
@@ -78,6 +80,17 @@ public sealed partial class CudaBackend
         LaunchKernel2D(kernel, (uint)tilesN, (uint)tilesM, (uint)splits, SkinnyTransposedABlockThreads, 1, args);
         return true;
     }
+
+    /// <summary>
+    /// A linear layer's forward in one kernel: <c>C = act(A[M,K] · W[K,N] + bias)</c> with act ReLU or none, the bias and
+    /// activation applied in skinny_gemm's epilogue (the GEMM, a bias-add pass and an activation pass otherwise). Equal
+    /// bit for bit to the GEMM followed by BiasAdd and Relu. False -- nothing launched -- for another activation or a
+    /// shape skinny_gemm does not take.
+    /// </summary>
+    bool IGemmBiasActivationBackend.TryGemmBiasActivation(IGpuBuffer A, IGpuBuffer W, IGpuBuffer bias, IGpuBuffer C,
+        int M, int N, int K, FusedActivationType activation)
+        => (activation == FusedActivationType.None || activation == FusedActivationType.ReLU)
+            && TrySkinnyGemm(A, W, C, M, N, K, transB: false, 1f, 0f, bias, activation == FusedActivationType.ReLU);
 
     // Rows each split of skinny_gemm_tn reduces: ~256 (four passes per group) and at most 64 blocks in all, a whole
     // number of the block's 64-row passes. Measured on a GTX 1660 Ti at K = 2048 for 64x64, 64x128 and 128x64 outputs,

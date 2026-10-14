@@ -56,10 +56,17 @@ __device__ __forceinline__ void sg_load_b_rows(const float* __restrict__ B, floa
     }
 }
 
-// Writes alpha * value + beta * C for one thread's 4x8 piece (two float4 column groups per row), skipping what lies
-// outside [M, N]. beta == 0 never reads C.
+// The ReLU kernel's operation (relu_nan_safe): NaN passes through, so the fused epilogue equals BiasAdd then Relu.
+__device__ __forceinline__ float sg_relu(float x)
+{
+    unsigned int bits = __float_as_uint(x) & 0x7fffffffu;
+    return (bits > 0x7f800000u) ? x : (x > 0.0f ? x : 0.0f);
+}
+
+// Writes act(alpha * value + beta * C + bias) for one float4 of a thread's 4x8 piece, skipping what lies outside
+// [M, N]. beta == 0 never reads C; bias may be null; relu applies sg_relu.
 __device__ __forceinline__ void sg_store(float* __restrict__ C, int M, int N, int row, int col, float4 v,
-    float alpha, float beta)
+    float alpha, float beta, const float* __restrict__ bias, int relu)
 {
     if (row >= M || col >= N) return;
     float4* out = reinterpret_cast<float4*>(C + (long long)row * N + col);
@@ -69,15 +76,22 @@ __device__ __forceinline__ void sg_store(float* __restrict__ C, int M, int N, in
         float4 c = *out;
         r.x += beta * c.x; r.y += beta * c.y; r.z += beta * c.z; r.w += beta * c.w;
     }
+    if (bias)
+    {
+        float4 b = *reinterpret_cast<const float4*>(bias + col);
+        r.x += b.x; r.y += b.y; r.z += b.z; r.w += b.w;
+    }
+    if (relu) { r.x = sg_relu(r.x); r.y = sg_relu(r.y); r.z = sg_relu(r.z); r.w = sg_relu(r.w); }
     *out = r;
 }
 
-// C[M,N] = alpha * A[M,K] * op(B) + beta * C, row-major; op(B) is B[K,N], or B[N,K] transposed when transB.
+// C[M,N] = act(alpha * A[M,K] * op(B) + beta * C + bias), row-major; op(B) is B[K,N], or B[N,K] transposed when
+// transB; bias[N] is optional (null) and act is ReLU when relu, else identity.
 // One 32x64 output tile per 64-thread block, K swept in SG_BK-deep chunks. Requires N and K multiples of four and
 // 16-byte-aligned operands (the host checks).
 extern ""C"" __global__ __launch_bounds__(SG_THREADS) void skinny_gemm(
     const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
-    int M, int N, int K, int transB, float alpha, float beta)
+    int M, int N, int K, int transB, float alpha, float beta, const float* __restrict__ bias, int relu)
 {
     __shared__ __align__(16) float As[SG_BK][SG_BM + 4];
     __shared__ __align__(16) float Bs[SG_BK][SG_BN + 4];
@@ -120,8 +134,8 @@ extern ""C"" __global__ __launch_bounds__(SG_THREADS) void skinny_gemm(
     for (int i = 0; i < 4; i++)
     {
         int row = row0 + ty * 4 + i;
-        sg_store(C, M, N, row, col0 + tx * 4, make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]), alpha, beta);
-        sg_store(C, M, N, row, col0 + 32 + tx * 4, make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]), alpha, beta);
+        sg_store(C, M, N, row, col0 + tx * 4, make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]), alpha, beta, bias, relu);
+        sg_store(C, M, N, row, col0 + 32 + tx * 4, make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]), alpha, beta, bias, relu);
     }
 }
 
@@ -245,7 +259,7 @@ extern ""C"" __global__ __launch_bounds__(SG_TN_GROUPS * SG_THREADS) void skinny
             s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
         }
         int owner = p >> 3, q = p & 7;
-        sg_store(C, M, N, row0 + (owner >> 3) * 4 + (q >> 1), col0 + (q & 1) * 32 + (owner & 7) * 4, s, alpha, beta);
+        sg_store(C, M, N, row0 + (owner >> 3) * 4 + (q >> 1), col0 + (q & 1) * 32 + (owner & 7) * 4, s, alpha, beta, nullptr, 0);
     }
     if (threadIdx.x == 0) counters[tile] = 0u;
 }
