@@ -43,6 +43,19 @@ public sealed class DirectPtxGemmEvolutionTests
             }
     }
 
+    [Fact]
+    public void DefaultIncumbent_FillsTheGpu_WithTheLargestTileThatCan()
+    {
+        var nn = new PtxGemmLayout(false, false);
+        // 68 SMs (RTX 3080). 128^3: a 128 x 128 tile is one block, so the default must be a small tile.
+        PtxGemmConfiguration small = PtxGemmEvolution.Seeds(nn, 128, 128, 128, 68)[0];
+        Assert.True((128 / small.BlockM) * (128 / small.BlockN) >= 16, small.Name);
+        // 4096^3: the largest seed tile already launches 1,024 blocks.
+        PtxGemmConfiguration large = PtxGemmEvolution.Seeds(nn, 4096, 4096, 4096, 68)[0];
+        Assert.Equal(128 * 128, large.BlockM * large.BlockN);
+        Assert.Equal(4, large.VectorWidth);
+    }
+
     [SkippableFact]
     public async Task SmallBudgetRun_DeploysACorrectMeasuredWinner()
     {

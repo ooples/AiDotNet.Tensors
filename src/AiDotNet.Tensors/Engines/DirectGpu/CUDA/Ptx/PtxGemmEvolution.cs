@@ -22,8 +22,12 @@ internal static class PtxGemmEvolution
     internal static readonly KernelSearchSpaceVersion SearchSpaceVersion = new(1);
     internal static readonly KernelBenchmarkProtocolVersion BenchmarkProtocolVersion = new(1);
 
-    /// <summary>Hand-picked starting points, from small to large tiles, kept only where they admit the problem.</summary>
-    internal static IReadOnlyList<PtxGemmConfiguration> Seeds(PtxGemmLayout layout, int m, int n, int k)
+    /// <summary>
+    /// Hand-picked starting points, from small to large tiles, kept only where they admit the problem. The first is the
+    /// shape's default (<see cref="DefaultFor"/>): the incumbent every evolved winner must beat in the paired replay, so
+    /// it has to be a sensible kernel for this shape, not an arbitrary one.
+    /// </summary>
+    internal static IReadOnlyList<PtxGemmConfiguration> Seeds(PtxGemmLayout layout, int m, int n, int k, int multiprocessors = 68)
     {
         var candidates = new[]
         {
@@ -40,7 +44,43 @@ internal static class PtxGemmEvolution
         foreach (var candidate in candidates)
             if (Admits(candidate, layout, m, n, k)) seeds.Add(candidate);
         if (seeds.Count == 0) throw new InvalidOperationException($"No GEMM seed admits M={m} N={n} K={k} ({layout.Name}).");
+        PtxGemmConfiguration defaultSeed = DefaultFor(seeds, m, n, multiprocessors);
+        seeds.Remove(defaultSeed);
+        seeds.Insert(0, defaultSeed);
         return seeds;
+    }
+
+    /// <summary>
+    /// The largest-tile admitted seed that still launches at least one block per multiprocessor (a 128 x 128 tile gives a
+    /// 128^3 problem a single block); with no such seed, the one launching the most blocks. Vector access breaks ties.
+    /// </summary>
+    internal static PtxGemmConfiguration DefaultFor(IReadOnlyList<PtxGemmConfiguration> admitted, int m, int n, int multiprocessors)
+    {
+        static long Blocks(PtxGemmConfiguration c, int m, int n) =>
+            (long)((m + c.BlockM - 1) / c.BlockM) * ((n + c.BlockN - 1) / c.BlockN);
+        PtxGemmConfiguration? best = null;
+        foreach (var c in admitted)
+        {
+            if (Blocks(c, m, n) < multiprocessors) continue;
+            if (best is not { } b || c.BlockM * c.BlockN > b.BlockM * b.BlockN ||
+                (c.BlockM * c.BlockN == b.BlockM * b.BlockN && c.VectorWidth > b.VectorWidth))
+                best = c;
+        }
+        if (best is { } chosen) return chosen;
+        PtxGemmConfiguration most = admitted[0];
+        foreach (var c in admitted)
+            if (Blocks(c, m, n) > Blocks(most, m, n) ||
+                (Blocks(c, m, n) == Blocks(most, m, n) && c.VectorWidth > most.VectorWidth))
+                most = c;
+        return most;
+    }
+
+    internal static int MultiprocessorCount(DirectPtxRuntime runtime)
+    {
+        using var _ = runtime.Enter();
+        if (CudaNativeBindings.cuCtxGetDevice(out int device) != CudaResult.Success) return 68;
+        return CuBlasNative.cuDeviceGetAttribute(out int count, (int)CudaDeviceAttribute.MultiprocessorCount, device) ==
+               CudaResult.Success && count > 0 ? count : 68;
     }
 
     internal static bool Admits(PtxGemmConfiguration configuration, PtxGemmLayout layout, int m, int n, int k) =>
@@ -75,7 +115,7 @@ internal static class PtxGemmEvolution
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
 
-        IReadOnlyList<PtxGemmConfiguration> seeds = Seeds(layout, m, n, k);
+        IReadOnlyList<PtxGemmConfiguration> seeds = Seeds(layout, m, n, k, MultiprocessorCount(runtime));
         using var backend = new ExperimentBackend(runtime, layout, m, n, k);
         var experiment = new KernelTuningExperiment<PtxGemmConfiguration>(
             backend,

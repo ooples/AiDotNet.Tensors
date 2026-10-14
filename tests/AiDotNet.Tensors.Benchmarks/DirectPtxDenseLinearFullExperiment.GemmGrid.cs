@@ -178,6 +178,10 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             {
                 operation,
                 configuration = winner.Name,
+                incumbent = tuning.IncumbentDeployment.Configuration.Name,
+                incumbent_gflops = tuning.IncumbentDeployment.Measurement.ThroughputGflops,
+                proposed = tuning.ProposedWinner.Configuration.Name,
+                proposed_gflops = tuning.ProposedWinner.Measurement.ThroughputGflops,
                 promoted = tuning.WasPromoted,
                 evaluations = tuning.Run.Counters.EvaluationAttempts,
             }));
