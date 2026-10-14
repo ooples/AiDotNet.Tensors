@@ -95,3 +95,6 @@ tensors-entitlement.json
 # Python tool caches
 __pycache__/
 *.pyc
+
+# token-optimizer plugin state: machine-local agent output, never committed (ooples/token-optimizer-mcp#500)
+.token-optimizer/

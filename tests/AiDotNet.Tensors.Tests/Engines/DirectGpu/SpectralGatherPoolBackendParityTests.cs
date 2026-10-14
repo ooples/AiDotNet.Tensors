@@ -146,17 +146,21 @@ public sealed class SpectralGatherPoolBackendParityTests
     // binStart = 1 + trunc((k / numBins)^2 (usable - 1)) and binEnd the same for k + 1, at least one wide, capped at usable.
     private static void WidebandLogBinPool(IDirectGpuBackend backend)
     {
-        foreach (var (segments, fftSize, numBins, usable) in new[] { (1, 64, 8, 32), (3, 256, 16, 128), (40, 128, 20, 64), (2, 16, 12, 5) })
+        foreach (var (segments, fftSize, numBins, usable) in new[] { (1, 64, 8, 32), (3, 256, 16, 128), (40, 128, 20, 64), (2, 16, 12, 5),
+            // shapes whose exact integer edges float (k=7 of 10 at usable 101; k=5 of 6 at 181) or double (k=1 of 7 at 50)
+            // arithmetic truncated to the bin below
+            (2, 202, 10, 101), (1, 362, 6, 181), (3, 100, 7, 50) })
         {
             float[] mag = Values(segments * fftSize, 41 + segments * fftSize, 0, 30);
             var expected = new double[segments * numBins];
             for (int seg = 0; seg < segments; seg++)
                 for (int k = 0; k < numBins; k++)
                 {
-                    // The bin edges are float arithmetic in the kernels; the same here, so an edge cannot land differently.
-                    float r0 = (float)k / numBins, r1 = (float)(k + 1) / numBins;
-                    int binStart = 1 + (int)(r0 * r0 * (usable - 1));
-                    int binEnd = 1 + (int)(r1 * r1 * (usable - 1));
+                    // The definition, in exact integers: 1 + floor(k^2 (usable-1) / numBins^2). Float or double (k/numBins)^2 truncates
+                    // exact integer edges to the bin below, which is what every backend did before.
+                    long den = (long)numBins * numBins;
+                    int binStart = 1 + (int)((long)k * k * (usable - 1) / den);
+                    int binEnd = 1 + (int)((long)(k + 1) * (k + 1) * (usable - 1) / den);
                     if (binEnd <= binStart) binEnd = binStart + 1;
                     if (binEnd > usable) binEnd = usable;
                     double sum = 0;

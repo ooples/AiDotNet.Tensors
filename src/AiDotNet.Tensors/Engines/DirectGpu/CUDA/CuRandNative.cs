@@ -84,6 +84,10 @@ internal static class CuRandNative
     [DllImport(Lib)]
     public static extern Status curandSetGeneratorOffset(IntPtr generator, ulong offset);
 
+    /// <summary>The stream the generator's kernels run on (zero is the legacy default stream).</summary>
+    [DllImport(Lib)]
+    public static extern Status curandSetStream(IntPtr generator, IntPtr stream);
+
     [DllImport(Lib)]
     public static extern Status curandGenerateUniform(IntPtr generator, IntPtr outputPtr, ulong num);
 

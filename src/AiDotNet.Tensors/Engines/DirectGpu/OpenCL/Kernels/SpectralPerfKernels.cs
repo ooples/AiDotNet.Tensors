@@ -155,10 +155,12 @@ __kernel void wideband_log_bin_pool(__global const float* magBuf,
     if (outIdx >= total) return;
     int seg = outIdx / numBins;
     int k = outIdx % numBins;
-    float r0 = (float)k / (float)numBins;
-    float r1 = (float)(k + 1) / (float)numBins;
-    int binStart = 1 + (int)(r0 * r0 * (float)(usable - 1));
-    int binEnd = 1 + (int)(r1 * r1 * (float)(usable - 1));
+    // Logarithmic bin layout: binStart = 1 + floor(k^2 (usable-1) / numBins^2), in exact 64-bit integers. The float form
+    // (k/numBins)^2 * (usable-1) truncated exact integer edges to the bin below (numBins=10, usable=101, k=7: 49 -> 48),
+    // and fast-math division made it worse.
+    long binDen = (long)numBins * numBins;
+    int binStart = 1 + (int)((long)k * k * (usable - 1) / binDen);
+    int binEnd = 1 + (int)((long)(k + 1) * (k + 1) * (usable - 1) / binDen);
     if (binEnd <= binStart) binEnd = binStart + 1;
     if (binEnd > usable) binEnd = usable;
     int magOff = seg * fftSize;
