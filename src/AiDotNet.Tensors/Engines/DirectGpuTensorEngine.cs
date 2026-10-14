@@ -3070,7 +3070,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var eng = s_residentScratchEngine;
         if (eng is not null && eng.ScratchPoolingActive)
-            return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
+            return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size, fullyWritten: true), ownsBuffer: false);
         return new OwnedBuffer(AllocateReclaiming(backend, b => AllocateDeviceBufferUninitialized(b, size)), ownsBuffer: true);
     }
 
@@ -7772,7 +7772,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bBuf = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
             int[] outShape = (int[])input.Shape._dims.Clone(); outShape[^1] = N;
             var outTensor = new Tensor<T>(new T[(long)M * N], outShape);
-            var outBuf = GetOrCreateResidentBuffer(backend, outTensor, M * N);
+            var outBuf = GetOrCreateResidentBuffer(backend, outTensor, M * N, fullyWritten: true);   // GEMM with beta 0
             if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < (long)M * K
                 || wBuf.Buffer.Handle == System.IntPtr.Zero || wBuf.Buffer.Size < (long)K * N
                 || bBuf.Buffer.Handle == System.IntPtr.Zero || bBuf.Buffer.Size < N
@@ -15312,7 +15312,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         // so it is NOT a cuMemAllocAsync graph node (the 8 small ~32KB in-capture allocs). Pooled ⇒ do
                         // NOT dispose (the pool owns + reuses it across steps/replays); unpooled (eager/eval) ⇒ dispose.
                         invVarPooled = ScratchPoolingActive;
-                        invVarBuf = invVarPooled ? RentActionScratch(backend, batchSize) : backend.AllocateBuffer(batchSize);
+                        invVarBuf = invVarPooled ? RentActionScratch(backend, batchSize, fullyWritten: true) : backend.AllocateBuffer(batchSize);
                         if (invVarBuf is not null && invVarBuf.Handle != System.IntPtr.Zero)
                         {
                             backend.AddScalar(varR, invVarBuf, (float)epsilon, batchSize); // var + eps
@@ -22442,7 +22442,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     // the pool (no alloc). Do NOT CacheActivation when pooled (its per-step bookkeeping perturbs the
                     // captured graph — matches GetOrCreateResidentBuffer's resident-miss path).
                     if (ScratchPoolingActive)
-                        outBuf = RentActionScratch(backend, output.Length);
+                        outBuf = RentActionScratch(backend, output.Length, fullyWritten: true);   // the permute writes every element
                     else
                     {
                         outBuf = backend.AllocateBuffer(output.Length);
@@ -25554,7 +25554,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int i = 0; i < axis; i++) outerSize *= tensor.Shape._dims[i];
                     int reduceSize = tensor.Shape._dims[axis];
                     var gi = UploadTensorRaw(b, tensor);
-                    var go = RentActionScratchOrAllocate(b, outerSize);
+                    var go = RentActionScratchOrAllocate(b, outerSize, fullyWritten: true);
                     b.SumAxis(gi, go, outerSize, reduceSize);
                     int[] outShape;
                     if (keepDims)
@@ -25603,7 +25603,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int i = 0; i < axis; i++) outerSize *= input.Shape._dims[i];
                     int reduceSize = input.Shape._dims[axis];
                     var gi = UploadTensorRaw(b, input);
-                    var go = RentActionScratchOrAllocate(b, outerSize);
+                    var go = RentActionScratchOrAllocate(b, outerSize, fullyWritten: true);
                     b.MeanAxis(gi, go, outerSize, reduceSize);
                     int[] outShape;
                     if (keepDims)
