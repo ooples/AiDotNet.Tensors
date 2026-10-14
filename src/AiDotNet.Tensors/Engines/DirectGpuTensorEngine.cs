@@ -17950,6 +17950,51 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Resident-step sum or mean over a LEADING block of axes of a contiguous [leading, kept] tensor: one GEMM against
+    /// a cached ones row writes the result into a resident buffer. The general resident path permutes the whole tensor
+    /// first (a transpose kernel) and then row-sums it -- on the parity Transformer, 8 transposes per training step,
+    /// one per bias gradient. Null when the shape or residency does not fit; the caller then takes the general path.
+    /// </summary>
+    private Tensor<T>? TryReduceLeadingAxesResident<T>(Tensor<T> input, int[] sortedAxes, bool keepDims,
+        IDirectGpuBackend backend, ReduceOperation op)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !input.IsContiguous
+            || input._storageOffset != 0 || input.Length == 0)
+            return null;
+        var dims = input.Shape._dims;
+        if (!TrySplitAroundKeptBlock(dims, sortedAxes, out int leading, out int kept, out int trailing)) return null;
+        if (trailing != 1 || leading <= 1) return null;
+        var inBuf = ResolveResidentBufferNoUpload(backend, input, input.Length);
+        if (inBuf is null) return null;
+        // Filled outside capture by the warm-up steps; null while capturing an unwarmed size.
+        var ones = GetCachedOnesBuffer(backend, leading);
+        if (ones is null) return null;
+
+        var reducedAxes = new bool[dims.Length];
+        foreach (int axis in sortedAxes) reducedAxes[axis] = true;
+        int[] outputShape;
+        if (keepDims)
+        {
+            outputShape = (int[])dims.Clone();
+            for (int i = 0; i < dims.Length; i++) if (reducedAxes[i]) outputShape[i] = 1;
+        }
+        else
+        {
+            outputShape = dims.Where((_, i) => !reducedAxes[i]).ToArray();
+        }
+
+        var output = new Tensor<T>(new T[kept], outputShape);
+        var outBuf = GetOrCreateResidentBuffer(backend, output, kept, fullyWritten: true);
+        if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < kept) return null;
+        backend.Gemm(ones, inBuf, outBuf, 1, kept, leading);   // [1, leading] · [leading, kept]
+        if (op == ReduceOperation.Mean)
+            backend.Scale(outBuf, outBuf, 1f / leading, kept);
+        ResidentSyncCheck("ReduceLeadingAxes");
+        BindResidentBuffer(output, outBuf, backend);
+        return output;
+    }
+
+    /// <summary>
     /// Splits a shape around ONE contiguous block of reduced axes that has kept axes on both sides, the case
     /// <see cref="TrySplitAroundKeptBlock"/> rejects: the tensor is [outer, reduced, inner] row-major. False otherwise.
     /// </summary>
@@ -18118,6 +18163,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ResidentStepActive && (op == ReduceOperation.Sum || op == ReduceOperation.Mean)
             && TryReduceAroundReducedBlock(input, normalizedAxes, keepDims, backend, op) is { } aroundReduced)
             return aroundReduced;
+        if (ResidentStepActive && (op == ReduceOperation.Sum || op == ReduceOperation.Mean)
+            && TryReduceLeadingAxesResident(input, normalizedAxes, keepDims, backend, op) is { } leadingReduced)
+            return leadingReduced;
 
         // Compute output shape
         var outputShapeList = new List<int>();
@@ -20383,6 +20431,61 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TryMatMulBackward2D", ex);
             AliasDiag($"MatMulBackward2D FELLBACK M={M} N={N} K={K}: {ex.GetType().Name}: {ex.Message}");
             gradA = null;
+            gradB = null;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The weight half of <see cref="TryMatMulBackward2D"/>: dB[K,N] = A[M,K]ᵀ · dY[M,N] as one GEMM that reads A
+    /// transposed in place, for a layer whose input gradient nothing reads (a network's first layer). False when the
+    /// backend cannot or the shapes do not fit; the caller then takes its general path.
+    /// </summary>
+    internal bool TryMatMulWeightGradient2D<T>(Tensor<T> gradOutput, Tensor<T> a, int n, out Tensor<T>? gradB)
+    {
+        gradB = null;
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA) return false;
+        if (a.Rank != 2 || gradOutput.Rank != 2) return false;
+        if (!a.IsContiguous || !gradOutput.IsContiguous || a._storageOffset != 0 || gradOutput._storageOffset != 0) return false;
+        int M = a._shape[0], K = a._shape[1];
+        if (n <= 0 || gradOutput._shape[0] != M || gradOutput._shape[1] != n) return false;
+
+        try
+        {
+            if (ResidentStepActive)
+            {
+                var bufG = ResolveResidentBufferNoUpload(backend, gradOutput, M * n);
+                var bufA = ResolveResidentBufferNoUpload(backend, a, M * K);
+                if (bufG is null || bufA is null) return false;
+                var outB = new Tensor<T>(new T[(long)K * n], new[] { K, n });
+                var outBufB = GetOrCreateResidentBuffer(backend, outB, K * n, fullyWritten: true);
+                if (outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * n) return false;
+                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, n, M);
+                ResidentSyncCheck("MatMulWeightGradient2D");
+                BindResidentBuffer(outB, outBufB, backend);
+                gradB = outB;
+                return true;
+            }
+
+            using var ownedG = GetOrAllocateBuffer(backend, gradOutput);
+            using var ownedA = GetOrAllocateBuffer(backend, a);
+            var bufOutB = AllocateOutputBuffer(backend, K * n);
+            try
+            {
+                transposedA.MatMulTransposedA(ownedA.Buffer, ownedG.Buffer, bufOutB.Buffer, K, n, M);
+            }
+            catch
+            {
+                bufOutB.Dispose();
+                throw;
+            }
+            gradB = DeferTensorResult<T>(backend, bufOutB.Buffer, K * n, new[] { K, n });
+            return true;
+        }
+        catch (NotSupportedException ex)
+        {
+            GpuLaunchProbe.OnFallback("TryMatMulWeightGradient2D", ex);
             gradB = null;
             return false;
         }

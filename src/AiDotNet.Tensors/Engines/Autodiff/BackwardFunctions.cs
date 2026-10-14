@@ -6836,20 +6836,52 @@ internal static class BackwardFunctions<T>
                 var gFlat = rowsG == gradOutput.Length / N && gradOutput.Rank == 2
                     ? gradOutput
                     : engine.Reshape(gradOutput, new[] { rowsG, N });
-                var wT = engine.TensorTranspose(inputs[1]); // [N, K] — 2D transpose is cheap
-                var inputGradFlat = engine.TensorMatMul(gFlat, wT);
-                var inputGradFast = inputs[0].Rank == 2
-                    ? inputGradFlat
-                    : engine.Reshape(inputGradFlat, inputs[0]._shape);
-                DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFast, engine);
-
-                // dL/dWeight = input^T @ gradOutput   (shapes: [K, rowsI] × [rowsG, N] = [K, N])
                 var iFlat = inputs[0].Rank == 2
                     ? inputs[0]
                     : engine.Reshape(inputs[0], new[] { rowsI, K });
-                var iFlatT = engine.TensorTranspose(iFlat);
-                var weightGradFast = engine.TensorMatMul(iFlatT, gFlat);
-                DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFast, engine);
+                Tensor<T>? inputGradFlat = null;
+                Tensor<T>? weightGradFast = null;
+                // GPU: the GEMMs read their operands transposed in place (cuBLAS op flags). Materializing Wᵀ and Xᵀ
+                // cost two transpose kernels per linear layer per step -- 16 of a Transformer step's 24 -- and a layer
+                // whose input gradient nothing reads (the first one) computed and discarded that GEMM as well.
+                bool gpuDone = false;
+                if (engine is DirectGpuTensorEngine gpuLinear
+                    && !DifferentiableOps.IsRecording<T>()
+                    && !Compilation.GraphMode.IsActive)
+                {
+                    if (needsInputGradient && needsWeightGradient
+                        && gpuLinear.TryMatMulBackward2D(gFlat, iFlat, inputs[1], out var gpuInputGrad, out var gpuWeightGrad)
+                        && gpuInputGrad is not null && gpuWeightGrad is not null)
+                    {
+                        inputGradFlat = gpuInputGrad;
+                        weightGradFast = gpuWeightGrad;
+                        gpuDone = true;
+                    }
+                    else if (!needsInputGradient && needsWeightGradient
+                        && gpuLinear.TryMatMulWeightGradient2D(gFlat, iFlat, N, out var gpuWeightOnly)
+                        && gpuWeightOnly is not null)
+                    {
+                        weightGradFast = gpuWeightOnly;
+                        gpuDone = true;
+                    }
+                }
+                if (!gpuDone)
+                {
+                    var wT = engine.TensorTranspose(inputs[1]); // [N, K] — 2D transpose is cheap
+                    inputGradFlat = engine.TensorMatMul(gFlat, wT);
+                    // dL/dWeight = input^T @ gradOutput   (shapes: [K, rowsI] × [rowsG, N] = [K, N])
+                    var iFlatT = engine.TensorTranspose(iFlat);
+                    weightGradFast = engine.TensorMatMul(iFlatT, gFlat);
+                }
+                if (inputGradFlat is not null)
+                {
+                    var inputGradFast = inputs[0].Rank == 2
+                        ? inputGradFlat
+                        : engine.Reshape(inputGradFlat, inputs[0]._shape);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFast, engine);
+                }
+                if (weightGradFast is not null)
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFast, engine);
 
                 if (inputs.Length > 2)
                 {
