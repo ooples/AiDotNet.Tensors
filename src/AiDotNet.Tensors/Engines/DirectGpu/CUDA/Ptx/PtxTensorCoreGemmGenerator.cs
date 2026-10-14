@@ -237,8 +237,9 @@ internal static class PtxTensorCoreGemmGenerator
             L($"add.u32 {b.SharedBase}, {smem}, {I((long)_c.Stages * stageBytesA)};");
 
             // Per-thread fragment bases within a stage (bytes); every fragment load adds a compile-time offset.
-            string aFrag = FragmentBase(a, warpM0, gid, tig);
-            string bFrag = FragmentBase(b, warpN0, gid, tig);
+            // FP16 loads whole fragments with ldmatrix, whose bases are per-lane row addresses instead.
+            string aFrag = Fp16 ? LdmatrixBase(a, warpM0, lane, isA: true) : FragmentBase(a, warpM0, gid, tig);
+            string bFrag = Fp16 ? LdmatrixBase(b, warpN0, lane, isA: false) : FragmentBase(b, warpN0, gid, tig);
 
             // Accumulators.
             var acc = new string[_c.Accumulators];
@@ -419,6 +420,44 @@ internal static class PtxTensorCoreGemmGenerator
             return offset;
         }
 
+        // ldmatrix: lane = 8 * matrix + row. For A (x4) matrix i covers rows (i & 1) * 8 and k (i >> 1) * 8 of the 16 x 16
+        // fragment; for B (x2) matrix i covers k (i & 1) * 8 of the 16 x 8 fragment. Each lane gives the address of one
+        // 16-byte row: along k when the operand is k-contiguous (plain ldmatrix), along mn otherwise (.trans).
+        private string LdmatrixBase(Operand op, string warpMn0, string lane, bool isA)
+        {
+            string matrix = R(), row = R(), rowOff = R(), kOff = R(), mn = R(), kIndex = R(), offset = R();
+            L($"shr.u32 {matrix}, {lane}, 3;");
+            L($"and.b32 {row}, {lane}, 7;");
+            if (isA)
+            {
+                L($"and.b32 {rowOff}, {matrix}, 1;");
+                L($"shl.b32 {rowOff}, {rowOff}, 3;");
+                L($"shr.u32 {kOff}, {matrix}, 1;");
+                L($"shl.b32 {kOff}, {kOff}, 3;");
+            }
+            else
+            {
+                L($"mov.u32 {rowOff}, 0;");
+                L($"and.b32 {kOff}, {matrix}, 1;");
+                L($"shl.b32 {kOff}, {kOff}, 3;");
+            }
+            L($"add.u32 {mn}, {warpMn0}, {rowOff};");
+            if (op.ContiguousAlongK)
+            {
+                L($"add.u32 {mn}, {mn}, {row};");
+                L($"mov.u32 {kIndex}, {kOff};");
+                L($"mad.lo.u32 {offset}, {mn}, {I(op.Pitch)}, {kIndex};");
+            }
+            else
+            {
+                L($"add.u32 {kIndex}, {kOff}, {row};");
+                L($"mad.lo.u32 {offset}, {kIndex}, {I(op.Pitch)}, {mn};");
+            }
+            L($"shl.b32 {offset}, {offset}, {I(Log2(_eb))};");
+            L($"add.u32 {offset}, {offset}, {op.SharedBase};");
+            return offset;
+        }
+
         // Byte offset of fragment element (mn, k) relative to the thread's fragment base.
         private int FragmentOffset(Operand op, int mn, int kIndex) =>
             (op.ContiguousAlongK ? mn * op.Pitch + kIndex : kIndex * op.Pitch + mn) * _eb;
@@ -460,8 +499,19 @@ internal static class PtxTensorCoreGemmGenerator
             for (int kk = 0; kk < _c.BlockK / _mmaK; kk++)
             {
                 int kBase = kk * _mmaK;
+                if (Fp16)
+                {
+                    string aTrans = a.ContiguousAlongK ? "" : ".trans";
+                    string bTrans = b.ContiguousAlongK ? "" : ".trans";
+                    for (int mt = 0; mt < tilesM; mt++)
+                        L($"ldmatrix.sync.aligned.m8n8.x4{aTrans}.shared.b16 {{{fa[mt, 0]}, {fa[mt, 1]}, {fa[mt, 2]}, {fa[mt, 3]}}}, " +
+                          $"[{stageA}+{I(FragmentOffset(a, mt * 16, kBase))}];");
+                    for (int nt = 0; nt < tilesN; nt++)
+                        L($"ldmatrix.sync.aligned.m8n8.x2{bTrans}.shared.b16 {{{fb[nt, 0]}, {fb[nt, 1]}}}, " +
+                          $"[{stageB}+{I(FragmentOffset(b, nt * 8, kBase))}];");
+                }
                 // A (16 x k, row): a0 (gid, k), a1 (gid + 8, k), a2 (gid, k + half), a3 (gid + 8, k + half).
-                for (int mt = 0; mt < tilesM; mt++)
+                for (int mt = 0; mt < tilesM && !Fp16; mt++)
                 {
                     int row = mt * 16;
                     LoadFragment(a, stageA, row, kBase, fa[mt, 0], scratch);
@@ -470,7 +520,7 @@ internal static class PtxTensorCoreGemmGenerator
                     LoadFragment(a, stageA, row + 8, kBase + kHalf, fa[mt, 3], scratch);
                 }
                 // B (k x 8, col): b0 (k, n = gid), b1 (k + half, n = gid).
-                for (int nt = 0; nt < tilesN; nt++)
+                for (int nt = 0; nt < tilesN && !Fp16; nt++)
                 {
                     int column = nt * 8;
                     LoadFragment(b, stageB, column, kBase, fb[nt, 0], scratch);
