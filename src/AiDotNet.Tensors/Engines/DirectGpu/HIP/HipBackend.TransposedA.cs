@@ -8,7 +8,7 @@ public sealed partial class HipBackend : ITransposedAGemm
     public void MatMulTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
         TransposedAGemmArgs.Validate(A, B, C, M, N, K);
-        if (!_hipblasAvailable || _hipblasHandle == IntPtr.Zero)
+        if (!HipBlasReady)
         {
             // No vendor BLAS: materialize Aᵀ [M,K] and run the regular GEMM (same result, one more launch).
             using var aT = TransposeBufferRowMajor(A, K, M);

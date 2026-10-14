@@ -76,14 +76,11 @@ public static class SparseOps
                 // HIP/Metal mirrors + FP64 + the perf bar land (tracked in #515).
                 if (CudaSparseBackend.IsAvailable)
                     outArr = CudaSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
-                // NOTE (#515): the managed HIP custom kernel (HipCustomSparseBackend)
-                // is implemented + compiled but intentionally NOT routed here yet. Its
-                // only cheap availability signal, HipBackend.IsHipAvailable, reports
-                // true whenever the HIP runtime sees a device even when the HIP kernel
-                // toolchain can't actually build a binary (e.g. a gfx-mismatched /
-                // header-missing install), which would regress this path to a failing
-                // backend instead of the CPU/vendor fallbacks. Wiring it needs a
-                // kernel-load-strict gate validated on a healthy ROCm runner.
+                // The managed HIP kernels, same role on AMD. IsAvailable is kernel-load strict: it builds the shared HIP
+                // backend once and requires the SpMM kernels to have compiled, so a HIP runtime whose toolchain cannot
+                // build for its arch falls through to the vendor / Vulkan / CPU tiers instead of failing here.
+                else if (HipCustomSparseBackend.IsAvailable)
+                    outArr = HipCustomSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (CuSparseBackend.IsAvailable)
                     outArr = CuSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (HipSparseBackend.IsAvailable)
@@ -131,11 +128,15 @@ public static class SparseOps
 
             // Tier 0 — GPU dispatch via the managed FP64 CSR kernel (#515). The
             // vendor host-array paths (cuSPARSE/rocSPARSE) aren't wired for FP64, so
-            // the managed CUDA kernel is the only GPU double path; previously double
-            // had no GPU tier at all and went straight to CPU. (The HIP FP64 mirror
-            // exists but isn't routed yet — see the float tier's note.)
-            if (rows * (long)n >= GpuDispatchThreshold && CudaSparseBackend.IsAvailable)
-                outArr = CudaSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+            // the managed CUDA and HIP kernels are the only GPU double paths; previously
+            // double had no GPU tier at all and went straight to CPU.
+            if (rows * (long)n >= GpuDispatchThreshold)
+            {
+                if (CudaSparseBackend.IsAvailable)
+                    outArr = CudaSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+                else if (HipCustomSparseBackend.IsAvailable)
+                    outArr = HipCustomSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
+            }
 
             // Tier 1 — CPU SIMD on hardware-accelerated Vector<T>.
             if (outArr is null && System.Numerics.Vector.IsHardwareAccelerated)

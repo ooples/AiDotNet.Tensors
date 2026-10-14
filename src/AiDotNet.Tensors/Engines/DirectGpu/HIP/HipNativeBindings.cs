@@ -373,6 +373,10 @@ internal static class HipNativeBindings
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipGetDeviceCount(ref int count);
 
+    /// <summary>The HIP runtime version (HIP_VERSION encoding), part of the evolution-tuning device fingerprint.</summary>
+    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
+    public static extern HipError hipRuntimeGetVersion(out int runtimeVersion);
+
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipSetDevice(int deviceId);
 

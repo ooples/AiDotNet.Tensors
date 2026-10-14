@@ -37,13 +37,18 @@ internal static class CuSparseNative
         R64F = 1,  // double
     }
 
+    // cusparse.h: CUSPARSE_INDEX_16U = 1, CUSPARSE_INDEX_32I = 2, CUSPARSE_INDEX_64I = 3. I32 used to be 1, so
+    // cuSPARSE read our 32-bit CSR indices as 16-bit and addressed outside the matrix (CUDA error 700).
     public enum IndexType
     {
-        I32 = 1,
+        I32 = 2,
+        I64 = 3,
     }
 
     public enum SpMatDescr_Format { Csr = 1, Csc = 2, Coo = 3 }
-    public enum DnMatDescr_Order { RowMajor = 0, ColMajor = 1 }
+    // cusparse.h: CUSPARSE_ORDER_COL = 1, CUSPARSE_ORDER_ROW = 2. There is no 0; this enum used to say RowMajor = 0,
+    // which cuSPARSE rejects (cusparseCreateDnMat returns INVALID_VALUE), so no cuSPARSE SpMM could ever run.
+    public enum DnMatDescr_Order { ColMajor = 1, RowMajor = 2 }
 
     public enum Operation
     {

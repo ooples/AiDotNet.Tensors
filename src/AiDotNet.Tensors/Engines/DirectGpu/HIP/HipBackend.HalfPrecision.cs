@@ -35,7 +35,7 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
     /// forward fallback does not claim this separate capability.</remarks>
     public bool SupportsFp16FusedBackward => HasVendorHalfGemm;
 
-    private bool HasVendorHalfGemm => _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
+    private bool HasVendorHalfGemm => HipBlasReady;
 
     private bool HasDirectHalfGemmFallback =>
         _kernelCache.ContainsKey("convert_fp32_to_fp16") &&

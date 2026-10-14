@@ -68,6 +68,21 @@ __device__ __forceinline__ bool fa_allowed(const FaParams& p, const int* __restr
     return true;
 }
 
+// Which tile block and which (batch, head) this thread block works on. Under causal masking the work per block
+// depends on its position along the diagonal, and blocks are dispatched in linear order (x fastest), so with the
+// natural mapping the heaviest blocks of the last heads start last and set the tail. Causal grids are instead walked
+// heaviest first across every head: linear block L takes rank L / (B * H) and head L % (B * H). heavyAtEnd says
+// whether the heaviest tile blocks are the last ones (the forward's query blocks) or the first (the backward's key
+// blocks).
+__device__ __forceinline__ void fa_block_order(const FaParams& p, bool heavyAtEnd, int* blk, int* bh)
+{
+    if (!p.causal) { *blk = (int)blockIdx.x; *bh = (int)blockIdx.y; return; }
+    int linear = (int)(blockIdx.y * gridDim.x + blockIdx.x);
+    int rank = linear / (int)gridDim.y;
+    *bh = linear % (int)gridDim.y;
+    *blk = heavyAtEnd ? (int)gridDim.x - 1 - rank : rank;
+}
+
 // The capped score and d(capped)/d(raw).
 __device__ __forceinline__ float fa_cap(float raw, float cap, float* slope)
 {
@@ -86,10 +101,11 @@ __device__ void fa_forward(const float* __restrict__ q, const float* __restrict_
 {
     __shared__ __align__(16) float Ks[FA_FBC][D + 4];
     __shared__ __align__(16) float Vs[FA_FBC][D + 4];
-    int bh = blockIdx.y, b = bh / p.H, h = bh % p.H;
-    int r = threadIdx.x / FA_SPLIT, c = threadIdx.x % FA_SPLIT;
     // Causal: the last query blocks see the most keys, so they are launched first (shorter tail).
-    int qBlock = p.causal ? (int)(gridDim.x - 1 - blockIdx.x) : (int)blockIdx.x;
+    int qBlock, bh;
+    fa_block_order(p, true, &qBlock, &bh);
+    int b = bh / p.H, h = bh % p.H;
+    int r = threadIdx.x / FA_SPLIT, c = threadIdx.x % FA_SPLIT;
     int i = qBlock * FA_BR + r;
     bool active = i < p.Sq;
 
@@ -397,9 +413,12 @@ __device__ void fa_backward_fused(const float* __restrict__ q, const float* __re
     __shared__ __align__(16) float Ks[FA_FKB][D + 4];
     __shared__ __align__(16) float dSs[FA_QT][FA_FKB + 4];
     __shared__ float Ls[FA_QT], Ds[FA_QT];
-    int bh = blockIdx.y, b = bh / p.H, h = bh % p.H;
+    // Causal: the first key blocks see the most query rows, so they are launched first (shorter tail).
+    int kBlock, bh;
+    fa_block_order(p, false, &kBlock, &bh);
+    int b = bh / p.H, h = bh % p.H;
     int jr = threadIdx.x / 2, half = threadIdx.x % 2;
-    int j = blockIdx.x * FA_FKB + jr;
+    int j = kBlock * FA_FKB + jr;
     bool active = j < p.Sk;
 
     float kr[HALF], vr[HALF], dk[HALF], dv[HALF];
@@ -415,7 +434,7 @@ __device__ void fa_backward_fused(const float* __restrict__ q, const float* __re
     }
     int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;   // the dQ tile: rows ty*4 .. +4, columns tx*OC .. +OC
 
-    int firstKey = blockIdx.x * FA_FKB;
+    int firstKey = kBlock * FA_FKB;
     int iStart = p.causal ? max(0, firstKey - p.causalOffset) : 0;
     iStart = iStart / FA_QT * FA_QT;
     const float* qbase = q + b * p.qb + h * p.qh;

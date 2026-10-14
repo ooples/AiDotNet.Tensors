@@ -48,8 +48,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _rdnaGemmWave32;
     private readonly Dictionary<string, IntPtr> _kernelCache;
 
-    /// <summary>Whether a compiled module registered this kernel name (KernelLookupIntegrityTests).</summary>
-    internal bool HasCompiledKernel(string name) => _kernelCache.ContainsKey(name);
+    /// <summary>
+    /// Whether a compiled module registered this kernel name (KernelLookupIntegrityTests). The CLBlast GEMM modules compile on first use rather than at
+    /// startup, so a name of theirs is built before it is judged; an unbuildable one is reported missing like any other.
+    /// </summary>
+    internal bool HasCompiledKernel(string name) =>
+        _kernelCache.ContainsKey(name) ||
+        (HipClBlastGemmKernels.IsLazyKernel(name) && EnsureClBlastIndirectGemm() && _kernelCache.ContainsKey(name));
     private readonly List<HipKernelCompilationException> _kernelCompilationFailures = new();
     private AmdGpuArchitecture _architecture;
     private string _architectureTarget = string.Empty;
@@ -128,6 +133,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _audioModule;
     private IntPtr _hipblasHandle;
     private bool _hipblasAvailable;
+    // 0 = not tried, 1 = loading, 2 = settled. An int rather than a lock object: tests build capability-only backends
+    // with GetUninitializedObject, where field initializers never run.
+    private int _hipblasInitState;
 
     private const int DefaultBlockSize = 256;
     private const int MaxRnnBlockSize = 1024;
@@ -336,7 +344,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 return;
             }
 
-            TryInitializeHipBlas();
+            // hipBLAS loads on the first call that wants it (HipBlasReady), not here: rocBLAS's Tensile libraries cost
+            // startup time and memory that a process whose GEMMs never reach the vendor path should not pay (#1266).
 
             // Compile MFMA kernels
             CompileKernels();
@@ -429,6 +438,42 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         return true;
     }
 
+    /// <summary>Whether the vendor BLAS is usable, loading it on the first ask.</summary>
+    private bool HipBlasReady
+    {
+        get
+        {
+            if (Volatile.Read(ref _hipblasInitState) != 2) SettleHipBlas(load: true);
+            return _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
+        }
+    }
+
+    /// <summary>Whether this backend has tried to load hipBLAS yet (lets tests prove the load is lazy).</summary>
+    internal bool HipBlasInitializationAttempted => Volatile.Read(ref _hipblasInitState) != 0;
+
+    /// <summary>
+    /// Moves hipBLAS to settled exactly once: the first caller loads it (or, from Dispose, rules it out) and any caller
+    /// that arrives while it loads waits for the result.
+    /// </summary>
+    private void SettleHipBlas(bool load)
+    {
+        if (Interlocked.CompareExchange(ref _hipblasInitState, 1, 0) == 0)
+        {
+            try
+            {
+                if (load && IsAvailable && !_disposed) TryInitializeHipBlas();
+            }
+            finally
+            {
+                Volatile.Write(ref _hipblasInitState, 2);
+            }
+            return;
+        }
+        var spin = new SpinWait();
+        while (Volatile.Read(ref _hipblasInitState) != 2) spin.SpinOnce();
+    }
+
+    /// <summary>Creates the hipBLAS handle on this backend's stream, leaving hipBLAS unavailable on any failure.</summary>
     private void TryInitializeHipBlas()
     {
         // rocBLAS aborts the process (rather than returning a status) when its Tensile package has
@@ -1627,6 +1672,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             return;
         }
 
+        // CLBlast's indirect GEMM, the kernel OpenCL runs on this GPU: up to 8x the kernels below on the shapes it takes (#1266).
+        if (ShouldUseClBlastIndirectGemm(M, N, K) && TryExecuteClBlastIndirectGemm(A, B, C, M, N, K, alpha, beta))
+        {
+            HipNativeBindings.CheckError(HipNativeBindings.hipStreamSynchronize(_stream), "hipStreamSynchronize");
+            return;
+        }
+
         var bufferA = (HipGpuBuffer)A;
         var bufferB = (HipGpuBuffer)B;
         var bufferC = (HipGpuBuffer)C;
@@ -1703,7 +1755,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public unsafe void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
-        if (!_hipblasAvailable || _hipblasHandle == IntPtr.Zero)
+        if (!HipBlasReady)
         {
             // No vendor BLAS: route through Gemm with a materialized
             // transpose (slower fallback; the win exists when hipBLAS is
@@ -1755,7 +1807,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private bool TryExecuteHipBlasGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
-        if (!_hipblasAvailable || _hipblasHandle == IntPtr.Zero)
+        if (!HipBlasReady)
         {
             return false;
         }
@@ -3651,11 +3703,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
@@ -3683,11 +3735,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         int gridX = (nnz + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        IntPtr rowHandle = ((HipGpuBuffer)rowIndices).Handle;
-        IntPtr colHandle = ((HipGpuBuffer)colIndices).Handle;
-        IntPtr xHandle = ((HipGpuBuffer)x).Handle;
-        IntPtr yHandle = ((HipGpuBuffer)y).Handle;
-        IntPtr outputHandle = ((HipGpuBuffer)output).Handle;
+        IntPtr rowHandle = rowIndices.Handle;
+        IntPtr colHandle = colIndices.Handle;
+        IntPtr xHandle = x.Handle;
+        IntPtr yHandle = y.Handle;
+        IntPtr outputHandle = output.Handle;
 
         void*[] args = new void*[7];
         fixed (void** argsPtr = args)
@@ -3735,21 +3787,55 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm_warp");
 
-        // One warp (32 lanes) per row; DefaultBlockSize threads/block => 8 warps/block.
+        // CSR_SPMM_ROW_LANES (32) threads per row, as the kernel indexes them; DefaultBlockSize threads/block => 8 rows/block.
         int gridX = (M * 32 + DefaultBlockSize - 1) / DefaultBlockSize;
         int gridY = 1;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
             M, K, N, nnz);
     }
 
+    /// <summary>CSR SpMM with 128-bit vectorized dense loads (issue #515): launches <c>csr_spmm_vec4</c>, one thread per
+    /// four adjacent output columns. Requires <paramref name="N"/> % 4 == 0. Same per-output reduction order as
+    /// <see cref="CsrSpMM"/>. CUDA mirror: <see cref="CUDA.CudaBackend.CsrSpMMVec4"/>.</summary>
+    public void CsrSpMMVec4(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
+        if (N % 4 != 0)
+            throw new ArgumentException(
+                $"CsrSpMMVec4 requires N divisible by 4 (got {N}); route other widths to CsrSpMM or CsrSpMMWarp.", nameof(N));
+
+        if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm_vec4");
+
+        // Each thread owns 4 columns, so the y-grid spans N/4 thread-columns.
+        int gridX = M;
+        int gridY = (N / 4 + DefaultBlockSize - 1) / DefaultBlockSize;
+
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
+
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
+            valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
+            M, K, N, nnz);
+    }
     /// <summary>FP64 CSR SpMM (issue #515): launches <c>csr_spmm_double</c>. The
     /// value / dense / output buffers carry <c>double</c> payloads (byte buffers); the
     /// int CSR index buffers are unchanged. CUDA mirror:
@@ -3771,11 +3857,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
@@ -3801,12 +3887,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var biasHandle = ((HipGpuBuffer)bias).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var biasHandle = bias.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2DBias(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, biasHandle, outputHandle,
@@ -3831,14 +3917,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // First zero the output buffer
         int outputSize = numNodes * features;
         int zeroGrid = (outputSize + DefaultBlockSize - 1) / DefaultBlockSize;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var outputHandle = output.Handle;
         LaunchKernel1D(zeroKernel, zeroGrid, DefaultBlockSize, outputHandle, outputSize);
         Synchronize();
 
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var sourceHandle = ((HipGpuBuffer)sourceIndices).Handle;
-        var targetHandle = ((HipGpuBuffer)targetIndices).Handle;
-        var edgeValuesHandle = edgeValues is not null ? ((HipGpuBuffer)edgeValues).Handle : IntPtr.Zero;
+        var inputHandle = input.Handle;
+        var sourceHandle = sourceIndices.Handle;
+        var targetHandle = targetIndices.Handle;
+        var edgeValuesHandle = edgeValues is not null ? edgeValues.Handle : IntPtr.Zero;
         int hasEdgeValues = edgeValues is not null ? 1 : 0;
 
         // Issue #382: route to atomic-free variant — per-target-node thread scans edges.
@@ -3875,10 +3961,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var inputHandle = input.Handle;
+        var outputHandle = output.Handle;
 
         LaunchCsrSegmentedKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             colIndicesHandle, rowPointersHandle, inputHandle, outputHandle, M, K, N);
@@ -3901,10 +3987,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var inputHandle = input.Handle;
+        var outputHandle = output.Handle;
 
         LaunchCsrSegmentedKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             colIndicesHandle, rowPointersHandle, inputHandle, outputHandle, M, K, N);
@@ -3928,10 +4014,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var inputHandle = input.Handle;
+        var outputHandle = output.Handle;
 
         LaunchCsrSegmentedStdDevKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             colIndicesHandle, rowPointersHandle, inputHandle, outputHandle, M, K, N, epsilon);
@@ -11379,6 +11465,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             HipNativeBindings.hipModuleUnload(_fftModule);
             _fftModule = IntPtr.Zero;
         }
+        DisposeClBlastGemm();
         if (_spectralPerfModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_spectralPerfModule);
@@ -11527,12 +11614,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
         _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = IntPtr.Zero;
 
+        // Settle first (ruling the load out if it never ran, or waiting out one in flight), so no handle appears after this.
+        SettleHipBlas(load: false);
         if (_hipblasHandle != IntPtr.Zero)
         {
             HipBlasNative.hipblasDestroy(_hipblasHandle); // lgtm[cs/call-to-unmanaged-code] HIP BLAS uses native bindings.
             _hipblasHandle = IntPtr.Zero;
-            _hipblasAvailable = false;
         }
+        _hipblasAvailable = false;
 
         if (_stream != IntPtr.Zero)
         {
