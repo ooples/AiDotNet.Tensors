@@ -27,6 +27,19 @@ public sealed class DirectPtxGemmEvolutionTests
         new(false, false), new(true, false), new(false, true), new(true, true),
     };
 
+    private sealed class MemoryStore : IKernelTuningStore<PtxGemmConfiguration>
+    {
+        public bool TryLoad(KernelTuningIdentity identity, IEvolutionGenomeCodec<PtxGemmConfiguration> codec,
+            out KernelTuningDeploymentSnapshot<PtxGemmConfiguration>? snapshot)
+        {
+            snapshot = null;
+            return false;
+        }
+
+        public bool TryStore(KernelTuningDeploymentSnapshot<PtxGemmConfiguration> snapshot,
+            IEvolutionGenomeCodec<PtxGemmConfiguration> codec) => true;
+    }
+
     [Fact]
     public void Seeds_AreValidAndAdmitTheirProblem()
     {
@@ -80,6 +93,9 @@ public sealed class DirectPtxGemmEvolutionTests
 
         EvolutionKernelTuningResult<PtxGemmConfiguration> result =
             await PtxGemmEvolution.TuneAsync(runtime, layout, m, n, k, engineOptions: options,
+                // Isolated: the test must neither read nor write the user's autotune cache.
+                deploymentRegistry: new KernelTuningDeploymentRegistry<PtxGemmConfiguration>(),
+                store: new MemoryStore(),
                 onTrial: (configuration, trial) => _output.WriteLine(
                     $"{configuration.Name}: {trial.Status} {trial.Measurement?.ThroughputGflops:F1} GFLOP/s {trial.Diagnostic}"));
 

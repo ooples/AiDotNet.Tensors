@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -37,7 +38,7 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         Seed = 1263,
         MaxEvaluationAttempts = 40,
         MaxProposals = 64,
-        MaxGenerations = 8,
+        MaxGenerations = 24,
         ProposalBatchSize = 8,
         MaxDegreeOfParallelism = 1,
         IslandCount = 1,
@@ -161,7 +162,11 @@ internal static partial class DirectPtxDenseLinearFullExperiment
         if (!EvolvedWinners.TryGetValue(name, out PtxGemmConfiguration winner))
         {
             GpuBenchmarkEnvironment.WaitForCooldown(operation + "-tune");
+            // A fresh store and registry: each benchmark tunes from scratch instead of hydrating a deployment persisted by an
+            // earlier run (which then stands as the incumbent).
             var tuning = PtxGemmEvolution.TuneAsync(runtime, layout, m, n, k, engineOptions: EvolutionOptions(name),
+                deploymentRegistry: new KernelTuningDeploymentRegistry<PtxGemmConfiguration>(),
+                store: new FreshTuningStore(),
                 onTrial: (configuration, trial) => Console.WriteLine("gemm_grid_evolution_trial_json=" +
                     JsonSerializer.Serialize(new
                     {
@@ -172,7 +177,9 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                         gflops = trial.Measurement?.ThroughputGflops,
                         diagnostic = trial.Diagnostic,
                     }))).GetAwaiter().GetResult();
-            winner = tuning.ActiveDeployment.Configuration;
+            // Time the search's best (the paired-replay candidate). Whether it would also pass the deployment gate,
+            // whose P95 test is noise-bound at microsecond scale, is reported separately as "promoted".
+            winner = tuning.ProposedWinner.Configuration;
             EvolvedWinners[name] = winner;
             Console.WriteLine("gemm_grid_evolution_winner_json=" + JsonSerializer.Serialize(new
             {
@@ -192,6 +199,20 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             () => kernel.Launch(left.Handle, right.Handle, output.Handle, m, n, k, k, n, n, 1f, 0f),
             () => relativeError(output), Resource(kernel.Audit), capture,
             tolerance: Fp32GridTolerance, deviceLaunches: launches);
+    }
+
+    // Loads nothing and keeps winners only in memory, so benchmark tuning neither reads nor writes the shared cache.
+    private sealed class FreshTuningStore : IKernelTuningStore<PtxGemmConfiguration>
+    {
+        public bool TryLoad(KernelTuningIdentity identity, AiDotNet.Evolution.IEvolutionGenomeCodec<PtxGemmConfiguration> codec,
+            out KernelTuningDeploymentSnapshot<PtxGemmConfiguration>? snapshot)
+        {
+            snapshot = null;
+            return false;
+        }
+
+        public bool TryStore(KernelTuningDeploymentSnapshot<PtxGemmConfiguration> snapshot,
+            AiDotNet.Evolution.IEvolutionGenomeCodec<PtxGemmConfiguration> codec) => true;
     }
 
     private static void PrintUnsupported(int run, string operation, string shape, string method, string? reason)
