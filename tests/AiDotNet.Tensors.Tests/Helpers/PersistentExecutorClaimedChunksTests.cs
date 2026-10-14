@@ -7,8 +7,9 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Helpers;
 
 /// <summary>
-/// #1248: plain dispatches claim chunks from a shared counter and complete when every chunk has finished, so a woken
-/// worker that never gets a core no longer holds the dispatch. That lets a worker wake late, after its dispatch
+/// #1248: in a plain dispatch each participant runs its own chunk set through a cursor, and the calling thread, after a
+/// short grace period, runs any chunk a woken worker has not started; the dispatch completes when every chunk has
+/// finished, so a worker that never gets a core no longer holds it. That lets a worker wake late, after its dispatch
 /// ended or into the next one; these pin that it still runs every chunk exactly once, never joins a dispatch twice,
 /// never runs a thread-local dispatch's chunks as a slot that dispatch did not wake, and that a chunk's exception
 /// still reaches the caller.
@@ -61,21 +62,27 @@ public sealed class PersistentExecutorClaimedChunksTests
     }
 
     [Fact]
-    public void ASlowParticipant_DoesNotKeepChunksTheOthersCanTake()
+    public void ASlowWorker_DoesNotKeepItsUnstartedChunks()
     {
-        // Every chunk that runs on the calling thread takes 20 ms; the rest are instant -- the shape of a participant
-        // that keeps losing its core. With fixed strided sets the caller owned 8 of the 32 chunks (~160 ms); with
-        // claiming it runs about one before the others have taken the rest.
+        // The first worker thread to run a chunk takes 20 ms on every chunk it runs -- the shape of a worker that keeps
+        // losing its core. With fixed sets it ran all 8 of its 32 chunks (~160 ms); now the calling thread, after a
+        // short grace period, runs the ones it has not started, so the dispatch costs about one slow chunk.
         int priorDop = CpuParallelSettings.MaxDegreeOfParallelism;
         try
         {
             CpuParallelSettings.MaxDegreeOfParallelism = 4;
             int caller = Environment.CurrentManagedThreadId;
+            int slow = 0;
             var hits = new int[32];
             var sw = Stopwatch.StartNew();
             PersistentParallelExecutor.Instance.Execute(32, c =>
             {
-                if (Environment.CurrentManagedThreadId == caller) Thread.Sleep(20);
+                int me = Environment.CurrentManagedThreadId;
+                if (me != caller)
+                {
+                    Interlocked.CompareExchange(ref slow, me, 0);
+                    if (Volatile.Read(ref slow) == me) Thread.Sleep(20);
+                }
                 Interlocked.Increment(ref hits[c]);
             });
             sw.Stop();

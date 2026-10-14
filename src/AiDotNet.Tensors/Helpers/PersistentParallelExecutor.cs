@@ -386,45 +386,81 @@ internal sealed class PersistentParallelExecutor
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
     /// <summary>
-    /// Plain mode. A participant first runs its own strided set (p, p+stride, ...), exactly the chunks the fixed
-    /// assignment gave it, so a repeated op keeps each chunk on the same core and its data in that core's cache
-    /// (1M-element elementwise ops run from L2 at ~1 TB/s; scattering chunks across cores made them ~10x slower).
-    /// Each chunk is taken with an atomic flag, so a participant that has finished its own set then steals chunks
-    /// nobody has started, scanning from the far end. A woken worker that does not get a core (another runtime's
-    /// spinning threads, a busy CI host) therefore delays nothing: its chunks are run by the others. With fixed sets
-    /// alone, one starved worker held the whole dispatch: an ONNX MatMul chain run right after ONNX Runtime (whose
-    /// pool keeps spinning after Run) took 21.8 ms on its first call against ~40 us steady (#1248). Whoever finishes
-    /// the last chunk signals the dispatcher. Chunks write disjoint output, so who runs them does not change results.
+    /// Plain mode: runs <paramref name="owner"/>'s strided set (owner, owner+stride, ...) as far as its cursor lets it,
+    /// then subtracts the chunks it ran from the pending total once. Every participant runs exactly its own set, as
+    /// with fixed assignment, so a repeated op keeps each chunk on the same core and its data in that core's cache
+    /// (1M-element elementwise ops run from L2; scattering chunks across cores made them ~10x slower).
     /// </summary>
     [MethodImpl(Hot)]
-    private Exception? RunOwnedThenSteal(Job job, int participant, bool publish)
+    private Exception? RunSet(Job job, int owner, bool publish)
     {
         Exception? first = null;
         var action = job.Action!;
         int numChunks = job.NumChunks, stride = job.Stride, seq = (int)job.Id;
         long[] cursors = _cursors;
+        int count = owner < stride ? (numChunks - owner + stride - 1) / stride : 0;
         int done = 0;
-        // Own set first, then the others' unstarted chunks, starting with the next participant so thieves spread out.
-        for (int k = 0; k < stride; k++)
+        while (TryClaim(cursors, owner, seq, count, out int i))
         {
-            int owner = (participant + k) % stride;
-            int count = (numChunks - owner + stride - 1) / stride;
-            while (TryClaim(cursors, owner, seq, count, out int i))
+            try { action(owner + i * stride); }
+            catch (Exception ex)
             {
-                int c = owner + i * stride;
-                try { action(c); }
-                catch (Exception ex)
-                {
-                    first ??= ex;
-                    if (publish)
-                        Interlocked.CompareExchange(ref _workerException, ex, null);
-                }
-                done++;
+                first ??= ex;
+                if (publish)
+                    Interlocked.CompareExchange(ref _workerException, ex, null);
             }
+            done++;
         }
-        // One update of the shared count per participant, not per chunk.
         if (done > 0 && Interlocked.Add(ref job.Pending, -done) == 0)
             _allDone.Set();
+        return first;
+    }
+
+    // How long the dispatching thread waits, after its own chunks, for the woken workers before it takes the chunks
+    // they have not started (Stopwatch ticks). A normal dispatch finishes well inside this, so nothing is stolen and
+    // nothing scans the other cursors; a worker that does not get a core (another runtime's spinning threads, a busy
+    // CI host) costs this delay instead of holding the dispatch until the OS runs it: an ONNX MatMul chain run right
+    // after ONNX Runtime (whose pool keeps spinning after Run) took 21.8 ms on its first call against ~40 us steady
+    // (#1248). Env override AIDOTNET_PPE_STEAL_AFTER_US; default 50 us.
+    private static readonly long _stealAfterTicks = ComputeStealAfterTicks();
+
+    private static long ComputeStealAfterTicks()
+    {
+        long micros = 50;
+        if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_STEAL_AFTER_US"), out var us) && us >= 0)
+            micros = us;
+        return (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+    }
+
+    /// <summary>
+    /// Dispatcher side of a plain dispatch, after its own set: wait up to <see cref="_stealAfterTicks"/> for the rest,
+    /// then run every chunk still unstarted (each owner's cursor, compare-exchanged like the owner does, so each chunk
+    /// still runs once), then wait for the chunks still running elsewhere.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private Exception? FinishPlainDispatch(Job job)
+    {
+        if (Volatile.Read(ref job.Pending) != 0)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            int spins = 0;
+            while (Volatile.Read(ref job.Pending) != 0)
+            {
+                System.Threading.Thread.SpinWait(16);
+                if ((++spins & 0x3F) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() - start >= _stealAfterTicks)
+                    break;
+            }
+        }
+        Exception? first = null;
+        if (Volatile.Read(ref job.Pending) != 0)
+        {
+            for (int owner = 1; owner < job.Stride; owner++)
+            {
+                var ex = RunSet(job, owner, publish: false);
+                first ??= ex;
+            }
+        }
+        WaitForZero(ref job.Pending);
         return first;
     }
 
@@ -647,9 +683,9 @@ internal sealed class PersistentParallelExecutor
             lastJobId = job.Id;
             if (job.LocalBody is null)
             {
-                // Plain mode: its own set if this dispatch woke it, then steal. A chunk's exception is published
+                // Plain mode: its own set (none if this dispatch did not wake it). A chunk's exception is published
                 // before the chunk counts as finished.
-                _ = RunOwnedThenSteal(job, slot + 1, publish: true);
+                _ = RunSet(job, slot + 1, publish: true);
                 continue;
             }
             if (slot >= job.Stride - 1)
@@ -860,11 +896,11 @@ internal sealed class PersistentParallelExecutor
                     _workReady[i].Set();
                 }
 
-                // The calling thread runs its own set (participant 0) and steals what is left, then waits for the
-                // chunks still running elsewhere -- not for every woken worker: one that has not started holds no
-                // chunk and is not waited on.
-                Exception? mainException = RunOwnedThenSteal(job, 0, publish: false);
-                WaitForZero(ref job.Pending);
+                // The calling thread runs its own set (participant 0), gives the workers a short grace period, then
+                // runs any chunk still unstarted and waits for the ones running elsewhere -- not for every woken
+                // worker: one that has not started holds no chunk and is not waited on.
+                Exception? mainException = RunSet(job, 0, publish: false);
+                mainException ??= FinishPlainDispatch(job);
 
                 _job = null; // release the body's captured references for GC between dispatches
 
