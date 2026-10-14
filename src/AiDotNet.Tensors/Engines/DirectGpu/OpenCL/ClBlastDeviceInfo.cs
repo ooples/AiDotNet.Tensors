@@ -51,6 +51,16 @@ internal readonly struct ClBlastDeviceInfo
         return new ClBlastDeviceInfo(type, vendor, architecture, deviceName);
     }
 
+    /// <summary>
+    /// The same database key an AMD device gets through OpenCL (vendor "AMD", the gfx target as the architecture, the board
+    /// name as the device), so a HIP backend on that device reads the parameters CLBlast tuned for it (#1266).
+    /// </summary>
+    internal static ClBlastDeviceInfo ForAmdGpu(string gfxTarget, string boardName)
+    {
+        string architecture = NormalizeArchitecture(gfxTarget ?? string.Empty);
+        string deviceName = NormalizeDeviceName(string.IsNullOrWhiteSpace(boardName) ? gfxTarget ?? string.Empty : boardName);
+        return new ClBlastDeviceInfo("GPU", "AMD", architecture, deviceName);
+    }
     private static bool HasExtension(string extensions, string extension)
     {
         return extensions.IndexOf(extension, StringComparison.OrdinalIgnoreCase) >= 0;
