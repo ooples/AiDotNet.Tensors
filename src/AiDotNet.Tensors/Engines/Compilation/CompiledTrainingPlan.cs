@@ -174,6 +174,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// the backward is all-specialized, pooled, or has no such buffer. Entries are cleared by
     /// <see cref="RecordEagerFirstWriteCoverage"/> when a run shows the buffer is not written.</summary>
     private bool[]? _eagerFirstWriteCandidates;
+    // How each step's backward was built ("specialized:Op", "generic:Op", "fused:..."), in build order. Test hook.
+    private string[]? _backwardStepKinds;
 
     /// <summary>True once one eager step has run with every candidate zeroed and recorded which ones it wrote.</summary>
     private bool _eagerFirstWriteVerified;
@@ -2090,6 +2092,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static string[]? _profBackwardStepNames;
     private static long[]? _profFwdUs;
     private static string[]? _profFwdNames;
+    // Bytes allocated (process-wide) while each forward action / backward delegate ran, under the same switches as
+    // the timings above. A compiled step is meant to allocate nothing, so these name the actions that do.
+    private static long[]? _profFwdAllocBytes;
+    private static long[]? _profBwdAllocBytes;
     private static long s_profLastAlloc;
     private static int s_profLastGc0, s_profLastGc1, s_profLastGc2;
 #if NET7_0_OR_GREATER
@@ -2122,28 +2128,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static void DumpPerOpProfile(int steps)
     {
         var sb = new System.Text.StringBuilder();
-        void Section(string title, long[]? us, string[]? names)
+        void Section(string title, long[]? us, string[]? names, long[]? allocBytes)
         {
             if (us is null) return;
-            long total = 0;
+            long total = 0, totalAlloc = 0;
             for (int i = 0; i < us.Length; i++) total += us[i];
-            sb.AppendLine($"== {title}: {us.Length} entries, {total / (double)steps:F1} µs/step");
-            var byName = new Dictionary<string, (long Us, int Count)>();
+            long[] alloc = allocBytes is not null && allocBytes.Length == us.Length ? allocBytes : Array.Empty<long>();
+            bool hasAlloc = alloc.Length > 0;
+            for (int i = 0; i < alloc.Length; i++) totalAlloc += alloc[i];
+            sb.AppendLine($"== {title}: {us.Length} entries, {total / (double)steps:F1} µs/step"
+                + (hasAlloc ? $", {totalAlloc / 1024.0 / steps:F1} KB/step allocated" : ""));
+            var byName = new Dictionary<string, (long Us, long Alloc, int Count)>();
             for (int i = 0; i < us.Length; i++)
             {
                 string n = names is not null && i < names.Length ? names[i] : $"#{i}";
                 byName.TryGetValue(n, out var acc);
-                byName[n] = (acc.Us + us[i], acc.Count + 1);
+                byName[n] = (acc.Us + us[i], acc.Alloc + (hasAlloc ? alloc[i] : 0), acc.Count + 1);
             }
             foreach (var kv in byName.OrderByDescending(kv => kv.Value.Us))
-                sb.AppendLine($"  {kv.Value.Us / (double)steps,9:F1} µs  x{kv.Value.Count,-3} {kv.Key}");
+                sb.AppendLine($"  {kv.Value.Us / (double)steps,9:F1} µs  x{kv.Value.Count,-3} {kv.Key}"
+                    + (hasAlloc ? $"  {kv.Value.Alloc / 1024.0 / steps:F1} KB" : ""));
         }
-        Section("forward", _profFwdUs, _profFwdNames);
-        Section("backward", _profPerStepUs, _profBackwardStepNames);
+        Section("forward", _profFwdUs, _profFwdNames, _profFwdAllocBytes);
+        Section("backward", _profPerStepUs, _profBackwardStepNames, _profBwdAllocBytes);
         System.IO.File.WriteAllText(StepProfDumpPath + ".ops.txt", sb.ToString());
     }
 
     public static long[] ProfPerStepUs => _profPerStepUs ?? Array.Empty<long>();
+    /// <summary>Bytes allocated while each backward delegate ran, accumulated like <see cref="ProfPerStepUs"/>.</summary>
+    public static long[] ProfBackwardAllocBytes => _profBwdAllocBytes ?? Array.Empty<long>();
+
+    // Process-wide allocated bytes for the per-op profiler. Imprecise (the current allocation contexts are not
+    // flushed), which is fine at the profiler's granularity; .NET Framework has no allocation counter.
+    private static long ProfAllocatedBytes()
+    {
+#if NETCOREAPP3_0_OR_GREATER
+        return GC.GetTotalAllocatedBytes(false);
+#else
+        return 0;
+#endif
+    }
     public static string[] ProfBackwardStepNames => _profBackwardStepNames ?? Array.Empty<string>();
     public static long ProfForwardUs => System.Threading.Interlocked.Read(ref _profForwardUs);
     public static long ProfGradZeroUs => System.Threading.Interlocked.Read(ref _profGradZeroUs);
@@ -2159,6 +2183,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         System.Threading.Interlocked.Exchange(ref _profStepCount, 0);
         var ps = _profPerStepUs;
         if (ps != null) System.Array.Clear(ps, 0, ps.Length);
+        var pa = _profBwdAllocBytes;
+        if (pa != null) System.Array.Clear(pa, 0, pa.Length);
         // Drop the previous plan's backward-step name table. Without this,
         // a fresh ResetProf-then-rebuild cycle (e.g. test reruns) leaves
         // the stale name array around and any future Step() that reads
@@ -2964,6 +2990,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _eagerFirstWriteVerified = true;
     }
 
+    /// <summary>
+    /// How each step's backward was built, in build order: <c>specialized:&lt;op&gt;</c> for a direct-into-buffer delegate,
+    /// <c>generic:&lt;op&gt;</c> for the accumulating BackwardFunctions path, <c>fused...</c> for fused groups. Analytic and
+    /// slice-prefix actions are not named. Test hook.
+    /// </summary>
+    internal IReadOnlyList<string> BackwardStepKinds => _backwardStepKinds ?? Array.Empty<string>();
+
     /// <summary>Gradient buffers the eager step currently leaves un-zeroed (first write copies in). Test hook.</summary>
     internal int EagerFirstWriteCandidateCount
     {
@@ -3127,12 +3160,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     }
                     _profFwdNames = names;
                 }
+                var perFwdAlloc = _profFwdAllocBytes;
+                if (perFwdAlloc == null || perFwdAlloc.Length != fwd.Length)
+                {
+                    perFwdAlloc = new long[fwd.Length];
+                    _profFwdAllocBytes = perFwdAlloc;
+                }
                 double tickToUsF = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
                 for (int i = 0; i < fwd.Length; i++)
                 {
+                    long ai = ProfAllocatedBytes();
                     long si = System.Diagnostics.Stopwatch.GetTimestamp();
                     fwd[i](engine);
                     perFwd[i] += (long)((System.Diagnostics.Stopwatch.GetTimestamp() - si) * tickToUsF);
+                    perFwdAlloc[i] += ProfAllocatedBytes() - ai;
                 }
             }
             else
@@ -3307,14 +3348,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 perStep = new long[bwd.Length];
                 _profPerStepUs = perStep;
             }
+            var perStepAlloc = _profBwdAllocBytes;
+            if (perStepAlloc == null || perStepAlloc.Length != bwd.Length)
+            {
+                perStepAlloc = new long[bwd.Length];
+                _profBwdAllocBytes = perStepAlloc;
+            }
             double tickToUsLocal = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
             for (int i = 0; i < bwd.Length; i++)
             {
+                long ai = ProfAllocatedBytes();
                 long si = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (_gradPoolReZeroByStep != null) ApplyGradPoolReZero(i, gradArrays);
                 bwd[i](engine);
                 long ei = System.Diagnostics.Stopwatch.GetTimestamp();
                 perStep[i] += (long)((ei - si) * tickToUsLocal);
+                perStepAlloc[i] += ProfAllocatedBytes() - ai;
                 if (bwdProbe != null)
                 {
                     var name = i < (_profBackwardStepNames?.Length ?? 0) ? _profBackwardStepNames![i] : $"#{i}";
@@ -7763,6 +7812,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             storageLeases = null;
             plan._liveGradientMap = gradMap;
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
+            plan._backwardStepKinds = backwardStepNames.ToArray();
             scope.ReleaseStorageLeases();
             return plan;
         }
@@ -9460,6 +9510,151 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         for (; i < end; i++) dst[i] += src[i];
     }
 
+    /// <summary>
+    /// The backward of <c>C[M,N] = A[M,K] · B[K,N]</c> (A's leading dims collapsed into M) when at least one operand
+    /// has several consumers: <c>dA = dC · Bᵀ</c> and <c>dB = Aᵀ · dC</c>, each one transposed GEMM into the plan's
+    /// gradient buffer. A single-consumer operand's gradient overwrites its buffer (beta = 0); a shared operand's
+    /// accumulates into it (beta = 1), relying on the plan zeroing every multi-consumer tensor's gradient buffer at the
+    /// start of the step. A gradient no parameter reads (<paramref name="requiresGrad"/>) is not computed. Returns null
+    /// for any layout the raw-array GEMMs cannot address, so the step keeps the generic backward.
+    /// </summary>
+    private static Action<IEngine>? BuildSharedOperandMatMulBackward(
+        CompiledStep<T> step,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<Tensor<T>, int> consumerCount,
+        HashSet<Tensor<T>>? requiresGrad)
+    {
+        var inputA = step.Inputs[0];
+        var inputB = step.Inputs[1];
+        // x · x writes both gradients into one buffer; the generic backward handles that aliasing.
+        if (ReferenceEquals(inputA, inputB)) return null;
+        if (!gradMap.TryGetValue(step.OutputBuffer, out var gradOut)
+            || !gradMap.TryGetValue(inputA, out var gradA)
+            || !gradMap.TryGetValue(inputB, out var gradB))
+            return null;
+        if (!gradOut.IsContiguous || !gradA.IsContiguous || !gradB.IsContiguous) return null;
+        // The GEMMs read dC while writing dA / dB, and write dA and dB independently: any shared storage among the three
+        // would make one write corrupt another's input.
+        if (gradA.SharesStorageWith(gradB) || gradOut.SharesStorageWith(gradA) || gradOut.SharesStorageWith(gradB))
+            return null;
+
+        int aRank = inputA.Rank;
+        int m = 1;
+        for (int i = 0; i < aRank - 1; i++) m *= inputA._shape[i];
+        int k = inputA._shape[aRank - 1];
+        int n = inputB._shape[1];
+        if (inputB._shape[0] != k || gradOut.Length != (long)m * n
+            || gradA.Length != (long)m * k || gradB.Length != (long)k * n)
+            return null;
+
+        bool accumulateA = consumerCount.TryGetValue(inputA, out int consumersA) && consumersA > 1;
+        bool accumulateB = consumerCount.TryGetValue(inputB, out int consumersB) && consumersB > 1;
+        bool needA = requiresGrad is null || requiresGrad.Contains(inputA);
+        bool needB = requiresGrad is null || requiresGrad.Contains(inputB);
+        if (!needA && !needB) return null;
+
+        if (typeof(T) == typeof(float))
+        {
+            var dc = TryGetLiveFloatBacking(gradOut);
+            var a = TryGetLiveFloatBacking(inputA);
+            var b = TryGetLiveFloatBacking(inputB);
+            var da = TryGetLiveFloatBacking(gradA);
+            var db = TryGetLiveFloatBacking(gradB);
+            if (dc is null || a is null || b is null || da is null || db is null) return null;
+            return _ =>
+            {
+                // dA[M,K] = dC[M,N] · B[K,N]ᵀ
+                if (needA)
+                {
+                    SharedOperandGemm(dc, n, false, b, n, true, da, m, n, k, accumulateA);
+                    inputA.Grad = gradA;
+                }
+                // dB[K,N] = A[M,K]ᵀ · dC[M,N]
+                if (needB)
+                {
+                    SharedOperandGemm(a, k, true, dc, n, false, db, k, m, n, accumulateB);
+                    inputB.Grad = gradB;
+                }
+            };
+        }
+
+        var dcD = TryGetLiveDoubleBacking(gradOut);
+        var aD = TryGetLiveDoubleBacking(inputA);
+        var bD = TryGetLiveDoubleBacking(inputB);
+        var daD = TryGetLiveDoubleBacking(gradA);
+        var dbD = TryGetLiveDoubleBacking(gradB);
+        if (dcD is null || aD is null || bD is null || daD is null || dbD is null) return null;
+        // Managed accumulation for double has no beta = 1 kernel: the product lands in this plan-owned scratch and is
+        // then added. Sized for the larger accumulated gradient, allocated on first use only.
+        int scratchLength = Math.Max(accumulateA && needA ? m * k : 0, accumulateB && needB ? k * n : 0);
+        double[]? scratch = null;
+        return _ =>
+        {
+            if (needA)
+            {
+                SharedOperandGemm(dcD, n, false, bD, n, true, daD, m, n, k, accumulateA, ref scratch, scratchLength);
+                inputA.Grad = gradA;
+            }
+            if (needB)
+            {
+                SharedOperandGemm(aD, k, true, dcD, n, false, dbD, k, m, n, accumulateB, ref scratch, scratchLength);
+                inputB.Grad = gradB;
+            }
+        };
+    }
+
+    /// <summary>
+    /// <c>C[rows, cols] (+)= op(A) · op(B)</c> with inner dimension <paramref name="inner"/>, C dense with leading
+    /// dimension <paramref name="cols"/>. Overwrites when <paramref name="accumulate"/> is false, else adds into C:
+    /// native BLAS with beta = 1 unless BLAS routing prefers the managed kernels (deterministic mode, autotune), in
+    /// which case <see cref="SimdGemm.SgemmAdd(ReadOnlySpan{float}, int, bool, ReadOnlySpan{float}, int, bool, Span{float}, int, int, int)"/> accumulates.
+    /// </summary>
+    private static void SharedOperandGemm(
+        float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c,
+        int rows, int inner, int cols, bool accumulate)
+    {
+        if (!accumulate)
+        {
+            LinearBackwardGemm(a, lda, transA, b, ldb, transB, c, rows, inner, cols);
+            return;
+        }
+        if (!BlasProvider.ShouldRouteManaged(rows, cols, inner, transA, transB, typeof(float))
+            && BlasProvider.TryGemmExBeta(rows, cols, inner, a, 0, lda, transA, b, 0, ldb, transB, c, 0, cols, 1f, 1f))
+            return;
+        SimdGemm.SgemmAdd(a.AsSpan(0, rows * inner), lda, transA, b.AsSpan(0, inner * cols), ldb, transB,
+            c.AsSpan(0, rows * cols), rows, inner, cols);
+    }
+
+    /// <summary>Double counterpart of the float <c>SharedOperandGemm</c>. Without native BLAS, or when routing prefers
+    /// the managed kernel, an accumulating product is computed into <paramref name="scratch"/> and then added.</summary>
+    private static void SharedOperandGemm(
+        double[] a, int lda, bool transA, double[] b, int ldb, bool transB, double[] c,
+        int rows, int inner, int cols, bool accumulate, ref double[]? scratch, int scratchLength)
+    {
+        if (!accumulate)
+        {
+            if (!BlasProvider.TryGemmEx(rows, cols, inner, a, 0, lda, transA, b, 0, ldb, transB, c, 0, cols))
+                Engines.BlasManaged.BlasManaged.Gemm<double>(
+                    a.AsSpan(0, rows * inner), lda, transA, b.AsSpan(0, inner * cols), ldb, transB,
+                    c.AsSpan(0, rows * cols), cols, rows, cols, inner,
+                    new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
+            return;
+        }
+        if (!BlasProvider.ShouldRouteManaged(rows, cols, inner, transA, transB, typeof(double))
+            && BlasProvider.TryGemmExBeta(rows, cols, inner, a, 0, lda, transA, b, 0, ldb, transB, c, 0, cols, 1.0, 1.0))
+            return;
+        var product = scratch ??= new double[scratchLength];
+        int length = rows * cols;
+        Engines.BlasManaged.BlasManaged.Gemm<double>(
+            a.AsSpan(0, rows * inner), lda, transA, b.AsSpan(0, inner * cols), ldb, transB,
+            product.AsSpan(0, length), cols, rows, cols, inner,
+            new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
+        int width = System.Numerics.Vector<double>.Count, i = 0;
+        for (; i + width <= length; i += width)
+            (new System.Numerics.Vector<double>(c, i) + new System.Numerics.Vector<double>(product, i)).CopyTo(c, i);
+        for (; i < length; i++) c[i] += product[i];
+    }
+
     private static void LinearBackwardGemm(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
     {
@@ -9720,6 +9915,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
         }
 
+        // Dense LEFT op a per-row scalar: RIGHT has LEFT's leading axes followed only by size-1 axes, e.g. an [out, batch]
+        // activation plus an [out, 1] bias (N-BEATS' column-major blocks). One vectorised pass per row straight into the
+        // output. The in-place kernel below has no case for this shape: its general fallback materialized the whole
+        // broadcast result and copied it back, element by element through INumericOperations -- on N-BEATS (30 blocks,
+        // hidden 512, batch 1024) 214 MB allocated and 160 ms of a CPU step across its 180 bias adds. Each element is
+        // the same single IEEE operation as before (a - s is computed as a + (-s), which is exact), so results are
+        // bit-identical.
+        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double)) && leftSpansOutput && !rightSpansOutput
+            && TryGetPerRowScalarBroadcast(left._shape, right._shape, out int scalarRows, out int scalarCols))
+        {
+            var perRow = BuildPerRowScalarBroadcast(left, right, output, scalarRows, scalarCols,
+                isAdd ? PerRowScalarOp.Add : isSubtract ? PerRowScalarOp.Subtract : PerRowScalarOp.Multiply);
+            if (perRow is not null) return perRow;
+        }
+
         // Subtract and multiply have no in-place broadcasting kernel for a smaller RIGHT operand,
         // and the row-vector case above did not apply. Leave it to the generic path rather than
         // open-code a second expansion here.
@@ -9760,6 +9970,89 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 cpu.TensorBroadcastAddInPlace(output, right);
             }
         };
+    }
+
+    /// <summary>The elementwise operation of a per-row scalar broadcast.</summary>
+    private enum PerRowScalarOp
+    {
+        Add,
+        Subtract,
+        Multiply,
+    }
+
+    /// <summary>
+    /// True when <paramref name="right"/> broadcasts as one scalar per row of <paramref name="left"/>: the same rank,
+    /// equal on a non-empty leading run of axes and 1 on every remaining axis, with at least one remaining axis wider
+    /// than 1. <paramref name="rows"/> is the product of the leading run, <paramref name="cols"/> of the rest.
+    /// </summary>
+    private static bool TryGetPerRowScalarBroadcast(int[] left, int[] right, out int rows, out int cols)
+    {
+        rows = 0;
+        cols = 0;
+        if (left.Length != right.Length || left.Length < 2) return false;
+        int split = 0;
+        while (split < left.Length && right[split] == left[split]) split++;
+        if (split == 0 || split == left.Length) return false;
+        for (int axis = split; axis < left.Length; axis++)
+            if (right[axis] != 1) return false;
+        long rowCount = 1, colCount = 1;
+        for (int axis = 0; axis < split; axis++) rowCount *= left[axis];
+        for (int axis = split; axis < left.Length; axis++) colCount *= left[axis];
+        if (colCount <= 1 || rowCount * colCount > int.MaxValue) return false;
+        rows = (int)rowCount;
+        cols = (int)colCount;
+        return true;
+    }
+
+    /// <summary>
+    /// <c>output[r, c] = left[r, c] op right[r]</c> over <paramref name="rows"/> x <paramref name="cols"/>, one
+    /// vectorised pass per row, rows chunked across the CPU pool. Null when an operand has no zero-offset live backing.
+    /// </summary>
+    private static Action<IEngine>? BuildPerRowScalarBroadcast(
+        Tensor<T> left, Tensor<T> right, Tensor<T> output, int rows, int cols, PerRowScalarOp op)
+    {
+        const int ChunkElements = 64 * 1024;
+        int rowsPerChunk = Math.Max(1, ChunkElements / cols);
+        int chunks = (rows + rowsPerChunk - 1) / rowsPerChunk;
+        long work = (long)rows * cols;
+        if (typeof(T) == typeof(float))
+        {
+            var l = TryGetLiveFloatBacking(left);
+            var r = TryGetLiveFloatBacking(right);
+            var o = TryGetLiveFloatBacking(output);
+            if (l is null || r is null || o is null) return null;
+            Action<int> chunkBody = chunk =>
+            {
+                int end = Math.Min(rows, (chunk + 1) * rowsPerChunk);
+                for (int row = chunk * rowsPerChunk; row < end; row++)
+                {
+                    var source = new ReadOnlySpan<float>(l, row * cols, cols);
+                    var destination = new Span<float>(o, row * cols, cols);
+                    float scalar = r[row];
+                    if (op == PerRowScalarOp.Multiply) SimdKernels.MultiplyScalar(source, scalar, destination);
+                    else SimdKernels.AddScalar(source, op == PerRowScalarOp.Subtract ? -scalar : scalar, destination);
+                }
+            };
+            return _ => CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunkBody);
+        }
+
+        var lD = TryGetLiveDoubleBacking(left);
+        var rD = TryGetLiveDoubleBacking(right);
+        var oD = TryGetLiveDoubleBacking(output);
+        if (lD is null || rD is null || oD is null) return null;
+        Action<int> chunkBodyD = chunk =>
+        {
+            int end = Math.Min(rows, (chunk + 1) * rowsPerChunk);
+            for (int row = chunk * rowsPerChunk; row < end; row++)
+            {
+                var source = new ReadOnlySpan<double>(lD, row * cols, cols);
+                var destination = new Span<double>(oD, row * cols, cols);
+                double scalar = rD[row];
+                if (op == PerRowScalarOp.Multiply) SimdKernels.MultiplyScalar(source, scalar, destination);
+                else SimdKernels.AddScalar(source, op == PerRowScalarOp.Subtract ? -scalar : scalar, destination);
+            }
+        };
+        return _ => CpuParallelSettings.ParallelForOrSerial(0, chunks, work, chunkBodyD);
     }
 
     /// <summary>
@@ -10025,14 +10318,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 && !HasSpecializedBacking(inputGrad))
                 return null;
 
-        // Both MatMul specializations below write dA / dB straight into the plan's gradient buffers with an OVERWRITING
-        // GEMM (beta = 0). That is only correct when the operand has exactly one consumer: an operand read by several ops
-        // (e.g. one normalised activation feeding the Q, K and V projections) must SUM their contributions, and with the
-        // overwrite only the last backward's survived (measured: dX came out at the last projection's share only).
-        // Such steps take the generic backward, which accumulates.
+        // The two MatMul specializations after this one write dA / dB straight into the plan's gradient buffers with an
+        // OVERWRITING GEMM (beta = 0). That is only correct when the operand has exactly one consumer: an operand read by
+        // several ops (e.g. one normalised activation feeding the Q, K and V projections) must SUM their contributions,
+        // and with the overwrite only the last backward's survived (measured: dX came out at the last projection's share
+        // only). A shared operand's gradient is therefore accumulated with beta = 1 (BuildSharedOperandMatMulBackward).
         bool matMulOperandShared = step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && ((consumerCount.TryGetValue(step.Inputs[0], out int consumersA) && consumersA > 1)
                 || (consumerCount.TryGetValue(step.Inputs[1], out int consumersB) && consumersB > 1));
+
+        // MatMul backward with a shared operand: each gradient is one transposed GEMM straight into the plan's buffer,
+        // overwriting (beta = 0) for a single-consumer operand and accumulating (beta = 1) for a shared one. The shared
+        // operand's buffer is zeroed at the start of every step (its tensor is multi-consumer, see the accumulating-
+        // buffer set in the compile), so the contributions sum in it. These steps used to take the generic backward:
+        // on N-BEATS (30 blocks, hidden 512, batch 1024) that was 90 of the 240 matmul backwards, each renting fresh
+        // gradients and then copying or adding them into the plan buffers -- 36 MB allocated and 59 separate add
+        // passes per CPU step. A step whose dW is peeled into the batched-dW phase keeps the generic backward.
+        if (matMulOperandShared && !dWPeeled
+            && (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.OutputBuffer.IsContiguous)
+        {
+            var sharedOperandBackward = BuildSharedOperandMatMulBackward(step, gradMap, consumerCount, requiresGrad);
+            if (sharedOperandBackward is not null)
+                return sharedOperandBackward;
+        }
 
         // MatMul backward (double): dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc.
         // Mirrors the float branch with cblas_dgemm via TryGemmEx's double overload;
@@ -11050,6 +11360,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 && inputBShape.Length == 4 && inputBShape[0] == 1 && inputBShape[2] == 1 && inputBShape[3] == 1
                 && inputBShape[1] == outShape[1];
 
+            // The [rows, cols] + [rows, 1] bias (a column-major layer such as N-BEATS'): the bias gradient is the row
+            // sums of dY. The generic reduce below computes them with CpuEngine.ReduceSum2DRows into a rented tensor
+            // and then copies or adds that in; calling the same kernel into the gradient buffer (or into this plan-owned
+            // scratch when the bias is shared) gives the same values without the per-step allocation -- 180 of them,
+            // about 650 KB, on an N-BEATS step.
+            bool isPerRowReduce = outShape.Length == 2 && reduceAxesArr.Length == 1 && reduceAxesArr[0] == 1
+                && inputBShape.Length == 2 && inputBShape[0] == outShape[0] && inputBShape[1] == 1
+                && gradOut.IsContiguous && gradInputB.IsContiguous
+                && (typeof(T) == typeof(float) || typeof(T) == typeof(double));
+            object? rowSumSource = null, rowSumDestination = null, rowSumScratch = null;
+            if (isPerRowReduce)
+            {
+                if (typeof(T) == typeof(float))
+                {
+                    rowSumSource = TryGetLiveFloatBacking(gradOut);
+                    rowSumDestination = TryGetLiveFloatBacking(gradInputB);
+                    if (accumB) rowSumScratch = new float[outShape[0]];
+                }
+                else
+                {
+                    rowSumSource = TryGetLiveDoubleBacking(gradOut);
+                    rowSumDestination = TryGetLiveDoubleBacking(gradInputB);
+                    if (accumB) rowSumScratch = new double[outShape[0]];
+                }
+                isPerRowReduce = rowSumSource is not null && rowSumDestination is not null;
+            }
+
             return eng =>
             {
                 // gradInputA: identity copy (or in-place add) of gradOut.
@@ -11139,6 +11476,34 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             reducedGeneric = eng.Reshape(reducedGeneric, inputBShape);
                         if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reducedGeneric);
                         else reducedGeneric.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    }
+                }
+                else if (isPerRowReduce)
+                {
+                    int rowCount = outShape[0], colCount = outShape[1];
+                    if (rowSumSource is float[] sumSrc && rowSumDestination is float[] sumDst)
+                    {
+                        if (rowSumScratch is float[] sumScratch)
+                        {
+                            CpuEngine.ReduceSum2DRows(sumSrc, sumScratch, rowCount, colCount);
+                            for (int r = 0; r < rowCount; r++) sumDst[r] += sumScratch[r];
+                        }
+                        else
+                        {
+                            CpuEngine.ReduceSum2DRows(sumSrc, sumDst, rowCount, colCount);
+                        }
+                    }
+                    else if (rowSumSource is double[] sumSrcD && rowSumDestination is double[] sumDstD)
+                    {
+                        if (rowSumScratch is double[] sumScratchD)
+                        {
+                            CpuEngine.ReduceSum2DRows(sumSrcD, sumScratchD, rowCount, colCount);
+                            for (int r = 0; r < rowCount; r++) sumDstD[r] += sumScratchD[r];
+                        }
+                        else
+                        {
+                            CpuEngine.ReduceSum2DRows(sumSrcD, sumDstD, rowCount, colCount);
+                        }
                     }
                 }
                 else
