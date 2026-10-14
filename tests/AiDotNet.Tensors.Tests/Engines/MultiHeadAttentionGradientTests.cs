@@ -183,4 +183,66 @@ public class MultiHeadAttentionGradientTests
             Assert.True(Math.Abs(fused[i] - taped[i]) <= 1e-4f * (1f + Math.Abs(fused[i])),
                 $"output {i} ({maskKind}): fused {fused[i]} vs tape path {taped[i]}.");
     }
+
+    [Theory]
+    [MemberData(nameof(Masks))]
+    public void FusedFloatGradients_MatchTheDoubleDecomposedChain(string maskKind)
+    {
+        // Float takes the fused tape node; double records the decomposed chain. Same values in both, so the fused
+        // backward is checked against an independent derivation at far tighter tolerance than float finite differences.
+        var eng = new CpuEngine();
+        var rng = new Random(2436);
+        const int batch = 3, seq = 7, dModel = 12, heads = 3;
+        double[] Values(int n) { var a = new double[n]; for (int i = 0; i < n; i++) a[i] = (rng.NextDouble() * 2 - 1) * 0.6; return a; }
+        var shapes = new[] { new[] { batch, seq, dModel }, new[] { dModel, dModel }, new[] { dModel, dModel }, new[] { dModel, dModel }, new[] { dModel, dModel }, new[] { batch, seq, dModel } };
+        var values = new double[shapes.Length][];
+        for (int i = 0; i < shapes.Length; i++) { int n = 1; foreach (var s in shapes[i]) n *= s; values[i] = Values(n); }
+        Tensor<bool>? mask = null;
+        if (maskKind.StartsWith("causal", StringComparison.Ordinal))
+        {
+            mask = new Tensor<bool>(new[] { 1, 1, seq, seq });
+            for (int i = 0; i < seq; i++) for (int j = 0; j < seq; j++) mask[0, 0, i, j] = j <= i;
+        }
+        else if (maskKind.StartsWith("padding", StringComparison.Ordinal))
+        {
+            mask = new Tensor<bool>(new[] { batch, 1, 1, seq });
+            for (int b = 0; b < batch; b++) for (int j = 0; j < seq; j++) mask[b, 0, 0, j] = j < seq - b;
+        }
+
+        var f = new Tensor<float>[shapes.Length];
+        var d = new Tensor<double>[shapes.Length];
+        for (int i = 0; i < shapes.Length; i++)
+        {
+            f[i] = new Tensor<float>(shapes[i]); d[i] = new Tensor<double>(shapes[i]);
+            var fs = f[i].AsWritableSpan(); var ds = d[i].AsWritableSpan();
+            for (int j = 0; j < values[i].Length; j++) { fs[j] = (float)values[i][j]; ds[j] = values[i][j]; }
+        }
+
+        Dictionary<Tensor<float>, Tensor<float>> gf;
+        using (var tape = new GradientTape<float>())
+        {
+            int before = tape.EntryCount;
+            var y = eng.MultiHeadAttentionForward(f[0], f[1], f[2], f[3], f[4], heads, mask);
+            Assert.Equal(before + 1, tape.EntryCount);   // the fused node, not the decomposed chain
+            gf = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, f[5]), null), new[] { f[0], f[1], f[2], f[3], f[4] });
+        }
+        Dictionary<Tensor<double>, Tensor<double>> gd;
+        using (var tape = new GradientTape<double>())
+        {
+            int before = tape.EntryCount;
+            var y = eng.MultiHeadAttentionForward(d[0], d[1], d[2], d[3], d[4], heads, mask);
+            Assert.True(tape.EntryCount > before + 1);    // the decomposed chain: an independent derivation
+            gd = tape.ComputeGradients(eng.ReduceSum(eng.TensorMultiply(y, d[5]), null), new[] { d[0], d[1], d[2], d[3], d[4] });
+        }
+
+        string[] names = { "input", "qWeight", "kWeight", "vWeight", "outWeight" };
+        for (int i = 0; i < 5; i++)
+        {
+            var a = gf[f[i]].AsSpan(); var r = gd[d[i]].AsSpan();
+            double scaleRef = 0; for (int j = 0; j < r.Length; j++) scaleRef = Math.Max(scaleRef, Math.Abs(r[j]));
+            for (int j = 0; j < r.Length; j++)
+                Assert.True(Math.Abs(a[j] - r[j]) <= 1e-4 * (1 + scaleRef),
+                    $"{names[i]}[{j}] ({maskKind}): fused float {a[j]} vs double chain {r[j]}.");
+        }
+    }
 }
