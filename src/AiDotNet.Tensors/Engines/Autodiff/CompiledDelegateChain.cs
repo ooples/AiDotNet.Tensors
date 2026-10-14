@@ -189,9 +189,11 @@ internal sealed class CompiledDelegateChain<T>
         }
         else if (loss.Length == 1)
         {
-            // Tiny: just allocate. Caching a 1-element tensor doesn't pay.
+            // Tiny: just allocate. Caching a 1-element tensor doesn't pay. The seed has the loss's own shape, as the
+            // tape's backward seeds it: a [1] seed for a rank-0 loss reached ops whose inputs are rank 0 as [1]
+            // gradients, which could not be accumulated with the [] gradients other paths produced.
             var numOps = Helpers.MathHelper.GetNumericOperations<T>();
-            seedGrad = new Tensor<T>(new[] { numOps.One }, new[] { 1 });
+            seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
         }
         else if (useScratch)
         {
