@@ -144,6 +144,17 @@ jobs:
           ./coverage/gpu-diagnostics.txt
         if-no-files-found: ignore
 
+    - name: Test ONNX importer (net10.0)
+      # Correctness against ONNX Runtime. No workflow ran this project before, so an importer that returned zeros for
+      # MatMul/Gemm passed CI for a month (#1235). The wall-clock comparisons with ORT (PerformanceComparison,
+      # LatencyBenchmark) stay out of the gate; AIDOTNET_REQUIRE_ORT makes an ORT load failure an error, not a skip.
+      env:
+        AIDOTNET_REQUIRE_ORT: '1'
+      run: |
+        dotnet restore tests/AiDotNet.Tensors.Onnx.Tests/AiDotNet.Tensors.Onnx.Tests.csproj
+        dotnet test tests/AiDotNet.Tensors.Onnx.Tests/AiDotNet.Tensors.Onnx.Tests.csproj --configuration Release --no-restore --framework net10.0 --verbosity normal \
+          --filter "FullyQualifiedName!~PerformanceComparison&FullyQualifiedName!~LatencyBenchmark"
+
     - name: Test enterprise license validator
       run: dotnet test build/LicenseValidator.Tests/AiDotNet.Tensors.LicenseValidator.Tests.csproj --configuration Release --verbosity normal
 

@@ -840,7 +840,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
         using var bindGroup = new WebGpuBindGroup(pipelineId, inputBuffer, outputBuffer);
 
-        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, batchSize, 1, 1);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, RowGridX(batchSize), RowGridY(batchSize), 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
@@ -868,7 +868,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
         using var bindGroup = new WebGpuBindGroup(pipelineId, inputBuffer, gammaBuffer, betaBuffer, outputBuffer);
 
-        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, batchSize, 1, 1);
+        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, RowGridX(batchSize), RowGridY(batchSize), 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
     }
 
@@ -908,7 +908,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer);
-        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize, WebGpuShaderModule.WorkgroupSizeX(moduleName, source, kernelName));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -923,7 +923,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer);
-        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize, WebGpuShaderModule.WorkgroupSizeX(moduleName, source, kernelName));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -939,7 +939,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
-        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize, WebGpuShaderModule.WorkgroupSizeX(moduleName, source, kernelName));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -956,7 +956,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer);
-        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize, WebGpuShaderModule.WorkgroupSizeX(moduleName, source, kernelName));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -975,7 +975,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer, eBuffer);
-        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize, WebGpuShaderModule.WorkgroupSizeX(moduleName, source, kernelName));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -995,7 +995,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer, dBuffer, eBuffer, fBuffer);
-        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize, WebGpuShaderModule.WorkgroupSizeX(moduleName, source, kernelName));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -1010,7 +1010,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var pipelineId = await GetOrCreatePipelineAsync(moduleName, source, kernelName);
         using var uniformBuffer = new WebGpuBuffer(uniformParams, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, wbufs);
-        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize);
+        var (workgroups, _) = _device.CalculateWorkgroups1D(workSize, WebGpuShaderModule.WorkgroupSizeX(moduleName, source, kernelName));
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, workgroups, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -1182,7 +1182,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
     private async Task<int> GetOrCreatePipelineAsync(string moduleName, string source, string entryPoint)
     {
-        var key = $"{moduleName}::{entryPoint}";
+        // Keyed on the source as well as the names: see WebGpuShaderModule.GetOrCreateModule.
+        var key = $"{WebGpuShaderModule.SourceKey(moduleName, source)}::{entryPoint}";
         if (_pipelineCache.TryGetValue(key, out var pipelineId))
         {
             return pipelineId;
@@ -1223,6 +1224,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         _disposed = true;
         _sharedDummyBuffer?.Dispose();
         _sharedDummyBuffer = null;
+        DisposeTunedKernelResources();
 
         // Dispose cached complex scratch buffers
         if (_complexScratch is not null)

@@ -64,12 +64,12 @@ internal sealed class PersistentParallelExecutor
     // GEMM arrays a thread-local body closes over) are released for GC between dispatches.
     private volatile Job? _job;
 
-    // Plain-mode set claims, one per participant on its own cache line (stride 8 longs = 64 bytes), each holding the Id
-    // of the last dispatch that claimed that participant's set. Ids only increase, so "older than this dispatch" means
-    // unclaimed: nobody re-initialises the slots before a dispatch (writing every participant's line on the calling
-    // thread cost the shortest ops ~0.6 us), a claim is one compare-exchange from an older Id to this one, and a worker
-    // that wakes late holding a finished dispatch can never claim for a later one (its Id is smaller). Reused across
-    // dispatches: no allocation per op.
+    // Plain-mode chunk cursors, one per participant on its own cache line (stride 8 longs = 64 bytes). Each holds
+    // (dispatch Id << 32) | next index into that participant's strided set. Ids only increase, so a cursor stamped
+    // with an older Id reads as index 0 of this dispatch: nobody re-initialises the cursors before a dispatch (writing
+    // every participant's line on the calling thread cost the shortest ops ~0.6 us), a claim is one compare-exchange,
+    // and a worker that wakes late holding a finished dispatch can never claim for a later one (its Id is smaller).
+    // Reused across dispatches: no allocation per op.
     private const int CursorStride = 8;
 
     /// <summary>Tests only: runs on a worker after it wakes for a plain dispatch and before it claims its set, to stand
@@ -392,12 +392,12 @@ internal sealed class PersistentParallelExecutor
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
     /// <summary>
-    /// Plain mode: takes <paramref name="owner"/>'s whole strided set (owner, owner+stride, ...) with ONE compare-exchange
-    /// on its cursor, runs it, then subtracts the chunks from the pending total once. Every participant runs exactly its
-    /// own set, as with fixed assignment, so a repeated op keeps each chunk on the same core and its data in that core's
-    /// cache (1M-element elementwise ops run from L2; scattering chunks across cores made them ~10x slower). The caller
-    /// steals the same way: a set whose owner never started is taken whole; one already taken is left to its owner.
-    /// One atomic per participant, not per chunk: per-chunk claims cost the shortest ops (12 us) ~1 us per dispatch.
+    /// Plain mode: runs <paramref name="owner"/>'s strided set (owner, owner+stride, ...), claiming each chunk on that
+    /// owner's cursor, then subtracts the chunks it ran from the pending total once. Every participant runs its own set,
+    /// as with fixed assignment, so a repeated op keeps each chunk on the same core and its data in that core's cache
+    /// (1M-element elementwise ops run from L2; claiming from one shared counter scattered chunks across cores and made
+    /// them ~10x slower). The caller steals through the same cursors, so even a worker stalled part-way through its set
+    /// gives up the chunks it has not started.
     /// </summary>
     [MethodImpl(Hot)]
     private Exception? RunSet(Job job, int owner, bool publish)
@@ -405,22 +405,23 @@ internal sealed class PersistentParallelExecutor
         Exception? first = null;
         var action = job.Action!;
         int numChunks = job.NumChunks, stride = job.Stride;
-        long id = job.Id;
+        uint id = (uint)job.Id;
         long[] cursors = _cursors;
         int count = owner < stride ? (numChunks - owner + stride - 1) / stride : 0;
-        if (count == 0 || !TryClaimSet(cursors, owner, id))
-            return null;
-        for (int c = owner; c < numChunks; c += stride)
+        int done = 0;
+        while (TryClaim(cursors, owner, id, count, out int i))
         {
-            try { action(c); }
+            try { action(owner + i * stride); }
             catch (Exception ex)
             {
                 first ??= ex;
                 if (publish)
                     Interlocked.CompareExchange(ref _workerException, ex, null);
             }
+            done++;
         }
-        if (Interlocked.Add(ref job.Pending, -count) == 0)
+        // One update of the shared count per participant, not per chunk.
+        if (done > 0 && Interlocked.Add(ref job.Pending, -done) == 0)
             _allDone.Set();
         return first;
     }
@@ -474,11 +475,31 @@ internal sealed class PersistentParallelExecutor
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool TryClaimSet(long[] cursors, int owner, long id)
+    private static bool TryClaim(long[] cursors, int owner, uint id, int count, out int index)
     {
         ref long slot = ref cursors[owner * CursorStride];
-        long seen = Volatile.Read(ref slot);
-        return seen < id && Interlocked.CompareExchange(ref slot, id, seen) == seen;
+        while (true)
+        {
+            long cur = Volatile.Read(ref slot);
+            uint curId = (uint)((ulong)cur >> 32);
+            if (curId > id)
+            {
+                index = 0;
+                return false; // a later dispatch owns this cursor: this caller is a late worker
+            }
+            int idx = curId == id ? (int)(uint)cur : 0;
+            if (idx >= count)
+            {
+                index = 0;
+                return false;
+            }
+            long next = (long)(((ulong)id << 32) | (uint)(idx + 1));
+            if (Interlocked.CompareExchange(ref slot, next, cur) == cur)
+            {
+                index = idx;
+                return true;
+            }
+        }
     }
 
     [MethodImpl(Hot)]

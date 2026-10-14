@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // IDirectGpuBackend implementation part 4: Optimizers, Sparse, FFT, RNN, Hyperbolic, Octonion, Quantum.
 
 using System;
@@ -1386,6 +1386,10 @@ public sealed unsafe partial class VulkanBackend
         long totalL = (long)totalSegBatch * numBins;
         if (totalL <= 0 || totalL > int.MaxValue) return;
         int total = (int)totalL;
+        // The shader computes the bin edges exactly in 32-bit integers (no int64 in the shading language); its products
+        // stay below 2^32 only while numBins * usable < 2^31 and numBins <= 46340. Larger shapes run on the CPU.
+        if ((long)numBins * usable >= int.MaxValue || numBins > 46340)
+            throw new GpuCapabilityUnavailableException("WidebandLogBinPool: numBins * usable exceeds the shader's exact 32-bit bin-edge range.");
         GlslUnaryOp(VulkanGlslSpectralPerfKernels.WidebandLogBinPool, magBuf, output, total,
             new uint[] { (uint)totalSegBatch, (uint)fftSize, (uint)numBins, (uint)usable }, 4 * sizeof(uint));
     }

@@ -2,6 +2,7 @@
 // Metal GPU backend - Normalization, Dropout, and Embedding operations.
 
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
@@ -50,9 +51,10 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (batchSize <= 0 || normalizedSize <= 0) return;
-        DispatchResidentMetal("layer_norm_forward_serial_rows", batchSize,
-            new[] { input, output, gamma, beta, saveMean, saveInvVar },
-            (uint)batchSize, (uint)normalizedSize, unchecked((uint)SingleToInt32BitsCompat(epsilon)));
+        // Registry dispatch (#1116): the established kernel or a generated row variant, chosen per shape class.
+        var args = new TunedLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar, batchSize, normalizedSize, epsilon);
+        if (LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), args)) return;
+        LayerNormReference(args);
     }
 
     /// <summary>
@@ -64,9 +66,22 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (batchSize <= 0 || normalizedSize <= 0) return;
-        DispatchResidentMetal("layer_norm_backward_serial", 1,
-            new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta },
-            (uint)batchSize, (uint)normalizedSize);
+        if (!TunedRowKernelsAvailable)
+        {
+            // Without the tuned-row library there is no split reference: the established single-thread kernel.
+            DispatchResidentMetal("layer_norm_backward_serial", 1,
+                new[] { gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta },
+                (uint)batchSize, (uint)normalizedSize);
+            return;
+        }
+        // Registry dispatch (#1116): the input gradient is a row reduction, the affine gradients a column reduction.
+        var shape = RowShape(batchSize, normalizedSize);
+        var inputGradArgs = new TunedNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, null,
+            batchSize, normalizedSize);
+        if (!LayerNormBackwardSlot.TryExecute(shape, inputGradArgs)) LayerNormBackwardInputReference(inputGradArgs);
+        var paramArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar, gradGamma, gradBeta,
+            batchSize, normalizedSize);
+        if (!LayerNormGradParametersSlot.TryExecute(shape, paramArgs)) ColumnGradReference(rms: false, paramArgs);
     }
 
     /// <summary>
@@ -133,9 +148,18 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (batchSize <= 0 || normalizedSize <= 0) return;
-        DispatchResidentMetal("rms_norm_backward_serial", 1,
-            new[] { gradOutput, input, gamma, saveRms, gradInput, gradGamma },
-            (uint)batchSize, (uint)normalizedSize);
+        if (!TunedRowKernelsAvailable)
+        {
+            // Without the tuned-row library there is no split reference: the established single-thread kernel.
+            DispatchResidentMetal("rms_norm_backward_serial", 1,
+                new[] { gradOutput, input, gamma, saveRms, gradInput, gradGamma },
+                (uint)batchSize, (uint)normalizedSize);
+            return;
+        }
+        RmsNormBackwardInputReference(gradOutput, input, gamma, saveRms, gradInput, batchSize, normalizedSize);
+        // The gamma gradient is a column reduction served by the registry (#1116).
+        var gammaArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null, batchSize, normalizedSize);
+        if (!RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)) ColumnGradReference(rms: true, gammaArgs);
     }
 
     #endregion

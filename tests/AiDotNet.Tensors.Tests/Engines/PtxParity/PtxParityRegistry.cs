@@ -630,6 +630,11 @@ public static class PtxParityRegistry
         new PtxParitySpec("PtxGemmKernel", PtxParityStatus.Deferred,
             "Gemm, GemmAsync, and MatMul (#836)",
             "driver and backend oracle coverage exists; strongest-cuBLASLt/PyTorch three-way evidence is pending."),
+        new PtxParitySpec("PtxSgemmKernel", PtxParityStatus.Deferred,
+            "generated FP32 GEMM for Gemm / batched GEMM (#1262, phase B of #377)",
+            "not dispatched by any backend route yet (#1265 makes it the CUDA GEMM default). Until then it is driver-" +
+            "tested by DirectPtxSgemmGeneratorTests against an fp64 CPU oracle over configurations, layouts, edge " +
+            "shapes, alpha/beta and batches; the three-way spec lands with the route."),
         new PtxParitySpec("PtxMatMulTransposedKernel", PtxParityStatus.Deferred,
             "MatMulTransposed (#836)",
             "NOT CONSTRUCTED anywhere (src, tests or benchmarks): only its emitted PTX text is count-asserted, and the " +

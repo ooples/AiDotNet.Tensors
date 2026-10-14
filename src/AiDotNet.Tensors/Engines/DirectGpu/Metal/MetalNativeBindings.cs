@@ -147,6 +147,13 @@ public static class MetalNativeBindings
     public static extern ulong SendMessageULongReturn(IntPtr receiver, IntPtr selector);
 
     /// <summary>
+    /// Sends a message that returns a double (for example a command buffer's CFTimeInterval GPU timestamps). arm64
+    /// and x86_64 both return a double in a floating-point register through plain objc_msgSend.
+    /// </summary>
+    [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
+    public static extern double SendMessageDoubleReturn(IntPtr receiver, IntPtr selector);
+
+    /// <summary>
     /// Sends a message that returns a bool.
     /// </summary>
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
@@ -435,6 +442,8 @@ public static class MetalNativeBindings
         public static readonly IntPtr Enqueue = RegisterSelector("enqueue");
         public static readonly IntPtr PresentDrawable = RegisterSelector("presentDrawable:");
         public static readonly IntPtr AddCompletedHandler = RegisterSelector("addCompletedHandler:");
+        public static readonly IntPtr GpuStartTime = RegisterSelector("GPUStartTime");
+        public static readonly IntPtr GpuEndTime = RegisterSelector("GPUEndTime");
 
         // Compute encoder selectors
         public static readonly IntPtr SetComputePipelineState = RegisterSelector("setComputePipelineState:");

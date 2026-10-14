@@ -58,7 +58,7 @@ public sealed class OpenClDevicePrimitives : IDevicePrimitives
 /// the device-tensor pipeline lands.</summary>
 public sealed class OpenClRng : IDeviceRng
 {
-    private readonly CpuPhiloxGenerator _cpu;
+    private readonly IDeviceRng _cpu;
     /// <inheritdoc/>
     public DeviceRngAlgorithm Algorithm { get; }
     /// <inheritdoc/>
@@ -72,12 +72,10 @@ public sealed class OpenClRng : IDeviceRng
     /// <summary>Constructs an OpenCL-backed RNG. Currently only
     /// <see cref="DeviceRngAlgorithm.Philox"/> is supported.</summary>
     public OpenClRng(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
-        if (algo != DeviceRngAlgorithm.Philox)
-            throw new System.NotSupportedException($"OpenClRng currently implements only {DeviceRngAlgorithm.Philox}; requested {algo}.");
         Algorithm = algo;
-        _cpu = new CpuPhiloxGenerator(seed, subsequence, offset);
+        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
     /// <inheritdoc/>
     public void Uniform(Tensor<float> output) => _cpu.Uniform(output);

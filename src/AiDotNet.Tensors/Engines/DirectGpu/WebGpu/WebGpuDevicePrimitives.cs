@@ -113,7 +113,7 @@ public sealed class WebGpuDevicePrimitives : IDevicePrimitives
 /// <summary>WebGPU-backed <see cref="IDeviceRng"/>.</summary>
 public sealed class WebGpuRng : IDeviceRng
 {
-    private readonly CpuPhiloxGenerator _cpu;
+    private readonly IDeviceRng _cpu;
     /// <inheritdoc/>
     public DeviceRngAlgorithm Algorithm { get; }
     /// <inheritdoc/>
@@ -126,12 +126,10 @@ public sealed class WebGpuRng : IDeviceRng
     public static bool IsAvailable => WebGpuLoaderProbe.IsAvailable;
     /// <summary>Constructs a WebGPU-backed RNG.</summary>
     public WebGpuRng(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
-        if (algo != DeviceRngAlgorithm.Philox)
-            throw new System.NotSupportedException($"WebGpuRng currently implements only {DeviceRngAlgorithm.Philox}; requested {algo}.");
         Algorithm = algo;
-        _cpu = new CpuPhiloxGenerator(seed, subsequence, offset);
+        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
     /// <inheritdoc/>
     public void Uniform(Tensor<float> output) => _cpu.Uniform(output);

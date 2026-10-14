@@ -58,6 +58,43 @@ public sealed class KernelTuningExperimentTests
     }
 
     [Fact]
+    public async Task PreparationFailure_RecordsCompilationFailedWithTheBackendsMessage()
+    {
+        var backend = new RecordingBackend();
+        var timer = new ConfigurationTimer(backend);
+        var experiment = new KernelTuningExperiment<Configuration>(
+            backend,
+            timer,
+            Configuration.Incumbent,
+            new KernelTuningWorkload(1, KernelTuningWorkUnit.Operations),
+            warmupCount: 0,
+            searchSampleCount: 3,
+            holdoutSampleCount: 7);
+
+        KernelTuningTrialResult result = await experiment.EvaluateAsync(
+            Configuration.Uncompilable,
+            new EvolutionEvaluationContext(0, 1, 2, 1));
+
+        Assert.Equal(KernelTuningTrialStatus.CompilationFailed, result.Status);
+        Assert.Contains("The driver rejected the kernel.", result.Diagnostic);
+        Assert.Equal(0, timer.MeasurementCount);
+    }
+
+    [Fact]
+    public void ValidationException_AcceptsRejectionStatusesOnly()
+    {
+        foreach (var status in new[]
+                 {
+                     KernelTuningTrialStatus.OutputMismatch, KernelTuningTrialStatus.GradientMismatch,
+                     KernelTuningTrialStatus.CompilationFailed, KernelTuningTrialStatus.ResourceLimitExceeded,
+                     KernelTuningTrialStatus.BenchmarkFailed,
+                 })
+            Assert.Equal(status, new KernelTuningValidationException(status, "x").Status);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new KernelTuningValidationException(KernelTuningTrialStatus.Passed, "x"));
+    }
+
+    [Fact]
     public async Task SearchValidationFailure_PreservesTypedMismatchStatusAndSkipsTiming()
     {
         var backend = new RecordingBackend();
@@ -222,6 +259,7 @@ public sealed class KernelTuningExperimentTests
         Incumbent,
         Candidate,
         Bad,
+        Uncompilable,
     }
 
     private enum BackendEventKind
@@ -257,6 +295,8 @@ public sealed class KernelTuningExperimentTests
             CancellationToken cancellationToken = default)
         {
             _events.Add(new BackendEvent(BackendEventKind.Prepare, configuration));
+            if (configuration == Configuration.Uncompilable)
+                throw new KernelTuningValidationException(KernelTuningTrialStatus.CompilationFailed, "The driver rejected the kernel.");
             return default;
         }
 

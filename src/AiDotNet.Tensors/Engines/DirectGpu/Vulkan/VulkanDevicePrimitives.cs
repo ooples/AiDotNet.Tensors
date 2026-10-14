@@ -104,7 +104,7 @@ public sealed class VulkanDevicePrimitives : IDevicePrimitives
 /// <summary>Vulkan-backed <see cref="IDeviceRng"/>.</summary>
 public sealed class VulkanRng : IDeviceRng
 {
-    private readonly CpuPhiloxGenerator _cpu;
+    private readonly IDeviceRng _cpu;
     /// <inheritdoc/>
     public DeviceRngAlgorithm Algorithm { get; }
     /// <inheritdoc/>
@@ -117,12 +117,10 @@ public sealed class VulkanRng : IDeviceRng
     public static bool IsAvailable => VulkanLoaderProbe.IsAvailable;
     /// <summary>Constructs a Vulkan-backed RNG.</summary>
     public VulkanRng(ulong seed, DeviceRngAlgorithm algo = DeviceRngAlgorithm.Philox,
-        ulong subsequence = 0, ulong offset = 0)
+        ulong subsequence = 0, ulong offset = 0, int dimensions = 1)
     {
-        if (algo != DeviceRngAlgorithm.Philox)
-            throw new System.NotSupportedException($"VulkanRng currently implements only {DeviceRngAlgorithm.Philox}; requested {algo}.");
         Algorithm = algo;
-        _cpu = new CpuPhiloxGenerator(seed, subsequence, offset);
+        _cpu = CpuDeviceRng.Create(algo, seed, subsequence, offset, dimensions);
     }
     /// <inheritdoc/>
     public void Uniform(Tensor<float> output) => _cpu.Uniform(output);

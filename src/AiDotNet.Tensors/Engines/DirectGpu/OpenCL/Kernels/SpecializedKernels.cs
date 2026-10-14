@@ -117,9 +117,10 @@ __kernel void poincare_exp_map(
         return;
     }
 
-    float conformalFactor = 1.0f - c * xNormSq;
-    float lambda = conformalFactor / 2.0f;
-    float arg = sqrtC * vNorm * lambda;
+    // Conformal factor lambda_x = 2 / (1 - c ||x||^2), exp_x(v) = x (+)_c tanh(sqrt(c) lambda_x ||v|| / 2) v / (sqrt(c) ||v||)
+    // (Ganea et al. 2018). This used (1 - c ||x||^2) / 2, the reciprocal, which is right only at the origin.
+    float lambda = 2.0f / fmax(1.0f - c * xNormSq, 1e-10f);
+    float arg = sqrtC * vNorm * lambda / 2.0f;
     float scale = tanh(arg) / (sqrtC * vNorm);
 
     // Compute scaled tangent and Mobius addition inline
@@ -135,9 +136,20 @@ __kernel void poincare_exp_map(
     float denom = 1.0f + 2.0f * c * xsvDot + c * c * xNormSq * svNormSq;
     if (fabs(denom) < 1e-10f) denom = 1e-10f;
 
+    // Then project back inside the ball, as the CPU engine's ProjectToBall does: near the boundary tanh saturates and the
+    // float Mobius numerator and denominator can cancel, which could otherwise leave the result on or past the boundary.
+    float outNormSq = 0.0f;
     for (int i = 0; i < dim; i++) {
         float sv = vp[i] * scale;
-        out[i] = (num_coef_x * xp[i] + num_coef_sv * sv) / denom;
+        float r = (num_coef_x * xp[i] + num_coef_sv * sv) / denom;
+        out[i] = r;
+        outNormSq += r * r;
+    }
+    float maxNorm = (1.0f - 1e-5f) / sqrtC;
+    float outNorm = sqrt(outNormSq);
+    if (outNorm > maxNorm) {
+        float shrink = maxNorm / outNorm;
+        for (int i = 0; i < dim; i++) out[i] *= shrink;
     }
 }
 

@@ -36,8 +36,9 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
     {
         try
         {
-            _backend = new WebGpuBackend();
-            _ready = _backend.IsAvailable && _backend.SupportsHgemm;
+            // The real backend, executing on Dawn (DawnHostedWebGpu); null when Dawn is not set up.
+            _backend = DawnHostedWebGpu.BackendOrNull()!;
+            _ready = _backend is not null && _backend.SupportsHgemm;
         }
         catch (Exception ex)
         {
@@ -46,7 +47,7 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
         }
     }
 
-    public void Dispose() => _backend?.Dispose();
+    public void Dispose() { }   // the hosted backend is shared by the test process
 
     private bool EnsureReady()
     {

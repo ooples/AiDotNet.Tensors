@@ -1,6 +1,8 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // Metal GPU backend - Convolution and Pooling operations.
 
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
+
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
@@ -48,17 +50,11 @@ public sealed partial class MetalBackend
         int dilationH, int dilationW)
     {
         ThrowIfDisposed();
-        try
-        {
-            if (TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_direct",
-                batch * outChannels * outHeight * outWidth, new[] { input, kernel, output },
-                new[] { batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW }))
-                return;
-        }
-        catch
-        {
-            throw;
-        }
+        // Registry dispatch (#1116): the established direct kernel or im2col + GEMM, chosen per shape class.
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)) return;
+        Conv2DDirect(args);
     }
 
     /// <summary>

@@ -792,7 +792,8 @@ fn gemm(@builtin(global_invocation_id) gid: vec3<u32>,
     // Write result
     if (row < params.M && col < params.N) {
         let idx = row * params.N + col;
-        C[idx] = params.alpha * acc + params.beta * C[idx];
+        // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+        C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
     }
 }
 
@@ -814,7 +815,9 @@ fn gemm_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
         acc = acc + A[row * params.K + k] * B[k * params.N + col];
     }
 
-    C[idx] = params.alpha * acc + params.beta * C[idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+
+    C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
 }
 
 // C[M,N] = A[M,K] · Bᵀ where B is stored row-major as [N, K].
@@ -833,7 +836,8 @@ fn gemm_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < params.K; k = k + 1u) {
         acc = acc + A[row * params.K + k] * B[col * params.K + k];
     }
-    C[idx] = params.alpha * acc + params.beta * C[idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+    C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
 }
 
 // C[M,N] = Aᵀ · B, where A is stored row-major as [K, M] and B as [K, N],
@@ -854,7 +858,8 @@ fn gemm_lhs_transposed_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < params.K; k = k + 1u) {
         acc = acc + A[k * params.M + row] * B[k * params.N + col];
     }
-    C[idx] = params.alpha * acc + params.beta * C[idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+    C[idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[idx], params.beta != 0.0);
 }
 ";
 
@@ -879,7 +884,9 @@ var<workgroup> local_data: array<f32, 256>;
 fn softmax(@builtin(global_invocation_id) gid: vec3<u32>,
            @builtin(local_invocation_id) lid: vec3<u32>,
            @builtin(workgroup_id) wid: vec3<u32>) {
-    let batch_idx = wid.x;
+    // One workgroup per row, folded over a 2-D grid: one dimension holds at most 65535 workgroups.
+    let batch_idx = wid.x + wid.y * 65535u;
+    if (batch_idx >= params.batch_size) { return; }
     let local_idx = lid.x;
     let base = batch_idx * params.class_count;
 
@@ -955,7 +962,9 @@ var<workgroup> local_data: array<f32, 256>;
 fn layer_norm(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(local_invocation_id) lid: vec3<u32>,
               @builtin(workgroup_id) wid: vec3<u32>) {
-    let batch_idx = wid.x;
+    // One workgroup per row, folded over a 2-D grid: one dimension holds at most 65535 workgroups.
+    let batch_idx = wid.x + wid.y * 65535u;
+    if (batch_idx >= params.batch_size) { return; }
     let local_idx = lid.x;
     let base = batch_idx * params.feature_size;
 
@@ -2746,7 +2755,9 @@ var<workgroup> local_data: array<f32, 256>;
 fn softmax_backward(@builtin(global_invocation_id) gid: vec3<u32>,
                     @builtin(local_invocation_id) lid: vec3<u32>,
                     @builtin(workgroup_id) wid: vec3<u32>) {
-    let batch_idx = wid.x;
+    // One workgroup per row, folded over a 2-D grid: one dimension holds at most 65535 workgroups.
+    let batch_idx = wid.x + wid.y * 65535u;
+    if (batch_idx >= params.batch_size) { return; }
     let local_idx = lid.x;
     let base = batch_idx * params.features;
 
@@ -5527,7 +5538,8 @@ fn batched_gemm(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < params.K; k = k + 1u) {
         acc = acc + A[a_off + row * params.K + k] * B[b_off + k * params.N + col];
     }
-    C[c_off + local_idx] = params.alpha * acc + params.beta * C[c_off + local_idx];
+    // beta = 0 must not read C (BLAS semantics): 0 * NaN or 0 * Inf from an uninitialized or reused buffer is NaN.
+    C[c_off + local_idx] = select(params.alpha * acc, params.alpha * acc + params.beta * C[c_off + local_idx], params.beta != 0.0);
 }
 
 @compute @workgroup_size(256)
@@ -9277,6 +9289,98 @@ fn grid_sample_ext(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// binding(0)=grad_output, binding(1)=input, binding(2)=gamma, binding(3)=grad_input,
     /// binding(4)=grad_gamma, binding(5)=grad_beta
     /// </summary>
+    // The two passes of LayerNormBackwardFullSource as separate modules (#1117). WebGPU builds a pipeline's layout from
+    // the bindings its entry point uses, so binding all six buffers of the shared module to either entry point was
+    // rejected ("binding index 4 not present in the bind group layout"): each pass now binds exactly what it reads and
+    // writes. Both recompute the row statistics from the input and epsilon.
+    public const string LayerNormBackwardDataSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> input_data: array<f32>;
+@group(0) @binding(2) var<storage, read> gamma: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_input: array<f32>;
+
+struct LNParams {
+    batch_size: u32,
+    feature_size: u32,
+    epsilon: f32,
+    _pad: f32,
+}
+@group(0) @binding(4) var<uniform> params: LNParams;
+
+@compute @workgroup_size(256)
+fn layer_norm_backward_data(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.feature_size;
+    if (idx >= total) { return; }
+    let f = idx % params.feature_size;
+    let base = (idx / params.feature_size) * params.feature_size;
+    let N = f32(params.feature_size);
+    var mean: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+        mean = mean + input_data[base + i];
+    }
+    mean = mean / N;
+    var variance: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+        let d = input_data[base + i] - mean;
+        variance = variance + d * d;
+    }
+    variance = variance / N;
+    let inv_std = 1.0 / sqrt(variance + params.epsilon);
+    var sum_dg: f32 = 0.0;
+    var sum_dg_xhat: f32 = 0.0;
+    for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+        let dg = gamma[i] * grad_output[base + i];
+        sum_dg = sum_dg + dg;
+        sum_dg_xhat = sum_dg_xhat + dg * (input_data[base + i] - mean) * inv_std;
+    }
+    let x_hat = (input_data[idx] - mean) * inv_std;
+    grad_input[idx] = inv_std * (gamma[f] * grad_output[idx] - (sum_dg + x_hat * sum_dg_xhat) / N);
+}
+";
+
+    public const string LayerNormBackwardStatsSource = @"
+@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(1) var<storage, read> input_data: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_gamma: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_beta: array<f32>;
+
+struct LNParams {
+    batch_size: u32,
+    feature_size: u32,
+    epsilon: f32,
+    _pad: f32,
+}
+@group(0) @binding(4) var<uniform> params: LNParams;
+
+@compute @workgroup_size(256)
+fn layer_norm_backward_stats(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let f = gid.x;
+    if (f >= params.feature_size) { return; }
+    var sum_grad_beta: f32 = 0.0;
+    var sum_grad_gamma: f32 = 0.0;
+    for (var n: u32 = 0u; n < params.batch_size; n = n + 1u) {
+        let base = n * params.feature_size;
+        var mean: f32 = 0.0;
+        for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+            mean = mean + input_data[base + i];
+        }
+        mean = mean / f32(params.feature_size);
+        var variance: f32 = 0.0;
+        for (var i: u32 = 0u; i < params.feature_size; i = i + 1u) {
+            let d = input_data[base + i] - mean;
+            variance = variance + d * d;
+        }
+        variance = variance / f32(params.feature_size);
+        let inv_std = 1.0 / sqrt(variance + params.epsilon);
+        let x_hat = (input_data[base + f] - mean) * inv_std;
+        sum_grad_beta = sum_grad_beta + grad_output[base + f];
+        sum_grad_gamma = sum_grad_gamma + grad_output[base + f] * x_hat;
+    }
+    grad_beta[f] = sum_grad_beta;
+    grad_gamma[f] = sum_grad_gamma;
+}
+";
     public const string LayerNormBackwardFullSource = @"
 @group(0) @binding(0) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(1) var<storage, read> input_data: array<f32>;

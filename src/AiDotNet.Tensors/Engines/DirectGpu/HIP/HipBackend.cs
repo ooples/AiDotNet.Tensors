@@ -47,6 +47,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _scalarGemmF32;
     private IntPtr _rdnaGemmWave32;
     private readonly Dictionary<string, IntPtr> _kernelCache;
+
+    /// <summary>Whether a compiled module registered this kernel name (KernelLookupIntegrityTests).</summary>
+    internal bool HasCompiledKernel(string name) => _kernelCache.ContainsKey(name);
     private readonly List<HipKernelCompilationException> _kernelCompilationFailures = new();
     private AmdGpuArchitecture _architecture;
     private string _architectureTarget = string.Empty;
@@ -78,6 +81,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
+    private IntPtr _missingLookupModule;
+    private IntPtr _octonionModule;
     private IntPtr _sparseModule;
     private IntPtr _locallyConnectedModule;
     private IntPtr _deformableConvModule;
@@ -644,6 +649,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(Kernels.HipSpectralPerfKernels.GetSource(), "spectral_perf", ref _spectralPerfModule,
                 Kernels.HipSpectralPerfKernels.GetKernelNames());
 
+            // Kernels HipBackend looked up that no compiled HIP module provided, so each op threw
+            // GpuCapabilityUnavailableException and ran on the CPU. Only the names missing here are loaded:
+            // squash / squash_backward and octonion_linear_forward already come from other modules.
+            CompileKernelModule(CUDA.Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup", ref _missingLookupModule,
+                new[] { "copy_2d_strided", "var_axis", "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev" });
+            CompileKernelModule(Kernels.HipOctonionKernels.GetSource(), "octonion", ref _octonionModule,
+                Kernels.HipOctonionKernels.GetKernelNames().Where(name => name != "octonion_linear_forward").ToArray());
+            CompileKernelModule(Kernels.HipDotProductKernels.GetSource(), "dot_product", ref _dotProductModule,
+                Kernels.HipDotProductKernels.GetKernelNames());
+
             // Compile Sparse kernels (CSR SpMM, GNN message passing)
             CompileKernelModule(HipSparseKernels.GetSource(), "sparse", ref _sparseModule,
                 HipSparseKernels.GetKernelNames());
@@ -762,6 +777,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(Kernels.HipShapeKernels.GetSource(), "shape", ref _shapeModule, Kernels.HipShapeKernels.GetKernelNames());
             CompileKernelModule(Kernels.HipLossForwardKernels.GetSource(), "loss_forward", ref _lossModule, Kernels.HipLossForwardKernels.GetKernelNames());
             CompileKernelModule(Kernels.HipSoftmaxVariantKernels.GetSource(), "softmax_variant", ref _softmaxVarModule, Kernels.HipSoftmaxVariantKernels.GetKernelNames());
+            CompileTunedRowKernels();
 
             // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
             CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());
@@ -3319,28 +3335,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
-        if (!_kernelCache.TryGetValue("softmax", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: softmax");
-
-        // 1 block per batch element, 256 threads cooperate on parallel reduction
-        // Shared memory: ceil(256/64) = 4 wavefronts * sizeof(float) = 16 bytes
-        uint sharedBytes = (DefaultBlockSize / 64 + 1) * sizeof(float);
-
-            {
-            IntPtr _p0 = A.Handle;
-            IntPtr _p1 = B.Handle;
-            void** args = stackalloc void*[4];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &batchSize;
-            args[3] = &features;
-
-
-            uint grid = (uint)batchSize;
-            LaunchKernel(krnl, grid, DefaultBlockSize, args, sharedBytes);
-            Synchronize();
-            }
+        // #1113: the tuned-kernel registry picks the established kernel or an L-lanes-per-row variant per shape class.
+        if (!(batchSize > 0 && features > 0
+              && SoftmaxSlot.TryExecute(RowShape(batchSize, features), new TunedSoftmaxArgs(A, B, batchSize, features))))
+            SoftmaxReference(A, B, batchSize, features);
+        Synchronize();
     }
+
 
     public unsafe void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
     {
@@ -3446,26 +3447,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
 
-    public unsafe void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
+    public void TileBatch(IGpuBuffer input, IGpuBuffer output, int repeats, int innerSize)
     {
-        if (!_kernelCache.TryGetValue("tile_batch", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: tile_batch");
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (repeats <= 0) throw new ArgumentOutOfRangeException(nameof(repeats), repeats, "repeats must be positive.");
+        if (innerSize <= 0) throw new ArgumentOutOfRangeException(nameof(innerSize), innerSize, "innerSize must be positive.");
+        long requiredOutput = checked((long)innerSize * repeats);
+        if (input.Size < innerSize)
+            throw new ArgumentException(
+                $"input buffer too small: expected at least {innerSize} elements, got {input.Size}.",
+                nameof(input));
+        if (output.Size < requiredOutput)
+            throw new ArgumentException(
+                $"output buffer too small: expected at least {requiredOutput} elements, got {output.Size}.",
+                nameof(output));
 
-        int totalSize = repeats * innerSize;
-            {
-            IntPtr _p0 = input.Handle;
-            IntPtr _p1 = output.Handle;
-            void** args = stackalloc void*[4];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &repeats;
-            args[3] = &innerSize;
-
-
-            uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        // out[i * repeats + r] = in[i], total innerSize * repeats. This looked up "tile_batch", which no HIP source
+        // defines; bx_repeat_elements launched as (outerSize: innerSize, innerSize: 1, repeats) computes
+        // output[idx] = input[idx / repeats], which is this contract (CudaBackend.TileBatch does the same).
+        RepeatElements(input, output, innerSize, 1, repeats);
     }
 
     public unsafe void TileAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int axisSize, int innerSize, int repeats)
@@ -4305,74 +4306,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        IntPtr pInput = input.Handle, pKernel = kernel.Handle, pOutput = output.Handle;
-
-        // Route 3x3 stride-1 dilation-1 through Winograd F(2x2,3x3)
-        if (kernelH == 3 && kernelW == 3 && strideH == 1 && strideW == 1 &&
-            dilationH == 1 && dilationW == 1 &&
-            _kernelCache.TryGetValue("conv2d_winograd_f2x2_3x3", out var winogradKrnl))
-        {
-            int tilesH = (outHeight + 1) / 2;
-            int tilesW = (outWidth + 1) / 2;
-            int totalTiles = batch * outChannels * tilesH * tilesW;
-            uint grid = (uint)((totalTiles + 255) / 256);
-
-            var args = new IntPtr[]
-            {
-                (IntPtr)(&pInput), (IntPtr)(&pKernel), (IntPtr)(&pOutput),
-                (IntPtr)(&batch), (IntPtr)(&inChannels), (IntPtr)(&inHeight), (IntPtr)(&inWidth),
-                (IntPtr)(&outChannels), (IntPtr)(&outHeight), (IntPtr)(&outWidth),
-                (IntPtr)(&padH), (IntPtr)(&padW)
-            };
-            LaunchKernel(winogradKrnl, grid, 256, args);
-            Synchronize();
-            return;
-        }
-
-        // Use shared-memory tiled kernel when available
-        if (_kernelCache.TryGetValue("conv2d_tiled", out var tiledKrnl))
-        {
-            const int TILE_OUT = 16;
-            uint gx = (uint)((outWidth + TILE_OUT - 1) / TILE_OUT);
-            uint gy = (uint)((outHeight + TILE_OUT - 1) / TILE_OUT);
-            uint gz = (uint)(batch * outChannels);
-
-            int effKH = (kernelH - 1) * dilationH + 1;
-            int effKW = (kernelW - 1) * dilationW + 1;
-            int tileInH = TILE_OUT * strideH + effKH - strideH;
-            int tileInW = TILE_OUT * strideW + effKW - strideW;
-            uint sharedMem = (uint)(tileInH * tileInW * sizeof(float));
-
-            var args = new IntPtr[]
-            {
-                (IntPtr)(&pInput), (IntPtr)(&pKernel), (IntPtr)(&pOutput),
-                (IntPtr)(&batch), (IntPtr)(&inChannels), (IntPtr)(&inHeight), (IntPtr)(&inWidth),
-                (IntPtr)(&outChannels), (IntPtr)(&outHeight), (IntPtr)(&outWidth),
-                (IntPtr)(&kernelH), (IntPtr)(&kernelW), (IntPtr)(&strideH), (IntPtr)(&strideW),
-                (IntPtr)(&padH), (IntPtr)(&padW), (IntPtr)(&dilationH), (IntPtr)(&dilationW)
-            };
-            LaunchKernel3D(tiledKrnl, gx, gy, gz, TILE_OUT, TILE_OUT, 1, args, sharedMem);
-            Synchronize();
-            return;
-        }
-
-        // Fallback: direct convolution
-        if (!_kernelCache.TryGetValue("conv2d_direct", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv2d_direct");
-
-        {
-            var args = new IntPtr[]
-            {
-                (IntPtr)(&pInput), (IntPtr)(&pKernel), (IntPtr)(&pOutput),
-                (IntPtr)(&batch), (IntPtr)(&inChannels), (IntPtr)(&inHeight), (IntPtr)(&inWidth),
-                (IntPtr)(&outChannels), (IntPtr)(&outHeight), (IntPtr)(&outWidth),
-                (IntPtr)(&kernelH), (IntPtr)(&kernelW), (IntPtr)(&strideH), (IntPtr)(&strideW),
-                (IntPtr)(&padH), (IntPtr)(&padW), (IntPtr)(&dilationH), (IntPtr)(&dilationW)
-            };
-            LaunchKernel3D(krnl, (uint)((outWidth + 15) / 16), (uint)((outHeight + 15) / 16),
-                (uint)(batch * outChannels), 16, 16, 1, args);
-            Synchronize();
-        }
+        // #1113: the tuned-kernel registry picks Winograd, tiled, direct or im2col + GEMM per shape class; the reference
+        // (Conv2DGeneric) is the dispatch this method ran before.
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+            kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (!(args.OutputCount > 0 && Conv2DForwardSlot.TryExecute(args.Shape(), args)))
+            Conv2DGeneric(args);
+        Synchronize();
     }
 
     public unsafe void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
@@ -5356,97 +5296,29 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public unsafe void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
-        if (!_kernelCache.TryGetValue("layernorm_forward", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: layernorm_forward");
-
-            {
-            IntPtr _p0 = input.Handle;
-            IntPtr _p1 = output.Handle;
-            IntPtr _p2 = gamma.Handle;
-            IntPtr _p3 = beta.Handle;
-            IntPtr _p4 = saveMean.Handle;
-            IntPtr _p5 = saveInvVar.Handle;
-            void** args = stackalloc void*[9];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &_p5;
-            args[6] = &batchSize;
-            args[7] = &normalizedSize;
-            args[8] = &epsilon;
-
-
-            uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        var args = new TunedLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar, batchSize, normalizedSize, epsilon);
+        if (!(batchSize > 0 && normalizedSize > 0 && LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), args)))
+            LayerNormReference(args);
+        Synchronize();
     }
+
 
     public unsafe void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batchSize, int normalizedSize, float epsilon)
     {
-        // First pass: compute gradInput
-        if (!_kernelCache.TryGetValue("layernorm_backward", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: layernorm_backward");
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = input.Handle;
-            IntPtr _p2 = gamma.Handle;
-            IntPtr _p3 = saveMean.Handle;
-            IntPtr _p4 = saveInvVar.Handle;
-            IntPtr _p5 = gradInput.Handle;
-            IntPtr _p6 = gradGamma.Handle;
-            IntPtr _p7 = gradBeta.Handle;
-            void** args = stackalloc void*[11];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &_p3;
-            args[4] = &_p4;
-            args[5] = &_p5;
-            args[6] = &_p6;
-            args[7] = &_p7;
-            args[8] = &batchSize;
-            args[9] = &normalizedSize;
-            args[10] = &epsilon;
-
-
-            uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
-
-        // Second pass: compute gradGamma and gradBeta
-        if (_kernelCache.TryGetValue("layernorm_grad_params", out var gradKrnl))
-        {
-                {
-                IntPtr _p0 = gradOutput.Handle;
-                IntPtr _p1 = input.Handle;
-                IntPtr _p2 = saveMean.Handle;
-                IntPtr _p3 = saveInvVar.Handle;
-                IntPtr _p4 = gradGamma.Handle;
-                IntPtr _p5 = gradBeta.Handle;
-                void** args2 = stackalloc void*[8];
-                args2[0] = &_p0;
-                args2[1] = &_p1;
-                args2[2] = &_p2;
-                args2[3] = &_p3;
-                args2[4] = &_p4;
-                args2[5] = &_p5;
-                args2[6] = &batchSize;
-                args2[7] = &normalizedSize;
-
-
-                uint grid2 = (uint)((normalizedSize + DefaultBlockSize - 1) / DefaultBlockSize);
-                LaunchKernel(gradKrnl, grid2, DefaultBlockSize, args2);
-                Synchronize();
-                }
-        }
+        bool rowsValid = batchSize > 0 && normalizedSize > 0;
+        var inputGradArgs = new TunedNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, null,
+            batchSize, normalizedSize);
+        if (!(rowsValid && LayerNormBackwardSlot.TryExecute(RowShape(batchSize, normalizedSize), inputGradArgs)))
+            LayerNormBackwardInputReference(inputGradArgs);
+        var paramArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar, gradGamma, gradBeta,
+            batchSize, normalizedSize);
+        if (!(rowsValid && LayerNormGradParametersSlot.TryExecute(RowShape(batchSize, normalizedSize), paramArgs)))
+            ColumnGradReference(rms: false, paramArgs);
+        Synchronize();
     }
+
 
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
@@ -5739,27 +5611,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
 
         // Compute gradGamma
-        if (!_kernelCache.TryGetValue("rmsnorm_grad_gamma", out var krnl2))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: rmsnorm_grad_gamma");
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = input.Handle;
-            IntPtr _p2 = saveRms.Handle;
-            IntPtr _p3 = gradGamma.Handle;
-            void** args2 = stackalloc void*[6];
-            args2[0] = &_p0;
-            args2[1] = &_p1;
-            args2[2] = &_p2;
-            args2[3] = &_p3;
-            args2[4] = &batchSize;
-            args2[5] = &normalizedSize;
-
-
-            uint grid2 = (uint)((normalizedSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl2, grid2, DefaultBlockSize, args2);
-            Synchronize();
-            }
+        var gammaArgs = new TunedNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null, batchSize, normalizedSize);
+        if (!(batchSize > 0 && normalizedSize > 0
+              && RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)))
+            ColumnGradReference(rms: true, gammaArgs);
+        Synchronize();
     }
 
     #endregion
@@ -7041,36 +6897,35 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("copy_2d_strided", out var kernel))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: copy_2d_strided");
 
-        int gridX = (srcCols + DefaultBlockSize - 1) / DefaultBlockSize;
-        int gridY = numRows;
+        if (numRows <= 0 || srcCols <= 0) return;   // an empty grid is an invalid launch, and there is nothing to copy
 
-        var srcHandle = ((HipGpuBuffer)source).Handle;
-        var dstHandle = ((HipGpuBuffer)destination).Handle;
+        // srcCols x numRows grid, rows in chunks of at most 65535 (the portable gridY limit), each chunk addressed by
+        // offsetting both base pointers to its first row -- as CudaBackend.Copy2DStrided does.
+        const int MaxGridY = 65535;
+        uint gridX = (uint)((srcCols + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr srcBase = source.Handle;
+        IntPtr dstBase = destination.Handle;
 
-        void*[] args = new void*[6];
-        fixed (void** argsPtr = args)
+        void** args = stackalloc void*[6];
+        for (int rowStart = 0; rowStart < numRows; rowStart += MaxGridY)
         {
-            IntPtr[] handles = [srcHandle, dstHandle];
-            int[] ints = [numRows, srcCols, destTotalCols, destColOffset];
+            int rows = Math.Min(MaxGridY, numRows - rowStart);
+            IntPtr srcPtr = (IntPtr)((long)srcBase + (long)rowStart * srcCols * sizeof(float));
+            IntPtr dstPtr = (IntPtr)((long)dstBase + (long)rowStart * destTotalCols * sizeof(float));
+            args[0] = &srcPtr;
+            args[1] = &dstPtr;
+            args[2] = &rows;
+            args[3] = &srcCols;
+            args[4] = &destTotalCols;
+            args[5] = &destColOffset;
 
-            fixed (IntPtr* h = handles)
-            fixed (int* i = ints)
-            {
-                argsPtr[0] = &h[0];
-                argsPtr[1] = &h[1];
-                argsPtr[2] = &i[0];
-                argsPtr[3] = &i[1];
-                argsPtr[4] = &i[2];
-                argsPtr[5] = &i[3];
-
-                GpuLaunchProbe.OnLaunch();
-                var result = HipNativeBindings.hipModuleLaunchKernel(
-                    kernel,
-                    (uint)gridX, (uint)gridY, 1,
-                    (uint)DefaultBlockSize, 1, 1,
-                    0, _stream, (IntPtr)argsPtr, IntPtr.Zero);
-                HipNativeBindings.CheckError(result, "hipModuleLaunchKernel (copy_2d_strided)");
-            }
+            GpuLaunchProbe.OnLaunch();
+            var result = HipNativeBindings.hipModuleLaunchKernel(
+                kernel,
+                gridX, (uint)rows, 1,
+                (uint)DefaultBlockSize, 1, 1,
+                0, _stream, (IntPtr)args, IntPtr.Zero);
+            HipNativeBindings.CheckError(result, "hipModuleLaunchKernel (copy_2d_strided)");
         }
     }
 
@@ -7205,26 +7060,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
-        if (!_kernelCache.TryGetValue("softmax_backward", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: softmax_backward");
-
-            {
-            IntPtr _p0 = gradOutput.Handle;
-            IntPtr _p1 = output.Handle;
-            IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[5];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &batchSize;
-            args[4] = &features;
-
-
-            uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
+        if (!(batchSize > 0 && features > 0
+              && SoftmaxBackwardSlot.TryExecute(RowShape(batchSize, features),
+                  new TunedSoftmaxBackwardArgs(gradOutput, output, gradInput, batchSize, features))))
+            SoftmaxBackwardReference(gradOutput, output, gradInput, batchSize, features);
+        Synchronize();
     }
+
 
     #endregion
 
@@ -9280,29 +9122,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Synchronize();
     }
 
-    public unsafe void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
-    {
-        if (!_kernelCache.TryGetValue("broadcast_multiply_last_axis", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: broadcast_multiply_last_axis");
-
-            {
-            IntPtr _p0 = A.Handle;
-            IntPtr _p1 = B.Handle;
-            IntPtr _p2 = C.Handle;
-            void** args = stackalloc void*[5];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &outerSize;
-            args[4] = &innerSize;
-
-
-            int totalSize = outerSize * innerSize;
-            uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
-    }
+    public void BroadcastMultiplyLastAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
+        // This looked up "broadcast_multiply_last_axis", which no HIP source defines, so every call threw
+        // GpuCapabilityUnavailableException and the engine fell back to the CPU. broadcast_mul_last is
+        // C[idx] = A[idx] * B[idx % innerSize] with these five arguments (CudaBackend made the same repoint).
+        => BroadcastMulLast(A, B, C, outerSize, innerSize);
 
     public unsafe void BroadcastMultiplyFirstAxis(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int outerSize, int innerSize)
     {
@@ -9942,7 +9766,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[5] = &nMels;
 
 
-            LaunchKernel2D(kernel, gridX, gridY, 1, (uint)DefaultBlockSize, args);
+            // The kernel indexes mels as blockIdx.y * blockDim.x + threadIdx.x: the block is DefaultBlockSize wide in x.
+            // It was launched (1, DefaultBlockSize), so each block computed one mel band and the rest stayed unwritten.
+            LaunchKernel2D(kernel, gridX, gridY, (uint)DefaultBlockSize, 1, args);
             Synchronize();
             }
     }
@@ -11558,6 +11384,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             HipNativeBindings.hipModuleUnload(_spectralPerfModule);
             _spectralPerfModule = IntPtr.Zero;
         }
+        if (_missingLookupModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_missingLookupModule);
+            _missingLookupModule = IntPtr.Zero;
+        }
+        if (_octonionModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_octonionModule);
+            _octonionModule = IntPtr.Zero;
+        }
         if (_locallyConnectedModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_locallyConnectedModule);
@@ -11684,12 +11520,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = IntPtr.Zero;
 
         if (_hipblasHandle != IntPtr.Zero)
         {

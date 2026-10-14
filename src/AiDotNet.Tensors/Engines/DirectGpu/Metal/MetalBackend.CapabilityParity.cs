@@ -38,7 +38,7 @@ public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend,
     private GenericFftReadiness? _fftReadiness;
 
     // The capability holds only once every FFT pipeline has been built from the batch library (#963).
-    private GenericFftReadiness FftReadiness => _fftReadiness ??= new GenericFftReadiness(CompileBatchKernel);
+    internal GenericFftReadiness FftReadiness => _fftReadiness ??= new GenericFftReadiness(CompileBatchKernel);
 
     private string? CompileBatchKernel(string name)
     {

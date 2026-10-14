@@ -2569,7 +2569,9 @@ void main() {
         for (uint d = 0; d < dim; d++) c[off + d] = a[off + d];
         return;
     }
-    float t = tanh(sqrtC * lambda * tvNorm / 2.0) / (sqrtC * tvNorm);
+    // GLSL tanh of a large argument can evaluate inf / inf = NaN near the boundary, where lambda is huge; tanh(20)
+    // is already 1 in float, so the argument is clamped there, as the CPU engine does.
+    float t = tanh(min(sqrtC * lambda * tvNorm / 2.0, 20.0)) / (sqrtC * tvNorm);
     // scaled = t * tangentVec, then Mobius add base + scaled
     float sSq = 0.0, bs = 0.0;
     for (uint d = 0; d < dim; d++) {
@@ -2581,8 +2583,19 @@ void main() {
     denom = max(abs(denom), 1e-10);
     float numX = 1.0 + 2.0 * cv * bs + cv * sSq;
     float numY = 1.0 - cv * bpSq;
-    for (uint d = 0; d < dim; d++)
-        c[off + d] = (numX * a[off + d] + numY * t * bdata[off + d]) / denom;
+    // Then project back inside the ball, as the CPU engine's ProjectToBall does.
+    float outSq = 0.0;
+    for (uint d = 0; d < dim; d++) {
+        float r = (numX * a[off + d] + numY * t * bdata[off + d]) / denom;
+        c[off + d] = r;
+        outSq += r * r;
+    }
+    float maxNorm = (1.0 - 1e-5) / sqrtC;
+    float outNorm = sqrt(outSq);
+    if (outNorm > maxNorm) {
+        float shrink = maxNorm / outNorm;
+        for (uint d = 0; d < dim; d++) c[off + d] *= shrink;
+    }
 }";
 
     /// <summary>

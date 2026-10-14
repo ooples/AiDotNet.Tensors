@@ -278,8 +278,7 @@ public sealed class SpectralElementwiseBackendParityTests
     [SkippableFact]
     public void WebGpu_SpectralElementwise_MatchesCpu()
     {
-        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend();
-        Skip.IfNot(backend.IsAvailable, "WebGPU is not available.");
+        var backend = DawnHostedWebGpu.BackendOrSkip();   // the real backend, executing on Dawn; shared, so not disposed
         Check(backend);
     }
 #endif
