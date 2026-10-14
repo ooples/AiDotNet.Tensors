@@ -36,7 +36,6 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     [InlineData(500, 700, 300, 0.5f, 0.25f)] // every dimension pads; beta reads C through the padded copy
     [InlineData(1024, 1024, 1024, 1f, 1f)]
     [InlineData(4096, 64, 257, 2f, -1f)]     // skinny N, ragged K
-    [InlineData(3, 2000, 5, 1f, 0f)]         // tiny M and K under a wide N
     public void Gemm_LargeShapes_TakeTheIndirectRoute_AndMatchReference(int m, int n, int k, float alpha, float beta)
     {
         if (!EnsureReady()) return;
@@ -55,7 +54,11 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     [InlineData(447, 447, 512)]
     [InlineData(1, 4096, 512)]               // vector products stay on the HIP kernels
     [InlineData(4096, 1, 512)]
-    public void Gemm_ShapesBelowThreshold_KeepTheHipKernels(int m, int n, int k)
+    [InlineData(8, 512, 512)]               // past the threshold, but padding 8 to a 64 tile is 8x the work
+    [InlineData(448, 8, 4096)]
+    [InlineData(16, 1024, 1024)]
+    [InlineData(3, 2000, 5)]
+    public void Gemm_ShapesTheIndirectPathWouldLose_KeepTheHipKernels(int m, int n, int k)
     {
         if (!EnsureReady()) return;
         var (a, b, c0) = Inputs(m, n, k, seed: 11);

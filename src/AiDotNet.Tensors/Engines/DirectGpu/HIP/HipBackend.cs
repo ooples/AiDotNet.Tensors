@@ -1627,8 +1627,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             return;
         }
 
-        // CLBlast's indirect GEMM, the kernel OpenCL runs on this GPU: 3.5-8x the kernels below at 448 and up (#1266).
-        if (ShouldUseClBlastIndirectGemm(M, N) && TryExecuteClBlastIndirectGemm(A, B, C, M, N, K, alpha, beta))
+        // CLBlast's indirect GEMM, the kernel OpenCL runs on this GPU: up to 8x the kernels below on the shapes it takes (#1266).
+        if (ShouldUseClBlastIndirectGemm(M, N, K) && TryExecuteClBlastIndirectGemm(A, B, C, M, N, K, alpha, beta))
         {
             HipNativeBindings.CheckError(HipNativeBindings.hipStreamSynchronize(_stream), "hipStreamSynchronize");
             return;

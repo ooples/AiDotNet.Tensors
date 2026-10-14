@@ -5,84 +5,31 @@ using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-// The CLBlast direct GEMM on HIP (#1266): the kernel OpenCL runs on this GPU, built from the same source with the
-// parameters CLBlast tuned for the device, launched with the same geometry.
+// CLBlast's indirect GEMM on HIP (#1266): the kernel OpenCL runs on this GPU, built from the same source with the
+// configuration CLBlast tuned for the device, packed and launched the same way.
 public sealed partial class HipBackend
 {
     private readonly object _clblastLock = new object();
-    private IntPtr _clblastDirectModule;
-    private ClBlastXgemmDirectParameters _clblastDirectParams;
-    private bool _clblastDirectTried;
-    private bool _clblastDirectReady;
     private IntPtr _clblastIndirectModule;
     private IntPtr _clblastPackingModule;
     private GemmConfig _clblastIndirectConfig;
+    private ClBlastPadParameters _clblastPadParams;
+    private ClBlastPadTransposeParameters _clblastPadTransposeParams;
     private int _clblastMinIndirectSize;
+    private bool _clblastIndirectTried;
+    private bool _clblastIndirectReady;
     private long _clblastIndirectGemmRuns;
+    // Grow-only packing buffers: per-call allocate / free cost more than the GEMM itself at 448^3.
+    private IGpuBuffer? _clblastScratchA, _clblastScratchB, _clblastScratchC;
+
+    /// <summary>The CLBlast database key for this device: the one OpenCL uses for the same GPU.</summary>
+    internal ClBlastDeviceInfo ClBlastDevice => ClBlastDeviceInfo.ForAmdGpu(_deviceProps.GcnArchName ?? _architectureTarget, DeviceName);
 
     /// <summary>How many GEMMs the indirect path has run on this backend (lets tests prove the route was taken).</summary>
     internal long ClBlastIndirectGemmRuns => Interlocked.Read(ref _clblastIndirectGemmRuns);
 
     /// <summary>Whether Gemm goes to hipBLAS first (and so never reaches the CLBlast kernels).</summary>
     internal bool IsHipBlasAvailable => _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
-    private ClBlastPadParameters _clblastPadParams;
-    private ClBlastPadTransposeParameters _clblastPadTransposeParams;
-    private bool _clblastIndirectTried;
-    private bool _clblastIndirectReady;
-    // Grow-only packing buffers: per-call hipMalloc / hipFree (which waits for the device) cost more than the GEMM below ~1000^3.
-    private IGpuBuffer? _clblastScratchA, _clblastScratchB, _clblastScratchC;
-    /// <summary>The CLBlast database key for this device: the one OpenCL uses for the same GPU.</summary>
-    internal ClBlastDeviceInfo ClBlastDevice => ClBlastDeviceInfo.ForAmdGpu(_deviceProps.GcnArchName ?? _architectureTarget, DeviceName);
-
-    /// <summary>Builds the direct GEMM module once, with the database parameters unless <paramref name="parameters"/> is given.</summary>
-    internal bool EnsureClBlastDirectGemm(ClBlastXgemmDirectParameters? parameters = null)
-    {
-        lock (_clblastLock)
-        {
-            if (parameters is null && _clblastDirectTried) return _clblastDirectReady;
-            var p = parameters ?? ClBlastXgemmDirectDatabase.GetParameters(ClBlastDevice);
-            if (!IsAvailable || !HipClBlastGemmKernels.Supports(p))
-            {
-                _clblastDirectTried = true;
-                _clblastDirectReady = false;
-                return false;
-            }
-            if (_clblastDirectModule != IntPtr.Zero)
-            {
-                HipNativeBindings.hipModuleUnload(_clblastDirectModule);
-                _clblastDirectModule = IntPtr.Zero;
-            }
-            var failure = CompileKernelModule(HipClBlastGemmKernels.BuildDirectSource(p), "clblast_direct", ref _clblastDirectModule,
-                HipClBlastGemmKernels.DirectKernelNames(), useFastMath: false);
-            _clblastDirectTried = true;
-            _clblastDirectReady = failure is null && _kernelCache.ContainsKey("XgemmDirectTN");
-            _clblastDirectParams = p;
-            return _clblastDirectReady;
-        }
-    }
-
-    /// <summary>
-    /// Row-major C = alpha * A[M x K] * B[K x N] + beta * C through XgemmDirectTN with C transposed, exactly as
-    /// OpenClBackend runs it. Returns false when the module is not available.
-    /// </summary>
-    internal unsafe bool TryExecuteClBlastDirectGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
-        float alpha = 1f, float beta = 0f)
-    {
-        if (M <= 0 || N <= 0 || K <= 0 || !EnsureClBlastDirectGemm()) return false;
-        var p = _clblastDirectParams;
-        IntPtr kernel = _kernelCache["XgemmDirectTN"];
-        int aOffset = 0, bOffset = 0, cOffset = 0, aLd = K, bLd = N, cLd = N, cTranspose = 1, aConj = 0, bConj = 0;
-        IntPtr pa = A.Handle, pb = B.Handle, pc = C.Handle;
-        void** args = stackalloc void*[17];
-        args[0] = &M; args[1] = &N; args[2] = &K; args[3] = &alpha; args[4] = &beta;
-        args[5] = &pa; args[6] = &aOffset; args[7] = &aLd;
-        args[8] = &pb; args[9] = &bOffset; args[10] = &bLd;
-        args[11] = &pc; args[12] = &cOffset; args[13] = &cLd;
-        args[14] = &cTranspose; args[15] = &aConj; args[16] = &bConj;
-        uint gridX = (uint)((M + p.Wgd - 1) / p.Wgd), gridY = (uint)((N + p.Wgd - 1) / p.Wgd);
-        LaunchKernel2D(kernel, gridX, gridY, (uint)p.MdimCd, (uint)p.NdimCd, args);
-        return true;
-    }
 
     /// <summary>
     /// Builds the indirect GEMM (clblast_xgemm) and its packing kernels once, with the database configuration unless
@@ -123,6 +70,21 @@ public sealed partial class HipBackend
                 _kernelCache.ContainsKey("CopyMatrix") && _kernelCache.ContainsKey("TransposePadMatrix");
             return _clblastIndirectReady;
         }
+    }
+
+    /// <summary>
+    /// The shapes Gemm sends through the indirect path: M or N at least CLBlast's MinIndirectSize for the device (where
+    /// OpenCL switches to it), and tile padding adding at most half again the work. Measured on an RX 5500 XT, a side
+    /// padded from 8 to the 64-wide tile (8x512x512: 22 vs 48 GF) or from 16 (16x1024x1024: 125 vs 218 GF) loses to the
+    /// HIP kernels, while unpadded skinny shapes win (4096x64x4096: 727 vs 406 GF).
+    /// </summary>
+    private bool ShouldUseClBlastIndirectGemm(int M, int N, int K)
+    {
+        if (M <= 1 || N <= 1 || !EnsureClBlastIndirectGemm() || _clblastMinIndirectSize <= 0) return false;
+        if (M < _clblastMinIndirectSize && N < _clblastMinIndirectSize) return false;
+        var c = _clblastIndirectConfig;
+        double padded = (double)CeilTo(N, c.TileM) * CeilTo(M, c.TileN) * CeilTo(K, c.TileK * (c.KReg > 0 ? c.KReg : 1));
+        return padded <= 1.5 * M * N * K;
     }
 
     /// <summary>
@@ -185,14 +147,6 @@ public sealed partial class HipBackend
         return buffer;
     }
 
-    /// <summary>
-    /// The shapes Gemm sends through the indirect path: the ones OpenCL does (M or N at least CLBlast's
-    /// MinIndirectSize for the device, not a vector product). Below that, packing costs more than the HIP kernel saves.
-    /// </summary>
-    private bool ShouldUseClBlastIndirectGemm(int M, int N) =>
-        M > 1 && N > 1 && EnsureClBlastIndirectGemm() && _clblastMinIndirectSize > 0 &&
-        (M >= _clblastMinIndirectSize || N >= _clblastMinIndirectSize);
-
     private static int CeilTo(int value, int multiple) => (value + multiple - 1) / multiple * multiple;
 
     /// <summary>One CLBlast pad / transpose launch with OpenClBackend's argument list and geometry.</summary>
@@ -230,12 +184,6 @@ public sealed partial class HipBackend
     {
         lock (_clblastLock)
         {
-            if (_clblastDirectModule != IntPtr.Zero)
-            {
-                HipNativeBindings.hipModuleUnload(_clblastDirectModule);
-                _clblastDirectModule = IntPtr.Zero;
-            }
-            _clblastDirectReady = false;
             if (_clblastIndirectModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastIndirectModule); _clblastIndirectModule = IntPtr.Zero; }
             if (_clblastPackingModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastPackingModule); _clblastPackingModule = IntPtr.Zero; }
             _clblastIndirectReady = false;

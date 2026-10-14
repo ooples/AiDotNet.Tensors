@@ -9,7 +9,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 
 /// <summary>
-/// The CLBlast GEMM kernels OpenCL runs (XgemmDirect), compiled for HIP from the same OpenCL C source (#1266). CLBlast
+/// The CLBlast GEMM kernels OpenCL runs (the indirect Xgemm and its packing kernels), compiled for HIP from the same OpenCL C source (#1266). CLBlast
 /// was written to build as CUDA too (LOCAL_PTR is a macro "because CUDA doesn't need them"); a preamble maps the
 /// remaining OpenCL built-ins to HIP and two definitions are rewritten so helper functions are device functions. Vector
 /// widths are limited to 1, 2 and 4: HIP has no float8 / float16 vector types (stubs only keep their typedefs valid).
@@ -38,19 +38,6 @@ internal static class HipClBlastGemmKernels
 typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7; } float8;
 typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sA, sB, sC, sD, sE, sF; } float16;
 ";
-
-    /// <summary>Whether a parameter set can be built for HIP (vector widths of 1, 2 or 4).</summary>
-    internal static bool Supports(ClBlastXgemmDirectParameters p) =>
-        p.Wgd > 0 && p.MdimCd > 0 && p.NdimCd > 0 && p.Vwm is 1 or 2 or 4 && p.Vwn is 1 or 2 or 4;
-
-    internal static string BuildDirectSource(ClBlastXgemmDirectParameters parameters)
-    {
-        if (!Supports(parameters))
-            throw new ArgumentException("HIP builds the CLBlast direct GEMM only with vector widths 1, 2 or 4.", nameof(parameters));
-        return Translate(ClBlastXgemmDirectKernel.BuildSource(parameters));
-    }
-
-    internal static string[] DirectKernelNames() => ClBlastXgemmDirectKernel.GetKernelNames();
 
     /// <summary>Whether the indirect Xgemm configuration can be built for HIP.</summary>
     internal static bool Supports(GemmConfig config) =>
