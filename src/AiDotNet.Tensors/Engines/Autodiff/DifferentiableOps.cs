@@ -670,7 +670,14 @@ internal static class DifferentiableOps
             ReplaceAccumulatorBufferOwner(tensor, previous, buffer);
         }
         if (!ReferenceEquals(contribution, buffer) && !IsSameDenseRegion(contribution, buffer))
+        {
+            if (_graphCaptureDebug)
+            {
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                    $"[ALIAS] firstwrite-copy op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={contribution.Length} sharesStorage={contribution.SharesStorageWith(buffer)}" + System.Environment.NewLine); } catch { }
+            }
             engine.TensorCopy(contribution, buffer);
+        }
         return buffer;
     }
 

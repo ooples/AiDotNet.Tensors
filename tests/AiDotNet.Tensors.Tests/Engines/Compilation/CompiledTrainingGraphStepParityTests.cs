@@ -686,6 +686,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [InlineData(true, TwoPathNetwork.SoftmaxCrossEntropy)]
     [InlineData(false, TwoPathNetwork.StandaloneRelu)]
     [InlineData(true, TwoPathNetwork.StandaloneRelu)]
+    [InlineData(false, TwoPathNetwork.Pooling)]
+    [InlineData(true, TwoPathNetwork.Pooling)]
     public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
         Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
@@ -696,6 +698,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             TwoPathNetwork.SharedBias => SharedBiasLoss,
             TwoPathNetwork.SoftmaxCrossEntropy => SoftmaxCrossEntropyLoss,
             TwoPathNetwork.StandaloneRelu => StandaloneReluLoss,
+            TwoPathNetwork.Pooling => PoolingLoss,
             _ => SharedLoss,
         };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
@@ -722,6 +725,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 TwoPathNetwork.StandaloneRelu => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
                     Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f),
                     Rand([Hidden, Outputs], 11, 0.3f) },
+                TwoPathNetwork.Pooling => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([8, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([6, Outputs], 11, 0.3f) },
                 TwoPathNetwork.WideLogSoftmax => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
                     Rand([Hidden, WideClasses], 6, 0.3f), Rand([WideClasses], 7, 0.1f), Rand([WideClasses, Outputs], 4, 0.1f), Rand([Outputs], 5, 0.1f) },
                 _ => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
@@ -856,6 +861,19 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorMSELoss(pred, y);
     }
 
+    /// <summary>MSE of <c>mean_1(r) · w2 + b2 + sum_2(r) · w4</c> with <c>r = ReLU(x · w0 + b0)</c> viewed as [batch, 6, 8]:
+    /// the trailing-axis sum's gradient is r's first contribution (the broadcast writes it straight into the
+    /// accumulator) and the middle-axis mean's is added on top.</summary>
+    private static Tensor<float> PoolingLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var r = e.Reshape(e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU), new[] { Batch, 6, 8 });
+        var mean = e.ReduceMean(r, new[] { 1 }, keepDims: false);
+        var sum = e.ReduceSum(r, new[] { 2 }, keepDims: false);
+        var pred = e.TensorAdd(e.FusedLinear(mean, w[2], w[3], FusedActivationType.None),
+            e.FusedLinear(sum, w[4], w[3], FusedActivationType.None));
+        return e.TensorMSELoss(pred, y);
+    }
+
     // A LayerNorm gain near one: 1 + noise.
     private static Tensor<float> Ones(int length, int seed, float noise)
     {
@@ -881,6 +899,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         SoftmaxCrossEntropy,
         /// <summary>Separate ReLU ops: one gradient written into its accumulator, one added to an earlier contribution.</summary>
         StandaloneRelu,
+        /// <summary>A middle-axis mean and a trailing-axis sum of one activation: broadcast gradients, written then added.</summary>
+        Pooling,
     }
 
     /// <summary>

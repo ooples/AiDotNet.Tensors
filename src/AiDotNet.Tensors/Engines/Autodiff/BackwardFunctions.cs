@@ -2492,6 +2492,7 @@ internal static class BackwardFunctions<T>
         // generic expand-and-tile below took the host path. No axes (a traced full sum records none) means every axis,
         // as the tiling below treats it.
         var reducedAxes = axes.Length == 0 ? Enumerable.Range(0, inputShape.Length).ToArray() : axes;
+        if (TryReducedGradientInto(gradOutput, inputs[0], reducedAxes, mean: false, engine, grads)) return;
         if (engine is DirectGpuTensorEngine gpu && gpu.TryBroadcastReducedGradient(gradOutput, inputShape, reducedAxes, 1f) is { } onDevice)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], onDevice, engine);
@@ -2516,12 +2517,35 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>
+    /// A sum's or mean's gradient over one contiguous block of axes, written by the GPU broadcast straight into the
+    /// input's gradient accumulator when this is its first contribution of a resident step. False when it was not.
+    /// </summary>
+    private static bool TryReducedGradientInto(Tensor<T> gradOutput, Tensor<T> input, int[] axes, bool mean,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (engine is not DirectGpuTensorEngine gpu || DifferentiableOps.IsRecording<T>() || Compilation.GraphMode.IsActive
+            || DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add) is not { } into || add)
+            return false;
+        float scale = 1f;
+        if (mean)
+        {
+            long count = 1;
+            foreach (int axis in axes) count *= input._shape[axis < 0 ? axis + input._shape.Length : axis];
+            if (count <= 0) return false;
+            scale = 1f / count;
+        }
+        if (!gpu.TryBroadcastReducedGradientInto(gradOutput, input._shape, axes, scale, into)) return false;
+        DifferentiableOps.CommitDirectGradWrite(grads, input, into);
+        return true;
+    }
     /// <summary>d(mean(x))/dx = grad / N (broadcast and scale)</summary>
     internal static void ReduceMeanBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axes = (int[])savedState[0];
+        if (TryReducedGradientInto(gradOutput, inputs[0], axes, mean: true, engine, grads)) return;
         var grad = engine.ReduceMeanBackward(gradOutput, inputs[0]._shape, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }

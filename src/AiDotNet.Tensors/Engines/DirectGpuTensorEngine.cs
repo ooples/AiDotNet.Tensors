@@ -18266,6 +18266,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var gradient = GetOrAllocateBuffer(backend, gradOutput);
         return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
         {
+            // One pass where the backend has it (the scale folded in); else a batched ones-GEMM and a scale.
+            if (backend is IBroadcastReducedBackend broadcast
+                && broadcast.TryBroadcastMiddle(gradient.Buffer, output, outer, reduced, inner, scale, add: false))
+                return;
             // outer batches of [reduced, 1] x [1, inner] -> [reduced, inner].
             backend.BatchedGemm(ones, gradient.Buffer, output, reduced, inner, 1, outer);
             if (scale != 1f)
@@ -18273,6 +18277,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
     }
 
+    /// <summary>
+    /// The gradient of a sum or mean over ONE contiguous block of axes (leading, middle or trailing) written straight
+    /// into a gradient accumulator receiving its first contribution of a resident step: the broadcast kernel overwrites
+    /// every element, so the gradient is not formed in a fresh buffer and copied in (the parity Transformer's mean
+    /// pooling cost a 512 KB copy per step). False -- nothing launched -- when the target or the axes do not qualify.
+    /// </summary>
+    internal bool TryBroadcastReducedGradientInto<T>(Tensor<T> gradOutput, int[] inputShape, int[] axes, float scale,
+        Tensor<T> into)
+    {
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive || !gradOutput.IsContiguous
+            || inputShape is not { Length: > 0 } || axes.Length == 0)
+            return false;
+        if (!TryGetBackend(out var backend) || backend is not IBroadcastReducedBackend broadcast) return false;
+        var sorted = new int[axes.Length];
+        for (int i = 0; i < axes.Length; i++)
+        {
+            sorted[i] = axes[i] < 0 ? axes[i] + inputShape.Length : axes[i];
+            if (sorted[i] < 0 || sorted[i] >= inputShape.Length) return false;
+        }
+        Array.Sort(sorted);
+        for (int i = 1; i < sorted.Length; i++)
+            if (sorted[i] != sorted[i - 1] + 1) return false;   // one contiguous block, no repeats
+        int outer = 1, reduced = 1, inner = 1;
+        for (int i = 0; i < sorted[0]; i++) outer = checked(outer * inputShape[i]);
+        for (int i = sorted[0]; i <= sorted[^1]; i++) reduced = checked(reduced * inputShape[i]);
+        for (int i = sorted[^1] + 1; i < inputShape.Length; i++) inner = checked(inner * inputShape[i]);
+        int total = checked(outer * reduced * inner);
+        if (gradOutput.Length != outer * inner || into.Length != total) return false;
+        var gR = ResolveResidentBufferNoUpload(backend, gradOutput, gradOutput.Length);
+        if (gR is null) return false;
+        var target = ResolveDirectGradTarget(backend, into, total, gR, gR, null);
+        if (target is null || !broadcast.TryBroadcastMiddle(gR, target, outer, reduced, inner, scale, add: false))
+            return false;
+        ResidentSyncCheck("BroadcastReducedGradientInto");
+        into.IncrementVersion();
+        BindResidentBuffer(into, target, backend);
+        return true;
+    }
     /// <summary>
     /// Internal GPU reduction implementation that handles arbitrary axes.
     /// </summary>

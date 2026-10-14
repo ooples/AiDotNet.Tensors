@@ -4,7 +4,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 // LayerNorm's backward as placeable pieces (see ILayerNormBackwardPartsBackend), and the same deterministic
 // column reduction for bias gradients (IColumnSumBackend).
-public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColumnSumBackend
+public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColumnSumBackend, IBroadcastReducedBackend
 {
     int IColumnSumBackend.ColumnSumScratchFloats(int rows, int cols) =>
         rows <= 0 || cols <= 0 ? 0 : checked(LayerNormAffineGradientChunks(rows, cols) * cols);
@@ -33,6 +33,26 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         return true;
     }
 
+    unsafe bool IBroadcastReducedBackend.TryBroadcastMiddle(IGpuBuffer g, IGpuBuffer output, int outer, int reduced,
+        int inner, float scale, bool add)
+    {
+        long total = (long)outer * reduced * inner;
+        if (!IsAvailable || outer <= 0 || reduced <= 0 || inner <= 0 || g.Size < (long)outer * inner
+            || output.Size < total || output.Handle == g.Handle
+            || ((g.Handle.ToInt64() | output.Handle.ToInt64()) & 15) != 0
+            || !_kernelCache.TryGetValue("broadcast_reduced_middle", out var kernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr gp = g.Handle, op = output.Handle;
+        int o = outer, r = reduced, i = inner, ad = add ? 1 : 0;
+        float sc = scale;
+        void** args = stackalloc void*[7];
+        args[0] = &gp; args[1] = &op; args[2] = &o; args[3] = &r; args[4] = &i; args[5] = &sc; args[6] = &ad;
+        long work = (inner & 3) == 0 ? total / 4 : total;
+        uint blocks = (uint)Math.Min(65535L, Math.Max(1L, (work + DefaultBlockSize - 1) / DefaultBlockSize));
+        LaunchKernel(kernel, blocks, DefaultBlockSize, args);
+        return true;
+    }
     // Chunks of rows for the affine-gradient reduction: enough blocks (~128 with the column tiles) to occupy the
     // device, and at least 32 rows per chunk (4 per row lane) so a chunk's partial is worth its write.
     private static int LayerNormAffineGradientChunks(int rows, int cols)

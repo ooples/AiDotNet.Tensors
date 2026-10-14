@@ -599,6 +599,38 @@ extern ""C"" __global__ __launch_bounds__(256) void column_sum_partial(
     }
 }
 
+// The gradient of a sum or mean over one middle block of axes: output[o, r, i] = scale * g[o, i] for an input viewed as
+// [outer, reduced, inner], written (or added) in one pass -- a float4 per thread when inner is a multiple of four.
+extern ""C"" __global__ __launch_bounds__(256) void broadcast_reduced_middle(
+    const float* __restrict__ g, float* __restrict__ output, int outer, int reduced, int inner, float scale, int add)
+{
+    long long total = (long long)outer * reduced * inner;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    if ((inner & 3) == 0)
+    {
+        long long quads = total >> 2;
+        for (long long q = (long long)blockIdx.x * blockDim.x + threadIdx.x; q < quads; q += stride)
+        {
+            long long e = q << 2;
+            int i = (int)(e % inner);
+            long long o = e / ((long long)reduced * inner);
+            float4 v = *reinterpret_cast<const float4*>(g + o * inner + i);
+            float4 r = make_float4(scale * v.x, scale * v.y, scale * v.z, scale * v.w);
+            float4* out = reinterpret_cast<float4*>(output + e);
+            if (add) { float4 c = *out; r.x += c.x; r.y += c.y; r.z += c.z; r.w += c.w; }
+            *out = r;
+        }
+        return;
+    }
+    for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += stride)
+    {
+        int i = (int)(e % inner);
+        long long o = e / ((long long)reduced * inner);
+        float r = scale * g[o * inner + i];
+        output[e] = add ? output[e] + r : r;
+    }
+}
+
 // Pass 2: each column's partials summed in chunk order, written to (or added to) output.
 extern ""C"" __global__ __launch_bounds__(256) void column_sum_finish(
     const float* __restrict__ partials, float* __restrict__ output, int cols, int chunks, int add)
@@ -713,6 +745,7 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "layernorm_grad_params_finish",
                 "column_sum_partial",
                 "column_sum_finish",
+                "broadcast_reduced_middle",
                 "softmax_xent_rows",
                 "softmax_xent_total",
                 "softmax_xent_backward"
