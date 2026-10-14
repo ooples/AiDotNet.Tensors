@@ -95,18 +95,26 @@ public class Conv2DImplicitGemmParityTests
         // Fused (implicit-GEMM) path, pinned: short-wide shapes now default to the full im2col path,
         // and pinning keeps this a real comparison if that routing ever widens to these shapes.
         float[] fused;
+        bool pointwise = k == 1 && stride == 1 && pad == 0 && dilation == 1;   // 1x1 identity always takes the full path
+        int implicitBefore = CpuEngine.ImplicitGemmConvRunsOnThisThread;
         using (CpuEngine.ForceImplicitGemmScope())
         {
             fused = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
         }
+        // The positive control: at 8+ threads the default route is the full im2col GEMM too, and a comparison of the full
+        // path with itself would pass whatever the implicit path computes.
+        if (!pointwise)
+            Assert.True(CpuEngine.ImplicitGemmConvRunsOnThisThread > implicitBefore, "the implicit-GEMM path did not run");
 
         // Full im2col baseline via a thread-local, auto-restoring scope — no process-wide flag, so
         // this can't perturb a concurrent Conv2D or leak into sibling tests.
         float[] full;
+        int fullBefore = CpuEngine.FullIm2ColConvRunsOnThisThread;
         using (CpuEngine.ForceFullIm2ColScope())
         {
             full = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
         }
+        Assert.True(CpuEngine.FullIm2ColConvRunsOnThisThread > fullBefore, "the full im2col path did not run");
 
         Assert.Equal(full.Length, fused.Length);
         // Bit-exact: identical GEMM, identical per-element K-reduction, disjoint column blocks.
@@ -116,5 +124,32 @@ public class Conv2DImplicitGemmParityTests
                 Assert.Fail($"fused conv diverged at index {i}: full={full[i]:R} fused={fused[i]:R} " +
                             $"(batch={batch} inC={inC} outC={outC} k={k} hw={hw} s={stride} p={pad} d={dilation})");
         }
+    }
+
+    // #653: high-channel 3x3 convs take the full im2col GEMM at 8+ threads (or on a 64x64+ plane) while its column
+    // matrix fits ThreadLocalTensorCache's 64 MB, and the implicit GEMM otherwise.
+    [Theory]
+    [InlineData(320, 32, 16, true)]    // 320ch@32x32 at 16 threads: 11.8 MB matrix -> full
+    [InlineData(320, 32, 1, false)]    // the same shape single-threaded keeps the implicit path
+    [InlineData(320, 64, 1, true)]     // a 64x64 plane takes the full path at any thread count (47 MB)
+    [InlineData(640, 64, 16, false)]   // 94 MB matrix: past the cache, keeps the implicit path
+    public void HighChannelConv_RoutesByThreadsAndMatrixSize(int channels, int hw, int threads, bool expectFull)
+    {
+        var e = new CpuEngine();
+        var x = Rand(new[] { 1, channels, hw, hw }, 303);
+        var kernel = Rand(new[] { channels, channels, 3, 3 }, 404);
+        int previous = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        int fullBefore = CpuEngine.FullIm2ColConvRunsOnThisThread, implicitBefore = CpuEngine.ImplicitGemmConvRunsOnThisThread;
+        try
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
+            e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
+        }
+        Assert.Equal(expectFull ? 1 : 0, CpuEngine.FullIm2ColConvRunsOnThisThread - fullBefore);
+        Assert.Equal(expectFull ? 0 : 1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }
 }
