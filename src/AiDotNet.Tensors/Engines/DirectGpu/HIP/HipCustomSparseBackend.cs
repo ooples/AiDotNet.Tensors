@@ -12,16 +12,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// <see cref="HipSparseBackend"/> but dispatching the managed kernels instead of
 /// rocSPARSE — the supply-chain-removal default for AMD GPUs (issue #515, P6).
 ///
-/// <para><b>Status (#515): implemented but NOT yet wired into
-/// <see cref="LinearAlgebra.Sparse.SparseOps"/> dispatch.</b> The only cheap
-/// availability signal, <see cref="HipBackend.IsHipAvailable"/>, reports true whenever
-/// the HIP runtime sees a device (it can route over a CUDA device) even when the HIP
-/// kernel toolchain can't build a usable binary for the active arch (e.g. a
-/// gfx-mismatched / header-missing install). Routing on that signal would replace the
-/// safe CPU/vendor fallback with a failing backend. Wiring this in needs a
-/// kernel-load-strict availability gate, validated end-to-end on a healthy ROCm
-/// runner. The kernels + launches are a faithful mirror of the CUDA path so the wiring
-/// is a small follow-up once such a runner exists.</para>
+/// <para>Routed by <see cref="LinearAlgebra.Sparse.SparseOps"/> ahead of rocSPARSE for float and double SpMM and for
+/// SDDMM. Availability is kernel-load strict (see <see cref="Shared"/>).</para>
 /// </summary>
 internal static class HipCustomSparseBackend
 {
@@ -30,9 +22,61 @@ internal static class HipCustomSparseBackend
     /// <see cref="CUDA.CudaSparseBackend"/>; first-cut, to be tuned by the #515 bar).</summary>
     private const int WarpColumnThreshold = 64;
 
-    /// <summary>Needs only a constructible HIP runtime — no rocSPARSE library, which
-    /// is the point of the supply-chain removal.</summary>
-    public static bool IsAvailable => HipBackend.IsHipAvailable;
+    private static readonly object SharedLock = new object();
+    private static readonly object CallLock = new object();
+    private static HipBackend? _shared;
+    private static bool _sharedTried;
+
+    /// <summary>
+    /// The process-lifetime backend these host-array entry points run on, built on first use. A HipBackend compiles
+    /// every kernel module when constructed (about 50 s on an RX 5500 XT), so one per call, as these wrappers used to
+    /// do, made the path unusable. Null unless construction succeeded AND the SpMM kernels actually compiled: the HIP
+    /// runtime seeing a device (HipBackend.IsHipAvailable) does not prove the toolchain can build for its arch.
+    /// </summary>
+    internal static HipBackend? Shared
+    {
+        get
+        {
+            lock (SharedLock)
+            {
+                if (_sharedTried) return _shared;
+                _sharedTried = true;
+                if (!HipBackend.IsHipAvailable) return null;
+                HipBackend? candidate = null;
+                try
+                {
+                    candidate = new HipBackend();
+                    if (candidate.IsAvailable && Array.TrueForAll(RequiredKernels, candidate.HasCompiledKernel))
+                    {
+                        _shared = candidate;
+                        candidate = null;
+                    }
+                    else
+                    {
+                        System.Diagnostics.Trace.TraceWarning(
+                            "HIP custom sparse backend unavailable: the HIP backend did not initialise or did not compile the SpMM kernels.");
+                    }
+                }
+                catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or InvalidOperationException or HipException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"HIP custom sparse backend unavailable ({ex.GetType().Name}): {ex.Message}");
+                }
+                finally
+                {
+                    candidate?.Dispose();
+                }
+                return _shared;
+            }
+        }
+    }
+
+    private static readonly string[] RequiredKernels = { "csr_spmm", "csr_spmm_warp", "csr_spmm_vec4", "csr_spmm_double", "sddmm" };
+
+    /// <summary>
+    /// Whether the managed kernels can run here: a HIP backend that initialised and compiled them. No rocSPARSE library,
+    /// which is the point of the supply-chain removal. The first query builds the shared backend.
+    /// </summary>
+    public static bool IsAvailable => Shared is not null;
 
     /// <summary>CSR · dense → dense, host-side <c>float[]</c> CSR inputs. Warp-per-row
     /// kernel for small/moderate N, 2-D scalar for wide N.</summary>
@@ -40,42 +84,46 @@ internal static class HipCustomSparseBackend
         int[] rowPtr, int[] colIdx, float[] values,
         float[] b, int rows, int cols, int n)
     {
-        if (!IsAvailable)
-            throw new GpuCapabilityUnavailableException("HIP custom-kernel SpMM backend is not available.");
-
-        using var backend = CreateBackend();
-
-        var output = new float[rows * n];
-
-        IGpuBuffer? valuesBuf = null, bBuf = null, outBuf = null;
-        IGpuBuffer? rowPtrBuf = null, colIdxBuf = null;
-        try
+        HipBackend backend = Shared ?? throw new GpuCapabilityUnavailableException("HIP custom-kernel sparse backend is not available.");
+        // One backend, one stream: calls from several threads must not interleave their uploads, launches and downloads.
+        lock (CallLock)
         {
-            valuesBuf = backend.AllocateBuffer(values);
-            bBuf = backend.AllocateBuffer(b);
-            outBuf = backend.AllocateBuffer(output);
-            rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
-            colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
-            UploadInts(rowPtrBuf.Handle, rowPtr);
-            UploadInts(colIdxBuf.Handle, colIdx);
+            var output = new float[rows * n];
 
-            if (n <= WarpColumnThreshold)
-                backend.CsrSpMMWarp(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
-                    rows, cols, n, values.Length);
-            else
-                backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
-                    rows, cols, n, values.Length);
+            IGpuBuffer? valuesBuf = null, bBuf = null, outBuf = null;
+            IGpuBuffer? rowPtrBuf = null, colIdxBuf = null;
+            try
+            {
+                valuesBuf = backend.AllocateBuffer(values);
+                bBuf = backend.AllocateBuffer(b);
+                outBuf = backend.AllocateBuffer(output);
+                rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
+                colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
+                UploadInts(rowPtrBuf.Handle, rowPtr);
+                UploadInts(colIdxBuf.Handle, colIdx);
 
-            backend.DownloadBuffer(outBuf, output);
-            return output;
-        }
-        finally
-        {
-            outBuf?.Dispose();
-            bBuf?.Dispose();
-            valuesBuf?.Dispose();
-            rowPtrBuf?.Dispose();
-            colIdxBuf?.Dispose();
+                // Same pick as CudaSparseBackend: vec4 when N % 4 == 0, warp-per-row for narrow N, else 2-D scalar.
+                if (n % 4 == 0)
+                    backend.CsrSpMMVec4(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
+                        rows, cols, n, values.Length);
+                else if (n <= WarpColumnThreshold)
+                    backend.CsrSpMMWarp(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
+                        rows, cols, n, values.Length);
+                else
+                    backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
+                        rows, cols, n, values.Length);
+
+                backend.DownloadBuffer(outBuf, output);
+                return output;
+            }
+            finally
+            {
+                outBuf?.Dispose();
+                bBuf?.Dispose();
+                valuesBuf?.Dispose();
+                rowPtrBuf?.Dispose();
+                colIdxBuf?.Dispose();
+            }
         }
     }
 
@@ -85,38 +133,38 @@ internal static class HipCustomSparseBackend
         int[] rowIndices, int[] colIndices,
         float[] x, float[] y, int innerK)
     {
-        if (!IsAvailable)
-            throw new GpuCapabilityUnavailableException("HIP custom-kernel SDDMM backend is not available.");
-
-        using var backend = CreateBackend();
-
-        int nnz = rowIndices.Length;
-        var output = new float[nnz];
-        if (nnz == 0) return output;
-
-        IGpuBuffer? rowBuf = null, colBuf = null, xBuf = null, yBuf = null, outBuf = null;
-        try
+        HipBackend backend = Shared ?? throw new GpuCapabilityUnavailableException("HIP custom-kernel sparse backend is not available.");
+        // One backend, one stream: calls from several threads must not interleave their uploads, launches and downloads.
+        lock (CallLock)
         {
-            xBuf = backend.AllocateBuffer(x);
-            yBuf = backend.AllocateBuffer(y);
-            outBuf = backend.AllocateBuffer(output);
-            rowBuf = backend.AllocateByteBuffer(rowIndices.Length * sizeof(int));
-            colBuf = backend.AllocateByteBuffer(colIndices.Length * sizeof(int));
-            UploadInts(rowBuf.Handle, rowIndices);
-            UploadInts(colBuf.Handle, colIndices);
+            int nnz = rowIndices.Length;
+            var output = new float[nnz];
+            if (nnz == 0) return output;
 
-            backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
+            IGpuBuffer? rowBuf = null, colBuf = null, xBuf = null, yBuf = null, outBuf = null;
+            try
+            {
+                xBuf = backend.AllocateBuffer(x);
+                yBuf = backend.AllocateBuffer(y);
+                outBuf = backend.AllocateBuffer(output);
+                rowBuf = backend.AllocateByteBuffer(rowIndices.Length * sizeof(int));
+                colBuf = backend.AllocateByteBuffer(colIndices.Length * sizeof(int));
+                UploadInts(rowBuf.Handle, rowIndices);
+                UploadInts(colBuf.Handle, colIndices);
 
-            backend.DownloadBuffer(outBuf, output);
-            return output;
-        }
-        finally
-        {
-            outBuf?.Dispose();
-            yBuf?.Dispose();
-            xBuf?.Dispose();
-            rowBuf?.Dispose();
-            colBuf?.Dispose();
+                backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
+
+                backend.DownloadBuffer(outBuf, output);
+                return output;
+            }
+            finally
+            {
+                outBuf?.Dispose();
+                yBuf?.Dispose();
+                xBuf?.Dispose();
+                rowBuf?.Dispose();
+                colBuf?.Dispose();
+            }
         }
     }
 
@@ -126,41 +174,41 @@ internal static class HipCustomSparseBackend
         int[] rowPtr, int[] colIdx, double[] values,
         double[] b, int rows, int cols, int n)
     {
-        if (!IsAvailable)
-            throw new GpuCapabilityUnavailableException("HIP custom-kernel SpMM backend is not available.");
-
-        using var backend = CreateBackend();
-
-        var output = new double[rows * n];
-
-        IGpuBuffer? valuesBuf = null, bBuf = null, outBuf = null;
-        IGpuBuffer? rowPtrBuf = null, colIdxBuf = null;
-        try
+        HipBackend backend = Shared ?? throw new GpuCapabilityUnavailableException("HIP custom-kernel sparse backend is not available.");
+        // One backend, one stream: calls from several threads must not interleave their uploads, launches and downloads.
+        lock (CallLock)
         {
-            valuesBuf = backend.AllocateByteBuffer(values.Length * sizeof(double));
-            bBuf = backend.AllocateByteBuffer(b.Length * sizeof(double));
-            outBuf = backend.AllocateByteBuffer(output.Length * sizeof(double));
-            UploadDoubles(valuesBuf.Handle, values);
-            UploadDoubles(bBuf.Handle, b);
+            var output = new double[rows * n];
 
-            rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
-            colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
-            UploadInts(rowPtrBuf.Handle, rowPtr);
-            UploadInts(colIdxBuf.Handle, colIdx);
+            IGpuBuffer? valuesBuf = null, bBuf = null, outBuf = null;
+            IGpuBuffer? rowPtrBuf = null, colIdxBuf = null;
+            try
+            {
+                valuesBuf = backend.AllocateByteBuffer(values.Length * sizeof(double));
+                bBuf = backend.AllocateByteBuffer(b.Length * sizeof(double));
+                outBuf = backend.AllocateByteBuffer(output.Length * sizeof(double));
+                UploadDoubles(valuesBuf.Handle, values);
+                UploadDoubles(bBuf.Handle, b);
 
-            backend.CsrSpMMDouble(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
-                rows, cols, n, values.Length);
+                rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
+                colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
+                UploadInts(rowPtrBuf.Handle, rowPtr);
+                UploadInts(colIdxBuf.Handle, colIdx);
 
-            DownloadDoubles(outBuf.Handle, output);
-            return output;
-        }
-        finally
-        {
-            outBuf?.Dispose();
-            bBuf?.Dispose();
-            valuesBuf?.Dispose();
-            rowPtrBuf?.Dispose();
-            colIdxBuf?.Dispose();
+                backend.CsrSpMMDouble(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
+                    rows, cols, n, values.Length);
+
+                DownloadDoubles(outBuf.Handle, output);
+                return output;
+            }
+            finally
+            {
+                outBuf?.Dispose();
+                bBuf?.Dispose();
+                valuesBuf?.Dispose();
+                rowPtrBuf?.Dispose();
+                colIdxBuf?.Dispose();
+            }
         }
     }
 
@@ -173,20 +221,6 @@ internal static class HipCustomSparseBackend
                 "hipMemcpy(int[])");
     }
 
-    private static HipBackend CreateBackend()
-    {
-        var backend = new HipBackend();
-        if (backend.IsAvailable)
-        {
-            return backend;
-        }
-
-        Exception? initializationException = backend.InitializationException;
-        backend.Dispose();
-        throw new InvalidOperationException(
-            "HIP backend failed to initialise.",
-            initializationException);
-    }
 
     private static unsafe void UploadDoubles(IntPtr device, double[] host)
     {
