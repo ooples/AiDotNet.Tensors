@@ -1363,6 +1363,52 @@ public class GradientCorrectnessTests : IDisposable
         Assert.Equal(24f, g2[3], 2);
     }
 
+    /// <summary>
+    /// Double backward through a class-index gather (the core of a class-index cross-entropy), as a meta-learner
+    /// differentiates its inner-loop gradient. v = gather(x, idx); g1 = d sum(v^2)/dx is 2x on the gathered entries,
+    /// so d sum(g1)/dx is 2 there and 0 elsewhere. The scatter kernel the first backward used records nothing, so the
+    /// second backward lost the edge from the upstream gradient (2v) and saw no dependence on x.
+    /// </summary>
+    [Fact]
+    public void GatherClassValues_DoubleBackward_DifferentiatesTheScatter()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f, 9f }, [3, 3]);
+        var classes = new Tensor<float>(new float[] { 2f, 0f, -1f }, [3]);   // the last row is ignored
+
+        using var tape = new GradientTape<float>();
+        var v = _engine.TensorGatherClassValues(x, classes);
+        var loss1 = _engine.ReduceSum(_engine.TensorMultiply(v, v), axes: null);
+        var g1 = tape.ComputeGradients(loss1, sources: new[] { x }, createGraph: true)[x];
+
+        var first = g1.Contiguous().AsSpan().ToArray();
+        Assert.Equal(new float[] { 0f, 0f, 6f, 8f, 0f, 0f, 0f, 0f, 0f }, first);
+
+        var loss2 = _engine.ReduceSum(g1, axes: null);
+        var grads2 = tape.ComputeGradients(loss2, sources: new[] { x }, createGraph: false);
+        Assert.True(grads2.ContainsKey(x));
+        var second = grads2[x].Contiguous().AsSpan().ToArray();
+        Assert.Equal(new float[] { 0f, 0f, 2f, 2f, 0f, 0f, 0f, 0f, 0f }, second);
+    }
+
+    /// <summary>
+    /// An infinite upstream gradient under create-graph: the selected class gets it and every other class stays exactly
+    /// 0, as the scatter kernel of the plain backward writes. A mask * gradient formulation turned 0 * Inf into NaN at
+    /// every unselected class.
+    /// </summary>
+    [Fact]
+    public void GatherClassValues_CreateGraph_NonFiniteUpstream_LeavesUnselectedClassesZero()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f, 5f, 6f }, [2, 3]);
+        var classes = new Tensor<float>(new float[] { 1f, 2f }, [2]);
+        var scale = new Tensor<float>(new float[] { float.PositiveInfinity, 1f }, [2]);
+
+        using var tape = new GradientTape<float>();
+        var v = _engine.TensorGatherClassValues(x, classes);
+        var loss = _engine.ReduceSum(_engine.TensorMultiply(v, scale), axes: null);   // d loss / d v = [Inf, 1]
+        var g = tape.ComputeGradients(loss, sources: new[] { x }, createGraph: true)[x].Contiguous().AsSpan().ToArray();
+
+        Assert.Equal(new float[] { 0f, float.PositiveInfinity, 0f, 0f, 0f, 1f }, g);
+    }
     // ──────────────────────────────────────────────────────────────
     // Loss function gradient tests
     // ──────────────────────────────────────────────────────────────

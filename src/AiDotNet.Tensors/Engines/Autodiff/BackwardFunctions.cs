@@ -2026,9 +2026,44 @@ internal static class BackwardFunctions<T>
     {
         var classIndices = (Tensor<T>)savedState[0];
         var values = inputs[0];
+
+        // Under create-graph the gradient is itself differentiated (a meta-learner's inner-loop gradient), so it has
+        // to come from recorded ops: the scatter kernel below records nothing, and the outer tape lost the edge from
+        // the upstream gradient (LEO's meta-gradient through a class-index cross-entropy failed in TransposeBackward).
+        // The same scatter as a constant one-hot mask selecting the upstream gradient broadcast over the class axis.
+        if (DifferentiableOps._isBackwardCreateGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, values, ClassValuesGradRecorded(gradOutput, classIndices, values._shape, engine), engine);
+            return;
+        }
+
         var cpu = engine as CpuEngine ?? new CpuEngine();
         var gradValues = cpu.ScatterClassValuesGrad(gradOutput, classIndices, values._shape);
         DifferentiableOps.AccumulateGrad(grads, values, gradValues, engine);
+    }
+
+    private static Tensor<T> ClassValuesGradRecorded(Tensor<T> gradOutput, Tensor<T> classIndices, int[] valuesShape, IEngine engine)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int numClasses = valuesShape[valuesShape.Length - 1];
+        var mask = new Tensor<T>((int[])valuesShape.Clone());
+        var classes = classIndices.IsContiguous ? classIndices : classIndices.Contiguous();
+        for (int row = 0; row < classes.Length; row++)
+        {
+            // The forward's rule (CpuEngine.ClassIndexOf): banker's rounding, NaN or out of range ignores the row.
+            double value = numOps.ToDouble(classes[row]);
+            if (double.IsNaN(value)) continue;
+            double rounded = Math.Round(value);
+            if (rounded >= 0 && rounded < numClasses)
+                mask[row * numClasses + (int)rounded] = numOps.One;
+        }
+
+        var rowShape = (int[])valuesShape.Clone();
+        rowShape[rowShape.Length - 1] = 1;
+        // A recorded select, not mask * gradient: an upstream Inf or NaN would turn 0 * g into NaN at every unselected class,
+        // where ScatterClassValuesGrad (the non-create-graph path) writes exactly 0.
+        var broadcastGrad = engine.TensorBroadcastTo(engine.Reshape(gradOutput, rowShape), (int[])valuesShape.Clone());
+        return engine.TensorWhere(mask, broadcastGrad, new Tensor<T>((int[])valuesShape.Clone()));
     }
 
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
