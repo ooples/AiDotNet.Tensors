@@ -108,7 +108,7 @@ public class CudaSkinnyGemmTests
                 AssertClose(got, i => TransposedAReference(a, b, new float[m * n], m, n, k, 1f, 0f, i), $"replay {replay}");
                 if (replay == 1 && previous is not null)
                     for (int i = 0; i < got.Length; i++)
-                        Assert.Equal(BitConverter.SingleToInt32Bits(previous[i]), BitConverter.SingleToInt32Bits(got[i]));
+                        Assert.Equal(TestHelpers.MathCompat.SingleToInt32Bits(previous[i]), TestHelpers.MathCompat.SingleToInt32Bits(got[i]));
                 previous = got;
             }
         }

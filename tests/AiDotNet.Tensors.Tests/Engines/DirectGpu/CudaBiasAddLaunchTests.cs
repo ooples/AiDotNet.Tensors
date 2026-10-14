@@ -62,7 +62,7 @@ public class CudaBiasAddLaunchTests
         var got = backend.DownloadBuffer(fused);
         var expected = backend.DownloadBuffer(separate);
         for (int i = 0; i < n; i++)
-            if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(expected[i]))
+            if (TestHelpers.MathCompat.SingleToInt32Bits(got[i]) != TestHelpers.MathCompat.SingleToInt32Bits(expected[i]))
                 Assert.Fail($"element {i}: fused {got[i]} != separate {expected[i]}");
     }
 
