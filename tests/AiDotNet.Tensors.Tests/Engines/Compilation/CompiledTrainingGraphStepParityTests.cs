@@ -658,12 +658,19 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// GEMMs write straight into the gradient buffers, overwriting on a buffer's first contribution of the step and
     /// adding on the later one (GEMM beta 0 / 1); a step that overwrote where it should add, or added onto the previous
     /// step's stale gradient, would still agree with its own eager twin, so only the tape can catch it.
+    /// <para>The residual network covers the plan's other shortcut: a residual branch's output is used only by the
+    /// add, so its gradient buffer IS the add's output gradient (no copy), while the residual stream's gets a copy
+    /// plus the branch's contribution.</para>
     /// </summary>
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Every_step_computes_the_tape_gradient_when_a_gradient_has_two_contributions(bool capture)
+    [InlineData(false, TwoPathNetwork.SharedWeightAndFanOut)]
+    [InlineData(true, TwoPathNetwork.SharedWeightAndFanOut)]
+    [InlineData(false, TwoPathNetwork.Residual)]
+    [InlineData(true, TwoPathNetwork.Residual)]
+    public void Every_step_computes_the_tape_gradient_when_a_gradient_has_two_contributions(bool capture, TwoPathNetwork network)
     {
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss =
+            network == TwoPathNetwork.Residual ? ResidualLoss : SharedLoss;
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
         {
@@ -677,13 +684,16 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             }
             var x = Rand([Batch, Inputs], 1, 1f);
             var y = Rand([Batch, Outputs], 2, 1f);
-            var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) };
+            var parameters = network == TwoPathNetwork.Residual
+                ? new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Hidden], 6, 0.3f),
+                    Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) }
+                : new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) };
             foreach (var p in parameters) p.Gpu();
 
             ICompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.EnableTraining(parameters))
             {
-                SharedLoss(gpu, x, y, parameters);
+                loss(gpu, x, y, parameters);
                 plan = scope.CompileTraining(parameters);
             }
             using (plan)
@@ -697,7 +707,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 for (int s = 0; s < Steps; s++)
                 {
                     FeedBatch(x, y, s);
-                    var expected = CpuTapeGradients(x, y, parameters, SharedLoss);
+                    var expected = CpuTapeGradients(x, y, parameters, loss);
                     plan.Step();
                     for (int p = 0; p < parameters.Length; p++)
                     {
@@ -733,6 +743,24 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
         var pred = e.TensorAdd(e.FusedLinear(h, w[2], w[3], FusedActivationType.None), e.TensorMatMul(h, w[2]));
         return e.TensorMSELoss(pred, y);
+    }
+
+    /// <summary>MSE of a residual block's projection: <c>r = h + ReLU(h · w2 + b2)</c>, <c>pred = r · w4 + b4</c>, with
+    /// <c>h = ReLU(x · w0 + b0)</c>.</summary>
+    private static Tensor<float> ResidualLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var r = e.TensorAdd(h, e.FusedLinear(h, w[2], w[3], FusedActivationType.ReLU));
+        return e.TensorMSELoss(e.FusedLinear(r, w[4], w[5], FusedActivationType.None), y);
+    }
+
+    /// <summary>Networks in which some gradient receives two contributions per step.</summary>
+    public enum TwoPathNetwork
+    {
+        /// <summary>An activation feeding two layers; a weight shared by a linear and a matmul.</summary>
+        SharedWeightAndFanOut,
+        /// <summary>A residual block: the stream gets the add's gradient plus the branch's.</summary>
+        Residual,
     }
 
     /// <summary>

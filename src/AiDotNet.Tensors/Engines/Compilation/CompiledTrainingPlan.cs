@@ -939,6 +939,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <paramref name="deviceAliases"/> with the gradient it views; the GPU step binds the view to that gradient's
     /// device buffer. On the parity Transformer (CUDA) the skipped reshape backwards were 25 of the captured step's
     /// 92 device-to-device copies.</para>
+    /// <para>The same holds for each same-shape operand of an elementwise add (see the loop).</para>
     /// </summary>
     private static HashSet<CompiledStep<T>>? AliasReshapeViewGradients(
         List<CompiledStep<T>> forwardSteps,
@@ -957,30 +958,53 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             var step = forwardSteps[i];
-            if (step.OpName != "Reshape" || step.Inputs.Length != 1) continue;
-            var input = step.Inputs[0];
+            bool reshape = step.OpName == "Reshape" && step.Inputs.Length == 1;
+            // An elementwise add's backward hands each operand the output gradient unchanged, so an operand used only
+            // here (a residual branch's output) can view it too. Its step still runs for an operand that cannot (the
+            // residual stream itself, which has a second consumer); the aliased operand's write is then a no-op
+            // (CopyFirstWrite / the specialized add skip a copy onto itself). On the parity Transformer (CUDA) these
+            // were 4 of the captured step's 512 KB device-to-device copies.
+            bool add = step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
+                && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
+            if (!reshape && !add) continue;
             var output = step.OutputBuffer;
-            if (input is null || parameterSet.Contains(input)) continue;
-            if (!consumerCount.TryGetValue(input, out int consumers) || consumers != 1) continue;
-            // The backward is Reshape(gradOutput, inputShape) whether or not the forward shared storage: a GPU engine
-            // materializes its reshape output, so only the host path keeps the view requirement it was measured with.
-            if ((!device && !input.SharesStorageWith(output)) || input.Length != output.Length) continue;
             if (!gradMap.TryGetValue(output, out var outputGrad) || !outputGrad.IsContiguous) continue;
-            if (!gradMap.TryGetValue(input, out var ownGrad)) continue;
-            var view = outputGrad.ReshapeViewUnrecorded(input._shape);
-            gradMap[input] = view;
-            dropped.Add(ownGrad);
-            if (device)
+            int aliasedInputs = 0;
+            foreach (var input in step.Inputs)
             {
-                // A chain of reshapes collapses onto the last one's buffer: bind to the gradient the output's own
-                // gradient views, if it is itself a view, so every view resolves to one physical buffer.
-                var target = outputGrad;
-                if (deviceAliases is not null)
-                    foreach (var (v, t) in deviceAliases)
-                        if (ReferenceEquals(v, outputGrad)) { target = t; break; }
-                (deviceAliases ??= new List<(Tensor<T> View, Tensor<T> Target)>()).Add((view, target));
+                if (input is null || parameterSet.Contains(input)) continue;
+                if (!consumerCount.TryGetValue(input, out int consumers) || consumers != 1) continue;
+                if (reshape)
+                {
+                    // The backward is Reshape(gradOutput, inputShape) whether or not the forward shared storage: a GPU
+                    // engine materializes its reshape output, so only the host path keeps the view requirement it was
+                    // measured with.
+                    if ((!device && !input.SharesStorageWith(output)) || input.Length != output.Length) continue;
+                }
+                else if (!input._shape.SequenceEqual(output._shape) || outputGrad._storageOffset != 0)
+                {
+                    // A broadcast operand's gradient is a reduction of the output gradient, not the output gradient.
+                    continue;
+                }
+                if (!gradMap.TryGetValue(input, out var ownGrad)) continue;
+                var view = outputGrad.ReshapeViewUnrecorded(input._shape);
+                gradMap[input] = view;
+                dropped.Add(ownGrad);
+                aliasedInputs++;
+                if (device)
+                {
+                    // A chain of views collapses onto the last one's buffer: bind to the gradient the output's own
+                    // gradient views, if it is itself a view, so every view resolves to one physical buffer.
+                    var target = outputGrad;
+                    if (deviceAliases is not null)
+                        foreach (var (v, t) in deviceAliases)
+                            if (ReferenceEquals(v, outputGrad)) { target = t; break; }
+                    (deviceAliases ??= new List<(Tensor<T> View, Tensor<T> Target)>()).Add((view, target));
+                }
             }
-            (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
+            // A step every operand of which views the output gradient has nothing left to do.
+            if (aliasedInputs == step.Inputs.Length)
+                (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
         }
         if (dropped.Count > 0)
             allGrads.RemoveAll(g => dropped.Contains(g));
@@ -10924,12 +10948,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     var g = TryGetLiveFloatBacking(gradOut)!;
                     var ga = TryGetLiveFloatBacking(gradA)!;
                     var gb = TryGetLiveFloatBacking(gradB)!;
+                    // An operand whose gradient views gradOut (AliasReshapeViewGradients) already holds it.
+                    bool skipA = !accumA && ReferenceEquals(ga, g) && gradA._storageOffset == gradOut._storageOffset;
+                    bool skipB = !accumB && ReferenceEquals(gb, g) && gradB._storageOffset == gradOut._storageOffset;
                     int chunks = Math.Max(1, (addLen + ReluChunkElements - 1) / ReluChunkElements);
                     CpuParallelSettings.ParallelForOrSerial(0, chunks, 2L * addLen, c =>
                     {
                         int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, addLen - start);
-                        AddOrCopy(g, ga, start, count, accumA);
-                        AddOrCopy(g, gb, start, count, accumB);
+                        if (!skipA) AddOrCopy(g, ga, start, count, accumA);
+                        if (!skipB) AddOrCopy(g, gb, start, count, accumB);
                     }, deterministicSafe: true);
                     inputA.Grad = gradA;
                     inputB.Grad = gradB;

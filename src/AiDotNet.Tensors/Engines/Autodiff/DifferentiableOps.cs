@@ -669,9 +669,24 @@ internal static class DifferentiableOps
             buffer._gradWriteGeneration = GradWriteGeneration;
             ReplaceAccumulatorBufferOwner(tensor, previous, buffer);
         }
-        if (!ReferenceEquals(contribution, buffer))
+        if (!ReferenceEquals(contribution, buffer) && !IsSameDenseRegion(contribution, buffer))
             engine.TensorCopy(contribution, buffer);
         return buffer;
+    }
+
+    /// <summary>True when <paramref name="a"/> and <paramref name="b"/> are the same elements: one contiguous region of
+    /// one storage and, where either is bound to a device buffer, the same device buffer. A compiled plan makes an
+    /// operand's gradient a view of an add's output gradient (CompiledTrainingPlan.AliasReshapeViewGradients), so the
+    /// add's backward then "copies" that gradient onto itself.</summary>
+    private static bool IsSameDenseRegion<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (!a.IsContiguous || !b.IsContiguous || a.Length != b.Length || a._storageOffset != b._storageOffset
+            || !a.SharesStorageWith(b))
+            return false;
+        var deviceA = a.TryGetGpuBuffer();
+        var deviceB = b.TryGetGpuBuffer();
+        if (deviceA is null && deviceB is null) return !a.HasPendingGpuData && !b.HasPendingGpuData;
+        return deviceA is not null && deviceB is not null && deviceA.Handle == deviceB.Handle;
     }
 
     internal static bool AccumulateGradPoolable<T>(
