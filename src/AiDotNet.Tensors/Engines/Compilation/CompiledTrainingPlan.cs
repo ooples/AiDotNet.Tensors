@@ -948,9 +948,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         IEngine engine,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         List<Tensor<T>> allGrads,
+        bool staticReverseBackward,
         out List<(Tensor<T> View, Tensor<T> Target)>? deviceAliases)
     {
         deviceAliases = null;
+        // The buffer each aliased gradient is ultimately a view of.
+        var rootOf = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         bool device = engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine;
         HashSet<CompiledStep<T>>? aliased = null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
@@ -989,6 +992,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (!gradMap.TryGetValue(input, out var ownGrad)) continue;
                 var view = outputGrad.ReshapeViewUnrecorded(input._shape);
                 gradMap[input] = view;
+                rootOf[view] = rootOf.TryGetValue(outputGrad, out var outputRoot) ? outputRoot : outputGrad;
                 dropped.Add(ownGrad);
                 aliasedInputs++;
                 if (device)
@@ -1006,10 +1010,145 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (aliasedInputs == step.Inputs.Length)
                 (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
         }
+        if (staticReverseBackward)
+            AliasMultiConsumerPassThroughs(forwardSteps, parameterSet, device, gradMap, dropped, rootOf, ref deviceAliases);
         if (dropped.Count > 0)
             allGrads.RemoveAll(g => dropped.Contains(g));
         return aliased;
     }
+
+    /// <summary>
+    /// The multi-consumer case <see cref="AliasReshapeViewGradients"/> leaves: an add operand or a reshaped tensor that
+    /// also feeds other steps -- a Transformer's residual stream, read by the residual add and by the next LayerNorm.
+    /// Its gradient's first contribution is the pass-through's output gradient, copied in (512 KB per residual add on
+    /// the parity Transformer), and the other consumers add onto it. When the backward runs in exact reverse forward
+    /// order, the input's gradient can be the output gradient's buffer instead, provided
+    /// <list type="bullet">
+    /// <item>every other consumer of the input precedes the pass-through (their contributions land after it), and</item>
+    /// <item>every step that reads that buffer as its own output gradient comes after all those consumers in forward
+    /// order -- so each reads before any of them adds into it.</item>
+    /// </list>
+    /// and every contribution an earlier merge added to the buffer has landed before the pass-through reads it (its
+    /// consumer precedes the pass-through in reverse order), so a residual stream's chain of adds shares one buffer.
+    /// The pass-through's backward still runs (an identity accumulate that only marks the buffer written this step, so
+    /// the later consumers add rather than overwrite). Gradients that were views of the input's own buffer follow it.
+    /// </summary>
+    private static void AliasMultiConsumerPassThroughs(
+        List<CompiledStep<T>> forwardSteps,
+        HashSet<Tensor<T>> parameterSet,
+        bool device,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        HashSet<Tensor<T>> dropped,
+        Dictionary<Tensor<T>, Tensor<T>> rootOf,
+        ref List<(Tensor<T> View, Tensor<T> Target)>? deviceAliases)
+    {
+        var cmp = ReferenceEqualityComparer<Tensor<T>>.Instance;
+        Tensor<T> Root(Tensor<T> g) => rootOf.TryGetValue(g, out var r) ? r : g;
+
+        var consumers = new Dictionary<Tensor<T>, List<int>>(cmp);
+        var producer = new Dictionary<Tensor<T>, int>(cmp);
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            var step = forwardSteps[i];
+            producer[step.OutputBuffer] = i;
+            foreach (var input in step.Inputs)
+            {
+                if (input is null) continue;
+                if (!consumers.TryGetValue(input, out var list)) consumers[input] = list = new List<int>();
+                list.Add(i);
+            }
+        }
+        // Per root buffer, the lowest forward index whose step reads it as its output gradient: reads run in
+        // decreasing index order, so that is the buffer's last read.
+        var lastRead = new Dictionary<Tensor<T>, int>(cmp);
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            if (!gradMap.TryGetValue(forwardSteps[i].OutputBuffer, out var g)) continue;
+            var r = Root(g);
+            if (!lastRead.TryGetValue(r, out int k) || i < k) lastRead[r] = i;
+        }
+        // Per root buffer, the lowest forward index among the merged inputs' other consumers: their contributions land
+        // in decreasing index order, so that is the last write into the buffer from a merge.
+        var lastMergedWrite = new Dictionary<Tensor<T>, int>(cmp);
+
+        for (int a = forwardSteps.Count - 1; a >= 0; a--)
+        {
+            var step = forwardSteps[a];
+            bool reshape = step.OpName == "Reshape" && step.Inputs.Length == 1;
+            bool add = step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
+                && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
+            if (!reshape && !add) continue;
+            var output = step.OutputBuffer;
+            if (!gradMap.TryGetValue(output, out var outputGrad) || !outputGrad.IsContiguous) continue;
+            var root = Root(outputGrad);
+            if (!lastRead.TryGetValue(root, out int earliestRead)) continue;
+            if (lastMergedWrite.TryGetValue(root, out int mergedWrite) && mergedWrite <= a) continue;
+            foreach (var x in step.Inputs)
+            {
+                if (x is null || parameterSet.Contains(x) || !producer.ContainsKey(x)) continue;
+                if (!consumers.TryGetValue(x, out var users) || users.Count < 2) continue;
+                if (!gradMap.TryGetValue(x, out var ownGrad) || rootOf.ContainsKey(ownGrad)) continue;
+                if (reshape)
+                {
+                    if (x.Length != output.Length || (!device && !x.SharesStorageWith(output))) continue;
+                }
+                else if (!x._shape.SequenceEqual(output._shape) || outputGrad._storageOffset != 0)
+                {
+                    continue;
+                }
+                int latestOther = -1, earliestOther = int.MaxValue, uses = 0;
+                foreach (int j in users)
+                {
+                    if (j == a) { uses++; continue; }
+                    latestOther = Math.Max(latestOther, j);
+                    earliestOther = Math.Min(earliestOther, j);
+                }
+                // The pass-through itself reads this buffer (earliestRead <= a), so this also puts every other consumer before it.
+                bool safe = uses == 1 && earliestRead > latestOther;
+                if (s_graphStepDiagnosticsEnabled)
+                {
+                    try
+                    {
+                        System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"),
+                            $"[MULTI-ALIAS] step {a} {step.OpName} input len={x.Length}: uses={uses} latestOther={latestOther} "
+                            + $"lastRead={earliestRead} -> {(safe ? "merged" : "kept")}" + System.Environment.NewLine);
+                    }
+                    catch { /* diagnostic must never break compilation */ }
+                }
+                if (!safe) continue;
+
+                var target = outputGrad;
+                if (deviceAliases is not null)
+                    foreach (var (v, tg) in deviceAliases)
+                        if (ReferenceEquals(v, outputGrad)) { target = tg; break; }
+                var view = outputGrad.ReshapeViewUnrecorded(x._shape);
+                gradMap[x] = view;
+                rootOf[view] = root;
+                if (device) (deviceAliases ??= new List<(Tensor<T> View, Tensor<T> Target)>()).Add((view, target));
+                // Gradients that were views of x's own buffer (its reshape chain) now view the shared one.
+                foreach (var dependent in gradMap.Keys.ToList())
+                {
+                    var g = gradMap[dependent];
+                    if (ReferenceEquals(dependent, x) || !rootOf.TryGetValue(g, out var r) || !ReferenceEquals(r, ownGrad))
+                        continue;
+                    var moved = view.ReshapeViewUnrecorded(dependent._shape);
+                    gradMap[dependent] = moved;
+                    if (producer.TryGetValue(dependent, out int dp) && dp < earliestRead) earliestRead = dp;
+                    rootOf.Remove(g);
+                    rootOf[moved] = root;
+                    if (deviceAliases is not null)
+                        for (int d = 0; d < deviceAliases.Count; d++)
+                            if (ReferenceEquals(deviceAliases[d].View, g)) deviceAliases[d] = (moved, target);
+                }
+                dropped.Add(ownGrad);
+                // x's producer (and its view chain's, above) now read this buffer; x's other consumers write into it.
+                lastRead[root] = Math.Min(earliestRead, producer[x]);
+                lastMergedWrite[root] = lastMergedWrite.TryGetValue(root, out int w) ? Math.Min(w, earliestOther) : earliestOther;
+                break;
+            }
+        }
+    }
+
 
     private static int[][] BuildPooledGradMap(
         System.Collections.Generic.HashSet<Tensor<T>> allTensors,
@@ -7335,8 +7474,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 gradMap[tensor] = grad;
                 allGrads.Add(grad);
             }
+            // The multi-consumer merge relies on the backward running in exact reverse forward order, which holds on
+            // the GPU generic path (no dataflow fusion, no host specializations appended out of order).
+            bool staticReverseBackward = engine.SupportsGpu
+                && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
             aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, parameters, consumerCount, engine, gradMap, allGrads,
-                out aliasedGradViews);
+                staticReverseBackward, out aliasedGradViews);
         }
 
         // #1624 prototype: quantify how much the per-traced-tensor gradient buffer

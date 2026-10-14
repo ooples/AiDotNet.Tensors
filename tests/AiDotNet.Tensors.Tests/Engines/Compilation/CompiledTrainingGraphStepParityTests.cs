@@ -688,6 +688,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [InlineData(true, TwoPathNetwork.StandaloneRelu)]
     [InlineData(false, TwoPathNetwork.Pooling)]
     [InlineData(true, TwoPathNetwork.Pooling)]
+    [InlineData(false, TwoPathNetwork.PreNormResidualStream)]
+    [InlineData(true, TwoPathNetwork.PreNormResidualStream)]
+    [InlineData(false, TwoPathNetwork.ResidualReadAfterFanOut)]
+    [InlineData(true, TwoPathNetwork.ResidualReadAfterFanOut)]
     public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
         Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
@@ -699,6 +703,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             TwoPathNetwork.SoftmaxCrossEntropy => SoftmaxCrossEntropyLoss,
             TwoPathNetwork.StandaloneRelu => StandaloneReluLoss,
             TwoPathNetwork.Pooling => PoolingLoss,
+            TwoPathNetwork.PreNormResidualStream => PreNormResidualStreamLoss,
+            TwoPathNetwork.ResidualReadAfterFanOut => ResidualReadAfterFanOutLoss,
             _ => SharedLoss,
         };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
@@ -725,6 +731,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 TwoPathNetwork.StandaloneRelu => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
                     Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f),
                     Rand([Hidden, Outputs], 11, 0.3f) },
+                TwoPathNetwork.ResidualReadAfterFanOut => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Hidden], 12, 0.3f), Rand([Hidden], 13, 0.1f),
+                    Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([Hidden, Outputs], 11, 0.3f) },
+                TwoPathNetwork.PreNormResidualStream => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Ones(Hidden, 8, 0.2f), Rand([Hidden], 9, 0.1f), Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f),
+                    Rand([Hidden, Hidden], 12, 0.3f), Rand([Hidden], 13, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
                 TwoPathNetwork.Pooling => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
                     Rand([8, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([6, Outputs], 11, 0.3f) },
                 TwoPathNetwork.WideLogSoftmax => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
@@ -874,6 +886,31 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorMSELoss(pred, y);
     }
 
+    /// <summary>MSE of a projection of two pre-norm residual blocks, <c>r1 = h + LN(h) · w4 + b5</c> and
+    /// <c>r2 = r1 + LN(r1) · w6 + b7</c> (one LayerNorm shared), with <c>h = ReLU(x · w0 + b1)</c>: the residual stream feeds
+    /// each add and the next LayerNorm, as a Transformer's does. On the GPU the stream's gradients share the adds' output
+    /// gradient buffers (AliasMultiConsumerPassThroughs), the LayerNorms adding into them after the branches read them.</summary>
+    private static Tensor<float> PreNormResidualStreamLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var r1 = e.TensorAdd(h, e.FusedLinear(e.LayerNorm(h, w[2], w[3], 1e-5, out _, out _), w[4], w[5], FusedActivationType.None));
+        var r2 = e.TensorAdd(r1, e.FusedLinear(e.LayerNorm(r1, w[2], w[3], 1e-5, out _, out _), w[6], w[7], FusedActivationType.None));
+        return e.TensorMSELoss(e.FusedLinear(r2, w[8], w[9], FusedActivationType.None), y);
+    }
+
+    /// <summary>MSE of <c>r · w6 + b7 + g · w8 + b7</c> with <c>f = h · w2 + b3</c>, <c>g = h · w4 + b5</c> recorded after f, and
+    /// <c>r = h + f</c>, for <c>h = ReLU(x · w0 + b1)</c>: f's backward reads r's gradient AFTER g's adds h's contribution, so
+    /// h's gradient must not share r's buffer (it would hand f a gradient with g's contribution in it).</summary>
+    private static Tensor<float> ResidualReadAfterFanOutLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var f = e.FusedLinear(h, w[2], w[3], FusedActivationType.None);
+        var g = e.FusedLinear(h, w[4], w[5], FusedActivationType.None);
+        var r = e.TensorAdd(h, f);
+        var pred = e.TensorAdd(e.FusedLinear(r, w[6], w[7], FusedActivationType.None), e.FusedLinear(g, w[8], w[7], FusedActivationType.None));
+        return e.TensorMSELoss(pred, y);
+    }
+
     // A LayerNorm gain near one: 1 + noise.
     private static Tensor<float> Ones(int length, int seed, float noise)
     {
@@ -901,6 +938,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         StandaloneRelu,
         /// <summary>A middle-axis mean and a trailing-axis sum of one activation: broadcast gradients, written then added.</summary>
         Pooling,
+        /// <summary>Two pre-norm residual blocks: the residual stream feeds each add and the next LayerNorm.</summary>
+        PreNormResidualStream,
+        /// <summary>A residual add whose branch is read after another consumer of the stream added into it.</summary>
+        ResidualReadAfterFanOut,
     }
 
     /// <summary>
