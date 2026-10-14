@@ -660,17 +660,25 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// step's stale gradient, would still agree with its own eager twin, so only the tape can catch it.
     /// <para>The residual network covers the plan's other shortcut: a residual branch's output is used only by the
     /// add, so its gradient buffer IS the add's output gradient (no copy), while the residual stream's gets a copy
-    /// plus the branch's contribution.</para>
+    /// plus the branch's contribution. The wide log-softmax network covers the step's pooled scratch: a log-softmax
+    /// over more classes than the fused kernel takes is composed from row reductions whose scratch buffers the step
+    /// reuses every replay.</para>
     /// </summary>
     [SkippableTheory]
     [InlineData(false, TwoPathNetwork.SharedWeightAndFanOut)]
     [InlineData(true, TwoPathNetwork.SharedWeightAndFanOut)]
     [InlineData(false, TwoPathNetwork.Residual)]
     [InlineData(true, TwoPathNetwork.Residual)]
-    public void Every_step_computes_the_tape_gradient_when_a_gradient_has_two_contributions(bool capture, TwoPathNetwork network)
+    [InlineData(false, TwoPathNetwork.WideLogSoftmax)]
+    [InlineData(true, TwoPathNetwork.WideLogSoftmax)]
+    public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
-        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss =
-            network == TwoPathNetwork.Residual ? ResidualLoss : SharedLoss;
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
+        {
+            TwoPathNetwork.Residual => ResidualLoss,
+            TwoPathNetwork.WideLogSoftmax => WideLogSoftmaxLoss,
+            _ => SharedLoss,
+        };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
         {
@@ -684,10 +692,14 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             }
             var x = Rand([Batch, Inputs], 1, 1f);
             var y = Rand([Batch, Outputs], 2, 1f);
-            var parameters = network == TwoPathNetwork.Residual
-                ? new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Hidden], 6, 0.3f),
-                    Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) }
-                : new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) };
+            var parameters = network switch
+            {
+                TwoPathNetwork.Residual => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
+                    Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+                TwoPathNetwork.WideLogSoftmax => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
+                    Rand([Hidden, WideClasses], 6, 0.3f), Rand([WideClasses], 7, 0.1f), Rand([WideClasses, Outputs], 4, 0.1f), Rand([Outputs], 5, 0.1f) },
+                _ => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+            };
             foreach (var p in parameters) p.Gpu();
 
             ICompiledTrainingPlan<float> plan;
@@ -754,13 +766,28 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorMSELoss(e.FusedLinear(r, w[4], w[5], FusedActivationType.None), y);
     }
 
-    /// <summary>Networks in which some gradient receives two contributions per step.</summary>
+    // Wider than DirectGpuTensorEngine's fused log-softmax row limit (256), so the GPU step composes it from row
+    // reductions whose scratch comes from the step's pool.
+    private const int WideClasses = 300;
+
+    /// <summary>MSE of a projection of <c>LogSoftmax(h · w2 + b2)</c> over <see cref="WideClasses"/> classes, with
+    /// <c>h = ReLU(x · w0 + b0)</c>.</summary>
+    private static Tensor<float> WideLogSoftmaxLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var logProbabilities = e.TensorLogSoftmax(e.FusedLinear(h, w[2], w[3], FusedActivationType.None), 1);
+        return e.TensorMSELoss(e.FusedLinear(logProbabilities, w[4], w[5], FusedActivationType.None), y);
+    }
+
+    /// <summary>Networks whose gradients the compiled GPU step forms through a shortcut the eager tape does not take.</summary>
     public enum TwoPathNetwork
     {
         /// <summary>An activation feeding two layers; a weight shared by a linear and a matmul.</summary>
         SharedWeightAndFanOut,
         /// <summary>A residual block: the stream gets the add's gradient plus the branch's.</summary>
         Residual,
+        /// <summary>A log-softmax over more classes than the fused kernel takes (pooled composed path).</summary>
+        WideLogSoftmax,
     }
 
     /// <summary>

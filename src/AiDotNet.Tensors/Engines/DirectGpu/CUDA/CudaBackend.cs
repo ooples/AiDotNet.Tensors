@@ -3836,21 +3836,25 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add_out");
 
+        if (M <= 0 || N <= 0) return;
         using var _ = PushContext();
-        uint gridX = (uint)((N + DefaultBlockSize - 1) / DefaultBlockSize);
-        uint gridY = (uint)M;
         IntPtr aPtr = A.Handle;
         IntPtr biasPtr = bias.Handle;
         IntPtr cPtr = C.Handle;
         int rows = M;
         int cols = N;
-        void** args = stackalloc void*[5];
+        int vec4 = (N & 3) == 0 && ((aPtr.ToInt64() | biasPtr.ToInt64() | cPtr.ToInt64()) & 15) == 0 ? 1 : 0;
+        long items = vec4 == 1 ? (long)M * N / 4 : (long)M * N;
+        // Grid-stride: enough blocks to fill the device, never more than the work.
+        uint grid = (uint)Math.Min((items + DefaultBlockSize - 1) / DefaultBlockSize, 65535L);
+        void** args = stackalloc void*[6];
         args[0] = &aPtr;
         args[1] = &biasPtr;
         args[2] = &cPtr;
         args[3] = &rows;
         args[4] = &cols;
-        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
+        args[5] = &vec4;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     /// <summary>

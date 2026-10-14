@@ -1119,14 +1119,30 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__
     data[row * cols + col] += __ldg(&bias[col]);
 }
 
-// Bias add with separate output: C[i,j] = A[i,j] + bias[j]
-extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __restrict__ A, const float* __restrict__ bias, float* __restrict__ C, int rows, int cols)
+// Bias add with separate output: C[i,j] = A[i,j] + bias[j], over the flat [rows * cols] range (grid-stride). One block
+// per row left most of a block idle for a linear layer's 64-128 columns (~80 GB/s on a GTX 1660 Ti). With cols % 4 == 0
+// (and 16-byte aligned A and C, which the caller checks) each thread moves a float4: vec4 = 1.
+extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __restrict__ A, const float* __restrict__ bias, float* __restrict__ C, int rows, int cols, int vec4)
 {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y;
-    if (col >= cols || row >= rows) return;
-    int idx = row * cols + col;
-    C[idx] = A[idx] + __ldg(&bias[col]);
+    long long stride = (long long)gridDim.x * blockDim.x;
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec4)
+    {
+        long long total4 = (long long)rows * cols / 4;
+        int cols4 = cols / 4;
+        const float4* a4 = (const float4*)A;
+        const float4* b4 = (const float4*)bias;
+        float4* c4 = (float4*)C;
+        for (; i < total4; i += stride)
+        {
+            float4 a = a4[i], b = __ldg(&b4[i % cols4]);
+            c4[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+        }
+        return;
+    }
+    long long total = (long long)rows * cols;
+    for (; i < total; i += stride)
+        C[i] = A[i] + __ldg(&bias[i % cols]);
 }
 
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]

@@ -999,20 +999,22 @@ public partial class DirectGpuTensorEngine
         Action<IGpuBuffer> dispatch,
         bool fullyWritten = false)
     {
-        IGpuBuffer? output = null;
+        // Inside a compiled step's action the output comes from the step's scratch pool (a stable buffer, no allocation
+        // node in a captured graph); otherwise it is a fresh buffer the result owns.
+        var output = fullyWritten ? AllocateFullyWrittenOutputBuffer(backend, elementCount) : AllocateOutputBuffer(backend, elementCount);
         bool handedOff = false;
         try
         {
-            output = fullyWritten ? AllocateDeviceBufferUninitialized(backend, elementCount) : backend.AllocateBuffer(elementCount);
-            dispatch(output);
-            var result = DeferTensorResult<T>(backend, output, elementCount, shape);
+            dispatch(output.Buffer);
+            var result = DeferTensorResult<T>(backend, output.Buffer, elementCount, shape);
+            output.RelinquishOwnership();
             handedOff = true;
             return result;
         }
         finally
         {
             if (!handedOff)
-                output?.Dispose();
+                output.Dispose();
         }
     }
 

@@ -26566,16 +26566,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         for (int d = axis + 1; d < tensor.Rank; d++) inner = checked(inner * tensor.Shape._dims[d]);
         int total = checked(tensor.Length * repeats);
 
-        IGpuBuffer? output = null;
-        bool handedOff = false;
+        OwnedBuffer output = default;
+        bool allocated = false, handedOff = false;
         try
         {
             var input = UploadTensorRaw(backend, tensor);
-            output = backend.AllocateBuffer(total);
-            backend.TileAxis(input, output, outer, axisSize, inner, repeats);
+            // TileAxis writes every element; inside a compiled step's action this is a pooled buffer, not a graph
+            // allocation node.
+            output = AllocateFullyWrittenOutputBuffer(backend, total);
+            allocated = true;
+            backend.TileAxis(input, output.Buffer, outer, axisSize, inner, repeats);
             var outShape = (int[])tensor.Shape._dims.Clone();
             outShape[axis] = checked(axisSize * repeats);
-            var result = DeferTensorResult<T>(backend, output, total, outShape);
+            var result = DeferTensorResult<T>(backend, output.Buffer, total, outShape);
+            output.RelinquishOwnership();
             handedOff = true;
             return result;
         }
@@ -26586,7 +26590,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            if (!handedOff) output?.Dispose();
+            if (allocated && !handedOff) output.Dispose();
         }
     }
 
@@ -27794,6 +27798,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return Softmax(tensor, axis);
     }
 
+    // The batch interface's LogSoftmax kernels give each row one thread, which beats the eight-kernel composition only
+    // while rows are short (a classifier's classes); a vocabulary-sized row keeps the parallel composition.
+    private const int FusedLogSoftmaxMaxRowLength = 256;
+
     Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
         // No IsTapeActive bail: the GPU result records the same LogSoftmax tape node as CpuEngine, so training keeps
@@ -27816,23 +27824,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     bool handedOff = false;
                     try
                     {
-                        // Per-ROW values are expanded across the row with TileAxis and subtracted elementwise:
-                        // BroadcastSubLast broadcasts along the last axis (one value per COLUMN), and the per-row
-                        // broadcast kernels are only on the optional IGpuBatchExecution interface.
-                        using var rowMax = backend.AllocateBuffer(outerSize);
-                        using var rowValues = backend.AllocateBuffer(tensor.Length);
-                        using var shifted = backend.AllocateBuffer(tensor.Length);
-                        using var expShifted = backend.AllocateBuffer(tensor.Length);
-                        using var rowSum = backend.AllocateBuffer(outerSize);
-                        using var logSum = backend.AllocateBuffer(outerSize);
-                        backend.MaxAxis(input.Buffer, rowMax, outerSize, features);
-                        backend.TileAxis(rowMax, rowValues, outerSize, 1, 1, features);
-                        backend.Subtract(input.Buffer, rowValues, shifted, tensor.Length);
-                        backend.Exp(shifted, expShifted, tensor.Length);
-                        backend.SumAxis(expShifted, rowSum, outerSize, features);
-                        backend.Log(rowSum, logSum, outerSize);
-                        backend.TileAxis(logSum, rowValues, outerSize, 1, 1, features);
-                        backend.Subtract(shifted, rowValues, output.Buffer, tensor.Length);
+                        if (features <= FusedLogSoftmaxMaxRowLength && TryGetBatchBackend(out var batch))
+                        {
+                            // One kernel, the same stable form, no scratch: a classifier's [batch, classes] loss head was
+                            // eight kernels and six scratch allocations -- twelve allocation nodes in a captured step.
+                            batch.LogSoftmax(input.Buffer, output.Buffer, outerSize, features);
+                        }
+                        else
+                        {
+                            // Per-ROW values are expanded across the row with TileAxis and subtracted elementwise:
+                            // BroadcastSubLast broadcasts along the last axis (one value per COLUMN), and the per-row
+                            // broadcast kernels are only on the optional IGpuBatchExecution interface. Every scratch
+                            // below is fully written; inside a compiled step it comes from the step's scratch pool
+                            // (owned there, not disposed) instead of an allocation node per step.
+                            bool pooled = ScratchPoolingActive;
+                            IGpuBuffer Scratch(int length) =>
+                                pooled ? RentActionScratch(backend, length, fullyWritten: true) : backend.AllocateBuffer(length);
+                            var rowMax = Scratch(outerSize);
+                            var rowValues = Scratch(tensor.Length);
+                            var shifted = Scratch(tensor.Length);
+                            var expShifted = Scratch(tensor.Length);
+                            var rowSum = Scratch(outerSize);
+                            var logSum = Scratch(outerSize);
+                            try
+                            {
+                                backend.MaxAxis(input.Buffer, rowMax, outerSize, features);
+                                backend.TileAxis(rowMax, rowValues, outerSize, 1, 1, features);
+                                backend.Subtract(input.Buffer, rowValues, shifted, tensor.Length);
+                                backend.Exp(shifted, expShifted, tensor.Length);
+                                backend.SumAxis(expShifted, rowSum, outerSize, features);
+                                backend.Log(rowSum, logSum, outerSize);
+                                backend.TileAxis(logSum, rowValues, outerSize, 1, 1, features);
+                                backend.Subtract(shifted, rowValues, output.Buffer, tensor.Length);
+                            }
+                            finally
+                            {
+                                if (!pooled)
+                                {
+                                    rowMax.Dispose(); rowValues.Dispose(); shifted.Dispose();
+                                    expShifted.Dispose(); rowSum.Dispose(); logSum.Dispose();
+                                }
+                            }
+                        }
                         handedOff = true;
                         var result = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
                         Autodiff.DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
