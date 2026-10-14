@@ -379,6 +379,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             t._gpuBufferVersion = -1;
         }
         for (int i = 0; i < _preAllocatedGrads.Length; i++) Unbind(_preAllocatedGrads[i]);
+        if (_aliasedGradViews is { } views)
+            foreach (var (view, _) in views) Unbind(view);
         Unbind(_lossGradSeed);
         Unbind(_lossGradDest);
         // The pre-pass (and the aborted capture) ran every forward op on the capture path, where GPU ops bind their
@@ -471,6 +473,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private void DetachCapturePathBindings()
     {
         foreach (var g in _preAllocatedGrads) DetachDeviceBinding(g);
+        if (_aliasedGradViews is { } views)
+            foreach (var (view, _) in views) DetachDeviceBinding(view);
         foreach (var g in _gradients) DetachDeviceBinding(g);
         DetachDeviceBinding(_lossGradSeed);
         if (_forwardSteps != null)
@@ -751,6 +755,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private Dictionary<Tensor<T>, Tensor<T>>? _liveGradientMap;
 
+    // Reshape-view gradients (AliasReshapeViewGradients) and the gradient buffer each views. They share host storage
+    // but not a device binding, so the GPU step binds each view to its target's device buffer.
+    private (Tensor<T> View, Tensor<T> Target)[]? _aliasedGradViews;
+
     /// <summary>
     /// Copies a parameter gradient the backward REPLACED in the live map (an out-of-place accumulation, a first-write
     /// copy, a contiguity fix-up) into the plan's own buffer. L2 regularization, clipping, the finiteness check, the
@@ -927,7 +935,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// copy into a fresh tensor plus a copy into the gradient buffer -- is skipped. Walking the steps in reverse makes a
     /// chain of reshapes collapse onto the last one's buffer. Measured on the parity Transformer (CPU): 31 reshape
     /// backwards were 2.3 ms of a 21 ms backward.
-    /// <para>Host engines only: a GPU engine binds device buffers per tensor, not per storage.</para>
+    /// <para>A GPU engine binds device buffers per tensor, not per storage, so each view is also returned in
+    /// <paramref name="deviceAliases"/> with the gradient it views; the GPU step binds the view to that gradient's
+    /// device buffer. On the parity Transformer (CUDA) the skipped reshape backwards were 25 of the captured step's
+    /// 92 device-to-device copies.</para>
     /// </summary>
     private static HashSet<CompiledStep<T>>? AliasReshapeViewGradients(
         List<CompiledStep<T>> forwardSteps,
@@ -935,9 +946,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
-        List<Tensor<T>> allGrads)
+        List<Tensor<T>> allGrads,
+        out List<(Tensor<T> View, Tensor<T> Target)>? deviceAliases)
     {
-        if (engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine) return null;
+        deviceAliases = null;
+        bool device = engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine;
         HashSet<CompiledStep<T>>? aliased = null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
         var dropped = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
@@ -949,11 +962,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var output = step.OutputBuffer;
             if (input is null || parameterSet.Contains(input)) continue;
             if (!consumerCount.TryGetValue(input, out int consumers) || consumers != 1) continue;
-            if (!input.SharesStorageWith(output) || input.Length != output.Length) continue;
+            // The backward is Reshape(gradOutput, inputShape) whether or not the forward shared storage: a GPU engine
+            // materializes its reshape output, so only the host path keeps the view requirement it was measured with.
+            if ((!device && !input.SharesStorageWith(output)) || input.Length != output.Length) continue;
             if (!gradMap.TryGetValue(output, out var outputGrad) || !outputGrad.IsContiguous) continue;
             if (!gradMap.TryGetValue(input, out var ownGrad)) continue;
-            gradMap[input] = outputGrad.ReshapeViewUnrecorded(input._shape);
+            var view = outputGrad.ReshapeViewUnrecorded(input._shape);
+            gradMap[input] = view;
             dropped.Add(ownGrad);
+            if (device)
+            {
+                // A chain of reshapes collapses onto the last one's buffer: bind to the gradient the output's own
+                // gradient views, if it is itself a view, so every view resolves to one physical buffer.
+                var target = outputGrad;
+                if (deviceAliases is not null)
+                    foreach (var (v, t) in deviceAliases)
+                        if (ReferenceEquals(v, outputGrad)) { target = t; break; }
+                (deviceAliases ??= new List<(Tensor<T> View, Tensor<T> Target)>()).Add((view, target));
+            }
             (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
         }
         if (dropped.Count > 0)
@@ -3008,6 +3034,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
                 residentEngine.EnsureResidentBuffer(_preAllocatedGrads[i]);
+            if (_aliasedGradViews is { } views)
+                foreach (var (view, target) in views)
+                    if (target._gpuBuffer is { } targetBuffer && target._gpuBackend is { } targetBackend)
+                        residentEngine.BindResidentBuffer(view, targetBuffer, targetBackend);
             // PR #638 (review): the loss-grad SEED is NOT part of _preAllocatedGrads, so the captured reseed below
             // (CopyBufferDtoD seed→dest) would find no seed GPU buffer and be skipped — leaving the captured
             // backward to start from a zero/stale loss gradient. Bind the seed resident here AND initialize its
@@ -7188,6 +7218,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int[][]? gradPoolReZeroByPosition = null;
         // Reshape steps whose input gradient is a view of their output gradient; their backward is the identity.
         HashSet<CompiledStep<T>>? aliasedReshapeSteps = null;
+        List<(Tensor<T> View, Tensor<T> Target)>? aliasedGradViews = null;
         // Decision sets the pooler used to plan the re-zero schedule; populated by
         // BuildPooledGradMap when pooling, left empty otherwise. Non-null so the
         // drift guard never needs a null-forgiving access.
@@ -7207,7 +7238,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 gradMap[tensor] = grad;
                 allGrads.Add(grad);
             }
-            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, parameters, consumerCount, engine, gradMap, allGrads);
+            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, parameters, consumerCount, engine, gradMap, allGrads,
+                out aliasedGradViews);
         }
 
         // #1624 prototype: quantify how much the per-traced-tensor gradient buffer
@@ -7943,6 +7975,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 storageLeases);
             storageLeases = null;
             plan._liveGradientMap = gradMap;
+            plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             scope.ReleaseStorageLeases();
             return plan;
