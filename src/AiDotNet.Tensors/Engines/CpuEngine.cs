@@ -11358,7 +11358,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// over disjoint column ranges.
     /// </summary>
     [MethodImpl(Hot)]
-    private void Conv2DWithImplicitGemmFloat(
+    private unsafe void Conv2DWithImplicitGemmFloat(
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
@@ -11369,66 +11369,65 @@ public partial class CpuEngine : ITensorLevelEngine
         int colH = checked(inChannels * kernelHeight * kernelWidth);
         int colW = checked(outputHeight * outputWidth);
 
-        // Block on whole output rows so the stride=1 contiguous-memcpy im2col fast path
-        // stays intact and the panel covers an exact column range [oh0*outW, oh1*outW).
+        // #653: the blocks of output rows run in parallel, each on one thread: its im2col panel is built in that
+        // thread's cache and multiplied by a single-threaded packed GEMM over all output channels into its slice of the
+        // output. The blocks used to run one after another, with a serial im2col and a GEMM over a block only a few rows
+        // wide parallelised inside it, which stopped scaling at about 8 threads. Each output element is still produced
+        // by one serial GEMM in the same K order, so the result does not depend on the thread count.
+        int threads = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
         long perRowFloats = (long)colH * outputWidth;
-        int ohRows = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / Math.Max(1, perRowFloats)));
-        int maxNcBlock = checked(ohRows * outputWidth);
-
-        using var inputSpanLease = input.Lease();
-        var inputSpan = inputSpanLease.Span;
-        using var kernelSpanLease = kernel.Lease();
-        var kernelSpan = kernelSpanLease.Span;
-        using var resultDataKeep43 = new KeepAliveScope(result);
-        var outputSpan = result.DataUnmarked.Span;
+        // Panel per thread within the budget the serial version had for its single panel.
+        int rowsByBudget = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / threads / Math.Max(1, perRowFloats)));
+        // At least ImplicitGemmMinBlockColumns output columns per block, so each GEMM is wide enough to run at speed...
+        int rowsForWidth = Math.Min(outputHeight, (ImplicitGemmMinBlockColumns + outputWidth - 1) / outputWidth);
+        // ...and, where the image allows, two blocks per thread so the threads stay balanced.
+        int rowsForBalance = Math.Max(1, (int)((long)batch * outputHeight / (2L * threads)));
+        int ohRows = Math.Max(1, Math.Min(rowsByBudget, Math.Max(rowsForWidth, Math.Min(rowsForBalance, rowsByBudget))));
+        int blocksPerImage = (outputHeight + ohRows - 1) / ohRows;
+        int units = checked(batch * blocksPerImage);
         int inputSliceSize = checked(inChannels * height * width);
+        int panelFloats = checked(colH * ohRows * outputWidth);
 
-        var pool = System.Buffers.ArrayPool<float>.Shared;
-        float[] panel = pool.Rent(checked(colH * maxNcBlock));
-        try
+        using var inputDataKeep = new KeepAliveScope(input);
+        using var pinIn = input.ReadOnlyDataUnmarked.Pin();
+        using var kernelDataKeep = new KeepAliveScope(kernel);
+        using var pinK = kernel.ReadOnlyDataUnmarked.Pin();
+        using var resultDataKeep43 = new KeepAliveScope(result);
+        using var pinOut = result.DataUnmarked.Pin();
+        nint pIn = (nint)pinIn.Pointer, pK = (nint)pinK.Pointer, pOut = (nint)pinOut.Pointer;
+        long kernelLength = (long)outChannels * colH, outputLength = (long)batch * outChannels * colW;
+        long work = (long)batch * outChannels * colH * colW;
+
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, units, work, u =>
         {
-            var panelSpan = panel.AsSpan();
-            for (int b = 0; b < batch; b++)
+            int b = u / blocksPerImage;
+            int oh0 = (u % blocksPerImage) * ohRows;
+            int oh1 = Math.Min(outputHeight, oh0 + ohRows);
+            int ncBlock = (oh1 - oh0) * outputWidth;
+            float[] panel = System.Buffers.ArrayPool<float>.Shared.Rent(panelFloats);
+            try
             {
-                var inSlice = inputSpan.Slice(b * inputSliceSize, inputSliceSize);
-                int outBatchOffset = b * outChannels * colW;
-                for (int oh0 = 0; oh0 < outputHeight; oh0 += ohRows)
-                {
-                    int oh1 = Math.Min(oh0 + ohRows, outputHeight);
-                    int ncBlock = (oh1 - oh0) * outputWidth;
-                    int colOffset = oh0 * outputWidth; // first output column of this block
-
-                    Helpers.Im2ColHelper.Im2ColRowBlockFloat(
-                        inSlice, panelSpan,
-                        inChannels, height, width,
-                        kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
-                        outputHeight, outputWidth, oh0, oh1);
-
-                    // C[oc, colOffset + j] = kernel[oc, :] · panel[:, j]  for j in [0, ncBlock).
-                    // The block's output columns occupy a ncBlock-wide window of each output
-                    // row, so pass ldc = colW (full row stride): the GEMM writes row oc at
-                    // C[oc*colW + j]. The slice base is the block's first output element.
-                    var cWindow = outputSpan.Slice(outBatchOffset + colOffset);
-                    bool usedBlas = Helpers.BlasProvider.TryGemm(
-                        outChannels, ncBlock, colH,
-                        kernelSpan.Slice(0, outChannels * colH), colH, // A = kernel [outChannels x colH], lda=colH
-                        panelSpan.Slice(0, colH * ncBlock), ncBlock,   // B = panel  [colH x ncBlock],     ldb=ncBlock
-                        cWindow, colW);                                // C window, ldc=colW
-
-                    if (!usedBlas)
-                    {
-                        MultiplyMatrixBlockedFloatStrided(
-                            kernelSpan, panelSpan, cWindow,
-                            outChannels, colH, ncBlock, colW);
-                    }
-                }
+                Helpers.Im2ColHelper.Im2ColRowBlockFloat(
+                    new ReadOnlySpan<float>((float*)pIn + (long)b * inputSliceSize, inputSliceSize), panel,
+                    inChannels, height, width,
+                    kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
+                    outputHeight, outputWidth, oh0, oh1);
+                long cOffset = (long)b * outChannels * colW + (long)oh0 * outputWidth;
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    new ReadOnlySpan<float>((float*)pK, (int)kernelLength), colH, false,   // A = kernel [outC x colH]
+                    new ReadOnlySpan<float>(panel, 0, colH * ncBlock), ncBlock, false,     // B = panel [colH x ncBlock]
+                    new Span<float>((float*)pOut + cOffset, (int)(outputLength - cOffset)), colW,
+                    outChannels, ncBlock, colH, new Engines.BlasManaged.BlasOptions<float> { NumThreads = -1 });   // serial (ref struct: built per call)
             }
-        }
-        finally
-        {
-            pool.Return(panel);
-        }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(panel);
+            }
+        }, deterministicSafe: true);
     }
+
+    // Narrowest block (output columns) the implicit conv GEMM is given: narrower GEMMs fall off the packed kernel's speed.
+    private const int ImplicitGemmMinBlockColumns = 64;
 
     /// <summary>
     /// Fallback (no BLAS) GEMM for the fused-conv block: C[m, ncBlock] written into a
