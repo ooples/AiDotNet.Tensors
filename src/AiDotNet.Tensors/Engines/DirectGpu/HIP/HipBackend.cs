@@ -3651,11 +3651,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
@@ -3683,11 +3683,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         int gridX = (nnz + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        IntPtr rowHandle = ((HipGpuBuffer)rowIndices).Handle;
-        IntPtr colHandle = ((HipGpuBuffer)colIndices).Handle;
-        IntPtr xHandle = ((HipGpuBuffer)x).Handle;
-        IntPtr yHandle = ((HipGpuBuffer)y).Handle;
-        IntPtr outputHandle = ((HipGpuBuffer)output).Handle;
+        IntPtr rowHandle = rowIndices.Handle;
+        IntPtr colHandle = colIndices.Handle;
+        IntPtr xHandle = x.Handle;
+        IntPtr yHandle = y.Handle;
+        IntPtr outputHandle = output.Handle;
 
         void*[] args = new void*[7];
         fixed (void** argsPtr = args)
@@ -3735,21 +3735,55 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("csr_spmm_warp", out var kernel))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm_warp");
 
-        // One warp (32 lanes) per row; DefaultBlockSize threads/block => 8 warps/block.
+        // CSR_SPMM_ROW_LANES (32) threads per row, as the kernel indexes them; DefaultBlockSize threads/block => 8 rows/block.
         int gridX = (M * 32 + DefaultBlockSize - 1) / DefaultBlockSize;
         int gridY = 1;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
             M, K, N, nnz);
     }
 
+    /// <summary>CSR SpMM with 128-bit vectorized dense loads (issue #515): launches <c>csr_spmm_vec4</c>, one thread per
+    /// four adjacent output columns. Requires <paramref name="N"/> % 4 == 0. Same per-output reduction order as
+    /// <see cref="CsrSpMM"/>. CUDA mirror: <see cref="CUDA.CudaBackend.CsrSpMMVec4"/>.</summary>
+    public void CsrSpMMVec4(
+        IGpuBuffer csrValues,
+        IGpuBuffer csrColIndices,
+        IGpuBuffer csrRowPointers,
+        IGpuBuffer denseB,
+        IGpuBuffer output,
+        int M, int K, int N, int nnz)
+    {
+        if (!IsAvailable)
+            throw new GpuCapabilityUnavailableException("HIP backend is not available.");
+        if (N % 4 != 0)
+            throw new ArgumentException(
+                $"CsrSpMMVec4 requires N divisible by 4 (got {N}); route other widths to CsrSpMM or CsrSpMMWarp.", nameof(N));
+
+        if (!_kernelCache.TryGetValue("csr_spmm_vec4", out var kernel))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: csr_spmm_vec4");
+
+        // Each thread owns 4 columns, so the y-grid spans N/4 thread-columns.
+        int gridX = M;
+        int gridY = (N / 4 + DefaultBlockSize - 1) / DefaultBlockSize;
+
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
+
+        LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
+            valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
+            M, K, N, nnz);
+    }
     /// <summary>FP64 CSR SpMM (issue #515): launches <c>csr_spmm_double</c>. The
     /// value / dense / output buffers carry <c>double</c> payloads (byte buffers); the
     /// int CSR index buffers are unchanged. CUDA mirror:
@@ -3771,11 +3805,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, outputHandle,
@@ -3801,12 +3835,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var valuesHandle = ((HipGpuBuffer)csrValues).Handle;
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var denseBHandle = ((HipGpuBuffer)denseB).Handle;
-        var biasHandle = ((HipGpuBuffer)bias).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var valuesHandle = csrValues.Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var denseBHandle = denseB.Handle;
+        var biasHandle = bias.Handle;
+        var outputHandle = output.Handle;
 
         LaunchKernel2DBias(kernel, gridX, gridY, DefaultBlockSize, 1,
             valuesHandle, colIndicesHandle, rowPointersHandle, denseBHandle, biasHandle, outputHandle,
@@ -3831,14 +3865,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // First zero the output buffer
         int outputSize = numNodes * features;
         int zeroGrid = (outputSize + DefaultBlockSize - 1) / DefaultBlockSize;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var outputHandle = output.Handle;
         LaunchKernel1D(zeroKernel, zeroGrid, DefaultBlockSize, outputHandle, outputSize);
         Synchronize();
 
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var sourceHandle = ((HipGpuBuffer)sourceIndices).Handle;
-        var targetHandle = ((HipGpuBuffer)targetIndices).Handle;
-        var edgeValuesHandle = edgeValues is not null ? ((HipGpuBuffer)edgeValues).Handle : IntPtr.Zero;
+        var inputHandle = input.Handle;
+        var sourceHandle = sourceIndices.Handle;
+        var targetHandle = targetIndices.Handle;
+        var edgeValuesHandle = edgeValues is not null ? edgeValues.Handle : IntPtr.Zero;
         int hasEdgeValues = edgeValues is not null ? 1 : 0;
 
         // Issue #382: route to atomic-free variant — per-target-node thread scans edges.
@@ -3875,10 +3909,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var inputHandle = input.Handle;
+        var outputHandle = output.Handle;
 
         LaunchCsrSegmentedKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             colIndicesHandle, rowPointersHandle, inputHandle, outputHandle, M, K, N);
@@ -3901,10 +3935,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var inputHandle = input.Handle;
+        var outputHandle = output.Handle;
 
         LaunchCsrSegmentedKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             colIndicesHandle, rowPointersHandle, inputHandle, outputHandle, M, K, N);
@@ -3928,10 +3962,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int gridX = M;
         int gridY = (N + DefaultBlockSize - 1) / DefaultBlockSize;
 
-        var colIndicesHandle = ((HipGpuBuffer)csrColIndices).Handle;
-        var rowPointersHandle = ((HipGpuBuffer)csrRowPointers).Handle;
-        var inputHandle = ((HipGpuBuffer)input).Handle;
-        var outputHandle = ((HipGpuBuffer)output).Handle;
+        var colIndicesHandle = csrColIndices.Handle;
+        var rowPointersHandle = csrRowPointers.Handle;
+        var inputHandle = input.Handle;
+        var outputHandle = output.Handle;
 
         LaunchCsrSegmentedStdDevKernel(kernel, gridX, gridY, DefaultBlockSize, 1,
             colIndicesHandle, rowPointersHandle, inputHandle, outputHandle, M, K, N, epsilon);
