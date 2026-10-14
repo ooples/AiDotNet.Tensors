@@ -20,6 +20,8 @@ public sealed partial class HipBackend
     private ClBlastPadTransposeParameters _clblastPadTransposeParams;
     private bool _clblastIndirectTried;
     private bool _clblastIndirectReady;
+    // Grow-only packing buffers: per-call hipMalloc / hipFree (which waits for the device) cost more than the GEMM below ~1000^3.
+    private IGpuBuffer? _clblastScratchA, _clblastScratchB, _clblastScratchC;
     /// <summary>The CLBlast database key for this device: the one OpenCL uses for the same GPU.</summary>
     internal ClBlastDeviceInfo ClBlastDevice => ClBlastDeviceInfo.ForAmdGpu(_architectureTarget, DeviceName);
 
@@ -130,22 +132,22 @@ public sealed partial class HipBackend
         bool aNeedsPad = N != mCeiled || K != kCeiled;
         bool cNeedsPad = N != mCeiled || M != nCeiled;
 
-        IGpuBuffer? aTemp = null, bTemp = null, cTemp = null;
-        try
+        // One stream and one set of scratch buffers: the lock keeps calls from interleaving their packing launches.
+        lock (_clblastLock)
         {
             IGpuBuffer aBuf = B, cBuf = C;
             if (aNeedsPad)
             {
-                aTemp = AllocateBuffer((int)aSize);
+                var aTemp = ClBlastScratch(ref _clblastScratchA, aSize);
                 ClBlastPack("CopyPadMatrix", B, aTemp, N, K, N, mCeiled, kCeiled, mCeiled);
                 aBuf = aTemp;
             }
             // The kernel reads its B operand as bgm[k * ld + n], so A goes in physically transposed, padded or not.
-            bTemp = AllocateBuffer((int)bSize);
+            var bTemp = ClBlastScratch(ref _clblastScratchB, bSize);
             ClBlastPack("TransposePadMatrix", A, bTemp, K, M, K, nCeiled, kCeiled, nCeiled);
             if (cNeedsPad)
             {
-                cTemp = AllocateBuffer((int)cSize);
+                var cTemp = ClBlastScratch(ref _clblastScratchC, cSize);
                 if (beta != 0f) ClBlastPack("CopyPadMatrix", C, cTemp, N, M, N, mCeiled, nCeiled, mCeiled);
                 cBuf = cTemp;
             }
@@ -161,13 +163,15 @@ public sealed partial class HipBackend
             if (cNeedsPad) ClBlastPack("CopyMatrix", cBuf, C, mCeiled, nCeiled, mCeiled, N, M, N);
             return true;
         }
-        finally
-        {
-            // hipFree waits for the device, so the temporaries outlive the kernels that read them.
-            cTemp?.Dispose();
-            bTemp?.Dispose();
-            aTemp?.Dispose();
-        }
+    }
+
+    private IGpuBuffer ClBlastScratch(ref IGpuBuffer? buffer, long size)
+    {
+        if (buffer is not null && buffer.Size >= size) return buffer;
+        // hipFree waits for the device, so the old buffer outlives every launch already queued against it.
+        buffer?.Dispose();
+        buffer = AllocateBufferUninitialized((int)size);
+        return buffer;
     }
 
     private static int CeilTo(int value, int multiple) => (value + multiple - 1) / multiple * multiple;
@@ -216,6 +220,9 @@ public sealed partial class HipBackend
             if (_clblastIndirectModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastIndirectModule); _clblastIndirectModule = IntPtr.Zero; }
             if (_clblastPackingModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastPackingModule); _clblastPackingModule = IntPtr.Zero; }
             _clblastIndirectReady = false;
+            _clblastScratchA?.Dispose(); _clblastScratchA = null;
+            _clblastScratchB?.Dispose(); _clblastScratchB = null;
+            _clblastScratchC?.Dispose(); _clblastScratchC = null;
         }
     }
 }
