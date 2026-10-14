@@ -10943,7 +10943,8 @@ public partial class CpuEngine : ITensorLevelEngine
             if (isPointwiseIdentity || t_forceFullIm2Col || fullIm2ColScales)
             {
                 Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
+                    packBoth: !isPointwiseIdentity);
             }
             else
             {
@@ -11187,7 +11188,8 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
-        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+        int stride, int padding, int dilation, int outputHeight, int outputWidth,
+        bool packBoth = false)
     {
         t_fullIm2ColConvRuns++;
         int colH = inChannels * kernelHeight * kernelWidth;
@@ -11237,9 +11239,22 @@ public partial class CpuEngine : ITensorLevelEngine
             // Few output channels against many output pixels is a short, wide GEMM, where SimdGemm's
             // N-parallel direct kernel beats the BLAS route 2-3x; everything else stays on BLAS.
             bool gemmHandled = false;
+            if (packBoth)
+            {
+                // The high-channel conv routes share one GEMM configuration with Conv2DWithImplicitGemmFloat: packed
+                // A and B at the default blocking, whose K order does not depend on how M and N are split or threaded,
+                // so the full matrix and the per-block GEMMs give bit-identical outputs.
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    kernelSpan.Slice(0, outChannels * colH), colH, false,
+                    im2colSpan.Slice(0, sliceSize), colW, false,
+                    outputSpan.Slice(outputOffset, outChannels * colW), colW,
+                    outChannels, colW, colH,
+                    ImplicitConvGemmOptions());
+                gemmHandled = true;
+            }
 #if NET5_0_OR_GREATER
             // No AVX2 SimdGemm on .NET Framework, so this route only exists from .NET 5.
-            if (Simd.SimdGemm.PrefersParallelN(outChannels, colH, colW))
+            if (!gemmHandled && Simd.SimdGemm.PrefersParallelN(outChannels, colH, colW))
             {
                 Simd.SimdGemm.Sgemm(
                     kernelSpan.Slice(0, outChannels * colH), colH, false,
@@ -11399,7 +11414,14 @@ public partial class CpuEngine : ITensorLevelEngine
         int rowsForWidth = Math.Min(outputHeight, (ImplicitGemmMinBlockColumns + outputWidth - 1) / outputWidth);
         // ...and, where the image allows, two blocks per thread so the threads stay balanced.
         int rowsForBalance = Math.Max(1, (int)((long)batch * outputHeight / (2L * threads)));
-        int ohRows = Math.Max(1, Math.Min(rowsByBudget, Math.Max(rowsForWidth, Math.Min(rowsForBalance, rowsByBudget))));
+        // The width floor wins over the per-thread budget: a block narrower than that runs the GEMM at a fraction of its speed.
+        int ohRows = Math.Max(1, Math.Min(outputHeight, Math.Max(rowsForWidth, Math.Min(rowsForBalance, rowsByBudget))));
+        // Every block but the last covers whole ImplicitGemmTileColumns-wide GEMM tiles, so the last block starts on a tile
+        // boundary and its partial tile holds exactly the columns the full-matrix GEMM's does: the packed kernel computes a
+        // partial (tail) tile with a different rounding than a full one, so a block edge inside a tile would change those
+        // columns' last bits (a 14-wide row put block 0's columns 64-69 in a tail tile).
+        int rowsPerTile = ImplicitGemmTileColumns / Gcd(outputWidth, ImplicitGemmTileColumns);
+        ohRows = Math.Min(outputHeight, (ohRows + rowsPerTile - 1) / rowsPerTile * rowsPerTile);
         int blocksPerImage = (outputHeight + ohRows - 1) / ohRows;
         int units = checked(batch * blocksPerImage);
         int inputSliceSize = checked(inChannels * height * width);
@@ -11434,7 +11456,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     new ReadOnlySpan<float>((float*)pK, (int)kernelLength), colH, false,   // A = kernel [outC x colH]
                     new ReadOnlySpan<float>(panel, 0, colH * ncBlock), ncBlock, false,     // B = panel [colH x ncBlock]
                     new Span<float>((float*)pOut + cOffset, (int)(outputLength - cOffset)), colW,
-                    outChannels, ncBlock, colH, new Engines.BlasManaged.BlasOptions<float> { NumThreads = -1 });   // serial (ref struct: built per call)
+                    outChannels, ncBlock, colH,
+                    ImplicitConvGemmOptions());
             }
             finally
             {
@@ -11443,8 +11466,21 @@ public partial class CpuEngine : ITensorLevelEngine
         }, deterministicSafe: true);
     }
 
+    // The GEMM both high-channel conv routes run: single-threaded (the caller parallelises over output blocks), packed A
+    // and B, and FIXED blocking. With fixed Kc every output element sums K in the same Kc-sized steps whatever N the call
+    // covers, so the per-block GEMMs of the implicit route and the full-matrix GEMM give bit-identical results; the
+    // strategy's shape-dependent blocking otherwise chose a different Kc for a 64-column block than for the full width.
+    private static Engines.BlasManaged.BlasOptions<float> ImplicitConvGemmOptions() => new()
+    {
+        NumThreads = -1,
+        PackingMode = Engines.BlasManaged.PackingMode.ForcePackBoth,
+        Mc = 96, Nc = 256, Kc = 256,
+    };
     // Narrowest block (output columns) the implicit conv GEMM is given: narrower GEMMs fall off the packed kernel's speed.
     private const int ImplicitGemmMinBlockColumns = 64;
+
+    // Widest column tile of the packed FP32 GEMM kernels (16 on AVX2 and AVX-512 builds; the 8-wide tiles divide it).
+    private const int ImplicitGemmTileColumns = 16;
 
     /// <summary>
     /// Fallback (no BLAS) GEMM for the fused-conv block: C[m, ncBlock] written into a
