@@ -68,6 +68,52 @@ public static class CuBlasLtNative
 
     [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatrixLayoutDestroy")]
     public static extern CublasStatus cublasLtMatrixLayoutDestroy(IntPtr matLayout);
+
+    [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatmulPreferenceCreate")]
+    internal static extern CublasStatus cublasLtMatmulPreferenceCreate(out IntPtr pref);
+
+    [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatmulPreferenceDestroy")]
+    internal static extern CublasStatus cublasLtMatmulPreferenceDestroy(IntPtr pref);
+
+    [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatmulPreferenceSetAttribute")]
+    internal static extern CublasStatus cublasLtMatmulPreferenceSetAttribute(
+        IntPtr pref, CublasLtMatmulPreferenceAttributes attr, IntPtr buf, ulong sizeInBytes);
+
+    [DllImport(CuBlasLtLibrary, EntryPoint = "cublasLtMatmulAlgoGetHeuristic")]
+    internal static extern unsafe CublasStatus cublasLtMatmulAlgoGetHeuristic(
+        IntPtr handle, IntPtr operationDesc, IntPtr aDesc, IntPtr bDesc, IntPtr cDesc, IntPtr dDesc,
+        IntPtr preference, int requestedAlgoCount, CublasLtMatmulHeuristicResult* results, out int returnAlgoCount);
+}
+
+/// <summary>cublasLtMatmulPreferenceAttributes_t (cublasLt.h, CUDA 13.1) -- subset.</summary>
+internal enum CublasLtMatmulPreferenceAttributes
+{
+    /// <summary>uint64: the largest workspace an algorithm may use.</summary>
+    MaxWorkspaceBytes = 1,
+    /// <summary>uint32 mask of <see cref="CublasLtReductionScheme"/> an algorithm may use.</summary>
+    ReductionSchemeMask = 3,
+}
+
+/// <summary>cublasLtReductionScheme_t (cublasLt.h) -- how a split-K algorithm combines its partial results.</summary>
+[Flags]
+internal enum CublasLtReductionScheme : uint
+{
+    None = 0,
+    /// <summary>Partial results accumulated into the output with atomics: run-to-run nondeterministic.</summary>
+    InPlace = 1,
+    ComputeType = 2,
+    OutputType = 4,
+}
+
+/// <summary>cublasLtMatmulHeuristicResult_t (cublasLt.h): a 64-byte algorithm, its workspace, status and waves.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct CublasLtMatmulHeuristicResult
+{
+    public fixed ulong Algo[8];
+    public UIntPtr WorkspaceSize;
+    public CublasStatus State;
+    public float WavesCount;
+    public fixed int Reserved[4];
 }
 
 /// <summary>cuBLAS library status codes shared by cuBLAS and

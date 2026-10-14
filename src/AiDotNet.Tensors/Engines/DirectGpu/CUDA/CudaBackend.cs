@@ -2439,6 +2439,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         //   op(first)  = None      on B_col (N×K)
         //   op(second) = Transpose on A_col (M×K → K×M)
         //   m=N, n=M, k=K.
+        // A weight gradient reduces over the batch (K = rows), the shape cuBLAS runs split-K -- and under graph
+        // capture cuBLAS's split-K allocates its workspace inside the graph (17 allocation/free node pairs per parity
+        // Transformer step). cuBLASLt takes this thread's workspace explicitly.
+        if (TryLtMatmulColumnMajor(transA: false, transB: true, N, M, K, B.Handle, N, A.Handle, M, C.Handle, N, alpha, beta))
+            return;
         CuBlasNative.CheckCublasStatus(
             CuBlasNative.cublasSgemm(
                 _cublasHandle,
@@ -3097,6 +3102,27 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         using var batch = scheduler.Dispatch(launches);
         scheduler.SynchronizeEvents(batch);
+    }
+
+    /// <summary>
+    /// A column-major FP32 GEMM (cublasSgemm semantics) through cuBLASLt with the calling thread's cuBLAS workspace,
+    /// on the current stream: cuBLASLt and the thread's cuBLAS handle run in that stream's order, so they can share
+    /// the one workspace. Deterministic like the classic handle: one cached algorithm per problem, no atomic split-K,
+    /// and strict fp32 under GpuDeterminism (the classic handle's pedantic mode). False -- nothing launched -- when
+    /// cuBLASLt or the workspace is unavailable or cuBLASLt declines the problem; the caller then runs cuBLAS.
+    /// </summary>
+    private bool TryLtMatmulColumnMajor(bool transA, bool transB, int m, int n, int k,
+        IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
+    {
+        if (!CurrentCublasHasWorkspace) return false;
+        var lt = TryGetCuBlasLt();
+        if (lt is null || _threadCublas?.Value?.Workspace is not { } workspace) return false;
+        // The classic handle's fp32 mode: TF32 tensor cores where the init chose them (Ampere+) unless determinism
+        // asks for strict fp32, which is what PEDANTIC gives the classic handle.
+        var compute = !GpuDeterminism.IsActive && _initGemmMathMode == CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
+            ? CublasComputeType.Float32FastTf32 : CublasComputeType.Float32;
+        return lt.TryMatmulColumnMajor(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta, compute,
+            workspace.Handle, (ulong)CublasWorkspaceFloats * sizeof(float), _stream) == CublasStatus.Success;
     }
 
     /// <summary>Lazily creates the cuBLASLt fused-epilogue wrapper, or returns null if unavailable.</summary>
