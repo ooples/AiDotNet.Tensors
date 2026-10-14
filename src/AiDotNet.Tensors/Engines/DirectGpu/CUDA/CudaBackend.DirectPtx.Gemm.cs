@@ -100,6 +100,19 @@ public sealed partial class CudaBackend
         }
     }
 
+    /// <summary>
+    /// The backend's direct-PTX runtime (this backend's context and main stream), created on first use: kernels it
+    /// loads run on the backend's own buffers and stream, so they order with every other operation of the backend.
+    /// </summary>
+    internal DirectPtxRuntime GetDirectPtxRuntime()
+    {
+        lock (_directPtxLock)
+        {
+            EnsureContextCurrent();
+            return _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
+        }
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private PtxGemmKernel CreateAndCacheGemmKernelSlow(DirectPtxGemmKey key) =>
