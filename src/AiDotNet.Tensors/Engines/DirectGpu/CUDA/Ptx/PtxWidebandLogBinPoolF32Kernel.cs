@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// Wideband log-bin pooling for issue #850, matching the NVRTC <c>wideband_log_bin_pool</c> kernel: pool a
 /// magnitude spectrum into <c>numBins</c> logarithmically-spaced bins and take <c>log1p</c> of each bin
 /// average. One thread owns one output bin <c>(seg, k)</c>; it derives the quadratic log-bin edges
-/// <c>binStart = 1 + floor((k/numBins)^2 * (usable-1))</c> (and the next edge for <c>binEnd</c>), averages
+/// <c>binStart = 1 + floor(k^2 (usable-1) / numBins^2)</c> (exact integers) (and the next edge for <c>binEnd</c>), averages
 /// <c>magBuf</c> over that half-open range, and writes <c>log1p(avg)</c>. The bin math uses integer floor
 /// casts and the log is <c>lg2.approx(1+avg)*ln(2)</c>, so the spec is TOLERANCE-based. <c>totalSegBatch</c>,
 /// <c>fftSize</c>, <c>numBins</c>, and <c>usable</c> are baked; the launch rounds up and a single guard drops
@@ -99,7 +99,8 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         Validate(totalSegBatch, fftSize, numBins, usable);
         ValidateBlockThreads(blockThreads);
         int total = checked(totalSegBatch * numBins);
-        string numBinsF = DirectPtxPtxText.Hex(numBins), usm1F = DirectPtxPtxText.Hex(usable - 1), ln2 = DirectPtxPtxText.Hex((float)Math.Log(2.0));
+        string ln2 = DirectPtxPtxText.Hex((float)Math.Log(2.0));
+        long usableMinusOne = usable - 1, binDen = (long)numBins * numBins;
 
         var ptx = new StringBuilder(3_328);
         ptx.AppendLine(".version 7.1");
@@ -126,20 +127,19 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         ptx.AppendLine("    @%p0 bra $WB_RET;");
         ptx.AppendLine($"    div.u32 %r3, %r2, {numBins};");            // seg
         ptx.AppendLine($"    rem.u32 %r4, %r2, {numBins};");            // k
-        // binStart = 1 + (int)((k/numBins)^2 * (usable-1))
-        ptx.AppendLine("    cvt.rn.f32.u32 %f0, %r4;");
-        ptx.AppendLine($"    div.rn.f32 %f0, %f0, {numBinsF};");        // r0
-        ptx.AppendLine("    mul.rn.f32 %f0, %f0, %f0;");
-        ptx.AppendLine($"    mul.rn.f32 %f0, %f0, {usm1F};");
-        ptx.AppendLine("    cvt.rzi.s32.f32 %r5, %f0;");
+        // binStart = 1 + floor(k^2 (usable-1) / numBins^2), in exact 64-bit integers: the float form truncated exact
+        // integer edges to the bin below (numBins=10, usable=101, k=7: 49 -> 48).
+        ptx.AppendLine("    mul.wide.u32 %rd6, %r4, %r4;");
+        ptx.AppendLine($"    mul.lo.u64 %rd6, %rd6, {usableMinusOne};");
+        ptx.AppendLine($"    div.u64 %rd6, %rd6, {binDen};");
+        ptx.AppendLine("    cvt.u32.u64 %r5, %rd6;");
         ptx.AppendLine("    add.s32 %r5, %r5, 1;");                     // binStart
-        // binEnd = 1 + (int)(((k+1)/numBins)^2 * (usable-1))
+        // binEnd = 1 + floor((k+1)^2 (usable-1) / numBins^2)
         ptx.AppendLine("    add.u32 %r6, %r4, 1;");
-        ptx.AppendLine("    cvt.rn.f32.u32 %f1, %r6;");
-        ptx.AppendLine($"    div.rn.f32 %f1, %f1, {numBinsF};");        // r1
-        ptx.AppendLine("    mul.rn.f32 %f1, %f1, %f1;");
-        ptx.AppendLine($"    mul.rn.f32 %f1, %f1, {usm1F};");
-        ptx.AppendLine("    cvt.rzi.s32.f32 %r6, %f1;");
+        ptx.AppendLine("    mul.wide.u32 %rd7, %r6, %r6;");
+        ptx.AppendLine($"    mul.lo.u64 %rd7, %rd7, {usableMinusOne};");
+        ptx.AppendLine($"    div.u64 %rd7, %rd7, {binDen};");
+        ptx.AppendLine("    cvt.u32.u64 %r6, %rd7;");
         ptx.AppendLine("    add.s32 %r6, %r6, 1;");                     // binEnd
         // if (binEnd <= binStart) binEnd = binStart + 1
         ptx.AppendLine("    add.s32 %r7, %r5, 1;");

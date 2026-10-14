@@ -646,10 +646,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Compile FFT kernels (Cooley-Tukey radix-2 FFT, STFT, Mel spectrogram)
             CompileKernelModule(HipFFTKernels.GetSource(), "fft", ref _fftModule,
                 HipFFTKernels.GetKernelNames());
-            // Not fast math: its approximate division put 6/12 below 0.5, so WidebandLogBinPool's bin edge
-            // (k / numBins)^2 * (usable - 1) = 1.0 truncated to 0 and the bin averaged the wrong spectrum line.
             CompileKernelModule(Kernels.HipSpectralPerfKernels.GetSource(), "spectral_perf", ref _spectralPerfModule,
-                Kernels.HipSpectralPerfKernels.GetKernelNames(), useFastMath: false);
+                Kernels.HipSpectralPerfKernels.GetKernelNames());
 
             // Kernels HipBackend looked up that no compiled HIP module provided, so each op threw
             // GpuCapabilityUnavailableException and ran on the CPU. Only the names missing here are loaded:
