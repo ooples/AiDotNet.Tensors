@@ -103,6 +103,31 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         backend.Gemm(a, b, c, 2, 2, 2);
         Assert.True(backend.HipBlasInitializationAttempted);
     }
+    [SkippableFact]
+    public void DeployedConfiguration_RunsItsShape_AndLeavesOtherShapesOnTheDatabaseConfiguration()
+    {
+        Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
+        using var backend = new HipBackend();
+        Assert.True(backend.EnsureClBlastIndirectGemm());
+        GemmConfig database = Assert.NotNull(backend.ClBlastDefaultConfig);
+        // The database configuration with its stride flags swapped: a different kernel, same tiles.
+        GemmConfig swapped = database with { StrideM = !database.StrideM, StrideN = !database.StrideN };
+        Assert.True(backend.DeployClBlastGemm(640, 576, 320, swapped));
+
+        Assert.Equal(swapped, backend.ClBlastConfigFor(640, 576, 320));
+        Assert.Equal(database, backend.ClBlastConfigFor(576, 640, 320));
+        foreach (var (m, n, k) in new[] { (640, 576, 320), (576, 640, 320) })
+        {
+            var (a, b, c0) = Inputs(m, n, k, seed: m + 3 * n);
+            using var ga = backend.AllocateBuffer(a);
+            using var gb = backend.AllocateBuffer(b);
+            using var gc = backend.AllocateBuffer(c0);
+            long before = backend.ClBlastIndirectGemmRuns;
+            backend.Gemm(ga, gb, gc, m, n, k, 1f, 0.5f);
+            Assert.Equal(before + 1, backend.ClBlastIndirectGemmRuns);
+            AssertMatches(backend.DownloadBuffer(gc), a, b, c0, m, n, k, 1f, 0.5f);
+        }
+    }
     private static (float[] A, float[] B, float[] C) Inputs(int m, int n, int k, int seed)
     {
         var rng = RandomHelper.CreateSeededRandom(seed);
