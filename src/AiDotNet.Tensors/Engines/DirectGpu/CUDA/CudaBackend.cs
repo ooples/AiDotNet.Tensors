@@ -187,6 +187,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         public IntPtr Stream;
         // Held for the handle's lifetime: cuBLAS keeps the raw pointer.
         public IGpuBuffer? Workspace;
+        // skinny_gemm_tn's per-tile arrival counters (zero between launches): its partials use Workspace, in the
+        // same stream order, so the counters live beside it.
+        public IGpuBuffer? SkinnyCounters;
     }
 
     // Per-handle cuBLAS workspace (PyTorch sets one the same way). 8 MiB covers the fp32 GEMM algorithms used here.
@@ -286,6 +289,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private IntPtr _fusedCeModule; // fused linear + cross-entropy kernels (#1464)
     private IntPtr _gruModule;
     private IntPtr _snnModule;
+    private IntPtr _skinnyGemmModule;
     private IntPtr _fp16Module;
     private IntPtr _parity210Module;
     private IntPtr _detectionModule;
@@ -1256,6 +1260,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Compile SNN kernels (STDP, spike traces, RBF, PRNG, 2:4 structured sparsity)
         _snnModule = CompileKernelModule(device, CudaSnnKernels.GetSource(), "snn_kernels", CudaSnnKernels.GetKernelNames());
+
+        // Narrow row-major GEMMs (TrySkinnyGemm / TrySkinnyGemmTransposedA), tried before cuBLAS.
+        _skinnyGemmModule = CompileKernelModule(device, Kernels.CudaSkinnyGemmKernels.GetSource(), "skinny_gemm_kernels",
+            Kernels.CudaSkinnyGemmKernels.GetKernelNames());
 
         // Compile GPU-resident optimizer kernels (adam/adamw/sgd/momentum/nag/
         // adagrad/rmsprop/adadelta/adamax/nadam/lamb/lars/lion/amsgrad/ftrl
@@ -2354,6 +2362,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #836) for the standard alpha=1/beta=0
         // C=A@B case; returns false until a shape is GPU-promoted, then falls to cuBLAS.
         if (alpha == 1.0f && beta == 0.0f && TryDirectPtxGemm(A, B, C, M, K, N)) return;
+        if (TrySkinnyGemm(A, B, C, M, N, K, transB: false, alpha, beta)) return;
         ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
@@ -2383,6 +2392,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.OutputMajor))
             return;
+        if (TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -2425,6 +2435,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
+        if (TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -6211,7 +6222,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             workspace?.Dispose();
             workspace = null;
         }
-        return new ThreadCublas { Handle = h, IsDeterministic = det, Stream = _stream, Workspace = workspace };
+        // Uploaded zeros: skinny_gemm_tn requires every counter at zero between launches (its last block resets one).
+        IGpuBuffer? skinnyCounters = workspace is null ? null : AllocateBuffer(new float[SkinnyCounterSlots]);
+        return new ThreadCublas
+        {
+            Handle = h, IsDeterministic = det, Stream = _stream, Workspace = workspace, SkinnyCounters = skinnyCounters,
+        };
     }
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
@@ -18149,6 +18165,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 // The handle's 8 MiB workspace is the backend's allocation, not cuBLAS's: free it with the handle.
                 tc.Workspace?.Dispose();
                 tc.Workspace = null;
+                tc.SkinnyCounters?.Dispose();
+                tc.SkinnyCounters = null;
             }
 
             _threadCublas.Dispose();
@@ -18349,6 +18367,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             CudaNativeBindings.cuModuleUnload(_snnModule);
             _snnModule = IntPtr.Zero;
+        }
+
+        if (_skinnyGemmModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_skinnyGemmModule);
+            _skinnyGemmModule = IntPtr.Zero;
         }
 
         if (_wmmaModule != IntPtr.Zero)

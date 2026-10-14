@@ -1,0 +1,264 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// CUDA GEMM kernels for narrow row-major products (a small model's projections and their weight gradients).
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
+{
+    /// <summary>
+    /// Row-major FP32 GEMMs for the shapes cuBLAS serves worst: a tall operand times a narrow one
+    /// (<c>[2048,64] x [64,64]</c>, a d_model-64 Transformer's projections) and the weight gradient of the same layer,
+    /// a long reduction into a small output (<c>[2048,64]^T x [2048,64]</c>). On a GTX 1660 Ti cuBLAS ran the first
+    /// as 32 blocks of 64 threads (~17 us) and the second as split-K plus a reduction kernel (~22 us); every algorithm
+    /// cuBLASLt offers for them timed the same.
+    /// </summary>
+    internal static class CudaSkinnyGemmKernels
+    {
+        public static string GetSource()
+        {
+            return @"
+#define SG_BM 32
+#define SG_BN 64
+#define SG_BK 32
+#define SG_THREADS 64
+
+// acc[i][j] += As[k][ty*4+i] * Bs[k][col j] over one SG_BK-deep chunk. Each of the block's 64 threads owns 4 rows x 8
+// columns of the 32x64 tile -- columns tx*4..+3 and 32+tx*4..+3, so eight neighbouring threads read 128 contiguous
+// bytes of B (no bank conflicts) -- and does 32 FMAs per 48 bytes it reads from shared memory. A 2x4 piece per thread
+// (8 FMAs per 24 bytes) left the FMA pipes waiting on shared memory at ~30% of peak.
+// A macro, not a function taking acc: an array parameter can put the accumulators in local memory.
+#define SG_ACCUMULATE(DEPTH)                                                                                  \
+    _Pragma(""unroll"")                                                                                     \
+    for (int kk = 0; kk < (DEPTH); kk++)                                                                    \
+    {                                                                                                       \
+        float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);                                       \
+        float4 b0 = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);                                      \
+        float4 b1 = *reinterpret_cast<const float4*>(&Bs[kk][32 + tx * 4]);                                 \
+        float av[4] = { a.x, a.y, a.z, a.w };                                                               \
+        _Pragma(""unroll"")                                                                                 \
+        for (int i = 0; i < 4; i++)                                                                         \
+        {                                                                                                   \
+            acc[i][0] += av[i] * b0.x; acc[i][1] += av[i] * b0.y; acc[i][2] += av[i] * b0.z;                \
+            acc[i][3] += av[i] * b0.w; acc[i][4] += av[i] * b1.x; acc[i][5] += av[i] * b1.y;                \
+            acc[i][6] += av[i] * b1.z; acc[i][7] += av[i] * b1.w;                                           \
+        }                                                                                                   \
+    }
+
+// Bs[k][n] = B[k0 + k][col0 + n] for a row-major B[rows, N], rows >= kEnd zero.
+__device__ __forceinline__ void sg_load_b_rows(const float* __restrict__ B, float (*Bs)[SG_BN + 4],
+    int k0, int kEnd, int col0, int N)
+{
+    for (int idx = threadIdx.x; idx < SG_BK * SG_BN / 4; idx += SG_THREADS)
+    {
+        int k = idx >> 4, c = (idx & 15) * 4;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (k0 + k < kEnd && col0 + c < N)
+            v = __ldg(reinterpret_cast<const float4*>(B + (long long)(k0 + k) * N + col0 + c));
+        *reinterpret_cast<float4*>(&Bs[k][c]) = v;
+    }
+}
+
+// Writes alpha * value + beta * C for one thread's 4x8 piece (two float4 column groups per row), skipping what lies
+// outside [M, N]. beta == 0 never reads C.
+__device__ __forceinline__ void sg_store(float* __restrict__ C, int M, int N, int row, int col, float4 v,
+    float alpha, float beta)
+{
+    if (row >= M || col >= N) return;
+    float4* out = reinterpret_cast<float4*>(C + (long long)row * N + col);
+    float4 r = make_float4(alpha * v.x, alpha * v.y, alpha * v.z, alpha * v.w);
+    if (beta != 0.0f)
+    {
+        float4 c = *out;
+        r.x += beta * c.x; r.y += beta * c.y; r.z += beta * c.z; r.w += beta * c.w;
+    }
+    *out = r;
+}
+
+// C[M,N] = alpha * A[M,K] * op(B) + beta * C, row-major; op(B) is B[K,N], or B[N,K] transposed when transB.
+// One 32x64 output tile per 64-thread block, K swept in SG_BK-deep chunks. Requires N and K multiples of four and
+// 16-byte-aligned operands (the host checks).
+extern ""C"" __global__ __launch_bounds__(SG_THREADS) void skinny_gemm(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    int M, int N, int K, int transB, float alpha, float beta)
+{
+    __shared__ __align__(16) float As[SG_BK][SG_BM + 4];
+    __shared__ __align__(16) float Bs[SG_BK][SG_BN + 4];
+    int tx = threadIdx.x & 7, ty = threadIdx.x >> 3;
+    int row0 = blockIdx.y * SG_BM, col0 = blockIdx.x * SG_BN;
+    float acc[4][8];
+    _Pragma(""unroll"") for (int i = 0; i < 4; i++)
+        _Pragma(""unroll"") for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += SG_BK)
+    {
+        // As[k][m] = A[row0 + m][k0 + k]: a float4 along k, stored transposed.
+        for (int idx = threadIdx.x; idx < SG_BM * SG_BK / 4; idx += SG_THREADS)
+        {
+            int r = idx / (SG_BK / 4), c = (idx % (SG_BK / 4)) * 4;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (row0 + r < M && k0 + c < K)
+                v = __ldg(reinterpret_cast<const float4*>(A + (long long)(row0 + r) * K + k0 + c));
+            As[c][r] = v.x; As[c + 1][r] = v.y; As[c + 2][r] = v.z; As[c + 3][r] = v.w;
+        }
+        if (transB)
+        {
+            // Bs[k][n] = B[col0 + n][k0 + k] for B stored [N, K].
+            for (int idx = threadIdx.x; idx < SG_BK * SG_BN / 4; idx += SG_THREADS)
+            {
+                int n = idx / (SG_BK / 4), c = (idx % (SG_BK / 4)) * 4;
+                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (col0 + n < N && k0 + c < K)
+                    v = __ldg(reinterpret_cast<const float4*>(B + (long long)(col0 + n) * K + k0 + c));
+                Bs[c][n] = v.x; Bs[c + 1][n] = v.y; Bs[c + 2][n] = v.z; Bs[c + 3][n] = v.w;
+            }
+        }
+        else
+        {
+            sg_load_b_rows(B, Bs, k0, K, col0, N);
+        }
+        __syncthreads();
+        SG_ACCUMULATE(SG_BK)
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; i++)
+    {
+        int row = row0 + ty * 4 + i;
+        sg_store(C, M, N, row, col0 + tx * 4, make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]), alpha, beta);
+        sg_store(C, M, N, row, col0 + 32 + tx * 4, make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]), alpha, beta);
+    }
+}
+
+// C[M,N] = alpha * A[K,M]^T * B[K,N] + beta * C, row-major, for a long reduction K (a weight gradient, K = rows of
+// the batch). Grid (tilesN, tilesM, splits), 256 threads: block z reduces rows [z * rowsPerSplit, +rowsPerSplit) of its
+// 32x64 tile, its four 64-thread groups taking interleaved 16-row chunks; the groups' sums are added in group order in
+// shared memory and written to partials[z][tile]. The last block to arrive at a tile (counters[tile]) adds the tile's
+// partials in split order 0, 1, ... -- so the bits do not depend on which block finished first -- writes C and resets
+// the counter for the next launch. One kernel where cuBLAS ran split-K plus a reduction kernel; the groups give a
+// 64x64 output (two tiles) enough warps without a split count whose reduction one block could not finish quickly.
+#define SG_TN_GROUPS 4
+#define SG_TN_BK 16
+#define SG_TN_STAGE (SG_TN_BK * (SG_BM + 4) + SG_TN_BK * (SG_BN + 4))
+extern ""C"" __global__ __launch_bounds__(SG_TN_GROUPS * SG_THREADS) void skinny_gemm_tn(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    float* __restrict__ partials, unsigned int* __restrict__ counters,
+    int M, int N, int K, int rowsPerSplit, float alpha, float beta)
+{
+    __shared__ __align__(16) float smem[SG_TN_GROUPS * SG_TN_STAGE];
+    __shared__ unsigned int isLast;
+    int g = threadIdx.x / SG_THREADS, lt = threadIdx.x % SG_THREADS;
+    int tx = lt & 7, ty = lt >> 3;
+    float (*As)[SG_BM + 4] = reinterpret_cast<float (*)[SG_BM + 4]>(smem + g * SG_TN_STAGE);
+    float (*Bs)[SG_BN + 4] = reinterpret_cast<float (*)[SG_BN + 4]>(smem + g * SG_TN_STAGE + SG_TN_BK * (SG_BM + 4));
+    int row0 = blockIdx.y * SG_BM, col0 = blockIdx.x * SG_BN;
+    int kBegin = blockIdx.z * rowsPerSplit;
+    int kEnd = min(K, kBegin + rowsPerSplit);
+    float acc[4][8];
+    _Pragma(""unroll"") for (int i = 0; i < 4; i++)
+        _Pragma(""unroll"") for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+    // Every group runs the same number of passes (a pass past kEnd loads zeros), so the block-wide barriers line up.
+    // Each thread holds the next pass's two float4s of A and four of B in registers, loaded before the current pass
+    // computes: the DRAM round trip then overlaps the FMAs instead of preceding them (each pass waited a full round
+    // trip, and a 64x64 output has too few blocks to hide it).
+    float4 pa[2], pb[4];
+#define SG_TN_FETCH(BASE)                                                                                   \
+    {                                                                                                       \
+        int k0 = (BASE) + g * SG_TN_BK;                                                                     \
+        _Pragma(""unroll"")                                                                                 \
+        for (int r = 0; r < 2; r++)                                                                         \
+        {                                                                                                   \
+            int idx = lt + r * SG_THREADS, k = idx >> 3, c = (idx & 7) * 4;                                 \
+            pa[r] = (k0 + k < kEnd && row0 + c < M)                                                         \
+                ? __ldg(reinterpret_cast<const float4*>(A + (long long)(k0 + k) * M + row0 + c))            \
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);                                                      \
+        }                                                                                                   \
+        _Pragma(""unroll"")                                                                                 \
+        for (int r = 0; r < 4; r++)                                                                         \
+        {                                                                                                   \
+            int idx = lt + r * SG_THREADS, k = idx >> 4, c = (idx & 15) * 4;                                \
+            pb[r] = (k0 + k < kEnd && col0 + c < N)                                                         \
+                ? __ldg(reinterpret_cast<const float4*>(B + (long long)(k0 + k) * N + col0 + c))            \
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);                                                      \
+        }                                                                                                   \
+    }
+    SG_TN_FETCH(kBegin)
+    for (int base = kBegin; base < kEnd; base += SG_TN_GROUPS * SG_TN_BK)
+    {
+        // As[k][m] = A[k0 + k][row0 + m] (A is stored [K, M]); Bs[k][n] = B[k0 + k][col0 + n].
+        _Pragma(""unroll"")
+        for (int r = 0; r < 2; r++)
+        {
+            int idx = lt + r * SG_THREADS;
+            *reinterpret_cast<float4*>(&As[idx >> 3][(idx & 7) * 4]) = pa[r];
+        }
+        _Pragma(""unroll"")
+        for (int r = 0; r < 4; r++)
+        {
+            int idx = lt + r * SG_THREADS;
+            *reinterpret_cast<float4*>(&Bs[idx >> 4][(idx & 15) * 4]) = pb[r];
+        }
+        __syncthreads();
+        if (base + SG_TN_GROUPS * SG_TN_BK < kEnd) SG_TN_FETCH(base + SG_TN_GROUPS * SG_TN_BK)
+        SG_ACCUMULATE(SG_TN_BK)
+        __syncthreads();
+    }
+#undef SG_TN_FETCH
+    // Groups 1..3 hand their sums to group 0 through shared memory (the staging area is free now), which adds them
+    // in group order. Partials keep each thread's register order (4 rows x 8 values) so the tail reads float4s.
+    if (g > 0)
+    {
+        float* handoff = smem + (g - 1) * (SG_THREADS * 32) + lt * 32;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 8; j++) handoff[i * 8 + j] = acc[i][j];
+    }
+    __syncthreads();
+    int tiles = gridDim.x * gridDim.y;
+    int tile = blockIdx.y * gridDim.x + blockIdx.x;
+    if (g == 0)
+    {
+        for (int h = 0; h < SG_TN_GROUPS - 1; h++)
+        {
+            const float* other = smem + h * (SG_THREADS * 32) + lt * 32;
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 8; j++) acc[i][j] += other[i * 8 + j];
+        }
+        float4* mine = reinterpret_cast<float4*>(partials + ((long long)blockIdx.z * tiles + tile) * (SG_BM * SG_BN))
+            + lt * 8;
+        for (int i = 0; i < 4; i++)
+        {
+            mine[2 * i] = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+            mine[2 * i + 1] = make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0)
+        isLast = atomicAdd(&counters[tile], 1u) == gridDim.z - 1;
+    __syncthreads();
+    if (!isLast) return;
+    __threadfence();
+
+    // The tile's 512 float4s, two per thread: float4 p belongs to group-0 thread p / 8, value pair p % 8.
+    for (int p = threadIdx.x; p < SG_BM * SG_BN / 4; p += SG_TN_GROUPS * SG_THREADS)
+    {
+        float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int z = 0; z < (int)gridDim.z; z++)
+        {
+            float4 v = __ldcg(reinterpret_cast<const float4*>(partials + ((long long)z * tiles + tile) * (SG_BM * SG_BN))
+                + p);
+            s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
+        }
+        int owner = p >> 3, q = p & 7;
+        sg_store(C, M, N, row0 + (owner >> 3) * 4 + (q >> 1), col0 + (q & 1) * 32 + (owner & 7) * 4, s, alpha, beta);
+    }
+    if (threadIdx.x == 0) counters[tile] = 0u;
+}
+";
+        }
+
+        public static string[] GetKernelNames()
+        {
+            return new[]
+            {
+                "skinny_gemm",
+                "skinny_gemm_tn"
+            };
+        }
+    }
+}
