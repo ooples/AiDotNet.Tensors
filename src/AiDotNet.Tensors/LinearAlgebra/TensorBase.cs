@@ -2524,6 +2524,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // the immutable _storageDeferred flag (NOT the mutable Lifetime hint, which a caller can
         // flip), so a normal tensor pays one predictable branch. This runs FIRST because a deferred
         // weight may also be streaming-tagged, and it has to exist before the pool can page it.
+        EnsureStorageResident();
+    }
+
+    /// <summary>
+    /// The storage half of <see cref="EnsureMaterialized"/>: creates a deferred buffer and pages a dropped
+    /// streaming weight (fp32/bf16 snapshot, int8 or int4) back in. Does not realize a lazy node.
+    /// </summary>
+    private protected void EnsureStorageResident()
+    {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (_storageDeferred && !_deferredReady)
             MaterializeDeferredStorage();
 
@@ -3977,6 +3987,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [MethodImpl(Hot)]
     internal T[] GetFlattenedData()
     {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
+        // Bring this tensor's own storage into residence before reading it: a deferred buffer is
+        // created and a paged-out streaming weight is rehydrated. Without it a dropped weight (empty
+        // storage, logical Length unchanged) fell through to the slice copy below and threw "Source
+        // array was not long enough" -- LayerNormBackward reading a streamed LayerNorm gamma during
+        // eager training of a 661M-parameter model (AiDotNet#1767). A lazy node is deliberately NOT
+        // realized here, matching GetDataArray: compile-time specializations read placeholders
+        // through these accessors and must not force a Realize.
+        EnsureStorageResident();
+
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
             return _storage.GetDataArray();
 
