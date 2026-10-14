@@ -287,6 +287,15 @@ def make_case(name, run, device):
         expected = functional.gelu(x.double() @ w.double() + bias.double(), approximate="tanh")
         return "M1 K512 N2048", 2.0 * m * k * n, op, expected
 
+    if name.startswith(GEMM_GRID_PREFIX):
+        m, k, n = GEMM_GRID[name[len(GEMM_GRID_PREFIX):]]
+        left, right = values((m, k)), values((k, n), 0.0625)
+
+        def op():
+            return left @ right
+
+        return f"M{m} K{k} N{n}", 2.0 * m * k * n, op, left.double() @ right.double()
+
     if name == "gemm-fp32":
         m, k, n = 64, 256, 256
         left, right = values((m, k)), values((k, n), 0.0625)
@@ -448,6 +457,20 @@ def make_mixed_backward_case(run, device):
     return op
 
 
+# #1261: the GEMM shape grid, mirroring DirectPtxDenseLinearFullExperiment.GemmGrid (name -> (M, K, N)).
+GEMM_GRID_PREFIX = "gemm-grid-"
+GEMM_GRID = {
+    "sq128": (128, 128, 128), "sq256": (256, 256, 256), "sq512": (512, 512, 512),
+    "sq1024": (1024, 1024, 1024), "sq2048": (2048, 2048, 2048), "sq4096": (4096, 4096, 4096),
+    "decode-m1-4096": (1, 4096, 4096), "decode-m16-4096": (16, 4096, 4096),
+    "decode-m1-mlp-up": (1, 4096, 11008), "decode-m16-mlp-up": (16, 4096, 11008),
+    "prefill-m128-qkv": (128, 4096, 4096), "prefill-m2048-qkv": (2048, 4096, 4096),
+    "prefill-m2048-mlp-up": (2048, 4096, 11008), "prefill-m2048-mlp-down": (2048, 11008, 4096),
+    "vision-56x56-c64": (3136, 576, 64), "vision-28x28-c128": (784, 1152, 128),
+    "odd-1000": (1000, 1000, 1000), "odd-127x513x255": (127, 513, 255),
+}
+GEMM_GRID_CASES = tuple(GEMM_GRID_PREFIX + name for name in GEMM_GRID)
+
 CASES = (
     "decode-gelu",
     "gemm-fp32",
@@ -470,7 +493,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--json-lines", action="store_true")
-    parser.add_argument("--only", choices=CASES)
+    # "gemm-grid" selects every grid shape; it is opt-in, never part of the default run.
+    parser.add_argument("--only", choices=CASES + ("gemm-grid",) + GEMM_GRID_CASES)
     args = parser.parse_args()
     if args.runs <= 0:
         parser.error("--runs must be positive")
@@ -497,7 +521,8 @@ def main():
         "graph_logical_operations_per_sample": GRAPH_LOGICAL_OPERATIONS_PER_SAMPLE,
     }
     for run in range(1, args.runs + 1):
-        operations = (args.only,) if args.only else CASES
+        operations = (GEMM_GRID_CASES if args.only == "gemm-grid"
+                      else (args.only,) if args.only else CASES)
         for operation in operations:
             require_no_foreign_compute(f"{operation}-start")
             shape, work, eager, expected = make_case(operation, run, device)
