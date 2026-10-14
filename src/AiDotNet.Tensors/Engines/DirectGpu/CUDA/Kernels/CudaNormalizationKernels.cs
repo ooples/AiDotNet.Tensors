@@ -596,6 +596,87 @@ extern ""C"" __global__ __launch_bounds__(256) void column_sum_finish(
     for (int c = 0; c < chunks; c++) t += partials[c * cols + col];
     output[col] = add ? output[col] + t : t;
 }
+
+// Soft-target softmax cross-entropy (IEngine.TensorSoftmaxCrossEntropy), forward pass 1: one warp per row of [rows, cols]
+// writes rowStats[0..rows) = log-sum-exp, [rows..2rows) = sum of targets, [2rows..3rows) = sum target * logSoftmax,
+// [3rows..4rows) = 1 when the target row has mass. Lane-strided sums then a fixed xor-shuffle tree: deterministic.
+extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_rows(
+    const float* __restrict__ logits, const float* __restrict__ target, float* __restrict__ rowStats, int rows, int cols)
+{
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const float* z = logits + (long long)row * cols;
+    const float* t = target + (long long)row * cols;
+    float m = -INFINITY;
+    for (int c = lane; c < cols; c += 32) m = fmaxf(m, z[c]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    float s = 0.0f;
+    for (int c = lane; c < cols; c += 32) s += expf(z[c] - m);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+    float lse = m + logf(s);
+    float sum = 0.0f, dot = 0.0f, mass = 0.0f;
+    for (int c = lane; c < cols; c += 32)
+    {
+        float tv = t[c];
+        sum += tv;
+        dot += tv * (z[c] - lse);
+        mass += fabsf(tv);
+    }
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        sum += __shfl_xor_sync(0xffffffff, sum, o);
+        dot += __shfl_xor_sync(0xffffffff, dot, o);
+        mass += __shfl_xor_sync(0xffffffff, mass, o);
+    }
+    if (lane == 0)
+    {
+        rowStats[row] = lse;
+        rowStats[rows + row] = sum;
+        rowStats[2 * rows + row] = dot;
+        rowStats[3 * rows + row] = mass > 0.0f ? 1.0f : 0.0f;
+    }
+}
+
+// Pass 2, one block of 256: loss[0] = -(sum of row dots) / count and count[0] = max(1, supervised rows), summed in a
+// fixed order (strided per thread, then a shared-memory tree).
+extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_total(
+    const float* __restrict__ rowStats, float* __restrict__ loss, float* __restrict__ count, int rows)
+{
+    __shared__ float sd[256];
+    __shared__ float ss[256];
+    int tid = threadIdx.x;
+    float d = 0.0f, s = 0.0f;
+    for (int r = tid; r < rows; r += 256) { d += rowStats[2 * rows + r]; s += rowStats[3 * rows + r]; }
+    sd[tid] = d; ss[tid] = s;
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1)
+    {
+        if (tid < w) { sd[tid] += sd[tid + w]; ss[tid] += ss[tid + w]; }
+        __syncthreads();
+    }
+    if (tid == 0)
+    {
+        float cnt = fmaxf(ss[0], 1.0f);
+        count[0] = cnt;
+        loss[0] = -(sd[0] / cnt);
+    }
+}
+
+// Backward: dLogits = gradOut / count * (softmax * sum of the row's targets - target), written or added.
+extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
+    const float* __restrict__ logits, const float* __restrict__ target, const float* __restrict__ rowStats,
+    const float* __restrict__ count, const float* __restrict__ gradOut, float* __restrict__ gradLogits,
+    int rows, int cols, int add)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long n = (long long)rows * cols;
+    if (i >= n) return;
+    int row = (int)(i / cols);
+    float g = gradOut[0] / count[0];
+    float v = g * (expf(logits[i] - rowStats[row]) * rowStats[rows + row] - target[i]);
+    gradLogits[i] = add ? gradLogits[i] + v : v;
+}
 ";
         }
 
@@ -617,7 +698,10 @@ extern ""C"" __global__ __launch_bounds__(256) void column_sum_finish(
                 "layernorm_grad_params_partial",
                 "layernorm_grad_params_finish",
                 "column_sum_partial",
-                "column_sum_finish"
+                "column_sum_finish",
+                "softmax_xent_rows",
+                "softmax_xent_total",
+                "softmax_xent_backward"
             };
         }
     }

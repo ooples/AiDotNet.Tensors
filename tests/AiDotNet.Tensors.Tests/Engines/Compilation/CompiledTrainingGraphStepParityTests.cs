@@ -675,6 +675,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [InlineData(true, TwoPathNetwork.ResidualLayerNorm)]
     [InlineData(false, TwoPathNetwork.SharedBias)]
     [InlineData(true, TwoPathNetwork.SharedBias)]
+    [InlineData(false, TwoPathNetwork.SoftmaxCrossEntropy)]
+    [InlineData(true, TwoPathNetwork.SoftmaxCrossEntropy)]
     public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
         Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
@@ -683,6 +685,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             TwoPathNetwork.WideLogSoftmax => WideLogSoftmaxLoss,
             TwoPathNetwork.ResidualLayerNorm => ResidualLayerNormLoss,
             TwoPathNetwork.SharedBias => SharedBiasLoss,
+            TwoPathNetwork.SoftmaxCrossEntropy => SoftmaxCrossEntropyLoss,
             _ => SharedLoss,
         };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
@@ -810,6 +813,25 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorMSELoss(pred, y);
     }
 
+    // Zeroes the target's first row: an ignored row, which must count in neither the loss nor its denominator.
+    private static readonly Tensor<float> IgnoreFirstRow = BuildIgnoreFirstRowMask();
+
+    private static Tensor<float> BuildIgnoreFirstRowMask()
+    {
+        var mask = new Tensor<float>([Batch, Outputs]);
+        for (int i = Outputs; i < mask.Length; i++) mask[i] = 1f;
+        return mask;
+    }
+
+    /// <summary>TensorSoftmaxCrossEntropy of a two-layer classifier's logits against the batch's targets (soft and
+    /// partly negative values, as FeedBatch draws them) with the first row ignored.</summary>
+    private static Tensor<float> SoftmaxCrossEntropyLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var logits = e.FusedLinear(h, w[2], w[3], FusedActivationType.None);
+        return e.TensorSoftmaxCrossEntropy(logits, e.TensorMultiply(y, IgnoreFirstRow));
+    }
+
     // A LayerNorm gain near one: 1 + noise.
     private static Tensor<float> Ones(int length, int seed, float noise)
     {
@@ -831,6 +853,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         ResidualLayerNorm,
         /// <summary>Two output layers sharing one bias: its gradient's column sums added into the accumulator.</summary>
         SharedBias,
+        /// <summary>A classifier trained with the fused softmax cross-entropy (soft, negative and ignored targets).</summary>
+        SoftmaxCrossEntropy,
     }
 
     /// <summary>
