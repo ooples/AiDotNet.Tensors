@@ -342,7 +342,7 @@ internal static class GpuBenchmarkEnvironment
     /// Waits (idle) until the GPU has cooled to <paramref name="targetCelsius"/>, so a long matrix of routes does not
     /// heat the device past the evidence ceiling partway through. The ceiling check itself is unchanged.
     /// </summary>
-    internal static void WaitForCooldown(string label, int targetCelsius = 62, int timeoutSeconds = 600)
+    internal static void WaitForCooldown(string label, int targetCelsius = 55, int timeoutSeconds = 900)
     {
         var watch = Stopwatch.StartNew();
         while (true)

@@ -53,9 +53,12 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             string shape = $"M{m} K{k} N{n}";
             string operation = GemmGridOperation + "-" + name;
             // Enough launches per device sample to span ~1 ms, so small shapes are not timer-bound and the
-            // largest do not take minutes; graphs only where 200 back-to-back operations stay short.
+            // largest do not take minutes. The graph lane replays 1,000 operations per sample, which for large
+            // shapes is tens of seconds of sustained load (this 3080 then exceeds the 75 C evidence ceiling) and
+            // adds nothing: event timing over several launches already amortizes launch overhead there. So graphs
+            // run only for shapes up to 0.2 GFLOP, where launch overhead is a real share of the time.
             int launches = (int)Math.Clamp(Math.Ceiling(2e10 / work), 1, DeviceLaunches);
-            bool capture = work <= 2e9;
+            bool capture = work <= 2e8;
             double RelativeError(IGpuBuffer output) => SampledRelativeError(backend.DownloadBuffer(output), samples, oracle, n);
 
             using var left = backend.AllocateBuffer(leftHost);
