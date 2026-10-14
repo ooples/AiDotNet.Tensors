@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Autodiff;
@@ -56,33 +57,47 @@ public partial class CpuEngine
         Tensor<bool>? mask, int batch, int seqLen, int dModel, int numHeads, int dHead)
     {
         int rows = batch * seqLen, d3 = 3 * dModel;
+        // Saved for the backward, so owned by the tape node rather than pooled.
         var qkv = new float[rows * d3];
         var concat = new float[rows * dModel];
         var lse = new float[batch * numHeads * seqLen];
-        var fusedW = FuseQkvWeights(qWeight, kWeight, vWeight, dModel);
-        var inputArr = input.GetFlattenedData();
-        SimdGemm.Sgemm(inputArr.AsSpan(0, rows * dModel), dModel, false, fusedW, d3, false, qkv, rows, dModel, d3);
+        var pool = ArrayPool<float>.Shared;
+        var fusedW = pool.Rent(dModel * d3);
+        try
+        {
+            FuseQkvWeights(qWeight, kWeight, vWeight, dModel, fusedW);
+            var inputArr = input.GetFlattenedData();
+            SimdGemm.Sgemm(inputArr.AsSpan(0, rows * dModel), dModel, false, fusedW.AsSpan(0, dModel * d3), d3, false,
+                qkv, rows, dModel, d3);
+        }
+        finally
+        {
+            pool.Return(fusedW);
+        }
 
         float scale = (float)(1.0 / Math.Sqrt(dHead));
-        int bh = batch * numHeads;
+        int bh = batch * numHeads, sd = seqLen * dHead, ss = seqLen * seqLen;
         int chunks = Math.Max(1, Math.Min(bh, CpuParallelSettings.MaxDegreeOfParallelism));
         PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
         {
-            var q = new float[seqLen * dHead];
-            var kT = new float[dHead * seqLen];
-            var v = new float[seqLen * dHead];
-            var p = new float[seqLen * seqLen];
-            var o = new float[seqLen * dHead];
-            for (int s = chunk; s < bh; s += chunks)
+            float[] q = pool.Rent(sd), kT = pool.Rent(sd), v = pool.Rent(sd), o = pool.Rent(sd), p = pool.Rent(ss);
+            try
             {
-                int b = s / numHeads, h = s % numHeads;
-                GatherHead(qkv, d3, b, h, seqLen, dHead, 0, q, transposed: false);
-                GatherHead(qkv, d3, b, h, seqLen, dHead, dModel, kT, transposed: true);
-                GatherHead(qkv, d3, b, h, seqLen, dHead, 2 * dModel, v, transposed: false);
-                SimdGemm.SgemmSequential(q, kT, p, seqLen, dHead, seqLen);
-                SoftmaxRowsExact(p, seqLen, scale, mask, b, h, lse, s * seqLen);
-                SimdGemm.SgemmSequential(p, v, o, seqLen, seqLen, dHead);
-                ScatterHead(o, concat, dModel, b, h, seqLen, dHead, 0);
+                for (int s = chunk; s < bh; s += chunks)
+                {
+                    int b = s / numHeads, h = s % numHeads;
+                    GatherHead(qkv, d3, b, h, seqLen, dHead, 0, q, transposed: false);
+                    GatherHead(qkv, d3, b, h, seqLen, dHead, dModel, kT, transposed: true);
+                    GatherHead(qkv, d3, b, h, seqLen, dHead, 2 * dModel, v, transposed: false);
+                    SimdGemm.SgemmSequential(q.AsSpan(0, sd), kT.AsSpan(0, sd), p.AsSpan(0, ss), seqLen, dHead, seqLen);
+                    SoftmaxRowsExact(p, seqLen, scale, mask, b, h, lse, s * seqLen);
+                    SimdGemm.SgemmSequential(p.AsSpan(0, ss), v.AsSpan(0, sd), o.AsSpan(0, sd), seqLen, seqLen, dHead);
+                    ScatterHead(o, concat, dModel, b, h, seqLen, dHead, 0);
+                }
+            }
+            finally
+            {
+                pool.Return(q); pool.Return(kT); pool.Return(v); pool.Return(o); pool.Return(p);
             }
         });
 
@@ -115,105 +130,136 @@ public partial class CpuEngine
         bool needQkvWeights = DifferentiableOps.IsGradientRequired(qWeight) || DifferentiableOps.IsGradientRequired(kWeight)
             || DifferentiableOps.IsGradientRequired(vWeight);
         bool needOutWeight = DifferentiableOps.IsGradientRequired(outWeight);
-        var gradY = gradOutput.GetFlattenedData();
+        var gradY = gradOutput.GetFlattenedData().AsSpan(0, rows * dModel);
 
         if (needOutWeight)
         {
             // dWo = concatᵀ · dY: [D, B*S] · [B*S, D].
             var gWo = new Tensor<float>(new[] { dModel, dModel });
             using (var keep = new KeepAliveScope(gWo))
-                SimdGemm.Sgemm(st.Concat, dModel, true, gradY.AsSpan(0, rows * dModel), dModel, false,
-                    gWo.AsWritableSpanUnmarked(), dModel, rows, dModel);
+                SimdGemm.Sgemm(st.Concat, dModel, true, gradY, dModel, false, gWo.AsWritableSpanUnmarked(), dModel, rows, dModel);
             DifferentiableOps.AccumulateGrad(grads, outWeight, gWo, engine);
         }
         if (!needInput && !needQkvWeights) return;
 
-        // dConcat = dY · Woᵀ.
-        var dConcat = new float[rows * dModel];
-        using (var keep = new KeepAliveScope(outWeight))
-            SimdGemm.Sgemm(gradY.AsSpan(0, rows * dModel), dModel, false, outWeight.AsSpanUnmarked(), dModel, true,
-                dConcat, rows, dModel, dModel);
-
-        var dQkv = new float[rows * d3];
-        float scale = (float)(1.0 / Math.Sqrt(dHead));
-        int bh = batch * heads;
-        int chunks = Math.Max(1, Math.Min(bh, CpuParallelSettings.MaxDegreeOfParallelism));
-        PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+        var pool = ArrayPool<float>.Shared;
+        var dConcat = pool.Rent(rows * dModel);
+        var dQkv = pool.Rent(rows * d3);
+        try
         {
-            int sd = seq * dHead, ss = seq * seq;
-            var q = new float[sd]; var k = new float[sd]; var kT = new float[sd];
-            var v = new float[sd]; var vT = new float[sd]; var o = new float[sd]; var dO = new float[sd];
-            var p = new float[ss]; var pT = new float[ss]; var dP = new float[ss];
-            var dQ = new float[sd]; var dK = new float[sd]; var dV = new float[sd];
-            for (int s = chunk; s < bh; s += chunks)
+            // dConcat = dY · Woᵀ.
+            using (var keep = new KeepAliveScope(outWeight))
+                SimdGemm.Sgemm(gradY, dModel, false, outWeight.AsSpanUnmarked(), dModel, true,
+                    dConcat.AsSpan(0, rows * dModel), rows, dModel, dModel);
+
+            // Every (batch, head, row) writes its q, k and v columns, so dQkv needs no clearing.
+            float scale = (float)(1.0 / Math.Sqrt(dHead));
+            int bh = batch * heads, sd = seq * dHead, ss = seq * seq;
+            int chunks = Math.Max(1, Math.Min(bh, CpuParallelSettings.MaxDegreeOfParallelism));
+            PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
             {
-                int b = s / heads, h = s % heads;
-                GatherHead(st.Qkv, d3, b, h, seq, dHead, 0, q, transposed: false);
-                GatherHead(st.Qkv, d3, b, h, seq, dHead, dModel, k, transposed: false);
-                GatherHead(st.Qkv, d3, b, h, seq, dHead, dModel, kT, transposed: true);
-                GatherHead(st.Qkv, d3, b, h, seq, dHead, 2 * dModel, v, transposed: false);
-                GatherHead(st.Qkv, d3, b, h, seq, dHead, 2 * dModel, vT, transposed: true);
-                GatherHead(st.Concat, dModel, b, h, seq, dHead, 0, o, transposed: false);
-                GatherHead(dConcat, dModel, b, h, seq, dHead, 0, dO, transposed: false);
-
-                // P from the saved log-sum-exp: the forward's exact probabilities, masked entries 0.
-                SimdGemm.SgemmSequential(q, kT, p, seq, dHead, seq);
-                RecomputeProbabilities(p, seq, scale, st.Mask, b, h, st.Lse, s * seq);
-
-                // dV = Pᵀ · dO.
-                Transpose(p, pT, seq, seq);
-                SimdGemm.SgemmSequential(pT, dO, dV, seq, seq, dHead);
-
-                // dP = dO · Vᵀ;  dS = P ⊙ (dP - rowsum(dO ⊙ O)), in place in dP.
-                SimdGemm.SgemmSequential(dO, vT, dP, seq, dHead, seq);
-                for (int i = 0; i < seq; i++)
+                float[] q = pool.Rent(sd), k = pool.Rent(sd), kT = pool.Rent(sd), v = pool.Rent(sd), vT = pool.Rent(sd);
+                float[] o = pool.Rent(sd), dO = pool.Rent(sd), dQ = pool.Rent(sd), dK = pool.Rent(sd), dV = pool.Rent(sd);
+                float[] p = pool.Rent(ss), pT = pool.Rent(ss), dP = pool.Rent(ss);
+                try
                 {
-                    float di = 0f;
-                    for (int d = 0; d < dHead; d++) di += dO[i * dHead + d] * o[i * dHead + d];
-                    int row = i * seq;
-                    for (int j = 0; j < seq; j++) dP[row + j] = p[row + j] * (dP[row + j] - di) * scale;
+                    for (int s = chunk; s < bh; s += chunks)
+                    {
+                        int b = s / heads, h = s % heads;
+                        GatherHead(st.Qkv, d3, b, h, seq, dHead, 0, q, transposed: false);
+                        GatherHead(st.Qkv, d3, b, h, seq, dHead, dModel, k, transposed: false);
+                        GatherHead(st.Qkv, d3, b, h, seq, dHead, dModel, kT, transposed: true);
+                        GatherHead(st.Qkv, d3, b, h, seq, dHead, 2 * dModel, v, transposed: false);
+                        GatherHead(st.Qkv, d3, b, h, seq, dHead, 2 * dModel, vT, transposed: true);
+                        GatherHead(st.Concat, dModel, b, h, seq, dHead, 0, o, transposed: false);
+                        GatherHead(dConcat, dModel, b, h, seq, dHead, 0, dO, transposed: false);
+
+                        // P from the saved log-sum-exp: the forward's exact probabilities, masked entries 0.
+                        SimdGemm.SgemmSequential(q.AsSpan(0, sd), kT.AsSpan(0, sd), p.AsSpan(0, ss), seq, dHead, seq);
+                        RecomputeProbabilities(p, seq, scale, st.Mask, b, h, st.Lse, s * seq);
+
+                        // dV = Pᵀ · dO.
+                        Transpose(p, pT, seq, seq);
+                        SimdGemm.SgemmSequential(pT.AsSpan(0, ss), dO.AsSpan(0, sd), dV.AsSpan(0, sd), seq, seq, dHead);
+
+                        // dP = dO · Vᵀ;  dS = P ⊙ (dP - rowsum(dO ⊙ O)) · scale, in place in dP.
+                        SimdGemm.SgemmSequential(dO.AsSpan(0, sd), vT.AsSpan(0, sd), dP.AsSpan(0, ss), seq, dHead, seq);
+                        for (int i = 0; i < seq; i++)
+                        {
+                            float di = 0f;
+                            for (int d = 0; d < dHead; d++) di += dO[i * dHead + d] * o[i * dHead + d];
+                            int row = i * seq;
+                            for (int j = 0; j < seq; j++) dP[row + j] = p[row + j] * (dP[row + j] - di) * scale;
+                        }
+
+                        // dQ = dS · K;  dK = dSᵀ · Q.
+                        SimdGemm.SgemmSequential(dP.AsSpan(0, ss), k.AsSpan(0, sd), dQ.AsSpan(0, sd), seq, seq, dHead);
+                        Transpose(dP, pT, seq, seq);
+                        SimdGemm.SgemmSequential(pT.AsSpan(0, ss), q.AsSpan(0, sd), dK.AsSpan(0, sd), seq, seq, dHead);
+
+                        ScatterHead(dQ, dQkv, d3, b, h, seq, dHead, 0);
+                        ScatterHead(dK, dQkv, d3, b, h, seq, dHead, dModel);
+                        ScatterHead(dV, dQkv, d3, b, h, seq, dHead, 2 * dModel);
+                    }
                 }
+                finally
+                {
+                    foreach (var a in new[] { q, k, kT, v, vT, o, dO, dQ, dK, dV, p, pT, dP }) pool.Return(a);
+                }
+            });
 
-                // dQ = dS · K;  dK = dSᵀ · Q (the scale is already in dS).
-                SimdGemm.SgemmSequential(dP, k, dQ, seq, seq, dHead);
-                Transpose(dP, pT, seq, seq);
-                SimdGemm.SgemmSequential(pT, q, dK, seq, seq, dHead);
-
-                ScatterHead(dQ, dQkv, d3, b, h, seq, dHead, 0);
-                ScatterHead(dK, dQkv, d3, b, h, seq, dHead, dModel);
-                ScatterHead(dV, dQkv, d3, b, h, seq, dHead, 2 * dModel);
+            if (needQkvWeights)
+            {
+                // [dWq | dWk | dWv] = Xᵀ · dQKV: [D, B*S] · [B*S, 3D].
+                var dW = pool.Rent(dModel * d3);
+                try
+                {
+                    var inputArr = input.GetFlattenedData();
+                    SimdGemm.Sgemm(inputArr.AsSpan(0, rows * dModel), dModel, true, dQkv.AsSpan(0, rows * d3), d3, false,
+                        dW.AsSpan(0, dModel * d3), dModel, rows, d3);
+                    if (DifferentiableOps.IsGradientRequired(qWeight))
+                        DifferentiableOps.AccumulateGrad(grads, qWeight, SliceColumns(dW, dModel, d3, 0), engine);
+                    if (DifferentiableOps.IsGradientRequired(kWeight))
+                        DifferentiableOps.AccumulateGrad(grads, kWeight, SliceColumns(dW, dModel, d3, dModel), engine);
+                    if (DifferentiableOps.IsGradientRequired(vWeight))
+                        DifferentiableOps.AccumulateGrad(grads, vWeight, SliceColumns(dW, dModel, d3, 2 * dModel), engine);
+                }
+                finally
+                {
+                    pool.Return(dW);
+                }
             }
-        });
-
-        if (needQkvWeights)
-        {
-            // [dWq | dWk | dWv] = Xᵀ · dQKV: [D, B*S] · [B*S, 3D].
-            var dW = new float[dModel * d3];
-            var inputArr = input.GetFlattenedData();
-            SimdGemm.Sgemm(inputArr.AsSpan(0, rows * dModel), dModel, true, dQkv, d3, false, dW, dModel, rows, d3);
-            if (DifferentiableOps.IsGradientRequired(qWeight))
-                DifferentiableOps.AccumulateGrad(grads, qWeight, SliceColumns(dW, dModel, d3, 0), engine);
-            if (DifferentiableOps.IsGradientRequired(kWeight))
-                DifferentiableOps.AccumulateGrad(grads, kWeight, SliceColumns(dW, dModel, d3, dModel), engine);
-            if (DifferentiableOps.IsGradientRequired(vWeight))
-                DifferentiableOps.AccumulateGrad(grads, vWeight, SliceColumns(dW, dModel, d3, 2 * dModel), engine);
+            if (needInput)
+            {
+                // dX = dQKV · [Wq | Wk | Wv]ᵀ: [B*S, 3D] · [3D, D].
+                var fusedW = pool.Rent(dModel * d3);
+                try
+                {
+                    FuseQkvWeights(qWeight, kWeight, vWeight, dModel, fusedW);
+                    var gX = new Tensor<float>(new[] { batch, seq, dModel });
+                    using (var keep = new KeepAliveScope(gX))
+                        SimdGemm.Sgemm(dQkv.AsSpan(0, rows * d3), d3, false, fusedW.AsSpan(0, dModel * d3), d3, true,
+                            gX.AsWritableSpanUnmarked(), rows, d3, dModel);
+                    DifferentiableOps.AccumulateGrad(grads, input, gX, engine);
+                }
+                finally
+                {
+                    pool.Return(fusedW);
+                }
+            }
         }
-        if (needInput)
+        finally
         {
-            // dX = dQKV · [Wq | Wk | Wv]ᵀ: [B*S, 3D] · [3D, D].
-            var fusedW = FuseQkvWeights(qWeight, kWeight, vWeight, dModel);
-            var gX = new Tensor<float>(new[] { batch, seq, dModel });
-            using (var keep = new KeepAliveScope(gX))
-                SimdGemm.Sgemm(dQkv, d3, false, fusedW, d3, true, gX.AsWritableSpanUnmarked(), rows, d3, dModel);
-            DifferentiableOps.AccumulateGrad(grads, input, gX, engine);
+            pool.Return(dConcat);
+            pool.Return(dQkv);
         }
     }
 
-    /// <summary>[Wq | Wk | Wv] side by side: a [D, 3D] matrix.</summary>
-    private static float[] FuseQkvWeights(Tensor<float> qWeight, Tensor<float> kWeight, Tensor<float> vWeight, int dModel)
+    /// <summary>[Wq | Wk | Wv] side by side, written into the first D·3D entries of <paramref name="fused"/>.</summary>
+    private static void FuseQkvWeights(Tensor<float> qWeight, Tensor<float> kWeight, Tensor<float> vWeight, int dModel,
+        float[] fused)
     {
         int d3 = 3 * dModel;
-        var fused = new float[dModel * d3];
         var qw = qWeight.GetFlattenedData();
         var kw = kWeight.GetFlattenedData();
         var vw = vWeight.GetFlattenedData();
@@ -223,9 +269,7 @@ public partial class CpuEngine
             Array.Copy(kw, r * dModel, fused, r * d3 + dModel, dModel);
             Array.Copy(vw, r * dModel, fused, r * d3 + 2 * dModel, dModel);
         }
-        return fused;
     }
-
     /// <summary>
     /// Copies head <paramref name="h"/> of batch <paramref name="b"/> out of a [B*S, stride] buffer (block starting at
     /// column <paramref name="column"/>) into [S, dHead], or [dHead, S] when <paramref name="transposed"/>.
