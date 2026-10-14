@@ -42,11 +42,34 @@ public sealed partial class HipBackend
     /// <summary>The CLBlast database key for this device: the one OpenCL uses for the same GPU.</summary>
     internal ClBlastDeviceInfo ClBlastDevice => ClBlastDeviceInfo.ForAmdGpu(_deviceProps.GcnArchName ?? _architectureTarget, DeviceName);
 
+    /// <summary>Whether this backend has tried to build the CLBlast modules (lets tests prove small GEMMs never do).</summary>
+    internal bool ClBlastModulesAttempted
+    {
+        get
+        {
+            lock (_clblastLock) return _clblastIndirectTried;
+        }
+    }
+
     /// <summary>How many GEMMs the indirect path has run on this backend (lets tests prove the route was taken).</summary>
     internal long ClBlastIndirectGemmRuns => Interlocked.Read(ref _clblastIndirectGemmRuns);
 
     /// <summary>Whether Gemm goes to hipBLAS first (and so never reaches the CLBlast kernels).</summary>
     internal bool IsHipBlasAvailable => HipBlasReady;
+
+    /// <summary>CLBlast's MinIndirectSize for this device (0 when the database has none), looked up once without compiling.</summary>
+    private int ClBlastMinIndirectSize
+    {
+        get
+        {
+            int cached = Volatile.Read(ref _clblastMinIndirectSize);
+            if (cached != 0) return cached;
+            int looked = ClBlastGemmRoutineDatabase.GetXgemmMinIndirectSize(ClBlastDevice);
+            cached = looked > 0 ? looked : -1;
+            Volatile.Write(ref _clblastMinIndirectSize, cached);
+            return cached;
+        }
+    }
 
     /// <summary>The configuration the database gives this device, once the indirect path is built.</summary>
     internal GemmConfig? ClBlastDefaultConfig
@@ -71,7 +94,6 @@ public sealed partial class HipBackend
             if (!IsAvailable || !ClBlastXgemmDatabase.TryGetConfig(device, out GemmConfig config) || !EnsureClBlastPacking(device))
                 return false;
             _clblastDefault = BuildClBlastVariant(config, HipClBlastGemmKernels.IndirectKernelName);
-            _clblastMinIndirectSize = ClBlastGemmRoutineDatabase.GetXgemmMinIndirectSize(device);
             return _clblastDefault is not null;
         }
     }
@@ -151,9 +173,12 @@ public sealed partial class HipBackend
     private bool ShouldUseClBlastIndirectGemm(int M, int N, int K)
     {
         if (M <= 1 || N <= 1) return false;
+        // The threshold is a database lookup; checking it before ClBlastVariantFor keeps every shape below it (including
+        // the first small GEMM a process runs) from compiling the CLBlast modules at all.
+        int minIndirect = ClBlastMinIndirectSize;
+        if (minIndirect <= 0 || (M < minIndirect && N < minIndirect)) return false;
         var variant = ClBlastVariantFor(M, N, K);
-        if (variant is null || _clblastMinIndirectSize <= 0) return false;
-        if (M < _clblastMinIndirectSize && N < _clblastMinIndirectSize) return false;
+        if (variant is null) return false;
         var c = variant.Config;
         double padded = (double)CeilTo(N, c.TileM) * CeilTo(M, c.TileN) * CeilTo(K, c.TileK * (c.KReg > 0 ? c.KReg : 1));
         return padded <= 1.5 * M * N * K;

@@ -89,7 +89,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     }
 
     [SkippableFact]
-    public void HipBlas_IsNotLoadedUntilAGemmAsksForIt()
+    public void HipBlasAndClBlast_AreNotBuiltUntilAGemmNeedsThem()
     {
         Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
         using var backend = new HipBackend();
@@ -103,6 +103,8 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
 
         backend.Gemm(a, b, c, 2, 2, 2);
         Assert.True(backend.HipBlasInitializationAttempted);
+        // Below MinIndirectSize the threshold is decided from the database alone: no CLBlast module is compiled.
+        Assert.False(backend.ClBlastModulesAttempted);
     }
     [SkippableFact]
     public void DeployedConfiguration_RunsItsShape_AndLeavesOtherShapesOnTheDatabaseConfiguration()

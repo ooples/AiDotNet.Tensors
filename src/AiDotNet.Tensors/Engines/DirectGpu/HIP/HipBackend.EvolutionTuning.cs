@@ -188,6 +188,10 @@ public sealed partial class HipBackend
         private readonly int _n;
         private readonly int _k;
         private readonly float[] _expected;
+        // The oracle covers every _rowStride-th row (at most ReferenceRows of them): a full double reference is O(M*N*K)
+        // on one host thread, hours at 8192^3, while an indexing or launch bug shows up in any sampled row.
+        private const int ReferenceRows = 64;
+        private readonly int _rowStride;
         private readonly IGpuBuffer _deviceA;
         private readonly IGpuBuffer _deviceB;
         private readonly IGpuBuffer _deviceC;
@@ -209,7 +213,8 @@ public sealed partial class HipBackend
             Repetitions = (int)Math.Min(MaximumRepetitions, Math.Max(1, Math.Ceiling(TargetFlopsPerExecution / (2d * m * n * k))));
             float[] inputA = CreateValues(checked(m * k), 17);
             float[] inputB = CreateValues(checked(k * n), 43);
-            _expected = ComputeReference(inputA, inputB, m, n, k);
+            _rowStride = Math.Max(1, (m + ReferenceRows - 1) / ReferenceRows);
+            _expected = ComputeReferenceRows(inputA, inputB, m, n, k, _rowStride);
             IGpuBuffer? deviceA = null, deviceB = null;
             try
             {
@@ -289,7 +294,8 @@ public sealed partial class HipBackend
             double maximumAbsoluteError = 0, maximumRelativeError = 0;
             for (int i = 0; i < _expected.Length; i++)
             {
-                double absoluteError = Math.Abs(actual[i] - _expected[i]);
+                int row = i / _n * _rowStride, column = i % _n;
+                double absoluteError = Math.Abs(actual[row * _n + column] - _expected[i]);
                 maximumAbsoluteError = Math.Max(maximumAbsoluteError, absoluteError);
                 maximumRelativeError = Math.Max(maximumRelativeError, absoluteError / Math.Max(Math.Abs(_expected[i]), 1e-6));
             }
@@ -342,17 +348,20 @@ public sealed partial class HipBackend
             return result;
         }
 
-        private static float[] ComputeReference(float[] a, float[] b, int m, int n, int k)
+        /// <summary>The double-precision product's rows 0, stride, 2*stride, ... packed one after another.</summary>
+        private static float[] ComputeReferenceRows(float[] a, float[] b, int m, int n, int k, int stride)
         {
-            var result = new float[checked(m * n)];
-            for (int row = 0; row < m; row++)
+            int sampled = (m + stride - 1) / stride;
+            var result = new float[checked(sampled * n)];
+            for (int s = 0; s < sampled; s++)
             {
+                int row = s * stride;
                 for (int column = 0; column < n; column++)
                 {
                     double sum = 0;
                     for (int inner = 0; inner < k; inner++)
                         sum += (double)a[row * k + inner] * b[inner * n + column];
-                    result[row * n + column] = (float)sum;
+                    result[s * n + column] = (float)sum;
                 }
             }
             return result;
