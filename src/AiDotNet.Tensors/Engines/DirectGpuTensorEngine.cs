@@ -20353,15 +20353,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// The device buffer a resident-step kernel may write a gradient straight into: <paramref name="target"/>'s own
+    /// bound buffer (never a persistent weight-cache copy, see <see cref="TryRunBinaryInPlace"/>), whole and dense, and
+    /// distinct from every buffer the kernel reads. Null when there is no target or it does not qualify.
+    /// </summary>
+    private IGpuBuffer? ResolveDirectGradTarget<T>(IDirectGpuBackend backend, Tensor<T>? target, int need,
+        IGpuBuffer read0, IGpuBuffer read1, IGpuBuffer? read2)
+    {
+        if (target is null || !ResidentStepActive || !target.IsContiguous || IsPartialView(target)
+            || target.Length != need)
+            return null;
+        var buffer = ResolveResidentBufferNoUpload(backend, target, need, includePersistentWeightCache: false);
+        if (buffer is null || buffer.Handle == IntPtr.Zero || buffer.Size < need) return null;
+        if (buffer.Handle == read0.Handle || buffer.Handle == read1.Handle
+            || (read2 is not null && buffer.Handle == read2.Handle))
+            return null;
+        return buffer;
+    }
+
+    /// <summary>
     /// Both gradients of the 2-D matmul <c>Y[M,N] = A[M,K] · B[K,N]</c>, each as one GEMM with a transpose flag:
     /// <c>dA = dY · Bᵀ</c> and <c>dB = Aᵀ · dY</c>. The generic backward materialized Bᵀ and Aᵀ with a transpose
     /// kernel each and then multiplied, two extra launches and temporaries per matmul per step (149 transpose_2d per
     /// AiDotNet N-BEATS step, #1804). Float only, on any backend implementing <see cref="DirectGpu.ITransposedAGemm"/>
     /// (all six); returns false otherwise, and in a resident (captured) step
     /// when an operand is not already device-resident, so the caller keeps its generic path.
+    /// <para>In a resident step, <paramref name="intoA"/> / <paramref name="intoB"/> name gradient accumulators
+    /// (<see cref="Autodiff.DifferentiableOps.PeekDirectDeviceGradTarget{T}"/>) the GEMMs write straight into -- added
+    /// to them (GEMM beta 1) or overwriting them (beta 0) -- instead of a fresh tensor the accumulation then copies or
+    /// adds. A target that is used is returned as that gradient; the caller then commits it rather than accumulating.</para>
     /// </summary>
     internal bool TryMatMulBackward2D<T>(
-        Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, out Tensor<T>? gradA, out Tensor<T>? gradB)
+        Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, out Tensor<T>? gradA, out Tensor<T>? gradB,
+        Tensor<T>? intoA = null, bool addIntoA = false, Tensor<T>? intoB = null, bool addIntoB = false)
     {
         gradA = null;
         gradB = null;
@@ -20383,15 +20407,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var bufA = ResolveResidentBufferNoUpload(backend, a, M * K);
                 var bufB = ResolveResidentBufferNoUpload(backend, b, K * N);
                 if (bufG is null || bufA is null || bufB is null) return false;
-                var outA = new Tensor<T>(new T[(long)M * K], new[] { M, K });
-                var outB = new Tensor<T>(new T[(long)K * N], new[] { K, N });
-                var outBufA = GetOrCreateResidentBuffer(backend, outA, M * K, fullyWritten: true);
-                var outBufB = GetOrCreateResidentBuffer(backend, outB, K * N, fullyWritten: true);
+                // Every buffer is resolved before the first launch: a GEMM that already added into a target must not
+                // be followed by a false return, or the caller's fallback would add the same gradient again.
+                var targetBufA = ResolveDirectGradTarget(backend, intoA, M * K, bufG, bufA, bufB);
+                var targetBufB = ResolveDirectGradTarget(backend, intoB, K * N, bufG, bufA, bufB);
+                if (targetBufA is not null && targetBufB is not null && targetBufA.Handle == targetBufB.Handle) targetBufB = null;
+                var outA = targetBufA is null ? new Tensor<T>(new T[(long)M * K], new[] { M, K }) : intoA;
+                var outB = targetBufB is null ? new Tensor<T>(new T[(long)K * N], new[] { K, N }) : intoB;
+                if (outA is null || outB is null) return false;
+                var outBufA = targetBufA ?? GetOrCreateResidentBuffer(backend, outA, M * K, fullyWritten: true);
+                var outBufB = targetBufB ?? GetOrCreateResidentBuffer(backend, outB, K * N, fullyWritten: true);
                 if (outBufA.Handle == IntPtr.Zero || outBufA.Size < (long)M * K
                     || outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * N) return false;
-                backend.MatMulTransposed(bufG, bufB, outBufA, M, K, N);  // dA[M,K] = dY[M,N] · B[K,N]ᵀ
-                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, N, M); // dB[K,N] = A[M,K]ᵀ · dY[M,N]
+                float betaA = targetBufA is not null && addIntoA ? 1f : 0f;
+                float betaB = targetBufB is not null && addIntoB ? 1f : 0f;
+                backend.MatMulTransposed(bufG, bufB, outBufA, M, K, N, 1f, betaA);  // dA[M,K] = dY[M,N] · B[K,N]ᵀ
+                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, N, M, 1f, betaB); // dB[K,N] = A[M,K]ᵀ · dY[M,N]
                 ResidentSyncCheck("MatMulBackward2D");
+                if (targetBufA is not null) outA.IncrementVersion();
+                if (targetBufB is not null) outB.IncrementVersion();
                 BindResidentBuffer(outA, outBufA, backend);
                 BindResidentBuffer(outB, outBufB, backend);
                 gradA = outA;
@@ -20439,9 +20473,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// The weight half of <see cref="TryMatMulBackward2D"/>: dB[K,N] = A[M,K]ᵀ · dY[M,N] as one GEMM that reads A
     /// transposed in place, for a layer whose input gradient nothing reads (a network's first layer). False when the
-    /// backend cannot or the shapes do not fit; the caller then takes its general path.
+    /// backend cannot or the shapes do not fit; the caller then takes its general path. <paramref name="intoB"/> is a
+    /// gradient accumulator to write into, as in <see cref="TryMatMulBackward2D"/>.
     /// </summary>
-    internal bool TryMatMulWeightGradient2D<T>(Tensor<T> gradOutput, Tensor<T> a, int n, out Tensor<T>? gradB)
+    internal bool TryMatMulWeightGradient2D<T>(Tensor<T> gradOutput, Tensor<T> a, int n, out Tensor<T>? gradB,
+        Tensor<T>? intoB = null, bool addIntoB = false)
     {
         gradB = null;
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
@@ -20458,11 +20494,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var bufG = ResolveResidentBufferNoUpload(backend, gradOutput, M * n);
                 var bufA = ResolveResidentBufferNoUpload(backend, a, M * K);
                 if (bufG is null || bufA is null) return false;
-                var outB = new Tensor<T>(new T[(long)K * n], new[] { K, n });
-                var outBufB = GetOrCreateResidentBuffer(backend, outB, K * n, fullyWritten: true);
+                var targetBufB = ResolveDirectGradTarget(backend, intoB, K * n, bufG, bufA, null);
+                var outB = targetBufB is null ? new Tensor<T>(new T[(long)K * n], new[] { K, n }) : intoB;
+                if (outB is null) return false;
+                var outBufB = targetBufB ?? GetOrCreateResidentBuffer(backend, outB, K * n, fullyWritten: true);
                 if (outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * n) return false;
-                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, n, M);
+                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, n, M, 1f, targetBufB is not null && addIntoB ? 1f : 0f);
                 ResidentSyncCheck("MatMulWeightGradient2D");
+                if (targetBufB is not null) outB.IncrementVersion();
                 BindResidentBuffer(outB, outBufB, backend);
                 gradB = outB;
                 return true;

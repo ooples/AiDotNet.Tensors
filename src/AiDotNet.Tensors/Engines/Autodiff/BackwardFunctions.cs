@@ -1016,13 +1016,24 @@ internal static class BackwardFunctions<T>
             if (needsInputGradient && needsWeightGradient
                 && engine is DirectGpuTensorEngine gpuBackward
                 && !DifferentiableOps.IsRecording<T>()
-                && !Compilation.GraphMode.IsActive
-                && gpuBackward.TryMatMulBackward2D(g2D, a2D, inputs[1], out var gpuGradA, out var gpuGradB)
-                && gpuGradA is not null && gpuGradB is not null)
+                && !Compilation.GraphMode.IsActive)
             {
-                DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(gpuGradA, (int[])inputs[0]._shape.Clone()), engine);
-                DifferentiableOps.AccumulateGrad(grads, inputs[1], gpuGradB, engine);
-                return;
+                // In a resident step the GEMMs write into the gradient accumulators themselves.
+                var intoA = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool addA);
+                var intoB = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out bool addB);
+                if (gpuBackward.TryMatMulBackward2D(g2D, a2D, inputs[1], out var gpuGradA, out var gpuGradB, intoA, addA, intoB, addB)
+                    && gpuGradA is not null && gpuGradB is not null)
+                {
+                    if (intoA is not null && ReferenceEquals(gpuGradA, intoA))
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], intoA);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(gpuGradA, (int[])inputs[0]._shape.Clone()), engine);
+                    if (intoB is not null && ReferenceEquals(gpuGradB, intoB))
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[1], intoB);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, inputs[1], gpuGradB, engine);
+                    return;
+                }
             }
 
             // Explicit transpose + TensorMatMul. Two earlier alternatives
@@ -6849,8 +6860,15 @@ internal static class BackwardFunctions<T>
                     && !DifferentiableOps.IsRecording<T>()
                     && !Compilation.GraphMode.IsActive)
                 {
+                    // In a resident step the GEMMs write into the gradient accumulators themselves.
+                    bool addInput = false, addWeight = false;
+                    var intoInput = needsInputGradient
+                        ? DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out addInput) : null;
+                    var intoWeight = needsWeightGradient
+                        ? DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out addWeight) : null;
                     if (needsInputGradient && needsWeightGradient
-                        && gpuLinear.TryMatMulBackward2D(gFlat, iFlat, inputs[1], out var gpuInputGrad, out var gpuWeightGrad)
+                        && gpuLinear.TryMatMulBackward2D(gFlat, iFlat, inputs[1], out var gpuInputGrad, out var gpuWeightGrad,
+                            intoInput, addInput, intoWeight, addWeight)
                         && gpuInputGrad is not null && gpuWeightGrad is not null)
                     {
                         inputGradFlat = gpuInputGrad;
@@ -6858,11 +6876,21 @@ internal static class BackwardFunctions<T>
                         gpuDone = true;
                     }
                     else if (!needsInputGradient && needsWeightGradient
-                        && gpuLinear.TryMatMulWeightGradient2D(gFlat, iFlat, N, out var gpuWeightOnly)
+                        && gpuLinear.TryMatMulWeightGradient2D(gFlat, iFlat, N, out var gpuWeightOnly, intoWeight, addWeight)
                         && gpuWeightOnly is not null)
                     {
                         weightGradFast = gpuWeightOnly;
                         gpuDone = true;
+                    }
+                    if (gpuDone && intoInput is not null && ReferenceEquals(inputGradFlat, intoInput))
+                    {
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], intoInput);
+                        inputGradFlat = null;
+                    }
+                    if (gpuDone && intoWeight is not null && ReferenceEquals(weightGradFast, intoWeight))
+                    {
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[1], intoWeight);
+                        weightGradFast = null;
                     }
                 }
                 if (!gpuDone)

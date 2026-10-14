@@ -653,6 +653,89 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// The tape ground truth for gradients that receive two contributions per step: the hidden activation feeds two
+    /// layers and the output weight is shared by a fused linear and a plain matmul. In a resident GPU step the backward
+    /// GEMMs write straight into the gradient buffers, overwriting on a buffer's first contribution of the step and
+    /// adding on the later one (GEMM beta 0 / 1); a step that overwrote where it should add, or added onto the previous
+    /// step's stale gradient, would still agree with its own eager twin, so only the tape can catch it.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Every_step_computes_the_tape_gradient_when_a_gradient_has_two_contributions(bool capture)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            if (capture)
+            {
+                Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                    "Whole-step graph capture is CUDA-only.");
+                Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                    "Graph capture is disabled for this process.");
+            }
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) };
+            foreach (var p in parameters) p.Gpu();
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                SharedLoss(gpu, x, y, parameters);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                if (!capture) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                var gradients = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_gradients", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete) as Tensor<float>[]
+                    ?? throw new InvalidOperationException("CompiledTrainingPlan._gradients was not found.");
+                for (int s = 0; s < Steps; s++)
+                {
+                    FeedBatch(x, y, s);
+                    var expected = CpuTapeGradients(x, y, parameters, SharedLoss);
+                    plan.Step();
+                    for (int p = 0; p < parameters.Length; p++)
+                    {
+                        var actual = gradients[p].TryGetGpuBuffer() is { } buffer && gpu.GetBackend() is { } backend
+                            ? backend.DownloadBuffer(buffer)
+                            : gradients[p].ToArray();
+                        double diff = 0, norm = 0;
+                        for (int i = 0; i < expected[p].Length; i++)
+                        {
+                            double d = actual[i] - expected[p][i];
+                            diff += d * d; norm += (double)expected[p][i] * expected[p][i];
+                        }
+                        Assert.True(norm > 0, $"step {s}, param {p}: the tape gradient is zero, so the comparison proves nothing");
+                        Assert.True(Math.Sqrt(diff) <= 1e-3 * Math.Sqrt(norm) + 1e-6,
+                            $"step {s}, param {p}: |plan - tape| = {Math.Sqrt(diff):G4}, |tape| = {Math.Sqrt(norm):G4}");
+                    }
+                }
+                if (capture)
+                {
+                    var exec = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete);
+                    Assert.True(exec is IntPtr handle && handle != IntPtr.Zero,
+                        "no graph was captured, so the capture row compared eager with eager");
+                }
+            }
+        }
+    }
+
+    /// <summary>MSE of <c>FusedLinear(h, w2, b2) + h · w2</c> with <c>h = ReLU(x · w0 + b0)</c>: h and w2 each get two
+    /// gradient contributions per step.</summary>
+    private static Tensor<float> SharedLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var pred = e.TensorAdd(e.FusedLinear(h, w[2], w[3], FusedActivationType.None), e.TensorMatMul(h, w[2]));
+        return e.TensorMSELoss(pred, y);
+    }
+
+    /// <summary>
     /// The same ground truth on the CPU engine, which AiDotNet's compiled training step uses whenever no GPU is
     /// selected: every step's plan gradient (plus the L2 term) must equal a fresh GradientTape's on that step's batch.
     /// </summary>
@@ -1017,6 +1100,23 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
             var loss = Loss(cpu, Copy(x), Copy(y), w, composedMse, hidden);
             var grads = tape.ComputeGradients(loss, w);
+            return w.Select(p => grads[p].ToArray()).ToArray();
+        }
+        finally { AiDotNetEngine.Current = prior; }
+    }
+
+    private static float[][] CpuTapeGradients(Tensor<float> x, Tensor<float> y, Tensor<float>[] parameters,
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss)
+    {
+        var prior = AiDotNetEngine.Current;
+        var cpu = new CpuEngine();
+        try
+        {
+            AiDotNetEngine.Current = cpu;
+            Tensor<float> Copy(Tensor<float> t) => new Tensor<float>(t.ToArray(), t.Shape.ToArray());
+            var w = parameters.Select(Copy).ToArray();
+            using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+            var grads = tape.ComputeGradients(loss(cpu, Copy(x), Copy(y), w), w);
             return w.Select(p => grads[p].ToArray()).ToArray();
         }
         finally { AiDotNetEngine.Current = prior; }

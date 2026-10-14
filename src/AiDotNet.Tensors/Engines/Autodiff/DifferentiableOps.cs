@@ -807,6 +807,44 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
+    /// The device counterpart of <see cref="TryGetDirectGradTarget{T}"/>, for a resident (captured) GPU step: the
+    /// existing gradient accumulator a backward kernel may write into on the device, so the step has no separate copy
+    /// (first contribution) or add (later ones) per gradient -- on the parity Transformer those first-write copies were
+    /// most of the captured step's copy nodes. <paramref name="accumulate"/> says whether the kernel must add to the
+    /// buffer's contents (it already holds this step's gradient) or overwrite them. Nothing is claimed: the caller
+    /// commits with <see cref="CommitDirectGradWrite{T}"/> only once the kernel was launched into this target, and
+    /// otherwise accumulates as usual. Null outside a resident step, under create-graph, or with no dense accumulator.
+    /// </summary>
+    internal static Tensor<T>? PeekDirectDeviceGradTarget<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool accumulate)
+    {
+        accumulate = false;
+        if (_isBackwardCreateGraph || engine is not DirectGpuTensorEngine gpu || !gpu.ResidentStepActive) return null;
+        int idx = tensor._gradIndex;
+        var indexedGrads = _indexedGrads;
+        Tensor<T>? existing = indexedGrads is not null && idx >= 0 && idx < indexedGrads.Length
+            ? (Tensor<T>?)indexedGrads[idx]
+            : (grads.TryGetValue(tensor, out var found) ? found : null);
+        if (existing is null || !existing.IsContiguous || existing._storageOffset != 0
+            || existing.Length != tensor.Length) return null;
+        accumulate = IsWrittenThisStep(existing);
+        return existing;
+    }
+
+    /// <summary>Records that a kernel wrote <paramref name="tensor"/>'s gradient straight into
+    /// <paramref name="target"/> (from <see cref="PeekDirectDeviceGradTarget{T}"/>), as AccumulateGrad would have.</summary>
+    internal static void CommitDirectGradWrite<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, Tensor<T> target)
+    {
+        MarkWrittenThisStep(target);
+        int idx = tensor._gradIndex;
+        var indexedGrads = _indexedGrads;
+        if (indexedGrads is not null && idx >= 0 && idx < indexedGrads.Length) indexedGrads[idx] = target;
+        grads[tensor] = target;
+        tensor.Grad = target;
+    }
+
+    /// <summary>
     /// Accumulates a gradient for a tensor in the gradient dictionary.
     /// If the tensor already has a gradient, the new gradient is added to it.
     /// </summary>
