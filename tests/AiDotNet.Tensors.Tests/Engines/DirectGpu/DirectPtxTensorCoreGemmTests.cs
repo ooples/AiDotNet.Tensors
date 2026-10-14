@@ -403,5 +403,151 @@ public sealed class DirectPtxTensorCoreGemmTests
             Assert.True(diff / scaleHalf < 1e-3, $"fp16 {config.Name} disagrees with cuBLAS: {diff / scaleHalf:E2}");
         }
     }
+
+    /// <summary>
+    /// Opt-in routing probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): over the #1261 grid shapes, the default (untuned) generated
+    /// kernels against the cuBLAS mode they would replace: TF32 Tensor-Core vs cuBLAS TF32, CUDA-core FP32 vs cuBLAS strict
+    /// FP32. Seconds long; it decides where #1265 may route by default, not evidence.
+    /// </summary>
+    [SkippableFact]
+    public void Probe_GridShapes_DefaultKernelsAgainstCublas()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_RUN_TC_GEMM_PROBE") == "1", "Set AIDOTNET_RUN_TC_GEMM_PROBE=1.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is unavailable.");
+        DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
+        var layout = new PtxGemmLayout(false, false);
+        int sms = PtxGemmEvolution.MultiprocessorCount(runtime);
+        (string, int, int, int)[] shapes =
+        {
+            ("sq128", 128, 128, 128), ("sq256", 256, 256, 256), ("sq512", 512, 512, 512), ("sq1024", 1024, 1024, 1024),
+            ("sq2048", 2048, 2048, 2048), ("sq4096", 4096, 4096, 4096), ("m1-4096", 1, 4096, 4096), ("m16-4096", 16, 4096, 4096),
+            ("m1-mlp", 1, 4096, 11008), ("m16-mlp", 16, 4096, 11008), ("m128-qkv", 128, 4096, 4096), ("m2048-qkv", 2048, 4096, 4096),
+            ("m2048-up", 2048, 4096, 11008), ("m2048-down", 2048, 11008, 4096), ("vis-c64", 3136, 576, 64), ("vis-c128", 784, 1152, 128),
+            ("odd-1000", 1000, 1000, 1000), ("odd-127", 127, 513, 255),
+        };
+        double Time(Action launch, double work)
+        {
+            int reps = (int)Math.Clamp(Math.Ceiling(5e10 / work), 3, 200);
+            for (int i = 0; i < 3; i++) launch();
+            backend.Synchronize();
+            using var start = backend.CreateEvent(enableTiming: true);
+            using var end = backend.CreateEvent(enableTiming: true);
+            backend.RecordEvent(start, backend.DefaultStream);
+            for (int i = 0; i < reps; i++) launch();
+            backend.RecordEvent(end, backend.DefaultStream);
+            end.Synchronize();
+            return backend.GetEventElapsedTime(start, end) * 1000.0 / reps;
+        }
+        bool previous = AiDotNet.Tensors.Engines.AiDotNetEngine.DeterministicMode;
+        try
+        {
+            foreach (var (name, m, k, n) in shapes)
+            {
+                double work = 2d * m * n * k;
+                using var a = backend.AllocateBuffer(Values(m * k, 1));
+                using var b = backend.AllocateBuffer(Values(k * n, 2));
+                using var c = backend.AllocateBuffer(m * n);
+                string line = $"{name,-11} M{m} K{k} N{n}: ";
+                AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(false);
+                double tf32 = Time(() => backend.Gemm(a, b, c, m, n, k), work);
+                if (PtxTensorCoreGemmEvolution.Admits(new PtxTensorCoreGemmConfiguration(64, 64, 16, 32, 32, 3, 4), layout, m, n, k, PtxTensorCorePrecision.Tf32))
+                {
+                    var config = PtxTensorCoreGemmEvolution.Seeds(layout, m, n, k, PtxTensorCorePrecision.Tf32, sms)[0];
+                    using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout);
+                    double ptx = Time(() => kernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f), work);
+                    line += $"TF32 cuBLAS {tf32,9:F1} us / PTX {ptx,9:F1} us ({tf32 / ptx:F2}x, {config.Name})   ";
+                }
+                else
+                {
+                    line += $"TF32 cuBLAS {tf32,9:F1} us / PTX n/a (unaligned)   ";
+                }
+                AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(true);
+                double strict = Time(() => backend.Gemm(a, b, c, m, n, k), work);
+                var sconfig = PtxGemmEvolution.Seeds(layout, m, n, k, sms)[0];
+                using var skernel = new PtxSgemmKernel(runtime, sconfig, layout);
+                double sptx = Time(() => skernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f), work);
+                line += $"| FP32 cuBLAS {strict,9:F1} us / PTX {sptx,9:F1} us ({strict / sptx:F2}x, {sconfig.Name})";
+                _output.WriteLine(line);
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(previous);
+        }
+    }
+
+    /// <summary>
+    /// Opt-in interleaved A/B (AIDOTNET_RUN_TC_GEMM_PROBE=1): 4096^3 TF32, cuBLAS and the generated kernel alternating in
+    /// short rounds (ABBA), each round timed on CUDA events; reports the per-round ratio's median and range, so clock or
+    /// thermal drift and background load hit both arms equally.
+    /// </summary>
+    [SkippableFact]
+    public void Probe_Interleaved4096Tf32()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_RUN_TC_GEMM_PROBE") == "1", "Set AIDOTNET_RUN_TC_GEMM_PROBE=1.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is unavailable.");
+        DirectPtxRuntime runtime = backend.GetDirectPtxRuntime();
+        const int m = 4096, n = 4096, k = 4096;
+        var layout = new PtxGemmLayout(false, false);
+        using var a = backend.AllocateBuffer(Values(m * k, 1));
+        using var b = backend.AllocateBuffer(Values(k * n, 2));
+        using var c = backend.AllocateBuffer(m * n);
+        using var kernel = new PtxTensorCoreGemmKernel(runtime, new PtxTensorCoreGemmConfiguration(128, 128, 16, 64, 64, 2, 8), layout);
+        Action cublas = () => backend.Gemm(a, b, c, m, n, k);
+        Action ptx = () => kernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f);
+        double Round(Action launch)
+        {
+            using var start = backend.CreateEvent(enableTiming: true);
+            using var end = backend.CreateEvent(enableTiming: true);
+            backend.RecordEvent(start, backend.DefaultStream);
+            for (int i = 0; i < 5; i++) launch();
+            backend.RecordEvent(end, backend.DefaultStream);
+            end.Synchronize();
+            return backend.GetEventElapsedTime(start, end) / 5;
+        }
+        for (int i = 0; i < 5; i++) { cublas(); ptx(); }
+        backend.Synchronize();
+        void Phase(string label)
+        {
+            var ratios = new System.Collections.Generic.List<double>();
+            for (int r = 0; r < 8; r++)
+            {
+                // ABBA within each round.
+                double c1 = Round(cublas), p1 = Round(ptx), p2 = Round(ptx), c2 = Round(cublas);
+                double ratio = (c1 + c2) / (p1 + p2);
+                ratios.Add(ratio);
+                _output.WriteLine($"{label} round {r}: cuBLAS {(c1 + c2) / 2:F3} ms, PTX {(p1 + p2) / 2:F3} ms, cuBLAS/PTX {ratio:F3}");
+            }
+            ratios.Sort();
+            _output.WriteLine($"{label}: cuBLAS/PTX median {ratios[ratios.Count / 2]:F3}, range {ratios[0]:F3} .. {ratios[^1]:F3}");
+        }
+        // The same process measures before and after a deterministic-mode round trip (as the grid-shape probe does), so a
+        // cuBLAS state change across the toggle shows up as a step between the phases rather than across processes.
+        float[] Output()
+        {
+            cublas();
+            backend.Synchronize();
+            return backend.DownloadBuffer(c);
+        }
+        Phase("as-created");
+        float[] created = Output();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(true);
+        Phase("strict-fp32");
+        float[] strict = Output();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.SetDeterministicMode(false);
+        for (int i = 0; i < 5; i++) cublas();
+        backend.Synchronize();
+        Phase("after-toggle");
+        float[] toggled = Output();
+        double MaxDiff(float[] x, float[] y)
+        {
+            double worst = 0;
+            for (int i = 0; i < x.Length; i++) worst = Math.Max(worst, Math.Abs(x[i] - y[i]));
+            return worst;
+        }
+        _output.WriteLine($"max |as-created - strict| {MaxDiff(created, strict):G3}, max |after-toggle - strict| {MaxDiff(toggled, strict):G3}");
+    }
 }
 #endif
