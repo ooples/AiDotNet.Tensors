@@ -560,6 +560,42 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_finish
     gradGamma[col] = addGamma ? gradGamma[col] + g : g;
     gradBeta[col] = addBeta ? gradBeta[col] + b : b;
 }
+
+// Column sums of a row-major [rows, cols] matrix (a linear layer's bias gradient), pass 1: the same deterministic
+// (column tile x row chunk) blocking as layernorm_grad_params_partial, writing partials[chunk][col]. cuBLAS ran this
+// as a ones-GEMV (gemv2N) at ~10 us for 2048 x 64..256.
+extern ""C"" __global__ __launch_bounds__(256) void column_sum_partial(
+    const float* __restrict__ input, float* __restrict__ partials, int rows, int cols, int rowsPerChunk)
+{
+    __shared__ float s[8][33];
+    int col = blockIdx.x * 32 + threadIdx.x;
+    int chunk = blockIdx.y;
+    int r0 = chunk * rowsPerChunk;
+    int r1 = min(rows, r0 + rowsPerChunk);
+    float acc = 0.0f;
+    if (col < cols)
+        for (int r = r0 + threadIdx.y; r < r1; r += 8)
+            acc += input[r * cols + col];
+    s[threadIdx.y][threadIdx.x] = acc;
+    __syncthreads();
+    if (threadIdx.y == 0 && col < cols)
+    {
+        float t = 0.0f;
+        for (int y = 0; y < 8; y++) t += s[y][threadIdx.x];
+        partials[chunk * cols + col] = t;
+    }
+}
+
+// Pass 2: each column's partials summed in chunk order, written to (or added to) output.
+extern ""C"" __global__ __launch_bounds__(256) void column_sum_finish(
+    const float* __restrict__ partials, float* __restrict__ output, int cols, int chunks, int add)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float t = 0.0f;
+    for (int c = 0; c < chunks; c++) t += partials[c * cols + col];
+    output[col] = add ? output[col] + t : t;
+}
 ";
         }
 
@@ -579,7 +615,9 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_finish
                 "rmsnorm_grad_gamma",
                 "layernorm_inverse_std",
                 "layernorm_grad_params_partial",
-                "layernorm_grad_params_finish"
+                "layernorm_grad_params_finish",
+                "column_sum_partial",
+                "column_sum_finish"
             };
         }
     }

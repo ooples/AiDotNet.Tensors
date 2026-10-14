@@ -18040,6 +18040,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Column sums of a resident [rows, cols] buffer into <paramref name="output"/> (added when <paramref name="add"/>)
+    /// through the backend's deterministic column-sum kernel (<see cref="IColumnSumBackend"/>), with its scratch from the
+    /// compiled step's pool. False -- nothing launched -- where unavailable; the caller then runs its ones-GEMM.
+    /// </summary>
+    private bool TryColumnSumsOnDevice(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int rows, int cols, bool add)
+    {
+        if (backend is not IColumnSumBackend columns || !ScratchPoolingActive) return false;
+        int scratchFloats = columns.ColumnSumScratchFloats(rows, cols);
+        if (scratchFloats <= 0) return false;
+        var scratch = RentActionScratch(backend, scratchFloats, fullyWritten: true);
+        return columns.TryColumnSums(input, scratch, output, rows, cols, add);
+    }
+
+    /// <summary>
     /// Resident-step sum or mean over a LEADING block of axes of a contiguous [leading, kept] tensor: one GEMM against
     /// a cached ones row writes the result into a resident buffer. The general resident path permutes the whole tensor
     /// first (a transpose kernel) and then row-sums it -- on the parity Transformer, 8 transposes per training step,
@@ -18076,7 +18090,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var output = new Tensor<T>(new T[kept], outputShape);
         var outBuf = GetOrCreateResidentBuffer(backend, output, kept, fullyWritten: true);
         if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < kept) return null;
-        backend.Gemm(ones, inBuf, outBuf, 1, kept, leading);   // [1, leading] · [leading, kept]
+        if (!TryColumnSumsOnDevice(backend, inBuf, outBuf, leading, kept, add: false))
+            backend.Gemm(ones, inBuf, outBuf, 1, kept, leading);   // [1, leading] · [leading, kept]
         if (op == ReduceOperation.Mean)
             backend.Scale(outBuf, outBuf, 1f / leading, kept);
         ResidentSyncCheck("ReduceLeadingAxes");
@@ -20580,7 +20595,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (target is null) return false;
         try
         {
-            backend.Gemm(ones, inBuf, target, 1, cols, rows, 1f, add ? 1f : 0f);   // [1, rows] · [rows, cols]
+            if (!TryColumnSumsOnDevice(backend, inBuf, target, rows, cols, add))
+                backend.Gemm(ones, inBuf, target, 1, cols, rows, 1f, add ? 1f : 0f);   // [1, rows] · [rows, cols]
         }
         catch (NotSupportedException ex)
         {

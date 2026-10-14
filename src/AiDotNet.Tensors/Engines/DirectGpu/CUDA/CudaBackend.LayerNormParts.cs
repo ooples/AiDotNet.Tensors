@@ -2,9 +2,37 @@ using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-// LayerNorm's backward as placeable pieces (see ILayerNormBackwardPartsBackend).
-public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend
+// LayerNorm's backward as placeable pieces (see ILayerNormBackwardPartsBackend), and the same deterministic
+// column reduction for bias gradients (IColumnSumBackend).
+public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColumnSumBackend
 {
+    int IColumnSumBackend.ColumnSumScratchFloats(int rows, int cols) =>
+        rows <= 0 || cols <= 0 ? 0 : checked(LayerNormAffineGradientChunks(rows, cols) * cols);
+
+    unsafe bool IColumnSumBackend.TryColumnSums(IGpuBuffer input, IGpuBuffer scratch, IGpuBuffer output,
+        int rows, int cols, bool add)
+    {
+        if (!IsAvailable || rows <= 0 || cols <= 0 || input.Size < (long)rows * cols || output.Size < cols
+            || output.Handle == input.Handle
+            || !_kernelCache.TryGetValue("column_sum_partial", out var partialKernel)
+            || !_kernelCache.TryGetValue("column_sum_finish", out var finishKernel))
+            return false;
+        int chunks = LayerNormAffineGradientChunks(rows, cols);
+        if (scratch.Size < (long)chunks * cols) return false;
+        int rowsPerChunk = (rows + chunks - 1) / chunks;
+
+        using var _ = PushContext();
+        IntPtr x = input.Handle, part = scratch.Handle, o = output.Handle;
+        int r = rows, c = cols, rpc = rowsPerChunk, ch = chunks, ad = add ? 1 : 0;
+        void** pargs = stackalloc void*[5];
+        pargs[0] = &x; pargs[1] = &part; pargs[2] = &r; pargs[3] = &c; pargs[4] = &rpc;
+        LaunchKernel2D(partialKernel, (uint)((cols + 31) / 32), (uint)chunks, 32, 8, pargs);
+        void** fargs = stackalloc void*[5];
+        fargs[0] = &part; fargs[1] = &o; fargs[2] = &c; fargs[3] = &ch; fargs[4] = &ad;
+        LaunchKernel(finishKernel, (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, fargs);
+        return true;
+    }
+
     // Chunks of rows for the affine-gradient reduction: enough blocks (~128 with the column tiles) to occupy the
     // device, and at least 32 rows per chunk (4 per row lane) so a chunk's partial is worth its write.
     private static int LayerNormAffineGradientChunks(int rows, int cols)

@@ -673,6 +673,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [InlineData(true, TwoPathNetwork.WideLogSoftmax)]
     [InlineData(false, TwoPathNetwork.ResidualLayerNorm)]
     [InlineData(true, TwoPathNetwork.ResidualLayerNorm)]
+    [InlineData(false, TwoPathNetwork.SharedBias)]
+    [InlineData(true, TwoPathNetwork.SharedBias)]
     public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
         Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
@@ -680,6 +682,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             TwoPathNetwork.Residual => ResidualLoss,
             TwoPathNetwork.WideLogSoftmax => WideLogSoftmaxLoss,
             TwoPathNetwork.ResidualLayerNorm => ResidualLayerNormLoss,
+            TwoPathNetwork.SharedBias => SharedBiasLoss,
             _ => SharedLoss,
         };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
@@ -699,6 +702,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             {
                 TwoPathNetwork.Residual => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
                     Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+                TwoPathNetwork.SharedBias => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
+                    Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([Hidden, Outputs], 6, 0.3f) },
                 TwoPathNetwork.ResidualLayerNorm => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
                     Ones(Hidden, 8, 0.2f), Rand([Hidden], 9, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
                 TwoPathNetwork.WideLogSoftmax => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
@@ -795,6 +800,16 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorMSELoss(e.FusedLinear(s, w[4], w[5], FusedActivationType.None), y);
     }
 
+    /// <summary>MSE of <c>(h · w2 + b) + (h · w4 + b)</c> with <c>h = ReLU(x · w0 + b0)</c>: the two output layers share
+    /// one bias, whose gradient is summed into its accumulator twice (overwrite, then add).</summary>
+    private static Tensor<float> SharedBiasLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var pred = e.TensorAdd(e.FusedLinear(h, w[2], w[3], FusedActivationType.None),
+            e.FusedLinear(h, w[4], w[3], FusedActivationType.None));
+        return e.TensorMSELoss(pred, y);
+    }
+
     // A LayerNorm gain near one: 1 + noise.
     private static Tensor<float> Ones(int length, int seed, float noise)
     {
@@ -814,6 +829,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         WideLogSoftmax,
         /// <summary>Residual blocks sharing a LayerNorm: its gradients written straight into their accumulators.</summary>
         ResidualLayerNorm,
+        /// <summary>Two output layers sharing one bias: its gradient's column sums added into the accumulator.</summary>
+        SharedBias,
     }
 
     /// <summary>
