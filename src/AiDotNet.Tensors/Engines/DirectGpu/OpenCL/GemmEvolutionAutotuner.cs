@@ -92,6 +92,22 @@ public sealed partial class GemmAutoTuner
     private static readonly KernelId EvolutionKernelId = new("gemm", "opencl-typed-evolution");
 
     /// <summary>
+    /// The kernel family and runtime the evolution identity records. OpenCL by default; the HIP backend tunes the same
+    /// CLBlast GEMM configurations under its own identity, so a deployment measured on one runtime never hydrates on the
+    /// other.
+    /// </summary>
+    internal KernelId EvolutionKernel { get; init; } = EvolutionKernelId;
+
+    /// <inheritdoc cref="EvolutionKernel"/>
+    internal KernelTuningBackend TuningBackend { get; init; } = KernelTuningBackend.OpenCl;
+
+    /// <summary>
+    /// Replaces the generic OpenCL variation operator, for a runtime whose kernel reads fewer of the configuration's
+    /// fields (mutating a field the kernel ignores spends an evaluation on an identical kernel).
+    /// </summary>
+    internal Func<GpuCapabilities, GemmKernelTemplate?, IVariationOperator<OpenClGemmConfiguration>>? VariationFactory { get; init; }
+
+    /// <summary>
     /// Returns locally valid heuristic configurations plus optional Bayesian, persisted, or community seeds.
     /// Downloaded/community values are never trusted merely because they deserialize.
     /// </summary>
@@ -151,18 +167,18 @@ public sealed partial class GemmAutoTuner
             throw new ArgumentOutOfRangeException(nameof(requiredTemplate));
         }
         var identity = new KernelTuningIdentity(
-            EvolutionKernelId,
+            EvolutionKernel,
             requiredTemplate.HasValue
                 ? new ShapeProfile(m, n, k, (int)requiredTemplate.Value)
                 : new ShapeProfile(m, n, k, -1),
             fingerprint,
-            KernelTuningBackend.OpenCl,
+            TuningBackend,
             searchSpaceVersion,
             benchmarkProtocolVersion);
         return new EvolutionKernelAutotuner<OpenClGemmConfiguration>(
             identity,
             new OpenClGemmCodec(),
-            new OpenClGemmVariation(capabilities, requiredTemplate),
+            VariationFactory?.Invoke(capabilities, requiredTemplate) ?? new OpenClGemmVariation(capabilities, requiredTemplate),
             async (configuration, context, cancellationToken) =>
             {
                 GemmConfig candidate = configuration.ToGemmConfig();
