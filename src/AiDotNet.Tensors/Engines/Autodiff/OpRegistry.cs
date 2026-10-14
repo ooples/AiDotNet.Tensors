@@ -184,7 +184,7 @@ internal static class OpRegistry
         // Loss
         "TensorMSELoss", "TensorBCEWithLogitsLoss", "TensorCrossEntropyLoss",
         "TensorBinaryCrossEntropy", "TensorL1Loss", "TensorHuberLoss",
-        "TensorKLDivLoss", "TensorNLLLoss", "TensorCTCLoss",
+        "TensorKLDivLoss", "TensorNLLLoss", "TensorCTCLoss", "TensorSoftmaxCrossEntropy",
 
         // Fused
         "FusedLinearReLU", "FusedLinearSigmoid", "FusedLinearTanh",
