@@ -37,6 +37,39 @@ internal static class CudaSparseBackend
     /// cuSPARSE library, which is the whole point of the supply-chain removal.</summary>
     public static bool IsAvailable => CudaBackend.IsCudaAvailable;
 
+    // One backend for every call. These entry points used to build a new CudaBackend per call and never dispose
+    // it: each call paid backend construction plus NVRTC for kernels the previous call had already compiled, and
+    // left the backend behind, so a host-array SpMM took 65-140 ms and got slower with every call. Calls are
+    // serialized on the shared backend's stream, and the lease makes its context current on the calling thread
+    // (the raw cuMemcpy copies below need it).
+    private static readonly object BackendGate = new object();
+    private static CudaBackend? _sharedBackend;
+
+    private readonly struct BackendLease : IDisposable
+    {
+        public CudaBackend Backend { get; }
+
+        private BackendLease(CudaBackend backend) => Backend = backend;
+
+        public static BackendLease Acquire()
+        {
+            System.Threading.Monitor.Enter(BackendGate);
+            try
+            {
+                var backend = _sharedBackend ??= CudaBackend.CreateOrThrow();
+                backend.EnsureContextCurrent();
+                return new BackendLease(backend);
+            }
+            catch
+            {
+                System.Threading.Monitor.Exit(BackendGate);
+                throw;
+            }
+        }
+
+        public void Dispose() => System.Threading.Monitor.Exit(BackendGate);
+    }
+
     /// <summary>
     /// CSR · dense → dense, host-side <c>float[]</c> CSR inputs. Returns the dense
     /// output flat array of length <c>rows · n</c>. Mirrors
@@ -50,7 +83,8 @@ internal static class CudaSparseBackend
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA custom-kernel SpMM backend is not available.");
 
-        var backend = CudaBackend.CreateOrThrow();
+        using var lease = BackendLease.Acquire();
+        var backend = lease.Backend;
         var output = new float[rows * n];
 
         // Every allocation sits inside the try so a throw anywhere along the
@@ -115,7 +149,8 @@ internal static class CudaSparseBackend
         var output = new float[nnz];
         if (nnz == 0) return output;
 
-        var backend = CudaBackend.CreateOrThrow();
+        using var lease = BackendLease.Acquire();
+        var backend = lease.Backend;
 
         IGpuBuffer? rowBuf = null, colBuf = null, xBuf = null, yBuf = null, outBuf = null;
         try
@@ -157,7 +192,8 @@ internal static class CudaSparseBackend
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA custom-kernel SpMM backend is not available.");
 
-        var backend = CudaBackend.CreateOrThrow();
+        using var lease = BackendLease.Acquire();
+        var backend = lease.Backend;
         var output = new double[rows * n];
 
         IGpuBuffer? valuesBuf = null, bBuf = null, outBuf = null;

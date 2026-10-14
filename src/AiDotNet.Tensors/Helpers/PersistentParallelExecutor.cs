@@ -64,6 +64,19 @@ internal sealed class PersistentParallelExecutor
     // GEMM arrays a thread-local body closes over) are released for GC between dispatches.
     private volatile Job? _job;
 
+    // Plain-mode chunk cursors, one per participant on its own cache line (stride 8 longs = 64 bytes). Each holds
+    // (dispatch Id << 32) | next index into that participant's strided set. Ids only increase, so a cursor stamped
+    // with an older Id reads as index 0 of this dispatch: nobody re-initialises the cursors before a dispatch (writing
+    // every participant's line on the calling thread cost the shortest ops ~0.6 us), a claim is one compare-exchange,
+    // and a worker that wakes late holding a finished dispatch can never claim for a later one (its Id is smaller).
+    // Reused across dispatches: no allocation per op.
+    private const int CursorStride = 8;
+
+    /// <summary>Tests only: runs on a worker after it wakes for a plain dispatch and before it claims its set, to stand
+    /// in for a worker the OS has not scheduled yet.</summary>
+    internal static Action<int>? TestWorkerStartDelay;
+    private long[] _cursors = Array.Empty<long>();
+
     /// <summary>
     /// Immutable snapshot of one dispatch. Either <see cref="Action"/> (plain mode) OR the
     /// <see cref="LocalInit"/>/<see cref="LocalBody"/>/<see cref="LocalFinally"/> trio (thread-local
@@ -79,53 +92,34 @@ internal sealed class PersistentParallelExecutor
         public readonly Action<object?>? LocalFinally;
         public readonly int NumChunks;
         public readonly int Stride;
-
-        // Identifies the dispatch, so a worker joins it at most once however its wake-ups interleave with later
-        // dispatches (#1248).
+        /// <summary>Distinct per dispatch: a worker joins a dispatch at most once.</summary>
         public readonly long Id;
+        /// <summary>Plain mode: chunks not yet finished; the dispatch completes when this reaches zero.</summary>
+        public int Pending;
 
-        // Workers this dispatch woke (slots 0 .. WokenWorkers - 1). A thread-local dispatch is joined only by them.
-        public readonly int WokenWorkers;
+        private static long s_ids;
 
-        // Plain dispatches: every participant claims chunks from NextChunk, and the dispatch is done when
-        // CompletedChunks reaches NumChunks, so a woken worker that never gets a core leaves its chunks to the others
-        // instead of stalling the dispatch until the OS schedules it (#1248).
-        public int NextChunk;
-        public int CompletedChunks;
-
-        // Thread-local dispatches: woken workers still to finish their fixed strided set.
-        public int RemainingWorkers;
-
-        // First exception any participant threw (worker or caller), re-thrown on the caller.
-        public Exception? FirstException;
-
-        public Job(long id, Action<int>? action, Func<object?>? localInit, Action<int, object?>? localBody,
-            Action<object?>? localFinally, int numChunks, int stride, int wokenWorkers)
+        public Job(Action<int>? action, Func<object?>? localInit, Action<int, object?>? localBody,
+            Action<object?>? localFinally, int numChunks, int stride)
         {
-            Id = id;
             Action = action;
             LocalInit = localInit;
             LocalBody = localBody;
             LocalFinally = localFinally;
             NumChunks = numChunks;
             Stride = stride;
-            WokenWorkers = wokenWorkers;
-            RemainingWorkers = wokenWorkers;
+            Id = Interlocked.Increment(ref s_ids);
+            Pending = numChunks;
         }
-
-        public bool IsThreadLocal => LocalBody is not null;
-
-        public bool IsDone => IsThreadLocal
-            ? Volatile.Read(ref RemainingWorkers) == 0
-            : Volatile.Read(ref CompletedChunks) >= NumChunks;
     }
 
-    private long _nextJobId;
+    // Completion tracking — workers decrement, dispatcher waits for zero
+    private int _remaining;
 
     // Completion signal for the dispatcher
     private readonly ManualResetEventSlim _allDone = new(false);
 
-    // How long the dispatching thread spins on the job' completion count before blocking on _allDone (Stopwatch ticks).
+    // How long the dispatching thread spins on _remaining before blocking on _allDone (Stopwatch ticks).
     // Blocking made every dispatch pay a kernel wait plus a wake-up handshake (ManualResetEventSlim.Wait's
     // Monitor slow path on the dispatcher, Set's lock + PulseAll on the last worker): on a CPU training step
     // that issues dozens of 10-100 us dispatches, ~20% of the dispatching thread went to that machinery. The
@@ -143,36 +137,39 @@ internal sealed class PersistentParallelExecutor
     }
 
     /// <summary>
-    /// Waits until <paramref name="job"/> is done (every chunk completed, or every woken worker finished its
-    /// thread-local set): a bounded spin, then the event.
+    /// Waits until every woken worker has decremented <see cref="_remaining"/>: a bounded spin, then the event.
     /// </summary>
     /// <remarks>
-    /// The event can carry a STALE set: when the spin sees the job finish it returns before the finisher's
-    /// <c>_allDone.Set()</c>, which may then land after the next dispatch's <c>Reset()</c>. So the job's own
+    /// The event can carry a STALE set: when the spin sees the count reach zero it returns before the last
+    /// worker's <c>_allDone.Set()</c>, which may then land after the next dispatch's <c>Reset()</c>. So the
     /// count, never the event, decides completion: after each wake the event is reset and the count re-read.
-    /// The finisher sets the event only AFTER its count update, so a not-done count read after the reset
+    /// The last worker sets the event only AFTER its decrement, so a non-zero count read after the reset
     /// guarantees that set is still to come -- no wake-up can be lost.
     /// </remarks>
-    private void WaitForJob(Job job)
+    private void WaitForWorkers() => WaitForZero(ref _remaining);
+
+    /// <summary>Waits until <paramref name="counter"/> is zero, by the protocol described on <see cref="WaitForWorkers"/>.</summary>
+    private void WaitForZero(ref int counter)
     {
         long budget = _completionSpinTicks;
-        if (budget > 0 && !job.IsDone)
+        if (budget > 0 && Volatile.Read(ref counter) != 0)
         {
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             int spins = 0;
-            while (!job.IsDone)
+            while (Volatile.Read(ref counter) != 0)
             {
                 System.Threading.Thread.SpinWait(16);
                 if ((++spins & 0x3F) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() - start >= budget)
                     break;
             }
         }
-        while (!job.IsDone)
+        while (Volatile.Read(ref counter) != 0)
         {
             _allDone.Wait();
             _allDone.Reset();
         }
     }
+
     // Serialize concurrent Execute calls
     private readonly object _executeLock = new();
 
@@ -212,6 +209,9 @@ internal sealed class PersistentParallelExecutor
             _workers[i].Start();
         }
     }
+
+    // Captured worker exception (first one wins)
+    private volatile Exception? _workerException;
 
     // Adaptive keep-warm window (Stopwatch ticks). After finishing an op, a worker
     // stays hot — cooperatively spinning for the next dispatch — for as long as the
@@ -383,26 +383,6 @@ internal sealed class PersistentParallelExecutor
 #endif
 
     /// <summary>
-    /// A participant's share of a plain dispatch: claims chunks from <c>job.NextChunk</c> until none are left,
-    /// recording the first exception on the job and counting each finished chunk. Whoever finishes the last chunk
-    /// signals the dispatcher. A participant that arrives late (or was never scheduled) simply finds nothing left.
-    /// </summary>
-    [MethodImpl(Hot)]
-    private void RunClaimedChunks(Job job)
-    {
-        var action = job.Action ?? throw new InvalidOperationException("A plain dispatch carries an action.");
-        int numChunks = job.NumChunks;
-        while (true)
-        {
-            int c = Interlocked.Increment(ref job.NextChunk) - 1;
-            if (c >= numChunks) return;
-            try { action(c); }
-            catch (Exception ex) { Interlocked.CompareExchange(ref job.FirstException, ex, null); }
-            if (Interlocked.Increment(ref job.CompletedChunks) == numChunks)
-                _allDone.Set();
-        }
-    }
-    /// <summary>
     /// Runs one participant's strided chunk set: chunks <paramref name="firstChunk"/>,
     /// firstChunk+Stride, … &lt; <c>job.NumChunks</c>. In normal mode calls <c>job.Action</c> per chunk;
     /// in thread-local mode (<c>job.LocalBody</c> set) creates ONE TLocal via <c>job.LocalInit</c> for
@@ -411,6 +391,117 @@ internal sealed class PersistentParallelExecutor
     /// re-throw first" semantics. Shared by the main thread and every worker (each passed the SAME
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
+    /// <summary>
+    /// Plain mode: runs <paramref name="owner"/>'s strided set (owner, owner+stride, ...), claiming each chunk on that
+    /// owner's cursor, then subtracts the chunks it ran from the pending total once. Every participant runs its own set,
+    /// as with fixed assignment, so a repeated op keeps each chunk on the same core and its data in that core's cache
+    /// (1M-element elementwise ops run from L2; claiming from one shared counter scattered chunks across cores and made
+    /// them ~10x slower). The caller steals through the same cursors, so even a worker stalled part-way through its set
+    /// gives up the chunks it has not started.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private Exception? RunSet(Job job, int owner, bool publish)
+    {
+        Exception? first = null;
+        var action = job.Action!;
+        int numChunks = job.NumChunks, stride = job.Stride;
+        uint id = (uint)job.Id;
+        long[] cursors = _cursors;
+        int count = owner < stride ? (numChunks - owner + stride - 1) / stride : 0;
+        int done = 0;
+        while (TryClaim(cursors, owner, id, count, out int i))
+        {
+            try { action(owner + i * stride); }
+            catch (Exception ex)
+            {
+                first ??= ex;
+                if (publish)
+                    Interlocked.CompareExchange(ref _workerException, ex, null);
+            }
+            done++;
+        }
+        // One update of the shared count per participant, not per chunk.
+        if (done > 0 && Interlocked.Add(ref job.Pending, -done) == 0)
+            _allDone.Set();
+        return first;
+    }
+
+    // How long the dispatching thread waits, after its own chunks, for the woken workers before it takes the chunks
+    // they have not started (Stopwatch ticks). A normal dispatch finishes well inside this, so nothing is stolen and
+    // nothing scans the other cursors; a worker that does not get a core (another runtime's spinning threads, a busy
+    // CI host) costs this delay instead of holding the dispatch until the OS runs it: an ONNX MatMul chain run right
+    // after ONNX Runtime (whose pool keeps spinning after Run) took 21.8 ms on its first call against ~40 us steady
+    // (#1248). Env override AIDOTNET_PPE_STEAL_AFTER_US; default 50 us.
+    private static readonly long _stealAfterTicks = ComputeStealAfterTicks();
+
+    private static long ComputeStealAfterTicks()
+    {
+        long micros = 50;
+        if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_STEAL_AFTER_US"), out var us) && us >= 0)
+            micros = us;
+        return (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+    }
+
+    /// <summary>
+    /// Dispatcher side of a plain dispatch, after its own set: wait up to <see cref="_stealAfterTicks"/> for the rest,
+    /// then run every chunk still unstarted (each owner's cursor, compare-exchanged like the owner does, so each chunk
+    /// still runs once), then wait for the chunks still running elsewhere.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private Exception? FinishPlainDispatch(Job job)
+    {
+        if (Volatile.Read(ref job.Pending) != 0)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            int spins = 0;
+            while (Volatile.Read(ref job.Pending) != 0)
+            {
+                System.Threading.Thread.SpinWait(16);
+                if ((++spins & 0x3F) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() - start >= _stealAfterTicks)
+                    break;
+            }
+        }
+        Exception? first = null;
+        if (Volatile.Read(ref job.Pending) != 0)
+        {
+            for (int owner = 1; owner < job.Stride; owner++)
+            {
+                var ex = RunSet(job, owner, publish: false);
+                first ??= ex;
+            }
+        }
+        WaitForZero(ref job.Pending);
+        return first;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryClaim(long[] cursors, int owner, uint id, int count, out int index)
+    {
+        ref long slot = ref cursors[owner * CursorStride];
+        while (true)
+        {
+            long cur = Volatile.Read(ref slot);
+            uint curId = (uint)((ulong)cur >> 32);
+            if (curId > id)
+            {
+                index = 0;
+                return false; // a later dispatch owns this cursor: this caller is a late worker
+            }
+            int idx = curId == id ? (int)(uint)cur : 0;
+            if (idx >= count)
+            {
+                index = 0;
+                return false;
+            }
+            long next = (long)(((ulong)id << 32) | (uint)(idx + 1));
+            if (Interlocked.CompareExchange(ref slot, next, cur) == cur)
+            {
+                index = idx;
+                return true;
+            }
+        }
+    }
+
     [MethodImpl(Hot)]
     private static Exception? RunParticipantChunks(Job job, int firstChunk)
     {
@@ -419,7 +510,7 @@ internal sealed class PersistentParallelExecutor
         var localBody = job.LocalBody;
         if (localBody is null)
         {
-            var action = job.Action ?? throw new InvalidOperationException("A plain dispatch carries an action.");
+            var action = job.Action!;
             for (int c = firstChunk; c < numChunks; c += stride)
             {
                 try { action(c); }
@@ -598,29 +689,37 @@ internal sealed class PersistentParallelExecutor
             // callbacks falls back to sequential instead of deadlocking on _executeLock.
             _isExecuting = true;
             // Read the whole dispatch atomically: _job was published (volatile) BEFORE this worker's
-            // _workReady was Set, so this single acquiring read gives a fully-consistent Job. A worker that was
-            // starved of a core can wake after the dispatch it was woken for has finished: it then reads null or a
-            // later job, which is why it joins by job id, at most once.
+            // _workReady was Set, so this single acquiring read gives a fully-consistent Job — no
+            // chance of a half-updated body/stride/chunk-count from a concurrent or prior dispatch.
             var job = _job;
+            // A plain dispatch can complete without a woken worker (others claimed its chunks), so a worker can
+            // wake late: after its dispatch ended (job null), into the next dispatch, or twice into the same one.
+            // It joins each dispatch at most once, and a thread-local one only as a slot that dispatch woke.
             if (job is null || job.Id == lastJobId)
                 continue;
             lastJobId = job.Id;
-
-            if (!job.IsThreadLocal)
+            if (job.LocalBody is null)
             {
-                RunClaimedChunks(job);
+                // Plain mode: its own set (none if this dispatch did not wake it). A chunk's exception is published
+                // before the chunk counts as finished.
+                TestWorkerStartDelay?.Invoke(slot);
+                _ = RunSet(job, slot + 1, publish: true);
                 continue;
             }
-
-            // A thread-local dispatch's chunk sets are fixed per participant (their per-participant state depends on
-            // it), so only a slot this dispatch woke may run one.
-            if (slot >= job.WokenWorkers)
+            if (slot >= job.Stride - 1)
                 continue;
+
+            // Thread-local mode: this worker's strided chunk set. Capture the first exception, re-thrown on the
+            // caller thread.
             var workerEx = RunParticipantChunks(job, slot + 1);
             if (workerEx is not null)
-                Interlocked.CompareExchange(ref job.FirstException, workerEx, null);
-            if (Interlocked.Decrement(ref job.RemainingWorkers) == 0)
+                Interlocked.CompareExchange(ref _workerException, workerEx, null);
+
+            // Signal completion
+            if (Interlocked.Decrement(ref _remaining) == 0)
+            {
                 _allDone.Set();
+            }
         }
     }
 
@@ -796,11 +895,15 @@ internal sealed class PersistentParallelExecutor
                 System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
                 System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
 
-                // Publish the whole dispatch as ONE Job, completion state included, BEFORE waking any worker: the
-                // _job volatile write (and the _workReady Set() release below) publishes it consistently.
+                // Completion state, then publish the whole dispatch as ONE immutable Job. The
+                // _job volatile write (and the _workReady Set() release below) publishes _remaining
+                // too, so a woken worker reads a fully-consistent dispatch.
+                _workerException = null;
                 _allDone.Reset();
-                var job = new Job(++_nextJobId, action, null, null, null, numChunks, stride, workersNeeded);
-                _job = job;
+                var job = new Job(action, null, null, null, numChunks, stride);
+                if (_cursors.Length < stride * CursorStride)
+                    _cursors = new long[(_numWorkers + 1) * CursorStride];
+                _job = job; // publish BEFORE waking any worker (the volatile write also publishes the cursors)
 
                 // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
                 for (int i = 0; i < workersNeeded; i++)
@@ -808,19 +911,20 @@ internal sealed class PersistentParallelExecutor
                     _workReady[i].Set();
                 }
 
-                // The caller claims chunks alongside the workers. Chunks write disjoint output, so which participant
-                // runs which chunk does not change the result, and a woken worker that never gets a core leaves its
-                // share to the others instead of stalling the dispatch (#1248).
-                RunClaimedChunks(job);
-
-                // Every chunk has been claimed; wait until the last claimed ones finish.
-                WaitForJob(job);
+                // The calling thread runs its own set (participant 0), gives the workers a short grace period, then
+                // runs any chunk still unstarted and waits for the ones running elsewhere -- not for every woken
+                // worker: one that has not started holds no chunk and is not waited on.
+                Exception? mainException = RunSet(job, 0, publish: false);
+                mainException ??= FinishPlainDispatch(job);
 
                 _job = null; // release the body's captured references for GC between dispatches
 
-                // Re-throw the first captured exception (worker or caller)
-                if (job.FirstException is { } first)
-                    throw first;
+                // Re-throw first captured exception (worker or main thread)
+                var workerEx = _workerException;
+                if (mainException is not null)
+                    throw mainException;
+                if (workerEx is not null)
+                    throw workerEx;
             }
             finally
             {
@@ -901,33 +1005,33 @@ internal sealed class PersistentParallelExecutor
                 System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
                 System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
 
-                // Publish the whole thread-local dispatch as ONE Job (the boxed TLocal lifecycle and the
-                // completion state live inside it), atomically, BEFORE waking any worker. Its chunk sets stay fixed
-                // per participant, since each participant's TLocal accumulates exactly its own set.
+                // Completion state, then publish the whole thread-local dispatch as ONE Job (the
+                // boxed TLocal lifecycle lives inside it), atomically, BEFORE waking any worker.
+                _remaining = workersNeeded;
+                _workerException = null;
                 _allDone.Reset();
-                var job = new Job(
-                    id: ++_nextJobId,
+                _job = new Job(
                     action: null,
                     localInit: () => localInit(),
                     localBody: (c, o) => body(c, (TLocal)o!),
                     localFinally: o => localFinally((TLocal)o!),
                     numChunks: numChunks,
-                    stride: stride,
-                    wokenWorkers: workersNeeded);
-                _job = job;
+                    stride: stride);
+                var job = _job;
 
                 for (int i = 0; i < workersNeeded; i++)
                     _workReady[i].Set();
 
                 Exception? mainException = RunParticipantChunks(job, 0);
 
-                // RemainingWorkers starts at workersNeeded, so with no woken workers the job is already done.
-                WaitForJob(job);
+                if (workersNeeded > 0)
+                    WaitForWorkers();
 
                 _job = null; // release the body's captured references for GC between dispatches
 
+                var workerEx = _workerException;
                 if (mainException is not null) throw mainException;
-                if (job.FirstException is { } workerEx) throw workerEx;
+                if (workerEx is not null) throw workerEx;
             }
             finally
             {
