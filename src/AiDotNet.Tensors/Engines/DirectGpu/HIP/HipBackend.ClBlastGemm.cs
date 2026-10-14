@@ -13,7 +13,13 @@ public sealed partial class HipBackend
     private ClBlastXgemmDirectParameters _clblastDirectParams;
     private bool _clblastDirectTried;
     private bool _clblastDirectReady;
-
+    private IntPtr _clblastIndirectModule;
+    private IntPtr _clblastPackingModule;
+    private GemmConfig _clblastIndirectConfig;
+    private ClBlastPadParameters _clblastPadParams;
+    private ClBlastPadTransposeParameters _clblastPadTransposeParams;
+    private bool _clblastIndirectTried;
+    private bool _clblastIndirectReady;
     /// <summary>The CLBlast database key for this device: the one OpenCL uses for the same GPU.</summary>
     internal ClBlastDeviceInfo ClBlastDevice => ClBlastDeviceInfo.ForAmdGpu(_architectureTarget, DeviceName);
 
@@ -67,6 +73,136 @@ public sealed partial class HipBackend
         return true;
     }
 
+    /// <summary>
+    /// Builds the indirect GEMM (clblast_xgemm) and its packing kernels once, with the database configuration unless
+    /// <paramref name="config"/> is given.
+    /// </summary>
+    internal bool EnsureClBlastIndirectGemm(GemmConfig? config = null)
+    {
+        lock (_clblastLock)
+        {
+            if (config is null && _clblastIndirectTried) return _clblastIndirectReady;
+            _clblastIndirectTried = true;
+            _clblastIndirectReady = false;
+            var device = ClBlastDevice;
+            GemmConfig c;
+            if (config is GemmConfig given) c = given;
+            else if (!ClBlastXgemmDatabase.TryGetConfig(device, out c)) return false;
+            if (!IsAvailable || !HipClBlastGemmKernels.Supports(c)) return false;
+
+            if (_clblastPackingModule == IntPtr.Zero)
+            {
+                _clblastPadParams = ClBlastPadDatabase.GetParameters(device);
+                _clblastPadTransposeParams = ClBlastPadTransposeDatabase.GetParameters(device);
+                var packing = HipClBlastGemmKernels.BuildPackingSource(_clblastPadParams, _clblastPadTransposeParams,
+                    ClBlastCopyDatabase.GetParameters(device), ClBlastTransposeDatabase.GetParameters(device));
+                if (CompileKernelModule(packing, "clblast_packing", ref _clblastPackingModule,
+                    HipClBlastGemmKernels.PackingKernelNames, useFastMath: false) is not null) return false;
+            }
+            if (_clblastIndirectModule != IntPtr.Zero)
+            {
+                HipNativeBindings.hipModuleUnload(_clblastIndirectModule);
+                _clblastIndirectModule = IntPtr.Zero;
+            }
+            if (CompileKernelModule(HipClBlastGemmKernels.BuildIndirectSource(c), "clblast_indirect", ref _clblastIndirectModule,
+                new[] { "clblast_xgemm" }, useFastMath: false) is not null) return false;
+            _clblastIndirectConfig = c;
+            _clblastIndirectReady = _kernelCache.ContainsKey("clblast_xgemm") && _kernelCache.ContainsKey("CopyPadMatrix") &&
+                _kernelCache.ContainsKey("CopyMatrix") && _kernelCache.ContainsKey("TransposePadMatrix");
+            return _clblastIndirectReady;
+        }
+    }
+
+    /// <summary>
+    /// Row-major C = alpha * A[M x K] * B[K x N] + beta * C through CLBlast's indirect path, as OpenClBackend runs it
+    /// (TryExecuteClBlastBaselineGemm's row-major swap): B is padded into the kernel's A slot, A is transposed into its
+    /// B slot, the GEMM runs on tile-multiple sizes, and C is copied out of a padded buffer when it needs one.
+    /// </summary>
+    internal unsafe bool TryExecuteClBlastIndirectGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
+        float alpha = 1f, float beta = 0f)
+    {
+        if (M <= 0 || N <= 0 || K <= 0 || !EnsureClBlastIndirectGemm()) return false;
+        var c = _clblastIndirectConfig;
+        int kUnit = c.TileK * (c.KReg > 0 ? c.KReg : 1);
+        int mCeiled = CeilTo(N, c.TileM), nCeiled = CeilTo(M, c.TileN), kCeiled = CeilTo(K, kUnit);
+        long aSize = (long)mCeiled * kCeiled, bSize = (long)nCeiled * kCeiled, cSize = (long)mCeiled * nCeiled;
+        if (aSize > int.MaxValue || bSize > int.MaxValue || cSize > int.MaxValue) return false;
+        bool aNeedsPad = N != mCeiled || K != kCeiled;
+        bool cNeedsPad = N != mCeiled || M != nCeiled;
+
+        IGpuBuffer? aTemp = null, bTemp = null, cTemp = null;
+        try
+        {
+            IGpuBuffer aBuf = B, cBuf = C;
+            if (aNeedsPad)
+            {
+                aTemp = AllocateBuffer((int)aSize);
+                ClBlastPack("CopyPadMatrix", B, aTemp, N, K, N, mCeiled, kCeiled, mCeiled);
+                aBuf = aTemp;
+            }
+            // The kernel reads its B operand as bgm[k * ld + n], so A goes in physically transposed, padded or not.
+            bTemp = AllocateBuffer((int)bSize);
+            ClBlastPack("TransposePadMatrix", A, bTemp, K, M, K, nCeiled, kCeiled, nCeiled);
+            if (cNeedsPad)
+            {
+                cTemp = AllocateBuffer((int)cSize);
+                if (beta != 0f) ClBlastPack("CopyPadMatrix", C, cTemp, N, M, N, mCeiled, nCeiled, mCeiled);
+                cBuf = cTemp;
+            }
+
+            IntPtr kernel = _kernelCache["clblast_xgemm"];
+            int zero = 0;
+            IntPtr pa = aBuf.Handle, pb = bTemp.Handle, pc = cBuf.Handle;
+            void** args = stackalloc void*[10];
+            args[0] = &mCeiled; args[1] = &nCeiled; args[2] = &kCeiled; args[3] = &alpha; args[4] = &beta;
+            args[5] = &pa; args[6] = &pb; args[7] = &pc; args[8] = &zero; args[9] = &zero;
+            LaunchKernel2D(kernel, (uint)(mCeiled / c.TileM), (uint)(nCeiled / c.TileN), (uint)c.ThreadTileM, (uint)c.ThreadTileN, args);
+
+            if (cNeedsPad) ClBlastPack("CopyMatrix", cBuf, C, mCeiled, nCeiled, mCeiled, N, M, N);
+            return true;
+        }
+        finally
+        {
+            // hipFree waits for the device, so the temporaries outlive the kernels that read them.
+            cTemp?.Dispose();
+            bTemp?.Dispose();
+            aTemp?.Dispose();
+        }
+    }
+
+    private static int CeilTo(int value, int multiple) => (value + multiple - 1) / multiple * multiple;
+
+    /// <summary>One CLBlast pad / transpose launch with OpenClBackend's argument list and geometry.</summary>
+    private unsafe void ClBlastPack(string name, IGpuBuffer src, IGpuBuffer dst, int srcOne, int srcTwo, int srcLd,
+        int destOne, int destTwo, int destLd)
+    {
+        IntPtr kernel = _kernelCache[name];
+        int offset = 0, flag = 0;
+        float one = 1f;
+        IntPtr ps = src.Handle, pd = dst.Handle;
+        void** args = stackalloc void*[14];
+        args[0] = &srcOne; args[1] = &srcTwo; args[2] = &srcLd; args[3] = &offset; args[4] = &ps;
+        args[5] = &destOne; args[6] = &destTwo; args[7] = &destLd; args[8] = &offset; args[9] = &pd;
+        args[10] = &one; args[11] = &flag; args[12] = &flag; args[13] = &flag;
+        uint blockX, blockY, gridX, gridY;
+        if (name == "TransposePadMatrix")
+        {
+            int tile = _clblastPadTransposeParams.Tile, wpt = _clblastPadTransposeParams.WorkPerThread;
+            blockX = blockY = (uint)tile;
+            gridX = (uint)((destOne + wpt * tile - 1) / (wpt * tile));
+            gridY = (uint)((destTwo + wpt * tile - 1) / (wpt * tile));
+        }
+        else
+        {
+            var p = _clblastPadParams;
+            blockX = (uint)p.DimX;
+            blockY = (uint)p.DimY;
+            gridX = (uint)((destOne + p.WorkPerThreadX * p.DimX - 1) / (p.WorkPerThreadX * p.DimX));
+            gridY = (uint)((destTwo + p.WorkPerThreadY * p.DimY - 1) / (p.WorkPerThreadY * p.DimY));
+        }
+        LaunchKernel2D(kernel, gridX, gridY, blockX, blockY, args);
+    }
+
     private void DisposeClBlastGemm()
     {
         lock (_clblastLock)
@@ -77,6 +213,9 @@ public sealed partial class HipBackend
                 _clblastDirectModule = IntPtr.Zero;
             }
             _clblastDirectReady = false;
+            if (_clblastIndirectModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastIndirectModule); _clblastIndirectModule = IntPtr.Zero; }
+            if (_clblastPackingModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastPackingModule); _clblastPackingModule = IntPtr.Zero; }
+            _clblastIndirectReady = false;
         }
     }
 }

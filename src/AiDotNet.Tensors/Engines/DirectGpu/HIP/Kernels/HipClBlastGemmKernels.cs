@@ -47,8 +47,35 @@ typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sA, sB, sC, sD, s
     {
         if (!Supports(parameters))
             throw new ArgumentException("HIP builds the CLBlast direct GEMM only with vector widths 1, 2 or 4.", nameof(parameters));
-        string openCl = ClBlastXgemmDirectKernel.BuildSource(parameters)
-            .Replace("#define RELAX_WORKGROUP_SIZE 0", "#define RELAX_WORKGROUP_SIZE 1");
+        return Translate(ClBlastXgemmDirectKernel.BuildSource(parameters));
+    }
+
+    internal static string[] DirectKernelNames() => ClBlastXgemmDirectKernel.GetKernelNames();
+
+    /// <summary>Whether the indirect Xgemm configuration can be built for HIP.</summary>
+    internal static bool Supports(GemmConfig config) =>
+        config.KernelTemplate == GemmKernelTemplate.ClBlastBaselineK0 &&
+        config.TileM > 0 && config.TileN > 0 && config.TileK > 0 && config.ThreadTileM > 0 && config.ThreadTileN > 0 &&
+        config.VectorWidthM is 0 or 1 or 2 or 4 && config.VectorWidthN is 0 or 1 or 2 or 4;
+
+    /// <summary>The indirect GEMM kernel (clblast_xgemm, GEMMK 0) that OpenCL runs for sizes past MinIndirectSize.</summary>
+    internal static string BuildIndirectSource(GemmConfig config)
+    {
+        if (!Supports(config))
+            throw new ArgumentException("HIP builds the CLBlast indirect GEMM only for GEMMK 0 with vector widths 1, 2 or 4.", nameof(config));
+        return Translate(ClBlastXgemmKernel.BuildSource(config, 0));
+    }
+
+    /// <summary>The pad and transpose kernels the indirect GEMM packs its operands with (the non-Fast variants).</summary>
+    internal static string BuildPackingSource(ClBlastPadParameters pad, ClBlastPadTransposeParameters padTranspose,
+        ClBlastCopyParameters copy, ClBlastTransposeParameters transpose) =>
+        Translate(ClBlastPackingKernels.BuildSource(pad, padTranspose, copy, transpose));
+
+    internal static readonly string[] PackingKernelNames = { "CopyPadMatrix", "CopyMatrix", "TransposePadMatrix" };
+
+    private static string Translate(string source)
+    {
+        string openCl = source.Replace("#define RELAX_WORKGROUP_SIZE 0", "#define RELAX_WORKGROUP_SIZE 1");
         // Device-side helpers: CLBlast defines INLINE_FUNC unguarded in its common header.
         openCl = Regex.Replace(openCl, @"(?m)^(\s*)#define INLINE_FUNC(\s+inline)?\s*$", "$1#define INLINE_FUNC __device__ inline",
             RegexOptions.None, RegexTimeout);
@@ -56,6 +83,4 @@ typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sA, sB, sC, sD, s
         openCl = Regex.Replace(openCl, @"(?m)^\s*#pragma OPENCL[^\n]*$", string.Empty, RegexOptions.None, RegexTimeout);
         return new StringBuilder(Preamble.Length + openCl.Length).Append(Preamble).Append(openCl).ToString();
     }
-
-    internal static string[] DirectKernelNames() => ClBlastXgemmDirectKernel.GetKernelNames();
 }
