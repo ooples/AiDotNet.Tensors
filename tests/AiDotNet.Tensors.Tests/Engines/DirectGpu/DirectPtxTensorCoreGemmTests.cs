@@ -262,6 +262,45 @@ public sealed class DirectPtxTensorCoreGemmTests
             PtxTensorCoreGemmGenerator.Emit(Sampled[0], Layouts[0], 8, 6, PtxTensorCorePrecision.Tf32, halfOutput: true));
     }
 
+    private sealed class MemoryStore : AiDotNet.Tensors.Helpers.Autotune.IKernelTuningStore<PtxTensorCoreGemmConfiguration>
+    {
+        public bool TryLoad(AiDotNet.Tensors.Helpers.Autotune.KernelTuningIdentity identity,
+            AiDotNet.Evolution.IEvolutionGenomeCodec<PtxTensorCoreGemmConfiguration> codec,
+            out AiDotNet.Tensors.Helpers.Autotune.KernelTuningDeploymentSnapshot<PtxTensorCoreGemmConfiguration>? snapshot)
+        {
+            snapshot = null;
+            return false;
+        }
+
+        public bool TryStore(AiDotNet.Tensors.Helpers.Autotune.KernelTuningDeploymentSnapshot<PtxTensorCoreGemmConfiguration> snapshot,
+            AiDotNet.Evolution.IEvolutionGenomeCodec<PtxTensorCoreGemmConfiguration> codec) => true;
+    }
+
+    [SkippableFact]
+    public async System.Threading.Tasks.Task SmallBudgetTuning_DeploysAValidatedWinner_Tf32AndFp16()
+    {
+        using var runtime = RequireAmpere();
+        foreach (var precision in new[] { PtxTensorCorePrecision.Tf32, PtxTensorCorePrecision.Fp16 })
+        {
+            var options = new AiDotNet.Evolution.EvolutionEngineOptions
+            {
+                RunId = "tc-gemm-evolution-test-" + precision, Seed = 1264, MaxEvaluationAttempts = 8, MaxProposals = 16,
+                MaxGenerations = 2, ProposalBatchSize = 4, MaxDegreeOfParallelism = 1, IslandCount = 1,
+                MigrationInterval = 0, MigrantsPerIsland = 1,
+            };
+            var result = await PtxTensorCoreGemmEvolution.TuneAsync(runtime, Layouts[0], 256, 256, 256, precision,
+                engineOptions: options,
+                deploymentRegistry: new AiDotNet.Tensors.Helpers.Autotune.KernelTuningDeploymentRegistry<PtxTensorCoreGemmConfiguration>(),
+                store: new MemoryStore(),
+                onTrial: (c, t) => _output.WriteLine($"{precision} {c.Name}: {t.Status} {t.Measurement?.ThroughputGflops:F0} GFLOP/s {t.Diagnostic}"));
+            Assert.True(result.Run.Counters.EvaluationAttempts >= 3);
+            Assert.Equal(AiDotNet.Tensors.Helpers.Autotune.KernelTuningValidationScope.Output,
+                result.ProposedWinner.Measurement.Correctness.Scope);
+            Assert.True(result.ProposedWinner.Measurement.ThroughputGflops > 0);
+            Assert.True(PtxTensorCoreGemmEvolution.Admits(result.ProposedWinner.Configuration, Layouts[0], 256, 256, 256, precision));
+        }
+    }
+
     /// <summary>
     /// Opt-in seconds-long timing probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): one large shape, the large-tile configurations
     /// against cuBLAS's default (TF32) GEMM on the same device and stream, timed with CUDA events; each PTX output is also
