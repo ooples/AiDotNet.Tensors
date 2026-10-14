@@ -73,6 +73,34 @@ public class ArenaTrainingStepTests
     }
 
     /// <summary>
+    /// A tensor the arena's ring reissues after a reset is a new tensor: it must not carry the autograd history of the
+    /// op that last produced it. A backward kernel that fills a rented buffer without recording left that GradFn in
+    /// place, so a later step's graph walk followed it into an earlier step's node, whose tensors had since been
+    /// reissued under other shapes ("Multiples length (1) must match tensor dimensions (3)", AiDotNet's StyleGAN).
+    /// </summary>
+    [Fact]
+    public void RingReissueAfterReset_CarriesNoAutogradHistory()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        using var arena = TensorArena.Create();
+
+        Tensor<float> produced;
+        using (var tape = new GradientTape<float>())
+        {
+            produced = _engine.TensorMultiplyScalar(x, 2f);
+            Assert.NotNull(produced.GradFn);
+        }
+
+        arena.Reset();
+        var reissued = TensorAllocator.RentUninitialized<float>(new[] { 4 });
+
+        // The ring must actually have handed the same object back, or this test proves nothing.
+        Assert.Same(produced, reissued);
+        Assert.Null(reissued.GradFn);
+        Assert.Null(reissued.Grad);
+    }
+
+    /// <summary>
     /// A backward that rents its gradient from <see cref="TensorPool{T}"/> (Narrow's does) must not be handed memory
     /// the arena reissues after a reset. TensorPool outlives every arena reset, so a pooled arena-backed tensor came
     /// back from Rent while the arena gave the same buffer to a live tensor of the next step: from the second step on,
