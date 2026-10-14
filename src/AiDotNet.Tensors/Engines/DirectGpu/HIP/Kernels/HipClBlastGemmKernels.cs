@@ -39,18 +39,36 @@ typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7; } float8;
 typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sA, sB, sC, sD, sE, sF; } float16;
 ";
 
-    /// <summary>Whether the indirect Xgemm configuration can be built for HIP.</summary>
-    internal static bool Supports(GemmConfig config) =>
-        config.KernelTemplate == GemmKernelTemplate.ClBlastBaselineK0 &&
-        config.TileM > 0 && config.TileN > 0 && config.TileK > 0 && config.ThreadTileM > 0 && config.ThreadTileN > 0 &&
-        config.VectorWidthM is 0 or 1 or 2 or 4 && config.VectorWidthN is 0 or 1 or 2 or 4;
-
+    /// <summary>
+    /// Whether the indirect Xgemm configuration can be built for HIP: GEMMK 0, vector widths 1, 2 or 4, and CLBlast's own
+    /// xgemm tuner constraints (src/tuning/kernels/xgemm.hpp). The cooperative-load ones (MDIMA, NDIMB against KWG and
+    /// the tiles) are not in DynamicGemmKernel.ValidateConfig; a configuration that breaks them indexes outside its tiles.
+    /// </summary>
+    internal static bool Supports(GemmConfig config)
+    {
+        if (config.KernelTemplate != GemmKernelTemplate.ClBlastBaselineK0) return false;
+        int mwg = config.TileM, nwg = config.TileN, kwg = config.TileK;
+        int mdimc = config.ThreadTileM, ndimc = config.ThreadTileN;
+        int mdima = config.MdimaSize > 0 ? config.MdimaSize : mdimc, ndimb = config.NdimbSize > 0 ? config.NdimbSize : ndimc;
+        int vwm = config.VectorWidthM > 0 ? config.VectorWidthM : 1, vwn = config.VectorWidthN > 0 ? config.VectorWidthN : 1;
+        int kwi = config.KUnroll > 0 ? config.KUnroll : 1;
+        if (mwg <= 0 || nwg <= 0 || kwg <= 0 || mdimc <= 0 || ndimc <= 0 || mdima <= 0 || ndimb <= 0) return false;
+        if (vwm is not (1 or 2 or 4) || vwn is not (1 or 2 or 4) || config.KReg > 1) return false;
+        int threads = mdimc * ndimc;
+        if (threads % mdima != 0 || threads % ndimb != 0) return false;
+        return kwg % kwi == 0 &&
+            mwg % (mdimc * vwm) == 0 && nwg % (ndimc * vwn) == 0 &&
+            mwg % (mdima * vwm) == 0 && nwg % (ndimb * vwn) == 0 &&
+            kwg % (threads / mdima) == 0 && kwg % (threads / ndimb) == 0;
+    }
     /// <summary>The indirect GEMM kernel (clblast_xgemm, GEMMK 0) that OpenCL runs for sizes past MinIndirectSize.</summary>
-    internal static string BuildIndirectSource(GemmConfig config)
+    internal static string BuildIndirectSource(GemmConfig config, string kernelName = IndirectKernelName)
     {
         if (!Supports(config))
             throw new ArgumentException("HIP builds the CLBlast indirect GEMM only for GEMMK 0 with vector widths 1, 2 or 4.", nameof(config));
-        return Translate(ClBlastXgemmKernel.BuildSource(config, 0));
+        // CLBlast names its entry point through "#define Xgemm clblast_xgemm"; a distinct name lets variants coexist.
+        return Translate(ClBlastXgemmKernel.BuildSource(config, 0)
+            .Replace("#define Xgemm clblast_xgemm", "#define Xgemm " + kernelName));
     }
 
     /// <summary>The pad and transpose kernels the indirect GEMM packs its operands with (the non-Fast variants).</summary>
@@ -66,6 +84,8 @@ typedef struct { float s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sA, sB, sC, sD, s
     internal static bool IsLazyKernel(string name) =>
         name == IndirectKernelName || Array.IndexOf(PackingKernelNames, name) >= 0;
 
+    /// <summary>OpenCL C from the CLBlast builders, made compilable by hiprtc: the built-in preamble, relaxed work-group
+    /// sizes, device-side helper functions, and no OpenCL pragmas.</summary>
     private static string Translate(string source)
     {
         string openCl = source.Replace("#define RELAX_WORKGROUP_SIZE 0", "#define RELAX_WORKGROUP_SIZE 1");

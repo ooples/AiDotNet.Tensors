@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
@@ -6,18 +7,34 @@ using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 // CLBlast's indirect GEMM on HIP (#1266): the kernel OpenCL runs on this GPU, built from the same source with the
-// configuration CLBlast tuned for the device, packed and launched the same way.
+// configuration CLBlast tuned for the device, packed and launched the same way. Evolution-tuned configurations
+// (HipBackend.EvolutionTuning.cs) build as further variants beside it and are deployed per shape.
 public sealed partial class HipBackend
 {
+    /// <summary>One compiled clblast_xgemm configuration: its own module, under its own kernel name.</summary>
+    private sealed class ClBlastXgemmVariant
+    {
+        internal ClBlastXgemmVariant(GemmConfig config, IntPtr module, IntPtr kernel)
+        {
+            Config = config;
+            Module = module;
+            Kernel = kernel;
+        }
+
+        internal GemmConfig Config { get; }
+        internal IntPtr Module { get; }
+        internal IntPtr Kernel { get; }
+    }
+
     private readonly object _clblastLock = new object();
-    private IntPtr _clblastIndirectModule;
     private IntPtr _clblastPackingModule;
-    private GemmConfig _clblastIndirectConfig;
+    private ClBlastXgemmVariant? _clblastDefault;
+    private readonly Dictionary<OpenClGemmConfiguration, ClBlastXgemmVariant> _clblastVariants = new();
+    private readonly Dictionary<(int M, int N, int K), ClBlastXgemmVariant> _clblastDeployments = new();
     private ClBlastPadParameters _clblastPadParams;
     private ClBlastPadTransposeParameters _clblastPadTransposeParams;
     private int _clblastMinIndirectSize;
     private bool _clblastIndirectTried;
-    private bool _clblastIndirectReady;
     private long _clblastIndirectGemmRuns;
     // Grow-only packing buffers: per-call allocate / free cost more than the GEMM itself at 448^3.
     private IGpuBuffer? _clblastScratchA, _clblastScratchB, _clblastScratchC;
@@ -31,45 +48,98 @@ public sealed partial class HipBackend
     /// <summary>Whether Gemm goes to hipBLAS first (and so never reaches the CLBlast kernels).</summary>
     internal bool IsHipBlasAvailable => HipBlasReady;
 
+    /// <summary>The configuration the database gives this device, once the indirect path is built.</summary>
+    internal GemmConfig? ClBlastDefaultConfig
+    {
+        get
+        {
+            lock (_clblastLock) return _clblastDefault?.Config;
+        }
+    }
+
     /// <summary>
-    /// Builds the indirect GEMM (clblast_xgemm) and its packing kernels once, with the database configuration unless
-    /// <paramref name="config"/> is given.
+    /// Builds the packing kernels and the database configuration's clblast_xgemm once. Returns whether the indirect
+    /// path is usable on this device.
     /// </summary>
-    internal bool EnsureClBlastIndirectGemm(GemmConfig? config = null)
+    internal bool EnsureClBlastIndirectGemm()
     {
         lock (_clblastLock)
         {
-            if (config is null && _clblastIndirectTried) return _clblastIndirectReady;
+            if (_clblastIndirectTried) return _clblastDefault is not null;
             _clblastIndirectTried = true;
-            _clblastIndirectReady = false;
             var device = ClBlastDevice;
-            GemmConfig c;
-            if (config is GemmConfig given) c = given;
-            else if (!ClBlastXgemmDatabase.TryGetConfig(device, out c)) return false;
-            if (!IsAvailable || !HipClBlastGemmKernels.Supports(c)) return false;
-
-            if (_clblastPackingModule == IntPtr.Zero)
-            {
-                _clblastPadParams = ClBlastPadDatabase.GetParameters(device);
-                _clblastPadTransposeParams = ClBlastPadTransposeDatabase.GetParameters(device);
-                var packing = HipClBlastGemmKernels.BuildPackingSource(_clblastPadParams, _clblastPadTransposeParams,
-                    ClBlastCopyDatabase.GetParameters(device), ClBlastTransposeDatabase.GetParameters(device));
-                if (CompileKernelModule(packing, "clblast_packing", ref _clblastPackingModule,
-                    HipClBlastGemmKernels.PackingKernelNames, useFastMath: false) is not null) return false;
-            }
-            if (_clblastIndirectModule != IntPtr.Zero)
-            {
-                HipNativeBindings.hipModuleUnload(_clblastIndirectModule);
-                _clblastIndirectModule = IntPtr.Zero;
-            }
-            if (CompileKernelModule(HipClBlastGemmKernels.BuildIndirectSource(c), "clblast_indirect", ref _clblastIndirectModule,
-                new[] { "clblast_xgemm" }, useFastMath: false) is not null) return false;
-            _clblastIndirectConfig = c;
+            if (!IsAvailable || !ClBlastXgemmDatabase.TryGetConfig(device, out GemmConfig config) || !EnsureClBlastPacking(device))
+                return false;
+            _clblastDefault = BuildClBlastVariant(config, HipClBlastGemmKernels.IndirectKernelName);
             _clblastMinIndirectSize = ClBlastGemmRoutineDatabase.GetXgemmMinIndirectSize(device);
-            _clblastIndirectReady = _kernelCache.ContainsKey("clblast_xgemm") && _kernelCache.ContainsKey("CopyPadMatrix") &&
-                _kernelCache.ContainsKey("CopyMatrix") && _kernelCache.ContainsKey("TransposePadMatrix");
-            return _clblastIndirectReady;
+            return _clblastDefault is not null;
         }
+    }
+
+    /// <summary>
+    /// The compiled variant for <paramref name="config"/>, building it (and the packing kernels) on first use. Null when
+    /// HIP cannot build that configuration.
+    /// </summary>
+    private ClBlastXgemmVariant? GetOrBuildClBlastVariant(GemmConfig config)
+    {
+        lock (_clblastLock)
+        {
+            if (!EnsureClBlastIndirectGemm()) return null;
+            // Keyed on the fields the kernel reads, so genomes that differ only elsewhere share one module.
+            var key = HipClBlastGemmVariation.Canonical(OpenClGemmConfiguration.FromGemmConfig(config));
+            if (_clblastVariants.TryGetValue(key, out var existing)) return existing;
+            var variant = BuildClBlastVariant(config, HipClBlastGemmKernels.IndirectKernelName + "_v" + _clblastVariants.Count.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (variant is not null) _clblastVariants[key] = variant;
+            return variant;
+        }
+    }
+
+    /// <summary>Whether this backend can build <paramref name="config"/> as a clblast_xgemm variant.</summary>
+    internal bool TryPrepareClBlastGemm(GemmConfig config) => HipClBlastGemmKernels.Supports(config) && GetOrBuildClBlastVariant(config) is not null;
+
+    /// <summary>Sends shape (M, N, K) to <paramref name="config"/>'s variant from now on, building it if needed.</summary>
+    internal bool DeployClBlastGemm(int M, int N, int K, GemmConfig config)
+    {
+        var variant = HipClBlastGemmKernels.Supports(config) ? GetOrBuildClBlastVariant(config) : null;
+        if (variant is null) return false;
+        // The exact configuration asked for, on the module its kernel-equivalent genome already built (modules belong to
+        // _clblastVariants and are unloaded from there).
+        lock (_clblastLock) _clblastDeployments[(M, N, K)] = new ClBlastXgemmVariant(config, variant.Module, variant.Kernel);
+        return true;
+    }
+
+    /// <summary>The configuration shape (M, N, K) runs with: its deployment, or the database's.</summary>
+    internal GemmConfig? ClBlastConfigFor(int M, int N, int K) => ClBlastVariantFor(M, N, K)?.Config;
+
+    private ClBlastXgemmVariant? ClBlastVariantFor(int M, int N, int K)
+    {
+        if (!EnsureClBlastIndirectGemm()) return null;
+        lock (_clblastLock)
+            return _clblastDeployments.TryGetValue((M, N, K), out var deployed) ? deployed : _clblastDefault;
+    }
+
+    private bool EnsureClBlastPacking(ClBlastDeviceInfo device)
+    {
+        if (_clblastPackingModule != IntPtr.Zero) return true;
+        _clblastPadParams = ClBlastPadDatabase.GetParameters(device);
+        _clblastPadTransposeParams = ClBlastPadTransposeDatabase.GetParameters(device);
+        var packing = HipClBlastGemmKernels.BuildPackingSource(_clblastPadParams, _clblastPadTransposeParams,
+            ClBlastCopyDatabase.GetParameters(device), ClBlastTransposeDatabase.GetParameters(device));
+        return CompileKernelModule(packing, "clblast_packing", ref _clblastPackingModule,
+            HipClBlastGemmKernels.PackingKernelNames, useFastMath: false) is null;
+    }
+
+    private ClBlastXgemmVariant? BuildClBlastVariant(GemmConfig config, string kernelName)
+    {
+        if (!HipClBlastGemmKernels.Supports(config)) return null;
+        IntPtr module = IntPtr.Zero;
+        if (CompileKernelModule(HipClBlastGemmKernels.BuildIndirectSource(config, kernelName), kernelName, ref module,
+            new[] { kernelName }, useFastMath: false) is not null || !_kernelCache.TryGetValue(kernelName, out IntPtr kernel))
+        {
+            if (module != IntPtr.Zero) HipNativeBindings.hipModuleUnload(module);
+            return null;
+        }
+        return new ClBlastXgemmVariant(config, module, kernel);
     }
 
     /// <summary>
@@ -80,23 +150,48 @@ public sealed partial class HipBackend
     /// </summary>
     private bool ShouldUseClBlastIndirectGemm(int M, int N, int K)
     {
-        if (M <= 1 || N <= 1 || !EnsureClBlastIndirectGemm() || _clblastMinIndirectSize <= 0) return false;
+        if (M <= 1 || N <= 1) return false;
+        var variant = ClBlastVariantFor(M, N, K);
+        if (variant is null || _clblastMinIndirectSize <= 0) return false;
         if (M < _clblastMinIndirectSize && N < _clblastMinIndirectSize) return false;
-        var c = _clblastIndirectConfig;
+        var c = variant.Config;
         double padded = (double)CeilTo(N, c.TileM) * CeilTo(M, c.TileN) * CeilTo(K, c.TileK * (c.KReg > 0 ? c.KReg : 1));
         return padded <= 1.5 * M * N * K;
     }
 
     /// <summary>
-    /// Row-major C = alpha * A[M x K] * B[K x N] + beta * C through CLBlast's indirect path, as OpenClBackend runs it
-    /// (TryExecuteClBlastBaselineGemm's row-major swap): B is padded into the kernel's A slot, A is transposed into its
-    /// B slot, the GEMM runs on tile-multiple sizes, and C is copied out of a padded buffer when it needs one.
+    /// Row-major C = alpha * A[M x K] * B[K x N] + beta * C through CLBlast's indirect path with the shape's deployed
+    /// configuration (or the database's), as OpenClBackend runs it.
     /// </summary>
-    internal unsafe bool TryExecuteClBlastIndirectGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
+    internal bool TryExecuteClBlastIndirectGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
         float alpha = 1f, float beta = 0f)
     {
-        if (M <= 0 || N <= 0 || K <= 0 || !EnsureClBlastIndirectGemm()) return false;
-        var c = _clblastIndirectConfig;
+        if (M <= 0 || N <= 0 || K <= 0) return false;
+        var variant = ClBlastVariantFor(M, N, K);
+        return variant is not null && ExecuteClBlastIndirectGemm(variant, A, B, C, M, N, K, alpha, beta);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="config"/>'s variant (building it if needed) whatever is deployed for the shape: the tuner's
+    /// measurement path. Returns false when HIP cannot build that configuration.
+    /// </summary>
+    internal bool TryExecuteClBlastIndirectGemm(GemmConfig config, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
+        float alpha = 1f, float beta = 0f)
+    {
+        if (M <= 0 || N <= 0 || K <= 0 || !HipClBlastGemmKernels.Supports(config)) return false;
+        var variant = GetOrBuildClBlastVariant(config);
+        return variant is not null && ExecuteClBlastIndirectGemm(variant, A, B, C, M, N, K, alpha, beta);
+    }
+
+    /// <summary>
+    /// The row-major swap of OpenClBackend's TryExecuteClBlastBaselineGemm: B is padded into the kernel's A slot, A is
+    /// transposed into its B slot, the GEMM runs on tile-multiple sizes, and C is copied out of a padded buffer when it
+    /// needs one.
+    /// </summary>
+    private unsafe bool ExecuteClBlastIndirectGemm(ClBlastXgemmVariant variant, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
+        int M, int N, int K, float alpha, float beta)
+    {
+        var c = variant.Config;
         int kUnit = c.TileK * (c.KReg > 0 ? c.KReg : 1);
         int mCeiled = CeilTo(N, c.TileM), nCeiled = CeilTo(M, c.TileN), kCeiled = CeilTo(K, kUnit);
         long aSize = (long)mCeiled * kCeiled, bSize = (long)nCeiled * kCeiled, cSize = (long)mCeiled * nCeiled;
@@ -124,20 +219,19 @@ public sealed partial class HipBackend
                 cBuf = cTemp;
             }
 
-            IntPtr kernel = _kernelCache["clblast_xgemm"];
             int zero = 0;
             IntPtr pa = aBuf.Handle, pb = bTemp.Handle, pc = cBuf.Handle;
             void** args = stackalloc void*[10];
             args[0] = &mCeiled; args[1] = &nCeiled; args[2] = &kCeiled; args[3] = &alpha; args[4] = &beta;
             args[5] = &pa; args[6] = &pb; args[7] = &pc; args[8] = &zero; args[9] = &zero;
-            LaunchKernel2D(kernel, (uint)(mCeiled / c.TileM), (uint)(nCeiled / c.TileN), (uint)c.ThreadTileM, (uint)c.ThreadTileN, args);
+            LaunchKernel2D(variant.Kernel, (uint)(mCeiled / c.TileM), (uint)(nCeiled / c.TileN), (uint)c.ThreadTileM, (uint)c.ThreadTileN, args);
 
             if (cNeedsPad) ClBlastPack("CopyMatrix", cBuf, C, mCeiled, nCeiled, mCeiled, N, M, N);
             Interlocked.Increment(ref _clblastIndirectGemmRuns);
             return true;
         }
     }
-
+    /// <summary>Returns <paramref name="buffer"/> when it holds <paramref name="size"/> floats, otherwise replaces it with a larger one.</summary>
     private IGpuBuffer ClBlastScratch(ref IGpuBuffer? buffer, long size)
     {
         if (buffer is not null && buffer.Size >= size) return buffer;
@@ -152,6 +246,7 @@ public sealed partial class HipBackend
         return buffer;
     }
 
+    /// <summary><paramref name="value"/> rounded up to a multiple of <paramref name="multiple"/>.</summary>
     private static int CeilTo(int value, int multiple) => (value + multiple - 1) / multiple * multiple;
 
     /// <summary>One CLBlast pad / transpose launch with OpenClBackend's argument list and geometry.</summary>
@@ -185,13 +280,17 @@ public sealed partial class HipBackend
         LaunchKernel2D(kernel, gridX, gridY, blockX, blockY, args);
     }
 
+    /// <summary>Unloads the CLBlast modules and releases the scratch buffers; called from the backend's Dispose.</summary>
     private void DisposeClBlastGemm()
     {
         lock (_clblastLock)
         {
-            if (_clblastIndirectModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastIndirectModule); _clblastIndirectModule = IntPtr.Zero; }
+            foreach (var variant in _clblastVariants.Values) HipNativeBindings.hipModuleUnload(variant.Module);
+            _clblastVariants.Clear();
+            _clblastDeployments.Clear();
+            if (_clblastDefault is not null) HipNativeBindings.hipModuleUnload(_clblastDefault.Module);
+            _clblastDefault = null;
             if (_clblastPackingModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastPackingModule); _clblastPackingModule = IntPtr.Zero; }
-            _clblastIndirectReady = false;
             _clblastScratchA?.Dispose(); _clblastScratchA = null;
             _clblastScratchB?.Dispose(); _clblastScratchB = null;
             _clblastScratchC?.Dispose(); _clblastScratchC = null;

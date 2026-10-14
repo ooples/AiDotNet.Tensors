@@ -48,9 +48,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _rdnaGemmWave32;
     private readonly Dictionary<string, IntPtr> _kernelCache;
 
-    /// <summary>Whether a compiled module registered this kernel name (KernelLookupIntegrityTests).</summary>
-    // The CLBlast GEMM modules compile on first use rather than at startup, so a name of theirs is built before it is
-    // judged; an unbuildable one is reported missing like any other.
+    /// <summary>
+    /// Whether a compiled module registered this kernel name (KernelLookupIntegrityTests). The CLBlast GEMM modules compile on first use rather than at
+    /// startup, so a name of theirs is built before it is judged; an unbuildable one is reported missing like any other.
+    /// </summary>
     internal bool HasCompiledKernel(string name) =>
         _kernelCache.ContainsKey(name) ||
         (HipClBlastGemmKernels.IsLazyKernel(name) && EnsureClBlastIndirectGemm() && _kernelCache.ContainsKey(name));
@@ -472,6 +473,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         while (Volatile.Read(ref _hipblasInitState) != 2) spin.SpinOnce();
     }
 
+    /// <summary>Creates the hipBLAS handle on this backend's stream, leaving hipBLAS unavailable on any failure.</summary>
     private void TryInitializeHipBlas()
     {
         // rocBLAS aborts the process (rather than returning a status) when its Tensile package has
