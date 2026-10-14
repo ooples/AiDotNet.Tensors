@@ -116,7 +116,15 @@ internal static class PtxGemmEvolution
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
 
         IReadOnlyList<PtxGemmConfiguration> seeds = Seeds(layout, m, n, k, MultiprocessorCount(runtime));
-        using var backend = new ExperimentBackend(runtime, layout, m, n, k);
+        int lda = layout.TransposeA ? m : k, ldb = layout.TransposeB ? k : n;
+        using var backend = new ExperimentBackend<PtxGemmConfiguration>(runtime, layout, m, n, k,
+            configuration =>
+            {
+                var kernel = new PtxSgemmKernel(runtime, configuration, layout);
+                return new LoadedGemm(kernel, kernel.Audit,
+                    (a, b, c) => kernel.Launch(a, b, c, m, n, k, lda, ldb, n, 1f, 0f));
+            },
+            configuration => configuration.Name);
         var experiment = new KernelTuningExperiment<PtxGemmConfiguration>(
             backend,
             new DeviceEventKernelTuningTimer(new CudaEventClock(runtime)),
@@ -174,7 +182,7 @@ internal static class PtxGemmEvolution
     }
 
     /// <summary>CUDA events on the runtime's stream as the tuning scaffold's device clock.</summary>
-    private sealed class CudaEventClock : IKernelTuningDeviceClock
+    internal sealed class CudaEventClock : IKernelTuningDeviceClock
     {
         private readonly DirectPtxRuntime _runtime;
 
@@ -242,39 +250,49 @@ internal static class PtxGemmEvolution
         }
     }
 
-    /// <summary>Owns the problem's device operands, the compiled candidates and the fp64 oracle.</summary>
-    private sealed class ExperimentBackend : IKernelTuningExperimentBackend<PtxGemmConfiguration>, IDisposable
+    /// <summary>A compiled candidate: what disposes it, its audit, and a launch of the experiment's problem.</summary>
+    internal readonly record struct LoadedGemm(IDisposable Owner, DirectPtxKernelAudit Audit, Action<IntPtr, IntPtr, IntPtr> Launch);
+
+    /// <summary>
+    /// Owns the problem's device operands, the compiled candidates and the fp64 oracle, for any generated GEMM family
+    /// (CUDA-core FP32, TF32 or FP16 Tensor Core). Operands are multiples of 1/256 in [-63/256, 63/256], exact in FP32,
+    /// TF32 and FP16, so every family sees exactly the oracle's inputs; FP16 operands are uploaded as halves.
+    /// </summary>
+    internal sealed class ExperimentBackend<TConfiguration> : IKernelTuningExperimentBackend<TConfiguration>, IDisposable
+        where TConfiguration : notnull
     {
         // FP32 accumulation over K terms in a different order than the fp64 oracle: relative to the output scale.
         private const double RelativeTolerance = 1e-4;
         private const int MaximumOracleOutputs = 4096;
         private readonly DirectPtxRuntime _runtime;
-        private readonly PtxGemmLayout _layout;
-        private readonly int _m, _n, _k, _lda, _ldb;
+        private readonly int _m, _n;
+        private readonly Func<TConfiguration, LoadedGemm> _compile;
+        private readonly Func<TConfiguration, string> _name;
         private readonly DirectPtxBuffer _a, _b, _c;
         private readonly int[] _sampleIndices;
         private readonly double[] _expected;
         private readonly double _scale;
-        private readonly Dictionary<PtxGemmConfiguration, PtxSgemmKernel> _kernels = new();
-        private readonly Dictionary<PtxGemmConfiguration, TimeSpan> _compileTimes = new();
-        private readonly Dictionary<PtxGemmConfiguration, string> _compileErrors = new();
+        private readonly Dictionary<TConfiguration, LoadedGemm> _kernels = new();
+        private readonly Dictionary<TConfiguration, TimeSpan> _compileTimes = new();
+        private readonly Dictionary<TConfiguration, string> _compileErrors = new();
         private bool _disposed;
 
-        internal ExperimentBackend(DirectPtxRuntime runtime, PtxGemmLayout layout, int m, int n, int k)
+        internal ExperimentBackend(DirectPtxRuntime runtime, PtxGemmLayout layout, int m, int n, int k,
+            Func<TConfiguration, LoadedGemm> compile, Func<TConfiguration, string> name, bool halfOperands = false)
         {
             _runtime = runtime;
-            _layout = layout;
             _m = m;
             _n = n;
-            _k = k;
-            _lda = layout.TransposeA ? m : k;
-            _ldb = layout.TransposeB ? k : n;
+            _compile = compile;
+            _name = name;
+            int lda = layout.TransposeA ? m : k, ldb = layout.TransposeB ? k : n;
             float[] a = Values(checked(m * k), 17), b = Values(checked(k * n), 43);
-            _a = runtime.AllocateBytes((nuint)((long)a.Length * sizeof(float)));
-            _b = runtime.AllocateBytes((nuint)((long)b.Length * sizeof(float)));
+            int operandBytes = halfOperands ? 2 : sizeof(float);
+            _a = runtime.AllocateBytes((nuint)((long)a.Length * operandBytes));
+            _b = runtime.AllocateBytes((nuint)((long)b.Length * operandBytes));
             _c = runtime.AllocateBytes((nuint)((long)m * n * sizeof(float)));
-            _a.Upload<float>(a);
-            _b.Upload<float>(b);
+            Upload(_a, a, halfOperands);
+            Upload(_b, b, halfOperands);
 
             // An fp64 oracle over every output for small problems, over a fixed sample (corners included) otherwise,
             // so the reference costs bounded host time at 4096^3.
@@ -302,8 +320,8 @@ internal static class PtxGemmEvolution
                 double sum = 0;
                 for (int p = 0; p < k; p++)
                 {
-                    double av = layout.TransposeA ? a[p * _lda + row] : a[row * _lda + p];
-                    double bv = layout.TransposeB ? b[column * _ldb + p] : b[p * _ldb + column];
+                    double av = layout.TransposeA ? a[p * lda + row] : a[row * lda + p];
+                    double bv = layout.TransposeB ? b[column * ldb + p] : b[p * ldb + column];
                     sum += av * bv;
                 }
                 _expected[s] = sum;
@@ -312,15 +330,42 @@ internal static class PtxGemmEvolution
             _scale = scale;
         }
 
+        // The values are q / 256 for an integer |q| <= 63 (see Values), so the FP16 encoding is exact and computed from q in
+        // integers: with p the position of q's leading bit, the exponent is p - 8 and the fraction q's remaining bits
+        // shifted to 10. No Half type, which netstandard2.0 and net462 lack, and no floating-point logarithm.
+        private static ushort HalfBits(float value)
+        {
+            int q = (int)Math.Round(value * 256f);
+            if (q == 0) return 0;
+            if (Math.Abs(q) > 63 || q / 256f != value) throw new ArgumentOutOfRangeException(nameof(value));
+            ushort sign = (ushort)(q < 0 ? 0x8000 : 0);
+            int magnitude = Math.Abs(q), leading = 0;
+            while ((magnitude >> (leading + 1)) != 0) leading++;
+            int fraction = (magnitude - (1 << leading)) << (10 - leading);
+            return (ushort)(sign | ((leading - 8 + 15) << 10) | fraction);
+        }
+
+        private static void Upload(DirectPtxBuffer buffer, float[] values, bool half)
+        {
+            if (!half)
+            {
+                buffer.Upload<float>(values);
+                return;
+            }
+            var bits = new ushort[values.Length];
+            for (int i = 0; i < values.Length; i++) bits[i] = HalfBits(values[i]);
+            buffer.Upload<ushort>(bits);
+        }
+
         /// <summary>Compiles the candidate once; returns the driver's or the budget's error, or null.</summary>
-        internal string? TryCompile(PtxGemmConfiguration configuration)
+        internal string? TryCompile(TConfiguration configuration)
         {
             if (_kernels.ContainsKey(configuration)) return null;
             if (_compileErrors.TryGetValue(configuration, out string? known)) return known;
             var watch = Stopwatch.StartNew();
             try
             {
-                _kernels[configuration] = new PtxSgemmKernel(_runtime, configuration, _layout);
+                _kernels[configuration] = _compile(configuration);
                 _compileTimes[configuration] = watch.Elapsed;
                 return null;
             }
@@ -332,7 +377,7 @@ internal static class PtxGemmEvolution
             }
         }
 
-        public ValueTask PrepareAsync(PtxGemmConfiguration configuration, CancellationToken cancellationToken = default)
+        public ValueTask PrepareAsync(TConfiguration configuration, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
@@ -341,13 +386,13 @@ internal static class PtxGemmEvolution
             return default;
         }
 
-        public ValueTask ExecuteAsync(PtxGemmConfiguration configuration, CancellationToken cancellationToken = default)
+        public ValueTask ExecuteAsync(TConfiguration configuration, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
-            if (!_kernels.TryGetValue(configuration, out PtxSgemmKernel? kernel))
+            if (!_kernels.TryGetValue(configuration, out LoadedGemm kernel))
                 throw new InvalidOperationException("The candidate was not prepared.");
-            kernel.Launch(_a.Pointer, _b.Pointer, _c.Pointer, _m, _n, _k, _lda, _ldb, _n, 1f, 0f);
+            kernel.Launch(_a.Pointer, _b.Pointer, _c.Pointer);
             return default;
         }
 
@@ -360,7 +405,7 @@ internal static class PtxGemmEvolution
         }
 
         public async ValueTask<KernelTuningCorrectnessEvidence> ValidateAsync(
-            PtxGemmConfiguration configuration, CancellationToken cancellationToken = default)
+            TConfiguration configuration, CancellationToken cancellationToken = default)
         {
             await ExecuteAsync(configuration, cancellationToken).ConfigureAwait(false);
             await SynchronizeAsync(cancellationToken).ConfigureAwait(false);
@@ -373,15 +418,15 @@ internal static class PtxGemmEvolution
             double absoluteTolerance = RelativeTolerance * _scale;
             if (!(relative <= RelativeTolerance))
                 throw new KernelTuningValidationException(KernelTuningTrialStatus.OutputMismatch,
-                    $"PTX GEMM {configuration.Name} exceeded tolerance: max abs {maximumAbsolute:R}, relative {relative:R}.");
+                    $"PTX GEMM {_name(configuration)} exceeded tolerance: max abs {maximumAbsolute:R}, relative {relative:R}.");
             return new KernelTuningCorrectnessEvidence(KernelTuningValidationScope.Output,
                 maximumAbsolute, relative, absoluteTolerance, RelativeTolerance);
         }
 
-        public KernelTuningResourceUsage GetResourceUsage(PtxGemmConfiguration configuration)
+        public KernelTuningResourceUsage GetResourceUsage(TConfiguration configuration)
         {
             ThrowIfDisposed();
-            if (!_kernels.TryGetValue(configuration, out PtxSgemmKernel? kernel))
+            if (!_kernels.TryGetValue(configuration, out LoadedGemm kernel))
                 throw new InvalidOperationException("The candidate was not prepared.");
             DirectPtxKernelAudit audit = kernel.Audit;
             double occupancy = (double)audit.ActiveBlocksPerMultiprocessor * audit.BlockThreads /
@@ -398,7 +443,7 @@ internal static class PtxGemmEvolution
         {
             if (_disposed) return;
             _disposed = true;
-            foreach (PtxSgemmKernel kernel in _kernels.Values) kernel.Dispose();
+            foreach (LoadedGemm kernel in _kernels.Values) kernel.Owner.Dispose();
             _kernels.Clear();
             _c.Dispose();
             _b.Dispose();
@@ -407,7 +452,7 @@ internal static class PtxGemmEvolution
 
         private void ThrowIfDisposed()
         {
-            if (_disposed) throw new ObjectDisposedException(nameof(ExperimentBackend));
+            if (_disposed) throw new ObjectDisposedException(nameof(ExperimentBackend<TConfiguration>));
         }
 
         private static float[] Values(int length, int salt)
