@@ -30,8 +30,8 @@ internal readonly record struct PtxGemmConfiguration(
     internal int SharedBytes => checked(Stages * BlockK * (PitchA + PitchB) * sizeof(float));
 
     /// <summary>A short stable name, used in kernel identities and evolution records.</summary>
-    internal string Name => string.Create(CultureInfo.InvariantCulture,
-        $"b{BlockM}x{BlockN}x{BlockK}-t{ThreadM}x{ThreadN}-v{VectorWidth}-p{SharedPad}-{(DoubleBuffer ? "db" : "sb")}");
+    internal string Name => string.Format(CultureInfo.InvariantCulture, "b{0}x{1}x{2}-t{3}x{4}-v{5}-p{6}-{7}",
+        BlockM, BlockN, BlockK, ThreadM, ThreadN, VectorWidth, SharedPad, DoubleBuffer ? "db" : "sb");
 
     /// <summary>
     /// The emit-able configurations over the genome's axes: the domain the evolutionary search (#1263) explores.
