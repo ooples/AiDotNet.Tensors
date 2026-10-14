@@ -10866,7 +10866,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
 #if NETCOREAPP
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
-        if (TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
+        // A pinned route (ForceFullIm2ColScope / ForceImplicitGemmScope) must reach that route: oneDNN, where installed (the
+        // Linux CI runners), would otherwise take the conv first and the pinned comparison would test oneDNN against itself.
+        if (!t_forceFullIm2Col && !t_forceImplicitGemmForTest && TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
         {
             return false;

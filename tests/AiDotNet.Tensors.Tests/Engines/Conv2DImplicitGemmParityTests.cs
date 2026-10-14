@@ -128,7 +128,7 @@ public class Conv2DImplicitGemmParityTests
 
     // #653: high-channel 3x3 convs take the full im2col GEMM at 8+ threads (or on a 64x64+ plane) while its column
     // matrix fits ThreadLocalTensorCache's 64 MB, and the implicit GEMM otherwise.
-    [Theory]
+    [SkippableTheory]
     [InlineData(320, 32, 16, true)]    // 320ch@32x32 at 16 threads: 11.8 MB matrix -> full
     [InlineData(320, 32, 1, false)]    // the same shape single-threaded keeps the implicit path
     [InlineData(320, 64, 1, true)]     // a 64x64 plane takes the full path at any thread count (47 MB)
@@ -149,6 +149,10 @@ public class Conv2DImplicitGemmParityTests
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
         }
+        // Where oneDNN is installed and accepts the shape (the Linux CI runners) it takes the conv before the full/implicit
+        // choice is made, so neither route runs and there is no choice to check.
+        Skip.If(CpuEngine.FullIm2ColConvRunsOnThisThread == fullBefore && CpuEngine.ImplicitGemmConvRunsOnThisThread == implicitBefore,
+            "oneDNN handled the convolution on this host.");
         Assert.Equal(expectFull ? 1 : 0, CpuEngine.FullIm2ColConvRunsOnThisThread - fullBefore);
         Assert.Equal(expectFull ? 0 : 1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }
