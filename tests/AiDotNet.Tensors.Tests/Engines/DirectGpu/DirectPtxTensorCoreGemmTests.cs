@@ -29,7 +29,7 @@ public sealed class DirectPtxTensorCoreGemmTests
     private static readonly PtxTensorCoreGemmConfiguration[] Sampled =
     {
         new(64, 64, 16, 32, 32, 2, 4),
-        new(128, 128, 32, 64, 32, 3, 4),
+        new(128, 128, 32, 64, 32, 2, 4),
         new(128, 64, 16, 32, 32, 4, 8),
         new(64, 128, 32, 32, 64, 2, 0),
     };
@@ -160,8 +160,9 @@ public sealed class DirectPtxTensorCoreGemmTests
     }
 
     /// <summary>
-    /// Opt-in seconds-long timing probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): one large shape, the sampled configurations
-    /// against cuBLAS's default (TF32) GEMM on the same device. A development check, not evidence.
+    /// Opt-in seconds-long timing probe (AIDOTNET_RUN_TC_GEMM_PROBE=1): one large shape, the large-tile configurations
+    /// against cuBLAS's default (TF32) GEMM on the same device and stream, timed with CUDA events; each PTX output is also
+    /// compared with cuBLAS's (both TF32), so a fast-but-wrong kernel fails. A development check, not evidence.
     /// </summary>
     [SkippableFact]
     public void Probe_LargeShapeAgainstCublasTf32()
@@ -173,27 +174,48 @@ public sealed class DirectPtxTensorCoreGemmTests
         const int m = 4096, n = 4096, k = 4096;
         using var a = backend.AllocateBuffer(Values(m * k, 1));
         using var b = backend.AllocateBuffer(Values(k * n, 2));
+        using var reference = backend.AllocateBuffer(m * n);
         using var c = backend.AllocateBuffer(m * n);
         double flops = 2d * m * n * k;
         double Time(Action launch)
         {
             for (int i = 0; i < 3; i++) launch();
             backend.Synchronize();
-            var watch = Stopwatch.StartNew();
+            using var start = backend.CreateEvent(enableTiming: true);
+            using var end = backend.CreateEvent(enableTiming: true);
             const int reps = 20;
+            backend.RecordEvent(start, backend.DefaultStream);
             for (int i = 0; i < reps; i++) launch();
-            backend.Synchronize();
-            return watch.Elapsed.TotalMilliseconds / reps;
+            backend.RecordEvent(end, backend.DefaultStream);
+            end.Synchronize();
+            return backend.GetEventElapsedTime(start, end) / reps;
         }
-        double cublas = Time(() => backend.Gemm(a, b, c, m, n, k));
-        _output.WriteLine($"cuBLAS default (TF32): {cublas:F3} ms, {flops / cublas / 1e9:F1} TFLOP/s");
+        double cublas = Time(() => backend.Gemm(a, b, reference, m, n, k));
+        float[] expected = backend.DownloadBuffer(reference);
+        double scale = expected.Max(v => Math.Abs((double)v));
+        _output.WriteLine($"cuBLAS default (TF32): {cublas:F3} ms, {flops / cublas / 1e9:F1} TFLOP/s, |C| max {scale:F1}");
         var layout = new PtxGemmLayout(false, false);
-        foreach (var config in PtxTensorCoreGemmConfiguration.SearchSpace(layout).Where(x => x.Stages == 3 && x.SharedPad == 4 &&
-                     x.BlockK == 32 && x.BlockM >= 128 && x.BlockN >= 128))
+        foreach (var config in PtxTensorCoreGemmConfiguration.SearchSpace(layout).Where(x => x.BlockM >= 128 && x.BlockN >= 128))
         {
-            using var kernel = new PtxTensorCoreGemmKernel(runtime, config, layout);
+            PtxTensorCoreGemmKernel kernel;
+            try
+            {
+                kernel = new PtxTensorCoreGemmKernel(runtime, config, layout);
+            }
+            catch (InvalidOperationException rejected)
+            {
+                // The loader enforces zero local memory: a configuration that spills is refused, as tuning would.
+                _output.WriteLine($"{config.Name}: rejected ({rejected.Message})");
+                continue;
+            }
+            using var _ = kernel;
             double ms = Time(() => kernel.Launch(a.Handle, b.Handle, c.Handle, m, n, k, k, n, n, 1f, 0f));
-            _output.WriteLine($"{config.Name}: {ms:F3} ms, {flops / ms / 1e9:F1} TFLOP/s ({cublas / ms:F2}x cuBLAS)");
+            float[] actual = backend.DownloadBuffer(c);
+            double diff = 0;
+            for (int i = 0; i < actual.Length; i += 97) diff = Math.Max(diff, Math.Abs(actual[i] - expected[i]));
+            _output.WriteLine($"{config.Name}: {ms:F3} ms, {flops / ms / 1e9:F1} TFLOP/s ({cublas / ms:F2}x cuBLAS), " +
+                $"max |PTX - cuBLAS| / max|C| = {diff / scale:E1}");
+            Assert.True(diff / scale < 5e-3, $"{config.Name} disagrees with cuBLAS TF32: {diff / scale:E2}");
         }
     }
 }
