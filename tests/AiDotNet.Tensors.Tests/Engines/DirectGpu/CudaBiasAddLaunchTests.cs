@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
@@ -34,6 +35,35 @@ public class CudaBiasAddLaunchTests
         for (int i = 0; i < n; i++)
             if (got[i] != a[i] + bias[i % cols])
                 Assert.Fail($"C[{i / cols},{i % cols}] = {got[i]}, expected {a[i] + bias[i % cols]}");
+    }
+
+    /// <summary>The fused bias + ReLU pass must equal BiasAdd followed by Relu bit for bit -- negative sums, NaN
+    /// propagation (relu_nan_safe) and both the float4 and the scalar layouts.</summary>
+    [SkippableTheory]
+    [InlineData(2048, 256)]
+    [InlineData(37, 6)]
+    public void BiasAddRelu_EqualsBiasAddThenRelu(int rows, int cols)
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        int n = rows * cols;
+        float[] a = Enumerable.Range(0, n).Select(i => i % 101 == 0 ? float.NaN : 0.37f * (i % 23) - 4f).ToArray();
+        float[] bias = Enumerable.Range(0, cols).Select(j => 0.25f * (j % 9) - 1f).ToArray();
+        using var aBuf = backend.AllocateBuffer(a);
+        using var biasBuf = backend.AllocateBuffer(bias);
+        using var fused = backend.AllocateBuffer(new float[n]);
+        using var separate = backend.AllocateBuffer(new float[n]);
+
+        Assert.True(((AiDotNet.Tensors.Engines.DirectGpu.IBiasActivationBackend)backend)
+            .TryBiasAddActivation(aBuf, biasBuf, fused, rows, cols, AiDotNet.Tensors.Engines.FusedActivationType.ReLU));
+        backend.BiasAdd(aBuf, biasBuf, separate, rows, cols);
+        backend.Relu(separate, separate, n);
+
+        var got = backend.DownloadBuffer(fused);
+        var expected = backend.DownloadBuffer(separate);
+        for (int i = 0; i < n; i++)
+            if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(expected[i]))
+                Assert.Fail($"element {i}: fused {got[i]} != separate {expected[i]}");
     }
 
     [SkippableFact]

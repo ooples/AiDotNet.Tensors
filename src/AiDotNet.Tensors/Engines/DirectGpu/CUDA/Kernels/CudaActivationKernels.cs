@@ -1121,8 +1121,9 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__
 
 // Bias add with separate output: C[i,j] = A[i,j] + bias[j], over the flat [rows * cols] range (grid-stride). One block
 // per row left most of a block idle for a linear layer's 64-128 columns (~80 GB/s on a GTX 1660 Ti). With cols % 4 == 0
-// (and 16-byte aligned A and C, which the caller checks) each thread moves a float4: vec4 = 1.
-extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __restrict__ A, const float* __restrict__ bias, float* __restrict__ C, int rows, int cols, int vec4)
+// (and 16-byte aligned A and C, which the caller checks) each thread moves a float4: vec4 = 1. relu = 1 also applies
+// relu_nan_safe to each sum -- the relu kernel's operation, so the fused pass equals bias_add_out followed by relu.
+extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __restrict__ A, const float* __restrict__ bias, float* __restrict__ C, int rows, int cols, int vec4, int relu)
 {
     long long stride = (long long)gridDim.x * blockDim.x;
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1136,13 +1137,18 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __
         for (; i < total4; i += stride)
         {
             float4 a = a4[i], b = __ldg(&b4[i % cols4]);
-            c4[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+            float4 s = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+            if (relu) s = make_float4(relu_nan_safe(s.x), relu_nan_safe(s.y), relu_nan_safe(s.z), relu_nan_safe(s.w));
+            c4[i] = s;
         }
         return;
     }
     long long total = (long long)rows * cols;
     for (; i < total; i += stride)
-        C[i] = A[i] + __ldg(&bias[i % cols]);
+    {
+        float s = A[i] + __ldg(&bias[i % cols]);
+        C[i] = relu ? relu_nan_safe(s) : s;
+    }
 }
 
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]

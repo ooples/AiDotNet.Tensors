@@ -7784,9 +7784,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < (long)M * N)
                 return false;
             cb.Gemm(inBuf.Buffer, wBuf.Buffer, outBuf, M, N, K, 1.0f, 0.0f);   // outBuf = input @ weights
-            cb.BiasAdd(outBuf, bBuf.Buffer, outBuf, M, N);                     // += bias[N] (in place)
-            if (activation != FusedActivationType.None)
-                ApplyGpuActivation(backend, outBuf, M * N, activation);        // in-place GPU activation (covers Swish/SiLU, Sigmoid, Tanh, …)
+            // Bias and activation in one pass where the backend fuses them (ReLU on CUDA): two full passes otherwise.
+            if (!(activation != FusedActivationType.None && backend is IBiasActivationBackend fusedBias
+                && fusedBias.TryBiasAddActivation(outBuf, bBuf.Buffer, outBuf, M, N, activation)))
+            {
+                cb.BiasAdd(outBuf, bBuf.Buffer, outBuf, M, N);                     // += bias[N] (in place)
+                if (activation != FusedActivationType.None)
+                    ApplyGpuActivation(backend, outBuf, M * N, activation);        // in-place GPU activation (covers Swish/SiLU, Sigmoid, Tanh, …)
+            }
             ResidentSyncCheck("FusedLinear");
             BindResidentBuffer(outTensor, outBuf, backend);
             result = outTensor;

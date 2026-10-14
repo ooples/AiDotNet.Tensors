@@ -17,7 +17,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
+public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -3857,7 +3857,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         return output;
     }
 
-    public unsafe void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N)
+    public void BiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N) => LaunchBiasAdd(A, bias, C, M, N, relu: false);
+
+    /// <summary>C = A + bias per row, then ReLU (relu_nan_safe) when <paramref name="relu"/>: one pass where a bias add
+    /// and a ReLU were two over the same [M, N] output.</summary>
+    private unsafe void LaunchBiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N, bool relu)
     {
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add_out");
@@ -3870,17 +3874,28 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int rows = M;
         int cols = N;
         int vec4 = (N & 3) == 0 && ((aPtr.ToInt64() | biasPtr.ToInt64() | cPtr.ToInt64()) & 15) == 0 ? 1 : 0;
+        int applyRelu = relu ? 1 : 0;
         long items = vec4 == 1 ? (long)M * N / 4 : (long)M * N;
         // Grid-stride: enough blocks to fill the device, never more than the work.
         uint grid = (uint)Math.Min((items + DefaultBlockSize - 1) / DefaultBlockSize, 65535L);
-        void** args = stackalloc void*[6];
+        void** args = stackalloc void*[7];
         args[0] = &aPtr;
         args[1] = &biasPtr;
         args[2] = &cPtr;
         args[3] = &rows;
         args[4] = &cols;
         args[5] = &vec4;
+        args[6] = &applyRelu;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    bool IBiasActivationBackend.TryBiasAddActivation(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N,
+        FusedActivationType activation)
+    {
+        if (activation != FusedActivationType.ReLU && activation != FusedActivationType.None) return false;
+        if (!IsAvailable || A.Size < (long)M * N || C.Size < (long)M * N || bias.Size < N) return false;
+        LaunchBiasAdd(A, bias, C, M, N, activation == FusedActivationType.ReLU);
+        return true;
     }
 
     /// <summary>
