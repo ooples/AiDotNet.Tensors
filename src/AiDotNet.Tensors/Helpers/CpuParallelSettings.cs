@@ -141,16 +141,42 @@ public static class CpuParallelSettings
     private const string LinuxCpuInfoPath = "/proc/cpuinfo";
 
     [MethodImpl(Hot)]
-    private static int DetectPhysicalCoresLinux()
+    private static int DetectPhysicalCoresLinux() => CountPhysicalCores(File.ReadLines(LinuxCpuInfoPath));
+
+    /// <summary>
+    /// Distinct (physical id, core id) pairs in /proc/cpuinfo text, one per processor record (records are separated by a
+    /// blank line). A record missing either id makes the topology unknown, so the count falls back to
+    /// <see cref="Environment.ProcessorCount"/>: carrying an id over from the previous record could merge distinct
+    /// cores and under-count, which now sets the default parallel width.
+    /// </summary>
+    internal static int CountPhysicalCores(IEnumerable<string> cpuInfoLines)
     {
-        var seen = new HashSet<string>();
-        string phys = "";
-        foreach (var line in File.ReadLines(LinuxCpuInfoPath))
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        string? physicalId = null, coreId = null;
+        bool inRecord = false, complete = true;
+
+        void EndRecord()
         {
-            if (line.StartsWith("physical id", StringComparison.Ordinal)) phys = line;
-            else if (line.StartsWith("core id", StringComparison.Ordinal)) seen.Add(phys + "|" + line);
+            if (!inRecord) return;
+            if (physicalId is null || coreId is null) complete = false;
+            else seen.Add(physicalId + "|" + coreId);
+            physicalId = null;
+            coreId = null;
+            inRecord = false;
         }
-        return seen.Count > 0 ? seen.Count : Environment.ProcessorCount;
+
+        foreach (var line in cpuInfoLines)
+        {
+            if (line.Trim().Length == 0) { EndRecord(); continue; }
+            inRecord = true;
+            int colon = line.IndexOf(':');
+            if (colon < 0) continue;
+            string key = line.Substring(0, colon).Trim(), value = line.Substring(colon + 1).Trim();
+            if (key == "physical id") physicalId = value;
+            else if (key == "core id") coreId = value;
+        }
+        EndRecord();
+        return complete && seen.Count > 0 ? seen.Count : Environment.ProcessorCount;
     }
 
     /// <summary>
