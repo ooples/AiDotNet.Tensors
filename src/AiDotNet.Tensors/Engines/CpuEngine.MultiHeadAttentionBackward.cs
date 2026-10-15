@@ -58,9 +58,12 @@ public partial class CpuEngine
     {
         int rows = batch * seqLen, d3 = 3 * dModel;
         // Saved for the backward, so owned by the tape node rather than pooled.
-        var qkv = new float[rows * d3];
-        var concat = new float[rows * dModel];
-        var lse = new float[batch * numHeads * seqLen];
+        // Every element of these is written below (the QKV GEMM stores all of qkv, each head stores its columns of every
+        // concat row and every lse entry), so they skip the zeroing a new array costs: 16.6 MB per step at
+        // 32x128x256, ~5% of the step's main-thread time.
+        var qkv = NewUninitialized(rows * d3);
+        var concat = NewUninitialized(rows * dModel);
+        var lse = NewUninitialized(batch * numHeads * seqLen);
         var pool = ArrayPool<float>.Shared;
         var fusedW = pool.Rent(dModel * d3);
         try
@@ -281,6 +284,13 @@ public partial class CpuEngine
     }
 
     /// <summary>[Wq | Wk | Wv] side by side, written into the first D·3D entries of <paramref name="fused"/>.</summary>
+    private static float[] NewUninitialized(int length)
+#if NET5_0_OR_GREATER
+        => GC.AllocateUninitializedArray<float>(length);
+#else
+        => new float[length];
+#endif
+
     private static void FuseQkvWeights(Tensor<float> qWeight, Tensor<float> kWeight, Tensor<float> vWeight, int dModel,
         float[] fused)
     {
