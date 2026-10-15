@@ -135,13 +135,15 @@ internal enum PtxGemmPrecision
     Fp16InFp16Out = 2,
     /// <summary>FP64 operands, FP64 output, FP64 arithmetic.</summary>
     Fp64 = 3,
+    /// <summary>BF16 operands, FP32 output, FP32 arithmetic.</summary>
+    Bf16InFp32Out = 4,
 }
 
 internal static class PtxGemmPrecisionFacts
 {
     internal static int OperandBytes(this PtxGemmPrecision precision) => precision switch
     {
-        PtxGemmPrecision.Fp16InFp32Out or PtxGemmPrecision.Fp16InFp16Out => 2,
+        PtxGemmPrecision.Fp16InFp32Out or PtxGemmPrecision.Fp16InFp16Out or PtxGemmPrecision.Bf16InFp32Out => 2,
         PtxGemmPrecision.Fp64 => 8,
         _ => 4,
     };
@@ -676,6 +678,15 @@ internal static class PtxSgemmGenerator
                 foreach (string v in op.Staged[s]) L($"mov.{Ct} {v}, {Zero};");
                 if (vw == 4)
                     L($"@{ok} ld.global.v4.f32 {{{op.Staged[s][0]}, {op.Staged[s][1]}, {op.Staged[s][2]}, {op.Staged[s][3]}}}, [{op.SlotPointer[s]}];");
+                else if (_p == PtxGemmPrecision.Bf16InFp32Out)
+                {
+                    // BF16 operand: its bits are an FP32's upper half, so widening is a 16-bit shift.
+                    string bits = R();
+                    L($"mov.u32 {bits}, 0;");
+                    L($"@{ok} ld.global.u16 {bits}, [{op.SlotPointer[s]}];");
+                    L($"shl.b32 {bits}, {bits}, 16;");
+                    L($"mov.b32 {op.Staged[s][0]}, {bits};");
+                }
                 else if (_ob == 2)
                 {
                     // FP16 operand: widen to FP32 at load, so shared memory and the inner product stay FP32.

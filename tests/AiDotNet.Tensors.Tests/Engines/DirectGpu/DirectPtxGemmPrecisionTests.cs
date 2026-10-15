@@ -35,7 +35,18 @@ public sealed class DirectPtxGemmPrecisionTests
     private static readonly PtxGemmPrecision[] Precisions =
     {
         PtxGemmPrecision.Fp16InFp32Out, PtxGemmPrecision.Fp16InFp16Out, PtxGemmPrecision.Fp64,
+        PtxGemmPrecision.Bf16InFp32Out,
     };
+
+    // BF16 has no System type: round to nearest even on the FP32 bits, keep the upper half.
+    private static ushort Bf16Bits(double value)
+    {
+        uint bits = BitConverter.SingleToUInt32Bits((float)value);
+        bits += 0x7FFFu + ((bits >> 16) & 1u);
+        return (ushort)(bits >> 16);
+    }
+
+    private static double FromBf16(ushort bits) => BitConverter.UInt32BitsToSingle((uint)bits << 16);
 
     private static DirectPtxRuntime RequireRuntime()
     {
@@ -78,14 +89,20 @@ public sealed class DirectPtxGemmPrecisionTests
         for (int i = 0; i < count; i++)
         {
             double value = random.NextDouble() * 2 - 1;
-            values[i] = precision == PtxGemmPrecision.Fp64 ? value : (double)(Half)value;
+            values[i] = precision switch
+            {
+                PtxGemmPrecision.Fp64 => value,
+                PtxGemmPrecision.Bf16InFp32Out => FromBf16(Bf16Bits(value)),
+                _ => (double)(Half)value,
+            };
         }
         return values;
     }
 
-    private static void Upload(DirectPtxBuffer buffer, double[] values, int bytes)
+    private static void Upload(DirectPtxBuffer buffer, double[] values, int bytes, bool bf16 = false)
     {
-        if (bytes == 8) buffer.Upload<double>(values);
+        if (bf16) buffer.Upload<ushort>(values.Select(Bf16Bits).ToArray());
+        else if (bytes == 8) buffer.Upload<double>(values);
         else if (bytes == 4) buffer.Upload<float>(values.Select(v => (float)v).ToArray());
         else buffer.Upload<Half>(values.Select(v => (Half)v).ToArray());
     }
@@ -124,8 +141,9 @@ public sealed class DirectPtxGemmPrecisionTests
         using var da = runtime.AllocateBytes((nuint)(a.Length * ob));
         using var db = runtime.AllocateBytes((nuint)(b.Length * ob));
         using var dc = runtime.AllocateBytes((nuint)(c.Length * outb));
-        Upload(da, a, ob);
-        Upload(db, b, ob);
+        bool bf16 = precision == PtxGemmPrecision.Bf16InFp32Out;
+        Upload(da, a, ob, bf16);
+        Upload(db, b, ob, bf16);
         Upload(dc, c, outb);
         // The oracle sees C as stored (an FP32 C rounds the FP64 test values).
         double[] cStored = Download(dc, c.Length, outb);

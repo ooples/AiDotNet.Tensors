@@ -106,6 +106,7 @@ internal sealed class PtxSgemmKernel : IDisposable
         DirectPtxPhysicalType operandType = precision switch
         {
             PtxGemmPrecision.Fp16InFp32Out or PtxGemmPrecision.Fp16InFp16Out => DirectPtxPhysicalType.Float16,
+            PtxGemmPrecision.Bf16InFp32Out => DirectPtxPhysicalType.BFloat16,
             PtxGemmPrecision.Fp64 => DirectPtxPhysicalType.Float64,
             _ => DirectPtxPhysicalType.Float32,
         };
