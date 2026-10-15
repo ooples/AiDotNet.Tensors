@@ -77,6 +77,9 @@ public sealed partial class CudaBackend
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
+        if (TryConv2DBackwardKernelImplicitGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return true;
         if (!ConvGemmUsable() || batch <= 0) return false;
         int L = outHeight * outWidth, P = inChannels * kernelH * kernelW;
         using var _ = PushContext();

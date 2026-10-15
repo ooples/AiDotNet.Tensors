@@ -57,6 +57,54 @@ public class CudaImplicitConvTests
                     }
     }
 
+    /// <summary>conv2d_weight_grad_implicit against the double reference dW[oc,ic,r,s] = sum over (n, oh, ow) of
+    /// dY[n,oc,oh,ow] * X[n,ic,oh*sH-pH+r*dH, ow*sW-pW+s*dW]. Each shape runs twice with different dY: the kernel's
+    /// last block per tile resets the tile's counter, so a second launch must be complete too.</summary>
+    [SkippableTheory]
+    [InlineData(64, 16, 14, 14, 32, 3, 3, 1, 1, 1, 1, 1, 1)]   // the parity CNN's second layer: 3 tiles
+    [InlineData(70, 5, 17, 13, 20, 3, 3, 2, 2, 1, 1, 1, 1)]    // stride 2; a partial channel tile
+    [InlineData(12, 8, 20, 20, 64, 3, 3, 1, 1, 2, 2, 2, 2)]    // dilation 2, padding 2; two channel tiles
+    [InlineData(32, 4, 16, 24, 7, 5, 3, 1, 2, 0, 1, 1, 1)]     // rectangular kernel and stride
+    public void ImplicitGemmConvWeightGradient_EqualsTheReference(int batch, int inC, int inH, int inW, int outC,
+        int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        int outH = (inH + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
+        int outW = (inW + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
+        var random = new Random(inC * 13 + outC);
+        float[] x = Enumerable.Range(0, batch * inC * inH * inW).Select(_ => (float)(random.NextDouble() * 2 - 1)).ToArray();
+        using var xBuf = backend.AllocateBuffer(x);
+        using var dwBuf = backend.AllocateBuffer(outC * inC * kH * kW);
+        for (int launch = 0; launch < 2; launch++)
+        {
+            float[] dy = Enumerable.Range(0, batch * outC * outH * outW).Select(_ => (float)(random.NextDouble() * 2 - 1)).ToArray();
+            using var dyBuf = backend.AllocateBuffer(dy);
+            backend.UploadBufferInPlace(Enumerable.Repeat(float.NaN, outC * inC * kH * kW).ToArray(), dwBuf);
+            Assert.True(backend.TryConv2DBackwardKernelImplicitGemm(xBuf, dyBuf, dwBuf, batch, inC, inH, inW, outC, outH, outW,
+                kH, kW, sH, sW, pH, pW, dH, dW), "conv2d_weight_grad_implicit declined the shape");
+            var dwGot = backend.DownloadBuffer(dwBuf);
+            for (int oc = 0; oc < outC; oc++)
+                for (int ic = 0; ic < inC; ic++)
+                    for (int r = 0; r < kH; r++)
+                        for (int q = 0; q < kW; q++)
+                        {
+                            double s = 0, bound = 0;
+                            for (int n = 0; n < batch; n++)
+                                for (int oh = 0; oh < outH; oh++)
+                                    for (int ow = 0; ow < outW; ow++)
+                                    {
+                                        int ih = oh * sH - pH + r * dH, iw = ow * sW - pW + q * dW;
+                                        if (ih < 0 || ih >= inH || iw < 0 || iw >= inW) continue;
+                                        double p = (double)dy[((n * outC + oc) * outH + oh) * outW + ow] * x[((n * inC + ic) * inH + ih) * inW + iw];
+                                        s += p; bound += Math.Abs(p);
+                                    }
+                            float got = dwGot[((oc * inC + ic) * kH + r) * kW + q];
+                            if (!(Math.Abs(got - s) <= 1e-5 * bound + 1e-6))
+                                Assert.Fail($"launch {launch}: dW[{oc},{ic},{r},{q}] = {got}, expected {s}");
+                        }
+        }
+    }
     [SkippableTheory]
     [InlineData(64, 1, 28, 28, 16)]    // reduction 9: Winograd serves it better
     [InlineData(64, 16, 14, 14, 128)]  // more output channels than the kernel takes
