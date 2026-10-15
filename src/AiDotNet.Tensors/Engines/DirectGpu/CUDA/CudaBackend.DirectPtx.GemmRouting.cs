@@ -26,27 +26,34 @@ public enum CudaGemmDispatchPath
 
 /// <summary>
 /// The verdict of <see cref="CudaBackend.TuneGemmRouteAsync"/> for one shape and math mode: the evolved generated kernel
-/// against cuBLAS in paired, alternating rounds on CUDA events, after checking both produce the same output.
+/// against cuBLAS in paired, alternating rounds on CUDA events, after checking both produce the same output. It is
+/// measured twice: on eager launches, and as replays of a captured CUDA graph, where launch overhead is gone and only
+/// device time counts. A shape can win one and lose the other, so each launch mode routes on its own verdict.
 /// </summary>
 public sealed class CudaGemmRouteDecision
 {
-    internal CudaGemmRouteDecision(int m, int n, int k, bool strictFp32, string kernel, bool usesDirectPtx,
-        double medianSpeedup, double minimumSpeedup, double cublasMicroseconds, double directPtxMicroseconds, int rounds,
-        double maxRelativeDifference, string reason)
+    internal CudaGemmRouteDecision(int m, int n, int k, bool strictFp32, string kernel, double maxRelativeDifference,
+        CudaBackend.GemmRouteVerdict eager, CudaBackend.GemmRouteVerdict graph)
     {
         M = m;
         N = n;
         K = k;
         StrictFp32 = strictFp32;
         Kernel = kernel;
-        UsesDirectPtx = usesDirectPtx;
-        MedianSpeedup = medianSpeedup;
-        MinimumSpeedup = minimumSpeedup;
-        CublasMicroseconds = cublasMicroseconds;
-        DirectPtxMicroseconds = directPtxMicroseconds;
-        Rounds = rounds;
+        UsesDirectPtx = eager.Wins;
+        MedianSpeedup = eager.MedianSpeedup;
+        MinimumSpeedup = eager.MinimumSpeedup;
+        CublasMicroseconds = eager.CublasMicroseconds;
+        DirectPtxMicroseconds = eager.DirectPtxMicroseconds;
+        Rounds = eager.Rounds;
+        Reason = eager.Reason;
+        UsesDirectPtxInGraph = graph.Wins;
+        GraphMedianSpeedup = graph.MedianSpeedup;
+        GraphMinimumSpeedup = graph.MinimumSpeedup;
+        GraphCublasMicroseconds = graph.CublasMicroseconds;
+        GraphDirectPtxMicroseconds = graph.DirectPtxMicroseconds;
+        GraphReason = graph.Reason;
         MaxRelativeDifference = maxRelativeDifference;
-        Reason = reason;
     }
 
     /// <summary>Rows of A and C.</summary>
@@ -59,7 +66,7 @@ public sealed class CudaGemmRouteDecision
     public bool StrictFp32 { get; }
     /// <summary>The evolved kernel's configuration name.</summary>
     public string Kernel { get; }
-    /// <summary>Whether <see cref="CudaBackend.Gemm"/> now routes this shape to the generated kernel.</summary>
+    /// <summary>Whether <see cref="CudaBackend.Gemm"/> now routes this shape's eager launches to the generated kernel.</summary>
     public bool UsesDirectPtx { get; }
     /// <summary>Median over rounds of cuBLAS time / generated-kernel time (above 1: the generated kernel is faster).</summary>
     public double MedianSpeedup { get; }
@@ -73,8 +80,20 @@ public sealed class CudaGemmRouteDecision
     public int Rounds { get; }
     /// <summary>Largest |generated - cuBLAS| over the output, relative to the largest |cuBLAS| output.</summary>
     public double MaxRelativeDifference { get; }
-    /// <summary>Why the route was or was not taken.</summary>
+    /// <summary>Why the eager route was or was not taken.</summary>
     public string Reason { get; }
+    /// <summary>Whether a GEMM of this shape recorded into a CUDA graph capture uses the generated kernel.</summary>
+    public bool UsesDirectPtxInGraph { get; }
+    /// <summary>As <see cref="MedianSpeedup"/>, timing replays of captured graphs.</summary>
+    public double GraphMedianSpeedup { get; }
+    /// <summary>As <see cref="MinimumSpeedup"/>, timing replays of captured graphs.</summary>
+    public double GraphMinimumSpeedup { get; }
+    /// <summary>Fastest cuBLAS graph-replay round, microseconds per GEMM.</summary>
+    public double GraphCublasMicroseconds { get; }
+    /// <summary>Fastest generated-kernel graph-replay round, microseconds per GEMM.</summary>
+    public double GraphDirectPtxMicroseconds { get; }
+    /// <summary>Why the graph route was or was not taken.</summary>
+    public string GraphReason { get; }
 }
 
 /// <summary>
@@ -106,6 +125,13 @@ public sealed partial class CudaBackend
 
     private readonly record struct GemmRouteKey(int M, int N, int K, bool Strict);
 
+    // One launch mode's paired-round comparison (eager launches or graph replays).
+    internal readonly record struct GemmRouteVerdict(bool Wins, double MedianSpeedup, double MinimumSpeedup,
+        double CublasMicroseconds, double DirectPtxMicroseconds, int Rounds, string Reason)
+    {
+        internal static GemmRouteVerdict Rejected(string reason) => new(false, 0, 0, 0, 0, 0, reason);
+    }
+
     private sealed class GemmRoute : IDisposable
     {
         internal GemmRoute(IDisposable owner, CudaGemmDispatchPath path, Action<IntPtr, IntPtr, IntPtr, float, float> launch)
@@ -118,6 +144,9 @@ public sealed partial class CudaBackend
         internal IDisposable Owner { get; }
         internal CudaGemmDispatchPath Path { get; }
         internal Action<IntPtr, IntPtr, IntPtr, float, float> Launch { get; }
+        // The launch modes in which it measured faster than cuBLAS; set before the route is installed.
+        internal bool Eager { get; set; } = true;
+        internal bool InGraph { get; set; } = true;
 
         public void Dispose() => Owner.Dispose();
     }
@@ -141,8 +170,9 @@ public sealed partial class CudaBackend
     /// <summary>
     /// Tunes the generated GEMM for <c>C[M,N] = A[M,K] @ B[K,N]</c> in the current math mode (strict FP32 when
     /// deterministic, TF32 otherwise), checks it reproduces cuBLAS's output, times it against cuBLAS in paired
-    /// alternating rounds, and routes <see cref="Gemm"/> for this shape to it only when it wins. The verdict, either way,
-    /// is persisted (unless <paramref name="persist"/> is false) for <see cref="TryActivatePersistedGemmRoute"/>.
+    /// alternating rounds, and routes <see cref="Gemm"/> for this shape to it only when it wins. Eager launches and
+    /// launches recorded into a CUDA graph capture are timed and routed separately. The verdicts, either way, are
+    /// persisted (unless <paramref name="persist"/> is false) for <see cref="TryActivatePersistedGemmRoute"/>.
     /// </summary>
     public async Task<CudaGemmRouteDecision> TuneGemmRouteAsync(int m, int n, int k,
         EvolutionEngineOptions? engineOptions = null, KernelTuningOptions? tuningOptions = null, bool persist = true,
@@ -190,7 +220,12 @@ public sealed partial class CudaBackend
             candidate.Dispose();
             throw;
         }
-        if (decision.UsesDirectPtx) InstallGemmRoute(new GemmRouteKey(m, n, k, strict), candidate);
+        if (decision.UsesDirectPtx || decision.UsesDirectPtxInGraph)
+        {
+            candidate.Eager = decision.UsesDirectPtx;
+            candidate.InGraph = decision.UsesDirectPtxInGraph;
+            InstallGemmRoute(new GemmRouteKey(m, n, k, strict), candidate);
+        }
         else
         {
             candidate.Dispose();
@@ -202,8 +237,9 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// Activates a persisted route for this shape in the current math mode without measuring: true when a verdict for
-    /// this device says the generated kernel wins and it compiled; false (cuBLAS stays) for no verdict, a cuBLAS verdict,
-    /// another device, or a stale genome.
+    /// this device says the generated kernel wins on eager launches, inside graph captures, or both, and it compiled;
+    /// false (cuBLAS stays) for no verdict, cuBLAS verdicts in both modes, another device, or a stale genome. A verdict
+    /// persisted before graph verdicts were measured routes graph captures to cuBLAS.
     /// </summary>
     public bool TryActivatePersistedGemmRoute(int m, int n, int k)
     {
@@ -222,7 +258,8 @@ public sealed partial class CudaBackend
             choice.Parameters is null) return false;
         Dictionary<string, string> p = choice.Parameters;
         DirectPtxRuntime runtime = GetDirectPtxRuntime();
-        if (!Matches(p, "device", PtxGemmEvolution.Fingerprint(runtime).LocalKey) || !Matches(p, "route", "ptx") ||
+        bool eager = Matches(p, "route", "ptx"), inGraph = Matches(p, "graph-route", "ptx");
+        if (!Matches(p, "device", PtxGemmEvolution.Fingerprint(runtime).LocalKey) || !(eager || inGraph) ||
             !p.TryGetValue("genome", out string? genome)) return false;
         try
         {
@@ -241,6 +278,8 @@ public sealed partial class CudaBackend
                 PtxTensorCoreGemmConfiguration configuration = PtxTensorCoreGemmEvolution.GenomeCodec.Deserialize(genome);
                 route = CreateTensorCoreRoute(runtime, configuration, m, n, k);
             }
+            route.Eager = eager;
+            route.InGraph = inGraph;
             InstallGemmRoute(new GemmRouteKey(m, n, k, strict), route);
             return true;
         }
@@ -258,8 +297,14 @@ public sealed partial class CudaBackend
     }
 
     // Tests: installs a strict-FP32 route without tuning or measuring, to exercise the dispatch wiring itself.
-    internal void InstallSgemmRouteForTesting(PtxGemmConfiguration configuration, int m, int n, int k) =>
-        InstallGemmRoute(new GemmRouteKey(m, n, k, Strict: true), CreateSgemmRoute(GetDirectPtxRuntime(), configuration, m, n, k));
+    internal void InstallSgemmRouteForTesting(PtxGemmConfiguration configuration, int m, int n, int k, bool eager = true,
+        bool inGraph = true)
+    {
+        GemmRoute route = CreateSgemmRoute(GetDirectPtxRuntime(), configuration, m, n, k);
+        route.Eager = eager;
+        route.InGraph = inGraph;
+        InstallGemmRoute(new GemmRouteKey(m, n, k, Strict: true), route);
+    }
 
     private static bool Matches(Dictionary<string, string> parameters, string key, string expected) =>
         parameters.TryGetValue(key, out string? value) && string.Equals(value, expected, StringComparison.Ordinal);
@@ -325,8 +370,9 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
-    /// Runs an installed route for this shape and math mode. False (the caller uses cuBLAS) when none is installed, an
-    /// operand is not 16-byte aligned, or a buffer's extent differs from the problem's.
+    /// Runs an installed route for this shape and math mode. False (the caller uses cuBLAS) when none is installed, its
+    /// verdict for the current launch mode (eager or graph capture) is cuBLAS, an operand is not 16-byte aligned, or a
+    /// buffer's extent differs from the problem's.
     /// </summary>
     private bool TryRoutedGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k, float alpha, float beta)
     {
@@ -338,6 +384,9 @@ public sealed partial class CudaBackend
             TryActivatePersistedGemmRoute(m, n, k);
         if (Volatile.Read(ref _gemmRouteCount) == 0) return false;
         if (!_gemmRoutes.TryGetValue(key, out GemmRoute? route)) return false;
+        // Each launch mode follows its own verdict: a kernel can win on launch overhead alone, which a graph removes.
+        if (!(route.Eager && route.InGraph) && (IsStreamCapturingCurrentContext() ? !route.InGraph : !route.Eager))
+            return false;
         if (((long)a.Handle & 15) != 0 || ((long)b.Handle & 15) != 0 || ((long)c.Handle & 15) != 0) return false;
         if (a.SizeInBytes < (long)m * k * sizeof(float) || b.SizeInBytes < (long)k * n * sizeof(float) ||
             c.SizeInBytes < (long)m * n * sizeof(float)) return false;
@@ -348,7 +397,8 @@ public sealed partial class CudaBackend
     }
 
     // Output check, then paired rounds: cuBLAS, the candidate, the candidate, cuBLAS (ABBA), each timed on CUDA events,
-    // so clock, thermal and background-load drift hit both arms alike; the speedup is per round.
+    // so clock, thermal and background-load drift hit both arms alike; the speedup is per round. The rounds run twice:
+    // as eager launches, and as replays of graphs that captured the same launches.
     private CudaGemmRouteDecision CompareWithCublas(GemmRoute candidate, string name, int m, int n, int k, bool strict)
     {
         using var context = PushContext();
@@ -380,8 +430,11 @@ public sealed partial class CudaBackend
         // necessarily the same way).
         double tolerance = strict ? 1e-4 : 1e-2;
         if (!(relative <= tolerance))
-            return new CudaGemmRouteDecision(m, n, k, strict, name, false, 0, 0, 0, 0, 0, relative,
+        {
+            var rejected = GemmRouteVerdict.Rejected(
                 $"output differs from cuBLAS by {relative:G3} of the largest output (tolerance {tolerance:G3})");
+            return new CudaGemmRouteDecision(m, n, k, strict, name, relative, rejected, rejected);
+        }
 
         double work = 2d * m * n * k;
         int reps = (int)Math.Max(1, Math.Min(200, Math.Ceiling(2e10 / work)));
@@ -391,12 +444,53 @@ public sealed partial class CudaBackend
             ptx();
         }
         Synchronize();
+        GemmRouteVerdict eager = PairedRounds(() => { for (int i = 0; i < reps; i++) cublas(); },
+            () => { for (int i = 0; i < reps; i++) ptx(); }, reps);
+        GemmRouteVerdict graph = GraphRounds(cublas, ptx, reps);
+        return new CudaGemmRouteDecision(m, n, k, strict, name, relative, eager, graph);
+    }
+
+    // Each arm captured as one graph of `reps` launches; the replays are then compared in paired rounds.
+    private GemmRouteVerdict GraphRounds(Action cublas, Action ptx, int reps)
+    {
+        IntPtr cublasGraph = IntPtr.Zero, ptxGraph = IntPtr.Zero;
+        try
+        {
+            cublasGraph = CaptureGraph(() => { for (int i = 0; i < reps; i++) cublas(); });
+            ptxGraph = CaptureGraph(() => { for (int i = 0; i < reps; i++) ptx(); });
+            if (cublasGraph == IntPtr.Zero || ptxGraph == IntPtr.Zero)
+                return GemmRouteVerdict.Rejected("graph capture failed; graphs keep cuBLAS");
+            IntPtr cublasExec = cublasGraph, ptxExec = ptxGraph;
+            for (int i = 0; i < 3; i++)
+            {
+                EnqueueCapturedGraph(cublasExec);
+                EnqueueCapturedGraph(ptxExec);
+            }
+            Synchronize();
+            return PairedRounds(() => EnqueueCapturedGraph(cublasExec), () => EnqueueCapturedGraph(ptxExec), reps);
+        }
+        // A capture that cannot be set up or replayed costs only the graph verdict: the eager verdict already measured
+        // stands. A sticky fault (the GPU circuit breaker tripped) is not recoverable and propagates.
+        catch (InvalidOperationException exception) when (!AiDotNetEngine.GpuCircuitBroken)
+        {
+            return GemmRouteVerdict.Rejected($"graph measurement failed ({exception.Message}); graphs keep cuBLAS");
+        }
+        finally
+        {
+            if (cublasGraph != IntPtr.Zero) DestroyCapturedGraph(cublasGraph);
+            if (ptxGraph != IntPtr.Zero) DestroyCapturedGraph(ptxGraph);
+        }
+    }
+
+    // ABBA rounds of `cublas` against `ptx`, each running `reps` GEMMs; microseconds per GEMM from CUDA events.
+    private GemmRouteVerdict PairedRounds(Action cublas, Action ptx, int reps)
+    {
         double Round(Action launch)
         {
             using IGpuEvent start = CreateEvent(enableTiming: true);
             using IGpuEvent end = CreateEvent(enableTiming: true);
             RecordEvent(start, DefaultStream);
-            for (int i = 0; i < reps; i++) launch();
+            launch();
             RecordEvent(end, DefaultStream);
             end.Synchronize();
             return GetEventElapsedTime(start, end) * 1000.0 / reps;
@@ -417,8 +511,7 @@ public sealed partial class CudaBackend
         string reason = wins
             ? $"faster than cuBLAS: median {median:F3}x, every round at least {minimum:F3}x"
             : $"not faster than cuBLAS: median {median:F3}x (needs {GemmRouteMedianMargin:F2}), minimum {minimum:F3}x (needs {GemmRouteMinimumSpeedup:F2})";
-        return new CudaGemmRouteDecision(m, n, k, strict, name, wins, median, minimum, bestCublas, bestPtx,
-            GemmRouteRounds, relative, reason);
+        return new GemmRouteVerdict(wins, median, minimum, bestCublas, bestPtx, GemmRouteRounds, reason);
     }
 
     private static void PersistGemmRoute(DirectPtxRuntime runtime, CudaGemmRouteDecision decision, string genome,
@@ -445,6 +538,10 @@ public sealed partial class CudaBackend
                 ["minimum-speedup"] = decision.MinimumSpeedup.ToString("R", CultureInfo.InvariantCulture),
                 ["max-relative-difference"] = decision.MaxRelativeDifference.ToString("R", CultureInfo.InvariantCulture),
                 ["reason"] = decision.Reason,
+                ["graph-route"] = decision.UsesDirectPtxInGraph ? "ptx" : "cublas",
+                ["graph-median-speedup"] = decision.GraphMedianSpeedup.ToString("R", CultureInfo.InvariantCulture),
+                ["graph-minimum-speedup"] = decision.GraphMinimumSpeedup.ToString("R", CultureInfo.InvariantCulture),
+                ["graph-reason"] = decision.GraphReason,
             },
         };
         AutotuneCache.TryStore(GemmRouteKernelId,

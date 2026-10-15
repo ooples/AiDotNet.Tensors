@@ -12,8 +12,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// Tuned per-shape GEMM routing (#1265): an installed route runs its generated kernel through the public
-/// <see cref="CudaBackend.Gemm"/> only in the math mode it was measured in and reproduces cuBLAS there; a tuning run's
-/// verdict persists and activation follows it exactly.
+/// <see cref="CudaBackend.Gemm"/> only in the math mode, and the launch mode (eager or graph capture), it won in, and
+/// reproduces cuBLAS there; a tuning run's verdicts persist and activation follows them exactly.
 /// </summary>
 [Collection("DirectGpuSerial")]
 public sealed class DirectPtxGemmRoutingTests
@@ -129,6 +129,11 @@ public sealed class DirectPtxGemmRoutingTests
             Assert.True(decision.StrictFp32);
             Assert.True(decision.MaxRelativeDifference <= 1e-4);
             Assert.Equal(GemmRoutingRule(decision), decision.UsesDirectPtx);
+            _output.WriteLine($"graph: {decision.GraphReason}; cuBLAS {decision.GraphCublasMicroseconds:F1} us, " +
+                $"PTX {decision.GraphDirectPtxMicroseconds:F1} us");
+            Assert.Equal(GraphRoutingRule(decision), decision.UsesDirectPtxInGraph);
+            Assert.True(decision.GraphCublasMicroseconds > 0 && decision.GraphDirectPtxMicroseconds > 0,
+                "the graph verdict was not measured: " + decision.GraphReason);
 
             // The tuning run installs exactly what it decided.
             using var a = backend.AllocateBuffer(Values(m * k, 1));
@@ -140,7 +145,7 @@ public sealed class DirectPtxGemmRoutingTests
 
             // A later activation (here: after clearing) follows the persisted verdict, in this math mode only.
             backend.ClearGemmRoutes();
-            Assert.Equal(decision.UsesDirectPtx, backend.TryActivatePersistedGemmRoute(m, n, k));
+            Assert.Equal(decision.UsesDirectPtx || decision.UsesDirectPtxInGraph, backend.TryActivatePersistedGemmRoute(m, n, k));
             backend.Gemm(a, b, c, m, n, k);
             Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : CudaGemmDispatchPath.Cublas,
                 backend.LastGemmDispatchPath);
@@ -171,5 +176,73 @@ public sealed class DirectPtxGemmRoutingTests
     // The documented rule: a median speedup of at least 2% and no round slower than cuBLAS.
     private static bool GemmRoutingRule(CudaGemmRouteDecision decision) =>
         decision.MedianSpeedup >= 1.02 && decision.MinimumSpeedup >= 1.0;
+
+    private static bool GraphRoutingRule(CudaGemmRouteDecision decision) =>
+        decision.GraphMedianSpeedup >= 1.02 && decision.GraphMinimumSpeedup >= 1.0;
+
+    [SkippableFact]
+    public void InstalledRoute_FollowsItsOwnVerdict_ForEagerLaunchesAndGraphCaptures()
+    {
+        using var backend = RequireAmpereBackend();
+        bool previous = AiDotNetEngine.DeterministicMode;
+        try
+        {
+            AiDotNetEngine.SetDeterministicMode(true);
+            const int m = 128, n = 128, k = 128;
+            using var a = backend.AllocateBuffer(Values(m * k, 1));
+            using var b = backend.AllocateBuffer(Values(k * n, 2));
+            using var c = backend.AllocateBuffer(m * n);
+            backend.Gemm(a, b, c, m, n, k);
+            float[] expected = backend.DownloadBuffer(c);
+            var configuration = PtxGemmEvolution.Seeds(new PtxGemmLayout(false, false), m, n, k)[0];
+
+            // Returns the path the captured GEMM took, and checks the replay reproduces cuBLAS.
+            CudaGemmDispatchPath Captured()
+            {
+                using var captured = backend.AllocateBuffer(m * n);
+                CudaGemmDispatchPath path = CudaGemmDispatchPath.None;
+                IntPtr graph = backend.CaptureGraph(() =>
+                {
+                    backend.Gemm(a, b, captured, m, n, k);
+                    path = backend.LastGemmDispatchPath;
+                });
+                Assert.NotEqual(IntPtr.Zero, graph);
+                try
+                {
+                    backend.LaunchCapturedGraph(graph);
+                    double relative = MaxRelativeDifference(expected, backend.DownloadBuffer(captured));
+                    Assert.True(relative <= 1e-5, $"graph replay differs from cuBLAS by {relative:G3} ({path})");
+                }
+                finally
+                {
+                    backend.DestroyCapturedGraph(graph);
+                }
+                return path;
+            }
+
+            // Wins eagerly only (launch overhead): eager launches route, captures keep cuBLAS.
+            backend.InstallSgemmRouteForTesting(configuration, m, n, k, eager: true, inGraph: false);
+            backend.Gemm(a, b, c, m, n, k);
+            Assert.Equal(CudaGemmDispatchPath.DirectPtxSgemm, backend.LastGemmDispatchPath);
+            Assert.Equal(CudaGemmDispatchPath.Cublas, Captured());
+
+            // Wins in graphs only: the reverse.
+            backend.InstallSgemmRouteForTesting(configuration, m, n, k, eager: false, inGraph: true);
+            backend.Gemm(a, b, c, m, n, k);
+            Assert.Equal(CudaGemmDispatchPath.Cublas, backend.LastGemmDispatchPath);
+            Assert.Equal(CudaGemmDispatchPath.DirectPtxSgemm, Captured());
+
+            // Both.
+            backend.InstallSgemmRouteForTesting(configuration, m, n, k);
+            backend.Gemm(a, b, c, m, n, k);
+            Assert.Equal(CudaGemmDispatchPath.DirectPtxSgemm, backend.LastGemmDispatchPath);
+            Assert.Equal(CudaGemmDispatchPath.DirectPtxSgemm, Captured());
+        }
+        finally
+        {
+            backend.ClearGemmRoutes();
+            AiDotNetEngine.SetDeterministicMode(previous);
+        }
+    }
 }
 #endif
