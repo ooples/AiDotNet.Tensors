@@ -171,6 +171,40 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_tiled(
         }
     }
 }
+// As maxpool2d_backward_tiled, with each window's winner found again from the input instead of read from saved
+// indices: the window's first strict maximum, a winnerless window (all -inf or NaN) its first cell -- maxpool2d's and
+// the CPU engine's rule. A compiled step recorded without indices replayed the whole pool under a tape to recover
+// them (a forward pool, its index buffers' zero-fills, the backward and a copy).
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_recompute_tiled(
+    const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput,
+    int planes, int inHeight, int inWidth, int outHeight, int outWidth, int kernelH, int kernelW)
+{
+    long long w = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)planes * outHeight * outWidth;
+    if (w >= total) return;
+    int ow = (int)(w % outWidth);
+    long long t = w / outWidth;
+    int oh = (int)(t % outHeight);
+    long long plane = t / outHeight;
+    const float* in = input + plane * inHeight * inWidth;
+    float* out = gradInput + plane * inHeight * inWidth;
+    float best = -INFINITY;
+    int winner = (oh * kernelH) * inWidth + ow * kernelW;
+    for (int kh = 0; kh < kernelH; kh++)
+        for (int kw = 0; kw < kernelW; kw++)
+        {
+            int cell = (oh * kernelH + kh) * inWidth + ow * kernelW + kw;
+            float v = in[cell];
+            if (v > best) { best = v; winner = cell; }
+        }
+    float g = gradOutput[w];
+    for (int kh = 0; kh < kernelH; kh++)
+        for (int kw = 0; kw < kernelW; kw++)
+        {
+            int cell = (oh * kernelH + kh) * inWidth + ow * kernelW + kw;
+            out[cell] = cell == winner ? g : 0.0f;
+        }
+}
 extern ""C"" __global__ __launch_bounds__(256) void avgpool2d(
     const float* __restrict__ input, float* __restrict__ output,
     int batch, int channels, int inHeight, int inWidth,
@@ -1009,6 +1043,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_max_pool2d(
                 "maxpool2d_backward",
                 "maxpool2d_backward_deterministic",
             "maxpool2d_backward_tiled",
+            "maxpool2d_backward_recompute_tiled",
                 "avgpool2d",
                 "avgpool2d_backward",
                 "global_avgpool2d",

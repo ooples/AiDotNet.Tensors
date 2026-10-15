@@ -45,6 +45,31 @@ internal sealed class LayerNormStateRef<T>
 internal static class BackwardFunctions<T>
 {
     /// <summary>
+    /// A max pool recorded without indices (a compiled plan's lazy node): on a GPU engine in a resident step, the
+    /// non-overlapping pool's input gradient comes from one kernel that finds each window's winner again from the input,
+    /// written straight into the input's accumulator on its first contribution
+    /// (<see cref="DirectGpuTensorEngine.TryMaxPool2DBackwardRecomputeResident{T}"/>); anything else runs
+    /// <paramref name="fallback"/> (replaying the pool under a tape).
+    /// </summary>
+    internal static BackwardFunction<T> MaxPool2DRecomputeOnDeviceOr(int[] poolSize, int[] stride, BackwardFunction<T> fallback) =>
+        (gradOutput, inputs, output, savedState, engine, grads) =>
+        {
+            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
+            {
+                var into = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add);
+                if (gpu.TryMaxPool2DBackwardRecomputeResident(gradOutput, inputs[0], poolSize, stride, add ? null : into,
+                        out var grad) && grad is not null)
+                {
+                    if (!add && into is not null && ReferenceEquals(grad, into))
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], into);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+                    return;
+                }
+            }
+            fallback(gradOutput, inputs, output, savedState, engine, grads);
+        };
+    /// <summary>
     /// A backward for a compiled-graph node whose op has a differentiable EAGER implementation but no dedicated graph
     /// backward: re-runs the op under a fresh <see cref="GradientTape{T}"/> and seeds that result with the node's
     /// output gradient, which yields exactly the vector-Jacobian product the tape path would. Graph nodes used to be

@@ -15135,11 +15135,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var gradInputBuffer = AllocateOutputBuffer(backend, gradInputSize);
         try
         {
-            backend.Fill(gradInputBuffer.Buffer, 0f, gradInputSize);
-            backend.MaxPool2DBackward(
-                gradOutputBuffer.Buffer, indicesBuffer.Buffer, gradInputBuffer.Buffer,
-                batch, channels, inHeight, inWidth, outHeight, outWidth,
-                poolSize[0], poolSize[1], stride[0], stride[1], 0, 0);
+            // A non-overlapping pool's backward writes every cell itself: no zero-fill first.
+            if (!(backend is IMaxPoolBackwardOverwriteBackend overwrite
+                && overwrite.TryMaxPool2DBackwardOverwrite(gradOutputBuffer.Buffer, indicesBuffer.Buffer, gradInputBuffer.Buffer,
+                    batch, channels, inHeight, inWidth, outHeight, outWidth, poolSize[0], poolSize[1], stride[0], stride[1])))
+            {
+                backend.Fill(gradInputBuffer.Buffer, 0f, gradInputSize);
+                backend.MaxPool2DBackward(
+                    gradOutputBuffer.Buffer, indicesBuffer.Buffer, gradInputBuffer.Buffer,
+                    batch, channels, inHeight, inWidth, outHeight, outWidth,
+                    poolSize[0], poolSize[1], stride[0], stride[1], 0, 0);
+            }
             var result = DeferTensorResult<T>(
                 backend, gradInputBuffer.Buffer, gradInputSize, (int[])inputShape.Clone());
             gradInputBuffer.RelinquishOwnership();
@@ -15151,6 +15157,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MaxPool2DBackwardWithTensorIndices(
                 gradOutput, maxIndices, inputShape, poolSize, stride);
         }
+    }
+
+    /// <summary>
+    /// A non-overlapping max pool's input gradient in a resident step, each window's winner found again from the
+    /// input (maxpool2d_backward_recompute_tiled) -- written into <paramref name="into"/> when that is the input's
+    /// accumulator receiving its first contribution, else into a fresh resident buffer. A compiled step records the
+    /// pool without indices, and its backward replayed the pool under a tape to recover them. False -- nothing
+    /// launched -- when the pool or the operands do not qualify; the caller then replays.
+    /// </summary>
+    internal bool TryMaxPool2DBackwardRecomputeResident<T>(Tensor<T> gradOutput, Tensor<T> input, int[] poolSize,
+        int[] stride, Tensor<T>? into, out Tensor<T>? gradInput)
+    {
+        gradInput = null;
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive || input.Rank != 4
+            || gradOutput.Rank != 4 || !input.IsContiguous || !gradOutput.IsContiguous
+            || poolSize is not { Length: 2 } || stride is not { Length: 2 })
+            return false;
+        if (!TryGetBackend(out var backend) || backend is not IMaxPoolBackwardOverwriteBackend overwrite) return false;
+        int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
+        int inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
+        int outHeight = gradOutput.Shape._dims[2], outWidth = gradOutput.Shape._dims[3];
+        if (gradOutput.Shape._dims[0] != batch || gradOutput.Shape._dims[1] != channels) return false;
+        int total = input.Length;
+        var gR = ResolveResidentBufferNoUpload(backend, gradOutput, gradOutput.Length);
+        var iR = ResolveResidentBufferNoUpload(backend, input, total);
+        if (gR is null || iR is null) return false;
+        var target = into is null ? null : ResolveDirectGradTarget(backend, into, total, gR, iR, null);
+        var result = target is not null && into is not null ? into : new Tensor<T>(new T[total], input.Shape.ToArray());
+        var buffer = target ?? GetOrCreateResidentBuffer(backend, result, total, fullyWritten: true);
+        if (buffer.Handle == IntPtr.Zero
+            || !overwrite.TryMaxPool2DBackwardRecompute(gR, iR, buffer, batch, channels, inHeight, inWidth, outHeight,
+                outWidth, poolSize[0], poolSize[1], stride[0], stride[1]))
+            return false;
+        ResidentSyncCheck("MaxPool2DBackwardRecompute");
+        if (target is not null) result.IncrementVersion();
+        BindResidentBuffer(result, buffer, backend);
+        gradInput = result;
+        return true;
     }
 
     /// <summary>

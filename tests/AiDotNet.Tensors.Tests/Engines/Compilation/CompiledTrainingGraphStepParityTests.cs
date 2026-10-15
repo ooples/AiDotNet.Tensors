@@ -694,6 +694,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [InlineData(true, TwoPathNetwork.ResidualReadAfterFanOut)]
     [InlineData(false, TwoPathNetwork.MeanAroundKeptAxis)]
     [InlineData(true, TwoPathNetwork.MeanAroundKeptAxis)]
+    [InlineData(false, TwoPathNetwork.MaxPool)]
+    [InlineData(true, TwoPathNetwork.MaxPool)]
     public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
         Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
@@ -708,6 +710,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             TwoPathNetwork.PreNormResidualStream => PreNormResidualStreamLoss,
             TwoPathNetwork.ResidualReadAfterFanOut => ResidualReadAfterFanOutLoss,
             TwoPathNetwork.MeanAroundKeptAxis => MeanAroundKeptAxisLoss,
+            TwoPathNetwork.MaxPool => MaxPoolLoss,
             _ => SharedLoss,
         };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
@@ -734,6 +737,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 TwoPathNetwork.StandaloneRelu => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
                     Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f),
                     Rand([Hidden, Outputs], 11, 0.3f) },
+                TwoPathNetwork.MaxPool => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden / 4, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
                 TwoPathNetwork.MeanAroundKeptAxis => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
                     Rand([Hidden, Outputs], 4, 0.3f) },
                 TwoPathNetwork.ResidualReadAfterFanOut => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
@@ -926,6 +931,17 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorMSELoss(e.FusedLinear(h, w[2], bias, FusedActivationType.None), y);
     }
 
+    /// <summary>MSE of a projection of a 2x2 max pool, <c>pool(h viewed as [batch, 3, 4, 4]) · w2 + b3</c> with
+    /// <c>h = ReLU(x · w0 + b1)</c>: the pool's input gradient is its accumulator's first contribution, which on the GPU the
+    /// per-window backward writes straight in (every cell: the winner's gradient, every other cell 0).</summary>
+    private static Tensor<float> MaxPoolLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.Reshape(e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU), new[] { Batch, 3, 4, 4 });
+        // The int-index overload, as AiDotNet's pooling layer calls it: a compiled plan records it without indices.
+        var pooled = e.MaxPool2DWithIndices(h, new[] { 2, 2 }, new[] { 2, 2 }, out _);
+        return e.TensorMSELoss(e.FusedLinear(e.Reshape(pooled, new[] { Batch, Hidden / 4 }), w[2], w[3], FusedActivationType.None), y);
+    }
+
     // A LayerNorm gain near one: 1 + noise.
     private static Tensor<float> Ones(int length, int seed, float noise)
     {
@@ -959,6 +975,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         ResidualReadAfterFanOut,
         /// <summary>A mean around one kept axis (a convolution's bias-gradient shape), used as a bias.</summary>
         MeanAroundKeptAxis,
+        /// <summary>A non-overlapping 2x2 max pool whose input gradient is a first contribution.</summary>
+        MaxPool,
     }
 
     /// <summary>

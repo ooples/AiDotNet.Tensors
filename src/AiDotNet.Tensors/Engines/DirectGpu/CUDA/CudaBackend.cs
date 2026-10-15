@@ -17,7 +17,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -7910,6 +7910,50 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
     }
 
+    bool IMaxPoolBackwardOverwriteBackend.TryMaxPool2DBackwardOverwrite(IGpuBuffer gradOutput, IGpuBuffer indices,
+        IGpuBuffer gradInput, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW)
+        => TryMaxPool2DBackwardTiled(gradOutput, indices, gradInput, batch, channels, inHeight, inWidth, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW);
+
+    unsafe bool IMaxPoolBackwardOverwriteBackend.TryMaxPool2DBackwardRecompute(IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer gradInput, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW)
+    {
+        if (!IsAvailable || kernelH < 1 || kernelW < 1 || kernelH != strideH || kernelW != strideW
+            || inHeight != outHeight * kernelH || inWidth != outWidth * kernelW || gradInput.Handle == input.Handle
+            || !_kernelCache.TryGetValue("maxpool2d_backward_recompute_tiled", out var recomputeKernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr g = gradOutput.Handle, x = input.Handle, dx = gradInput.Handle;
+        int planes = batch * channels, rih = inHeight, riw = inWidth, roh = outHeight, row = outWidth, rkh = kernelH, rkw = kernelW;
+        long windows = (long)planes * outHeight * outWidth;
+        void** argsR = stackalloc void*[10];
+        argsR[0] = &g; argsR[1] = &x; argsR[2] = &dx; argsR[3] = &planes; argsR[4] = &rih;
+        argsR[5] = &riw; argsR[6] = &roh; argsR[7] = &row; argsR[8] = &rkh; argsR[9] = &rkw;
+        LaunchKernel(recomputeKernel, (uint)((windows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argsR);
+        return true;
+    }
+    // maxpool2d_backward_tiled for a non-overlapping pool (kernel equal to stride, the input an exact multiple of the
+    // kernel): every input cell belongs to one window, and the window's thread writes it. False otherwise.
+    private unsafe bool TryMaxPool2DBackwardTiled(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
+        int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW)
+    {
+        if (!IsAvailable || kernelH < 1 || kernelW < 1 || kernelH != strideH || kernelW != strideW
+            || inHeight != outHeight * kernelH || inWidth != outWidth * kernelW
+            || !_kernelCache.TryGetValue("maxpool2d_backward_tiled", out var tiledKernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr g = gradOutput.Handle, idx = indices.Handle, dx = gradInput.Handle;
+        int planes = batch * channels, tih = inHeight, tiw = inWidth, toh = outHeight, tow = outWidth, tkh = kernelH, tkw = kernelW;
+        long windows = (long)planes * outHeight * outWidth;
+        void** argsT = stackalloc void*[10];
+        argsT[0] = &g; argsT[1] = &idx; argsT[2] = &dx; argsT[3] = &planes; argsT[4] = &tih;
+        argsT[5] = &tiw; argsT[6] = &toh; argsT[7] = &tow; argsT[8] = &tkh; argsT[9] = &tkw;
+        LaunchKernel(tiledKernel, (uint)((windows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argsT);
+        return true;
+    }
     public unsafe void MaxPool2DBackward(IGpuBuffer gradOutput, IGpuBuffer indices, IGpuBuffer gradInput,
         int batch, int channels, int inHeight, int inWidth,
         int outHeight, int outWidth,
@@ -7932,18 +7976,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // Non-overlapping pools: one thread per window writes its whole block (deterministic, no zero-fill, no atomics),
         // for either determinism setting.
-        if (kernelH == strideH && kernelW == strideW && padH == 0 && padW == 0
-            && inHeight == outHeight * kernelH && inWidth == outWidth * kernelW
-            && _kernelCache.TryGetValue("maxpool2d_backward_tiled", out var tiledKernel))
-        {
-            int planes = batch * channels, tih = inHeight, tiw = inWidth, toh = outHeight, tow = outWidth, tkh = kernelH, tkw = kernelW;
-            long windows = (long)planes * outHeight * outWidth;
-            void** argsT = stackalloc void*[10];
-            argsT[0] = &gradOutPtr; argsT[1] = &indicesPtr; argsT[2] = &gradInPtr; argsT[3] = &planes; argsT[4] = &tih;
-            argsT[5] = &tiw; argsT[6] = &toh; argsT[7] = &tow; argsT[8] = &tkh; argsT[9] = &tkw;
-            LaunchKernel(tiledKernel, (uint)((windows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argsT);
+        if (padH == 0 && padW == 0 && TryMaxPool2DBackwardTiled(gradOutput, indices, gradInput, batch, channels,
+                inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW))
             return;
-        }
         // Both maxpool2d_backward kernels take NINE parameters — the last two are
         // (outHeight, outWidth). Passing only eight args (a single outWidth) left the
         // kernel's outWidth reading an unfilled arg slot — garbage — which blew up
