@@ -18,6 +18,27 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("BlasManaged-Stats-Serial")]
 public class Conv2DImplicitGemmParityTests
 {
+    // The oneDNN / implicit / full route chain is compiled only on .NET Core (CpuEngine.Conv2DWithIm2ColFloat), so the
+    // routes these tests compare and pin do not exist on .NET Framework.
+#if NETCOREAPP
+    private const bool RouteChainCompiled = true;
+#else
+    private const bool RouteChainCompiled = false;
+#endif
+
+    // An unpinned conv reaches that chain only on Windows.
+    private static bool UnpinnedRouteChainRuns =>
+        RouteChainCompiled
+        && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+
+    // oneDNN, where installed, takes the conv before the chain's own routes; its run counter says whether it did.
+    private static int OneDnnConvRuns =>
+#if NETCOREAPP
+        AiDotNet.Tensors.Helpers.OneDnnProvider.Conv2DRunsOnThisThread;
+#else
+        0;
+#endif
+
     private static Tensor<float> Rand(int[] shape, int seed)
     {
         var rng = new Random(seed);
@@ -71,7 +92,7 @@ public class Conv2DImplicitGemmParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     // batch, inC, outC, k, hw, stride, pad, dilation
     [InlineData(1, 256, 256, 3, 16, 1, 1, 1)]   // canonical diffusion ResBlock 3×3
     [InlineData(1, 320, 320, 3, 32, 1, 1, 1)]   // larger spatial → multiple row-blocks
@@ -85,6 +106,7 @@ public class Conv2DImplicitGemmParityTests
     public void FusedConv_IsBitIdentical_ToFullIm2Col(
         int batch, int inC, int outC, int k, int hw, int stride, int pad, int dilation)
     {
+        Skip.IfNot(RouteChainCompiled, "The implicit and full conv routes are compiled only on .NET Core.");
         var e = new CpuEngine();
         var x = Rand(new[] { batch, inC, hw, hw }, 101);
         var kernel = Rand(new[] { outC, inC, k, k }, 202);
@@ -130,7 +152,7 @@ public class Conv2DImplicitGemmParityTests
     // 8+ threads or on a 64x64+ plane; parallel blocks on fixed-blocking GEMMs elsewhere), so the routes must agree under
     // each plan. The shapes cover a 14-wide row (a block edge inside a 16-column tile), output channels that are not a
     // multiple of the 48-row chunk, an 8x8 plane split over output channels, and a batch.
-    [Theory]
+    [SkippableTheory]
     [InlineData(1, 256, 256, 3, 16, 1)]
     [InlineData(1, 256, 256, 3, 16, 4)]
     [InlineData(1, 256, 256, 3, 16, 16)]
@@ -140,6 +162,7 @@ public class Conv2DImplicitGemmParityTests
     [InlineData(1, 512, 512, 3, 8, 16)]
     [InlineData(2, 256, 136, 3, 24, 3)]
     [InlineData(1, 128, 64, 3, 64, 16)]
+    [InlineData(1, 512, 48, 3, 63, 16)]    // 73 MB matrix keeps the implicit route; 16-row tile blocks cap it at 3 workers
     [InlineData(1, 64, 64, 3, 64, 4)]      // K = 576: past the row-block conv, a low-channel shape on the implicit route
     public void FusedConv_IsBitIdentical_ToFullIm2Col_AtThreadCount(int batch, int inC, int outC, int k, int hw, int threads)
     {
@@ -163,11 +186,12 @@ public class Conv2DImplicitGemmParityTests
     [InlineData(96, 96, 64, 16)]
     public void LargeSpatialConv_PastRowBlockK_TakesImplicitGemm(int inC, int outC, int hw, int threads)
     {
+        Skip.IfNot(UnpinnedRouteChainRuns, "The adaptive conv route chain runs only on Windows under .NET Core.");
         var e = new CpuEngine();
         var x = Rand(new[] { 1, inC, hw, hw }, 505);
         var kernel = Rand(new[] { outC, inC, 3, 3 }, 606);
         int previous = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
-        int fullBefore = CpuEngine.FullIm2ColConvRunsOnThisThread, implicitBefore = CpuEngine.ImplicitGemmConvRunsOnThisThread;
+        int fullBefore = CpuEngine.FullIm2ColConvRunsOnThisThread, implicitBefore = CpuEngine.ImplicitGemmConvRunsOnThisThread, oneDnnBefore = OneDnnConvRuns;
         try
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
@@ -177,8 +201,8 @@ public class Conv2DImplicitGemmParityTests
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
         }
-        Skip.If(CpuEngine.FullIm2ColConvRunsOnThisThread == fullBefore && CpuEngine.ImplicitGemmConvRunsOnThisThread == implicitBefore,
-            "Another route (non-Windows im2col, or oneDNN) handled the convolution on this host.");
+
+        Skip.If(OneDnnConvRuns > oneDnnBefore, "oneDNN handled the convolution on this host.");
         Assert.Equal(0, CpuEngine.FullIm2ColConvRunsOnThisThread - fullBefore);
         Assert.Equal(1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }
@@ -192,11 +216,12 @@ public class Conv2DImplicitGemmParityTests
     [InlineData(640, 64, 16, false)]   // 94 MB matrix: past the cache, keeps the implicit path
     public void HighChannelConv_RoutesByThreadsAndMatrixSize(int channels, int hw, int threads, bool expectFull)
     {
+        Skip.IfNot(UnpinnedRouteChainRuns, "The adaptive conv route chain runs only on Windows under .NET Core.");
         var e = new CpuEngine();
         var x = Rand(new[] { 1, channels, hw, hw }, 303);
         var kernel = Rand(new[] { channels, channels, 3, 3 }, 404);
         int previous = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
-        int fullBefore = CpuEngine.FullIm2ColConvRunsOnThisThread, implicitBefore = CpuEngine.ImplicitGemmConvRunsOnThisThread;
+        int fullBefore = CpuEngine.FullIm2ColConvRunsOnThisThread, implicitBefore = CpuEngine.ImplicitGemmConvRunsOnThisThread, oneDnnBefore = OneDnnConvRuns;
         try
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
@@ -206,10 +231,8 @@ public class Conv2DImplicitGemmParityTests
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
         }
-        // The full/implicit choice is made only on the Windows adaptive route chain, and there only when oneDNN does not take
-        // the conv first; elsewhere neither route runs and there is no choice to check.
-        Skip.If(CpuEngine.FullIm2ColConvRunsOnThisThread == fullBefore && CpuEngine.ImplicitGemmConvRunsOnThisThread == implicitBefore,
-            "Another route (non-Windows im2col, or oneDNN) handled the convolution on this host.");
+        // On that chain oneDNN, where installed, may take the conv first; otherwise one of the two routes must have run.
+        Skip.If(OneDnnConvRuns > oneDnnBefore, "oneDNN handled the convolution on this host.");
         Assert.Equal(expectFull ? 1 : 0, CpuEngine.FullIm2ColConvRunsOnThisThread - fullBefore);
         Assert.Equal(expectFull ? 0 : 1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }
