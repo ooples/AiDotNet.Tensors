@@ -76,13 +76,18 @@ public sealed partial class CudaBackend
                     // AIDOTNET_CONV_ENGINE_FPROP=0) is not registered at all, rather than registered as inapplicable:
                     // persisted tuning decisions are keyed by the registered candidate set, so the two states of a switch
                     // must not share (and read back) each other's decisions.
-                    var candidates = new List<ITunedKernelCandidate<CudaConv2DArgs>>
-                    {
+                    // The first applicable candidate is the slot's reference (served under capture and once the online
+                    // tuning budget is spent), so #1325's engine, fastest on every ResNet-18 layer, goes first when on.
+                    var candidates = new List<ITunedKernelCandidate<CudaConv2DArgs>>();
+                    if (s_convEngineFprop)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.implicit_engine",
+                            TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_fprop_ig128_tap"),
+                            (in CudaConv2DArgs a) => ExecuteConv2DForwardEngine(a)));
+                    candidates.Add(
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.generic", TunedKernelOrigin.Builtin,
                             true, _ => true, (in CudaConv2DArgs a) => LaunchConv2DGeneric(a.Input, a.Kernel, a.Output,
                                 a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels, a.OutHeight, a.OutWidth,
-                                a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW)),
-                    };
+                                a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW)));
                     if (s_convGemmBackward)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("cublas.conv2d.im2col_gemm",
                             TunedKernelOrigin.Vendor, true, ConvGemmForwardFits, (in CudaConv2DArgs a) => ExecuteConv2DForwardGemm(a)));
@@ -94,10 +99,6 @@ public sealed partial class CudaBackend
                             shape => HasTunedKernel("conv2d_implicit_gemm") && ImplicitConvAdmits(shape[0], shape[1],
                                 shape[4], shape[13], shape[14], shape[5], shape[6], shape[7], shape[8], shape[11], shape[12]),
                             (in CudaConv2DArgs a) => ExecuteConv2DForwardNarrow(a)));
-                    if (s_convEngineFprop)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.implicit_engine",
-                            TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_fprop_ig128_tap"),
-                            (in CudaConv2DArgs a) => ExecuteConv2DForwardEngine(a)));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
                         true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,

@@ -59,9 +59,11 @@ internal readonly struct CudaConv2DBackwardArgs
 /// <summary>
 /// #1325: Conv2D backward (weight and input gradients) through the tuned-kernel registry, as the forward pass already is.
 /// No one route wins every shape: on ResNet-18 #1323's implicit GEMM has the fastest weight gradient on most layers,
-/// the #1325 engine the fastest stride-1 input gradient, and SGEMM + col2im the fastest strided 3x3 input gradient. The
-/// reference is the direct kernel; each other route competes per shape class after the correctness and paired-timing
-/// gate, and falls back to the reference when it declines at dispatch (partials that cannot be sized during a capture).
+/// the #1325 engine the fastest stride-1 input gradient, and SGEMM + col2im the fastest strided 3x3 input gradient. Each
+/// route competes per shape class after the correctness and paired-timing gate. The slot's reference (its first
+/// applicable candidate, served under capture and once the process's online tuning budget is spent) is the strongest
+/// general route; a route that declines at dispatch (partials that cannot be sized during a capture) runs the direct
+/// kernel instead.
 /// A route switched off for the process is not registered, so its two states never share persisted decisions.
 /// </summary>
 public sealed partial class CudaBackend
@@ -84,19 +86,19 @@ public sealed partial class CudaBackend
             {
                 if (_conv2DBackwardFilterSlot is null)
                 {
-                    var candidates = new List<ITunedKernelCandidate<CudaConv2DBackwardArgs>>
-                    {
-                        new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.direct", TunedKernelOrigin.Builtin,
-                            true, _ => HasTunedKernel("conv2d_backward_kernel"), (in CudaConv2DBackwardArgs a) => LaunchDwDirect(a)),
-                    };
-                    if (s_convGemmBackward && s_convEngineBackwardEnv)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.engine",
-                            TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_wgrad_ce128"),
-                            (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaEngine(a)) LaunchDwDirect(a); }));
+                    // The first applicable candidate is the slot's reference: it is served under capture, after the
+                    // process's online tuning budget is spent, and as the correctness baseline. So the strongest general
+                    // route goes first (#1323's implicit GEMM: fastest weight gradient on most ResNet-18 layers), and the
+                    // direct kernel, which never wins, is registered only when nothing else is.
+                    var candidates = new List<ITunedKernelCandidate<CudaConv2DBackwardArgs>>();
                     if (s_convGemmBackward && s_convImplicitWgradEnv)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.implicit",
                             TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_wgrad_implicit_gemm"),
                             (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaImplicit(a)) LaunchDwDirect(a); }));
+                    if (s_convGemmBackward && s_convEngineBackwardEnv)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.engine",
+                            TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_wgrad_ce128"),
+                            (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaEngine(a)) LaunchDwDirect(a); }));
                     if (s_convGemmBackward && ImplicitConvEnabled)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.implicit_narrow",
                             TunedKernelOrigin.Builtin, true, shape => HasTunedKernel("conv2d_weight_grad_implicit") && NarrowWgradAdmits(shape),
@@ -105,6 +107,9 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("cublas.conv2d_dw.im2col_gemm",
                             TunedKernelOrigin.Vendor, true, _ => true,
                             (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaIm2col(a)) LaunchDwDirect(a); }));
+                    if (candidates.Count == 0)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.direct", TunedKernelOrigin.Builtin,
+                            true, _ => HasTunedKernel("conv2d_backward_kernel"), (in CudaConv2DBackwardArgs a) => LaunchDwDirect(a)));
                     _conv2DBackwardFilterSlot = new TunedKernelSlot<CudaConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardFilter,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
@@ -122,11 +127,9 @@ public sealed partial class CudaBackend
             {
                 if (_conv2DBackwardDataSlot is null)
                 {
-                    var candidates = new List<ITunedKernelCandidate<CudaConv2DBackwardArgs>>
-                    {
-                        new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
-                            true, _ => HasTunedKernel("conv2d_backward_input"), (in CudaConv2DBackwardArgs a) => LaunchDxDirect(a)),
-                    };
+                    // Reference first (see the weight-gradient slot): the engine (fastest stride-1 input gradient, but
+                    // Cout % 8 == 0 only), then #1323's implicit GEMM, which takes every shape; direct only alone.
+                    var candidates = new List<ITunedKernelCandidate<CudaConv2DBackwardArgs>>();
                     if (s_convGemmBackward && s_convEngineBackwardEnv)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.engine",
                             TunedKernelOrigin.Builtin, true,
@@ -140,6 +143,9 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("cublas.conv2d_dx.gemm_col2im",
                             TunedKernelOrigin.Vendor, true, _ => true,
                             (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaCol2im(a)) LaunchDxDirect(a); }));
+                    if (candidates.Count == 0)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
+                            true, _ => HasTunedKernel("conv2d_backward_input"), (in CudaConv2DBackwardArgs a) => LaunchDxDirect(a)));
                     _conv2DBackwardDataSlot = new TunedKernelSlot<CudaConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardData,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
