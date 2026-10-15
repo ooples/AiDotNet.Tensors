@@ -22,6 +22,9 @@
     },
     "transformer:cuda": {
       "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.721
+    },
+    "resnet18:cuda": {
+      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 1.73
     }
   }
 }
