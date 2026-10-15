@@ -216,6 +216,51 @@ public static class GpuOptimizer
     }
 
     /// <summary>
+    /// Plain SGD over a whole parameter list on the GPU, as <c>torch.optim.SGD</c> with <c>foreach</c>: one fused launch
+    /// on a backend with a multi-tensor kernel, otherwise each tensor through the backend's own SGD kernel. The result
+    /// equals calling <see cref="TrySgdStep"/> per tensor. Nothing is updated unless every parameter and gradient is
+    /// GPU-resident, so a <c>false</c> leaves the whole list unchanged for the caller's CPU path.
+    /// </summary>
+    public static bool TrySgdStepMultiTensor(
+        IReadOnlyList<Tensor<float>> parameters, IReadOnlyList<Tensor<float>> gradients, float learningRate)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (parameters.Count != gradients.Count)
+            throw new ArgumentException("Every parameter needs a gradient.", nameof(gradients));
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return false;
+        var backend = gpuEngine.GetBackend();
+        if (backend is null) return false;
+
+        int n = parameters.Count;
+        var parameterBuffers = new IGpuBuffer[n];
+        var gradientBuffers = new IGpuBuffer[n];
+        var sizes = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            var param = parameters[i] ?? throw new ArgumentNullException(nameof(parameters));
+            var grad = gradients[i] ?? throw new ArgumentNullException(nameof(gradients));
+            if (param.Length != grad.Length)
+                throw new ArgumentException($"Parameter {i} and its gradient differ in length.", nameof(gradients));
+            var pBuf = param.TryGetGpuBuffer();
+            var gBuf = grad.TryGetGpuBuffer();
+            if (pBuf is null || gBuf is null) return false;
+            parameterBuffers[i] = pBuf;
+            gradientBuffers[i] = gBuf;
+            sizes[i] = param.Length;
+        }
+
+        if (backend is IMultiTensorGpuOptimizerBackend multiTensor)
+            multiTensor.SgdMultiTensorUpdate(parameterBuffers, gradientBuffers, sizes, learningRate, weightDecay: 0f);
+        else
+            for (int i = 0; i < n; i++)
+                backend.SgdUpdate(parameterBuffers[i], gradientBuffers[i], learningRate, weightDecay: 0f, sizes[i]);
+        for (int i = 0; i < n; i++)
+            MarkGpuUpdated(backend, parameters[i]);
+        return true;
+    }
+
+    /// <summary>
     /// Proximal gradient (ISTA) step with L1 soft-threshold prox, in place on the GPU.
     /// Returns false when param/grad aren't GPU-resident so the caller falls
     /// back to the CPU path.

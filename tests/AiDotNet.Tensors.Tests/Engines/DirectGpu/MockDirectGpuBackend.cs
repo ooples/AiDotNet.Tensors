@@ -273,6 +273,7 @@ public class MockDirectGpuBackend : DispatchProxy
             case "FtrlUpdate":
             case "AdamMultiTensorUpdate":
             case "AdamWMultiTensorUpdate":
+            case "SgdMultiTensorUpdate":
             case "SparseAdamUpdate":
             case "SparseAdamWUpdate":
             case "SparseSgdUpdate":

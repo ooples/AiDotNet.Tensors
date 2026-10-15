@@ -58,4 +58,16 @@ public interface IMultiTensorGpuOptimizerBackend : IDirectGpuBackend
         float epsilon,
         float weightDecay,
         int step);
+
+    /// <summary>
+    /// Plain SGD over a list of fp32 parameter tensors (PyTorch's <c>torch.optim.SGD</c> with <c>foreach</c>):
+    /// <c>grad += weightDecay * param; param -= learningRate * grad</c> for every element of every tensor, in place.
+    /// Matches <see cref="IDirectGpuBackend.SgdUpdate"/> applied per tensor, bit for bit.
+    /// </summary>
+    void SgdMultiTensorUpdate(
+        IReadOnlyList<IGpuBuffer> parameters,
+        IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<int> sizes,
+        float learningRate,
+        float weightDecay);
 }

@@ -152,6 +152,44 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_update(
 // gridDim.x = total chunks; blockDim.x = CHUNK (256). Math is identical to the
 // single-tensor adam_update / adamw_update kernels — this only changes launch
 // batching, so results match the per-tensor kernels bit-for-bit.
+// Multi-tensor plain SGD (torch.optim.SGD foreach): the tensor list travels in the kernel's parameter block, so a
+// launch needs no device-side table, allocation or upload. Up to SGD_MT_MAX tensors per launch; block b works on
+// tensor t where blockStart[t] <= b < blockStart[t + 1], SGD_MT_CHUNK elements per block. The arithmetic is
+// sgd_update's, so the result is bit-identical to one sgd_update launch per tensor.
+#define SGD_MT_MAX 48
+#define SGD_MT_CHUNK 1024
+struct SgdMultiTensorArgs
+{
+    unsigned long long param[SGD_MT_MAX];
+    unsigned long long grad[SGD_MT_MAX];
+    int size[SGD_MT_MAX];
+    int blockStart[SGD_MT_MAX + 1];
+    int count;
+};
+
+extern ""C"" __global__ __launch_bounds__(256) void sgd_multi_tensor_update(
+    SgdMultiTensorArgs a, float learningRate, float weightDecay)
+{
+    int b = blockIdx.x;
+    int t = 0;
+    while (t + 1 < a.count && a.blockStart[t + 1] <= b) t++;
+    float* __restrict__ param = (float*)a.param[t];
+    const float* __restrict__ gradient = (const float*)a.grad[t];
+    int size = a.size[t];
+    int base = (b - a.blockStart[t]) * SGD_MT_CHUNK + threadIdx.x;
+    #pragma unroll
+    for (int k = 0; k < SGD_MT_CHUNK / 256; k++)
+    {
+        int idx = base + k * 256;
+        if (idx >= size) return;
+        float grad = gradient[idx];
+        if (weightDecay > 0.0f) {
+            grad += weightDecay * param[idx];
+        }
+        param[idx] -= learningRate * grad;
+    }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update(
     const unsigned long long* __restrict__ paramPtrs,
     const unsigned long long* __restrict__ gradPtrs,
@@ -1160,6 +1198,7 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device
             "sgd_update",
             "adam_update",
             "adamw_update",
+            "sgd_multi_tensor_update",
             "adam_multi_tensor_update",
             "adamw_multi_tensor_update",
             "multi_tensor_sum_squares",

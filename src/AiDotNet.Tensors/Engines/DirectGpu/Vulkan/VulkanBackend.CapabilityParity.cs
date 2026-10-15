@@ -27,4 +27,9 @@ public sealed partial class VulkanBackend : ISeededGumbelSoftmaxBackend, IUninit
         float weightDecay, int step)
         => PerTensorMultiTensorOptimizer.Update(this, true, parameters, gradients, firstMoments, secondMoments,
             sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    public void SgdMultiTensorUpdate(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay)
+        => PerTensorMultiTensorOptimizer.Sgd(this, parameters, gradients, sizes, learningRate, weightDecay);
 }
