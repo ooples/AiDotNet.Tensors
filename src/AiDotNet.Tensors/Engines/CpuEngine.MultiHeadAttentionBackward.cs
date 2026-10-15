@@ -86,9 +86,9 @@ public partial class CpuEngine
 #if NET5_0_OR_GREATER
             if (MhaDirectHeads)
             {
-                float[] kTd = pool.Rent(sd), pd = pool.Rent(ss);
-                try { MhaForwardHeadsDirect(qkv, concat, lse, kTd, pd, chunk, chunks, bh, numHeads, seqLen, dHead, dModel, scale, mask); }
-                finally { pool.Return(kTd); pool.Return(pd); }
+                float[] kTd = pool.Rent(sd), pd = pool.Rent(ss), rowsd = pool.Rent(sd);
+                try { MhaForwardHeadsDirect(qkv, concat, lse, kTd, pd, rowsd, chunk, chunks, bh, numHeads, seqLen, dHead, dModel, scale, mask); }
+                finally { pool.Return(kTd); pool.Return(pd); pool.Return(rowsd); }
                 return;
             }
 #endif
@@ -173,15 +173,15 @@ public partial class CpuEngine
 #if NET5_0_OR_GREATER
                 if (MhaDirectHeads)
                 {
-                    float[] kTd = pool.Rent(sd), vTd = pool.Rent(sd), pd = pool.Rent(ss), pTd = pool.Rent(ss), dPd = pool.Rent(ss);
+                    float[] kTd = pool.Rent(sd), vTd = pool.Rent(sd), pd = pool.Rent(ss), pTd = pool.Rent(ss), dPd = pool.Rent(ss), rowsd = pool.Rent(sd);
                     try
                     {
-                        MhaBackwardHeadsDirect(st.Qkv, st.Concat, dConcat, dQkv, st.Lse, kTd, vTd, pd, pTd, dPd,
+                        MhaBackwardHeadsDirect(st.Qkv, st.Concat, dConcat, dQkv, st.Lse, kTd, vTd, pd, pTd, dPd, rowsd,
                             chunk, chunks, bh, heads, seq, dHead, dModel, scale, st.Mask);
                     }
                     finally
                     {
-                        pool.Return(kTd); pool.Return(vTd); pool.Return(pd); pool.Return(pTd); pool.Return(dPd);
+                        pool.Return(kTd); pool.Return(vTd); pool.Return(pd); pool.Return(pTd); pool.Return(dPd); pool.Return(rowsd);
                     }
                     return;
                 }

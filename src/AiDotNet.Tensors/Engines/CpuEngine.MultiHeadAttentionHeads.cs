@@ -20,18 +20,18 @@ public partial class CpuEngine
     private static bool MhaDirectHeads => Avx2.IsSupported && Fma.IsSupported;
 
     private static unsafe void MhaForwardHeadsDirect(
-        float[] qkv, float[] concat, float[] lse, float[] kTBuf, float[] pBuf, int chunk, int chunks,
+        float[] qkv, float[] concat, float[] lse, float[] kTBuf, float[] pBuf, float[] rowsBuf, int chunk, int chunks,
         int batchHeads, int numHeads, int seq, int dHead, int dModel, float scale, Tensor<bool>? mask)
     {
         int d3 = 3 * dModel;
-        fixed (float* pQkv = qkv, pCat = concat, kT = kTBuf, p = pBuf)
+        fixed (float* pQkv = qkv, pCat = concat, kT = kTBuf, p = pBuf, rowScratch = rowsBuf)
         {
             for (int s = chunk; s < batchHeads; s += chunks)
             {
                 int b = s / numHeads, h = s % numHeads;
                 long rowBase = (long)b * seq;
                 float* q = pQkv + rowBase * d3 + h * dHead, k = q + dModel, v = q + 2 * dModel;
-                TransposeRows(k, d3, seq, dHead, kT);
+                TransposeRows(k, d3, seq, dHead, kT, rowScratch);
                 SimdGemm.SgemmDirectSerialStrided(q, d3, kT, seq, p, seq, seq, dHead, seq);
                 if (mask is null) SoftmaxRowsVec(p, seq, scale, lse, s * seq);
                 else SoftmaxRowsExact(pBuf, seq, scale, mask, b, h, lse, s * seq);
@@ -42,12 +42,12 @@ public partial class CpuEngine
 
     private static unsafe void MhaBackwardHeadsDirect(
         float[] qkv, float[] concat, float[] dConcat, float[] dQkv, float[] lse,
-        float[] kTBuf, float[] vTBuf, float[] pBuf, float[] pTBuf, float[] dPBuf, int chunk, int chunks,
+        float[] kTBuf, float[] vTBuf, float[] pBuf, float[] pTBuf, float[] dPBuf, float[] rowsBuf, int chunk, int chunks,
         int batchHeads, int numHeads, int seq, int dHead, int dModel, float scale, Tensor<bool>? mask)
     {
         int d3 = 3 * dModel, ss = seq * seq;
         fixed (float* pQkv = qkv, pCat = concat, pDCat = dConcat, pDQkv = dQkv)
-        fixed (float* kT = kTBuf, vT = vTBuf, p = pBuf, pT = pTBuf, dP = dPBuf)
+        fixed (float* kT = kTBuf, vT = vTBuf, p = pBuf, pT = pTBuf, dP = dPBuf, rowScratch = rowsBuf)
         {
             for (int s = chunk; s < batchHeads; s += chunks)
             {
@@ -57,8 +57,8 @@ public partial class CpuEngine
                 float* o = pCat + rowBase * dModel + col, dO = pDCat + rowBase * dModel + col;
                 float* dq = pDQkv + rowBase * d3 + col, dk = dq + dModel, dv = dq + 2 * dModel;
 
-                TransposeRows(k, d3, seq, dHead, kT);
-                TransposeRows(v, d3, seq, dHead, vT);
+                TransposeRows(k, d3, seq, dHead, kT, rowScratch);
+                TransposeRows(v, d3, seq, dHead, vT, rowScratch);
                 SimdGemm.SgemmDirectSerialStrided(q, d3, kT, seq, p, seq, seq, dHead, seq);
                 if (mask is null) RecomputeRowsVec(p, seq, scale, lse, s * seq);
                 else RecomputeProbabilities(pBuf, seq, scale, mask, b, h, lse, s * seq);
@@ -83,14 +83,16 @@ public partial class CpuEngine
         }
     }
 
-    // dst [cols x rows] = src [rows x cols] read with row stride ld.
-    private static unsafe void TransposeRows(float* src, int ld, int rows, int cols, float* dst)
+    // dst [cols x rows] = src [rows x cols] read with row stride ld: each row is copied whole into the contiguous scratch
+    // (one cache line per row at dHead = 32) and the scratch transposed in 8x8 SIMD tiles. The column-strided scalar
+    // gather it replaces took ~17 us per head for Kᵀ and Vᵀ at 128 x 32. The transpose stays serial below its 64K-element
+    // parallel threshold, as it must inside a parallel task.
+    private static unsafe void TransposeRows(float* src, int ld, int rows, int cols, float* dst, float* scratch)
     {
+        long rowBytes = (long)cols * sizeof(float);
         for (int r = 0; r < rows; r++)
-        {
-            float* s = src + (long)r * ld;
-            for (int c = 0; c < cols; c++) dst[c * rows + r] = s[c];
-        }
+            Buffer.MemoryCopy(src + (long)r * ld, scratch + (long)r * cols, rowBytes, rowBytes);
+        SimdTranspose.Transpose(new ReadOnlySpan<float>(scratch, rows * cols), new Span<float>(dst, rows * cols), rows, cols);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
