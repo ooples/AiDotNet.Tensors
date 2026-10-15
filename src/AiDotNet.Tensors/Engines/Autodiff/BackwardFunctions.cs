@@ -735,6 +735,28 @@ internal static class BackwardFunctions<T>
     /// </summary>
     private static long MatMulBackwardSimdThreshold => SimdGemm.ParallelWorkThreshold;
 
+    // The two GEMMs of a 2-D matmul backward, Y[M,N] = X[M,K]·W[K,N]. SimdGemm.Sgemm carries the backward routes
+    // (large-K split for Xᵀ·dY, tall-M for dY·Wᵀ, the direct kernels) that the packed BlasManaged GEMM these used did
+    // not. Measured on a 3950X (ms, BlasManaged DisableAutotune vs SimdGemm): dX = dY·Wᵀ 1.55 vs 1.30, 4.26 vs 3.00,
+    // 2.77 vs 1.85 at M = 1024-4096, and never slower; dW = Xᵀ·dY 7.28 vs 2.43 at M = 4096, 2.52 vs 2.21 at 1024, but
+    // 0.35 vs 0.68 at M = 256, where the packed GEMM keeps it.
+    private const int BackwardWeightGradientSimdMinRows = 1024;
+
+    private static void BackwardGemmInputGradient(float[] dY, float[] w, float[] dX, int m, int k, int n)
+        => SimdGemm.Sgemm(dY.AsSpan(0, m * n), n, false, w.AsSpan(0, k * n), n, true, dX.AsSpan(0, m * k), m, n, k);
+
+    private static void BackwardGemmWeightGradient(float[] x, float[] dY, float[] dW, int m, int k, int n)
+    {
+        if (m >= BackwardWeightGradientSimdMinRows)
+        {
+            SimdGemm.Sgemm(x.AsSpan(0, m * k), k, true, dY.AsSpan(0, m * n), n, false, dW.AsSpan(0, k * n), k, m, n);
+            return;
+        }
+        Engines.BlasManaged.BlasManaged.Gemm<float>(
+            x, k, true, dY, n, false, dW.AsSpan(0, k * n), n, k, n, m,
+            new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+    }
+
     /// <summary>
     /// Whether a float32 matmul backward runs its GEMMs on <see cref="SimdGemm"/>: above
     /// <see cref="MatMulBackwardSimdThreshold"/>, or at any size when there is no native BLAS to prefer. Without
@@ -945,15 +967,9 @@ internal static class BackwardFunctions<T>
                                 // (each C element is one thread's full-K reduction).
                                 // gradA[Mflat,K] = dC[Mflat,N] · Bᵀ[N,K]. Contiguous leading-dim
                                 // collapse lets us treat the rank-3 input as rank-2 [Mflat,K].
-                                Engines.BlasManaged.BlasManaged.Gemm<float>(
-                                    dCArr, N, false, bArr, N, true,
-                                    gradAData.AsSpan(0, Mflat * K), K, Mflat, K, N,
-                                    new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+                                BackwardGemmInputGradient(dCArr, bArr, gradAData, Mflat, K, N);
                                 // gradB[K,N] = Aᵀ[K,Mflat] · dC[Mflat,N].
-                                Engines.BlasManaged.BlasManaged.Gemm<float>(
-                                    aArr, K, true, dCArr, N, false,
-                                    gradBData.AsSpan(0, K * N), N, K, N, Mflat,
-                                    new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+                                BackwardGemmWeightGradient(aArr, dCArr, gradBData, Mflat, K, N);
 
                                 DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
                                 DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
@@ -7166,10 +7182,6 @@ internal static class BackwardFunctions<T>
             var grad = (float[])(object)gradLease.Array;
             var input = (float[])(object)inputs[0].GetDataArray();
             var weight = (float[])(object)inputs[1].GetDataArray();
-            var options = new Engines.BlasManaged.BlasOptions<float>
-            {
-                PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune
-            };
 
             if (needsInputGradient)
             {
@@ -7178,10 +7190,7 @@ internal static class BackwardFunctions<T>
                     result.GetLiveBackingArrayAllowingPaddingOrNull()
                     ?? throw new InvalidOperationException(
                         "Selective linear backward requires writable contiguous CPU storage."));
-                Engines.BlasManaged.BlasManaged.Gemm<float>(
-                    grad, outputFeatures, false, weight, outputFeatures, true,
-                    data.AsSpan(0, rows * inputFeatures), inputFeatures,
-                    rows, inputFeatures, outputFeatures, options);
+                BackwardGemmInputGradient(grad, weight, data, rows, inputFeatures, outputFeatures);
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], result, engine);
             }
             if (needsWeightGradient)
@@ -7191,10 +7200,7 @@ internal static class BackwardFunctions<T>
                     result.GetLiveBackingArrayAllowingPaddingOrNull()
                     ?? throw new InvalidOperationException(
                         "Selective linear backward requires writable contiguous CPU storage."));
-                Engines.BlasManaged.BlasManaged.Gemm<float>(
-                    input, inputFeatures, true, grad, outputFeatures, false,
-                    data.AsSpan(0, inputFeatures * outputFeatures), outputFeatures,
-                    inputFeatures, outputFeatures, rows, options);
+                BackwardGemmWeightGradient(input, grad, data, rows, inputFeatures, outputFeatures);
                 DifferentiableOps.AccumulateGrad(grads, inputs[1], result, engine);
             }
             if (needsBiasGradient)

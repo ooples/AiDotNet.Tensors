@@ -99,6 +99,17 @@ public sealed class SimdGemmLargeKAndTallMTests
         AssertClose(Reference(a, false, b, transB, null, m, k, n), c, k, $"{m}x{k}x{n} transB={transB}");
     }
 
+    // A B past the tall-M route's cache-resident cap keeps the routes ahead of it: 2-4 MB of B ran 4-5x slower there.
+    [Theory]
+    [InlineData(1024, 512, 1024)]
+    [InlineData(1024, 1024, 512)]
+    [InlineData(2048, 1024, 1024)]
+    public void LargeB_DoesNotTakeTallM(int m, int k, int n)
+    {
+        Assert.False(SimdGemm.PrefersTallMForBigA(m, k, n));
+        Assert.False(SimdGemm.QualifiesForTallM(false, false, m, k, n));
+    }
+
     // A tall product with an A of 2 MB or more takes the tall-M route ahead of the column-panel route, at any K.
     [SkippableTheory]
     [InlineData(4096, 256, 768, false)]    // the fused attention's QKV projection

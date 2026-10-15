@@ -145,6 +145,13 @@ internal static partial class SimdGemm
     private const int TallMPanelN = 64;
     private const int TallMMinM = 1024;
     private const int TallMMaxK = 4096;
+
+    // Largest B (k x n floats) the tall-M route takes: each row block walks all of B, so it must stay cache-resident.
+    // Measured on a 3950X against the routes it displaces: B <= 768K floats won or tied ([4096x128]x[128x384] 0.39 vs
+    // 0.66 ms, [8192x512]x[512x512] 6.6 vs 8.6 ms; [4096x256]x[256x768] won inside the attention step), while
+    // 2-4 MB of B lost 4-5x ([1024x512]x[512x1024] 5.5 vs 1.3 ms, [1024x1024]x[1024x512] 6.1 vs 1.2 ms): an MLP
+    // training step with 1024-wide layers ran 1.1x slower than PyTorch through it.
+    private const long TallMMaxBFloats = 256L * 1024;
     // Below this K the small-K direct and JIT kernels win: dY·Woᵀ at K = 128 and 256 ran 0.26 -> 0.51 ms and 0.59 -> 0.80 ms here.
     private const int TallMMinK = 384;
 
@@ -161,7 +168,7 @@ internal static partial class SimdGemm
     {
 #if NET5_0_OR_GREATER
         return UseTallM && Avx2.IsSupported && Fma.IsSupported
-            && m >= TallMMinM && n >= Nr && k <= TallMMaxK
+            && m >= TallMMinM && n >= Nr && k <= TallMMaxK && (long)k * n <= TallMMaxBFloats
             && (long)m * k * sizeof(float) >= TallMBigABytes
             && (long)m * k * n >= ParallelWorkThreshold;
 #else
@@ -173,7 +180,7 @@ internal static partial class SimdGemm
     {
 #if NET5_0_OR_GREATER
         return UseTallM && !transA && !transB && Avx2.IsSupported && Fma.IsSupported
-            && m >= TallMMinM && n >= Nr && k <= TallMMaxK
+            && m >= TallMMinM && n >= Nr && k <= TallMMaxK && (long)k * n <= TallMMaxBFloats
             && k >= TallMMinK
             && (long)m * k * n >= ParallelWorkThreshold;
 #else
