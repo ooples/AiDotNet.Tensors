@@ -213,7 +213,7 @@ internal sealed class PtxCsrSpMMF32Kernel : IDisposable
                 MaxRegistersPerThread: 40,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 1536 / blockThreads),
+                MinBlocksPerMultiprocessor: Math.Min(16, 1536 / blockThreads)),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "output[i,:] = sum over p in [row_ptr[i], row_ptr[i+1]) of values[p] * dense[col_idx[p],:]",
@@ -246,8 +246,9 @@ internal sealed class PtxCsrSpMMF32Kernel : IDisposable
             throw new ArgumentOutOfRangeException(nameof(rows),
                 "The first CSR SpMM family supports exact (M, K, N) cells (2708,2708,64), (19717,500,128), " +
                 "(10000,10000,32) and (512,512,64).");
-        if (blockThreads is not (128 or 256 or 512))
-            throw new ArgumentOutOfRangeException(nameof(blockThreads), "CSR SpMM block threads must be 128, 256 or 512.");
+        if (blockThreads is not (64 or 128 or 256 or 512) || blockThreads < columns / 4)
+            throw new ArgumentOutOfRangeException(nameof(blockThreads),
+                "CSR SpMM block threads must be 64, 128, 256 or 512 and hold at least one row.");
     }
 
     private static int Log2(int value)

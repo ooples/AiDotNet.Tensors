@@ -108,7 +108,7 @@ public class DirectPtxCsrSpMMTests
         // The NVRTC kernel the PTX ports, on the same data.
         float[] nvrtc = SpMMCsr.RunNvrtc(backend, csr);
         for (int i = 0; i < actual.Length; i++)
-            Assert.True(BitConverter.SingleToInt32Bits(actual[i]) == BitConverter.SingleToInt32Bits(nvrtc[i]),
+            Assert.True(Bits(actual[i]) == Bits(nvrtc[i]),
                 $"[{i}] PTX {actual[i]:R} vs NVRTC {nvrtc[i]:R}");
 
         // And a float64 oracle.
@@ -160,6 +160,8 @@ public class DirectPtxCsrSpMMTests
         Skip.IfNot(DirectPtxArchitecture.HasValidatedCsrSpMM(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor),
             "SM86 only.");
         using var kernel = new PtxCsrSpMMF32Kernel(runtime, rows, inner, columns);
+        using var kernel128 = new PtxCsrSpMMF32Kernel(runtime, rows, inner, columns, 128);
+        using var kernel64 = new PtxCsrSpMMF32Kernel(runtime, rows, inner, columns, 64);
         var csr = SpMMCsr.Build(rows, inner, columns, density, seed: rows + columns);
         using var ptx = SpMMCsr.Upload(runtime, kernel, csr);
         using var nv = SpMMCsr.UploadBackend(backend, csr);
@@ -168,6 +170,8 @@ public class DirectPtxCsrSpMMTests
         var arms = new List<(string Name, Action Launch, Action Sync)>
         {
             ("ptx", () => kernel.Launch(ptx.RowPointers, ptx.ColumnIndices, ptx.Values, ptx.Dense, ptx.Output, csr.Nonzeros), runtime.Synchronize),
+            ("ptx-b128", () => kernel128.Launch(ptx.RowPointers, ptx.ColumnIndices, ptx.Values, ptx.Dense, ptx.Output, csr.Nonzeros), runtime.Synchronize),
+            ("ptx-b64", () => kernel64.Launch(ptx.RowPointers, ptx.ColumnIndices, ptx.Values, ptx.Dense, ptx.Output, csr.Nonzeros), runtime.Synchronize),
             ("nvrtc-vec4", () => backend.CsrSpMMVec4(nv.Values, nv.ColumnIndices, nv.RowPointers, nv.Dense, nv.Output, rows, inner, columns, csr.Nonzeros), backend.Synchronize),
         };
         if (columns <= 64)
@@ -194,10 +198,14 @@ public class DirectPtxCsrSpMMTests
             var sorted = samples[a].OrderBy(x => x).ToArray();
             double median = sorted[Samples / 2], p95 = sorted[(int)(0.95 * (Samples - 1))], p99 = sorted[(int)(0.99 * (Samples - 1))];
             _out.WriteLine($"{arms[a].Name,-12}{median,11:F2}{p95,9:F2}{p99,9:F2}{sorted.Average(),9:F2}{flop / (median * 1e3),9:F1}");
-            if (a == 0) ptxMedian = median; else bestOther = Math.Min(bestOther, median);
+            if (arms[a].Name.StartsWith("ptx", StringComparison.Ordinal)) ptxMedian = ptxMedian == 0 ? median : Math.Min(ptxMedian, median);
+            else bestOther = Math.Min(bestOther, median);
         }
-        _out.WriteLine($"=> ptx speedup over the fastest NVRTC arm: {bestOther / ptxMedian:F2}x");
+        _out.WriteLine($"=> fastest ptx block size vs the fastest NVRTC arm: {bestOther / ptxMedian:F2}x");
     }
+
+    // BitConverter.SingleToInt32Bits is not on net462/net471.
+    private static int Bits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
 
     private static int Count(string text, string value)
     {
