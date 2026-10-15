@@ -116,11 +116,13 @@ public sealed class SimdGemmLargeKAndTallMTests
         Assert.Equal(before + 1, SimdGemm.TallMRunsOnThisThread);
         AssertClose(Reference(a, false, b, transB, null, m, k, n), c, k, $"{m}x{k}x{n} transB={transB}");
     }
+    // Every budget, one thread included, must give the same bits, and each run must take one of the new routes.
     [SkippableTheory]
-    [InlineData(256, 4096, 768, true, false)]
-    [InlineData(70, 3001, 300, false, false)]
-    [InlineData(4096, 768, 256, false, true)]
-    public void NewRoutes_AreBitIdentical_AcrossThreadBudgetsAndSerial(int m, int k, int n, bool transA, bool transB)
+    [InlineData(256, 4096, 768, true, false)]    // large-K, A stored transposed
+    [InlineData(70, 3001, 300, false, false)]    // large-K
+    [InlineData(4096, 768, 256, false, true)]    // tall-M, B transposed once
+    [InlineData(4096, 768, 256, false, false)]   // tall-M
+    public void NewRoutes_AreBitIdentical_AcrossThreadBudgets(int m, int k, int n, bool transA, bool transB)
     {
         Skip.IfNot(RoutesAvailable, NoRoutes);
         int lda = transA ? m : k, ldb = transB ? k : n;
@@ -132,12 +134,14 @@ public sealed class SimdGemmLargeKAndTallMTests
             float[] Run(int threads)
             {
                 CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                int routesBefore = SimdGemm.LargeKRunsOnThisThread + SimdGemm.TallMRunsOnThisThread;
                 var c = new float[m * n];
                 SimdGemm.Sgemm(a, lda, transA, b, ldb, transB, c, m, k, n);
+                Assert.Equal(routesBefore + 1, SimdGemm.LargeKRunsOnThisThread + SimdGemm.TallMRunsOnThisThread);
                 return c;
             }
-            var baseline = Run(saved);
-            foreach (int threads in new[] { 2, 4, 7, 16 })
+            var baseline = Run(16);
+            foreach (int threads in new[] { 1, 2, 4, 7 })
             {
                 var other = Run(threads);
                 for (int i = 0; i < baseline.Length; i++)
@@ -148,18 +152,25 @@ public sealed class SimdGemmLargeKAndTallMTests
         {
             CpuParallelSettings.MaxDegreeOfParallelism = saved;
         }
-        if (!transB)
-        {
-            // The serial entry point (used inside parallel regions) must take the same route in the same order.
-            var serial = new float[m * n];
-            var reference = new float[m * n];
-            SimdGemm.Sgemm(a, lda, transA, b, ldb, false, reference, m, k, n);
-            if (!transA)
-            {
-                SimdGemm.SgemmSequential(a, b, serial, m, k, n);
-                for (int i = 0; i < reference.Length; i++)
-                    Assert.True(Bits(reference[i]) == Bits(serial[i]), $"serial [{i}]: {serial[i]:R} vs {reference[i]:R}");
-            }
-        }
+    }
+
+    // SgemmSequential (the entry point used inside parallel regions; untransposed operands only) must take the same
+    // route in the same order as the parallel Sgemm.
+    [SkippableTheory]
+    [InlineData(70, 3001, 300)]      // large-K
+    [InlineData(4096, 768, 256)]     // tall-M
+    public void NewRoutes_SequentialEntryPoint_IsBitIdentical(int m, int k, int n)
+    {
+        Skip.IfNot(RoutesAvailable, NoRoutes);
+        var a = Fill(m * k, 41);
+        var b = Fill(k * n, 43);
+        var parallel = new float[m * n];
+        SimdGemm.Sgemm(a, k, false, b, n, false, parallel, m, k, n);
+        int routesBefore = SimdGemm.LargeKRunsOnThisThread + SimdGemm.TallMRunsOnThisThread;
+        var serial = new float[m * n];
+        SimdGemm.SgemmSequential(a, b, serial, m, k, n);
+        Assert.Equal(routesBefore + 1, SimdGemm.LargeKRunsOnThisThread + SimdGemm.TallMRunsOnThisThread);
+        for (int i = 0; i < parallel.Length; i++)
+            Assert.True(Bits(parallel[i]) == Bits(serial[i]), $"serial [{i}]: {serial[i]:R} vs {parallel[i]:R}");
     }
 }
