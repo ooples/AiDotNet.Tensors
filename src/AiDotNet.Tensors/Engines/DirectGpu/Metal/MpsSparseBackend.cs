@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 /// <summary>
 /// Metal Performance Shaders sparse adapter — Apple Silicon /
-/// Metal-compatible-GPU equivalent of <see cref="CUDA.CuSparseBackend"/>.
+/// Metal-compatible GPUs (the role CudaSparseBackend plays on NVIDIA).
 /// Routes through the Objective-C runtime to call
 /// <c>MPSMatrixVectorMultiplication</c> and the sparse-matrix
 /// descriptors that ship with macOS 13+ MPS.

@@ -3,13 +3,11 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// Raw P/Invoke bindings into <c>libcusparse</c>. Surfaces SpMM, SpMV,
-/// and SpGEMM entry points. Cached <see cref="IsAvailable"/> probe so
-/// callers can fall through to a CPU CSR implementation when the native
-/// lib is missing.
+/// Raw P/Invoke bindings into <c>libcusparse</c>, kept only as the baseline <see cref="GpuSpMMResidentBench"/> times
+/// the managed CSR kernels against (#515). The library itself no longer depends on cuSPARSE.
 /// </summary>
 internal static class CuSparseNative
 {

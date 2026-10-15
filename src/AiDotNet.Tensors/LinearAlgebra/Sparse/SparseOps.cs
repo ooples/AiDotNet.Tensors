@@ -69,11 +69,9 @@ public static class SparseOps
             // they save in compute.
             if (rows * (long)n >= GpuDispatchThreshold)
             {
-                // #515 (P6): AiDotNet's own managed CSR-SpMM CUDA kernel is the
-                // default GPU path — it needs only the CUDA driver, removing the
-                // native cuSPARSE dependency. The vendor backends (cuSPARSE /
-                // rocSPARSE / MPS) stay as availability fallbacks until the custom
-                // HIP/Metal mirrors + FP64 + the perf bar land (tracked in #515).
+                // #515: AiDotNet's own managed CSR-SpMM CUDA kernel is the GPU path on NVIDIA. It needs only the
+                // CUDA driver; cuSPARSE was removed after the managed kernels beat it on every catalog shape
+                // (SpecializedPerfBar.GpuSpMM*). rocSPARSE and MPS stay as availability fallbacks.
                 if (CudaSparseBackend.IsAvailable)
                     outArr = CudaSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 // The managed HIP kernels, same role on AMD. IsAvailable is kernel-load strict: it builds the shared HIP
@@ -81,8 +79,6 @@ public static class SparseOps
                 // build for its arch falls through to the vendor / Vulkan / CPU tiers instead of failing here.
                 else if (HipCustomSparseBackend.IsAvailable)
                     outArr = HipCustomSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
-                else if (CuSparseBackend.IsAvailable)
-                    outArr = CuSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (HipSparseBackend.IsAvailable)
                     outArr = HipSparseBackend.SpMM(rowPtr, colIdx, valsArr, bArr, rows, k, n);
                 else if (MpsSparseBackend.IsAvailable)
