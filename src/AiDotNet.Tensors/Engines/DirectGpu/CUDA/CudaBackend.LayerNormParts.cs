@@ -40,7 +40,7 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         if (!IsAvailable || outer <= 0 || reduced <= 0 || inner <= 0 || g.Size < (long)outer * inner
             || output.Size < total || output.Handle == g.Handle
             || ((g.Handle.ToInt64() | output.Handle.ToInt64()) & 15) != 0
-            || !_kernelCache.TryGetValue("broadcast_reduced_middle", out var kernel))
+            || !_kernelCache.TryGetValue("broadcast_reduced_middle", out var broadcastKernel))
             return false;
         using var _ = PushContext();
         IntPtr gp = g.Handle, op = output.Handle;
@@ -50,7 +50,7 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         args[0] = &gp; args[1] = &op; args[2] = &o; args[3] = &r; args[4] = &i; args[5] = &sc; args[6] = &ad;
         long work = (inner & 3) == 0 ? total / 4 : total;
         uint blocks = (uint)Math.Min(65535L, Math.Max(1L, (work + DefaultBlockSize - 1) / DefaultBlockSize));
-        LaunchKernel(kernel, blocks, DefaultBlockSize, args);
+        LaunchKernel(broadcastKernel, blocks, DefaultBlockSize, args);
         return true;
     }
     // Chunks of rows for the affine-gradient reduction: enough blocks (~128 with the column tiles) to occupy the
@@ -70,7 +70,7 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         int rows, float epsilon)
     {
         if (!IsAvailable || rows <= 0 || variance.Size < rows || inverseStd.Size < rows
-            || !_kernelCache.TryGetValue("layernorm_inverse_std", out var kernel))
+            || !_kernelCache.TryGetValue("layernorm_inverse_std", out var inverseStdKernel))
             return false;
         using var _ = PushContext();
         IntPtr v = variance.Handle, s = inverseStd.Handle;
@@ -78,14 +78,14 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         float eps = epsilon;
         void** args = stackalloc void*[4];
         args[0] = &v; args[1] = &s; args[2] = &n; args[3] = &eps;
-        LaunchKernel(kernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        LaunchKernel(inverseStdKernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
         return true;
     }
 
     unsafe bool ILayerNormBackwardPartsBackend.TryLayerNormVarianceFromInverseStd(IGpuBuffer values, int rows, float epsilon)
     {
         if (!IsAvailable || rows <= 0 || values.Size < rows
-            || !_kernelCache.TryGetValue("layernorm_variance_from_inverse_std", out var kernel))
+            || !_kernelCache.TryGetValue("layernorm_variance_from_inverse_std", out var varianceKernel))
             return false;
         using var _ = PushContext();
         IntPtr v = values.Handle;
@@ -93,7 +93,7 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         float eps = epsilon;
         void** args = stackalloc void*[3];
         args[0] = &v; args[1] = &n; args[2] = &eps;
-        LaunchKernel(kernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+        LaunchKernel(varianceKernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
         return true;
     }
 
@@ -121,7 +121,7 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         long n = (long)rows * cols;
         if (!IsAvailable || rows <= 0 || cols <= 0 || gradOutput.Size < n || input.Size < n || gradInput.Size < n
             || gamma.Size < cols || mean.Size < rows || inverseStd.Size < rows
-            || !_kernelCache.TryGetValue("layernorm_input_grad_add", out var kernel))
+            || !_kernelCache.TryGetValue("layernorm_input_grad_add", out var addKernel))
             return false;
         using var _ = PushContext();
         IntPtr g = gradOutput.Handle, x = input.Handle, ga = gamma.Handle, mu = mean.Handle, inv = inverseStd.Handle,
@@ -130,7 +130,7 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         void** args = stackalloc void*[8];
         args[0] = &g; args[1] = &x; args[2] = &ga; args[3] = &mu; args[4] = &inv; args[5] = &dx; args[6] = &r; args[7] = &cl;
         // One warp per row: 8 rows per 256-thread block.
-        LaunchKernel(kernel, (uint)((rows + 7) / 8), DefaultBlockSize, args);
+        LaunchKernel(addKernel, (uint)((rows + 7) / 8), DefaultBlockSize, args);
         return true;
     }
     unsafe bool ILayerNormBackwardPartsBackend.TryLayerNormAffineGradients(IGpuBuffer gradOutput, IGpuBuffer input,
