@@ -325,10 +325,21 @@ public partial class CpuEngine
         int G = 4 * hidden;
 
         // Operands every chunk shares (read-only inside the region): WIhᵀ [in, G], WHhᵀ [hidden, G] and bIh + bHh.
+#if NET5_0_OR_GREATER
         // SIMD tile transposes (parallel past their threshold): the scalar column-strided loops they replace re-read the
         // weights every step, ~10% of a 64x32x128x256 training step.
         SimdTranspose.Transpose(wIhArr.AsSpan(0, G * inFeatures), ws.WIhT.AsSpan(0, inFeatures * G), G, inFeatures);
         SimdTranspose.Transpose(wHhArr.AsSpan(0, G * hidden), ws.WHhT.AsSpan(0, hidden * G), G, hidden);
+#else
+        var wIhT = ws.WIhT;
+        for (int g = 0; g < G; g++)
+            for (int i = 0; i < inFeatures; i++)
+                wIhT[i * G + g] = wIhArr[g * inFeatures + i];
+        var wHhT = ws.WHhT;
+        for (int g = 0; g < G; g++)
+            for (int h = 0; h < hidden; h++)
+                wHhT[h * G + g] = wHhArr[g * hidden + h];
+#endif
         var bias = ws.Bias;
         for (int g = 0; g < G; g++)
             bias[g] = (bIhArr is null ? 0f : bIhArr[g]) + (bHhArr is null ? 0f : bHhArr[g]);

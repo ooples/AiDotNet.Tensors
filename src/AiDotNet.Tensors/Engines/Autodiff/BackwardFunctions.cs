@@ -764,6 +764,7 @@ internal static class BackwardFunctions<T>
 
     private static void BackwardGemmWeightGradient(float[] x, float[] dY, float[] dW, int m, int k, int n)
     {
+#if NET5_0_OR_GREATER
         if (n <= BackwardNarrowWeightGradientMaxN && (long)m * k * n <= BackwardNarrowWeightGradientMaxWork)
         {
             var pool = System.Buffers.ArrayPool<float>.Shared;
@@ -781,6 +782,7 @@ internal static class BackwardFunctions<T>
             }
             return;
         }
+#endif
         if (SimdGemm.QualifiesForLargeK(transA: true, transB: false, lda: k, m: k, k: m, n: n))
         {
             SimdGemm.Sgemm(x.AsSpan(0, m * k), k, true, dY.AsSpan(0, m * n), n, false, dW.AsSpan(0, k * n), k, m, n);
