@@ -78,6 +78,13 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The FP32 CSR SpMM specialization (issue #852) is measured only on GA102/SM86; other architectures fail closed
+    /// to the NVRTC sparse kernels.
+    /// </summary>
+    internal static bool HasValidatedCsrSpMM(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The index-select specialization is measured only on GA102/SM86. It is a
     /// separate predicate from the gather one because the two ops have
     /// different index dtypes and are promoted independently.
