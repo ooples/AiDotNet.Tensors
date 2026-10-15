@@ -1018,7 +1018,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (aliasedInputs == step.Inputs.Length)
                 (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
         }
-        if (staticReverseBackward)
+        // Only where the step is captured into a device graph (CUDA): the pass exists to cut that graph's copy nodes, and
+        // on Vulkan, which replays no graph, merged multi-consumer gradients gave the permute and spectral (RFFT/IRFFT)
+        // ops a wrong first-step gradient in CompiledTrainingOpStalenessProbeTests while the per-tensor buffers do not.
+        if (staticReverseBackward && (engine as Engines.DirectGpuTensorEngine)?.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
             AliasMultiConsumerPassThroughs(forwardSteps, parameterSet, device, gradMap, dropped, rootOf, ref deviceAliases);
         if (dropped.Count > 0)
             allGrads.RemoveAll(g => dropped.Contains(g));
