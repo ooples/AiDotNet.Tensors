@@ -458,7 +458,8 @@ internal enum DirectPtxPhysicalType
     BFloat16,
     Float32,
     Int32,
-    UInt8
+    UInt8,
+    Float64
 }
 
 internal enum DirectPtxPhysicalLayout
@@ -689,6 +690,7 @@ internal readonly struct DirectPtxTensorView
             DirectPtxPhysicalType.BFloat16 => 2,
             DirectPtxPhysicalType.Float32 => 4,
             DirectPtxPhysicalType.Int32 => 4,
+            DirectPtxPhysicalType.Float64 => 8,
             _ => throw new ArgumentOutOfRangeException(
                 nameof(physicalType), physicalType, "Unsupported direct-PTX physical type.")
         };

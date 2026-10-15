@@ -777,7 +777,8 @@ internal sealed class DirectPtxModule : IDisposable
         uint gridX, uint gridY, uint gridZ,
         uint blockX, uint blockY, uint blockZ,
         uint sharedMemoryBytes,
-        void** arguments)
+        void** arguments,
+        IntPtr stream = default)
     {
         // CUDA requires a per-function opt-in above the portable 48 KiB default.
         // Keep this at the common launch boundary so an emitter cannot expose a
@@ -788,7 +789,7 @@ internal sealed class DirectPtxModule : IDisposable
         using var _ = _runtime.Enter();
         LaunchCurrentContext(
             function, gridX, gridY, gridZ, blockX, blockY, blockZ,
-            sharedMemoryBytes, arguments);
+            sharedMemoryBytes, arguments, stream);
     }
 
     /// <summary>
@@ -802,7 +803,8 @@ internal sealed class DirectPtxModule : IDisposable
         uint gridX, uint gridY, uint gridZ,
         uint blockX, uint blockY, uint blockZ,
         uint sharedMemoryBytes,
-        void** arguments)
+        void** arguments,
+        IntPtr stream = default)
     {
         PtxCompat.ThrowIfDisposed(_module == IntPtr.Zero, this);
         DirectPtxRuntime.Check(
@@ -811,7 +813,8 @@ internal sealed class DirectPtxModule : IDisposable
                 gridX, gridY, gridZ,
                 blockX, blockY, blockZ,
                 sharedMemoryBytes,
-                _runtime.Stream,
+                // Zero: the runtime's stream (the backend's compute or capture stream); else the caller's stream.
+                stream == IntPtr.Zero ? _runtime.Stream : stream,
                 (IntPtr)arguments,
                 IntPtr.Zero),
             "cuLaunchKernel(PTX)");

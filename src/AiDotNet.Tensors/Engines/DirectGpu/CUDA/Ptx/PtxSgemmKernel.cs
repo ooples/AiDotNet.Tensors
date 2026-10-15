@@ -14,17 +14,21 @@ internal sealed class PtxSgemmKernel : IDisposable
 
     internal PtxGemmConfiguration Configuration { get; }
     internal PtxGemmLayout Layout { get; }
+    internal PtxGemmPrecision Precision { get; }
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
 
-    internal PtxSgemmKernel(DirectPtxRuntime runtime, PtxGemmConfiguration configuration, PtxGemmLayout layout)
+    internal PtxSgemmKernel(DirectPtxRuntime runtime, PtxGemmConfiguration configuration, PtxGemmLayout layout,
+        PtxGemmPrecision precision = PtxGemmPrecision.Fp32)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         Configuration = configuration;
         Layout = layout;
-        Ptx = PtxSgemmGenerator.Emit(configuration, layout, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, configuration, layout);
+        Precision = precision;
+        Ptx = PtxSgemmGenerator.Emit(configuration, layout, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
+            precision);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, configuration, layout, precision);
         DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
             runtime, Ptx, PtxSgemmGenerator.EntryPoint, configuration.Threads, Blueprint);
         _module = loaded.Module;
@@ -35,16 +39,41 @@ internal sealed class PtxSgemmKernel : IDisposable
     /// <summary>
     /// <c>C = alpha * op(A) @ op(B) + beta * C</c> for <paramref name="batch"/> problems; pointers are device addresses
     /// of the first problem, strides are in elements. Throws when this configuration does not admit the problem.
+    /// <paramref name="stream"/> zero launches on the runtime's stream. FP64 kernels launch through
+    /// <see cref="LaunchDouble"/>.
     /// </summary>
     internal unsafe void Launch(IntPtr a, IntPtr b, IntPtr c, int m, int n, int k, int lda, int ldb, int ldc,
-        float alpha, float beta, int batch = 1, long strideA = 0, long strideB = 0, long strideC = 0)
+        float alpha, float beta, int batch = 1, long strideA = 0, long strideB = 0, long strideC = 0,
+        IntPtr stream = default)
+    {
+        if (Precision == PtxGemmPrecision.Fp64) throw new InvalidOperationException("An FP64 GEMM launches with LaunchDouble.");
+        Validate(a, b, c, m, n, k, lda, ldb, ldc, batch, strideA, strideB, strideC);
+        LaunchCore(a, b, c, m, n, k, lda, ldb, ldc, &alpha, &beta, batch, strideA, strideB, strideC, stream);
+    }
+
+    /// <summary>The FP64 kernel's launch: as <see cref="Launch"/>, with FP64 scalars.</summary>
+    internal unsafe void LaunchDouble(IntPtr a, IntPtr b, IntPtr c, int m, int n, int k, int lda, int ldb, int ldc,
+        double alpha, double beta, int batch = 1, long strideA = 0, long strideB = 0, long strideC = 0,
+        IntPtr stream = default)
+    {
+        if (Precision != PtxGemmPrecision.Fp64) throw new InvalidOperationException("Only an FP64 GEMM launches with LaunchDouble.");
+        Validate(a, b, c, m, n, k, lda, ldb, ldc, batch, strideA, strideB, strideC);
+        LaunchCore(a, b, c, m, n, k, lda, ldb, ldc, &alpha, &beta, batch, strideA, strideB, strideC, stream);
+    }
+
+    private void Validate(IntPtr a, IntPtr b, IntPtr c, int m, int n, int k, int lda, int ldb, int ldc, int batch,
+        long strideA, long strideB, long strideC)
     {
         if (batch < 1 || batch > 65535) throw new ArgumentOutOfRangeException(nameof(batch));
-        if (!PtxSgemmGenerator.Admits(Configuration, Layout, m, n, k, lda, ldb, ldc, strideA, strideB, strideC))
+        if (!PtxSgemmGenerator.Admits(Configuration, Layout, m, n, k, lda, ldb, ldc, strideA, strideB, strideC, Precision))
             throw new ArgumentException($"GEMM configuration {Configuration.Name} ({Layout.Name}) does not admit M={m} N={n} K={k}.");
         if (Configuration.VectorWidth == 4 && (((long)a | (long)b | (long)c) & 15) != 0)
             throw new ArgumentException("A 16-byte vector configuration needs 16-byte-aligned operands.");
+    }
 
+    private unsafe void LaunchCore(IntPtr a, IntPtr b, IntPtr c, int m, int n, int k, int lda, int ldb, int ldc,
+        void* alpha, void* beta, int batch, long strideA, long strideB, long strideC, IntPtr stream)
+    {
         ulong aPointer = (ulong)a, bPointer = (ulong)b, cPointer = (ulong)c;
         uint mu = (uint)m, nu = (uint)n, ku = (uint)k, ldau = (uint)lda, ldbu = (uint)ldb, ldcu = (uint)ldc;
         ulong sa = (ulong)strideA, sb = (ulong)strideB, sc = (ulong)strideC;
@@ -58,43 +87,55 @@ internal sealed class PtxSgemmKernel : IDisposable
         arguments[6] = &ldau;
         arguments[7] = &ldbu;
         arguments[8] = &ldcu;
-        arguments[9] = &alpha;
-        arguments[10] = &beta;
+        arguments[9] = alpha;
+        arguments[10] = beta;
         arguments[11] = &sa;
         arguments[12] = &sb;
         arguments[13] = &sc;
         uint gridX = (uint)((n + Configuration.BlockN - 1) / Configuration.BlockN);
         uint gridY = (uint)((m + Configuration.BlockM - 1) / Configuration.BlockM);
         uint dynamicShared = Configuration.IsAsync ? (uint)Configuration.SharedBytes : 0;
-        _module.Launch(_function, gridX, gridY, (uint)batch, (uint)Configuration.Threads, 1, 1, dynamicShared, arguments);
+        _module.Launch(_function, gridX, gridY, (uint)batch, (uint)Configuration.Threads, 1, 1, dynamicShared, arguments, stream);
     }
 
     public void Dispose() => _module.Dispose();
 
     private static DirectPtxKernelBlueprint CreateBlueprint(DirectPtxArchitectureFamily architecture,
-        PtxGemmConfiguration configuration, PtxGemmLayout layout)
+        PtxGemmConfiguration configuration, PtxGemmLayout layout, PtxGemmPrecision precision)
     {
+        DirectPtxPhysicalType operandType = precision switch
+        {
+            PtxGemmPrecision.Fp16InFp32Out or PtxGemmPrecision.Fp16InFp16Out => DirectPtxPhysicalType.Float16,
+            PtxGemmPrecision.Fp64 => DirectPtxPhysicalType.Float64,
+            _ => DirectPtxPhysicalType.Float32,
+        };
+        DirectPtxPhysicalType outputType = precision switch
+        {
+            PtxGemmPrecision.Fp16InFp16Out => DirectPtxPhysicalType.Float16,
+            PtxGemmPrecision.Fp64 => DirectPtxPhysicalType.Float64,
+            _ => DirectPtxPhysicalType.Float32,
+        };
         // Any shape: the tensors declare a 1 x 1 lower bound and Launch checks the real problem.
         var any = new DirectPtxExtent(1, 1);
         return new DirectPtxKernelBlueprint(
             Operation: "sgemm",
             Version: 1,
             Architecture: architecture,
-            Variant: configuration.Name + "-" + layout.Name,
+            Variant: configuration.Name + "-" + layout.Name + (precision == PtxGemmPrecision.Fp32 ? "" : "-" + precision),
             Tensors:
             [
-                new("a", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
-                    any, any, configuration.VectorWidth * sizeof(float), DirectPtxTensorAccess.Read, DirectPtxExtentMode.AtLeast),
-                new("b", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
-                    any, any, configuration.VectorWidth * sizeof(float), DirectPtxTensorAccess.Read, DirectPtxExtentMode.AtLeast),
-                new("c", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.RowMajor2D,
-                    any, any, configuration.VectorWidth * sizeof(float), DirectPtxTensorAccess.Read | DirectPtxTensorAccess.Write,
+                new("a", operandType, DirectPtxPhysicalLayout.RowMajor2D,
+                    any, any, configuration.VectorWidth * precision.OperandBytes(), DirectPtxTensorAccess.Read, DirectPtxExtentMode.AtLeast),
+                new("b", operandType, DirectPtxPhysicalLayout.RowMajor2D,
+                    any, any, configuration.VectorWidth * precision.OperandBytes(), DirectPtxTensorAccess.Read, DirectPtxExtentMode.AtLeast),
+                new("c", outputType, DirectPtxPhysicalLayout.RowMajor2D,
+                    any, any, configuration.VectorWidth * precision.OutputBytes(), DirectPtxTensorAccess.Read | DirectPtxTensorAccess.Write,
                     DirectPtxExtentMode.AtLeast),
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 255,
                 // A cp.async kernel's stages are dynamic shared memory (sized per launch), so its static budget is zero.
-                MaxStaticSharedBytes: configuration.IsAsync ? 0 : configuration.SharedBytes,
+                MaxStaticSharedBytes: configuration.IsAsync ? 0 : precision.SharedBytes(configuration),
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
@@ -102,6 +143,7 @@ internal sealed class PtxSgemmKernel : IDisposable
                 ["formula"] = "C = alpha * op(A) @ op(B) + beta * C, batched over grid z",
                 ["configuration"] = configuration.Name,
                 ["layout"] = layout.Name,
+                ["precision"] = precision.ToString(),
                 ["edges"] = configuration.IsAsync
                     ? "cp.async zero-fill outside the matrix; out-of-range stores skipped"
                     : "predicated: out-of-range loads read zero, out-of-range stores skipped",

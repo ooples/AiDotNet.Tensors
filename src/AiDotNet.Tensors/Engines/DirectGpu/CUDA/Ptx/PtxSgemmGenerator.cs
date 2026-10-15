@@ -120,6 +120,58 @@ internal readonly record struct PtxGemmConfiguration(
     }
 }
 
+/// <summary>
+/// Operand, output and arithmetic types of a generated GEMM (#1265: the cuBLAS-free fallback covers every cuBLAS GEMM the
+/// backend issues). FP32 is the tuned path; the others are register-staged with scalar global loads. FP16 operands are
+/// widened to FP32 on load and accumulate in FP32 (cuBLAS's <c>CUBLAS_COMPUTE_32F</c>), FP64 runs entirely in FP64.
+/// </summary>
+internal enum PtxGemmPrecision
+{
+    /// <summary>FP32 operands, FP32 output, FP32 arithmetic.</summary>
+    Fp32 = 0,
+    /// <summary>FP16 operands, FP32 output, FP32 arithmetic.</summary>
+    Fp16InFp32Out = 1,
+    /// <summary>FP16 operands, FP16 output, FP32 arithmetic.</summary>
+    Fp16InFp16Out = 2,
+    /// <summary>FP64 operands, FP64 output, FP64 arithmetic.</summary>
+    Fp64 = 3,
+}
+
+internal static class PtxGemmPrecisionFacts
+{
+    internal static int OperandBytes(this PtxGemmPrecision precision) => precision switch
+    {
+        PtxGemmPrecision.Fp16InFp32Out or PtxGemmPrecision.Fp16InFp16Out => 2,
+        PtxGemmPrecision.Fp64 => 8,
+        _ => 4,
+    };
+
+    internal static int OutputBytes(this PtxGemmPrecision precision) => precision switch
+    {
+        PtxGemmPrecision.Fp16InFp16Out => 2,
+        PtxGemmPrecision.Fp64 => 8,
+        _ => 4,
+    };
+
+    // Shared-memory elements and registers: FP64 for FP64, FP32 otherwise.
+    internal static int ComputeBytes(this PtxGemmPrecision precision) => precision == PtxGemmPrecision.Fp64 ? 8 : 4;
+
+    internal static int SharedBytes(this PtxGemmPrecision precision, PtxGemmConfiguration configuration) =>
+        checked(configuration.SharedBytes / sizeof(float) * precision.ComputeBytes());
+
+    /// <summary>Why a configuration cannot run at this precision, or null when it can.</summary>
+    internal static string? Invalidity(this PtxGemmPrecision precision, PtxGemmConfiguration configuration)
+    {
+        if (!Enum.IsDefined(typeof(PtxGemmPrecision), precision)) return "unknown precision";
+        if (precision == PtxGemmPrecision.Fp32) return null;
+        if (configuration.IsAsync) return "only FP32 runs the cp.async pipeline";
+        if (configuration.VectorWidth != 1) return "only FP32 loads vectors";
+        if (precision.SharedBytes(configuration) > PtxGemmConfiguration.MaxStaticSharedBytes)
+            return "shared memory exceeds 48 KiB at this precision";
+        return null;
+    }
+}
+
 /// <summary>The operand layouts and the K-contiguity they imply.</summary>
 internal readonly record struct PtxGemmLayout(bool TransposeA, bool TransposeB)
 {
@@ -147,13 +199,14 @@ internal static class PtxSgemmGenerator
         "a_ptr", "b_ptr", "c_ptr", "m", "n", "k", "lda", "ldb", "ldc", "alpha", "beta", "stride_a", "stride_b", "stride_c",
     };
 
-    internal static string Emit(PtxGemmConfiguration config, PtxGemmLayout layout, int ccMajor, int ccMinor)
+    internal static string Emit(PtxGemmConfiguration config, PtxGemmLayout layout, int ccMajor, int ccMinor,
+        PtxGemmPrecision precision = PtxGemmPrecision.Fp32)
     {
-        string? invalid = config.Invalidity();
+        string? invalid = config.Invalidity() ?? precision.Invalidity(config);
         if (invalid is not null) throw new ArgumentException("Invalid GEMM configuration " + config.Name + ": " + invalid, nameof(config));
         if (config.IsAsync && ccMajor < 8)
             throw new PlatformNotSupportedException("cp.async needs compute capability 8.0 or newer.");
-        return new Emitter(config, layout).Build(ccMajor, ccMinor);
+        return new Emitter(config, layout, precision).Build(ccMajor, ccMinor);
     }
 
     /// <summary>
@@ -161,9 +214,10 @@ internal static class PtxSgemmGenerator
     /// to be wholly inside or wholly outside the matrix and 16-byte aligned.
     /// </summary>
     internal static bool Admits(PtxGemmConfiguration config, PtxGemmLayout layout, int m, int n, int k,
-        int lda, int ldb, int ldc, long strideA, long strideB, long strideC)
+        int lda, int ldb, int ldc, long strideA, long strideB, long strideC, PtxGemmPrecision precision = PtxGemmPrecision.Fp32)
     {
-        if (config.Invalidity() is not null || m <= 0 || n <= 0 || k < 0) return false;
+        if (config.Invalidity() is not null || precision.Invalidity(config) is not null || m <= 0 || n <= 0 || k < 0)
+            return false;
         if (config.VectorWidth == 1) return true;
         int aContiguousExtent = layout.AContiguousAlongK ? k : m;
         int bContiguousExtent = layout.BContiguousAlongK ? k : n;
@@ -176,14 +230,29 @@ internal static class PtxSgemmGenerator
     {
         private readonly PtxGemmConfiguration _c;
         private readonly PtxGemmLayout _layout;
+        private readonly PtxGemmPrecision _p;
+        private readonly int _ob, _cb, _outb;  // operand, compute (shared and register) and output element bytes
+        private readonly bool _f64;
         private readonly StringBuilder _body = new(64_000);
-        private int _r32, _r64, _pred, _f;
+        private int _r32, _r64, _pred, _f, _fd, _h;
 
-        internal Emitter(PtxGemmConfiguration config, PtxGemmLayout layout)
+        internal Emitter(PtxGemmConfiguration config, PtxGemmLayout layout, PtxGemmPrecision precision)
         {
             _c = config;
             _layout = layout;
+            _p = precision;
+            _ob = precision.OperandBytes();
+            _cb = precision.ComputeBytes();
+            _outb = precision.OutputBytes();
+            _f64 = precision == PtxGemmPrecision.Fp64;
         }
+
+        // The compute type: its PTX suffix, a fresh register and its zero literal.
+        private string Ct => _f64 ? "f64" : "f32";
+        private string CF() => _f64 ? "%fd" + (_fd++).ToString(CultureInfo.InvariantCulture) : F();
+        private string Zero => _f64 ? "0d0000000000000000" : "0f00000000";
+        private string H() => "%h" + (_h++).ToString(CultureInfo.InvariantCulture);
+        private static int Log2(int bytes) => bytes switch { 2 => 1, 4 => 2, 8 => 3, _ => throw new ArgumentOutOfRangeException(nameof(bytes)) };
 
         private string R() => "%r" + (_r32++).ToString(CultureInfo.InvariantCulture);
         private string Rd() => "%rd" + (_r64++).ToString(CultureInfo.InvariantCulture);
@@ -217,7 +286,7 @@ internal static class PtxSgemmGenerator
             // Kernel arguments.
             string aPtr = Rd(), bPtr = Rd(), cPtr = Rd(), strideA = Rd(), strideB = Rd(), strideC = Rd();
             string m = R(), n = R(), k = R(), lda = R(), ldb = R(), ldc = R();
-            string alpha = F(), beta = F();
+            string alpha = CF(), beta = CF();
             L($"ld.param.u64 {aPtr}, [a_ptr];");
             L($"ld.param.u64 {bPtr}, [b_ptr];");
             L($"ld.param.u64 {cPtr}, [c_ptr];");
@@ -227,8 +296,8 @@ internal static class PtxSgemmGenerator
             L($"ld.param.u32 {lda}, [lda];");
             L($"ld.param.u32 {ldb}, [ldb];");
             L($"ld.param.u32 {ldc}, [ldc];");
-            L($"ld.param.f32 {alpha}, [alpha];");
-            L($"ld.param.f32 {beta}, [beta];");
+            L($"ld.param.{Ct} {alpha}, [alpha];");
+            L($"ld.param.{Ct} {beta}, [beta];");
             L($"ld.param.u64 {strideA}, [stride_a];");
             L($"ld.param.u64 {strideB}, [stride_b];");
             L($"ld.param.u64 {strideC}, [stride_c];");
@@ -267,11 +336,11 @@ internal static class PtxSgemmGenerator
             // Batch offsets (element strides -> bytes).
             string batch64 = Rd();
             L($"cvt.u64.u32 {batch64}, {batch};");
-            foreach (var (ptr, stride) in new[] { (aPtr, strideA), (bPtr, strideB), (cPtr, strideC) })
+            foreach (var (ptr, stride, bytes) in new[] { (aPtr, strideA, _ob), (bPtr, strideB, _ob), (cPtr, strideC, _outb) })
             {
                 string off = Rd();
                 L($"mul.lo.u64 {off}, {batch64}, {stride};");
-                L($"shl.b64 {off}, {off}, 2;");
+                L($"shl.b64 {off}, {off}, {I(Log2(bytes))};");
                 L($"add.u64 {ptr}, {ptr}, {off};");
             }
 
@@ -280,7 +349,7 @@ internal static class PtxSgemmGenerator
 
             // Shared buffers (32-bit shared-window addresses) and the double-buffer selector. A cp.async kernel's
             // stages live in dynamic shared memory: every A stage, then every B stage.
-            int tileBytesA = _c.BlockK * _c.PitchA * sizeof(float), tileBytesB = _c.BlockK * _c.PitchB * sizeof(float);
+            int tileBytesA = _c.BlockK * _c.PitchA * _cb, tileBytesB = _c.BlockK * _c.PitchB * _cb;
             string curA = R(), curB = R(), nxtA = R(), nxtB = R();
             if (_c.IsAsync)
             {
@@ -300,19 +369,19 @@ internal static class PtxSgemmGenerator
             var acc = new string[accumulators];
             for (int i = 0; i < accumulators; i++)
             {
-                acc[i] = F();
-                L($"mov.f32 {acc[i]}, 0f00000000;");
+                acc[i] = CF();
+                L($"mov.{Ct} {acc[i]}, {Zero};");
             }
             var fa = new string[_c.ThreadM];
             var fb = new string[_c.ThreadN];
-            for (int i = 0; i < fa.Length; i++) fa[i] = F();
-            for (int i = 0; i < fb.Length; i++) fb[i] = F();
+            for (int i = 0; i < fa.Length; i++) fa[i] = CF();
+            for (int i = 0; i < fb.Length; i++) fb[i] = CF();
 
             // Per-thread shared read offsets for the inner product: the thread's first A row ty*FM and B column tx*FN
             // (bytes); its other fragments sit at compile-time offsets (RowOffset / ColumnOffset).
             string aRead = R(), bRead = R();
-            L($"mul.lo.u32 {aRead}, {ty}, {I(_c.FragmentM * sizeof(float))};");
-            L($"mul.lo.u32 {bRead}, {tx}, {I(_c.FragmentN * sizeof(float))};");
+            L($"mul.lo.u32 {aRead}, {ty}, {I(_c.FragmentM * _cb)};");
+            L($"mul.lo.u32 {bRead}, {tx}, {I(_c.FragmentN * _cb)};");
 
             // Tile count; K == 0 skips the main loop (C = beta * C).
             string tiles = R(), tile = R(), k0 = R();
@@ -442,12 +511,12 @@ internal static class PtxSgemmGenerator
             ptx.AppendLine(".version 7.1");
             ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
             ptx.AppendLine(".address_size 64");
-            ptx.Append("// sgemm ").Append(_c.Name).Append(' ').AppendLine(_layout.Name);
+            ptx.Append("// sgemm ").Append(_c.Name).Append(' ').Append(_layout.Name).Append(' ').AppendLine(_p.ToString());
             if (_c.IsAsync) ptx.AppendLine(".extern .shared .align 16 .b8 smem[];");
             ptx.Append(".visible .entry ").Append(EntryPoint).AppendLine("(");
             ptx.AppendLine("    .param .u64 a_ptr, .param .u64 b_ptr, .param .u64 c_ptr,");
             ptx.AppendLine("    .param .u32 m, .param .u32 n, .param .u32 k, .param .u32 lda, .param .u32 ldb, .param .u32 ldc,");
-            ptx.AppendLine("    .param .f32 alpha, .param .f32 beta,");
+            ptx.Append("    .param .").Append(Ct).Append(" alpha, .param .").Append(Ct).AppendLine(" beta,");
             ptx.AppendLine("    .param .u64 stride_a, .param .u64 stride_b, .param .u64 stride_c)");
             ptx.Append(".maxntid ").Append(I(threads)).AppendLine(", 1, 1");
             if (_c.MinBlocksPerSM > 1) ptx.Append(".minnctapersm ").AppendLine(I(_c.MinBlocksPerSM));
@@ -456,6 +525,8 @@ internal static class PtxSgemmGenerator
             ptx.Append("    .reg .b32 %r<").Append(I(Math.Max(1, _r32))).AppendLine(">;");
             ptx.Append("    .reg .b64 %rd<").Append(I(Math.Max(1, _r64))).AppendLine(">;");
             ptx.Append("    .reg .f32 %f<").Append(I(Math.Max(1, _f))).AppendLine(">;");
+            ptx.Append("    .reg .f64 %fd<").Append(I(Math.Max(1, _fd))).AppendLine(">;");
+            ptx.Append("    .reg .b16 %h<").Append(I(Math.Max(1, _h))).AppendLine(">;");
             if (!_c.IsAsync)
             {
                 ptx.Append("    .shared .align 16 .b8 a_tile[").Append(I(_c.Stages * tileBytesA)).AppendLine("];");
@@ -518,7 +589,7 @@ internal static class PtxSgemmGenerator
                 L($"cvt.u64.u32 {k64}, {kOff};");
                 if (contiguousAlongK) L($"mad.lo.u64 {offset}, {mn64}, {ld64}, {k64};");
                 else L($"mad.lo.u64 {offset}, {k64}, {ld64}, {mn64};");
-                L($"shl.b64 {offset}, {offset}, 2;");
+                L($"shl.b64 {offset}, {offset}, {I(Log2(_ob))};");
                 L($"add.u64 {ptr}, {basePtr}, {offset};");
                 op.SlotPointer[s] = ptr;
                 op.SlotMnInBounds[s] = inBounds;
@@ -526,7 +597,7 @@ internal static class PtxSgemmGenerator
                 op.SlotK[s] = s;
                 op.SlotMn[s] = s;
                 op.Staged[s] = new string[viaRegisters ? vw : 0];
-                for (int v = 0; v < op.Staged[s].Length; v++) op.Staged[s][v] = F();
+                for (int v = 0; v < op.Staged[s].Length; v++) op.Staged[s][v] = CF();
                 _slotK[(name, s)] = kOff;
                 _slotMn[(name, s)] = mnOff;
                 if (!viaRegisters)
@@ -541,8 +612,8 @@ internal static class PtxSgemmGenerator
             }
             // One K tile further: BK elements along K, or BK rows of ld elements.
             op.Step = Rd();
-            if (contiguousAlongK) L($"mov.u64 {op.Step}, {I((long)_c.BlockK * sizeof(float))};");
-            else L($"mul.lo.u64 {op.Step}, {ld64}, {I((long)_c.BlockK * sizeof(float))};");
+            if (contiguousAlongK) L($"mov.u64 {op.Step}, {I((long)_c.BlockK * _ob)};");
+            else L($"mul.lo.u64 {op.Step}, {ld64}, {I((long)_c.BlockK * _ob)};");
             return op;
         }
 
@@ -602,11 +673,18 @@ internal static class PtxSgemmGenerator
                 string kGlobal = R(), ok = P();
                 L($"add.u32 {kGlobal}, {k0}, {_slotK[(op.Name, s)]};");
                 L($"setp.lt.and.u32 {ok}, {kGlobal}, {k}, {op.SlotMnInBounds[s]};");
-                foreach (string v in op.Staged[s]) L($"mov.f32 {v}, 0f00000000;");
+                foreach (string v in op.Staged[s]) L($"mov.{Ct} {v}, {Zero};");
                 if (vw == 4)
                     L($"@{ok} ld.global.v4.f32 {{{op.Staged[s][0]}, {op.Staged[s][1]}, {op.Staged[s][2]}, {op.Staged[s][3]}}}, [{op.SlotPointer[s]}];");
+                else if (_ob == 2)
+                {
+                    // FP16 operand: widen to FP32 at load, so shared memory and the inner product stay FP32.
+                    string half = H();
+                    L($"@{ok} ld.global.b16 {half}, [{op.SlotPointer[s]}];");
+                    L($"@{ok} cvt.f32.f16 {op.Staged[s][0]}, {half};");
+                }
                 else
-                    L($"@{ok} ld.global.f32 {op.Staged[s][0]}, [{op.SlotPointer[s]}];");
+                    L($"@{ok} ld.global.{Ct} {op.Staged[s][0]}, [{op.SlotPointer[s]}];");
             }
         }
 
@@ -619,13 +697,13 @@ internal static class PtxSgemmGenerator
                 string kOff = _slotK[(op.Name, s)], mnOff = _slotMn[(op.Name, s)];
                 string address = R();
                 L($"mad.lo.u32 {address}, {kOff}, {I(op.Pitch)}, {mnOff};");
-                L($"shl.b32 {address}, {address}, 2;");
+                L($"shl.b32 {address}, {address}, {I(Log2(_cb))};");
                 L($"add.u32 {address}, {address}, {buffer};");
                 if (op.ContiguousAlongK)
                 {
                     // The vector runs along K: a column of the K-major tile, one row apart per element.
                     for (int v = 0; v < vw; v++)
-                        L($"st.shared.f32 [{address}+{I(v * op.Pitch * sizeof(float))}], {op.Staged[s][v]};");
+                        L($"st.shared.{Ct} [{address}+{I(v * op.Pitch * _cb)}], {op.Staged[s][v]};");
                 }
                 else if (vw == 4)
                 {
@@ -633,7 +711,7 @@ internal static class PtxSgemmGenerator
                 }
                 else
                 {
-                    L($"st.shared.f32 [{address}], {op.Staged[s][0]};");
+                    L($"st.shared.{Ct} [{address}], {op.Staged[s][0]};");
                 }
             }
         }
@@ -646,17 +724,31 @@ internal static class PtxSgemmGenerator
             L($"add.u32 {bBase}, {curB}, {bRead};");
             for (int kk = 0; kk < _c.BlockK; kk++)
             {
-                int aRow = kk * _c.PitchA * sizeof(float), bRow = kk * _c.PitchB * sizeof(float);
+                int aRow = kk * _c.PitchA * _cb, bRow = kk * _c.PitchB * _cb;
+                // Four consecutive elements per read: one 16-byte vector in FP32, two in FP64.
                 for (int i = 0; i < fa.Length; i += 4)
-                    L($"ld.shared.v4.f32 {{{fa[i]}, {fa[i + 1]}, {fa[i + 2]}, {fa[i + 3]}}}, [{aBase}+{I(aRow + _c.RowOffset(i) * sizeof(float))}];");
+                    LoadFragment(fa, i, aBase, aRow + _c.RowOffset(i) * _cb);
                 for (int j = 0; j < fb.Length; j += 4)
-                    L($"ld.shared.v4.f32 {{{fb[j]}, {fb[j + 1]}, {fb[j + 2]}, {fb[j + 3]}}}, [{bBase}+{I(bRow + _c.ColumnOffset(j) * sizeof(float))}];");
+                    LoadFragment(fb, j, bBase, bRow + _c.ColumnOffset(j) * _cb);
                 for (int i = 0; i < fa.Length; i++)
                     for (int j = 0; j < fb.Length; j++)
                     {
                         string a = acc[i * fb.Length + j];
-                        L($"fma.rn.f32 {a}, {fa[i]}, {fb[j]}, {a};");
+                        L($"fma.rn.{Ct} {a}, {fa[i]}, {fb[j]}, {a};");
                     }
+            }
+        }
+
+        private void LoadFragment(string[] registers, int first, string baseRegister, int offset)
+        {
+            if (_f64)
+            {
+                L($"ld.shared.v2.f64 {{{registers[first]}, {registers[first + 1]}}}, [{baseRegister}+{I(offset)}];");
+                L($"ld.shared.v2.f64 {{{registers[first + 2]}, {registers[first + 3]}}}, [{baseRegister}+{I(offset + 16)}];");
+            }
+            else
+            {
+                L($"ld.shared.v4.f32 {{{registers[first]}, {registers[first + 1]}, {registers[first + 2]}, {registers[first + 3]}}}, [{baseRegister}+{I(offset)}];");
             }
         }
 
@@ -665,7 +757,7 @@ internal static class PtxSgemmGenerator
             string tx, string ty, string[] acc)
         {
             string useBeta = P();
-            L($"setp.neu.f32 {useBeta}, {beta}, 0f00000000;");
+            L($"setp.neu.{Ct} {useBeta}, {beta}, {Zero};");
             string row0 = R(), col0 = R(), ldc64 = Rd();
             L($"mad.lo.u32 {row0}, {ty}, {I(_c.FragmentM)}, {bm};");
             L($"mad.lo.u32 {col0}, {tx}, {I(_c.FragmentN)}, {bn};");
@@ -678,7 +770,7 @@ internal static class PtxSgemmGenerator
                 L($"setp.lt.u32 {rowOk}, {row}, {m};");
                 L($"cvt.u64.u32 {row64}, {row};");
                 L($"mul.lo.u64 {rowPtr}, {row64}, {ldc64};");
-                L($"shl.b64 {rowPtr}, {rowPtr}, 2;");
+                L($"shl.b64 {rowPtr}, {rowPtr}, {I(Log2(_outb))};");
                 L($"add.u64 {rowPtr}, {rowPtr}, {cPtr};");
                 int step = vector ? 4 : 1;
                 for (int j = 0; j < _c.ThreadN; j += step)
@@ -687,17 +779,17 @@ internal static class PtxSgemmGenerator
                     L($"add.u32 {col}, {col0}, {I(_c.ColumnOffset(j))};");
                     L($"setp.lt.and.u32 {ok}, {col}, {n}, {rowOk};");
                     L($"cvt.u64.u32 {col64}, {col};");
-                    L($"shl.b64 {col64}, {col64}, 2;");
+                    L($"shl.b64 {col64}, {col64}, {I(Log2(_outb))};");
                     L($"add.u64 {ptr}, {rowPtr}, {col64};");
                     L($"and.pred {okBeta}, {ok}, {useBeta};");
                     var outs = new string[step];
                     var olds = new string[step];
                     for (int v = 0; v < step; v++)
                     {
-                        outs[v] = F();
-                        olds[v] = F();
-                        L($"mul.rn.f32 {outs[v]}, {alpha}, {acc[i * _c.ThreadN + j + v]};");
-                        L($"mov.f32 {olds[v]}, 0f00000000;");
+                        outs[v] = CF();
+                        olds[v] = CF();
+                        L($"mul.rn.{Ct} {outs[v]}, {alpha}, {acc[i * _c.ThreadN + j + v]};");
+                        L($"mov.{Ct} {olds[v]}, {Zero};");
                     }
                     if (vector)
                     {
@@ -705,11 +797,21 @@ internal static class PtxSgemmGenerator
                         for (int v = 0; v < step; v++) L($"@{okBeta} fma.rn.f32 {outs[v]}, {beta}, {olds[v]}, {outs[v]};");
                         L($"@{ok} st.global.v4.f32 [{ptr}], {{{outs[0]}, {outs[1]}, {outs[2]}, {outs[3]}}};");
                     }
+                    else if (_outb == 2)
+                    {
+                        // FP16 output: C is read and written as FP16, the blend is FP32.
+                        string oldHalf = H(), outHalf = H();
+                        L($"@{okBeta} ld.global.b16 {oldHalf}, [{ptr}];");
+                        L($"@{okBeta} cvt.f32.f16 {olds[0]}, {oldHalf};");
+                        L($"@{okBeta} fma.rn.f32 {outs[0]}, {beta}, {olds[0]}, {outs[0]};");
+                        L($"cvt.rn.f16.f32 {outHalf}, {outs[0]};");
+                        L($"@{ok} st.global.b16 [{ptr}], {outHalf};");
+                    }
                     else
                     {
-                        L($"@{okBeta} ld.global.f32 {olds[0]}, [{ptr}];");
-                        L($"@{okBeta} fma.rn.f32 {outs[0]}, {beta}, {olds[0]}, {outs[0]};");
-                        L($"@{ok} st.global.f32 [{ptr}], {outs[0]};");
+                        L($"@{okBeta} ld.global.{Ct} {olds[0]}, [{ptr}];");
+                        L($"@{okBeta} fma.rn.{Ct} {outs[0]}, {beta}, {olds[0]}, {outs[0]};");
+                        L($"@{ok} st.global.{Ct} [{ptr}], {outs[0]};");
                     }
                 }
             }
