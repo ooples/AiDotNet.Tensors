@@ -120,6 +120,74 @@ public sealed class GpuOptimizerResidencyMockTests
             t => t.P);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SgdStepMultiTensor_DispatchesOnceOrPerTensor_AndMarksEveryParameterCurrent(bool multiTensor)
+    {
+        using var ctx = new MockGpuEngineScope(multiTensor);
+        var ps = new[] { GpuFloat(ctx.Backend, 4), GpuFloat(ctx.Backend, 9), GpuFloat(ctx.Backend, 1) };
+        var gs = new[] { GpuFloat(ctx.Backend, 4), GpuFloat(ctx.Backend, 9), GpuFloat(ctx.Backend, 1) };
+        var tracked = new List<TrackedTensor>();
+        foreach (var t in ps) tracked.Add(Track(t));
+        foreach (var t in gs) tracked.Add(Track(t));
+        var before = tracked.ConvertAll(t => t.Snapshot());
+
+        Assert.True(GpuOptimizer.TrySgdStepMultiTensor(ps, gs, 0.01f));
+
+        // An IMultiTensorGpuOptimizerBackend gets the whole list in one call; any other backend gets one SgdUpdate per tensor.
+        if (multiTensor) Assert.Equal(new[] { "SgdMultiTensorUpdate" }, ctx.State.OptimizerCalls);
+        else Assert.Equal(new[] { "SgdUpdate", "SgdUpdate", "SgdUpdate" }, ctx.State.OptimizerCalls);
+        for (int i = 0; i < ps.Length; i++)
+            AssertGpuMarkedCurrent(ps[i], before[i].Version, $"parameter {i}");
+        for (int i = 0; i < gs.Length; i++)
+        {
+            Assert.Equal(before[ps.Length + i].Version, tracked[ps.Length + i].Version);
+            Assert.Same(before[ps.Length + i].LastWriteSync, tracked[ps.Length + i].LastWriteSync);
+        }
+    }
+
+    [Fact]
+    public void SgdStepMultiTensor_RefusesBeforeDispatchAndValidatesItsArguments()
+    {
+        using var ctx = new MockGpuEngineScope(multiTensor: true);
+        var ps = new[] { GpuFloat(ctx.Backend, 4), GpuFloat(ctx.Backend, 4) };
+        var gs = new[] { GpuFloat(ctx.Backend, 4), GpuFloat(ctx.Backend, 4) };
+        var before = Array.ConvertAll(ps, p => p.Version);
+
+        // One host-only gradient refuses the whole list: nothing is launched and no parameter is touched.
+        var host = new Tensor<float>(new float[4], new[] { 4 });
+        Assert.False(GpuOptimizer.TrySgdStepMultiTensor(ps, new[] { gs[0], host }, 0.01f));
+        Assert.False(GpuOptimizer.TrySgdStepMultiTensor(new[] { ps[0], host }, gs, 0.01f));
+        Assert.Empty(ctx.State.OptimizerCalls);
+        Assert.Equal(before, Array.ConvertAll(ps, p => p.Version));
+
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TrySgdStepMultiTensor(null, gs, 0.01f));
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TrySgdStepMultiTensor(ps, null, 0.01f));
+        Assert.Throws<ArgumentException>(() => GpuOptimizer.TrySgdStepMultiTensor(ps, new[] { gs[0] }, 0.01f));
+        Assert.Throws<ArgumentException>(() => GpuOptimizer.TrySgdStepMultiTensor(ps, new[] { gs[0], GpuFloat(ctx.Backend, 3) }, 0.01f));
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TrySgdStepMultiTensor(new[] { ps[0], null }, gs, 0.01f));
+        Assert.Empty(ctx.State.OptimizerCalls);
+    }
+
+    [Fact]
+    public void SgdStepMultiTensor_RefusesOnACpuEngine()
+    {
+        var previous = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.Current = new CpuEngine();
+            var p = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+            var g = new Tensor<float>(new[] { 1f, 1f }, new[] { 2 });
+            Assert.False(GpuOptimizer.TrySgdStepMultiTensor(new[] { p }, new[] { g }, 0.5f));
+            Assert.Equal(new[] { 1f, 2f }, p.AsSpan().ToArray());
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
     [Fact]
     public void SparseDispatchValidation_RejectsDuplicateIndicesBeforeDispatch()
     {
@@ -488,7 +556,7 @@ public sealed class GpuOptimizerResidencyMockTests
         public IDirectGpuBackend Backend { get; }
         public DirectGpuTensorEngine Engine { get; }
 
-        public MockGpuEngineScope()
+        public MockGpuEngineScope(bool multiTensor = false)
         {
             _priorEngine = AiDotNetEngine.Current;
             _priorBackendEnv = Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS");
@@ -496,7 +564,7 @@ public sealed class GpuOptimizerResidencyMockTests
             var directGpu = new DirectGpuEngine();
             Environment.SetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS", _priorBackendEnv);
 
-            Backend = MockDirectGpuBackend.Create(State);
+            Backend = multiTensor ? MockDirectGpuBackend.CreateMultiTensor(State) : MockDirectGpuBackend.Create(State);
             SetField(directGpu, "_backend", Backend);
             SetField(directGpu, "_isAvailable", true);
 
