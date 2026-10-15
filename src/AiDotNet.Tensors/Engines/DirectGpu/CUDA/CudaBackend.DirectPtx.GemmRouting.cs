@@ -127,6 +127,12 @@ public sealed partial class CudaBackend
 
     internal long GemmRouteDispatchCount => Interlocked.Read(ref _gemmRouteDispatchCount);
 
+    /// <summary>
+    /// Benchmarks: false pins <see cref="Gemm"/> to cuBLAS on this backend (installed routes stay installed and nothing
+    /// is activated), so a lane labelled cuBLAS measures cuBLAS even where a route exists.
+    /// </summary>
+    internal bool GemmRoutingEnabled { get; set; } = true;
+
     // Strict FP32 under determinism (the default) or when TF32 is unavailable or disabled; TF32 otherwise. The same rule
     // picks cuBLAS's math mode (ApplyDeterministicGemmMathMode), so a route always competes with the cuBLAS it replaces.
     private bool GemmRouteIsStrict =>
@@ -324,7 +330,7 @@ public sealed partial class CudaBackend
     /// </summary>
     private bool TryRoutedGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k, float alpha, float beta)
     {
-        if (!GemmRouteActivationEnabled) return false;
+        if (!GemmRouteActivationEnabled || !GemmRoutingEnabled) return false;
         var key = new GemmRouteKey(m, n, k, GemmRouteIsStrict);
         // First GEMM of a shape in this mode: activate its persisted verdict, if any. Never inside a stream capture,
         // where loading a module is not allowed; the shape is then looked up on its first uncaptured call.
