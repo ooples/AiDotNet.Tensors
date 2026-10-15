@@ -31,6 +31,18 @@ public sealed class DirectPtxSgemmGeneratorTests
         new(128, 128, 8, 8, 8, 4, 4, true),
         new(64, 128, 16, 4, 8, 1, 4, false),
         new(256, 128, 16, 8, 8, 4, 0, true),
+        // Split fragments and grouped rasterization, scalar and vector, on grids whose row count no group divides.
+        new(128, 128, 8, 8, 8, 4, 4, true, true, 8),
+        new(64, 128, 16, 4, 8, 1, 4, false, true, 4),
+        new(128, 64, 16, 8, 4, 4, 0, true, false, 16),
+        new(32, 32, 8, 8, 4, 1, 0, true, true, 4),
+        // cp.async pipelines (SM 8.0+): two, three and four stages, over every layout's mix of 16-byte and 4-byte copies.
+        new(64, 64, 16, 4, 4, 4, 4, false, false, 1, 1, 2),
+        new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 1, 3),
+        new(128, 64, 16, 8, 4, 4, 0, false, true, 4, 1, 4),
+        // cp.async for the M/N-contiguous operand, register transposition for the K-contiguous one.
+        new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true),
+        new(64, 128, 16, 4, 8, 4, 0, false, true, 4, 1, 3, true),
     };
 
     // (M, N, K): degenerate, odd (no tile divides), exact tiles, tall / wide / deep, and vector-aligned odd.
@@ -66,6 +78,12 @@ public sealed class DirectPtxSgemmGeneratorTests
         Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 3, 4, 1, 0, false).Invalidity());   // TM not a multiple of 4
         Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 4, 4, 2, 0, false).Invalidity());   // vector width 2
         Assert.NotNull(new PtxGemmConfiguration(256, 256, 32, 8, 8, 4, 4, true).Invalidity()); // > 48 KiB shared
+        Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 4, 4, 1, 0, false, true).Invalidity());       // 4x4 split
+        Assert.NotNull(new PtxGemmConfiguration(64, 64, 8, 4, 8, 1, 0, false, false, 3).Invalidity());  // swizzle 3
+        Assert.NotNull(new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 0, true, false, 1, 1, 2).Invalidity());  // async + db
+        Assert.NotNull(new PtxGemmConfiguration(64, 64, 16, 4, 4, 1, 0, false, false, 1, 1, 2).Invalidity()); // async scalar
+        Assert.Throws<PlatformNotSupportedException>(() => PtxSgemmGenerator.Emit(
+            new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 0, false, false, 1, 1, 2), new PtxGemmLayout(false, false), 7, 5));
         Assert.Throws<ArgumentException>(() =>
             PtxSgemmGenerator.Emit(new PtxGemmConfiguration(64, 64, 8, 4, 4, 2, 0, false), new PtxGemmLayout(false, false), 8, 6));
     }
@@ -159,6 +177,7 @@ public sealed class DirectPtxSgemmGeneratorTests
         foreach (var config in Sampled)
             foreach (var layout in Layouts)
             {
+                if (config.IsAsync && runtime.ComputeCapabilityMajor < 8) continue;
                 using var kernel = new PtxSgemmKernel(runtime, config, layout);
                 Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
                 foreach (var (m, n, k) in Shapes)
@@ -189,9 +208,10 @@ public sealed class DirectPtxSgemmGeneratorTests
     public void Batched_MatchesTheOracle()
     {
         using var runtime = RequireRuntime();
-        foreach (var config in new[] { Sampled[0], Sampled[2] })
+        foreach (var config in new[] { Sampled[0], Sampled[2], Sampled[6], Sampled[9], Sampled[10], Sampled[11], Sampled[13] })
             foreach (var layout in Layouts)
             {
+                if (config.IsAsync && runtime.ComputeCapabilityMajor < 8) continue;
                 using var kernel = new PtxSgemmKernel(runtime, config, layout);
                 Check(runtime, kernel, 3, 40, 36, 52, 1f, 0f, poisonC: false);
                 Check(runtime, kernel, 3, 40, 36, 52, -1.5f, 0.25f, poisonC: false);
@@ -202,8 +222,9 @@ public sealed class DirectPtxSgemmGeneratorTests
     public void BetaZero_NeverReadsC_AndKZeroScalesC()
     {
         using var runtime = RequireRuntime();
-        foreach (var config in new[] { Sampled[0], Sampled[1] })
+        foreach (var config in new[] { Sampled[0], Sampled[1], Sampled[11], Sampled[13] })
         {
+            if (config.IsAsync && runtime.ComputeCapabilityMajor < 8) continue;
             using var kernel = new PtxSgemmKernel(runtime, config, new PtxGemmLayout(false, false));
             // C holds NaN: any read would poison the output.
             Check(runtime, kernel, 1, 64, 64, 64, 1f, 0f, poisonC: true);

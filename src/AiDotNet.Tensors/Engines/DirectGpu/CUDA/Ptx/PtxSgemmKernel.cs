@@ -65,7 +65,8 @@ internal sealed class PtxSgemmKernel : IDisposable
         arguments[13] = &sc;
         uint gridX = (uint)((n + Configuration.BlockN - 1) / Configuration.BlockN);
         uint gridY = (uint)((m + Configuration.BlockM - 1) / Configuration.BlockM);
-        _module.Launch(_function, gridX, gridY, (uint)batch, (uint)Configuration.Threads, 1, 1, 0, arguments);
+        uint dynamicShared = Configuration.IsAsync ? (uint)Configuration.SharedBytes : 0;
+        _module.Launch(_function, gridX, gridY, (uint)batch, (uint)Configuration.Threads, 1, 1, dynamicShared, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -92,7 +93,8 @@ internal sealed class PtxSgemmKernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 255,
-                MaxStaticSharedBytes: configuration.SharedBytes,
+                // A cp.async kernel's stages are dynamic shared memory (sized per launch), so its static budget is zero.
+                MaxStaticSharedBytes: configuration.IsAsync ? 0 : configuration.SharedBytes,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
@@ -100,7 +102,12 @@ internal sealed class PtxSgemmKernel : IDisposable
                 ["formula"] = "C = alpha * op(A) @ op(B) + beta * C, batched over grid z",
                 ["configuration"] = configuration.Name,
                 ["layout"] = layout.Name,
-                ["edges"] = "predicated: out-of-range loads read zero, out-of-range stores skipped",
+                ["edges"] = configuration.IsAsync
+                    ? "cp.async zero-fill outside the matrix; out-of-range stores skipped"
+                    : "predicated: out-of-range loads read zero, out-of-range stores skipped",
+                ["pipeline"] = configuration.IsAsync
+                    ? "cp.async, " + configuration.AsyncStages.ToString(System.Globalization.CultureInfo.InvariantCulture) + " shared stages"
+                    : configuration.DoubleBuffer ? "register-staged, double-buffered" : "register-staged",
                 ["beta-zero"] = "C is not read",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",

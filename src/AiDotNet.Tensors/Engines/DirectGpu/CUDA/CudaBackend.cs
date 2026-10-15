@@ -2353,6 +2353,15 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Fail-closed direct-PTX fast path (issue #836) for the standard alpha=1/beta=0
         // C=A@B case; returns false until a shape is GPU-promoted, then falls to cuBLAS.
         if (alpha == 1.0f && beta == 0.0f && TryDirectPtxGemm(A, B, C, M, K, N)) return;
+        // #1265: a shape tuned and measured faster than cuBLAS in the current math mode runs its generated kernel.
+        if (TryRoutedGemm(A, B, C, M, N, K, alpha, beta)) return;
+        CublasGemm(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // Row-major C = alpha * A @ B + beta * C on cuBLAS in the backend's current math mode (the caller pushed the context).
+    private void CublasGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
+        System.Threading.Volatile.Write(ref _lastGemmDispatchPath, (int)CudaGemmDispatchPath.Cublas);
         ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
