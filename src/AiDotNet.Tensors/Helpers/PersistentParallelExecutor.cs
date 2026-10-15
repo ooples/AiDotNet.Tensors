@@ -915,7 +915,12 @@ internal sealed class PersistentParallelExecutor
                 // runs any chunk still unstarted and waits for the ones running elsewhere -- not for every woken
                 // worker: one that has not started holds no chunk and is not waited on.
                 Exception? mainException = RunSet(job, 0, publish: false);
-                mainException ??= FinishPlainDispatch(job);
+                // Always finish the dispatch, also when one of the caller's own chunks threw: `mainException ??=
+                // FinishPlainDispatch(job)` skipped it then, so Execute rethrew without waiting for the workers or running
+                // the chunks they had not started -- a sibling chunk could be skipped, or still be running after Execute
+                // returned (seen once the caller owned the throwing chunk, at a smaller team on a 4-core CI runner).
+                Exception? finishException = FinishPlainDispatch(job);
+                mainException ??= finishException;
 
                 _job = null; // release the body's captured references for GC between dispatches
 
