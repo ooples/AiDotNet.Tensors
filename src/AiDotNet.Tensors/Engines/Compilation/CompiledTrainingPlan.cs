@@ -969,7 +969,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // were 4 of the captured step's 512 KB device-to-device copies.
             bool add = step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
                 && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
-            if (!reshape && !add) continue;
+            // A per-channel bias add passes its input's gradient through unchanged (the bias takes the reduction), so the
+            // input is aliased as an add operand is (the bias, a different shape, keeps its own buffer). GPU only: the CPU plan fuses Conv2D,
+            // this add and ReLU into one backward that reads these buffers itself. On the parity CNN (CUDA) these were
+            // a 3.2 MB and a 1.6 MB device-to-device copy per step.
+            bool channelBias = device && step.OpName == "TensorChannelBiasAdd" && step.Inputs.Length == 2
+                && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
+            if (!reshape && !add && !channelBias) continue;
             var output = step.OutputBuffer;
             if (!gradMap.TryGetValue(output, out var outputGrad) || !outputGrad.IsContiguous) continue;
             int aliasedInputs = 0;
