@@ -369,6 +369,48 @@ internal static class HeadToHeadNetworkHarness
         internal Dictionary<string, int>? Crossings { get; set; }
     }
 
+    /// <summary>
+    /// Trains through <see cref="AiDotNet.Tensors.Engines.Compilation.TensorCodec.CompileTraining{T}"/>: one Step() is
+    /// the whole training step, so only the "step" phase is measured (the per-phase entries repeat it for the report).
+    /// </summary>
+    private static SideResult TrainCompiled(JsonElement spec, IEngine engine, List<Func<Tensor<float>, Tensor<float>>> layers,
+        List<Tensor<float>> parameters, Tensor<float> x, Tensor<float> y, double lr, DirectGpuTensorEngine? gpu)
+    {
+        var allAxes = new[] { 0, 1 };
+        using var plan = AiDotNet.Tensors.Engines.Compilation.TensorCodec.CompileTraining<float>(() =>
+        {
+            var h = x;
+            foreach (var layer in layers) h = layer(h);
+            engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(h, y)), allAxes, keepDims: false);
+        }, parameters.ToArray());
+        plan.ConfigureOptimizer(AiDotNet.Tensors.Engines.Compilation.OptimizerType.SGD, lr);
+        void Sync() => gpu?.SynchronizeStream();
+
+        int warmup = spec.GetProperty("warmupSteps").GetInt32();
+        int measured = spec.GetProperty("measuredSteps").GetInt32();
+        int lossSteps = spec.GetProperty("lossAgreementSteps").GetInt32();
+        var steps = new List<double>();
+        var losses = new List<double>();
+        var sw = new Stopwatch();
+        for (int step = 0; step < warmup + measured; step++)
+        {
+            Sync();
+            sw.Restart();
+            var loss = plan.Step();
+            Sync();
+            double t = sw.Elapsed.TotalMilliseconds;
+            if (step < lossSteps) losses.Add(loss.GetFlat(0));
+            if (step >= warmup) steps.Add(t);
+        }
+
+        var stats = Stats(steps);
+        return new SideResult(
+            "AiDotNet.Tensors (compiled)",
+            typeof(Tensor<>).Assembly.GetName().Version?.ToString() ?? "unknown",
+            new Dictionary<string, PhaseStats> { ["forward"] = stats, ["backward"] = stats, ["optimizer"] = stats, ["step"] = stats },
+            losses);
+    }
+
     private static SideResult TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, StepCrossingCapture? capture = null)
     {
         IEngine engine = AiDotNetEngine.Current;
@@ -568,6 +610,11 @@ internal static class HeadToHeadNetworkHarness
         }
 
         double lr = spec.GetProperty("optimizer").GetProperty("lr").GetDouble();
+        // PARITY_TENSORS_MODE=compiled: the same layers traced once into a compiled training plan (forward, backward and
+        // a fused SGD update, replayed per Step()) - the engine's counterpart to torch.compile or a captured step. Opt-in:
+        // the gated ratchet keeps measuring the eager tape.
+        if (capture is null && Environment.GetEnvironmentVariable("PARITY_TENSORS_MODE") == "compiled")
+            return TrainCompiled(spec, engine, layers, parameters, x, y, lr, gpu);
         var optimizer = new SgdOptimizer();
         var group = optimizer.AddParamGroup(new Dictionary<string, double> { ["lr"] = lr });
         // The optimizer updates the parameter tensors in place and reads the tape's gradients directly, as
