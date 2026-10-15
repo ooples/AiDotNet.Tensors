@@ -149,9 +149,10 @@ public partial class CpuEngine
         // records each step, so a training call gets the gradients the composition defines.
         if (DifferentiableOps.ThreadTapeActive())
         {
-            // Float with plain weights: one fused tape node (CpuEngine.MultiHeadAttentionBackward.cs). Streamed int8 / int4
-            // weights and other element types record the decomposed chain.
-            if (typeof(T) == typeof(float) && !HasStreamingQuantizedWeight(qWeight, kWeight, vWeight, outWeight))
+            // Float with plain weights: one fused tape node (CpuEngine.MultiHeadAttentionBackward.cs), computed on the host.
+            // Streamed int8 / int4 weights and other element types record the decomposed chain, and so does a GPU engine
+            // falling back here (no kernel for a shape): its chain still dispatches each op to the GPU.
+            if (typeof(T) == typeof(float) && !SupportsGpu && !HasStreamingQuantizedWeight(qWeight, kWeight, vWeight, outWeight))
             {
                 ValidateMhaMask(mask, batch, numHeads, seqLen, seqLen);
                 return (Tensor<T>)(object)MultiHeadAttentionForwardFloatTrain(
@@ -889,17 +890,7 @@ public partial class CpuEngine
         Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK)
     {
         if (mask is null) return null;
-        if (mask.Rank != 4)
-            throw new ArgumentException("Attention mask must be rank 4.", nameof(mask));
-
-        int[] target = { batch, heads, seqQ, seqK };
-        for (int axis = 0; axis < 4; axis++)
-        {
-            if (mask._shape[axis] != 1 && mask._shape[axis] != target[axis])
-                throw new ArgumentException(
-                    $"Attention mask axis {axis} has extent {mask._shape[axis]}; expected 1 or {target[axis]}.",
-                    nameof(mask));
-        }
+        ValidateMhaMask(mask, batch, heads, seqQ, seqK);
 
         if (mask._shape[0] == batch && mask._shape[1] == heads &&
             mask._shape[2] == seqQ && mask._shape[3] == seqK)
@@ -916,6 +907,6 @@ public partial class CpuEngine
                             mask._shape[1] == 1 ? 0 : h,
                             mask._shape[2] == 1 ? 0 : q,
                             mask._shape[3] == 1 ? 0 : k];
-        return new Tensor<bool>(expanded, target);
+        return new Tensor<bool>(expanded, new[] { batch, heads, seqQ, seqK });
     }
 }

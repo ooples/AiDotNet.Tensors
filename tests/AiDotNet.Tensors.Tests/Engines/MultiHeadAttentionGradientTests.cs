@@ -184,6 +184,42 @@ public class MultiHeadAttentionGradientTests
                 $"output {i} ({maskKind}): fused {fused[i]} vs tape path {taped[i]}.");
     }
 
+    // A GPU engine falling back to the CPU implementation (no kernel for a shape) must keep the decomposed chain, whose
+    // ops it dispatches to the GPU, not the host-side fused node.
+    private sealed class GpuReportingEngine : CpuEngine
+    {
+        public override bool SupportsGpu => true;
+    }
+
+    [Fact]
+    public void Float_OnAnEngineThatSupportsGpu_RecordsTheDecomposedChain()
+    {
+        var rng = new Random(2437);
+        const int batch = 2, seq = 5, dModel = 8, heads = 2;
+        Tensor<float> Rand(params int[] shape)
+        {
+            var t = new Tensor<float>(shape);
+            var s = t.AsWritableSpan();
+            for (int i = 0; i < s.Length; i++) s[i] = (float)(rng.NextDouble() - 0.5);
+            return t;
+        }
+        var x = Rand(batch, seq, dModel);
+        var w = new[] { Rand(dModel, dModel), Rand(dModel, dModel), Rand(dModel, dModel), Rand(dModel, dModel) };
+
+        // Positive control: the plain CPU engine records the single fused node.
+        using (var tape = new GradientTape<float>())
+        {
+            int before = tape.EntryCount;
+            new CpuEngine().MultiHeadAttentionForward(x, w[0], w[1], w[2], w[3], heads, null);
+            Assert.Equal(before + 1, tape.EntryCount);
+        }
+        using (var tape = new GradientTape<float>())
+        {
+            int before = tape.EntryCount;
+            new GpuReportingEngine().MultiHeadAttentionForward(x, w[0], w[1], w[2], w[3], heads, null);
+            Assert.True(tape.EntryCount > before + 1, $"expected the decomposed chain, got {tape.EntryCount - before} tape entries");
+        }
+    }
     [Theory]
     [MemberData(nameof(Masks))]
     public void FusedFloatGradients_MatchTheDoubleDecomposedChain(string maskKind)
