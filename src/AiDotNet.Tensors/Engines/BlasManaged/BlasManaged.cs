@@ -473,6 +473,13 @@ public static partial class BlasManaged
         ReadOnlySpan<T> a, int lda, bool transA, ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc, int m, int n, int k, in BlasOptions<T> options) where T : unmanaged
     {
+        // Like the JIT shortcut, this route answers only an Auto request: a caller that names a packing mode, thread count
+        // or blocking gets that plan. It used to take explicit ForcePackBoth / NumThreads=-1 calls to SimdGemm's parallel
+        // split-K kernel whenever ldc == n, so the same product summed K in a different order depending on whether the call
+        // covered the full width (the implicit and full-matrix conv routes disagreed in the last bits at M=128, K=2304).
+        if (options.PackingMode != PackingMode.Auto || options.NumThreads != 0
+            || options.Mc != 0 || options.Nc != 0 || options.Kc != 0)
+            return false;
         if (ldc != n || options.PackedA is not null || options.PackedB is not null
             || !options.Epilogue.BiasN.IsEmpty || options.Epilogue.Activation != FusedActivationType.None
             || !options.Epilogue.SkipMxN.IsEmpty || options.Epilogue.DropoutMask != 0)
