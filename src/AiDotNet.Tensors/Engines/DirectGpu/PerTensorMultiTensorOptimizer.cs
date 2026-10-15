@@ -39,4 +39,34 @@ internal static class PerTensorMultiTensorOptimizer
                     learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[t]);
         }
     }
+
+    /// <summary>Plain SGD over a tensor list through the backend's own per-tensor <c>SgdUpdate</c> kernel.</summary>
+    public static void Sgd(IDirectGpuBackend backend,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay)
+    {
+        ValidateSgd(parameters, gradients, sizes);
+        for (int t = 0; t < parameters.Count; t++)
+            backend.SgdUpdate(parameters[t], gradients[t], learningRate, weightDecay, sizes[t]);
+    }
+
+    /// <summary>The argument checks every <c>SgdMultiTensorUpdate</c> runs before launching anything.</summary>
+    public static void ValidateSgd(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+        int n = parameters.Count;
+        if (gradients.Count != n || sizes.Count != n)
+            throw new ArgumentException("Multi-tensor optimizer buffer lists must all have the same length.");
+        for (int t = 0; t < n; t++)
+        {
+            if (parameters[t] is null || gradients[t] is null)
+                throw new ArgumentNullException(nameof(parameters), "Every parameter and gradient buffer is required.");
+            if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (parameters[t].Size < sizes[t] || gradients[t].Size < sizes[t])
+                throw new ArgumentException("A parameter or gradient buffer is smaller than its size.", nameof(sizes));
+        }
+    }
 }

@@ -277,16 +277,16 @@ public sealed partial class CudaBackend
         ApplyDeterministicGemmMathMode();
         float one = 1f, zero = 0f;
         // Column-major: partials_b[P x Cout] = col_b^T-view(T)[P x L] * gradOutput_b-view[L x Cout].
-        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSgemmStridedBatched(_cublasHandle,
+        BlasSgemmStridedBatched(
             CublasOperation.Transpose, CublasOperation.None, P, outChannels, L,
             ref one, col.Handle, L, (long)P * L, gradOutput.Handle, L, (long)outChannels * L,
-            ref zero, partials.Handle, P, (long)outChannels * P, batch), "cublasSgemmStridedBatched(conv dW)");
+            ref zero, partials.Handle, P, (long)outChannels * P, batch, "cublasSgemmStridedBatched(conv dW)");
         // Sum over the batch: gradKernel[N2] = partials[N2 x B] * ones[B], N2 = Cout*P.
         int n2 = outChannels * P;
-        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSgemm(_cublasHandle,
+        BlasSgemm(
             CublasOperation.None, CublasOperation.None, n2, 1, batch,
             ref one, partials.Handle, n2, _convOnes.Handle, batch,
-            ref zero, gradKernel.Handle, n2), "cublasSgemm(conv dW batch sum)");
+            ref zero, gradKernel.Handle, n2, "cublasSgemm(conv dW batch sum)");
         return true;
     }
 
@@ -308,10 +308,10 @@ public sealed partial class CudaBackend
         ApplyDeterministicGemmMathMode();
         float one = 1f, zero = 0f;
         // Column-major: col_b[L x P] = gradOutput_b-view[L x Cout] * kernel-view(T)[Cout x P].
-        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSgemmStridedBatched(_cublasHandle,
+        BlasSgemmStridedBatched(
             CublasOperation.None, CublasOperation.Transpose, L, P, outChannels,
             ref one, gradOutput.Handle, L, (long)outChannels * L, kernel.Handle, P, 0L,
-            ref zero, col.Handle, L, (long)P * L, batch), "cublasSgemmStridedBatched(conv dX)");
+            ref zero, col.Handle, L, (long)P * L, batch, "cublasSgemmStridedBatched(conv dX)");
 
         LaunchCol2Im(col, gradInput, batch, inChannels, inHeight, inWidth, kernelH, kernelW,
             strideH, strideW, padH, padW, dilationH, dilationW, outHeight, outWidth);

@@ -67,6 +67,14 @@ internal static class SimdTranspose
         }
     }
 
+    /// <summary>The float transpose on the calling thread only, for callers that are already parallel tasks.</summary>
+    internal static unsafe void TransposeSerial(float* src, float* dst, int rows, int cols)
+    {
+        int dstRowTiles = (cols + Tile - 1) / Tile;
+        for (int t = 0; t < dstRowTiles; t++)
+            TransposeDstRowTile(src, dst, rows, cols, t * Tile);
+    }
+
     private static void ValidateLengths(int srcLength, int dstLength, int rows, int cols)
     {
         long total = (long)rows * cols;

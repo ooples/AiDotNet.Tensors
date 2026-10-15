@@ -613,15 +613,22 @@ internal static class HeadToHeadNetworkHarness
             Sync();
             double t2 = sw.Elapsed.TotalMilliseconds;
 
+            var stepGradients = new Tensor<float>[parameters.Count];
             for (int i = 0; i < parameters.Count; i++)
             {
                 if (!grads.TryGetValue(parameters[i], out var g))
                     throw new InvalidOperationException($"Tape produced no gradient for parameter {i}.");
-                if (gpu is not null && !GpuOptimizer.TrySgdStep(parameters[i], g, (float)lr))
-                    throw new InvalidOperationException(
-                        $"Parameter {i} [{string.Join(", ", parameters[i].Shape.ToArray())}]: the device-side SGD step " +
-                        $"was refused (parameter on device: {parameters[i].TryGetGpuBuffer() is not null}, gradient on " +
-                        $"device: {g.TryGetGpuBuffer() is not null}). That is a residency gap: the step would have to leave the device.");
+                stepGradients[i] = g;
+            }
+            // One fused update for the whole list, as torch.optim.SGD (foreach) does on the PyTorch side.
+            if (gpu is not null && !GpuOptimizer.TrySgdStepMultiTensor(parameters, stepGradients, (float)lr))
+            {
+                int i = Enumerable.Range(0, parameters.Count).First(k =>
+                    parameters[k].TryGetGpuBuffer() is null || stepGradients[k].TryGetGpuBuffer() is null);
+                throw new InvalidOperationException(
+                    $"Parameter {i} [{string.Join(", ", parameters[i].Shape.ToArray())}]: the device-side SGD step " +
+                    $"was refused (parameter on device: {parameters[i].TryGetGpuBuffer() is not null}, gradient on " +
+                    $"device: {stepGradients[i].TryGetGpuBuffer() is not null}). That is a residency gap: the step would have to leave the device.");
             }
 
             // Marks each parameter modified itself, so data derived from the old weights is refreshed.

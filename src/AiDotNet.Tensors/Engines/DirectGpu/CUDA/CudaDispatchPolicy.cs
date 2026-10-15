@@ -55,11 +55,9 @@ internal static class CudaDispatchPolicy
         => TensorCodecOptions.Current.UseCudnnBatchNorm && CuDnnContext.IsAvailable;
 
     /// <summary>
-    /// Returns true when MatMul / GEMM should run through cuBLAS: user
-    /// hasn't set <see cref="TensorCodecOptions.UseCublas"/> to false and
-    /// the cuBLAS handle is available. CudaBackend always has cuBLAS
-    /// loaded as a prerequisite of initialisation, so the availability
-    /// leg is effectively "are we running on CudaBackend at all".
+    /// The user's leg of whether a GEMM calls cuBLAS: <see cref="TensorCodecOptions.UseCublas"/>. The backend
+    /// combines it with whether cuBLAS is loadable at all (<see cref="CudaBackend.IsCublasAvailable"/>; cuBLAS is
+    /// optional, #1265); otherwise the generated GEMM kernels run.
     /// </summary>
     public static bool UseCublasForMatMul
         => TensorCodecOptions.Current.UseCublas;
