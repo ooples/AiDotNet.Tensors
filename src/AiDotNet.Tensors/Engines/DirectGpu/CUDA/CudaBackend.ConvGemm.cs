@@ -72,11 +72,143 @@ public sealed partial class CudaBackend
         LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
+    /// <summary>AIDOTNET_CONV_IMPLICIT_WGRAD=0 restores the im2col + GEMM weight gradient (#1313).</summary>
+    private static readonly bool s_convImplicitWgrad =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CONV_IMPLICIT_WGRAD") != "0";
+
+    private IGpuBuffer? _convWgradPartials;
+
+    // Tile and split-K shape of conv2d_wgrad_implicit_gemm (WG_BM / WG_BN / WG_BK in CudaConvolutionKernels).
+    private const int WgradTile = 64, WgradTileK = 16;
+
+    /// <summary>
+    /// #1313: gradKernel[Cout, P] as an implicit GEMM over K = batch * outH * outW, gathering the input instead of
+    /// materializing an im2col buffer. When the 64 x 64 output tiles alone cannot fill the device, K is split across
+    /// blocks and the slices are summed in a fixed order afterwards. Overwrites gradKernel. False when the kernels
+    /// are missing or the partials buffer cannot be sized (the caller then uses the im2col path).
+    /// </summary>
+    private unsafe bool TryConv2DBackwardKernelImplicitGemm(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        if (!s_convGemmBackward || !s_convImplicitWgrad || batch <= 0) return false;
+        if (!_kernelCache.TryGetValue("conv2d_wgrad_implicit_gemm", out var gemm) ||
+            !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out var reduce))
+            return false;
+        long kTotal = (long)batch * outHeight * outWidth;
+        long p = (long)inChannels * kernelH * kernelW;
+        long outputs = outChannels * p;
+        if (kTotal <= 0 || kTotal > int.MaxValue || outputs > int.MaxValue) return false;
+
+        int tilesN = (int)((p + WgradTile - 1) / WgradTile), tilesM = (outChannels + WgradTile - 1) / WgradTile;
+        int splits = ImplicitGemmSplits(tilesN * tilesM, kTotal, out int kPerSplit);
+
+        using var _ = PushContext();
+        IGpuBuffer destination = gradKernel;
+        if (splits > 1)
+        {
+            var partials = TryConvScratch(ref _convWgradPartials, (long)splits * outputs);
+            if (partials is null) return false;
+            destination = partials;
+        }
+
+        IntPtr inPtr = input.Handle, dyPtr = gradOutput.Handle, outPtr = destination.Handle;
+        void** args = stackalloc void*[20];
+        args[0] = &inPtr; args[1] = &dyPtr; args[2] = &outPtr;
+        args[3] = &batch; args[4] = &inChannels; args[5] = &inHeight; args[6] = &inWidth;
+        args[7] = &outChannels; args[8] = &outHeight; args[9] = &outWidth;
+        args[10] = &kernelH; args[11] = &kernelW; args[12] = &strideH; args[13] = &strideW;
+        args[14] = &padH; args[15] = &padW; args[16] = &dilationH; args[17] = &dilationW; args[18] = &kPerSplit;
+        LaunchKernel3D(gemm, (uint)tilesN, (uint)tilesM, (uint)splits, (uint)DefaultBlockSize, 1, 1, args, 0);
+
+        if (splits > 1)
+        {
+            IntPtr partPtr = destination.Handle, gkPtr = gradKernel.Handle;
+            int count = (int)outputs;
+            void** rargs = stackalloc void*[4];
+            rargs[0] = &partPtr; rargs[1] = &gkPtr; rargs[2] = &count; rargs[3] = &splits;
+            LaunchKernel(reduce, (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, rargs);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Split-K count for the implicit-GEMM conv kernels: enough blocks for four per SM, but never a split shorter
+    /// than eight K tiles. kPerSplit is a multiple of the K tile.
+    /// </summary>
+    private int ImplicitGemmSplits(int tiles, long kTotal, out int kPerSplit)
+    {
+        int blockTarget = Math.Max(1, 4 * Math.Max(1, _multiProcessorCount));
+        int maxSplits = (int)Math.Max(1, kTotal / (8L * WgradTileK));
+        int splits = Math.Min(maxSplits, Math.Max(1, (blockTarget + tiles - 1) / tiles));
+        kPerSplit = (int)(((kTotal + splits - 1) / splits + WgradTileK - 1) / WgradTileK * WgradTileK);
+        return (int)((kTotal + kPerSplit - 1) / kPerSplit);
+    }
+
+    /// <summary>AIDOTNET_CONV_IMPLICIT_DGRAD=0 restores the GEMM + col2im input gradient (#1313).</summary>
+    private static readonly bool s_convImplicitDgrad =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_CONV_IMPLICIT_DGRAD") != "0";
+
+    private IGpuBuffer? _convDgradPartials;
+
+    /// <summary>
+    /// #1313: gradInput[B, Cin, H, W] as an implicit GEMM over K = Cout * kH * kW, gathering gradOutput instead of
+    /// writing a col buffer and scattering it back with col2im. Split-K and its fixed-order sum as in the weight
+    /// gradient. Overwrites gradInput. False when the kernels are missing or the partials buffer cannot be sized.
+    /// </summary>
+    private unsafe bool TryConv2DBackwardInputImplicitGemm(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        if (!s_convGemmBackward || !s_convImplicitDgrad || batch <= 0) return false;
+        if (!_kernelCache.TryGetValue("conv2d_dgrad_implicit_gemm", out var gemm) ||
+            !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out var reduce))
+            return false;
+        long nTotal = (long)batch * inChannels * inHeight * inWidth;
+        long columns = (long)batch * inHeight * inWidth;
+        long kTotal = (long)outChannels * kernelH * kernelW;
+        if (nTotal <= 0 || kTotal <= 0 || nTotal > int.MaxValue) return false;
+
+        int tilesN = (int)((columns + WgradTile - 1) / WgradTile), tilesM = (inChannels + WgradTile - 1) / WgradTile;
+        int splits = ImplicitGemmSplits(tilesN * tilesM, kTotal, out int kPerSplit);
+
+        using var _ = PushContext();
+        IGpuBuffer destination = gradInput;
+        if (splits > 1)
+        {
+            var partials = TryConvScratch(ref _convDgradPartials, (long)splits * nTotal);
+            if (partials is null) return false;
+            destination = partials;
+        }
+
+        IntPtr dyPtr = gradOutput.Handle, wPtr = kernel.Handle, outPtr = destination.Handle;
+        void** args = stackalloc void*[20];
+        args[0] = &dyPtr; args[1] = &wPtr; args[2] = &outPtr;
+        args[3] = &batch; args[4] = &inChannels; args[5] = &inHeight; args[6] = &inWidth;
+        args[7] = &outChannels; args[8] = &outHeight; args[9] = &outWidth;
+        args[10] = &kernelH; args[11] = &kernelW; args[12] = &strideH; args[13] = &strideW;
+        args[14] = &padH; args[15] = &padW; args[16] = &dilationH; args[17] = &dilationW; args[18] = &kPerSplit;
+        LaunchKernel3D(gemm, (uint)tilesN, (uint)tilesM, (uint)splits, (uint)DefaultBlockSize, 1, 1, args, 0);
+
+        if (splits > 1)
+        {
+            IntPtr partPtr = destination.Handle, gxPtr = gradInput.Handle;
+            int count = (int)nTotal;
+            void** rargs = stackalloc void*[4];
+            rargs[0] = &partPtr; rargs[1] = &gxPtr; rargs[2] = &count; rargs[3] = &splits;
+            LaunchKernel(reduce, (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, rargs);
+        }
+        return true;
+    }
+
     /// <summary>gradKernel[Cout,P] = sum_b gradOutput_b[Cout,L] * col_b[P,L]^T. Overwrites gradKernel.</summary>
     private bool TryConv2DBackwardKernelGemm(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
+        if (TryConv2DBackwardKernelImplicitGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return true;
         if (!ConvGemmUsable() || batch <= 0) return false;
         int L = outHeight * outWidth, P = inChannels * kernelH * kernelW;
         using var _ = PushContext();
@@ -117,6 +249,9 @@ public sealed partial class CudaBackend
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
+        if (TryConv2DBackwardInputImplicitGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return true;
         if (!ConvGemmUsable() || batch <= 0) return false;
         int L = outHeight * outWidth, P = inChannels * kernelH * kernelW;
         using var _ = PushContext();
