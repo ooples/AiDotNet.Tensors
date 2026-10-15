@@ -18166,7 +18166,8 @@ public partial class CpuEngine : ITensorLevelEngine
                             DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     },
-                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)),
+                    BackwardFunctions<T>.MaxPool2DRecomputeOnDeviceOr(new[] { ph, pw }, new[] { sh, sw },
+                        BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _))),
                     // The pool geometry (no indices): lets a compiled CPU training plan run the backward as one
                     // re-scan of the input written straight into the gradient buffer (MaxPool2DBackwardRecomputeInto)
                     // instead of replaying the forward under a tape, and lets the serializer rebuild the real pool.

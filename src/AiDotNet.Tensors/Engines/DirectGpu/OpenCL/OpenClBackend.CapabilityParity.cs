@@ -5,8 +5,11 @@ using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
-public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend
+public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMeshgridBackend, ISeededGumbelSoftmaxBackend, IUninitializedGpuAllocation, IMultiTensorGpuOptimizerBackend, IDeviceReadbackFactory
 {
+    // No asynchronous device-to-host copy is wired on this backend: the readback downloads when it is queued.
+    IDeviceReadback IDeviceReadbackFactory.CreateReadback(int byteCapacity) => new SynchronousDeviceReadback(this, byteCapacity);
+
     /// <remarks>OpenCL keeps its power-of-two FFT kernel.</remarks>
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
 
@@ -30,6 +33,14 @@ public sealed partial class OpenClBackend : IFftBackend, IGenericFftBackend, IMe
         float weightDecay, int step)
         => PerTensorMultiTensorOptimizer.Update(this, true, parameters, gradients, firstMoments, secondMoments,
             sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    public void AdamMultiTensorUpdateGuarded(bool decoupledWeightDecay,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step, IGpuBuffer finiteGuard)
+        => PerTensorMultiTensorOptimizer.UpdateGuarded(this, decoupledWeightDecay, parameters, gradients, firstMoments,
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard);
 
     public void SgdMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,

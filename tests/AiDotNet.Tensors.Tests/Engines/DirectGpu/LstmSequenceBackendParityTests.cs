@@ -1,6 +1,7 @@
 #if NET6_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
@@ -184,6 +185,17 @@ public sealed class LstmSequenceBackendParityTests
             AssertClose(r.GWhh, backend.DownloadBuffer(gWhh), $"{shape} gradWhh");
             AssertClose(r.GBias, backend.DownloadBuffer(gBias), $"{shape} gradBias");
         }
+    }
+
+    // CUDA's backward is the recurrence kernel plus GEMMs (lstm_backward_recurrence); this is its only parity check
+    // against the CPU BPTT.
+    [SkippableFact]
+    public void Cuda_LstmSequence_MatchesCpu()
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        Check(backend);
     }
 
     [SkippableFact]

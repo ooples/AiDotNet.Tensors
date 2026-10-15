@@ -63,12 +63,18 @@ public sealed class TensorCodecOptions
     /// </remarks>
     internal static Scope Push(TensorCodecOptions? options)
     {
-        var scope = new Scope(_current, BlasProvider.GetThreadLocalDeterministicMode());
+        var scope = Save();
         SetCurrent(options);
         return scope;
     }
 
-    /// <summary>Restores the options and determinism override captured by <see cref="Push"/>.</summary>
+    /// <summary>
+    /// Captures the calling thread's options field (including "none") and BLAS determinism override, without changing
+    /// them, for a caller that installs options itself; disposing the scope puts both back.
+    /// </summary>
+    internal static Scope Save() => new(_current, BlasProvider.GetThreadLocalDeterministicMode());
+
+    /// <summary>Restores the options and determinism override captured by <see cref="Push"/> or <see cref="Save"/>.</summary>
     internal readonly struct Scope : IDisposable
     {
         private readonly TensorCodecOptions? _previous;

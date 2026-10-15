@@ -342,8 +342,16 @@ internal static class GpuBenchmarkEnvironment
     /// Waits (idle) until the GPU has cooled to <paramref name="targetCelsius"/>, so a long matrix of routes does not
     /// heat the device past the evidence ceiling partway through. The ceiling check itself is unchanged.
     /// </summary>
-    internal static void WaitForCooldown(string label, int targetCelsius = 55, int timeoutSeconds = 900)
+    // 55 C was reachable only with the SM clock locked low; at stock clocks this 3080 idles near 60-63 C. 65 C is reachable
+    // at idle and stays 10 C under the 75 C evidence ceiling. AIDOTNET_BENCH_COOLDOWN_C overrides it.
+    private static int DefaultCooldownCelsius =>
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_BENCH_COOLDOWN_C"), out int celsius) && celsius > 0
+            ? celsius
+            : 65;
+
+    internal static void WaitForCooldown(string label, int targetCelsius = 0, int timeoutSeconds = 900)
     {
+        if (targetCelsius <= 0) targetCelsius = DefaultCooldownCelsius;
         var watch = Stopwatch.StartNew();
         while (true)
         {

@@ -463,7 +463,8 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.NormalizationExperimentOverride;
-        TensorCodecOptions previousOptions = TensorCodecOptions.Current;
+        // Save restores the thread's options and determinism override; SetCurrent(Current) would leave an override behind (#1221).
+        var previousOptions = TensorCodecOptions.Save();
         DirectPtxFeatureGate.TestOverride = true;
         DirectPtxFeatureGate.NormalizationExperimentOverride = true;
         TensorCodecOptions.SetCurrent(new TensorCodecOptions { Deterministic = false });
@@ -536,7 +537,7 @@ public sealed class DirectPtxNormalizationCorrectnessTests
         }
         finally
         {
-            TensorCodecOptions.SetCurrent(previousOptions);
+            previousOptions.Dispose();
             DirectPtxFeatureGate.TestOverride = previousGate;
             DirectPtxFeatureGate.NormalizationExperimentOverride = previousExperiment;
         }

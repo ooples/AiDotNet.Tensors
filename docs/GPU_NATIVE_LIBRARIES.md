@@ -39,6 +39,8 @@ Three ways to switch cuBLAS off:
 
 Independent of cuBLAS's presence, `Gemm` routes a shape to a tuned generated kernel only where it measured faster than cuBLAS on this device (#1309, `CudaBackend.TuneGemmRouteAsync`). cuBLAS calls stay wherever cuBLAS still wins, so they are kept and made optional rather than removed.
 
+Eager launches and launches recorded into a CUDA graph capture are measured and routed separately. A generated kernel can beat cuBLAS on eager launches only because it launches more cheaply. A graph removes that difference, and cuBLAS's kernel can then be the faster one (at 128³ and 256³ strict FP32 on an RTX 3080: 6.8 vs 4.4 µs and 9.7 vs 6.4 µs per GEMM in replay). A verdict persisted before graph verdicts existed keeps graph captures on cuBLAS.
+
 ## HIP (`HipBackend`)
 
 | Library | Needed? | Loaded | Without it |

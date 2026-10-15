@@ -669,9 +669,31 @@ internal static class DifferentiableOps
             buffer._gradWriteGeneration = GradWriteGeneration;
             ReplaceAccumulatorBufferOwner(tensor, previous, buffer);
         }
-        if (!ReferenceEquals(contribution, buffer))
+        if (!ReferenceEquals(contribution, buffer) && !IsSameDenseRegion(contribution, buffer))
+        {
+            if (_graphCaptureDebug)
+            {
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                    $"[ALIAS] firstwrite-copy op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={contribution.Length} sharesStorage={contribution.SharesStorageWith(buffer)}" + System.Environment.NewLine); } catch { }
+            }
             engine.TensorCopy(contribution, buffer);
+        }
         return buffer;
+    }
+
+    /// <summary>True when <paramref name="a"/> and <paramref name="b"/> are the same elements: one contiguous region of
+    /// one storage and, where either is bound to a device buffer, the same device buffer. A compiled plan makes an
+    /// operand's gradient a view of an add's output gradient (CompiledTrainingPlan.AliasReshapeViewGradients), so the
+    /// add's backward then "copies" that gradient onto itself.</summary>
+    private static bool IsSameDenseRegion<T>(Tensor<T> a, Tensor<T> b)
+    {
+        if (!a.IsContiguous || !b.IsContiguous || a.Length != b.Length || a._storageOffset != b._storageOffset
+            || !a.SharesStorageWith(b))
+            return false;
+        var deviceA = a.TryGetGpuBuffer();
+        var deviceB = b.TryGetGpuBuffer();
+        if (deviceA is null && deviceB is null) return !a.HasPendingGpuData && !b.HasPendingGpuData;
+        return deviceA is not null && deviceB is not null && deviceA.Handle == deviceB.Handle;
     }
 
     internal static bool AccumulateGradPoolable<T>(
@@ -807,6 +829,44 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
+    /// The device counterpart of <see cref="TryGetDirectGradTarget{T}"/>, for a resident (captured) GPU step: the
+    /// existing gradient accumulator a backward kernel may write into on the device, so the step has no separate copy
+    /// (first contribution) or add (later ones) per gradient -- on the parity Transformer those first-write copies were
+    /// most of the captured step's copy nodes. <paramref name="accumulate"/> says whether the kernel must add to the
+    /// buffer's contents (it already holds this step's gradient) or overwrite them. Nothing is claimed: the caller
+    /// commits with <see cref="CommitDirectGradWrite{T}"/> only once the kernel was launched into this target, and
+    /// otherwise accumulates as usual. Null outside a resident step, under create-graph, or with no dense accumulator.
+    /// </summary>
+    internal static Tensor<T>? PeekDirectDeviceGradTarget<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool accumulate)
+    {
+        accumulate = false;
+        if (_isBackwardCreateGraph || engine is not DirectGpuTensorEngine gpu || !gpu.ResidentStepActive) return null;
+        int idx = tensor._gradIndex;
+        var indexedGrads = _indexedGrads;
+        Tensor<T>? existing = indexedGrads is not null && idx >= 0 && idx < indexedGrads.Length
+            ? (Tensor<T>?)indexedGrads[idx]
+            : (grads.TryGetValue(tensor, out var found) ? found : null);
+        if (existing is null || !existing.IsContiguous || existing._storageOffset != 0
+            || existing.Length != tensor.Length) return null;
+        accumulate = IsWrittenThisStep(existing);
+        return existing;
+    }
+
+    /// <summary>Records that a kernel wrote <paramref name="tensor"/>'s gradient straight into
+    /// <paramref name="target"/> (from <see cref="PeekDirectDeviceGradTarget{T}"/>), as AccumulateGrad would have.</summary>
+    internal static void CommitDirectGradWrite<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, Tensor<T> target)
+    {
+        MarkWrittenThisStep(target);
+        int idx = tensor._gradIndex;
+        var indexedGrads = _indexedGrads;
+        if (indexedGrads is not null && idx >= 0 && idx < indexedGrads.Length) indexedGrads[idx] = target;
+        grads[tensor] = target;
+        tensor.Grad = target;
+    }
+
+    /// <summary>
     /// Accumulates a gradient for a tensor in the gradient dictionary.
     /// If the tensor already has a gradient, the new gradient is added to it.
     /// </summary>
@@ -927,6 +987,11 @@ internal static class DifferentiableOps
                     }
                     else
                     {
+                        if (_graphCaptureDebug)
+                        {
+                            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                                $"[ALIAS] inplace-add op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length}" + System.Environment.NewLine); } catch { }
+                        }
                         using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
                             engine.TensorAddInPlace(existing, GradForInPlace());
                         accumulated = existing;
@@ -985,6 +1050,11 @@ internal static class DifferentiableOps
                 }
                 else
                 {
+                    if (_graphCaptureDebug)
+                    {
+                        try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                            $"[ALIAS] inplace-add op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length} rank={tensor.Rank}" + System.Environment.NewLine); } catch { }
+                    }
                     using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
                         engine.TensorAddInPlace(existingDict, GradForInPlace());
                     tensor.Grad = existingDict;

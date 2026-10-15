@@ -79,9 +79,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public bool ReplayedAGraph;
         public string[] StepStates = Array.Empty<string>();
         public float[][] LastGradients = Array.Empty<float[]>();
+        public float[][] WeightsBeforeNonFiniteStep = Array.Empty<float[]>();
+        public float[][] WeightsAfterNonFiniteStep = Array.Empty<float[]>();
+        public bool SkipReportedAtNonFiniteStep;
+        public bool SkipReportedAfterNonFiniteStep;
+        public int NonFiniteStepsSkipped;
+        public int OptimizerStep;
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -118,12 +124,21 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             concrete.FailNextCaptureForTesting = failCapture;
             concrete.FailInsideNextCaptureForTesting = failInsideCapture;
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            plan.SetMaxGradNorm(maxGradNorm);
             var losses = new double[Steps];
             float[][] lastGradients = Array.Empty<float[]>();
             var states = new string[Steps];
+            var run = new Run();
             for (int s = 0; s < Steps; s++)
             {
                 FeedBatch(x, y, s);
+                if (s == clipOffFromStep) plan.SetMaxGradNorm(0);
+                if (s == nonFiniteStep)
+                {
+                    // One non-finite input makes every gradient non-finite: the whole step must be discarded.
+                    x.AsWritableSpan()[0] = float.NaN;
+                    run.WeightsBeforeNonFiniteStep = parameters.Select(p => p.ToArray()).ToArray();
+                }
                 if (releasedInputBinding && s == 3)
                 {
                     // An earlier eager step can leave an input bound to a buffer that is no longer its to use: released
@@ -159,17 +174,23 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 states[s] = $"resident={lossTensor.IsGpuResident} pending={lossTensor.HasPendingGpuData} cpuRef={reference:G6}";
                 losses[s] = lossTensor.ToArray()[0];
                 if (s == Steps - 1) lastGradients = plan.Gradients.Select(g => g.ToArray()).ToArray();
+                if (s == nonFiniteStep)
+                {
+                    run.WeightsAfterNonFiniteStep = parameters.Select(p => p.ToArray()).ToArray();
+                    run.SkipReportedAtNonFiniteStep = plan.LastStepSkippedNonFiniteGradients;
+                }
+                if (nonFiniteStep >= 0 && s == nonFiniteStep + 1) run.SkipReportedAfterNonFiniteStep = plan.LastStepSkippedNonFiniteGradients;
             }
             var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
-            return new Run
-            {
-                Losses = losses,
-                FinalWeights = parameters.Select(p => p.ToArray()).ToArray(),
-                ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead,
-                LastGradients = lastGradients,
-                StepStates = states,
-            };
+            run.Losses = losses;
+            run.FinalWeights = parameters.Select(p => p.ToArray()).ToArray();
+            run.ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead;
+            run.LastGradients = lastGradients;
+            run.StepStates = states;
+            run.NonFiniteStepsSkipped = plan.NonFiniteStepsSkipped;
+            run.OptimizerStep = concrete.OptimizerStep;
+            return run;
         }
     }
 
@@ -199,6 +220,56 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6} (captured {captured.StepStates[s]}, eager {eager.StepStates[s]})");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A non-finite gradient on a replayed step must discard that step entirely - no moment or weight written - and
+    /// report it, exactly as an eager step does. On CUDA the decision is made on the device (the multi-tensor Adam
+    /// kernel reads the gradients' sum of squares) and the host learns of it from an asynchronous readback, so the
+    /// skip report and the step counter must still come out as if the host had checked before launching.
+    /// <para>With gradient clipping on, the guard reuses the clip's sum of squares of the same gradients; clipping
+    /// switched off at the non-finite step must not let the previous step's (finite) clip sum stand in for it.</para>
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0.0, int.MaxValue)]
+    [InlineData(0.5, int.MaxValue)]
+    [InlineData(0.5, 6)]
+    public void A_non_finite_gradient_discards_the_replayed_step_like_the_eager_step(double maxGradNorm, int clipOffFromStep)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            const int nonFiniteStep = 6;   // after warm-up and capture: a replay
+            var eager = Train(gpu, capture: false, nonFiniteStep: nonFiniteStep, maxGradNorm: maxGradNorm, clipOffFromStep: clipOffFromStep);
+            var captured = Train(gpu, capture: true, nonFiniteStep: nonFiniteStep, maxGradNorm: maxGradNorm, clipOffFromStep: clipOffFromStep);
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+
+            foreach (var (name, run) in new[] { ("eager", eager), ("captured", captured) })
+            {
+                Assert.True(run.SkipReportedAtNonFiniteStep, $"{name}: the non-finite step was not reported as skipped");
+                Assert.False(run.SkipReportedAfterNonFiniteStep, $"{name}: the finite step after it was reported as skipped");
+                Assert.Equal(1, run.NonFiniteStepsSkipped);
+                Assert.Equal(Steps - 1, run.OptimizerStep);
+                for (int p = 0; p < run.WeightsBeforeNonFiniteStep.Length; p++)
+                    Assert.Equal(run.WeightsBeforeNonFiniteStep[p], run.WeightsAfterNonFiniteStep[p]);
+            }
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s == nonFiniteStep) continue;
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            }
             for (int p = 0; p < eager.FinalWeights.Length; p++)
                 for (int i = 0; i < eager.FinalWeights[p].Length; i++)
                     Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
@@ -589,6 +660,326 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// The tape ground truth for gradients that receive two contributions per step: the hidden activation feeds two
+    /// layers and the output weight is shared by a fused linear and a plain matmul. In a resident GPU step the backward
+    /// GEMMs write straight into the gradient buffers, overwriting on a buffer's first contribution of the step and
+    /// adding on the later one (GEMM beta 0 / 1); a step that overwrote where it should add, or added onto the previous
+    /// step's stale gradient, would still agree with its own eager twin, so only the tape can catch it.
+    /// <para>The residual network covers the plan's other shortcut: a residual branch's output is used only by the
+    /// add, so its gradient buffer IS the add's output gradient (no copy), while the residual stream's gets a copy
+    /// plus the branch's contribution. The wide log-softmax network covers the step's pooled scratch: a log-softmax
+    /// over more classes than the fused kernel takes is composed from row reductions whose scratch buffers the step
+    /// reuses every replay.</para>
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, TwoPathNetwork.SharedWeightAndFanOut)]
+    [InlineData(true, TwoPathNetwork.SharedWeightAndFanOut)]
+    [InlineData(false, TwoPathNetwork.Residual)]
+    [InlineData(true, TwoPathNetwork.Residual)]
+    [InlineData(false, TwoPathNetwork.WideLogSoftmax)]
+    [InlineData(true, TwoPathNetwork.WideLogSoftmax)]
+    [InlineData(false, TwoPathNetwork.ResidualLayerNorm)]
+    [InlineData(true, TwoPathNetwork.ResidualLayerNorm)]
+    [InlineData(false, TwoPathNetwork.SharedBias)]
+    [InlineData(true, TwoPathNetwork.SharedBias)]
+    [InlineData(false, TwoPathNetwork.SoftmaxCrossEntropy)]
+    [InlineData(true, TwoPathNetwork.SoftmaxCrossEntropy)]
+    [InlineData(false, TwoPathNetwork.StandaloneRelu)]
+    [InlineData(true, TwoPathNetwork.StandaloneRelu)]
+    [InlineData(false, TwoPathNetwork.Pooling)]
+    [InlineData(true, TwoPathNetwork.Pooling)]
+    [InlineData(false, TwoPathNetwork.PreNormResidualStream)]
+    [InlineData(true, TwoPathNetwork.PreNormResidualStream)]
+    [InlineData(false, TwoPathNetwork.ResidualReadAfterFanOut)]
+    [InlineData(true, TwoPathNetwork.ResidualReadAfterFanOut)]
+    [InlineData(false, TwoPathNetwork.MeanAroundKeptAxis)]
+    [InlineData(true, TwoPathNetwork.MeanAroundKeptAxis)]
+    [InlineData(false, TwoPathNetwork.MaxPool)]
+    [InlineData(true, TwoPathNetwork.MaxPool)]
+    public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
+    {
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
+        {
+            TwoPathNetwork.Residual => ResidualLoss,
+            TwoPathNetwork.WideLogSoftmax => WideLogSoftmaxLoss,
+            TwoPathNetwork.ResidualLayerNorm => ResidualLayerNormLoss,
+            TwoPathNetwork.SharedBias => SharedBiasLoss,
+            TwoPathNetwork.SoftmaxCrossEntropy => SoftmaxCrossEntropyLoss,
+            TwoPathNetwork.StandaloneRelu => StandaloneReluLoss,
+            TwoPathNetwork.Pooling => PoolingLoss,
+            TwoPathNetwork.PreNormResidualStream => PreNormResidualStreamLoss,
+            TwoPathNetwork.ResidualReadAfterFanOut => ResidualReadAfterFanOutLoss,
+            TwoPathNetwork.MeanAroundKeptAxis => MeanAroundKeptAxisLoss,
+            TwoPathNetwork.MaxPool => MaxPoolLoss,
+            _ => SharedLoss,
+        };
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            if (capture)
+            {
+                Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                    "Whole-step graph capture is CUDA-only.");
+                Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                    "Graph capture is disabled for this process.");
+            }
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var parameters = network switch
+            {
+                TwoPathNetwork.Residual => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
+                    Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+                TwoPathNetwork.SharedBias => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
+                    Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([Hidden, Outputs], 6, 0.3f) },
+                TwoPathNetwork.ResidualLayerNorm => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
+                    Ones(Hidden, 8, 0.2f), Rand([Hidden], 9, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+                TwoPathNetwork.StandaloneRelu => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f),
+                    Rand([Hidden, Outputs], 11, 0.3f) },
+                TwoPathNetwork.MaxPool => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden / 4, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+                TwoPathNetwork.MeanAroundKeptAxis => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden, Outputs], 4, 0.3f) },
+                TwoPathNetwork.ResidualReadAfterFanOut => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Hidden], 12, 0.3f), Rand([Hidden], 13, 0.1f),
+                    Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([Hidden, Outputs], 11, 0.3f) },
+                TwoPathNetwork.PreNormResidualStream => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Ones(Hidden, 8, 0.2f), Rand([Hidden], 9, 0.1f), Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f),
+                    Rand([Hidden, Hidden], 12, 0.3f), Rand([Hidden], 13, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+                TwoPathNetwork.Pooling => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([8, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([6, Outputs], 11, 0.3f) },
+                TwoPathNetwork.WideLogSoftmax => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]),
+                    Rand([Hidden, WideClasses], 6, 0.3f), Rand([WideClasses], 7, 0.1f), Rand([WideClasses, Outputs], 4, 0.1f), Rand([Outputs], 5, 0.1f) },
+                _ => new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f) },
+            };
+            foreach (var p in parameters) p.Gpu();
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                loss(gpu, x, y, parameters);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                if (!capture) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                var gradients = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_gradients", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete) as Tensor<float>[]
+                    ?? throw new InvalidOperationException("CompiledTrainingPlan._gradients was not found.");
+                for (int s = 0; s < Steps; s++)
+                {
+                    FeedBatch(x, y, s);
+                    var expected = CpuTapeGradients(x, y, parameters, loss);
+                    plan.Step();
+                    for (int p = 0; p < parameters.Length; p++)
+                    {
+                        var actual = gradients[p].TryGetGpuBuffer() is { } buffer && gpu.GetBackend() is { } backend
+                            ? backend.DownloadBuffer(buffer)
+                            : gradients[p].ToArray();
+                        double diff = 0, norm = 0;
+                        for (int i = 0; i < expected[p].Length; i++)
+                        {
+                            double d = actual[i] - expected[p][i];
+                            diff += d * d; norm += (double)expected[p][i] * expected[p][i];
+                        }
+                        Assert.True(norm > 0, $"step {s}, param {p}: the tape gradient is zero, so the comparison proves nothing");
+                        Assert.True(Math.Sqrt(diff) <= 1e-3 * Math.Sqrt(norm) + 1e-6,
+                            $"step {s}, param {p}: |plan - tape| = {Math.Sqrt(diff):G4}, |tape| = {Math.Sqrt(norm):G4}");
+                    }
+                }
+                if (capture)
+                {
+                    var exec = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete);
+                    Assert.True(exec is IntPtr handle && handle != IntPtr.Zero,
+                        "no graph was captured, so the capture row compared eager with eager");
+                }
+            }
+        }
+    }
+
+    /// <summary>MSE of <c>FusedLinear(h, w2, b2) + h · w2</c> with <c>h = ReLU(x · w0 + b0)</c>: h and w2 each get two
+    /// gradient contributions per step.</summary>
+    private static Tensor<float> SharedLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var pred = e.TensorAdd(e.FusedLinear(h, w[2], w[3], FusedActivationType.None), e.TensorMatMul(h, w[2]));
+        return e.TensorMSELoss(pred, y);
+    }
+
+    /// <summary>MSE of a residual block's projection: <c>r = h + ReLU(h · w2 + b2)</c>, <c>pred = r · w4 + b4</c>, with
+    /// <c>h = ReLU(x · w0 + b0)</c>.</summary>
+    private static Tensor<float> ResidualLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var r = e.TensorAdd(h, e.FusedLinear(h, w[2], w[3], FusedActivationType.ReLU));
+        return e.TensorMSELoss(e.FusedLinear(r, w[4], w[5], FusedActivationType.None), y);
+    }
+
+    // Wider than DirectGpuTensorEngine's fused log-softmax row limit (256), so the GPU step composes it from row
+    // reductions whose scratch comes from the step's pool.
+    private const int WideClasses = 300;
+
+    /// <summary>MSE of a projection of <c>LogSoftmax(h · w2 + b2)</c> over <see cref="WideClasses"/> classes, with
+    /// <c>h = ReLU(x · w0 + b0)</c>.</summary>
+    private static Tensor<float> WideLogSoftmaxLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var logProbabilities = e.TensorLogSoftmax(e.FusedLinear(h, w[2], w[3], FusedActivationType.None), 1);
+        return e.TensorMSELoss(e.FusedLinear(logProbabilities, w[4], w[5], FusedActivationType.None), y);
+    }
+
+    /// <summary>MSE of a projection of two residual blocks sharing one LayerNorm, <c>r = h + LN(h)</c> and
+    /// <c>s = r + LN(r)</c>, with <c>h = ReLU(x · w0 + b0)</c>: each LayerNorm input gets its own and the residual's
+    /// gradient, and the shared gamma and beta two contributions each (overwrite, then add).</summary>
+    private static Tensor<float> ResidualLayerNormLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var r = e.TensorAdd(h, e.LayerNorm(h, w[2], w[3], 1e-5, out _, out _));
+        var s = e.TensorAdd(r, e.LayerNorm(r, w[2], w[3], 1e-5, out _, out _));
+        return e.TensorMSELoss(e.FusedLinear(s, w[4], w[5], FusedActivationType.None), y);
+    }
+
+    /// <summary>MSE of <c>(h · w2 + b) + (h · w4 + b)</c> with <c>h = ReLU(x · w0 + b0)</c>: the two output layers share
+    /// one bias, whose gradient is summed into its accumulator twice (overwrite, then add).</summary>
+    private static Tensor<float> SharedBiasLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var pred = e.TensorAdd(e.FusedLinear(h, w[2], w[3], FusedActivationType.None),
+            e.FusedLinear(h, w[4], w[3], FusedActivationType.None));
+        return e.TensorMSELoss(pred, y);
+    }
+
+    // Zeroes the target's first row: an ignored row, which must count in neither the loss nor its denominator.
+    private static readonly Tensor<float> IgnoreFirstRow = BuildIgnoreFirstRowMask();
+
+    private static Tensor<float> BuildIgnoreFirstRowMask()
+    {
+        var mask = new Tensor<float>([Batch, Outputs]);
+        for (int i = Outputs; i < mask.Length; i++) mask[i] = 1f;
+        return mask;
+    }
+
+    /// <summary>TensorSoftmaxCrossEntropy of a two-layer classifier's logits against the batch's targets (soft and
+    /// partly negative values, as FeedBatch draws them) with the first row ignored.</summary>
+    private static Tensor<float> SoftmaxCrossEntropyLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var logits = e.FusedLinear(h, w[2], w[3], FusedActivationType.None);
+        return e.TensorSoftmaxCrossEntropy(logits, e.TensorMultiply(y, IgnoreFirstRow));
+    }
+
+    /// <summary>MSE of <c>ReLU(ReLU(p) · w2 + b2) · w4 + b4 + p · w6</c> with <c>p = x · w0 + b0</c>, the ReLUs separate
+    /// ops: the outer ReLU's input gradient is its accumulator's first contribution of the step (written straight
+    /// in), while p's already holds the later matmul's contribution when the inner ReLU's backward runs (added).</summary>
+    private static Tensor<float> StandaloneReluLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var p = e.FusedLinear(x, w[0], w[1], FusedActivationType.None);
+        var c = e.TensorReLU(e.FusedLinear(e.TensorReLU(p), w[2], w[3], FusedActivationType.None));
+        var pred = e.TensorAdd(e.FusedLinear(c, w[4], w[5], FusedActivationType.None), e.TensorMatMul(p, w[6]));
+        return e.TensorMSELoss(pred, y);
+    }
+
+    /// <summary>MSE of <c>mean_1(r) · w2 + b2 + sum_2(r) · w4</c> with <c>r = ReLU(x · w0 + b0)</c> viewed as [batch, 6, 8]:
+    /// the trailing-axis sum's gradient is r's first contribution (the broadcast writes it straight into the
+    /// accumulator) and the middle-axis mean's is added on top.</summary>
+    private static Tensor<float> PoolingLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var r = e.Reshape(e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU), new[] { Batch, 6, 8 });
+        var mean = e.ReduceMean(r, new[] { 1 }, keepDims: false);
+        var sum = e.ReduceSum(r, new[] { 2 }, keepDims: false);
+        var pred = e.TensorAdd(e.FusedLinear(mean, w[2], w[3], FusedActivationType.None),
+            e.FusedLinear(sum, w[4], w[3], FusedActivationType.None));
+        return e.TensorMSELoss(pred, y);
+    }
+
+    /// <summary>MSE of a projection of two pre-norm residual blocks, <c>r1 = h + LN(h) · w4 + b5</c> and
+    /// <c>r2 = r1 + LN(r1) · w6 + b7</c> (one LayerNorm shared), with <c>h = ReLU(x · w0 + b1)</c>: the residual stream feeds
+    /// each add and the next LayerNorm, as a Transformer's does. On the GPU the stream's gradients share the adds' output
+    /// gradient buffers (AliasMultiConsumerPassThroughs), the LayerNorms adding into them after the branches read them.</summary>
+    private static Tensor<float> PreNormResidualStreamLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var r1 = e.TensorAdd(h, e.FusedLinear(e.LayerNorm(h, w[2], w[3], 1e-5, out _, out _), w[4], w[5], FusedActivationType.None));
+        var r2 = e.TensorAdd(r1, e.FusedLinear(e.LayerNorm(r1, w[2], w[3], 1e-5, out _, out _), w[6], w[7], FusedActivationType.None));
+        return e.TensorMSELoss(e.FusedLinear(r2, w[8], w[9], FusedActivationType.None), y);
+    }
+
+    /// <summary>MSE of <c>r · w6 + b7 + g · w8 + b7</c> with <c>f = h · w2 + b3</c>, <c>g = h · w4 + b5</c> recorded after f, and
+    /// <c>r = h + f</c>, for <c>h = ReLU(x · w0 + b1)</c>: f's backward reads r's gradient AFTER g's adds h's contribution, so
+    /// h's gradient must not share r's buffer (it would hand f a gradient with g's contribution in it).</summary>
+    private static Tensor<float> ResidualReadAfterFanOutLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var f = e.FusedLinear(h, w[2], w[3], FusedActivationType.None);
+        var g = e.FusedLinear(h, w[4], w[5], FusedActivationType.None);
+        var r = e.TensorAdd(h, f);
+        var pred = e.TensorAdd(e.FusedLinear(r, w[6], w[7], FusedActivationType.None), e.FusedLinear(g, w[8], w[7], FusedActivationType.None));
+        return e.TensorMSELoss(pred, y);
+    }
+
+    /// <summary>MSE of <c>h · w2 + mean_{0,2}(h viewed as [batch, 6, 8])</c> with <c>h = ReLU(x · w0 + b1)</c>: a mean over a
+    /// leading and a trailing block around one kept axis, as a convolution's bias gradient sums dY over N, H and W, used
+    /// as the projection's bias. In a resident step that reduction runs as sum_around_kept.</summary>
+    private static Tensor<float> MeanAroundKeptAxisLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var bias = e.ReduceMean(e.Reshape(h, new[] { Batch, Outputs, Hidden / Outputs }), new[] { 0, 2 }, keepDims: false);
+        return e.TensorMSELoss(e.FusedLinear(h, w[2], bias, FusedActivationType.None), y);
+    }
+
+    /// <summary>MSE of a projection of a 2x2 max pool, <c>pool(h viewed as [batch, 3, 4, 4]) · w2 + b3</c> with
+    /// <c>h = ReLU(x · w0 + b1)</c>: the pool's input gradient is its accumulator's first contribution, which on the GPU the
+    /// per-window backward writes straight in (every cell: the winner's gradient, every other cell 0).</summary>
+    private static Tensor<float> MaxPoolLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.Reshape(e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU), new[] { Batch, 3, 4, 4 });
+        // The int-index overload, as AiDotNet's pooling layer calls it: a compiled plan records it without indices.
+        var pooled = e.MaxPool2DWithIndices(h, new[] { 2, 2 }, new[] { 2, 2 }, out _);
+        return e.TensorMSELoss(e.FusedLinear(e.Reshape(pooled, new[] { Batch, Hidden / 4 }), w[2], w[3], FusedActivationType.None), y);
+    }
+
+    // A LayerNorm gain near one: 1 + noise.
+    private static Tensor<float> Ones(int length, int seed, float noise)
+    {
+        var t = Rand([length], seed, noise);
+        for (int i = 0; i < length; i++) t[i] += 1f;
+        return t;
+    }
+
+    /// <summary>Networks whose gradients the compiled GPU step forms through a shortcut the eager tape does not take.</summary>
+    public enum TwoPathNetwork
+    {
+        /// <summary>An activation feeding two layers; a weight shared by a linear and a matmul.</summary>
+        SharedWeightAndFanOut,
+        /// <summary>A residual block: the stream gets the add's gradient plus the branch's.</summary>
+        Residual,
+        /// <summary>A log-softmax over more classes than the fused kernel takes (pooled composed path).</summary>
+        WideLogSoftmax,
+        /// <summary>Residual blocks sharing a LayerNorm: its gradients written straight into their accumulators.</summary>
+        ResidualLayerNorm,
+        /// <summary>Two output layers sharing one bias: its gradient's column sums added into the accumulator.</summary>
+        SharedBias,
+        /// <summary>A classifier trained with the fused softmax cross-entropy (soft, negative and ignored targets).</summary>
+        SoftmaxCrossEntropy,
+        /// <summary>Separate ReLU ops: one gradient written into its accumulator, one added to an earlier contribution.</summary>
+        StandaloneRelu,
+        /// <summary>A middle-axis mean and a trailing-axis sum of one activation: broadcast gradients, written then added.</summary>
+        Pooling,
+        /// <summary>Two pre-norm residual blocks: the residual stream feeds each add and the next LayerNorm.</summary>
+        PreNormResidualStream,
+        /// <summary>A residual add whose branch is read after another consumer of the stream added into it.</summary>
+        ResidualReadAfterFanOut,
+        /// <summary>A mean around one kept axis (a convolution's bias-gradient shape), used as a bias.</summary>
+        MeanAroundKeptAxis,
+        /// <summary>A non-overlapping 2x2 max pool whose input gradient is a first contribution.</summary>
+        MaxPool,
+    }
+
+    /// <summary>
     /// The same ground truth on the CPU engine, which AiDotNet's compiled training step uses whenever no GPU is
     /// selected: every step's plan gradient (plus the L2 term) must equal a fresh GradientTape's on that step's batch.
     /// </summary>
@@ -953,6 +1344,23 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
             var loss = Loss(cpu, Copy(x), Copy(y), w, composedMse, hidden);
             var grads = tape.ComputeGradients(loss, w);
+            return w.Select(p => grads[p].ToArray()).ToArray();
+        }
+        finally { AiDotNetEngine.Current = prior; }
+    }
+
+    private static float[][] CpuTapeGradients(Tensor<float> x, Tensor<float> y, Tensor<float>[] parameters,
+        Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss)
+    {
+        var prior = AiDotNetEngine.Current;
+        var cpu = new CpuEngine();
+        try
+        {
+            AiDotNetEngine.Current = cpu;
+            Tensor<float> Copy(Tensor<float> t) => new Tensor<float>(t.ToArray(), t.Shape.ToArray());
+            var w = parameters.Select(Copy).ToArray();
+            using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+            var grads = tape.ComputeGradients(loss(cpu, Copy(x), Copy(y), w), w);
             return w.Select(p => grads[p].ToArray()).ToArray();
         }
         finally { AiDotNetEngine.Current = prior; }

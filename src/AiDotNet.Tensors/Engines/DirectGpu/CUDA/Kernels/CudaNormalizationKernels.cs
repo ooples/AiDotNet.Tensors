@@ -492,6 +492,310 @@ extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_grad_gamma(
     }
     gradGamma[i] = dGamma;
 }
+
+// LayerNorm's inverse std from the saved variance, invStd = 1 / sqrt(var + eps): the same three operations as the
+// add_scalar, sqrt_vector and reciprocal_vector kernels (same compile flags), in one launch instead of three.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_inverse_std(
+    const float* __restrict__ variance, float* __restrict__ invStd, int rows, float epsilon)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    float s = sqrtf(variance[i] + epsilon);
+    invStd[i] = 1.0f / s;
+}
+
+// The inverse: LayerNorm's forward reports true variance, var = 1 / (invStd * invStd) - eps, in place -- the
+// multiply_vectors, reciprocal_vector and sub_scalar kernels' arithmetic (same compile flags) in one launch.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_variance_from_inverse_std(
+    float* __restrict__ values, int rows, float epsilon)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
+    float inv = values[i];
+    float squared = inv * inv;
+    float r = 1.0f / squared;
+    values[i] = r - epsilon;
+}
+
+// LayerNorm's affine gradients over [rows, cols], pass 1 of a deterministic two-pass column reduction. Block (32, 8)
+// covers 32 columns of one chunk of rows: each warp reads 32 consecutive floats of a row (coalesced), each of the 8 row
+// lanes sums its rows in order, and lane 0 adds the 8 lanes in a fixed order into partials[chunk][col] (gamma) and
+// partials[chunks + chunk][col] (beta). The thread-per-column kernel ran on cols / 32 blocks -- 2 for a 64-wide model.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_partial(
+    const float* __restrict__ gradOutput, const float* __restrict__ input,
+    const float* __restrict__ saveMean, const float* __restrict__ saveInvVar,
+    float* __restrict__ partials, int rows, int cols, int rowsPerChunk)
+{
+    __shared__ float sg[8][33];
+    __shared__ float sb[8][33];
+    int col = blockIdx.x * 32 + threadIdx.x;
+    int chunk = blockIdx.y;
+    int r0 = chunk * rowsPerChunk;
+    int r1 = min(rows, r0 + rowsPerChunk);
+    float g = 0.0f, b = 0.0f;
+    if (col < cols)
+    {
+        for (int r = r0 + threadIdx.y; r < r1; r += 8)
+        {
+            int idx = r * cols + col;
+            float dy = gradOutput[idx];
+            float normalized = (input[idx] - saveMean[r]) * saveInvVar[r];
+            g += dy * normalized;
+            b += dy;
+        }
+    }
+    sg[threadIdx.y][threadIdx.x] = g;
+    sb[threadIdx.y][threadIdx.x] = b;
+    __syncthreads();
+    if (threadIdx.y == 0 && col < cols)
+    {
+        float tg = 0.0f, tb = 0.0f;
+        for (int y = 0; y < 8; y++) { tg += sg[y][threadIdx.x]; tb += sb[y][threadIdx.x]; }
+        partials[chunk * cols + col] = tg;
+        partials[(gridDim.y + chunk) * cols + col] = tb;
+    }
+}
+
+// Pass 2: each column's chunk partials summed in chunk order, then written to (or added to, for a gradient that
+// already holds this step's contributions) gradGamma / gradBeta.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_finish(
+    const float* __restrict__ partials, float* __restrict__ gradGamma, float* __restrict__ gradBeta,
+    int cols, int chunks, int addGamma, int addBeta)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float g = 0.0f, b = 0.0f;
+    for (int c = 0; c < chunks; c++)
+    {
+        g += partials[c * cols + col];
+        b += partials[(chunks + c) * cols + col];
+    }
+    gradGamma[col] = addGamma ? gradGamma[col] + g : g;
+    gradBeta[col] = addBeta ? gradBeta[col] + b : b;
+}
+
+// Column sums of a row-major [rows, cols] matrix (a linear layer's bias gradient), pass 1: the same deterministic
+// (column tile x row chunk) blocking as layernorm_grad_params_partial, writing partials[chunk][col]. cuBLAS ran this
+// as a ones-GEMV (gemv2N) at ~10 us for 2048 x 64..256.
+extern ""C"" __global__ __launch_bounds__(256) void column_sum_partial(
+    const float* __restrict__ input, float* __restrict__ partials, int rows, int cols, int rowsPerChunk)
+{
+    __shared__ float s[8][33];
+    int col = blockIdx.x * 32 + threadIdx.x;
+    int chunk = blockIdx.y;
+    int r0 = chunk * rowsPerChunk;
+    int r1 = min(rows, r0 + rowsPerChunk);
+    float acc = 0.0f;
+    if (col < cols)
+        for (int r = r0 + threadIdx.y; r < r1; r += 8)
+            acc += input[r * cols + col];
+    s[threadIdx.y][threadIdx.x] = acc;
+    __syncthreads();
+    if (threadIdx.y == 0 && col < cols)
+    {
+        float t = 0.0f;
+        for (int y = 0; y < 8; y++) t += s[y][threadIdx.x];
+        partials[chunk * cols + col] = t;
+    }
+}
+
+// A sum over a leading and a trailing block around one kept axis (a convolution's bias gradient): input viewed as
+// [L, C, T]. Pass 1: block (c, chunk) sums channel c over rows [chunk * rowsPerChunk, +rowsPerChunk) -- each row a run
+// of T contiguous floats -- by a fixed shared-memory tree, into partials[chunk * C + c].
+extern ""C"" __global__ __launch_bounds__(256) void sum_around_kept_partial(
+    const float* __restrict__ x, float* __restrict__ partials, int L, int C, int T, int rowsPerChunk)
+{
+    __shared__ float s[256];
+    int c = blockIdx.x, chunk = blockIdx.y;
+    int l0 = chunk * rowsPerChunk, l1 = min(L, l0 + rowsPerChunk);
+    long long span = (long long)max(0, l1 - l0) * T;
+    float acc = 0.0f;
+    for (long long e = threadIdx.x; e < span; e += blockDim.x)
+    {
+        int l = l0 + (int)(e / T), t = (int)(e % T);
+        acc += x[((long long)l * C + c) * T + t];
+    }
+    s[threadIdx.x] = acc;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1)
+    {
+        if (threadIdx.x < o) s[threadIdx.x] += s[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partials[(long long)chunk * C + c] = s[0];
+}
+
+// Pass 2: each channel's partials summed in chunk order, times scale.
+extern ""C"" __global__ __launch_bounds__(256) void sum_around_kept_finish(
+    const float* __restrict__ partials, float* __restrict__ output, int C, int chunks, float scale)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float t = 0.0f;
+    for (int k = 0; k < chunks; k++) t += partials[(long long)k * C + c];
+    output[c] = scale * t;
+}
+
+// LayerNorm's input gradient ADDED into gradInput, one warp per row of [rows, cols]:
+// dx += invStd * (g*dy - mean_c(g*dy) - xhat * mean_c(g*dy*xhat)), xhat = (x - mean) * invStd. Lane-strided sums
+// reduced by a fixed xor-shuffle tree: deterministic.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_input_grad_add(
+    const float* __restrict__ dy, const float* __restrict__ x, const float* __restrict__ gamma,
+    const float* __restrict__ mean, const float* __restrict__ invStd, float* __restrict__ dx, int rows, int cols)
+{
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const float* dyr = dy + (long long)row * cols;
+    const float* xr = x + (long long)row * cols;
+    float* dxr = dx + (long long)row * cols;
+    float mu = mean[row], is = invStd[row];
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int c = lane; c < cols; c += 32)
+    {
+        float gdy = gamma[c] * dyr[c];
+        s1 += gdy;
+        s2 += gdy * ((xr[c] - mu) * is);
+    }
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        s1 += __shfl_xor_sync(0xffffffff, s1, o);
+        s2 += __shfl_xor_sync(0xffffffff, s2, o);
+    }
+    float invCols = 1.0f / cols;
+    s1 *= invCols;
+    s2 *= invCols;
+    for (int c = lane; c < cols; c += 32)
+    {
+        float gdy = gamma[c] * dyr[c];
+        float xh = (xr[c] - mu) * is;
+        dxr[c] += is * (gdy - s1 - xh * s2);
+    }
+}
+
+// The gradient of a sum or mean over one middle block of axes: output[o, r, i] = scale * g[o, i] for an input viewed as
+// [outer, reduced, inner], written (or added) in one pass -- a float4 per thread when inner is a multiple of four.
+extern ""C"" __global__ __launch_bounds__(256) void broadcast_reduced_middle(
+    const float* __restrict__ g, float* __restrict__ output, int outer, int reduced, int inner, float scale, int add)
+{
+    long long total = (long long)outer * reduced * inner;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    if ((inner & 3) == 0)
+    {
+        long long quads = total >> 2;
+        for (long long q = (long long)blockIdx.x * blockDim.x + threadIdx.x; q < quads; q += stride)
+        {
+            long long e = q << 2;
+            int i = (int)(e % inner);
+            long long o = e / ((long long)reduced * inner);
+            float4 v = *reinterpret_cast<const float4*>(g + o * inner + i);
+            float4 r = make_float4(scale * v.x, scale * v.y, scale * v.z, scale * v.w);
+            float4* out = reinterpret_cast<float4*>(output + e);
+            if (add) { float4 c = *out; r.x += c.x; r.y += c.y; r.z += c.z; r.w += c.w; }
+            *out = r;
+        }
+        return;
+    }
+    for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += stride)
+    {
+        int i = (int)(e % inner);
+        long long o = e / ((long long)reduced * inner);
+        float r = scale * g[o * inner + i];
+        output[e] = add ? output[e] + r : r;
+    }
+}
+
+// Pass 2: each column's partials summed in chunk order, written to (or added to) output.
+extern ""C"" __global__ __launch_bounds__(256) void column_sum_finish(
+    const float* __restrict__ partials, float* __restrict__ output, int cols, int chunks, int add)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    float t = 0.0f;
+    for (int c = 0; c < chunks; c++) t += partials[c * cols + col];
+    output[col] = add ? output[col] + t : t;
+}
+
+// Soft-target softmax cross-entropy (IEngine.TensorSoftmaxCrossEntropy), forward pass 1: one warp per row of [rows, cols]
+// writes rowStats[0..rows) = log-sum-exp, [rows..2rows) = sum of targets, [2rows..3rows) = sum target * logSoftmax,
+// [3rows..4rows) = 1 when the target row has mass. Lane-strided sums then a fixed xor-shuffle tree: deterministic.
+extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_rows(
+    const float* __restrict__ logits, const float* __restrict__ target, float* __restrict__ rowStats, int rows, int cols)
+{
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const float* z = logits + (long long)row * cols;
+    const float* t = target + (long long)row * cols;
+    float m = -INFINITY;
+    for (int c = lane; c < cols; c += 32) m = fmaxf(m, z[c]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    float s = 0.0f;
+    for (int c = lane; c < cols; c += 32) s += expf(z[c] - m);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+    float lse = m + logf(s);
+    float sum = 0.0f, dot = 0.0f, mass = 0.0f;
+    for (int c = lane; c < cols; c += 32)
+    {
+        float tv = t[c];
+        sum += tv;
+        dot += tv * (z[c] - lse);
+        mass += fabsf(tv);
+    }
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        sum += __shfl_xor_sync(0xffffffff, sum, o);
+        dot += __shfl_xor_sync(0xffffffff, dot, o);
+        mass += __shfl_xor_sync(0xffffffff, mass, o);
+    }
+    if (lane == 0)
+    {
+        rowStats[row] = lse;
+        rowStats[rows + row] = sum;
+        rowStats[2 * rows + row] = dot;
+        rowStats[3 * rows + row] = mass > 0.0f ? 1.0f : 0.0f;
+    }
+}
+
+// Pass 2, one block of 256: loss[0] = -(sum of row dots) / count and count[0] = max(1, supervised rows), summed in a
+// fixed order (strided per thread, then a shared-memory tree).
+extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_total(
+    const float* __restrict__ rowStats, float* __restrict__ loss, float* __restrict__ count, int rows)
+{
+    __shared__ float sd[256];
+    __shared__ float ss[256];
+    int tid = threadIdx.x;
+    float d = 0.0f, s = 0.0f;
+    for (int r = tid; r < rows; r += 256) { d += rowStats[2 * rows + r]; s += rowStats[3 * rows + r]; }
+    sd[tid] = d; ss[tid] = s;
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1)
+    {
+        if (tid < w) { sd[tid] += sd[tid + w]; ss[tid] += ss[tid + w]; }
+        __syncthreads();
+    }
+    if (tid == 0)
+    {
+        float cnt = fmaxf(ss[0], 1.0f);
+        count[0] = cnt;
+        loss[0] = -(sd[0] / cnt);
+    }
+}
+
+// Backward: dLogits = gradOut / count * (softmax * sum of the row's targets - target), written or added.
+extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
+    const float* __restrict__ logits, const float* __restrict__ target, const float* __restrict__ rowStats,
+    const float* __restrict__ count, const float* __restrict__ gradOut, float* __restrict__ gradLogits,
+    int rows, int cols, int add)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long n = (long long)rows * cols;
+    if (i >= n) return;
+    int row = (int)(i / cols);
+    float g = gradOut[0] / count[0];
+    float v = g * (expf(logits[i] - rowStats[row]) * rowStats[rows + row] - target[i]);
+    gradLogits[i] = add ? gradLogits[i] + v : v;
+}
 ";
         }
 
@@ -508,7 +812,20 @@ extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_grad_gamma(
                 "instancenorm_forward",
                 "rmsnorm_forward",
                 "rmsnorm_backward",
-                "rmsnorm_grad_gamma"
+                "rmsnorm_grad_gamma",
+                "layernorm_inverse_std",
+                "layernorm_variance_from_inverse_std",
+                "layernorm_grad_params_partial",
+                "layernorm_grad_params_finish",
+                "column_sum_partial",
+                "column_sum_finish",
+                "broadcast_reduced_middle",
+                "layernorm_input_grad_add",
+                "sum_around_kept_partial",
+                "sum_around_kept_finish",
+                "softmax_xent_rows",
+                "softmax_xent_total",
+                "softmax_xent_backward"
             };
         }
     }

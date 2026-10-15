@@ -987,6 +987,511 @@ extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d_backward_we
     }
     gradKernel[idx] = sum;
 }
+
+// #1313: Conv2D weight gradient as an implicit GEMM, without an im2col buffer.
+//   dW[co, p] = sum over k = (b, oh, ow) of dY[b, co, oh, ow] * X[b, ci, oh*sH - pH + kh*dH, ow*sW - pW + kw*dW]
+// with p = (ci, kh, kw) and X zero outside the input: C[M = Cout, N = P] = A[M, K] * B[K, N], K = batch * outH * outW.
+// A block owns a 64 x 64 tile of C (4 x 4 per thread) over the K range [z * kPerSplit, (z + 1) * kPerSplit); both
+// operand tiles go through padded shared memory, and the B tile is gathered from X with the convolution's index
+// arithmetic, consecutive lanes on consecutive output positions so the loads coalesce. Each split writes its own
+// slice of partials ([split][Cout][P]); conv2d_wgrad_splitk_reduce adds the slices in split order, so the result
+// does not depend on scheduling. With one split the block writes dW directly.
+#define WG_BM 64
+#define WG_BN 64
+#define WG_BK 16
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_implicit_gemm(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    // Two buffers each: the next K tile's global loads go to registers while this tile's FMAs run.
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
+    const int L = outH * outW, P = inC * kH * kW, K = batch * L, khw = kH * kW;
+    const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
+    const int kBegin = blockIdx.z * kPerSplit;
+    const int kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+
+    // Loader lanes: element e = tid + 256 * r of a 16 x 64 tile, k = e % 16 (fastest), m or n = e / 16.
+    const int lk = tid & 15, lc = tid >> 4;   // lc in [0, 16); the four loads cover columns lc, lc + 16, lc + 32, lc + 48
+    int bci[4], bkh[4], bkw[4];
+    bool bValid[4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+    {
+        int p = n0 + lc + 16 * r;
+        bValid[r] = p < P;
+        int pp = bValid[r] ? p : 0;
+        bci[r] = pp / khw;
+        int rem = pp - bci[r] * khw;
+        bkh[r] = rem / kW;
+        bkw[r] = rem - bkh[r] * kW;
+    }
+
+    float ra[4], rb[4];
+    auto load = [&](int k0)
+    {
+        int k = k0 + lk;
+        bool kIn = k < kEnd;
+        int b = 0, oh = 0, ow = 0;
+        if (kIn) { b = k / L; int l = k - b * L; oh = l / outW; ow = l - oh * outW; }
+        const float* dyRow = gradOutput + (long long)b * outC * L + oh * outW + ow;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            ra[r] = (kIn && m < outC) ? dyRow[(long long)m * L] : 0.0f;
+            float x = 0.0f;
+            if (kIn && bValid[r])
+            {
+                int ih = oh * sH - pH + bkh[r] * dH;
+                int iw = ow * sW - pW + bkw[r] * dW;
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                    x = input[(((long long)b * inC + bci[r]) * H + ih) * W + iw];
+            }
+            rb[r] = x;
+        }
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][lk][lc + 16 * r] = rb[r];
+        }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    if (kBegin < kEnd)
+    {
+        load(kBegin);
+        store(0);
+        __syncthreads();
+    }
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < kEnd;
+        if (more) load(k0 + WG_BK);
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        if (more)
+        {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    float* slice = out + (long long)blockIdx.z * outC * P;
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+        int m = m0 + ty * 4 + i;
+        if (m >= outC) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            int n = n0 + tx * 4 + j;
+            if (n < P) slice[(long long)m * P + n] = acc[i][j];
+        }
+    }
+}
+
+// Adds the split-K slices of conv2d_wgrad_implicit_gemm in split order: dW[i] = sum over z of partials[z][i].
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce(
+    const float* __restrict__ partials, float* __restrict__ gradKernel, int count, int splits)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float sum = 0.0f;
+    for (int z = 0; z < splits; z++) sum += partials[(long long)z * count + i];
+    gradKernel[i] = sum;
+}
+
+// #1313: Conv2D input gradient as an implicit GEMM, without the col buffer and col2im scatter.
+//   dX[b, ci, ih, iw] = sum over k = (co, kh, kw) of W[co, ci, kh, kw] * dY[b, co, oh, ow],
+//   oh = (ih + pH - kh*dH) / sH and ow = (iw + pW - kw*dW) / sW when both divide exactly and land inside dY.
+// C[M = Cin, N = batch * H * W] = A[M, K] * B[K, N], K = Cout * kH * kW. Same tiling as conv2d_wgrad_implicit_gemm
+// (64 x 64 per block, 4 x 4 per thread, BK = 16); the B loader puts consecutive lanes on consecutive input pixels, so
+// each lane's (b, ih, iw) is fixed for the whole K loop and dY reads coalesce along a row. Split-K slices are written
+// in dX's layout to out + z * batch * Cin * H * W and summed in order by conv2d_wgrad_splitk_reduce.
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    __shared__ __align__(16) float As[WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[WG_BK][WG_BN + 4];
+    const int HW = H * W, N = batch * HW, khw = kH * kW, K = outC * khw, P = inC * khw, L = outH * outW;
+    const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
+    const int kBegin = blockIdx.z * kPerSplit;
+    const int kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+
+    // A loader: k = k0 + (tid & 15), rows m = m0 + (tid >> 4) + 16 * r.
+    const int lk = tid & 15, lc = tid >> 4;
+    // B loader: one input pixel n per lane, rows k = k0 + (tid >> 6) + 4 * r.
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / HW; int hw = n - nb * HW; int ih = hw / W; ihp = ih + pH; iwp = hw - ih * W + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        int ka = k0 + lk;
+        bool kaIn = ka < kEnd;
+        int aco = 0, at = 0;
+        if (kaIn) { aco = ka / khw; at = ka - aco * khw; }
+        const float* wRow = kernel + (long long)aco * P + at;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            As[lk][lc + 16 * r] = (kaIn && m < inC) ? wRow[(long long)m * khw] : 0.0f;
+        }
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int kr = bkRow + 4 * r, kb = k0 + kr;
+            float v = 0.0f;
+            if (nIn && kb < kEnd)
+            {
+                int co = kb / khw, t = kb - co * khw;
+                int kh = t / kW, kw = t - kh * kW;
+                int th = ihp - kh * dH, tw = iwp - kw * dW;
+                if (th >= 0 && tw >= 0)
+                {
+                    int oh = th / sH, ow = tw / sW;
+                    if (oh * sH == th && ow * sW == tw && oh < outH && ow < outW)
+                        v = dyBatch[(long long)co * L + oh * outW + ow];
+                }
+            }
+            Bs[kr][bn] = v;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        __syncthreads();
+    }
+
+    float* slice = out + (long long)blockIdx.z * batch * inC * HW;
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        int nn = n0 + tx * 4 + j;
+        if (nn >= N) continue;
+        int b = nn / HW, hw = nn - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC) col[(long long)m * HW] = acc[i][j];
+        }
+    }
+}
+
+// #1313: conv2d_dgrad_implicit_gemm for Cout % 16 == 0 (every ResNet-style layer), with K ordered (kh, kw, co):
+// k = t * Cout + co, t = kh * kW + kw. A 16-wide K tile then shares one kernel tap, so each lane checks its pixel's
+// source position once per tile instead of once per element, and (t, co0) advance by addition: the K loop has no
+// integer division. Unit stride is its own instantiation (no remainder test). Output columns go out as float4 when
+// H * W is a multiple of 4. Split-K slices as in the generic kernel.
+template <bool UNIT>
+__device__ __forceinline__ void conv2d_dgrad_c16_body(float (*As)[WG_BK][WG_BM + 4], float (*Bs)[WG_BK][WG_BN + 4],
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    const int HW = H * W, N = batch * HW, khw = kH * kW, K = outC * khw, P = inC * khw, L = outH * outW;
+    const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
+    const int kBegin = blockIdx.z * kPerSplit;
+    const int kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int lk = tid & 15, lc = tid >> 4;
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / HW; int hw = n - nb * HW; int ih = hw / W; ihp = ih + pH; iwp = hw - ih * W + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    // Tile state: tap t = (kh, kw) and first output channel co0 of the tile at k0 (kBegin is a multiple of 16).
+    int t = kBegin / outC, co0 = kBegin - t * outC;
+    int kh = t / kW, kw = t - kh * kW;
+
+    // Global -> register loads of one K tile; the stores to shared memory happen after the next compute, so the loads
+    // of tile i + 1 are in flight while tile i's FMAs run (two shared buffers, one barrier per tile).
+    float ra[4], rb[4];
+    auto load = [&]()
+    {
+        const float* wRow = kernel + (long long)(co0 + lk) * P + t;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            ra[r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+        }
+        int th = ihp - kh * dH, tw = iwp - kw * dW;
+        int oh = th, ow = tw;
+        bool valid = nIn && th >= 0 && tw >= 0;
+        if (!UNIT && valid)
+        {
+            oh = th / sH; ow = tw / sW;
+            valid = oh * sH == th && ow * sW == tw;
+        }
+        valid = valid && oh < outH && ow < outW;
+        const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            rb[r] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][bkRow + 4 * r][bn] = rb[r];
+        }
+    };
+    auto advance = [&]()
+    {
+        co0 += WG_BK;
+        if (co0 == outC) { co0 = 0; t++; if (++kw == kW) { kw = 0; kh++; } }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    if (kBegin < kEnd)
+    {
+        load();
+        store(0);
+        __syncthreads();
+    }
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < kEnd;
+        if (more) { advance(); load(); }
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        if (more)
+        {
+            // The other buffer was last read in the previous iteration, before its closing barrier.
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    float* slice = out + (long long)blockIdx.z * batch * inC * HW;
+    int nn = n0 + tx * 4;
+    if ((HW & 3) == 0)
+    {
+        // Four consecutive pixels of one image plane, 16-byte aligned.
+        if (nn >= N) return;
+        int b = nn / HW, hw = nn - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC)
+                *reinterpret_cast<float4*>(col + (long long)m * HW) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        }
+        return;
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        if (nn + j >= N) continue;
+        int b = (nn + j) / HW, hw = nn + j - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC) col[(long long)m * HW] = acc[i][j];
+        }
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c16(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    // Declared here, not in the body, so the two instantiations share one allocation. Two buffers each (prefetch).
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
+    if (sH == 1 && sW == 1)
+        conv2d_dgrad_c16_body<true>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
+            kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
+    else
+        conv2d_dgrad_c16_body<false>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
+            kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
+}
+// #1313: strided input gradient by sub-pixel (phase) decomposition, for Cout % 16 == 0, unit dilation and kH >= sH,
+// kW >= sW. Input pixels split into sH * sW phases by (ih + pH) mod sH and (iw + pW) mod sW; in phase (rh, rw) only the
+// taps kh = rh, rh + sH, ... and kw = rw, rw + sW, ... reach an output position, and every one of them does. So each
+// phase is a dense GEMM C[Cin, pixels of the phase] over K = Cout * (its taps), with no zero-filled gathers: the generic
+// kernel at stride 2 spends three quarters of its B tile on taps that miss. blockIdx.z is the phase; no split-K, the
+// phases write disjoint pixels of dX directly. K is ordered (tap row, tap column, co) as in the _c16 kernel.
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c16_phase(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW)
+{
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
+    const int rh = blockIdx.z / sW, rw = blockIdx.z - rh * sW;
+    // First input row / column of the phase: (ih + pH) % sH == rh.
+    const int ih0 = ((rh - pH) % sH + sH) % sH, iw0 = ((rw - pW) % sW + sW) % sW;
+    const int Hp = ih0 < H ? (H - ih0 + sH - 1) / sH : 0, Wp = iw0 < W ? (W - iw0 + sW - 1) / sW : 0;
+    const int plane = Hp * Wp, N = batch * plane;
+    const int n0 = blockIdx.x * WG_BN;
+    if (n0 >= N) return;
+    const int tapsH = (kH - rh + sH - 1) / sH, tapsW = (kW - rw + sW - 1) / sW;
+    const int K = outC * tapsH * tapsW, HW = H * W, L = outH * outW, khw = kH * kW, P = inC * khw;
+    const int m0 = blockIdx.y * WG_BM;
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int lk = tid & 15, lc = tid >> 4;
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / plane; int q = n - nb * plane; int i = q / Wp; ihp = ih0 + i * sH + pH; iwp = iw0 + (q - i * Wp) * sW + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    int co0 = 0, kh = rh, kw = rw;
+    float ra[4], rb[4];
+    auto load = [&]()
+    {
+        const float* wRow = kernel + (long long)(co0 + lk) * P + kh * kW + kw;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            ra[r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+        }
+        // (ihp - kh) is a multiple of sH by construction; only the edges can fall outside dY.
+        int oh = (ihp - kh) / sH, ow = (iwp - kw) / sW;
+        bool valid = nIn && ihp >= kh && iwp >= kw && oh < outH && ow < outW;
+        const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            rb[r] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][bkRow + 4 * r][bn] = rb[r];
+        }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    load();
+    store(0);
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < K;
+        if (more)
+        {
+            co0 += WG_BK;
+            if (co0 == outC) { co0 = 0; kw += sW; if (kw >= kW) { kw = rw; kh += sH; } }
+            load();
+        }
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        if (more)
+        {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        int nn = n0 + tx * 4 + j;
+        if (nn >= N) continue;
+        int b = nn / plane, q = nn - b * plane, i = q / Wp;
+        float* col = out + (long long)b * inC * HW + (ih0 + i * sH) * W + iw0 + (q - i * Wp) * sW;
+        #pragma unroll
+        for (int i2 = 0; i2 < 4; i2++)
+        {
+            int m = m0 + ty * 4 + i2;
+            if (m < inC) col[(long long)m * HW] = acc[i2][j];
+        }
+    }
+}
 ";
         }
 
@@ -1015,7 +1520,12 @@ extern ""C"" __global__ __launch_bounds__(256) void depthwise_conv2d_backward_we
                 "spiral_conv_backward_input",
                 "spiral_conv_backward_weights",
                 "depthwise_conv2d_backward_input",
-                "depthwise_conv2d_backward_weights"
+                "depthwise_conv2d_backward_weights",
+                "conv2d_wgrad_implicit_gemm",
+                "conv2d_wgrad_splitk_reduce",
+                "conv2d_dgrad_implicit_gemm",
+                "conv2d_dgrad_implicit_gemm_c16",
+                "conv2d_dgrad_implicit_gemm_c16_phase"
             };
         }
     }
