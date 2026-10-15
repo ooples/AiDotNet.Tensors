@@ -1267,7 +1267,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Narrow row-major GEMMs (TrySkinnyGemm / TrySkinnyGemmTransposedA), tried before cuBLAS.
         _skinnyGemmModule = CompileKernelModule(device, Kernels.CudaSkinnyGemmKernels.GetSource(), "skinny_gemm_kernels",
             Kernels.CudaSkinnyGemmKernels.GetKernelNames());
-        // Narrow convolutions as an implicit GEMM (TryConv2DImplicitGemm), tried before the tuned/generic kernels.
+        // Narrow convolutions as an implicit GEMM (TryConv2DImplicitGemm), a candidate of the forward tuned-kernel slot.
         _implicitConvModule = CompileKernelModule(device, Kernels.CudaImplicitConvKernels.GetSource(), "implicit_conv_kernels",
             Kernels.CudaImplicitConvKernels.GetKernelNames());
 
@@ -6725,9 +6725,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _profile = CudaDispatchPolicy.Scope(
             "Conv2D",
             useVendor: false);
-        if (TryConv2DImplicitGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
-                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
-            return;
         // Tuned-kernel registry seam (#1096 E-1): the generic Winograd/tiled/direct dispatch below is the
         // reference; im2col + cuBLAS GEMM and the explicit tiled/direct kernels compete per shape class.
         if (batch > 0 && outHeight > 0 && outWidth > 0)

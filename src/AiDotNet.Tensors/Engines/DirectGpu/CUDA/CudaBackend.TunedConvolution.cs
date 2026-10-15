@@ -82,6 +82,12 @@ public sealed partial class CudaBackend
                             // logged as cuBLAS while the generic kernel ran.
                             true, shape => s_convGemmBackward && ConvGemmForwardFits(shape),
                             (in CudaConv2DArgs a) => ExecuteConv2DForwardGemm(a)),
+                        // #1274's narrow-layer implicit GEMM (Cout <= 64). It used to run ahead of the slot for every
+                        // shape it admits; as a candidate it is chosen only where it measures fastest.
+                        new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.implicit_narrow", TunedKernelOrigin.Builtin,
+                            true, shape => HasTunedKernel("conv2d_implicit_gemm") && ImplicitConvAdmits(shape[0], shape[1],
+                                shape[4], shape[13], shape[14], shape[5], shape[6], shape[7], shape[8], shape[11], shape[12]),
+                            (in CudaConv2DArgs a) => ExecuteConv2DForwardNarrow(a)),
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.implicit_engine", TunedKernelOrigin.Builtin,
                             true, _ => s_convEngineFprop && HasTunedKernel("conv2d_fprop_ig128_tap"),
                             (in CudaConv2DArgs a) => ExecuteConv2DForwardEngine(a)),
@@ -115,6 +121,16 @@ public sealed partial class CudaBackend
         // Only transient states land here (applicability already excludes the process-wide opt-out): during capture
         // without a cuBLAS workspace, or with the scratch not yet sized, the generic kernel computes the same convolution.
         if (!TryConv2DForwardGemm(a))
+            LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+                a.PadH, a.PadW, a.DilationH, a.DilationW);
+    }
+
+    private void ExecuteConv2DForwardNarrow(in CudaConv2DArgs a)
+    {
+        if (!TryConv2DImplicitGemm(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+                a.PadH, a.PadW, a.DilationH, a.DilationW))
             LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                 a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
                 a.PadH, a.PadW, a.DilationH, a.DilationW);
