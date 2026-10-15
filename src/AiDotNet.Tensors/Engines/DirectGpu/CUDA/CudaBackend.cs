@@ -8211,10 +8211,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: adaptive_avgpool2d");
 
         using var _ = PushContext();
-        const int blockSize = 16;
-        uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
-        uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
-        uint gridZ = (uint)(batch * channels);
+        long outputs = (long)batch * channels * outHeight * outWidth;
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
@@ -8227,7 +8224,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         args[5] = &inWidth;
         args[6] = &outHeight;
         args[7] = &outWidth;
-        LaunchKernel2D(kernel, gridX, gridY, gridZ, (uint)blockSize, (uint)blockSize, args);
+        LaunchKernel(kernel, (uint)((outputs + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
     public unsafe void MaxPool3D(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? indices,

@@ -384,12 +384,15 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool2d(
     const float* input, float* output,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
 {
-    int ow = blockIdx.x * blockDim.x + threadIdx.x;
-    int oh = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % channels;
-    int b = blockIdx.z / channels;
-
-    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
+    // One thread per output element over a flat 1D grid. A 16x16 block per (b, c) plane left a 4x4 output with 240 of
+    // 256 threads idle (~50 us for the parity CNN's [64,32,14,14] -> 4x4), and capped batch * channels at 65535.
+    long long flat = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (flat >= (long long)batch * channels * outHeight * outWidth) return;
+    int ow = (int)(flat % outWidth);
+    int oh = (int)((flat / outWidth) % outHeight);
+    long long plane = flat / ((long long)outWidth * outHeight);
+    int c = (int)(plane % channels);
+    int b = (int)(plane / channels);
 
     int hStart = (oh * inHeight) / outHeight;
     int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
