@@ -60,7 +60,6 @@ internal static partial class SimdGemm
     {
         t_largeKRuns++;
         int slices = LargeKSlices(m, k, n);
-        int panels = (n + LargeKPanelN - 1) / LargeKPanelN;
         int outSize = m * n;
         var partials = ArrayPool<float>.Shared.Rent(slices * outSize);
         try
@@ -68,28 +67,29 @@ internal static partial class SimdGemm
             fixed (float* pA = a, pB = b)
             {
                 IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB;
-                void Task(int t)
+                // One task per slice: its slice of A is transposed once and stays in L2 while the task walks the
+                // 256-column panels of B (a task per panel transposed it once per panel: 3x at n = 768).
+                void Task(int s)
                 {
-                    int s = t / panels, panel = t % panels;
                     int k0 = (int)((long)s * k / slices), k1 = (int)((long)(s + 1) * k / slices), ks = k1 - k0;
-                    int j0 = panel * LargeKPanelN, nb = Math.Min(LargeKPanelN, n - j0);
-                    fixed (float* pPart = partials)
+                    float[]? sliceA = null;
+                    if (transA)
                     {
-                        float* pB0 = (float*)ipB + (long)k0 * ldb + j0;
-                        float* pC0 = pPart + (long)s * outSize + j0;
-                        if (!transA)
-                        {
-                            DirectPanel((float*)ipA + k0, lda, pB0, ldb, pC0, n, m, ks, nb, clearedOutput: true);
-                            return;
-                        }
                         // A is stored [k x m] (lda == m): its rows k0..k1 are one contiguous [ks x m] block.
-                        var sliceA = t_largeKSliceA is { } cached && cached.Length >= m * ks ? cached : (t_largeKSliceA = new float[m * ks]);
-                        SimdTranspose.Transpose(new ReadOnlySpan<float>((float*)ipA + (long)k0 * m, ks * m), sliceA, ks, m);
-                        fixed (float* pS = sliceA)
-                            DirectPanel(pS, ks, pB0, ldb, pC0, n, m, ks, nb, clearedOutput: true);
+                        sliceA = t_largeKSliceA is { } cached && cached.Length >= m * ks ? cached : (t_largeKSliceA = new float[m * ks]);
+                        fixed (float* pT = sliceA)
+                            SimdTranspose.TransposeSerial((float*)ipA + (long)k0 * m, pT, ks, m);
+                    }
+                    fixed (float* pPart = partials, pS = sliceA)
+                    {
+                        float* aS = transA ? pS : (float*)ipA + k0;
+                        int ldaS = transA ? ks : lda;
+                        for (int j0 = 0; j0 < n; j0 += LargeKPanelN)
+                            DirectPanel(aS, ldaS, (float*)ipB + (long)k0 * ldb + j0, ldb, pPart + (long)s * outSize + j0, n,
+                                m, ks, Math.Min(LargeKPanelN, n - j0), clearedOutput: true);
                     }
                 }
-                int tasks = slices * panels;
+                int tasks = slices;
                 if (allowParallel && Helpers.CpuParallelSettings.MaxDegreeOfParallelism > 1)
                     Helpers.CpuParallelSettings.LightweightParallel(tasks, Task);
                 else

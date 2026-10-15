@@ -1723,6 +1723,20 @@ internal static partial class SimdGemm
             return;
         }
 
+#if NET5_0_OR_GREATER
+        // Both routes store every element of C, so C need not be cleared first: for a freshly allocated gradient the clear
+        // was also the first touch of its pages (~2.6% of a fused-attention training step's main-thread time).
+        if (QualifiesForTallM(transA, transB, m, k, n))
+        {
+            SgemmTallM(a, lda, b, ldb, c, m, k, n, clearedOutput: true, allowParallel: UseParallelGemm);
+            return;
+        }
+        if (QualifiesForLargeK(transA, transB, lda, m, k, n))
+        {
+            SgemmLargeK(a, lda, transA, b, ldb, c, m, k, n, clearedOutput: true, allowParallel: UseParallelGemm);
+            return;
+        }
+#endif
         c.Clear();
         SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: true);
     }
