@@ -10947,7 +10947,8 @@ public partial class CpuEngine : ITensorLevelEngine
             if (isPointwiseIdentity || t_forceFullIm2Col || fullIm2ColScales)
             {
                 Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
+                    packBoth: !isPointwiseIdentity);
             }
             else
             {
@@ -11191,7 +11192,8 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
-        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+        int stride, int padding, int dilation, int outputHeight, int outputWidth,
+        bool packBoth = false)
     {
         t_fullIm2ColConvRuns++;
         int colH = inChannels * kernelHeight * kernelWidth;
@@ -11241,9 +11243,22 @@ public partial class CpuEngine : ITensorLevelEngine
             // Few output channels against many output pixels is a short, wide GEMM, where SimdGemm's
             // N-parallel direct kernel beats the BLAS route 2-3x; everything else stays on BLAS.
             bool gemmHandled = false;
+            if (packBoth)
+            {
+                // The high-channel conv routes share one GEMM configuration with Conv2DWithImplicitGemmFloat: packed
+                // A and B at the default blocking, whose K order does not depend on how M and N are split or threaded,
+                // so the full matrix and the per-block GEMMs give bit-identical outputs.
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    kernelSpan.Slice(0, outChannels * colH), colH, false,
+                    im2colSpan.Slice(0, sliceSize), colW, false,
+                    outputSpan.Slice(outputOffset, outChannels * colW), colW,
+                    outChannels, colW, colH,
+                    ImplicitConvGemmOptions());
+                gemmHandled = true;
+            }
 #if NET5_0_OR_GREATER
             // No AVX2 SimdGemm on .NET Framework, so this route only exists from .NET 5.
-            if (Simd.SimdGemm.PrefersParallelN(outChannels, colH, colW))
+            if (!gemmHandled && Simd.SimdGemm.PrefersParallelN(outChannels, colH, colW))
             {
                 Simd.SimdGemm.Sgemm(
                     kernelSpan.Slice(0, outChannels * colH), colH, false,
@@ -11378,7 +11393,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// over disjoint column ranges.
     /// </summary>
     [MethodImpl(Hot)]
-    private void Conv2DWithImplicitGemmFloat(
+    private unsafe void Conv2DWithImplicitGemmFloat(
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
@@ -11390,66 +11405,102 @@ public partial class CpuEngine : ITensorLevelEngine
         int colH = checked(inChannels * kernelHeight * kernelWidth);
         int colW = checked(outputHeight * outputWidth);
 
-        // Block on whole output rows so the stride=1 contiguous-memcpy im2col fast path
-        // stays intact and the panel covers an exact column range [oh0*outW, oh1*outW).
+        // #653: the blocks of output rows run in parallel, each on one thread: its im2col panel is built in that
+        // thread's cache and multiplied by a single-threaded packed GEMM over all output channels into its slice of the
+        // output. The blocks used to run one after another, with a serial im2col and a GEMM over a block only a few rows
+        // wide parallelised inside it, which stopped scaling at about 8 threads. Each output element is still produced
+        // by one serial GEMM in the same K order, so the result does not depend on the thread count.
+        int threads = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
         long perRowFloats = (long)colH * outputWidth;
-        int ohRows = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / Math.Max(1, perRowFloats)));
-        int maxNcBlock = checked(ohRows * outputWidth);
-
-        using var inputSpanLease = input.Lease();
-        var inputSpan = inputSpanLease.Span;
-        using var kernelSpanLease = kernel.Lease();
-        var kernelSpan = kernelSpanLease.Span;
-        using var resultDataKeep43 = new KeepAliveScope(result);
-        var outputSpan = result.DataUnmarked.Span;
+        // Panel per thread within the budget the serial version had for its single panel.
+        int rowsByBudget = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / threads / Math.Max(1, perRowFloats)));
+        // At least ImplicitGemmMinBlockColumns output columns per block, so each GEMM is wide enough to run at speed...
+        int rowsForWidth = Math.Min(outputHeight, (ImplicitGemmMinBlockColumns + outputWidth - 1) / outputWidth);
+        // ...and, where the image allows, two blocks per thread so the threads stay balanced.
+        int rowsForBalance = Math.Max(1, (int)((long)batch * outputHeight / (2L * threads)));
+        // The width floor wins over the per-thread budget: a block narrower than that runs the GEMM at a fraction of its speed.
+        int ohRows = Math.Max(1, Math.Min(outputHeight, Math.Max(rowsForWidth, Math.Min(rowsForBalance, rowsByBudget))));
+        // Every block but the last covers whole ImplicitGemmTileColumns-wide GEMM tiles, so the last block starts on a tile
+        // boundary and its partial tile holds exactly the columns the full-matrix GEMM's does: the packed kernel computes a
+        // partial (tail) tile with a different rounding than a full one, so a block edge inside a tile would change those
+        // columns' last bits (a 14-wide row put block 0's columns 64-69 in a tail tile).
+        int rowsPerTile = ImplicitGemmTileColumns / Gcd(outputWidth, ImplicitGemmTileColumns);
+        ohRows = Math.Min(outputHeight, (ohRows + rowsPerTile - 1) / rowsPerTile * rowsPerTile);
+        int blocksPerImage = (outputHeight + ohRows - 1) / ohRows;
+        int blocks = checked(batch * blocksPerImage);
+        // A small plane has few row blocks (an 8x8 output is one 64-column block), so the output channels are split too
+        // until there are two units per thread. Chunks are multiples of ImplicitGemmRowGrain rows, a multiple of every
+        // packed tile height, so only the last chunk holds a partial tile and it is the full GEMM's (same rounding).
+        int mChunkRows = outChannels;
+        if (blocks < 2 * threads && outChannels > ImplicitGemmRowGrain)
+        {
+            int wantChunks = Math.Min((2 * threads + blocks - 1) / blocks, (outChannels + ImplicitGemmRowGrain - 1) / ImplicitGemmRowGrain);
+            mChunkRows = ((outChannels + wantChunks - 1) / wantChunks + ImplicitGemmRowGrain - 1) / ImplicitGemmRowGrain * ImplicitGemmRowGrain;
+        }
+        int mChunks = (outChannels + mChunkRows - 1) / mChunkRows;
+        int units = checked(blocks * mChunks);
         int inputSliceSize = checked(inChannels * height * width);
+        int panelFloats = checked(colH * ohRows * outputWidth);
 
-        var pool = System.Buffers.ArrayPool<float>.Shared;
-        float[] panel = pool.Rent(checked(colH * maxNcBlock));
-        try
+        using var inputDataKeep = new KeepAliveScope(input);
+        using var pinIn = input.ReadOnlyDataUnmarked.Pin();
+        using var kernelDataKeep = new KeepAliveScope(kernel);
+        using var pinK = kernel.ReadOnlyDataUnmarked.Pin();
+        using var resultDataKeep43 = new KeepAliveScope(result);
+        using var pinOut = result.DataUnmarked.Pin();
+        nint pIn = (nint)pinIn.Pointer, pK = (nint)pinK.Pointer, pOut = (nint)pinOut.Pointer;
+        long kernelLength = (long)outChannels * colH, outputLength = (long)batch * outChannels * colW;
+        long work = (long)batch * outChannels * colH * colW;
+
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, units, work, u =>
         {
-            var panelSpan = panel.AsSpan();
-            for (int b = 0; b < batch; b++)
+            int block = u / mChunks, m0 = (u % mChunks) * mChunkRows;
+            int mRows = Math.Min(mChunkRows, outChannels - m0);
+            int b = block / blocksPerImage;
+            int oh0 = (block % blocksPerImage) * ohRows;
+            int oh1 = Math.Min(outputHeight, oh0 + ohRows);
+            int ncBlock = (oh1 - oh0) * outputWidth;
+            float[] panel = System.Buffers.ArrayPool<float>.Shared.Rent(panelFloats);
+            try
             {
-                var inSlice = inputSpan.Slice(b * inputSliceSize, inputSliceSize);
-                int outBatchOffset = b * outChannels * colW;
-                for (int oh0 = 0; oh0 < outputHeight; oh0 += ohRows)
-                {
-                    int oh1 = Math.Min(oh0 + ohRows, outputHeight);
-                    int ncBlock = (oh1 - oh0) * outputWidth;
-                    int colOffset = oh0 * outputWidth; // first output column of this block
-
-                    Helpers.Im2ColHelper.Im2ColRowBlockFloat(
-                        inSlice, panelSpan,
-                        inChannels, height, width,
-                        kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
-                        outputHeight, outputWidth, oh0, oh1);
-
-                    // C[oc, colOffset + j] = kernel[oc, :] · panel[:, j]  for j in [0, ncBlock).
-                    // The block's output columns occupy a ncBlock-wide window of each output
-                    // row, so pass ldc = colW (full row stride): the GEMM writes row oc at
-                    // C[oc*colW + j]. The slice base is the block's first output element.
-                    var cWindow = outputSpan.Slice(outBatchOffset + colOffset);
-                    bool usedBlas = Helpers.BlasProvider.TryGemm(
-                        outChannels, ncBlock, colH,
-                        kernelSpan.Slice(0, outChannels * colH), colH, // A = kernel [outChannels x colH], lda=colH
-                        panelSpan.Slice(0, colH * ncBlock), ncBlock,   // B = panel  [colH x ncBlock],     ldb=ncBlock
-                        cWindow, colW);                                // C window, ldc=colW
-
-                    if (!usedBlas)
-                    {
-                        MultiplyMatrixBlockedFloatStrided(
-                            kernelSpan, panelSpan, cWindow,
-                            outChannels, colH, ncBlock, colW);
-                    }
-                }
+                Helpers.Im2ColHelper.Im2ColRowBlockFloat(
+                    new ReadOnlySpan<float>((float*)pIn + (long)b * inputSliceSize, inputSliceSize), panel,
+                    inChannels, height, width,
+                    kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
+                    outputHeight, outputWidth, oh0, oh1);
+                long cOffset = (long)b * outChannels * colW + (long)m0 * colW + (long)oh0 * outputWidth;
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    new ReadOnlySpan<float>((float*)pK + (long)m0 * colH, (int)(kernelLength - (long)m0 * colH)), colH, false,   // A = kernel rows [m0, m0 + mRows)
+                    new ReadOnlySpan<float>(panel, 0, colH * ncBlock), ncBlock, false,     // B = panel [colH x ncBlock]
+                    new Span<float>((float*)pOut + cOffset, (int)(outputLength - cOffset)), colW,
+                    mRows, ncBlock, colH,
+                    ImplicitConvGemmOptions());
             }
-        }
-        finally
-        {
-            pool.Return(panel);
-        }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(panel);
+            }
+        }, deterministicSafe: true);
     }
+
+    // The GEMM both high-channel conv routes run: single-threaded (the caller parallelises over output blocks), packed A
+    // and B, and FIXED blocking. With fixed Kc every output element sums K in the same Kc-sized steps whatever N the call
+    // covers, so the per-block GEMMs of the implicit route and the full-matrix GEMM give bit-identical results; the
+    // strategy's shape-dependent blocking otherwise chose a different Kc for a 64-column block than for the full width.
+    private static Engines.BlasManaged.BlasOptions<float> ImplicitConvGemmOptions() => new()
+    {
+        NumThreads = -1,
+        PackingMode = Engines.BlasManaged.PackingMode.ForcePackBoth,
+        Mc = 96, Nc = 256, Kc = 256,
+    };
+    // Narrowest block (output columns) the implicit conv GEMM is given: narrower GEMMs fall off the packed kernel's speed.
+    private const int ImplicitGemmMinBlockColumns = 64;
+
+    // Widest column tile of the packed FP32 GEMM kernels (16 on AVX2 and AVX-512 builds; the 8-wide tiles divide it).
+    private const int ImplicitGemmTileColumns = 16;
+
+    // Output-channel chunk granularity of the implicit conv GEMM: a multiple of every packed FP32 tile height (6, 8, 16).
+    private const int ImplicitGemmRowGrain = 48;
 
     /// <summary>
     /// Fallback (no BLAS) GEMM for the fused-conv block: C[m, ncBlock] written into a
