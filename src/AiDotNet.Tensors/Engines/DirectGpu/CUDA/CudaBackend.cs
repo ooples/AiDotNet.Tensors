@@ -290,6 +290,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr _gruModule;
     private IntPtr _snnModule;
     private IntPtr _skinnyGemmModule;
+    private IntPtr _implicitConvModule;
     private IntPtr _fp16Module;
     private IntPtr _parity210Module;
     private IntPtr _detectionModule;
@@ -1264,6 +1265,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Narrow row-major GEMMs (TrySkinnyGemm / TrySkinnyGemmTransposedA), tried before cuBLAS.
         _skinnyGemmModule = CompileKernelModule(device, Kernels.CudaSkinnyGemmKernels.GetSource(), "skinny_gemm_kernels",
             Kernels.CudaSkinnyGemmKernels.GetKernelNames());
+        // Narrow convolutions as an implicit GEMM (TryConv2DImplicitGemm), tried before the tuned/generic kernels.
+        _implicitConvModule = CompileKernelModule(device, Kernels.CudaImplicitConvKernels.GetSource(), "implicit_conv_kernels",
+            Kernels.CudaImplicitConvKernels.GetKernelNames());
 
         // Compile GPU-resident optimizer kernels (adam/adamw/sgd/momentum/nag/
         // adagrad/rmsprop/adadelta/adamax/nadam/lamb/lars/lion/amsgrad/ftrl
@@ -6731,6 +6735,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _profile = CudaDispatchPolicy.Scope(
             "Conv2D",
             useVendor: false);
+        if (TryConv2DImplicitGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return;
         // Tuned-kernel registry seam (#1096 E-1): the generic Winograd/tiled/direct dispatch below is the
         // reference; im2col + cuBLAS GEMM and the explicit tiled/direct kernels compete per shape class.
         if (batch > 0 && outHeight > 0 && outWidth > 0)
@@ -18438,6 +18445,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             CudaNativeBindings.cuModuleUnload(_skinnyGemmModule);
             _skinnyGemmModule = IntPtr.Zero;
+        }
+
+        if (_implicitConvModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_implicitConvModule);
+            _implicitConvModule = IntPtr.Zero;
         }
 
         if (_wmmaModule != IntPtr.Zero)
