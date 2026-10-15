@@ -494,7 +494,7 @@ internal static class CudaNativeBindings
 
     /// <summary>Allocates a CUDA device buffer of <paramref name="bytesize"/>
     /// bytes; caller frees with <see cref="cuMemFree"/>. Used by the on-device
-    /// dispatch path in <see cref="CuRand"/> / <see cref="CuSparse"/> / etc.
+    /// dispatch path in <see cref="CuRand"/> / etc.
     /// and by the transport-side wrappers (NCCL, etc.) to stage host tensors.</summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemAlloc_v2")]
     public static extern CudaResult cuMemAlloc(out IntPtr dptr, ulong bytesize);

@@ -7,8 +7,7 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 /// <summary>
-/// High-level rocSPARSE-backed <see cref="ISparseDeviceOps"/>. AMD-side
-/// mirror of <c>CuSparse</c>. Dispatches to <see cref="RocSparseNative"/>
+/// High-level rocSPARSE-backed <see cref="ISparseDeviceOps"/>. Dispatches to <see cref="RocSparseNative"/>
 /// when <c>librocsparse</c> is loadable; otherwise hands work to
 /// <see cref="CpuSparseDeviceOps"/>. Both produce numerically-identical
 /// CSR output so the caller doesn't see the choice.

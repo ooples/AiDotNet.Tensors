@@ -11,9 +11,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// #515: the managed CSR SpMM kernels against cuSPARSE with everything resident on the device, which is what the
-/// perf bar is about. <see cref="GpuSpMMBenchHarness"/> times the host-array convenience calls, which allocate,
-/// upload, run and download on every call, so on these shapes it measures transfers and allocation and reads
-/// 0.0 GF/s for both sides. Here the operands are uploaded once, each arm runs a batch of launches between two
+/// perf bar is about. cuSPARSE is reached through a test-only binding (<see cref="CuSparseNative"/>); the library
+/// itself no longer uses it. The operands are uploaded once, each arm runs a batch of launches between two
 /// device synchronizations, the two arms alternate over several rounds, and each arm keeps its fastest round.
 /// Gated like the other harness on <c>AIDOTNET_PERF_RUNNER=1</c>: it needs a quiet machine.
 /// </summary>
@@ -33,7 +32,7 @@ public sealed class GpuSpMMResidentBench
         Skip.IfNot(Environment.GetEnvironmentVariable("AIDOTNET_PERF_RUNNER") == "1",
             "Set AIDOTNET_PERF_RUNNER=1 on a quiet GPU machine to bench GPU SpMM.");
         Skip.IfNot(CudaSparseBackend.IsAvailable, "CUDA is not available.");
-        Skip.IfNot(CuSparseBackend.IsAvailable, "cuSPARSE is not available.");
+        Skip.IfNot(CuSparseNative.IsAvailable, "cuSPARSE is not available.");
 
         using var backend = CudaBackend.CreateOrThrow();
         var rng = new Random(515);

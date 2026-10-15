@@ -56,8 +56,9 @@ public partial class CpuEngine
     /// </para>
     ///
     /// <para>
-    /// <b>Training.</b> Under an active <c>GradientTape</c> the call runs the decomposed, differentiable chain
-    /// (projections, SDPA, output projection), so gradients reach the input and all four weights.
+    /// <b>Training.</b> Under an active <c>GradientTape</c> a float call records one fused node whose backward
+    /// recomputes the attention from the saved softmax log-sum-exp; other element types and streamed-quantized weights
+    /// record the decomposed, differentiable chain. Either way gradients reach the input and all four weights.
     /// </para>
     /// </summary>
     /// <param name="input">[B, seq, dModel] input sequence.</param>
@@ -148,6 +149,17 @@ public partial class CpuEngine
         // records each step, so a training call gets the gradients the composition defines.
         if (DifferentiableOps.ThreadTapeActive())
         {
+            // Float with plain weights: one fused tape node (CpuEngine.MultiHeadAttentionBackward.cs), computed on the host.
+            // Streamed int8 / int4 weights and other element types record the decomposed chain, and so does a GPU engine
+            // falling back here (no kernel for a shape): its chain still dispatches each op to the GPU.
+            if (typeof(T) == typeof(float) && !SupportsGpu && !HasStreamingQuantizedWeight(qWeight, kWeight, vWeight, outWeight))
+            {
+                ValidateMhaMask(mask, batch, numHeads, seqLen, seqLen);
+                return (Tensor<T>)(object)MultiHeadAttentionForwardFloatTrain(
+                    (Tensor<float>)(object)input, (Tensor<float>)(object)qWeight, (Tensor<float>)(object)kWeight,
+                    (Tensor<float>)(object)vWeight, (Tensor<float>)(object)outWeight,
+                    mask, batch, seqLen, dModel, numHeads, dHead);
+            }
             var expandedMask = ExpandAttentionMaskForGraph(mask, batch, numHeads, seqLen, seqLen);
             return MultiHeadAttentionForwardGraph(
                 input, qWeight, kWeight, vWeight, outWeight,
@@ -848,14 +860,12 @@ public partial class CpuEngine
         return Reshape(TensorMatMul(concat, outWeight), new[] { batch, seqLen, dModel });
     }
 
-    [MethodImpl(Hot)]
-    private static Tensor<bool>? ExpandAttentionMaskForGraph(
-        Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK)
+    /// <summary>Rejects a mask that is not rank 4 or does not broadcast to [batch, heads, seqQ, seqK].</summary>
+    private static void ValidateMhaMask(Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK)
     {
-        if (mask is null) return null;
+        if (mask is null) return;
         if (mask.Rank != 4)
             throw new ArgumentException("Attention mask must be rank 4.", nameof(mask));
-
         int[] target = { batch, heads, seqQ, seqK };
         for (int axis = 0; axis < 4; axis++)
         {
@@ -864,6 +874,23 @@ public partial class CpuEngine
                     $"Attention mask axis {axis} has extent {mask._shape[axis]}; expected 1 or {target[axis]}.",
                     nameof(mask));
         }
+    }
+
+    /// <summary>Whether any projection weight is a streamed int8 / int4 weight (no fused training path for those).</summary>
+    private static bool HasStreamingQuantizedWeight<T>(params Tensor<T>[] weights)
+    {
+#if NET5_0_OR_GREATER
+        foreach (var w in weights)
+            if (w.GetMaterializedStreamingInt8() is not null || w.GetMaterializedStreamingInt4() is not null) return true;
+#endif
+        return false;
+    }
+    [MethodImpl(Hot)]
+    private static Tensor<bool>? ExpandAttentionMaskForGraph(
+        Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK)
+    {
+        if (mask is null) return null;
+        ValidateMhaMask(mask, batch, heads, seqQ, seqK);
 
         if (mask._shape[0] == batch && mask._shape[1] == heads &&
             mask._shape[2] == seqQ && mask._shape[3] == seqK)
@@ -880,6 +907,6 @@ public partial class CpuEngine
                             mask._shape[1] == 1 ? 0 : h,
                             mask._shape[2] == 1 ? 0 : q,
                             mask._shape[3] == 1 ? 0 : k];
-        return new Tensor<bool>(expanded, target);
+        return new Tensor<bool>(expanded, new[] { batch, heads, seqQ, seqK });
     }
 }

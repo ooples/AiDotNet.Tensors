@@ -6,9 +6,8 @@ using System.Runtime.InteropServices;
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 /// <summary>
-/// rocSPARSE adapter — HIP/ROCm equivalent of
-/// <see cref="CUDA.CuSparseBackend"/>. Same shape (allocate buffers,
-/// build descriptors, call SpMM, copy back), different runtime. Used
+/// rocSPARSE adapter on HIP/ROCm (allocate buffers, build descriptors, call SpMM,
+/// copy back). Used
 /// by <c>SparseOps.SparseMatMul</c> when running on AMD GPUs.
 ///
 /// <para><b>Hardware caveat:</b> not testable on hosts without ROCm.
@@ -45,7 +44,7 @@ internal static class HipSparseBackend
         // Marshal.AllocHGlobal still hits the cleanup branch. Without
         // this guard, a throw between two allocations leaked every
         // earlier device buffer (and any HGlobal pin) — same fix
-        // pattern as CuSparseBackend.
+        // pattern as CudaSparseBackend.
         IGpuBuffer? aValuesBuf = null, bBuf = null, outBuf = null;
         IGpuBuffer? rowPtrBuf = null, colIdxBuf = null, workspaceBuf = null;
         IntPtr handle = IntPtr.Zero;

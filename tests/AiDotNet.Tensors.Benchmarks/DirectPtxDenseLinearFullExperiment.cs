@@ -97,12 +97,20 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                 // Opt-in only: the #1261 shape grid is far longer than the default matrix.
                 if (onlyOperation == GemmGridOperation) RunGemmGrid(backend, run);
                 if (onlyOperation == GemmGridEvolvedOperation) RunGemmGrid(backend, run, evolve: true);
+                if (onlyOperation == GemmGridRoutedOperation)
+                {
+                    // Route tuning writes evolution deployments through the autotune cache: keep them out of the user's.
+                    Environment.SetEnvironmentVariable("AIDOTNET_AUTOTUNE_CACHE_PATH",
+                        Path.Combine(Path.GetTempPath(), "aidotnet-gemm-grid-routed-" + Guid.NewGuid().ToString("N")));
+                    RunGemmGrid(backend, run, routed: true);
+                }
             }
             if (includePython)
             {
                 GpuBenchmarkEnvironment.RequireIdleGpu("dense-linear-pytorch-start");
                 // The evolved grid's competitors are the plain grid's PyTorch lanes.
-                RunPython(independentRuns, onlyOperation == GemmGridEvolvedOperation ? GemmGridOperation : onlyOperation);
+                RunPython(independentRuns,
+                    onlyOperation is GemmGridEvolvedOperation or GemmGridRoutedOperation ? GemmGridOperation : onlyOperation);
             }
             // WDDM can attribute the just-finished process sample to an unrelated
             // desktop C+G process. The outer evidence runner repeats the post-suite

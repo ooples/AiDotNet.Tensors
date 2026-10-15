@@ -795,6 +795,10 @@ internal static class OneDnnProvider
     /// <summary>
     /// Returns true if oneDNN is available.
     /// </summary>
+    // Convolutions oneDNN completed on this thread; tests use it to tell a conv oneDNN took from one no tracked route ran.
+    [ThreadStatic] private static int t_conv2DRuns;
+    internal static int Conv2DRunsOnThisThread => t_conv2DRuns;
+
     internal static bool IsAvailable
     {
         get
@@ -951,6 +955,7 @@ internal static class OneDnnProvider
             {
                 Console.WriteLine("[oneDNN] Conv2D completed successfully");
             }
+            t_conv2DRuns++;
             return true;
         }
         catch (Exception ex)

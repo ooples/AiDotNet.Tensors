@@ -88,6 +88,12 @@ public static class PtxParityRegistry
             "non-integral index values too (3.7 must select row 3) to prove the conversion is numeric " +
             "and not a bit reinterpretation."),
 
+        new PtxParitySpec("PtxCsrSpMMF32Kernel", PtxParityStatus.Deferred,
+            "CSR SpMM, fp32 (#852) - no public route yet (CudaBackend.CsrSpMMVec4 is its NVRTC counterpart)",
+            "experimental and not dispatched: DirectPtxCsrSpMMTests drives the module directly and proves it " +
+            "bit-identical to NVRTC csr_spmm_vec4 and within 1.3e-6 of an fp64 oracle on every cell. Converts " +
+            "to ThreeWayParity once a backend route exists: the per-output accumulation order matches the NVRTC " +
+            "kernel, so CUDA, PTX and the CPU CSR reference can be compared bit-exactly against each other."),
         new PtxParitySpec("PtxFusedGatherF32Kernel", PtxParityStatus.Deferred,
             "embedding gather, fp32 (#844) — CudaBackend.Gather",
             "has a public route, but its tests cover the emitter and the PTX-vs-CPU result only, so the " +
