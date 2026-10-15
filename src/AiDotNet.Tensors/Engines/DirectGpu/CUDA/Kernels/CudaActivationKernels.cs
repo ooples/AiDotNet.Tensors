@@ -1154,6 +1154,18 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __
 // Conv2D bias add in NCHW format: output[b,c,h,w] += bias[c]
 // Uses 2D grid to eliminate integer division/modulo:
 //   blockIdx.y = batch * channel index, blockIdx.x * blockDim.x + threadIdx.x = spatial index
+// conv2d_bias_add written out of place: output = input + bias[channel], one pass. The in-place form needed the input
+// copied into a zero-filled output first (a fill, a copy and the add: three passes over a convolution's output).
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add_out(const float* __restrict__ input,
+    const float* __restrict__ bias, float* __restrict__ output, int batch, int channels, int spatialSize)
+{
+    int spatialIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int bc = blockIdx.y;
+    if (spatialIdx >= spatialSize || bc >= batch * channels) return;
+    int channel = bc % channels;
+    long long i = (long long)bc * spatialSize + spatialIdx;
+    output[i] = input[i] + __ldg(&bias[channel]);
+}
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __restrict__ output, const float* __restrict__ bias, int batch, int channels, int spatialSize)
 {
     int spatialIdx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1559,6 +1571,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "bias_add",
                 "bias_add_out",
                 "conv2d_bias_add",
+                "conv2d_bias_add_out",
                 // Vectorized (float4) unary
                 "relu_vec4",
                 "sigmoid_vec4",

@@ -24830,18 +24830,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var biasBuffer = GetWeightBufferPreferResident(
                 backend, bias, PersistentTensorRole.Biases);
-            var outputBuffer = AllocateOutputBuffer(backend, input.Length);
+            // One out-of-place pass where the backend has it: a fully written output needs no zero-fill and no copy.
+            bool outOfPlace = backend is IChannelBiasAddOutBackend;
+            var outputBuffer = outOfPlace ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : AllocateOutputBuffer(backend, input.Length);
             bool outputHandedOff = false;
 
             try
             {
-                backend.Copy(inputBuffer.Buffer, outputBuffer.Buffer, input.Length);
-                backend.Conv2DBiasAdd(
-                    outputBuffer.Buffer,
-                    biasBuffer.Buffer,
-                    batchCount,
-                    channelCount,
-                    spatialSize);
+                if (!(outOfPlace && ((IChannelBiasAddOutBackend)backend).TryChannelBiasAddOut(inputBuffer.Buffer, biasBuffer.Buffer,
+                        outputBuffer.Buffer, batchCount, channelCount, spatialSize)))
+                {
+                    backend.Copy(inputBuffer.Buffer, outputBuffer.Buffer, input.Length);
+                    backend.Conv2DBiasAdd(
+                        outputBuffer.Buffer,
+                        biasBuffer.Buffer,
+                        batchCount,
+                        channelCount,
+                        spatialSize);
+                }
 
                 var output = DeferTensorResult<T>(
                     backend,

@@ -17,7 +17,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -3986,6 +3986,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IUni
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
+    unsafe bool IChannelBiasAddOutBackend.TryChannelBiasAddOut(IGpuBuffer input, IGpuBuffer bias, IGpuBuffer output,
+        int batch, int channels, int spatialSize)
+    {
+        long n = (long)batch * channels * spatialSize;
+        if (!IsAvailable || batch <= 0 || channels <= 0 || spatialSize <= 0 || input.Size < n || output.Size < n
+            || bias.Size < channels || (long)batch * channels > 65535
+            || !_kernelCache.TryGetValue("conv2d_bias_add_out", out var biasOutKernel))
+            return false;
+        using var _ = PushContext();
+        uint gridX = (uint)((spatialSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint gridY = (uint)(batch * channels);
+        IntPtr inPtr = input.Handle, biasPtr = bias.Handle, outPtr = output.Handle;
+        int b = batch, c = channels, s = spatialSize;
+        void** args = stackalloc void*[6];
+        args[0] = &inPtr; args[1] = &biasPtr; args[2] = &outPtr; args[3] = &b; args[4] = &c; args[5] = &s;
+        LaunchKernel2D(biasOutKernel, gridX, gridY, DefaultBlockSize, 1, args);
+        return true;
+    }
     public void Add(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         LaunchElementwiseKernel("add_vectors", A, B, C, size);
