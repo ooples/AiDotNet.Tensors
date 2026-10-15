@@ -29,7 +29,8 @@ public sealed class CompiledStorageContractFusionTests
 
         var engine = new CpuEngine();
         var previousEngine = AiDotNetEngine.Current;
-        var previousOptions = TensorCodecOptions.Current;
+        // Push restores the thread's determinism override too; SetCurrent(Current) would leave one behind (#1221).
+        var previousOptions = TensorCodecOptions.Push(TensorCodecOptions.Current);
         TensorCodecOptions.SetCurrent(new TensorCodecOptions
         {
             EnableDataflowFusion = true,
@@ -67,7 +68,7 @@ public sealed class CompiledStorageContractFusionTests
         finally
         {
             AiDotNetEngine.Current = previousEngine;
-            TensorCodecOptions.SetCurrent(previousOptions);
+            previousOptions.Dispose();
             TensorAllocator.Return(input);
             TensorAllocator.Return(w1);
             TensorAllocator.Return(w2);
@@ -92,7 +93,8 @@ public sealed class CompiledStorageContractFusionTests
 
         var engine = new CpuEngine();
         var previousEngine = AiDotNetEngine.Current;
-        var previousOptions = TensorCodecOptions.Current;
+        // Push restores the thread's determinism override too; SetCurrent(Current) would leave one behind (#1221).
+        var previousOptions = TensorCodecOptions.Push(TensorCodecOptions.Current);
         TensorCodecOptions.SetCurrent(new TensorCodecOptions
         {
             EnableDataflowFusion = true,
@@ -124,7 +126,7 @@ public sealed class CompiledStorageContractFusionTests
         finally
         {
             AiDotNetEngine.Current = previousEngine;
-            TensorCodecOptions.SetCurrent(previousOptions);
+            previousOptions.Dispose();
         }
     }
 
@@ -179,7 +181,8 @@ public sealed class CompiledStorageContractFusionTests
 
         var engine = new CpuEngine();
         var previousEngine = AiDotNetEngine.Current;
-        var previousOptions = TensorCodecOptions.Current;
+        // Push restores the thread's determinism override too; SetCurrent(Current) would leave one behind (#1221).
+        var previousOptions = TensorCodecOptions.Push(TensorCodecOptions.Current);
         string? previousSlice = Environment.GetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION");
         Environment.SetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION", "1");
         TensorCodecOptions.SetCurrent(new TensorCodecOptions { EnableBackwardGradientPooling = false });
@@ -210,7 +213,7 @@ public sealed class CompiledStorageContractFusionTests
         finally
         {
             AiDotNetEngine.Current = previousEngine;
-            TensorCodecOptions.SetCurrent(previousOptions);
+            previousOptions.Dispose();
             Environment.SetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION", previousSlice);
             TensorAllocator.Return(input);
             TensorAllocator.Return(weight);
@@ -228,7 +231,8 @@ public sealed class CompiledStorageContractFusionTests
 
         var engine = new CpuEngine();
         var previousEngine = AiDotNetEngine.Current;
-        var previousOptions = TensorCodecOptions.Current;
+        // Push restores the thread's determinism override too; SetCurrent(Current) would leave one behind (#1221).
+        var previousOptions = TensorCodecOptions.Push(TensorCodecOptions.Current);
         string? previousCross = Environment.GetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION");
         Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", "1");
         TensorCodecOptions.SetCurrent(new TensorCodecOptions
@@ -261,7 +265,7 @@ public sealed class CompiledStorageContractFusionTests
         finally
         {
             AiDotNetEngine.Current = previousEngine;
-            TensorCodecOptions.SetCurrent(previousOptions);
+            previousOptions.Dispose();
             Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", previousCross);
             TensorAllocator.Return(input);
             TensorAllocator.Return(w1);
@@ -283,7 +287,8 @@ public sealed class CompiledStorageContractFusionTests
 
         var engine = new CpuEngine();
         var previousEngine = AiDotNetEngine.Current;
-        var previousOptions = TensorCodecOptions.Current;
+        // Push restores the thread's determinism override too; SetCurrent(Current) would leave one behind (#1221).
+        var previousOptions = TensorCodecOptions.Push(TensorCodecOptions.Current);
         string? previousBatch = Environment.GetEnvironmentVariable("AIDOTNET_DW_BATCHING");
         Environment.SetEnvironmentVariable("AIDOTNET_DW_BATCHING", "1");
         TensorCodecOptions.SetCurrent(new TensorCodecOptions
@@ -315,7 +320,7 @@ public sealed class CompiledStorageContractFusionTests
         finally
         {
             AiDotNetEngine.Current = previousEngine;
-            TensorCodecOptions.SetCurrent(previousOptions);
+            previousOptions.Dispose();
             Environment.SetEnvironmentVariable("AIDOTNET_DW_BATCHING", previousBatch);
             TensorAllocator.Return(x1);
             TensorAllocator.Return(x2);

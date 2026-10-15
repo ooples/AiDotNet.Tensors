@@ -33,7 +33,8 @@ internal static class DirectPtxNormalizationExperiment
                 nameof(scope), scope, "Use all, row, row256, row2048, row8192, or channel.");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.NormalizationExperimentOverride;
-        TensorCodecOptions previousOptions = TensorCodecOptions.Current;
+        // Push restores the thread's determinism override too; SetCurrent(Current) would leave one behind (#1221).
+        var previousOptions = TensorCodecOptions.Push(TensorCodecOptions.Current);
         var benchmarkOptions = new TensorCodecOptions
         {
             UseCudnnBatchNorm = false,
@@ -79,7 +80,7 @@ internal static class DirectPtxNormalizationExperiment
         {
             DirectPtxFeatureGate.TestOverride = previousGate;
             DirectPtxFeatureGate.NormalizationExperimentOverride = previousExperiment;
-            TensorCodecOptions.SetCurrent(previousOptions);
+            previousOptions.Dispose();
         }
     }
 

@@ -242,11 +242,19 @@ internal static partial class DirectPtxDenseLinearFullExperiment
                 ptx_us = decision.DirectPtxMicroseconds,
                 max_relative_difference = decision.MaxRelativeDifference,
                 reason = decision.Reason,
+                graph_routed = decision.UsesDirectPtxInGraph,
+                graph_median_speedup = decision.GraphMedianSpeedup,
+                graph_minimum_speedup = decision.GraphMinimumSpeedup,
+                graph_cublas_us = decision.GraphCublasMicroseconds,
+                graph_ptx_us = decision.GraphDirectPtxMicroseconds,
+                graph_reason = decision.GraphReason,
             }));
             backend.GemmRoutingEnabled = true;
             GpuBenchmarkEnvironment.WaitForCooldown(operation);
+            // Eager and graph launches route separately; the graph row (" graph" suffix) runs the graph verdict.
             string lane = (strict ? "Gemm routed FP32 strict (" : "Gemm routed TF32 (") +
-                (decision.UsesDirectPtx ? "PTX " + decision.Kernel : "cuBLAS") + ")";
+                (decision.UsesDirectPtx ? "PTX " + decision.Kernel : "cuBLAS") + "; graph " +
+                (decision.UsesDirectPtxInGraph ? "PTX" : "cuBLAS") + ")";
             BenchmarkRoute(backend, run, operation, shape, lane, work,
                 () => backend.Gemm(left, right, output, m, n, k), () => relativeError(output), Resources.None, capture,
                 tolerance: strict ? Fp32GridTolerance : Tf32GridTolerance, deviceLaunches: launches);
