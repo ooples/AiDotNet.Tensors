@@ -126,6 +126,34 @@ public class Conv2DImplicitGemmParityTests
         }
     }
 
+    // #653: the GEMM plan follows the shape and the thread count (the full route's own GEMM where it is the default, at
+    // 8+ threads or on a 64x64+ plane; parallel blocks on fixed-blocking GEMMs elsewhere), so the routes must agree under
+    // each plan. The shapes cover a 14-wide row (a block edge inside a 16-column tile), output channels that are not a
+    // multiple of the 48-row chunk, an 8x8 plane split over output channels, and a batch.
+    [Theory]
+    [InlineData(1, 256, 256, 3, 16, 1)]
+    [InlineData(1, 256, 256, 3, 16, 4)]
+    [InlineData(1, 256, 256, 3, 16, 16)]
+    [InlineData(1, 320, 300, 3, 14, 4)]
+    [InlineData(1, 320, 300, 3, 14, 16)]
+    [InlineData(1, 512, 512, 3, 8, 4)]
+    [InlineData(1, 512, 512, 3, 8, 16)]
+    [InlineData(2, 256, 136, 3, 24, 3)]
+    [InlineData(1, 128, 64, 3, 64, 16)]
+    public void FusedConv_IsBitIdentical_ToFullIm2Col_AtThreadCount(int batch, int inC, int outC, int k, int hw, int threads)
+    {
+        int previous = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
+            FusedConv_IsBitIdentical_ToFullIm2Col(batch, inC, outC, k, hw, 1, 1, 1);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
+        }
+    }
+
     // #653: high-channel 3x3 convs take the full im2col GEMM at 8+ threads (or on a 64x64+ plane) while its column
     // matrix fits ThreadLocalTensorCache's 64 MB, and the implicit GEMM otherwise.
     [SkippableTheory]

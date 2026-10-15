@@ -10940,20 +10940,26 @@ public partial class CpuEngine : ITensorLevelEngine
             // image, taken from ThreadLocalTensorCache: FullIm2ColMaxBytes is the most that cache retains per thread, so a
             // larger matrix (which would be a fresh large-object allocation on every call) keeps the implicit path.
             long fullIm2ColBytes = (long)inChannels * kernelHeight * kernelWidth * outputHeight * outputWidth * sizeof(float);
-            bool fullIm2ColScales = highChannelNonWinograd && !t_forceImplicitGemmForTest
+            bool fullIm2ColIsDefault = highChannelNonWinograd
                 && (Helpers.CpuParallelSettings.MaxDegreeOfParallelism >= FullIm2ColMinThreads
                     || (long)outputHeight * outputWidth >= FullIm2ColMinPlane)
                 && fullIm2ColBytes <= FullIm2ColMaxBytes;
-            if (isPointwiseIdentity || t_forceFullIm2Col || fullIm2ColScales)
+            // The two routes give bit-identical results, so they share a GEMM plan chosen by the shape, not the route.
+            // Where the full matrix is the default, both keep the BLAS GEMM that route is fastest on (a fixed-blocking
+            // GEMM over the full matrix measured 1.2x slower there at 8-16 threads) and the implicit route keeps its
+            // serial loop over blocks. Everywhere else the implicit route is the default and runs its blocks in parallel
+            // on single-threaded fixed-blocking GEMMs, and the full route runs the same blocking threaded.
+            if (isPointwiseIdentity || t_forceFullIm2Col || (fullIm2ColIsDefault && !t_forceImplicitGemmForTest))
             {
                 Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
-                    packBoth: !isPointwiseIdentity);
+                    packBoth: !isPointwiseIdentity && !fullIm2ColIsDefault);
             }
             else
             {
                 Conv2DWithImplicitGemmFloat(input, kernel, result, batch, inChannels, height, width,
-                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
+                    parallelBlocks: !fullIm2ColIsDefault);
             }
             return false;
         }
@@ -11245,15 +11251,15 @@ public partial class CpuEngine : ITensorLevelEngine
             bool gemmHandled = false;
             if (packBoth)
             {
-                // The high-channel conv routes share one GEMM configuration with Conv2DWithImplicitGemmFloat: packed
-                // A and B at the default blocking, whose K order does not depend on how M and N are split or threaded,
-                // so the full matrix and the per-block GEMMs give bit-identical outputs.
+                // Where the implicit route is the default, this route runs the same GEMM configuration as its per-block
+                // GEMMs: packed A and B at fixed blocking, whose K order does not depend on how M and N are split or
+                // threaded, so the full matrix and the per-block GEMMs give bit-identical outputs. Here it is threaded.
                 Engines.BlasManaged.BlasManaged.Gemm<float>(
                     kernelSpan.Slice(0, outChannels * colH), colH, false,
                     im2colSpan.Slice(0, sliceSize), colW, false,
                     outputSpan.Slice(outputOffset, outChannels * colW), colW,
                     outChannels, colW, colH,
-                    ImplicitConvGemmOptions());
+                    ImplicitConvGemmOptions(Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism)));
                 gemmHandled = true;
             }
 #if NET5_0_OR_GREATER
@@ -11397,13 +11403,20 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
-        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+        int stride, int padding, int dilation, int outputHeight, int outputWidth, bool parallelBlocks = true)
     {
         t_implicitGemmConvRuns++;
         // Fail loud on int overflow of the shape products rather than silently wrapping to a
         // negative/wrong size (which would corrupt the panel Rent and the GEMM bounds below).
         int colH = checked(inChannels * kernelHeight * kernelWidth);
         int colW = checked(outputHeight * outputWidth);
+
+        if (!parallelBlocks)
+        {
+            Conv2DWithSerialImplicitGemmFloat(input, kernel, result, batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth, colH, colW);
+            return;
+        }
 
         // #653: the blocks of output rows run in parallel, each on one thread: its im2col panel is built in that
         // thread's cache and multiplied by a single-threaded packed GEMM over all output channels into its slice of the
@@ -11483,13 +11496,80 @@ public partial class CpuEngine : ITensorLevelEngine
         }, deterministicSafe: true);
     }
 
-    // The GEMM both high-channel conv routes run: single-threaded (the caller parallelises over output blocks), packed A
-    // and B, and FIXED blocking. With fixed Kc every output element sums K in the same Kc-sized steps whatever N the call
+    // The implicit route where the full matrix is the default: the blocks run one after another, each GEMM on the BLAS
+    // route the full-matrix path uses (threaded inside), so its result matches that path's.
+    private void Conv2DWithSerialImplicitGemmFloat(
+        Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int kernelHeight, int kernelWidth,
+        int stride, int padding, int dilation, int outputHeight, int outputWidth, int colH, int colW)
+    {
+        // Block on whole output rows so the stride=1 contiguous-memcpy im2col fast path
+        // stays intact and the panel covers an exact column range [oh0*outW, oh1*outW).
+        long perRowFloats = (long)colH * outputWidth;
+        int ohRows = (int)Math.Max(1, Math.Min(outputHeight, FusedConvPanelFloatBudget / Math.Max(1, perRowFloats)));
+        int maxNcBlock = checked(ohRows * outputWidth);
+
+        using var inputSpanLease = input.Lease();
+        var inputSpan = inputSpanLease.Span;
+        using var kernelSpanLease = kernel.Lease();
+        var kernelSpan = kernelSpanLease.Span;
+        using var resultDataKeep = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
+        int inputSliceSize = checked(inChannels * height * width);
+
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        float[] panel = pool.Rent(checked(colH * maxNcBlock));
+        try
+        {
+            var panelSpan = panel.AsSpan();
+            for (int b = 0; b < batch; b++)
+            {
+                var inSlice = inputSpan.Slice(b * inputSliceSize, inputSliceSize);
+                int outBatchOffset = b * outChannels * colW;
+                for (int oh0 = 0; oh0 < outputHeight; oh0 += ohRows)
+                {
+                    int oh1 = Math.Min(oh0 + ohRows, outputHeight);
+                    int ncBlock = (oh1 - oh0) * outputWidth;
+                    int colOffset = oh0 * outputWidth; // first output column of this block
+
+                    Helpers.Im2ColHelper.Im2ColRowBlockFloat(
+                        inSlice, panelSpan,
+                        inChannels, height, width,
+                        kernelHeight, kernelWidth, stride, stride, padding, padding, dilation, dilation,
+                        outputHeight, outputWidth, oh0, oh1);
+
+                    // C[oc, colOffset + j] = kernel[oc, :] · panel[:, j]  for j in [0, ncBlock), written with
+                    // ldc = colW (the full row stride) from the block's first output element.
+                    var cWindow = outputSpan.Slice(outBatchOffset + colOffset);
+                    bool usedBlas = Helpers.BlasProvider.TryGemm(
+                        outChannels, ncBlock, colH,
+                        kernelSpan.Slice(0, outChannels * colH), colH, // A = kernel [outChannels x colH], lda=colH
+                        panelSpan.Slice(0, colH * ncBlock), ncBlock,   // B = panel  [colH x ncBlock],     ldb=ncBlock
+                        cWindow, colW);                                // C window, ldc=colW
+
+                    if (!usedBlas)
+                    {
+                        MultiplyMatrixBlockedFloatStrided(
+                            kernelSpan, panelSpan, cWindow,
+                            outChannels, colH, ncBlock, colW);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            pool.Return(panel);
+        }
+    }
+
+    // The GEMM both high-channel conv routes run where the implicit route is the default: single-threaded on the implicit
+    // route (the caller parallelises over output blocks) and threaded on the full matrix, packed A and B, FIXED blocking. With fixed Kc every output element sums K in the same Kc-sized steps whatever N the call
     // covers, so the per-block GEMMs of the implicit route and the full-matrix GEMM give bit-identical results; the
     // strategy's shape-dependent blocking otherwise chose a different Kc for a 64-column block than for the full width.
-    private static Engines.BlasManaged.BlasOptions<float> ImplicitConvGemmOptions() => new()
+    private static Engines.BlasManaged.BlasOptions<float> ImplicitConvGemmOptions(int numThreads = -1) => new()
     {
-        NumThreads = -1,
+        NumThreads = numThreads,
         PackingMode = Engines.BlasManaged.PackingMode.ForcePackBoth,
         Mc = 96, Nc = 256, Kc = 256,
     };
