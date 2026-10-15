@@ -102,6 +102,121 @@ public sealed partial class CudaBackend
         return true;
     }
 
+    /// <summary>
+    /// #1325: conv backward through the engine (conv2d_wgrad_ce*, conv2d_dgrad_ce*) before #1323's kernels;
+    /// AIDOTNET_CONV_ENGINE_BACKWARD=0 starts it off. Settable so tests and the benchmark can interleave both.
+    /// </summary>
+    internal bool UseConvEngineBackward { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_CONV_ENGINE_BACKWARD") != "0";
+
+    private IGpuBuffer? _convEngineWgradPartials, _convEngineDgradPartials;
+
+    /// <summary>gradKernel[Cout, Cin*kH*kW] through conv2d_wgrad_ce*. Overwrites gradKernel. False: nothing launched.</summary>
+    private bool TryConv2DBackwardKernelEngine(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        if (!s_convGemmBackward || !UseConvEngineBackward || batch <= 0 || outChannels <= 0) return false;
+        long p = (long)inChannels * kernelH * kernelW;
+        long kTotal = (long)batch * outHeight * outWidth;
+        long outputs = outChannels * p;
+        if (p <= 0 || kTotal <= 0 || kTotal > int.MaxValue || outputs > int.MaxValue
+            || (long)batch * inChannels * inHeight * inWidth > int.MaxValue
+            || (long)batch * outChannels * outHeight * outWidth > int.MaxValue)
+            return false;
+        ConvEnginePlan(p, outChannels, kTotal, out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit);
+        if (!_kernelCache.TryGetValue(tile == 128 ? "conv2d_wgrad_ce128" : "conv2d_wgrad_ce64", out var gemm)) return false;
+        IntPtr reduce = IntPtr.Zero;
+        if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
+
+        using var context = PushContext();
+        IGpuBuffer destination = gradKernel;
+        if (splits > 1)
+        {
+            var partials = TryConvScratch(ref _convEngineWgradPartials, splits * outputs);
+            if (partials is null) return false;
+            destination = partials;
+        }
+        LaunchConvEngine(gemm, input, gradOutput, destination, tilesN, tilesM, splits, kPerSplit, batch, inChannels, inHeight,
+            inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (splits > 1) LaunchSplitKReduce(reduce, destination, gradKernel, (int)outputs, splits);
+        return true;
+    }
+
+    /// <summary>
+    /// gradInput through conv2d_dgrad_ce* for Cout % 8 == 0: the sub-pixel phase kernel for strided, undilated
+    /// convolutions whose kernel covers the stride, else the tap-uniform kernel with split-K. Overwrites gradInput.
+    /// False: nothing launched.
+    /// </summary>
+    private bool TryConv2DBackwardInputEngine(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        if (!s_convGemmBackward || !UseConvEngineBackward || batch <= 0 || inChannels <= 0
+            || outChannels % ConvEngineTileK != 0) return false;
+        long outputs = (long)batch * inChannels * inHeight * inWidth;
+        long kTotal = (long)outChannels * kernelH * kernelW;
+        if (outputs <= 0 || kTotal <= 0 || outputs > int.MaxValue || kTotal > int.MaxValue
+            || (long)batch * outChannels * outHeight * outWidth > int.MaxValue)
+            return false;
+        bool phase = (strideH > 1 || strideW > 1) && dilationH == 1 && dilationW == 1
+                     && kernelH >= strideH && kernelW >= strideW;
+        using var context = PushContext();
+        if (phase)
+        {
+            // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image; one grid layer per phase, no split.
+            long columns = (long)batch * ((inHeight + strideH - 1) / strideH) * ((inWidth + strideW - 1) / strideW);
+            ConvEnginePlan(columns, inChannels, kTotal, out int ptile, out int ptilesN, out int ptilesM, out _, out _);
+            if (!_kernelCache.TryGetValue(ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase", out var pgemm))
+                return false;
+            LaunchConvEngine(pgemm, gradOutput, kernel, gradInput, ptilesN, ptilesM, strideH * strideW, 0, batch, inChannels,
+                inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
+                dilationH, dilationW);
+            return true;
+        }
+
+        ConvEnginePlan((long)batch * inHeight * inWidth, inChannels, kTotal, out int tile, out int tilesN, out int tilesM,
+            out int splits, out int kPerSplit);
+        if (!_kernelCache.TryGetValue(tile == 128 ? "conv2d_dgrad_ce128" : "conv2d_dgrad_ce64", out var gemm)) return false;
+        IntPtr reduce = IntPtr.Zero;
+        if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
+        IGpuBuffer destination = gradInput;
+        if (splits > 1)
+        {
+            var partials = TryConvScratch(ref _convEngineDgradPartials, splits * outputs);
+            if (partials is null) return false;
+            destination = partials;
+        }
+        LaunchConvEngine(gemm, gradOutput, kernel, destination, tilesN, tilesM, splits, kPerSplit, batch, inChannels, inHeight,
+            inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (splits > 1) LaunchSplitKReduce(reduce, destination, gradInput, (int)outputs, splits);
+        return true;
+    }
+
+    // Every engine kernel shares the 19-parameter ABI (two operands, output, the 15 conv sizes, kPerSplit).
+    private unsafe void LaunchConvEngine(IntPtr function, IGpuBuffer first, IGpuBuffer second, IGpuBuffer output,
+        int tilesN, int tilesM, int gridZ, int kPerSplit, int batch, int inC, int inH, int inW, int outC, int outH, int outW,
+        int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+    {
+        IntPtr aPtr = first.Handle, bPtr = second.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[19];
+        args[0] = &aPtr; args[1] = &bPtr; args[2] = &outPtr;
+        args[3] = &batch; args[4] = &inC; args[5] = &inH; args[6] = &inW;
+        args[7] = &outC; args[8] = &outH; args[9] = &outW;
+        args[10] = &kH; args[11] = &kW; args[12] = &sH; args[13] = &sW;
+        args[14] = &pH; args[15] = &pW; args[16] = &dH; args[17] = &dW; args[18] = &kPerSplit;
+        LaunchKernel3D(function, (uint)tilesN, (uint)tilesM, (uint)gridZ, (uint)DefaultBlockSize, 1, 1, args, 0);
+    }
+
+    // dst[i] = sum over z of partials[z][i], in z order (conv2d_wgrad_splitk_reduce).
+    private unsafe void LaunchSplitKReduce(IntPtr reduce, IGpuBuffer partials, IGpuBuffer destination, int count, int splits)
+    {
+        IntPtr partPtr = partials.Handle, dstPtr = destination.Handle;
+        void** rargs = stackalloc void*[4];
+        rargs[0] = &partPtr; rargs[1] = &dstPtr; rargs[2] = &count; rargs[3] = &splits;
+        LaunchKernel(reduce, (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, rargs);
+    }
+
     // Entry points for the per-path forward benchmark (Bench_ResNet18ConvForward): each runs one route regardless of
     // what the tuned-kernel slot would pick. False when that route declines the shape.
     internal bool Conv2DForwardViaEngine(in CudaConv2DArgs a) => TryConv2DForwardEngine(a);

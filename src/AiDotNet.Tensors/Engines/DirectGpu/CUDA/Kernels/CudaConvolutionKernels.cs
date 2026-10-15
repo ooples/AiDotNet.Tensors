@@ -1685,6 +1685,268 @@ CE_FPROP_KERNEL(conv2d_fprop_ig128_tap, 128, true)
 CE_FPROP_KERNEL(conv2d_fprop_ig128_gen, 128, false)
 CE_FPROP_KERNEL(conv2d_fprop_ig64_tap, 64, true)
 CE_FPROP_KERNEL(conv2d_fprop_ig64_gen, 64, false)
+
+// Weight gradient on the engine core: dW[Cout, P] = dY[Cout, K] * X_gathered[K, P], P = Cin*kH*kW, K = B*oH*oW.
+// Both loaders put one K element per lane (8 lanes along K, rows 32 apart), so each lane decomposes its k = (b, oh, ow)
+// once per tile, dY reads coalesce along the output row, and every column's (ci, kh, kw) is fixed for the whole loop.
+// Split-K slices go to out + z * Cout*P, summed in order by conv2d_wgrad_splitk_reduce.
+template <int BM, int BN>
+__device__ __forceinline__ void conv2d_wgrad_ce_body(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
+    constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256;
+    const int L = outH * outW, khw = kH * kW, P = inC * khw, K = batch * L, HW = H * W;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int kBegin = blockIdx.z * kPerSplit, kEnd = min(K, kBegin + kPerSplit);
+    const int tiles = kBegin < kEnd ? (kEnd - kBegin + CE_BK - 1) / CE_BK : 0;
+    const int tid = threadIdx.x;
+    const int lk = tid & 7, lr = tid >> 3;   // k lane; rows (A) / columns (B) lr + 32 r
+
+    int cci[RB], ckh[RB], ckw[RB];
+    bool cIn[RB];
+    #pragma unroll
+    for (int r = 0; r < RB; r++)
+    {
+        int p = n0 + lr + 32 * r;
+        cIn[r] = p < P;
+        int pp = cIn[r] ? p : 0;
+        cci[r] = pp / khw;
+        int t = pp - cci[r] * khw;
+        ckh[r] = t / kW;
+        ckw[r] = t - ckh[r] * kW;
+    }
+
+    int kc = kBegin;
+    float ra[RA], rb[RB];
+    auto load = [&]()
+    {
+        int k = kc + lk;
+        bool kIn = k < kEnd;
+        int b = 0, oh = 0, ow = 0;
+        if (kIn) { b = k / L; int l = k - b * L; oh = l / outW; ow = l - oh * outW; }
+        const float* dyRow = gradOutput + (long long)b * outC * L + oh * outW + ow;
+        #pragma unroll
+        for (int r = 0; r < RA; r++)
+        {
+            int m = m0 + lr + 32 * r;
+            ra[r] = (kIn && m < outC) ? dyRow[(long long)m * L] : 0.0f;
+        }
+        const float* xImage = input + (long long)b * inC * HW;
+        int ihBase = oh * sH - pH, iwBase = ow * sW - pW;
+        #pragma unroll
+        for (int r = 0; r < RB; r++)
+        {
+            float v = 0.0f;
+            if (kIn && cIn[r])
+            {
+                int ih = ihBase + ckh[r] * dH, iw = iwBase + ckw[r] * dW;
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W) v = xImage[(long long)cci[r] * HW + ih * W + iw];
+            }
+            rb[r] = v;
+        }
+    };
+    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
+    {
+        #pragma unroll
+        for (int r = 0; r < RA; r++) as[lk][lr + 32 * r] = ra[r];
+        #pragma unroll
+        for (int r = 0; r < RB; r++) bs[lk][lr + 32 * r] = rb[r];
+    };
+    auto advance = [&]() { kc += CE_BK; };
+
+    float acc[TM][TN];
+    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+
+    float* slice = out + (long long)blockIdx.z * outC * P;
+    const int tx = tid & 15, ty = tid >> 4;
+    const bool vec = (P & 3) == 0;
+    #pragma unroll
+    for (int g = 0; g < TN / 4; g++)
+    {
+        int nn = n0 + g * 64 + tx * 4;
+        if (nn >= P) continue;
+        #pragma unroll
+        for (int i = 0; i < TM; i++)
+        {
+            int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
+            if (m >= outC) continue;
+            float* row = slice + (long long)m * P + nn;
+            if (vec)
+                *reinterpret_cast<float4*>(row) = make_float4(acc[i][g * 4], acc[i][g * 4 + 1], acc[i][g * 4 + 2], acc[i][g * 4 + 3]);
+            else
+            {
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    if (nn + j < P) row[j] = acc[i][g * 4 + j];
+            }
+        }
+    }
+}
+
+// Input gradient on the engine core, Cout % 8 == 0: dX[Cin, B*H*W] = W'[Cin, K] * dY_gathered[K, B*H*W] with K ordered
+// (kh, kw, co), so a K tile shares one tap. PHASE = false: unit stride or any stride with per-tile divisibility checks,
+// split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation, kernel >= stride): blockIdx.z is the
+// sub-pixel phase (rh, rw); the block's columns are that phase's pixels and only the taps kh = rh (mod sH),
+// kw = rw (mod sW) are visited, every one of which hits; phases write disjoint pixels, no split.
+template <int BM, int BN, bool PHASE>
+__device__ __forceinline__ void conv2d_dgrad_ce_body(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
+    constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256, BSTEP = 256 / BN;
+    const int HW = H * W, khw = kH * kW, P = inC * khw, L = outH * outW;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+
+    // Column space: every pixel (PHASE = false) or the pixels of one phase.
+    int rh = 0, rw = 0, ih0 = 0, iw0 = 0, Hp = H, Wp = W, tapsH = kH, tapsW = kW;
+    if (PHASE)
+    {
+        rh = blockIdx.z / sW; rw = blockIdx.z - rh * sW;
+        ih0 = ((rh - pH) % sH + sH) % sH; iw0 = ((rw - pW) % sW + sW) % sW;
+        Hp = ih0 < H ? (H - ih0 + sH - 1) / sH : 0; Wp = iw0 < W ? (W - iw0 + sW - 1) / sW : 0;
+        tapsH = (kH - rh + sH - 1) / sH; tapsW = (kW - rw + sW - 1) / sW;
+    }
+    const int plane = Hp * Wp, N = batch * plane;
+    if (n0 >= N) return;
+    const int K = outC * tapsH * tapsW;
+    int kBegin = 0, kEnd = K;
+    if (!PHASE) { kBegin = blockIdx.z * kPerSplit; kEnd = min(K, kBegin + kPerSplit); }
+    const int tiles = kBegin < kEnd ? (kEnd - kBegin + CE_BK - 1) / CE_BK : 0;
+
+    const int ak = tid & 7, am = tid >> 3;
+    const int bn = tid % BN, bk = tid / BN;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn)
+    {
+        nb = n / plane; int q = n - nb * plane; int i = q / Wp;
+        ihp = ih0 + (PHASE ? i * sH : i) + pH;
+        iwp = iw0 + (PHASE ? (q - i * Wp) * sW : q - i * Wp) + pW;
+    }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    // Tile state: tap (kh, kw) and first output channel co0 (K tiles never straddle a tap: Cout % 8 == 0).
+    int tapIndex = kBegin / outC, co0 = kBegin - tapIndex * outC;
+    int th = tapIndex / tapsW, tw = tapIndex - th * tapsW;
+    int kh = PHASE ? rh + th * sH : th, kw = PHASE ? rw + tw * sW : tw;
+
+    float ra[RA], rb[RB];
+    auto load = [&]()
+    {
+        const float* wTap = kernel + (long long)(co0 + ak) * P + kh * kW + kw;
+        #pragma unroll
+        for (int r = 0; r < RA; r++)
+        {
+            int m = m0 + am + 32 * r;
+            ra[r] = m < inC ? wTap[(long long)m * khw] : 0.0f;
+        }
+        int ty_ = ihp - kh * dH, tx_ = iwp - kw * dW;
+        int oh = ty_, ow = tx_;
+        bool valid = nIn && ty_ >= 0 && tx_ >= 0;
+        if (valid && (sH > 1 || sW > 1))
+        {
+            oh = ty_ / sH; ow = tx_ / sW;
+            valid = PHASE || (oh * sH == ty_ && ow * sW == tx_);
+        }
+        valid = valid && oh < outH && ow < outW;
+        const float* src = dyBatch + (long long)(co0 + bk) * L + (valid ? oh * outW + ow : 0);
+        #pragma unroll
+        for (int r = 0; r < RB; r++)
+            rb[r] = valid ? src[(long long)(BSTEP * r) * L] : 0.0f;
+    };
+    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
+    {
+        #pragma unroll
+        for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];
+        #pragma unroll
+        for (int r = 0; r < RB; r++) bs[bk + BSTEP * r][bn] = rb[r];
+    };
+    auto advance = [&]()
+    {
+        co0 += CE_BK;
+        if (co0 == outC)
+        {
+            co0 = 0;
+            if (++tw == tapsW) { tw = 0; th++; }
+            kh = PHASE ? rh + th * sH : th; kw = PHASE ? rw + tw * sW : tw;
+        }
+    };
+
+    float acc[TM][TN];
+    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+
+    float* slice = out + (PHASE ? 0LL : (long long)blockIdx.z * batch * inC * HW);
+    const int tx = tid & 15, ty = tid >> 4;
+    const bool vec = !PHASE && (HW & 3) == 0;
+    #pragma unroll
+    for (int g = 0; g < TN / 4; g++)
+    {
+        int nn = n0 + g * 64 + tx * 4;
+        if (nn >= N) continue;
+        if (vec)
+        {
+            int b = nn / plane, q = nn - b * plane;
+            float* col = slice + (long long)b * inC * HW + q;
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+            {
+                int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
+                if (m < inC)
+                    *reinterpret_cast<float4*>(col + (long long)m * HW) =
+                        make_float4(acc[i][g * 4], acc[i][g * 4 + 1], acc[i][g * 4 + 2], acc[i][g * 4 + 3]);
+            }
+            continue;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            int nj = nn + j;
+            if (nj >= N) break;
+            int b = nj / plane, q = nj - b * plane, i2 = q / Wp;
+            int pix = PHASE ? (ih0 + i2 * sH) * W + iw0 + (q - i2 * Wp) * sW : q;
+            float* col = slice + (long long)b * inC * HW + pix;
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+            {
+                int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
+                if (m < inC) col[(long long)m * HW] = acc[i][g * 4 + j];
+            }
+        }
+    }
+}
+
+#define CE_WGRAD_KERNEL(NAME, BM) \
+extern ""C"" __global__ __launch_bounds__(256) void NAME( \
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out, \
+    int batch, int inC, int H, int W, int outC, int outH, int outW, \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+{ \
+    conv2d_wgrad_ce_body<BM, BM>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
+        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+}
+CE_WGRAD_KERNEL(conv2d_wgrad_ce128, 128)
+CE_WGRAD_KERNEL(conv2d_wgrad_ce64, 64)
+
+#define CE_DGRAD_KERNEL(NAME, BM, PHASE) \
+extern ""C"" __global__ __launch_bounds__(256) void NAME( \
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out, \
+    int batch, int inC, int H, int W, int outC, int outH, int outW, \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+{ \
+    conv2d_dgrad_ce_body<BM, BM, PHASE>(gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW, \
+        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+}
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128, 128, false)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64, 64, false)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128_phase, 128, true)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64_phase, 64, true)
 ";
         }
 
@@ -1722,7 +1984,13 @@ CE_FPROP_KERNEL(conv2d_fprop_ig64_gen, 64, false)
                 "conv2d_fprop_ig128_tap",
                 "conv2d_fprop_ig128_gen",
                 "conv2d_fprop_ig64_tap",
-                "conv2d_fprop_ig64_gen"
+                "conv2d_fprop_ig64_gen",
+                "conv2d_wgrad_ce128",
+                "conv2d_wgrad_ce64",
+                "conv2d_dgrad_ce128",
+                "conv2d_dgrad_ce64",
+                "conv2d_dgrad_ce128_phase",
+                "conv2d_dgrad_ce64_phase"
             };
         }
     }

@@ -39,13 +39,18 @@ public sealed class ConvImplicitGemmBackwardTests
         new object[] { 3, 70, 9, 9, 48, 3, 3, 3, 3, 2, 2, 1, 1 },        // phase path: stride 3 (9 phases), Cin not a tile multiple
     };
 
+    /// <summary>Every shape through the #1325 engine (true) and through #1323's kernels (false), its fallback.</summary>
+    public static System.Collections.Generic.IEnumerable<object[]> ShapesBothPaths() =>
+        Shapes().SelectMany(s => new[] { s.Concat(new object[] { true }).ToArray(), s.Concat(new object[] { false }).ToArray() });
+
     [SkippableTheory]
-    [MemberData(nameof(Shapes))]
+    [MemberData(nameof(ShapesBothPaths))]
     public void WeightGradient_MatchesFloat64ReferenceAndIsBitReproducible(
-        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, bool engine)
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
+        backend.UseConvEngineBackward = engine;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (w + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
         Assert.True(outH > 0 && outW > 0, "invalid test shape");
@@ -102,12 +107,13 @@ public sealed class ConvImplicitGemmBackwardTests
     }
 
     [SkippableTheory]
-    [MemberData(nameof(Shapes))]
+    [MemberData(nameof(ShapesBothPaths))]
     public void InputGradient_MatchesFloat64ReferenceAndIsBitReproducible(
-        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, bool engine)
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
+        backend.UseConvEngineBackward = engine;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (w + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
         Assert.True(outH > 0 && outW > 0, "invalid test shape");
@@ -205,8 +211,10 @@ public sealed class ConvImplicitGemmBackwardTests
         float[] Fill(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
         double Median(List<double> v) { var o = v.OrderBy(x => x).ToList(); return o[o.Count / 2]; }
 
-        double[] totMin = new double[4], totMed = new double[4];   // dW implicit, dW im2col, dX implicit, dX im2col
-        _out.WriteLine("layer                    x  | dW implicit min/med | dW im2col min/med | dX implicit min/med | dX col2im min/med  (us per call)");
+        // Arms: dW via the #1325 engine / #1323 implicit / im2col, then dX via the same three.
+        string[] arms = { "dW engine", "dW #1323", "dW im2col", "dX engine", "dX #1323", "dX col2im" };
+        double[] totMin = new double[6], totMed = new double[6];
+        _out.WriteLine("layer                    x  | " + string.Join(" | ", arms.Select(a => $"{a,19}")) + "  (us per call, min / median)");
         foreach (var l in layers)
         {
             int outHw = (l.Hw + 2 * l.P - l.K) / l.S + 1;
@@ -215,14 +223,16 @@ public sealed class ConvImplicitGemmBackwardTests
             using var w = backend.AllocateBuffer(Fill(l.OutC * l.InC * l.K * l.K));
             using var dw = backend.AllocateBuffer(l.OutC * l.InC * l.K * l.K);
             using var dx = backend.AllocateBuffer(batch * l.InC * l.Hw * l.Hw);
-            var samples = new[] { new List<double>(), new List<double>(), new List<double>(), new List<double>() };
+            var samples = arms.Select(_ => new List<double>()).ToArray();
             for (int r = 0; r < rounds; r++)
             {
-                for (int arm = 0; arm < 4; arm++)
+                for (int arm = 0; arm < arms.Length; arm++)
                 {
-                    bool implicitPath = arm % 2 == 0, input = arm >= 2;
+                    int path = arm % 3;
+                    bool input = arm >= 3;
                     if (input && !l.NeedsDx) continue;
-                    backend.UseImplicitConvWgrad = backend.UseImplicitConvDgrad = implicitPath;
+                    backend.UseConvEngineBackward = path == 0;
+                    backend.UseImplicitConvWgrad = backend.UseImplicitConvDgrad = path <= 1;
                     void Call()
                     {
                         if (input)
@@ -238,18 +248,19 @@ public sealed class ConvImplicitGemmBackwardTests
                     if (r > 0) samples[arm].Add(sw.Elapsed.TotalMilliseconds * 1000.0 / burst);
                 }
             }
+            backend.UseConvEngineBackward = true;
             backend.UseImplicitConvWgrad = backend.UseImplicitConvDgrad = true;
             string Cell(int arm)
             {
-                if (samples[arm].Count == 0) return "         -         ";
+                if (samples[arm].Count == 0) return $"{"-",19}";
                 double mn = samples[arm].Min(), md = Median(samples[arm]);
                 totMin[arm] += l.Count * mn; totMed[arm] += l.Count * md;
                 return $"{mn,8:F1} / {md,8:F1}";
             }
-            _out.WriteLine($"{l.Name,-22} {l.Count,2}  | {Cell(0)} | {Cell(1)} | {Cell(2)} | {Cell(3)}");
+            _out.WriteLine($"{l.Name,-22} {l.Count,2}  | " + string.Join(" | ", Enumerable.Range(0, arms.Length).Select(Cell)));
         }
-        _out.WriteLine($"step total (weighted)       | {totMin[0],8:F1} / {totMed[0],8:F1} | {totMin[1],8:F1} / {totMed[1],8:F1} | {totMin[2],8:F1} / {totMed[2],8:F1} | {totMin[3],8:F1} / {totMed[3],8:F1}");
-        _out.WriteLine($"conv backward per step: implicit {(totMin[0] + totMin[2]) / 1000:F3} ms min, {(totMed[0] + totMed[2]) / 1000:F3} ms median; " +
-                       $"im2col {(totMin[1] + totMin[3]) / 1000:F3} ms min, {(totMed[1] + totMed[3]) / 1000:F3} ms median");
+        _out.WriteLine("step total (weighted)       | " + string.Join(" | ", Enumerable.Range(0, arms.Length).Select(a => $"{totMin[a],8:F1} / {totMed[a],8:F1}")));
+        _out.WriteLine($"conv backward per step (min): engine {(totMin[0] + totMin[3]) / 1000:F3} ms, #1323 {(totMin[1] + totMin[4]) / 1000:F3} ms, " +
+                       $"im2col {(totMin[2] + totMin[5]) / 1000:F3} ms");
     }
 }
