@@ -471,6 +471,9 @@ internal static class PtxGemmEvolution
         }
     }
 
+    /// <summary>The genome codec persisted records use (deployments and CUDA GEMM routes).</summary>
+    internal static IEvolutionGenomeCodec<PtxGemmConfiguration> GenomeCodec { get; } = new Codec();
+
     private sealed class Codec : IEvolutionGenomeCodec<PtxGemmConfiguration>
     {
         public string Id => "cuda-ptx-gemm-typed";
