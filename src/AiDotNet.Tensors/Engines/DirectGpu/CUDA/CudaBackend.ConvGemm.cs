@@ -252,7 +252,12 @@ public sealed partial class CudaBackend
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
+        // #1323's general implicit GEMM first; #1274's narrow-layer kernel (conv2d_weight_grad_implicit) is next for the
+        // shapes it admits whenever the first declines (switched off, or its split-K partials cannot be sized).
         if (TryConv2DBackwardKernelImplicitGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return true;
+        if (TryConv2DBackwardKernelImplicitNarrow(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             return true;
         if (!ConvGemmUsable() || batch <= 0) return false;
