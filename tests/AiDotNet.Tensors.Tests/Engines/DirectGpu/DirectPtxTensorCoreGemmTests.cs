@@ -565,14 +565,14 @@ public sealed class DirectPtxTensorCoreGemmTests
         var layout = new PtxGemmLayout(false, false);
         PtxGemmConfiguration[] variants =
         {
-            new(128, 128, 8, 8, 8, 4, 4, true),
-            new(128, 128, 16, 8, 8, 4, 4, false, true, 8),
             new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2),
-            new(128, 128, 16, 8, 8, 4, 4, true, true, 8, 2),
-            new(128, 128, 8, 8, 8, 4, 4, true, true, 8, 2),
-            new(128, 128, 32, 8, 8, 4, 4, false, true, 8, 2),
-            new(128, 64, 16, 8, 4, 4, 4, true, true, 8, 2),
-            new(256, 128, 8, 8, 8, 4, 4, true, true, 8),
+            new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 1, 3),
+            new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true),
+            new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 1, 2, true),
+            new(128, 128, 16, 8, 8, 4, 4, false, true, 8, 1, 3, true),
+            new(128, 128, 8, 8, 8, 4, 4, false, true, 8, 2, 3, true),
+            new(128, 128, 8, 8, 8, 4, 4, false, true, 8, 2, 4, true),
+            new(128, 128, 32, 8, 8, 4, 4, false, true, 8, 1, 2, true),
         };
         variants = Array.FindAll(variants, v => v.Invalidity() is null);
         (int M, int N, int K)[] shapes = { (1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (2048, 4096, 4096) };

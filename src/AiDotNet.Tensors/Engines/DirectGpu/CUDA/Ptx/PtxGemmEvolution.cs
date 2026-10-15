@@ -472,18 +472,19 @@ internal static class PtxGemmEvolution
         {
             F(genome.BlockM), F(genome.BlockN), F(genome.BlockK), F(genome.ThreadM), F(genome.ThreadN),
             F(genome.VectorWidth), F(genome.SharedPad), genome.DoubleBuffer ? "1" : "0", genome.SplitTile ? "1" : "0",
-            F(genome.Swizzle), F(genome.MinBlocksPerSM),
+            F(genome.Swizzle), F(genome.MinBlocksPerSM), F(genome.AsyncStages), genome.RegisterTranspose ? "1" : "0",
         });
 
         public PtxGemmConfiguration Deserialize(string payload)
         {
             if (payload is null) throw new ArgumentNullException(nameof(payload));
             string[] v = payload.Split('|');
-            // Eight fields is the version-1 genome (no fragment split, plain rasterization, no occupancy floor).
-            if (v.Length is not (8 or 11)) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
-            bool v2 = v.Length == 11;
+            // Eight fields is the version-1 genome (no fragment split, plain rasterization, no occupancy floor, register
+            // staging).
+            if (v.Length is not (8 or 13)) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
+            bool v2 = v.Length == 13;
             var genome = new PtxGemmConfiguration(P(v[0]), P(v[1]), P(v[2]), P(v[3]), P(v[4]), P(v[5]), P(v[6]), B(v[7]),
-                v2 && B(v[8]), v2 ? P(v[9]) : 1, v2 ? P(v[10]) : 1);
+                v2 && B(v[8]), v2 ? P(v[9]) : 1, v2 ? P(v[10]) : 1, v2 ? P(v[11]) : 0, v2 && B(v[12]));
             if (genome.Invalidity() is { } reason) throw new InvalidDataException("Invalid PTX GEMM genome: " + reason);
             return genome;
         }
@@ -538,7 +539,7 @@ internal static class PtxGemmEvolution
         }
 
         private static PtxGemmConfiguration Mutate(PtxGemmConfiguration value, StableRandom random) =>
-            random.NextInt(11) switch
+            random.NextInt(13) switch
             {
                 0 => value with { BlockM = Pick(Tiles, random) },
                 1 => value with { BlockN = Pick(Tiles, random) },
@@ -551,6 +552,9 @@ internal static class PtxGemmEvolution
                 8 => value with { SplitTile = !value.SplitTile },
                 9 => value with { Swizzle = Pick(PtxGemmConfiguration.Swizzles, random) },
                 10 => value with { MinBlocksPerSM = value.MinBlocksPerSM == 1 ? 2 : 1 },
+                // Switching to cp.async drops register double buffering (the pipeline replaces it).
+                11 => value with { AsyncStages = Pick(PtxGemmConfiguration.AsyncStageCounts, random), DoubleBuffer = false },
+                12 => value with { RegisterTranspose = !value.RegisterTranspose },
                 _ => throw new InvalidOperationException(),
             };
 

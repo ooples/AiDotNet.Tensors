@@ -25,21 +25,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// to the next block column, so they share A and B tiles in L2. 1 is plain row order.</param>
 /// <param name="MinBlocksPerSM">Blocks each multiprocessor must be able to hold (<c>.minnctapersm</c>): 2 caps the
 /// registers ptxas may allocate so two blocks are resident; 1 leaves the register count to ptxas.</param>
+/// <param name="AsyncStages">0 stages K tiles through registers (any compute capability); 2 to 4 streams them straight
+/// into that many shared-memory stages with <c>cp.async</c> (SM 8.0+), with no staging registers: 16-byte copies for
+/// an operand contiguous along M/N, 4-byte copies (transposing on the way in) for one contiguous along K.</param>
+/// <param name="RegisterTranspose">With <c>AsyncStages</c>, an operand contiguous along K is not copied element by
+/// element: each thread loads 16-byte vectors into registers while the current stage computes and stores them
+/// transposed into the stage being refilled afterwards (as CUTLASS does for a K-contiguous SIMT operand).</param>
 internal readonly record struct PtxGemmConfiguration(
     int BlockM, int BlockN, int BlockK, int ThreadM, int ThreadN, int VectorWidth, int SharedPad, bool DoubleBuffer,
-    bool SplitTile = false, int Swizzle = 1, int MinBlocksPerSM = 1)
+    bool SplitTile = false, int Swizzle = 1, int MinBlocksPerSM = 1, int AsyncStages = 0, bool RegisterTranspose = false)
 {
     internal int ThreadsN => BlockN / ThreadN;
     internal int ThreadsM => BlockM / ThreadM;
     internal int Threads => ThreadsM * ThreadsN;
     internal int PitchA => BlockM + SharedPad;
     internal int PitchB => BlockN + SharedPad;
-    internal int Stages => DoubleBuffer ? 2 : 1;
+    internal int Stages => AsyncStages > 0 ? AsyncStages : DoubleBuffer ? 2 : 1;
+    internal bool IsAsync => AsyncStages > 0;
     internal int SharedBytes => checked(Stages * BlockK * (PitchA + PitchB) * sizeof(float));
 
     /// <summary>A short stable name, used in kernel identities and evolution records.</summary>
     internal string Name => string.Format(CultureInfo.InvariantCulture, "b{0}x{1}x{2}-t{3}x{4}-v{5}-p{6}-{7}{8}{9}{10}",
-        BlockM, BlockN, BlockK, ThreadM, ThreadN, VectorWidth, SharedPad, DoubleBuffer ? "db" : "sb",
+        BlockM, BlockN, BlockK, ThreadM, ThreadN, VectorWidth, SharedPad,
+        IsAsync ? "as" + AsyncStages.ToString(CultureInfo.InvariantCulture) + (RegisterTranspose ? "r" : "") : DoubleBuffer ? "db" : "sb",
         SplitTile ? "-split" : "", Swizzle > 1 ? "-g" + Swizzle.ToString(CultureInfo.InvariantCulture) : "",
         MinBlocksPerSM > 1 ? "-o" + MinBlocksPerSM.ToString(CultureInfo.InvariantCulture) : "");
 
@@ -67,13 +75,21 @@ internal readonly record struct PtxGemmConfiguration(
         foreach (bool split in new[] { false, true })
         foreach (int swizzle in Swizzles)
         foreach (int occupancy in new[] { 1, 2 })
+        foreach (int async in AsyncStageCounts)
+        foreach (bool transpose in new[] { false, true })
         {
-            var config = new PtxGemmConfiguration(bm, bn, bk, tm, tn, vw, pad, db, split, swizzle, occupancy);
+            var config = new PtxGemmConfiguration(bm, bn, bk, tm, tn, vw, pad, db, split, swizzle, occupancy, async, transpose);
             if (config.Invalidity() is null) yield return config;
         }
     }
 
     internal static readonly int[] Swizzles = { 1, 4, 8, 16 };
+    internal static readonly int[] AsyncStageCounts = { 0, 2, 3, 4 };
+
+    // Register-staged kernels stay within the 48 KiB every supported device gives a block statically; cp.async kernels
+    // (SM 8.0+) take dynamic shared memory up to the 99 KiB an SM 8.6 block may opt into.
+    internal const int MaxStaticSharedBytes = 48 * 1024;
+    internal const int MaxDynamicSharedBytes = 99 * 1024;
 
     /// <summary>Why this configuration cannot be emitted, or null when it can.</summary>
     internal string? Invalidity()
@@ -87,7 +103,12 @@ internal readonly record struct PtxGemmConfiguration(
         if (BlockK % VectorWidth != 0) return "vector width must divide the K tile";
         if (BlockM * BlockK % (Threads * VectorWidth) != 0 || BlockN * BlockK % (Threads * VectorWidth) != 0)
             return "each thread must load a whole number of vectors of both tiles";
-        if (SharedBytes > 48 * 1024) return "shared memory exceeds 48 KiB";
+        if (Array.IndexOf(AsyncStageCounts, AsyncStages) < 0) return "async stages must be 0, 2, 3 or 4";
+        if (IsAsync && DoubleBuffer) return "the cp.async pipeline replaces register double buffering";
+        if (IsAsync && VectorWidth != 4) return "cp.async needs the 16-byte-aligned (vector width 4) admission";
+        if (RegisterTranspose && !IsAsync) return "register transposition is a cp.async pipeline option";
+        if (SharedBytes > (IsAsync ? MaxDynamicSharedBytes : MaxStaticSharedBytes))
+            return IsAsync ? "shared memory exceeds 99 KiB" : "shared memory exceeds 48 KiB";
         if (ThreadM * ThreadN > 128) return "more than 128 accumulators per thread";
         if (Array.IndexOf(Swizzles, Swizzle) < 0) return "swizzle must be 1, 4, 8 or 16";
         if (SplitTile && ThreadM == 4 && ThreadN == 4) return "a 4 x 4 thread tile is already one fragment";
@@ -129,6 +150,8 @@ internal static class PtxSgemmGenerator
     {
         string? invalid = config.Invalidity();
         if (invalid is not null) throw new ArgumentException("Invalid GEMM configuration " + config.Name + ": " + invalid, nameof(config));
+        if (config.IsAsync && ccMajor < 8)
+            throw new PlatformNotSupportedException("cp.async needs compute capability 8.0 or newer.");
         return new Emitter(config, layout).Build(ccMajor, ccMinor);
     }
 
@@ -184,6 +207,7 @@ internal static class PtxSgemmGenerator
             internal int[] SlotMn = Array.Empty<int>();
             internal string[][] Staged = Array.Empty<string[]>();  // registers holding the slot's VW loaded values
             internal string Step = "";  // u64 bytes to advance every slot pointer by one K tile
+            internal bool ViaRegisters;  // staged through registers (always, or a transposed operand of a cp.async kernel)
         }
 
         internal string Build(int ccMajor, int ccMinor)
@@ -253,11 +277,20 @@ internal static class PtxSgemmGenerator
             var a = SetUpOperand("a", _layout.AContiguousAlongK, _c.BlockM, _c.PitchA, aPtr, lda, bm, m, tid);
             var b = SetUpOperand("b", _layout.BContiguousAlongK, _c.BlockN, _c.PitchB, bPtr, ldb, bn, n, tid);
 
-            // Shared buffers (32-bit shared-window addresses) and the double-buffer selector.
+            // Shared buffers (32-bit shared-window addresses) and the double-buffer selector. A cp.async kernel's
+            // stages live in dynamic shared memory: every A stage, then every B stage.
             int tileBytesA = _c.BlockK * _c.PitchA * sizeof(float), tileBytesB = _c.BlockK * _c.PitchB * sizeof(float);
             string curA = R(), curB = R(), nxtA = R(), nxtB = R();
-            L($"mov.u32 {curA}, a_tile;");
-            L($"mov.u32 {curB}, b_tile;");
+            if (_c.IsAsync)
+            {
+                L($"mov.u32 {curA}, smem;");
+                L($"add.u32 {curB}, {curA}, {I(_c.AsyncStages * tileBytesA)};");
+            }
+            else
+            {
+                L($"mov.u32 {curA}, a_tile;");
+                L($"mov.u32 {curB}, b_tile;");
+            }
             L($"add.u32 {nxtA}, {curA}, {I(tileBytesA)};");
             L($"add.u32 {nxtB}, {curB}, {I(tileBytesB)};");
 
@@ -290,7 +323,58 @@ internal static class PtxSgemmGenerator
             L($"setp.eq.u32 {empty}, {tiles}, 0;");
             L($"@{empty} bra EPILOGUE;");
 
-            if (_c.DoubleBuffer)
+            if (_c.IsAsync)
+            {
+                // Prologue: tiles 0 .. Stages-2 in flight, one commit group per tile (empty past the last tile).
+                for (int s = 0; s < _c.AsyncStages - 1; s++)
+                {
+                    string issue = P();
+                    L($"setp.gt.u32 {issue}, {tiles}, {I(s)};");
+                    IssueTile(a, curA, I(s * tileBytesA), k0, k, issue);
+                    IssueTile(b, curB, I(s * tileBytesB), k0, k, issue);
+                    L("cp.async.commit_group;");
+                    FinishTile(a, curA, I(s * tileBytesA));
+                    FinishTile(b, curB, I(s * tileBytesB));
+                    if (s < _c.AsyncStages - 2)
+                    {
+                        Advance(a);
+                        Advance(b);
+                        L($"add.u32 {k0}, {k0}, {I(_c.BlockK)};");
+                    }
+                }
+                Label("K_LOOP");
+                // Tile `tile` has landed once at most Stages-2 younger groups are pending; the barrier also retires
+                // every thread's reads of the stage the next issue overwrites (computed in the previous iteration).
+                L($"cp.async.wait_group {I(_c.AsyncStages - 2)};");
+                L("bar.sync 0;");
+                string next = R(), issueStage = R(), hasNext = P(), nextK0 = R(), offA = R(), offB = R();
+                L($"add.u32 {next}, {tile}, {I(_c.AsyncStages - 1)};");
+                L($"setp.lt.u32 {hasNext}, {next}, {tiles};");
+                L($"rem.u32 {issueStage}, {next}, {I(_c.AsyncStages)};");
+                L($"mul.lo.u32 {nextK0}, {next}, {I(_c.BlockK)};");
+                Advance(a);
+                Advance(b);
+                L($"mul.lo.u32 {offA}, {issueStage}, {I(tileBytesA)};");
+                L($"mul.lo.u32 {offB}, {issueStage}, {I(tileBytesB)};");
+                IssueTile(a, curA, offA, nextK0, k, hasNext);
+                IssueTile(b, curB, offB, nextK0, k, hasNext);
+                L("cp.async.commit_group;");
+                string computeStage = R(), stageA = R(), stageB = R();
+                L($"rem.u32 {computeStage}, {tile}, {I(_c.AsyncStages)};");
+                L($"mad.lo.u32 {stageA}, {computeStage}, {I(tileBytesA)}, {curA};");
+                L($"mad.lo.u32 {stageB}, {computeStage}, {I(tileBytesB)}, {curB};");
+                Compute(stageA, stageB, aRead, bRead, fa, fb, acc);
+                // The refilled stage was last read in the previous iteration (the barrier above retired it) and is
+                // next read Stages-1 iterations on, after at least one more barrier.
+                FinishTile(a, curA, offA);
+                FinishTile(b, curB, offB);
+                string more = P();
+                L($"add.u32 {tile}, {tile}, 1;");
+                L($"setp.lt.u32 {more}, {tile}, {tiles};");
+                L($"@{more} bra K_LOOP;");
+                L("cp.async.wait_group 0;");
+            }
+            else if (_c.DoubleBuffer)
             {
                 LoadTile(a, k0, k);
                 LoadTile(b, k0, k);
@@ -358,6 +442,7 @@ internal static class PtxSgemmGenerator
             ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
             ptx.AppendLine(".address_size 64");
             ptx.Append("// sgemm ").Append(_c.Name).Append(' ').AppendLine(_layout.Name);
+            if (_c.IsAsync) ptx.AppendLine(".extern .shared .align 16 .b8 smem[];");
             ptx.Append(".visible .entry ").Append(EntryPoint).AppendLine("(");
             ptx.AppendLine("    .param .u64 a_ptr, .param .u64 b_ptr, .param .u64 c_ptr,");
             ptx.AppendLine("    .param .u32 m, .param .u32 n, .param .u32 k, .param .u32 lda, .param .u32 ldb, .param .u32 ldc,");
@@ -370,8 +455,11 @@ internal static class PtxSgemmGenerator
             ptx.Append("    .reg .b32 %r<").Append(I(Math.Max(1, _r32))).AppendLine(">;");
             ptx.Append("    .reg .b64 %rd<").Append(I(Math.Max(1, _r64))).AppendLine(">;");
             ptx.Append("    .reg .f32 %f<").Append(I(Math.Max(1, _f))).AppendLine(">;");
-            ptx.Append("    .shared .align 16 .b8 a_tile[").Append(I(_c.Stages * tileBytesA)).AppendLine("];");
-            ptx.Append("    .shared .align 16 .b8 b_tile[").Append(I(_c.Stages * tileBytesB)).AppendLine("];");
+            if (!_c.IsAsync)
+            {
+                ptx.Append("    .shared .align 16 .b8 a_tile[").Append(I(_c.Stages * tileBytesA)).AppendLine("];");
+                ptx.Append("    .shared .align 16 .b8 b_tile[").Append(I(_c.Stages * tileBytesB)).AppendLine("];");
+            }
             ptx.Append(_body);
             ptx.AppendLine("}");
             return ptx.ToString();
@@ -381,11 +469,15 @@ internal static class PtxSgemmGenerator
         private Operand SetUpOperand(string name, bool contiguousAlongK, int mnTile, int pitch, string basePtr, string ld,
             string blockMn, string mnLimit, string tid)
         {
-            int vw = _c.VectorWidth;
+            // A cp.async slot is 16 bytes along M/N, or one element along K (the copy transposes it into the K-major
+            // tile); a register slot is the configuration's vector width either way.
+            bool viaRegisters = !_c.IsAsync || (contiguousAlongK && _c.RegisterTranspose);
+            int vw = viaRegisters ? _c.VectorWidth : contiguousAlongK ? 1 : 4;
             int slots = mnTile * _c.BlockK / (_c.Threads * vw);
             var op = new Operand
             {
                 Name = name,
+                ViaRegisters = viaRegisters,
                 ContiguousAlongK = contiguousAlongK,
                 MnTile = mnTile,
                 Pitch = pitch,
@@ -432,10 +524,19 @@ internal static class PtxSgemmGenerator
                 // Keep the k offset and the mn offset as registers too (shared store address and the K bound).
                 op.SlotK[s] = s;
                 op.SlotMn[s] = s;
-                op.Staged[s] = new string[vw];
-                for (int v = 0; v < vw; v++) op.Staged[s][v] = F();
+                op.Staged[s] = new string[viaRegisters ? vw : 0];
+                for (int v = 0; v < op.Staged[s].Length; v++) op.Staged[s][v] = F();
                 _slotK[(name, s)] = kOff;
                 _slotMn[(name, s)] = mnOff;
+                if (!viaRegisters)
+                {
+                    // The slot's byte offset within a stage of the K-major tile.
+                    string shared = R();
+                    L($"mad.lo.u32 {shared}, {kOff}, {I(pitch)}, {mnOff};");
+                    L($"shl.b32 {shared}, {shared}, 2;");
+                    _slotShared[(name, s)] = shared;
+                    _slotBytes[name] = vw * sizeof(float);
+                }
             }
             // One K tile further: BK elements along K, or BK rows of ld elements.
             op.Step = Rd();
@@ -446,6 +547,45 @@ internal static class PtxSgemmGenerator
 
         private readonly Dictionary<(string, int), string> _slotK = new();
         private readonly Dictionary<(string, int), string> _slotMn = new();
+        private readonly Dictionary<(string, int), string> _slotShared = new();
+        private readonly Dictionary<string, int> _slotBytes = new();
+
+        // A register-staged operand of a cp.async kernel: stores the values IssueTile loaded into buffer + stageOffset.
+        private void FinishTile(Operand op, string buffer, string stageOffset)
+        {
+            if (!op.ViaRegisters) return;
+            string stage = R();
+            L($"add.u32 {stage}, {buffer}, {stageOffset};");
+            StoreTile(op, stage);
+        }
+
+        // cp.async of every slot of the tile starting at k0 into the stage at buffer + stageOffset (a register or an
+        // immediate). A slot outside the matrix, or past the last tile, copies zero bytes and zero-fills; a
+        // register-staged operand loads instead (FinishTile stores it).
+        private void IssueTile(Operand op, string buffer, string stageOffset, string k0, string k, string issue)
+        {
+            if (op.ViaRegisters)
+            {
+                // Loads only; out-of-range (or past-the-end) values read zero. FinishTile stores them.
+                LoadTile(op, k0, k);
+                return;
+            }
+            int bytes = _slotBytes[op.Name];
+            for (int s = 0; s < op.SlotPointer.Length; s++)
+            {
+                string kGlobal = R(), ok = P(), size = R(), dst = R();
+                L($"add.u32 {kGlobal}, {k0}, {_slotK[(op.Name, s)]};");
+                L($"setp.lt.and.u32 {ok}, {kGlobal}, {k}, {op.SlotMnInBounds[s]};");
+                L($"and.pred {ok}, {ok}, {issue};");
+                L($"selp.u32 {size}, {I(bytes)}, 0, {ok};");
+                L($"add.u32 {dst}, {buffer}, {_slotShared[(op.Name, s)]};");
+                L($"add.u32 {dst}, {dst}, {stageOffset};");
+                // 16-byte copies may bypass L1 (.cg); 4-byte copies must go through it (.ca).
+                L(bytes == 16
+                    ? $"cp.async.cg.shared.global [{dst}], [{op.SlotPointer[s]}], 16, {size};"
+                    : $"cp.async.ca.shared.global [{dst}], [{op.SlotPointer[s]}], {I(bytes)}, {size};");
+            }
+        }
 
         private void Advance(Operand op)
         {
