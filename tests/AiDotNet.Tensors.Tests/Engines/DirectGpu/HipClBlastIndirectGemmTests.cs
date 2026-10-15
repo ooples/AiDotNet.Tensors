@@ -32,8 +32,11 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     }
 
     [SkippableTheory]
-    [InlineData(448, 448, 448, 1f, 0f)]      // exactly MinIndirectSize: no padding on this device's tiles
-    [InlineData(447, 448, 61, 1f, 0f)]       // N alone reaches the threshold; M and K pad
+    [InlineData(448, 448, 448, 1f, 0f)]      // no padding on this device's tiles
+    [InlineData(447, 447, 512, 1f, 0f)]      // below CLBlast's OpenCL MinIndirectSize (448): 3.2x the HIP kernel here
+    [InlineData(64, 64, 64, 1f, 0f)]         // the HIP threshold itself
+    [InlineData(200, 500, 300, 1f, 0.5f)]
+    [InlineData(47, 448, 61, 1f, 0f)]        // N alone reaches the threshold; M and K pad
     [InlineData(500, 700, 300, 0.5f, 0.25f)] // every dimension pads; beta reads C through the padded copy
     [InlineData(1024, 1024, 1024, 1f, 1f)]
     [InlineData(4096, 64, 257, 2f, -1f)]     // skinny N, ragged K
@@ -52,7 +55,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     }
 
     [SkippableTheory]
-    [InlineData(447, 447, 512)]
+    [InlineData(63, 63, 512)]                // below the HIP threshold on both sides
     [InlineData(1, 4096, 512)]               // vector products stay on the HIP kernels
     [InlineData(4096, 1, 512)]
     [InlineData(8, 512, 512)]               // past the threshold, but padding 8 to a 64 tile is 8x the work

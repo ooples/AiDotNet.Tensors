@@ -165,17 +165,24 @@ public sealed partial class HipBackend
     }
 
     /// <summary>
-    /// The shapes Gemm sends through the indirect path: M or N at least CLBlast's MinIndirectSize for the device (where
-    /// OpenCL switches to it), and tile padding adding at most half again the work. Measured on an RX 5500 XT, a side
-    /// padded from 8 to the 64-wide tile (8x512x512: 22 vs 48 GF) or from 16 (16x1024x1024: 125 vs 218 GF) loses to the
-    /// HIP kernels, while unpadded skinny shapes win (4096x64x4096: 727 vs 406 GF).
+    /// The shapes Gemm sends through the indirect path: M or N at least <see cref="HipIndirectMinSize"/>, and tile
+    /// padding adding at most half again the work. Measured on an RX 5500 XT, a side padded from 8 to the 64-wide tile
+    /// (8x512x512: 22 vs 48 GF) or from 16 (16x1024x1024: 125 vs 218 GF) loses to the HIP kernels, while unpadded skinny
+    /// shapes win (4096x64x4096: 727 vs 406 GF).
     /// </summary>
+    // #1266: CLBlast's MinIndirectSize (448 for this device) is where its OpenCL switches from the direct to the indirect
+    // kernel. On HIP the alternative is not CLBlast's direct kernel but ours, and the indirect kernel beat it at every
+    // size measured below 448 on an RX 5500 XT (ms, ours vs indirect, bit-identical results): 64^3 0.066 vs 0.019, 128^3
+    // 0.063 vs 0.028, 256^3 0.137 vs 0.048, 384^3 0.298 vs 0.080, 447^3 0.396 vs 0.122, 128x4096x128 0.126 vs 0.063,
+    // 4096x128x256 0.272 vs 0.202, 200x500x300 0.155 vs 0.071.
+    private const int HipIndirectMinSize = 64;
+
     private bool ShouldUseClBlastIndirectGemm(int M, int N, int K)
     {
         if (M <= 1 || N <= 1) return false;
-        // The threshold is a database lookup; checking it before ClBlastVariantFor keeps every shape below it (including
-        // the first small GEMM a process runs) from compiling the CLBlast modules at all.
-        int minIndirect = ClBlastMinIndirectSize;
+        // Checked before ClBlastVariantFor, so the smallest GEMMs (including the first a process runs) never compile the
+        // CLBlast modules.
+        int minIndirect = ClBlastMinIndirectSize > 0 ? Math.Min(ClBlastMinIndirectSize, HipIndirectMinSize) : 0;
         if (minIndirect <= 0 || (M < minIndirect && N < minIndirect)) return false;
         var variant = ClBlastVariantFor(M, N, K);
         if (variant is null) return false;
