@@ -4182,6 +4182,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // finalizer frees it stream-ordered, with NO download. It used to be entered in the activation cache as well,
         // which strongly owned it, so the cache had to materialize (download) every result before it could free it:
         // at every tape dispose and every pressure eviction, plus the cache bookkeeping on every op.
+        // #1302: say so on the tensor, or Dispose() leaves the buffer to the finalizer: a 64 MB device result behind a
+        // few-hundred-byte object gives the GC no reason to run, so every call allocated a fresh buffer and none was freed.
+        tensor._ownsGpuBuffer = true;
         NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
         // Not released when the tape ends: a result the caller holds stays valid, as in PyTorch, and returns to the pool
         // when it is collected. The gradients backward computes but does not return are freed as soon as backward ends
