@@ -35,20 +35,37 @@ internal static class MlpFusionProbe
         float[] xa = x.ToArray();
         float[][] wa = w.Select(t => t.ToArray()).ToArray();
         float[][] ba = b.Select(t => t!.ToArray()).ToArray();
+        bool savedStripes = CpuEngine.MlpRowStripesEnabled;
+        CpuEngine.MlpRowStripesEnabled = false;
         float[] reference = engine.MlpForward(x, w, b, FusedActivationType.ReLU, FusedActivationType.None).ToArray();
+        CpuEngine.MlpRowStripesEnabled = true;
+        float[] striped = engine.MlpForward(x, w, b, FusedActivationType.ReLU, FusedActivationType.None).ToArray();
+        CpuEngine.MlpRowStripesEnabled = savedStripes;
+        {
+            double err = 0, big = 0;
+            for (int i = 0; i < reference.Length; i++) { err = Math.Max(err, Math.Abs(striped[i] - reference[i])); big = Math.Max(big, Math.Abs(reference[i])); }
+            Console.WriteLine($"row stripes vs per-layer MlpForward: max relative difference {err / big:G3}");
+        }
 
         var configs = new List<(string Name, Action Body)>();
         int saved = CpuParallelSettings.MaxDegreeOfParallelism;
-        foreach (int dop in new[] { 8, 16, 32, 64, Environment.ProcessorCount })
-        {
-            int d = dop;
-            configs.Add(($"MlpForward dop={d}", () =>
+        foreach (int dop in new[] { 16, 32, 64, Environment.ProcessorCount })
+            foreach (bool stripesOn in new[] { false, true })
             {
-                CpuParallelSettings.MaxDegreeOfParallelism = d;
-                engine.MlpForward(x, w, b, FusedActivationType.ReLU, FusedActivationType.None);
-                CpuParallelSettings.MaxDegreeOfParallelism = saved;
-            }));
-        }
+                int d = dop;
+                bool on = stripesOn;
+                configs.Add(($"MlpForward {(on ? "row stripes" : "per-layer")} dop={d}", () =>
+                {
+                    CpuParallelSettings.MaxDegreeOfParallelism = d;
+                    CpuEngine.MlpRowStripesEnabled = on;
+                    try { engine.MlpForward(x, w, b, FusedActivationType.ReLU, FusedActivationType.None).Dispose(); }
+                    finally
+                    {
+                        CpuParallelSettings.MaxDegreeOfParallelism = saved;
+                        CpuEngine.MlpRowStripesEnabled = savedStripes;
+                    }
+                }));
+            }
 
         // Row stripes: one dispatch, each participant runs its rows through all three layers (no inter-layer barrier).
         foreach (int stripes in new[] { 8, 16, 32 })
