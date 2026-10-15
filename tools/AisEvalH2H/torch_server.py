@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 torch.set_grad_enabled(False)
+WARM_SECONDS = 0.25
 
 
 def load(directory, name, *shape):
@@ -135,7 +136,8 @@ def main():
                 iters = int(cmd['iters'])
                 times = []
                 with torch.inference_mode():
-                    for _ in range(3):
+                    warm = time.perf_counter()
+                    while time.perf_counter() - warm < WARM_SECONDS:   # steady state, as the AiDotNet side
                         fn(x)
                     for _ in range(iters):
                         t0 = time.perf_counter()

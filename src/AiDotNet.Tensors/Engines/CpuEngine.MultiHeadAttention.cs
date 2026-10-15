@@ -249,12 +249,18 @@ public partial class CpuEngine
         // utilizes far better than N=dModel — #476 root-cause-2 (managed
         // projection GEMM quality). Output rows are [q(dModel)|k(dModel)|v(dModel)].
         int dModel3 = 3 * dModel;
-        var qkvFlatBuf = pool.Rent(totalRows * dModel3);
+        // #436: batch-fused path. With small projection weights, one dispatch runs every stage for whole batch
+        // elements on one worker: [seq, dModel] @ fusedW, each head's attention, @ outWeight. No barrier between the
+        // stages and no [B*seq, 3*dModel] intermediate to round-trip through the caches; the three-phase path below
+        // pays a fork/join and a pass over B*seq rows per phase.
+        bool batchFused = !hasQuantizedProjection && MhaBatchFusedEnabled && batch > 1
+            && (long)dModel * dModel3 <= MhaBatchFusedMaxWeightFloats;
+        var qkvFlatBuf = batchFused ? System.Array.Empty<float>() : pool.Rent(totalRows * dModel3);
         // Quantized kernels produce one contiguous projection at a time; normal fp32
         // retains the faster single fused-QKV GEMM. Rent only the scratch each route uses.
         var fusedWBuf = hasQuantizedProjection ? null : pool.Rent(dModel * dModel3);
         var projectionBuf = hasQuantizedProjection ? pool.Rent(totalRows * dModel) : null;
-        var concatBuf = pool.Rent(totalRows * dModel); // [B*seq, dModel] attention output, pre out-proj
+        var concatBuf = batchFused ? System.Array.Empty<float>() : pool.Rent(totalRows * dModel); // [B*seq, dModel] attention output, pre out-proj
 
         var output = AutoTensorCache.RentOrAllocate<float>(new[] { batch, seqLen, dModel });
 
@@ -292,6 +298,15 @@ public partial class CpuEngine
                     qWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow, dModel));
                     kWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow + dModel, dModel));
                     vWS.Slice(kk * dModel, dModel).CopyTo(fW.Slice(dstRow + 2 * dModel, dModel));
+                }
+                if (batchFused)
+                {
+                    // A lease, not GetDataArray: the raw-array accessor marks the result escaped, which stops its
+                    // array from ever being recycled, so each call would allocate (and page in) a fresh large output.
+                    using (var outLease = output.LeaseArray())
+                        MultiHeadAttentionBatchFused(inputArray, fusedWBuf!, outWeight, mask, outLease.Array,
+                            batch, seqLen, dModel, numHeads, dHead);
+                    return output;
                 }
                 using (Profiling.Profiler.OpScope("MHA.QKVproj"))
                 SimdGemm.Sgemm(
@@ -342,10 +357,10 @@ public partial class CpuEngine
         }
         finally
         {
-            pool.Return(qkvFlatBuf);
+            if (!batchFused) pool.Return(qkvFlatBuf);
             if (fusedWBuf is not null) pool.Return(fusedWBuf);
             if (projectionBuf is not null) pool.Return(projectionBuf);
-            pool.Return(concatBuf);
+            if (!batchFused) pool.Return(concatBuf);
         }
     }
 
@@ -432,14 +447,9 @@ public partial class CpuEngine
     {
         int bhCount = batch * heads;
         float scaleF = (float)scaleValue;
-        float negInfF = float.NegativeInfinity;
         var pool = System.Buffers.ArrayPool<float>.Shared;
 
-        // Per-slice scratch: Q [seq×dHead] | V [seq×dHead] | Kᵀ [dHead×seq] | scores [seq×seq].
-        int qSoff = 0;
-        int vSoff = seq * dHead;
-        int ktoff = 2 * seq * dHead;
-        int scoff = 3 * seq * dHead;      // dHead*seq == seq*dHead
+        // Per-slice scratch (see SdpaSliceFloat): Q [seq×dHead] | V [seq×dHead] | Kᵀ [dHead×seq] | scores [seq×seq].
         int scratchLen = 3 * seq * dHead + seq * seq;
 
         // Mask broadcasting (IEngine contract: the attention mask is broadcastable to
@@ -464,123 +474,11 @@ public partial class CpuEngine
             {
                 for (int bh = chunk; bh < bhCount; bh += _sdpaChunks)
                 {
-                int b = bh / heads;
-                int h = bh % heads;
-                int mb = BroadcastMaskIndex(b, mB);   // broadcast batch/head indices into the mask
-                int mh = BroadcastMaskIndex(h, mH);
-                int hQ = qCol + h * dHead;
-                int hK = kCol + h * dHead;
-                int hV = vCol + h * dHead;
-
-                // Gather: Q contiguous [seq×dHead], V contiguous [seq×dHead],
-                // K already TRANSPOSED into [dHead×seq] (so the score GEMM is a
-                // plain no-transpose A·B). One strided read pass per slice.
-                for (int s = 0; s < seq; s++)
-                {
-                    int rowBase = (b * seq + s) * qkvRowStride;
-                    int qsrc = rowBase + hQ, vsrc = rowBase + hV, ksrc = rowBase + hK;
-                    int qdst = qSoff + s * dHead, vdst = vSoff + s * dHead;
-                    for (int d = 0; d < dHead; d++)
-                    {
-                        scratch[qdst + d] = qkv[qsrc + d];
-                        scratch[vdst + d] = qkv[vsrc + d];
-                        scratch[ktoff + d * seq + s] = qkv[ksrc + d];   // Kᵀ
-                    }
-                }
-
-                // scores[seq×seq] = Q[seq×dHead] · Kᵀ[dHead×seq]
-                Engines.Simd.SimdGemm.SgemmSequential(
-                    scratch.AsSpan(qSoff, seq * dHead),
-                    scratch.AsSpan(ktoff, dHead * seq),
-                    scratch.AsSpan(scoff, seq * seq),
-                    seq, dHead, seq);
-
-                // In-place scale + numerically-stable softmax, row by row.
-                // SIMD fast path: no mask + seq%8==0 (the transformer-encoder case)
-                // — vectorized scale/max, SIMD exp (HerumiExp256.Exp8), vectorized
-                // sum/normalize. The scalar MathF.Exp loop (524K exp/forward at
-                // bs128) was profiled as ~31% of the whole transformer forward.
-#if NET5_0_OR_GREATER
-                if (mask == null && (seq & 7) == 0 && Avx2.IsSupported && Fma.IsSupported)
-                {
-                    fixed (float* scPtr = scratch)
-                    fixed (float* tbl = HerumiExp256._table)
-                    {
-                        var vScale = Vector256.Create(scaleF);
-                        for (int i = 0; i < seq; i++)
-                        {
-                            float* row = scPtr + scoff + i * seq;
-                            var vmax = Vector256.Create(negInfF);
-                            for (int j = 0; j < seq; j += 8)
-                            {
-                                var v = Avx.Multiply(Avx.LoadVector256(row + j), vScale);
-                                Avx.Store(row + j, v);
-                                vmax = Avx.Max(vmax, v);
-                            }
-                            float maxVal = HMax256(vmax);
-                            var vMaxB = Vector256.Create(maxVal);
-                            var vsum = Vector256<float>.Zero;
-                            for (int j = 0; j < seq; j += 8)
-                            {
-                                var e = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(row + j), vMaxB), tbl);
-                                Avx.Store(row + j, e);
-                                vsum = Avx.Add(vsum, e);
-                            }
-                            float sumExp = HSum256(vsum);
-                            float inv = sumExp != 0f ? 1f / sumExp : 0f;
-                            var vinv = Vector256.Create(inv);
-                            for (int j = 0; j < seq; j += 8)
-                                Avx.Store(row + j, Avx.Multiply(Avx.LoadVector256(row + j), vinv));
-                        }
-                    }
-                }
-                else
-#endif
-                {
-                    for (int i = 0; i < seq; i++)
-                    {
-                        int rowOff = scoff + i * seq;
-                        float maxVal = negInfF;
-                        for (int j = 0; j < seq; j++)
-                        {
-                            float v = scratch[rowOff + j] * scaleF;
-                            if (mask != null && !mask[mb, mh, BroadcastMaskIndex(i, mSq), BroadcastMaskIndex(j, mSk)]) v = negInfF;
-                            if (v > maxVal) maxVal = v;
-                            scratch[rowOff + j] = v;
-                        }
-                        if (float.IsNegativeInfinity(maxVal))
-                        {
-                            for (int j = 0; j < seq; j++) scratch[rowOff + j] = 0f;
-                            continue;
-                        }
-                        float sumExp = 0f;
-                        for (int j = 0; j < seq; j++)
-                        {
-                            float e = MathF.Exp(scratch[rowOff + j] - maxVal);
-                            scratch[rowOff + j] = e;
-                            sumExp += e;
-                        }
-                        float inv = sumExp != 0f ? 1f / sumExp : 0f;
-                        for (int j = 0; j < seq; j++) scratch[rowOff + j] *= inv;
-                    }
-                }
-
-                // out[seq×dHead] = P[seq×seq] · V[seq×dHead]. Reuse the Q region
-                // (no longer needed) as the output buffer.
-                Engines.Simd.SimdGemm.SgemmSequential(
-                    scratch.AsSpan(scoff, seq * seq),
-                    scratch.AsSpan(vSoff, seq * dHead),
-                    scratch.AsSpan(qSoff, seq * dHead),
-                    seq, seq, dHead);
-
-                // Scatter into concat[B, seq, H, dHead] = [B*seq, dModel].
-                for (int s = 0; s < seq; s++)
-                {
-                    int dst = (b * seq + s) * dModel + h * dHead;
-                    int src = qSoff + s * dHead;
-                    for (int d = 0; d < dHead; d++)
-                        concat[dst + d] = scratch[src + d];
-                }
+                    int b = bh / heads;
+                    int h = bh % heads;
+                    SdpaSliceFloat(qkv, qkvRowStride, b * seq, qCol, kCol, vCol, h, mask,
+                        BroadcastMaskIndex(b, mB), BroadcastMaskIndex(h, mH), mSq, mSk,
+                        scaleF, seq, dHead, scratch, concat, b * seq, dModel);
                 } // end for bh slice in this chunk
             }
             finally
@@ -588,6 +486,204 @@ public partial class CpuEngine
                 pool.Return(scratch);
             }
         });
+    }
+
+    /// <summary>
+    /// One (batch, head) slice of the transpose-fused SDPA: gathers Q, V and Kᵀ for head <paramref name="h"/> from the
+    /// rows of <paramref name="qkv"/> starting at <paramref name="qkvRowBase"/>, runs Q·Kᵀ, the scaled and masked
+    /// softmax and P·V, and scatters the result into <paramref name="concat"/> rows starting at
+    /// <paramref name="concatRowBase"/>. <paramref name="scratch"/> holds at least 3·seq·dHead + seq² floats.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void SdpaSliceFloat(
+        float[] qkv, int qkvRowStride, int qkvRowBase, int qCol, int kCol, int vCol, int h,
+        Tensor<bool>? mask, int mb, int mh, int mSq, int mSk, float scaleF,
+        int seq, int dHead, float[] scratch, float[] concat, int concatRowBase, int dModel)
+    {
+        float negInfF = float.NegativeInfinity;
+        int qSoff = 0;
+        int vSoff = seq * dHead;
+        int ktoff = 2 * seq * dHead;
+        int scoff = 3 * seq * dHead;
+        int hQ = qCol + h * dHead;
+        int hK = kCol + h * dHead;
+        int hV = vCol + h * dHead;
+
+        // Gather: Q contiguous [seq×dHead], V contiguous [seq×dHead],
+        // K already TRANSPOSED into [dHead×seq] (so the score GEMM is a
+        // plain no-transpose A·B). One strided read pass per slice.
+        for (int s = 0; s < seq; s++)
+        {
+            int rowBase = (qkvRowBase + s) * qkvRowStride;
+            int qsrc = rowBase + hQ, vsrc = rowBase + hV, ksrc = rowBase + hK;
+            int qdst = qSoff + s * dHead, vdst = vSoff + s * dHead;
+            for (int d = 0; d < dHead; d++)
+            {
+                scratch[qdst + d] = qkv[qsrc + d];
+                scratch[vdst + d] = qkv[vsrc + d];
+                scratch[ktoff + d * seq + s] = qkv[ksrc + d];   // Kᵀ
+            }
+        }
+
+        // scores[seq×seq] = Q[seq×dHead] · Kᵀ[dHead×seq]
+        Engines.Simd.SimdGemm.SgemmSequential(
+            scratch.AsSpan(qSoff, seq * dHead),
+            scratch.AsSpan(ktoff, dHead * seq),
+            scratch.AsSpan(scoff, seq * seq),
+            seq, dHead, seq);
+
+        // In-place scale + numerically-stable softmax, row by row.
+        // SIMD fast path: no mask + seq%8==0 (the transformer-encoder case)
+        // — vectorized scale/max, SIMD exp (HerumiExp256.Exp8), vectorized
+        // sum/normalize. The scalar MathF.Exp loop (524K exp/forward at
+        // bs128) was profiled as ~31% of the whole transformer forward.
+#if NET5_0_OR_GREATER
+        if (mask == null && (seq & 7) == 0 && Avx2.IsSupported && Fma.IsSupported)
+        {
+            fixed (float* scPtr = scratch)
+            fixed (float* tbl = HerumiExp256._table)
+            {
+                var vScale = Vector256.Create(scaleF);
+                for (int i = 0; i < seq; i++)
+                {
+                    float* row = scPtr + scoff + i * seq;
+                    var vmax = Vector256.Create(negInfF);
+                    for (int j = 0; j < seq; j += 8)
+                    {
+                        var v = Avx.Multiply(Avx.LoadVector256(row + j), vScale);
+                        Avx.Store(row + j, v);
+                        vmax = Avx.Max(vmax, v);
+                    }
+                    float maxVal = HMax256(vmax);
+                    var vMaxB = Vector256.Create(maxVal);
+                    var vsum = Vector256<float>.Zero;
+                    for (int j = 0; j < seq; j += 8)
+                    {
+                        var e = HerumiExp256.Exp8(Avx.Subtract(Avx.LoadVector256(row + j), vMaxB), tbl);
+                        Avx.Store(row + j, e);
+                        vsum = Avx.Add(vsum, e);
+                    }
+                    float sumExp = HSum256(vsum);
+                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                    var vinv = Vector256.Create(inv);
+                    for (int j = 0; j < seq; j += 8)
+                        Avx.Store(row + j, Avx.Multiply(Avx.LoadVector256(row + j), vinv));
+                }
+            }
+        }
+        else
+#endif
+        {
+            for (int i = 0; i < seq; i++)
+            {
+                int rowOff = scoff + i * seq;
+                float maxVal = negInfF;
+                for (int j = 0; j < seq; j++)
+                {
+                    float v = scratch[rowOff + j] * scaleF;
+                    if (mask != null && !mask[mb, mh, BroadcastMaskIndex(i, mSq), BroadcastMaskIndex(j, mSk)]) v = negInfF;
+                    if (v > maxVal) maxVal = v;
+                    scratch[rowOff + j] = v;
+                }
+                if (float.IsNegativeInfinity(maxVal))
+                {
+                    for (int j = 0; j < seq; j++) scratch[rowOff + j] = 0f;
+                    continue;   // a fully masked row attends to nothing
+                }
+                float sumExp = 0f;
+                for (int j = 0; j < seq; j++)
+                {
+                    float e = MathF.Exp(scratch[rowOff + j] - maxVal);
+                    scratch[rowOff + j] = e;
+                    sumExp += e;
+                }
+                float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                for (int j = 0; j < seq; j++) scratch[rowOff + j] *= inv;
+            }
+        }
+
+        // out[seq×dHead] = P[seq×seq] · V[seq×dHead]. Reuse the Q region
+        // (no longer needed) as the output buffer.
+        Engines.Simd.SimdGemm.SgemmSequential(
+            scratch.AsSpan(scoff, seq * seq),
+            scratch.AsSpan(vSoff, seq * dHead),
+            scratch.AsSpan(qSoff, seq * dHead),
+            seq, seq, dHead);
+
+        // Scatter into concat[B, seq, H, dHead] = [B*seq, dModel].
+        for (int s = 0; s < seq; s++)
+        {
+            int dst = (concatRowBase + s) * dModel + h * dHead;
+            int src = qSoff + s * dHead;
+            for (int d = 0; d < dHead; d++)
+                concat[dst + d] = scratch[src + d];
+        }
+    }
+
+    /// <summary>
+    /// #436: <see cref="MultiHeadAttentionForward{T}"/> at small width runs as one parallel dispatch over batch
+    /// elements: each worker projects its elements' rows to Q|K|V, runs every head's attention and the output
+    /// projection in its own scratch, and writes final rows. Enabled by default; AIDOTNET_MHA_BATCH_FUSED=0 restores
+    /// the three-phase path (QKV GEMM, SDPA over (batch, head) slices, output GEMM).
+    /// </summary>
+    internal static bool MhaBatchFusedEnabled = Environment.GetEnvironmentVariable("AIDOTNET_MHA_BATCH_FUSED") != "0";
+
+    // [dModel, 3*dModel] fused projection weight at most 3*256*256 floats (768 KB): a worker's per-element GEMMs read it
+    // from L2/L3 once per element. Wider models keep the three-phase path, whose large GEMMs parallelize internally.
+    private const long MhaBatchFusedMaxWeightFloats = 3L * 256 * 256;
+
+    [MethodImpl(Hot)]
+    internal static void MultiHeadAttentionBatchFused(
+        float[] input, float[] fusedW, Tensor<float> outWeight, Tensor<bool>? mask, float[] output,
+        int batch, int seq, int dModel, int heads, int dHead)
+    {
+        int dModel3 = 3 * dModel;
+        float scaleF = (float)(1.0 / Math.Sqrt(dHead));
+        var pool = ArrayPool<float>.Shared;
+        // The output weight as a plain array for the workers (a [dModel, dModel] copy: 16 KB at dModel 64).
+        var outW = pool.Rent(dModel * dModel);
+        using (var lease = outWeight.Lease()) lease.Span.Slice(0, dModel * dModel).CopyTo(outW);
+        int mB = mask is null ? 1 : mask.Shape[0];
+        int mH = mask is null ? 1 : mask.Shape[1];
+        int mSq = mask is null ? 1 : mask.Shape[2];
+        int mSk = mask is null ? 1 : mask.Shape[3];
+        int scratchLen = 3 * seq * dHead + seq * seq;
+        int chunks = Math.Max(1, Math.Min(batch,
+            Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, PersistentParallelExecutor.Instance.MaxParticipants)));
+        try
+        {
+            PersistentParallelExecutor.Instance.Execute(chunks, [MethodImpl(Hot)] (chunk) =>
+            {
+                var qkv = pool.Rent(seq * dModel3);
+                var concat = pool.Rent(seq * dModel);
+                var scratch = pool.Rent(scratchLen);
+                try
+                {
+                    for (int b = chunk; b < batch; b += chunks)
+                    {
+                        int rows = b * seq * dModel;
+                        SimdGemm.SgemmSequential(input.AsSpan(rows, seq * dModel), fusedW.AsSpan(0, dModel * dModel3),
+                            qkv.AsSpan(0, seq * dModel3), seq, dModel, dModel3);
+                        int mb = BroadcastMaskIndex(b, mB);
+                        for (int h = 0; h < heads; h++)
+                            SdpaSliceFloat(qkv, dModel3, 0, 0, dModel, 2 * dModel, h, mask,
+                                mb, BroadcastMaskIndex(h, mH), mSq, mSk, scaleF, seq, dHead, scratch, concat, 0, dModel);
+                        SimdGemm.SgemmSequential(concat.AsSpan(0, seq * dModel), outW.AsSpan(0, dModel * dModel),
+                            output.AsSpan(rows, seq * dModel), seq, dModel, dModel);
+                    }
+                }
+                finally
+                {
+                    pool.Return(qkv);
+                    pool.Return(concat);
+                    pool.Return(scratch);
+                }
+            });
+        }
+        finally
+        {
+            pool.Return(outW);
+        }
     }
 
 #if NET5_0_OR_GREATER

@@ -793,6 +793,18 @@ class Program
 
         // Issue #436: the AiDotNet side of tools/AisEvalH2H/driver.py, the paired, interleaved head-to-head against real
         // PyTorch at its best CPU settings (stdin/stdout command server).
+        if (args[0] == "--aiseval-mha-probe")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.MhaFusionProbe.Run();
+            return;
+        }
+
+        if (args[0] == "--aiseval-mlp-probe")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.MlpFusionProbe.Run();
+            return;
+        }
+
         if (args[0] == "--aiseval-h2h-serve")
         {
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalH2HServer.Run();

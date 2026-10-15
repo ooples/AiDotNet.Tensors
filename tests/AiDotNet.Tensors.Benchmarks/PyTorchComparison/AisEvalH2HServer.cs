@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.Benchmarks.PyTorchComparison;
 /// <list type="bullet">
 /// <item><c>setup &lt;mlp|mha|lstm&gt; &lt;dir&gt;</c>: loads the model's tensors from <c>dir</c>.</item>
 /// <item><c>dump &lt;path&gt;</c>: runs once and writes the output as raw float32, for the driver's correctness check.</item>
-/// <item><c>round &lt;iters&gt;</c>: three untimed calls, then <c>iters</c> timed calls; reports median, p95 and min in ms.</item>
+/// <item><c>round &lt;iters&gt;</c>: 0.25 s of untimed calls, then <c>iters</c> timed calls; reports median, p95 and min in ms.</item>
 /// <item><c>quit</c>.</item>
 /// </list>
 /// Shapes (AIsEval CPU scaffold): MLP 784-512-128-10 at batch 128 with ReLU; MHA [128,32,64] with 4 heads and no
@@ -28,6 +28,8 @@ namespace AiDotNet.Tensors.Benchmarks.PyTorchComparison;
 /// </remarks>
 internal static class AisEvalH2HServer
 {
+    private const double WarmSeconds = 0.25;
+
     public static void Run()
     {
         var engine = new CpuEngine();
@@ -124,7 +126,11 @@ internal static class AisEvalH2HServer
 
     private static string TimeRound(Func<Tensor<float>> forward, int iters)
     {
-        for (int i = 0; i < 3; i++) forward();
+        // Warm for a fixed time, not a call count: after the driver's idle pause the cores are parked and clocked
+        // down, and the first ~0.2 s of calls run up to 1.8x slower. Both sides warm the same way, so the round
+        // compares steady states.
+        var warm = Stopwatch.StartNew();
+        while (warm.Elapsed.TotalSeconds < WarmSeconds) forward();
         var times = new double[iters];
         var watch = new Stopwatch();
         for (int i = 0; i < iters; i++)
