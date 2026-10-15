@@ -173,6 +173,14 @@ public partial class CpuEngine
                 savedState: savedState);
         }
 
+        // #436: row stripes. Rows of an MLP are independent through every layer, so one dispatch can run each worker's
+        // stripe of rows through ALL the layers: no barrier between layers, no full-batch intermediate, and the bias and
+        // ReLU applied in registers. The weights are read in place by the unpacked small-row kernel (they stay in cache
+        // across calls); the per-layer path below pays a fork/join per GEMM plus separate bias/activation passes.
+        if (typeof(T) == typeof(float)
+            && TryMlpRowStripes(input, weights, biases, hiddenActivation, outputActivation, out var striped))
+            return striped!;
+
         // Issue #436: small-batch inference GEMMs are oversubscribed by the
         // default all-cores native-BLAS thread count. On a 16-core box the
         // AIsEval MLP (bs=128) measured ~1.74 ms at 16 threads vs ~1.20 ms at
@@ -390,5 +398,111 @@ public partial class CpuEngine
         }
 
         return x;
+    }
+
+    /// <summary>
+    /// #436: <see cref="MlpForward{T}"/> as row stripes (see the call site). On by default; AIDOTNET_MLP_ROW_STRIPES=0
+    /// keeps the per-layer path.
+    /// </summary>
+    internal static bool MlpRowStripesEnabled = Environment.GetEnvironmentVariable("AIDOTNET_MLP_ROW_STRIPES") != "0";
+
+    // Rows per stripe at least this (the kernel's register tile is 4 rows), and two stripes at least, or the per-layer
+    // path keeps the call.
+    private const int MlpRowStripeMinRows = 4;
+
+    // Each stripe streams every weight from cache: keep a layer's weight within a chiplet's share of L3 (8 MB).
+    private const long MlpRowStripeMaxWeightFloats = 2L * 1024 * 1024;
+
+    private static unsafe bool TryMlpRowStripes<T>(
+        Tensor<T> input, IReadOnlyList<Tensor<T>> weights, IReadOnlyList<Tensor<T>?> biases,
+        FusedActivationType hiddenActivation, FusedActivationType outputActivation, out Tensor<T>? result)
+    {
+        result = null;
+        if (!MlpRowStripesEnabled || !Simd.SimdGemm.RowStripeKernelSupported) return false;
+        if (hiddenActivation is not (FusedActivationType.ReLU or FusedActivationType.None)
+            || outputActivation is not (FusedActivationType.ReLU or FusedActivationType.None)) return false;
+        if (input.Rank != 2 || input.IsSparse) return false;
+        int m = input._shape[0];
+        int layers = weights.Count;
+        if (m < 2 * MlpRowStripeMinRows || layers == 0) return false;
+
+        var dims = new int[layers + 1];
+        dims[0] = input._shape[1];
+        int widest = 0;
+        for (int i = 0; i < layers; i++)
+        {
+            var w = weights[i];
+            if (w is null || w.Rank != 2 || w.IsSparse || w._shape[0] != dims[i]) return false;
+            int n = w._shape[1];
+            if ((long)dims[i] * n > MlpRowStripeMaxWeightFloats) return false;
+            var bias = biases[i];
+            if (bias is not null && (bias.Rank != 1 || bias.Length < n)) return false;
+            dims[i + 1] = n;
+            if (i < layers - 1) widest = Math.Max(widest, n);
+        }
+
+        int participants = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism,
+            PersistentParallelExecutor.Instance.MaxParticipants);
+        int stripes = Math.Min(participants, m / MlpRowStripeMinRows);
+        if (stripes < 2) return false;
+        int rowsPer = (m + stripes - 1) / stripes;
+        rowsPer = (rowsPer + 3) / 4 * 4;   // whole register tiles where the rows allow
+        stripes = (m + rowsPer - 1) / rowsPer;
+
+        // Read-only arrays without the escape mark: these tensors are kept alive below until the dispatch is done.
+        var x = ((Tensor<float>)(object)input).GetReadOnlyDataArrayUnmarked();
+        var wArr = new float[layers][];
+        var bArr = new float[]?[layers];
+        for (int i = 0; i < layers; i++)
+        {
+            wArr[i] = ((Tensor<float>)(object)weights[i]).GetReadOnlyDataArrayUnmarked();
+            bArr[i] = biases[i] is { } b ? ((Tensor<float>)(object)b).GetReadOnlyDataArrayUnmarked() : null;
+        }
+
+        var output = AutoTensorCache.RentOrAllocate<float>(new[] { m, dims[layers] });
+        using (var outLease = output.LeaseArray())
+        {
+            float[] outArr = outLease.Array;
+            bool hiddenRelu = hiddenActivation == FusedActivationType.ReLU;
+            bool outputRelu = outputActivation == FusedActivationType.ReLU;
+            PersistentParallelExecutor.Instance.Execute(stripes, [MethodImpl(Hot)] (stripe) =>
+            {
+                int r0 = stripe * rowsPer;
+                int rows = Math.Min(rowsPer, m - r0);
+                if (rows <= 0) return;
+                var pool = System.Buffers.ArrayPool<float>.Shared;
+                float[] ping = widest > 0 ? pool.Rent(rows * widest) : System.Array.Empty<float>();
+                float[] pong = widest > 0 ? pool.Rent(rows * widest) : System.Array.Empty<float>();
+                try
+                {
+                    float[] src = x;
+                    int srcOffset = r0 * dims[0];
+                    for (int i = 0; i < layers; i++)
+                    {
+                        int k = dims[i], n = dims[i + 1];
+                        bool last = i == layers - 1;
+                        float[] dst = last ? outArr : (i % 2 == 0 ? ping : pong);
+                        int dstOffset = last ? r0 * n : 0;
+                        fixed (float* ps = src)
+                        fixed (float* pw = wArr[i])
+                        fixed (float* pb = bArr[i])
+                        fixed (float* pd = dst)
+                            Simd.SimdGemm.RowStripeGemmBiasAct(ps + srcOffset, k, pw, n, pd + dstOffset, n,
+                                rows, k, n, pb, last ? outputRelu : hiddenRelu);
+                        src = dst;
+                        srcOffset = 0;
+                    }
+                }
+                finally
+                {
+                    if (widest > 0) { pool.Return(ping); pool.Return(pong); }
+                }
+            });
+        }
+        GC.KeepAlive(input);
+        GC.KeepAlive(weights);
+        GC.KeepAlive(biases);
+        result = (Tensor<T>)(object)output;
+        return true;
     }
 }
