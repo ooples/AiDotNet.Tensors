@@ -7929,6 +7929,21 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr indicesPtr = indices.Handle;
         IntPtr gradInPtr = gradInput.Handle;
+
+        // Non-overlapping pools: one thread per window writes its whole block (deterministic, no zero-fill, no atomics),
+        // for either determinism setting.
+        if (kernelH == strideH && kernelW == strideW && padH == 0 && padW == 0
+            && inHeight == outHeight * kernelH && inWidth == outWidth * kernelW
+            && _kernelCache.TryGetValue("maxpool2d_backward_tiled", out var tiledKernel))
+        {
+            int planes = batch * channels, tih = inHeight, tiw = inWidth, toh = outHeight, tow = outWidth, tkh = kernelH, tkw = kernelW;
+            long windows = (long)planes * outHeight * outWidth;
+            void** argsT = stackalloc void*[10];
+            argsT[0] = &gradOutPtr; argsT[1] = &indicesPtr; argsT[2] = &gradInPtr; argsT[3] = &planes; argsT[4] = &tih;
+            argsT[5] = &tiw; argsT[6] = &toh; argsT[7] = &tow; argsT[8] = &tkh; argsT[9] = &tkw;
+            LaunchKernel(tiledKernel, (uint)((windows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argsT);
+            return;
+        }
         // Both maxpool2d_backward kernels take NINE parameters — the last two are
         // (outHeight, outWidth). Passing only eight args (a single outWidth) left the
         // kernel's outWidth reading an unfilled arg slot — garbage — which blew up

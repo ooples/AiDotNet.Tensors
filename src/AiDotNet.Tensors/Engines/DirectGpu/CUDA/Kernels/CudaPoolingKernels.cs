@@ -32,7 +32,11 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d(
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
     float maxVal = -INFINITY;
-    int maxIdx = 0;
+    // A winnerless window (all -inf or NaN) routes to its own first in-bounds cell, as the CPU engine and PyTorch
+    // do. It routed to cell 0 of the plane, which made the deterministic backward scan every window for cell 0.
+    int firstH = min(max(oh * strideH - padH, 0), inHeight - 1);
+    int firstW = min(max(ow * strideW - padW, 0), inWidth - 1);
+    int maxIdx = firstH * inWidth + firstW;
 
     for (int kh = 0; kh < kernelH; kh++) {
         for (int kw = 0; kw < kernelW; kw++) {
@@ -93,8 +97,10 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
 // the cell cannot hold its index, so the terms added, and their order, are the same as a full scan's and the result
 // is bit-identical; the cost is O((kH+P)/sH * (kW+P)/sW) per cell instead of O(outH*outW). (Bounding with the passed
 // padding alone dropped gradient for every padded pool reached through the engine: k3 s2 p1 lost 8 of 60 cells.)
-// The one exception is the forward's fallback index 0, stored when no window element compared greater than
-// -INFINITY (an all -inf/NaN window): it can point outside the window, so cell 0 keeps the full scan.
+// A winnerless window (all -inf/NaN) stores its own first in-bounds cell (maxpool2d, as the CPU engine and PyTorch),
+// so every index lies inside its window and every cell, cell 0 included, takes the bounded scan. The forward stored
+// cell 0 for such a window, so cell 0 scanned the whole output plane: one 196-iteration thread per plane, stalling its
+// warp, ~135 us per step on the parity CNN's first pool.
 extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_deterministic(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
     int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
@@ -108,7 +114,7 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
 
     int targetMaxIdx = ih * inWidth + iw;
     int ohLo = 0, ohHi = outHeight - 1, owLo = 0, owHi = outWidth - 1;
-    if (targetMaxIdx != 0) {
+    {
         int padHMax = padH > kernelH - 1 ? padH : kernelH - 1;
         int padWMax = padW > kernelW - 1 ? padW : kernelW - 1;
         int hNum = ih - kernelH + 1;
@@ -137,6 +143,34 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
 }
 
 // Average Pooling 2D
+// Non-overlapping pools (kernel == stride, no padding, the input an exact multiple of the kernel): one thread per output
+// window writes its whole k x k block of gradInput -- the window's winner (indices) gets the window's gradient, every
+// other cell 0. Each input cell belongs to exactly one window, so there are no atomics and no pre-zeroing, and the
+// result is deterministic: the gather per input cell (maxpool2d_backward_deterministic) ran ~6x its memory floor.
+extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_tiled(
+    const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
+    int planes, int inHeight, int inWidth, int outHeight, int outWidth, int kernelH, int kernelW)
+{
+    long long w = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)planes * outHeight * outWidth;
+    if (w >= total) return;
+    int ow = (int)(w % outWidth);
+    long long t = w / outWidth;
+    int oh = (int)(t % outHeight);
+    long long plane = t / outHeight;
+    float g = gradOutput[w];
+    int winner = indices[w];
+    float* base = gradInput + plane * inHeight * inWidth;
+    for (int kh = 0; kh < kernelH; kh++)
+    {
+        int ih = oh * kernelH + kh;
+        for (int kw = 0; kw < kernelW; kw++)
+        {
+            int cell = ih * inWidth + ow * kernelW + kw;
+            base[cell] = cell == winner ? g : 0.0f;
+        }
+    }
+}
 extern ""C"" __global__ __launch_bounds__(256) void avgpool2d(
     const float* __restrict__ input, float* __restrict__ output,
     int batch, int channels, int inHeight, int inWidth,
@@ -971,6 +1005,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_max_pool2d(
                 "maxpool2d",
                 "maxpool2d_backward",
                 "maxpool2d_backward_deterministic",
+            "maxpool2d_backward_tiled",
                 "avgpool2d",
                 "avgpool2d_backward",
                 "global_avgpool2d",
