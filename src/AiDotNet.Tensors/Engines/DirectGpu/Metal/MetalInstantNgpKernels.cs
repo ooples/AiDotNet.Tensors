@@ -725,27 +725,27 @@ inline int spiral_append_unique(device float* list, int count, int candidate, in
 }
 
 inline int spiral_build_neighbors(
-    device const float* faces, int numFaces, int vertex, device float* list, int capacity)
+    device const float* faces, int numFaces, int vtx, device float* list, int capacity)
 {
     int count = 0;
     for (int f = 0; f < numFaces; f++) {
         int v0 = int(faces[f * 3]), v1 = int(faces[f * 3 + 1]), v2 = int(faces[f * 3 + 2]);
-        if (vertex == v0) { count = spiral_append_unique(list, count, v1, capacity); count = spiral_append_unique(list, count, v2, capacity); }
-        else if (vertex == v1) { count = spiral_append_unique(list, count, v0, capacity); count = spiral_append_unique(list, count, v2, capacity); }
-        else if (vertex == v2) { count = spiral_append_unique(list, count, v0, capacity); count = spiral_append_unique(list, count, v1, capacity); }
+        if (vtx == v0) { count = spiral_append_unique(list, count, v1, capacity); count = spiral_append_unique(list, count, v2, capacity); }
+        else if (vtx == v1) { count = spiral_append_unique(list, count, v0, capacity); count = spiral_append_unique(list, count, v2, capacity); }
+        else if (vtx == v2) { count = spiral_append_unique(list, count, v0, capacity); count = spiral_append_unique(list, count, v1, capacity); }
     }
     return count;
 }
 
-inline float spiral_angle(device const float* vertices, int center, int reference, int vertex)
+inline float spiral_angle(device const float* vertices, int center, int reference, int vtx)
 {
     float cx = vertices[center * 3], cy = vertices[center * 3 + 1], cz = vertices[center * 3 + 2];
     float rx = vertices[reference * 3] - cx;
     float ry = vertices[reference * 3 + 1] - cy;
     float rz = vertices[reference * 3 + 2] - cz;
-    float ax = vertices[vertex * 3] - cx;
-    float ay = vertices[vertex * 3 + 1] - cy;
-    float az = vertices[vertex * 3 + 2] - cz;
+    float ax = vertices[vtx * 3] - cx;
+    float ay = vertices[vtx * 3 + 1] - cy;
+    float az = vertices[vtx * 3 + 2] - cz;
     return atan2(ax * ry - ay * rx, ax * rx + ay * ry + az * rz);
 }
 

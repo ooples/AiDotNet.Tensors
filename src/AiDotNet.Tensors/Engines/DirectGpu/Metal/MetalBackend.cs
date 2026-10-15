@@ -315,8 +315,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         // Parity-210 hot-path kernels — same function surface as CUDA/HIP.
         try
         {
+            // Strict floating point: p210_log1p's (u - 1) correction and the special-value checks in the
+            // math helpers are exactly what fast math is allowed to fold away.
             _parity210Library = _shaderLibrary.CompileLibrary("Parity210",
-                MetalParity210Kernels.Source);
+                MetalParity210Kernels.Source, requireStrictFloatingPoint: true);
         }
         catch (Exception ex)
         {

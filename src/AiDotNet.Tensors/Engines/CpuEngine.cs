@@ -8667,7 +8667,7 @@ public partial class CpuEngine : ITensorLevelEngine
     // summation order -- every output is accumulated by one thread in the same sequence as before -- so the result is
     // bit-identical to the serial loop at any thread count.
 
-    private static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
+    internal static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
     {
         // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
         // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
@@ -8719,7 +8719,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
-    private static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
+    internal static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
     {
         // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
         // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
