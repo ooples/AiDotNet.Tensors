@@ -18103,12 +18103,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
         var dims = input.Shape._dims;
         if (!TrySplitAroundKeptBlock(dims, sortedAxes, out int leading, out int kept, out int trailing)) return null;
-        if (trailing != 1 || leading <= 1) return null;
+        // A trailing block too (a convolution's bias gradient, [N, C, H, W] over N, H and W): the two-pass sum around
+        // the kept axis, where the general resident path permuted the whole tensor and row-summed it (~180 us per
+        // training step on the parity CNN).
+        bool aroundKept = trailing > 1 && backend is ISumAroundKeptBackend;
+        if ((trailing != 1 && !aroundKept) || (leading <= 1 && !aroundKept)) return null;
         var inBuf = ResolveResidentBufferNoUpload(backend, input, input.Length);
         if (inBuf is null) return null;
         // Filled outside capture by the warm-up steps; null while capturing an unwarmed size.
-        var ones = GetCachedOnesBuffer(backend, leading);
-        if (ones is null) return null;
+        var ones = aroundKept ? null : GetCachedOnesBuffer(backend, leading);
+        if (!aroundKept && ones is null) return null;
 
         var reducedAxes = new bool[dims.Length];
         foreach (int axis in sortedAxes) reducedAxes[axis] = true;
@@ -18126,10 +18130,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var output = new Tensor<T>(new T[kept], outputShape);
         var outBuf = GetOrCreateResidentBuffer(backend, output, kept, fullyWritten: true);
         if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < kept) return null;
-        if (!TryColumnSumsOnDevice(backend, inBuf, outBuf, leading, kept, add: false))
-            backend.Gemm(ones, inBuf, outBuf, 1, kept, leading);   // [1, leading] · [leading, kept]
-        if (op == ReduceOperation.Mean)
-            backend.Scale(outBuf, outBuf, 1f / leading, kept);
+        if (aroundKept)
+        {
+            var around = (ISumAroundKeptBackend)backend;
+            int scratchFloats = around.SumAroundKeptScratchFloats(leading, kept, trailing);
+            var scratch = scratchFloats > 0 ? RentActionScratch(backend, scratchFloats, fullyWritten: true) : null;
+            float scale = op == ReduceOperation.Mean ? 1f / ((float)leading * trailing) : 1f;
+            if (scratch is null || !around.TrySumAroundKept(inBuf, scratch, outBuf, leading, kept, trailing, scale))
+                return null;
+        }
+        else
+        {
+            if (!TryColumnSumsOnDevice(backend, inBuf, outBuf, leading, kept, add: false) && ones is not null)
+                backend.Gemm(ones, inBuf, outBuf, 1, kept, leading);   // [1, leading] · [leading, kept]
+            if (op == ReduceOperation.Mean)
+                backend.Scale(outBuf, outBuf, 1f / leading, kept);
+        }
         ResidentSyncCheck("ReduceLeadingAxes");
         BindResidentBuffer(output, outBuf, backend);
         return output;

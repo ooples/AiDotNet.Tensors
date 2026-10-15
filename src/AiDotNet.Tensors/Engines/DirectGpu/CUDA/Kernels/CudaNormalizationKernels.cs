@@ -599,6 +599,43 @@ extern ""C"" __global__ __launch_bounds__(256) void column_sum_partial(
     }
 }
 
+// A sum over a leading and a trailing block around one kept axis (a convolution's bias gradient): input viewed as
+// [L, C, T]. Pass 1: block (c, chunk) sums channel c over rows [chunk * rowsPerChunk, +rowsPerChunk) -- each row a run
+// of T contiguous floats -- by a fixed shared-memory tree, into partials[chunk * C + c].
+extern ""C"" __global__ __launch_bounds__(256) void sum_around_kept_partial(
+    const float* __restrict__ x, float* __restrict__ partials, int L, int C, int T, int rowsPerChunk)
+{
+    __shared__ float s[256];
+    int c = blockIdx.x, chunk = blockIdx.y;
+    int l0 = chunk * rowsPerChunk, l1 = min(L, l0 + rowsPerChunk);
+    long long span = (long long)max(0, l1 - l0) * T;
+    float acc = 0.0f;
+    for (long long e = threadIdx.x; e < span; e += blockDim.x)
+    {
+        int l = l0 + (int)(e / T), t = (int)(e % T);
+        acc += x[((long long)l * C + c) * T + t];
+    }
+    s[threadIdx.x] = acc;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1)
+    {
+        if (threadIdx.x < o) s[threadIdx.x] += s[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partials[(long long)chunk * C + c] = s[0];
+}
+
+// Pass 2: each channel's partials summed in chunk order, times scale.
+extern ""C"" __global__ __launch_bounds__(256) void sum_around_kept_finish(
+    const float* __restrict__ partials, float* __restrict__ output, int C, int chunks, float scale)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float t = 0.0f;
+    for (int k = 0; k < chunks; k++) t += partials[(long long)k * C + c];
+    output[c] = scale * t;
+}
+
 // LayerNorm's input gradient ADDED into gradInput, one warp per row of [rows, cols]:
 // dx += invStd * (g*dy - mean_c(g*dy) - xhat * mean_c(g*dy*xhat)), xhat = (x - mean) * invStd. Lane-strided sums
 // reduced by a fixed xor-shuffle tree: deterministic.
@@ -784,6 +821,8 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "column_sum_finish",
                 "broadcast_reduced_middle",
                 "layernorm_input_grad_add",
+                "sum_around_kept_partial",
+                "sum_around_kept_finish",
                 "softmax_xent_rows",
                 "softmax_xent_total",
                 "softmax_xent_backward"

@@ -4,7 +4,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 // LayerNorm's backward as placeable pieces (see ILayerNormBackwardPartsBackend), and the same deterministic
 // column reduction for bias gradients (IColumnSumBackend).
-public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColumnSumBackend, IBroadcastReducedBackend
+public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColumnSumBackend, IBroadcastReducedBackend,
+    ISumAroundKeptBackend
 {
     int IColumnSumBackend.ColumnSumScratchFloats(int rows, int cols) =>
         rows <= 0 || cols <= 0 ? 0 : checked(LayerNormAffineGradientChunks(rows, cols) * cols);
@@ -51,6 +52,38 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         long work = (inner & 3) == 0 ? total / 4 : total;
         uint blocks = (uint)Math.Min(65535L, Math.Max(1L, (work + DefaultBlockSize - 1) / DefaultBlockSize));
         LaunchKernel(broadcastKernel, blocks, DefaultBlockSize, args);
+        return true;
+    }
+    // Chunks of the leading block per kept channel for sum_around_kept: ~256 blocks in all, at least one row each.
+    private static int SumAroundKeptChunks(int leading, int kept) =>
+        Math.Max(1, Math.Min(leading, (256 + kept - 1) / Math.Max(1, kept)));
+
+    int ISumAroundKeptBackend.SumAroundKeptScratchFloats(int leading, int kept, int trailing) =>
+        leading <= 0 || kept <= 0 || trailing <= 0 ? 0 : checked(SumAroundKeptChunks(leading, kept) * kept);
+
+    unsafe bool ISumAroundKeptBackend.TrySumAroundKept(IGpuBuffer input, IGpuBuffer scratch, IGpuBuffer output,
+        int leading, int kept, int trailing, float scale)
+    {
+        long n = (long)leading * kept * trailing;
+        if (!IsAvailable || leading <= 0 || kept <= 0 || trailing <= 0 || kept > 65535 || input.Size < n
+            || output.Size < kept || output.Handle == input.Handle
+            || !_kernelCache.TryGetValue("sum_around_kept_partial", out var aroundPartialKernel)
+            || !_kernelCache.TryGetValue("sum_around_kept_finish", out var aroundFinishKernel))
+            return false;
+        int chunks = SumAroundKeptChunks(leading, kept);
+        if (scratch.Size < (long)chunks * kept) return false;
+        int rowsPerChunk = (leading + chunks - 1) / chunks;
+
+        using var _ = PushContext();
+        IntPtr x = input.Handle, part = scratch.Handle, o = output.Handle;
+        int l = leading, c = kept, t = trailing, rpc = rowsPerChunk, ch = chunks;
+        float sc = scale;
+        void** pargs = stackalloc void*[6];
+        pargs[0] = &x; pargs[1] = &part; pargs[2] = &l; pargs[3] = &c; pargs[4] = &t; pargs[5] = &rpc;
+        LaunchKernel2D(aroundPartialKernel, (uint)kept, (uint)chunks, 1, DefaultBlockSize, 1, pargs);
+        void** fargs = stackalloc void*[5];
+        fargs[0] = &part; fargs[1] = &o; fargs[2] = &c; fargs[3] = &ch; fargs[4] = &sc;
+        LaunchKernel(aroundFinishKernel, (uint)((kept + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, fargs);
         return true;
     }
     // Chunks of rows for the affine-gradient reduction: enough blocks (~128 with the column tiles) to occupy the

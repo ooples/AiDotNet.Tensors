@@ -692,6 +692,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [InlineData(true, TwoPathNetwork.PreNormResidualStream)]
     [InlineData(false, TwoPathNetwork.ResidualReadAfterFanOut)]
     [InlineData(true, TwoPathNetwork.ResidualReadAfterFanOut)]
+    [InlineData(false, TwoPathNetwork.MeanAroundKeptAxis)]
+    [InlineData(true, TwoPathNetwork.MeanAroundKeptAxis)]
     public void Every_step_computes_the_tape_gradient_through_the_gpu_step_shortcuts(bool capture, TwoPathNetwork network)
     {
         Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>[], Tensor<float>> loss = network switch
@@ -705,6 +707,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             TwoPathNetwork.Pooling => PoolingLoss,
             TwoPathNetwork.PreNormResidualStream => PreNormResidualStreamLoss,
             TwoPathNetwork.ResidualReadAfterFanOut => ResidualReadAfterFanOutLoss,
+            TwoPathNetwork.MeanAroundKeptAxis => MeanAroundKeptAxisLoss,
             _ => SharedLoss,
         };
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
@@ -731,6 +734,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 TwoPathNetwork.StandaloneRelu => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
                     Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f),
                     Rand([Hidden, Outputs], 11, 0.3f) },
+                TwoPathNetwork.MeanAroundKeptAxis => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
+                    Rand([Hidden, Outputs], 4, 0.3f) },
                 TwoPathNetwork.ResidualReadAfterFanOut => new[] { Rand([Inputs, Hidden], 3, 0.3f), Rand([Hidden], 10, 0.1f),
                     Rand([Hidden, Hidden], 6, 0.3f), Rand([Hidden], 7, 0.1f), Rand([Hidden, Hidden], 12, 0.3f), Rand([Hidden], 13, 0.1f),
                     Rand([Hidden, Outputs], 4, 0.3f), Rand([Outputs], 5, 0.1f), Rand([Hidden, Outputs], 11, 0.3f) },
@@ -911,6 +916,16 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.TensorMSELoss(pred, y);
     }
 
+    /// <summary>MSE of <c>h · w2 + mean_{0,2}(h viewed as [batch, 6, 8])</c> with <c>h = ReLU(x · w0 + b1)</c>: a mean over a
+    /// leading and a trailing block around one kept axis, as a convolution's bias gradient sums dY over N, H and W, used
+    /// as the projection's bias. In a resident step that reduction runs as sum_around_kept.</summary>
+    private static Tensor<float> MeanAroundKeptAxisLoss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var bias = e.ReduceMean(e.Reshape(h, new[] { Batch, Outputs, Hidden / Outputs }), new[] { 0, 2 }, keepDims: false);
+        return e.TensorMSELoss(e.FusedLinear(h, w[2], bias, FusedActivationType.None), y);
+    }
+
     // A LayerNorm gain near one: 1 + noise.
     private static Tensor<float> Ones(int length, int seed, float noise)
     {
@@ -942,6 +957,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         PreNormResidualStream,
         /// <summary>A residual add whose branch is read after another consumer of the stream added into it.</summary>
         ResidualReadAfterFanOut,
+        /// <summary>A mean around one kept axis (a convolution's bias-gradient shape), used as a bias.</summary>
+        MeanAroundKeptAxis,
     }
 
     /// <summary>
