@@ -469,6 +469,12 @@ public sealed partial class CudaBackend
             Synchronize();
             return PairedRounds(() => EnqueueCapturedGraph(cublasExec), () => EnqueueCapturedGraph(ptxExec), reps);
         }
+        // A capture that cannot be set up or replayed costs only the graph verdict: the eager verdict already measured
+        // stands. A sticky fault (the GPU circuit breaker tripped) is not recoverable and propagates.
+        catch (InvalidOperationException exception) when (!AiDotNetEngine.GpuCircuitBroken)
+        {
+            return GemmRouteVerdict.Rejected($"graph measurement failed ({exception.Message}); graphs keep cuBLAS");
+        }
         finally
         {
             if (cublasGraph != IntPtr.Zero) DestroyCapturedGraph(cublasGraph);

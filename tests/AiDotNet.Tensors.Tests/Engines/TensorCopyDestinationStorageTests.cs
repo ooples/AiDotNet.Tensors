@@ -78,8 +78,8 @@ public class TensorCopyAliasCompiledPlanTests
         var prior = AiDotNetEngine.Current;
         string? priorFusion = Environment.GetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION");
         Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", "1");
-        // Push restores the thread's determinism override too; SetCurrent(Current) would leave one behind (#1221).
-        var priorOptions = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Push(AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current);
+        // Save restores the thread's options and determinism override; SetCurrent(Current) would leave an override behind (#1221).
+        var priorOptions = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Save();
         AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(
             new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions { EnableDataflowFusion = true });
         try

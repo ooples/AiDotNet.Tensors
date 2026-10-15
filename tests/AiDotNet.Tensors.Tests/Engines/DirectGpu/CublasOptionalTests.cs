@@ -162,6 +162,7 @@ public sealed class CublasOptionalTests
         using var c = backend.AllocateBuffer(m * n);
         // Push, not Current + SetCurrent(prior): that "restore" leaves a determinism override on this thread (#1221),
         // which made every later test on it ignore SetDeterministicMode(false).
+        bool? priorOverride = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
         long before = backend.FallbackGemmDispatchCount;
         using (AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Push(
                    new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions { UseCublas = false }))
@@ -175,7 +176,7 @@ public sealed class CublasOptionalTests
             backend.Gemm(a, b, c, m, n, k);
             Assert.Equal(before + 1, backend.FallbackGemmDispatchCount);   // cuBLAS again
         }
-        Assert.Null(AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode());
+        Assert.Equal(priorOverride, AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode());
     }
 
     [SkippableFact]
