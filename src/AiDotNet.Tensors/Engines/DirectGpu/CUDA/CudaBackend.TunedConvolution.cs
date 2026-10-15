@@ -82,6 +82,9 @@ public sealed partial class CudaBackend
                             // logged as cuBLAS while the generic kernel ran.
                             true, shape => s_convGemmBackward && ConvGemmForwardFits(shape),
                             (in CudaConv2DArgs a) => ExecuteConv2DForwardGemm(a)),
+                        new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.implicit_engine", TunedKernelOrigin.Builtin,
+                            true, _ => s_convEngineFprop && HasTunedKernel("conv2d_fprop_ig128_tap"),
+                            (in CudaConv2DArgs a) => ExecuteConv2DForwardEngine(a)),
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)),
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,
@@ -112,6 +115,16 @@ public sealed partial class CudaBackend
         // Only transient states land here (applicability already excludes the process-wide opt-out): during capture
         // without a cuBLAS workspace, or with the scratch not yet sized, the generic kernel computes the same convolution.
         if (!TryConv2DForwardGemm(a))
+            LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+                a.PadH, a.PadW, a.DilationH, a.DilationW);
+    }
+
+    private void ExecuteConv2DForwardEngine(in CudaConv2DArgs a)
+    {
+        // Declines only transiently (split-K partials not yet sized during a capture): the generic kernel computes the
+        // same convolution.
+        if (!TryConv2DForwardEngine(a))
             LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                 a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
                 a.PadH, a.PadW, a.DilationH, a.DilationW);

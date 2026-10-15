@@ -1492,6 +1492,199 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
         }
     }
 }
+
+// ===== #1325: implicit-GEMM conv engine (cuBLAS-class SIMT tiling, strict fp32 FMA) =====
+// One main loop for every conv GEMM: a BM x BN tile of C per 256-thread block, (BM/16) x (BN/16) accumulators per
+// thread (8 x 8 at 128 x 128, 4 x 4 at 64 x 64), CE_BK = 8 deep K tiles. The operand loaders of each conv kind fill
+// registers for the next K tile while the current one is multiplied out of the other of two shared buffers (one
+// barrier per tile). A thread's accumulator rows are ty*4 + {0..3} + 64*g and its columns tx*4 + {0..3} + 64*g, so
+// every shared read is a float4.
+#define CE_BK 8
+
+template <int BM, int BN, typename Load, typename Store, typename Advance>
+__device__ __forceinline__ void ce_mainloop(float* smem, int tiles, Load load, Store store, Advance advance,
+    float (&acc)[BM / 16][BN / 16])
+{
+    constexpr int TM = BM / 16, TN = BN / 16;
+    float (*As)[CE_BK][BM + 4] = reinterpret_cast<float (*)[CE_BK][BM + 4]>(smem);
+    float (*Bs)[CE_BK][BN + 4] = reinterpret_cast<float (*)[CE_BK][BN + 4]>(smem + 2 * CE_BK * (BM + 4));
+    const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;
+    if (tiles <= 0) return;
+    int buf = 0;
+    load();
+    store(As[0], Bs[0]);
+    __syncthreads();
+    for (int t = 0; t < tiles; t++)
+    {
+        bool more = t + 1 < tiles;
+        if (more) { advance(); load(); }
+        #pragma unroll
+        for (int kk = 0; kk < CE_BK; kk++)
+        {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int g = 0; g < TM / 4; g++)
+            {
+                float4 v = *reinterpret_cast<const float4*>(&As[buf][kk][g * 64 + ty * 4]);
+                a[g * 4] = v.x; a[g * 4 + 1] = v.y; a[g * 4 + 2] = v.z; a[g * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int g = 0; g < TN / 4; g++)
+            {
+                float4 v = *reinterpret_cast<const float4*>(&Bs[buf][kk][g * 64 + tx * 4]);
+                b[g * 4] = v.x; b[g * 4 + 1] = v.y; b[g * 4 + 2] = v.z; b[g * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+                #pragma unroll
+                for (int j = 0; j < TN; j++) acc[i][j] += a[i] * b[j];
+        }
+        if (more)
+        {
+            // The other buffer was last read in the previous iteration, before its closing barrier.
+            store(As[buf ^ 1], Bs[buf ^ 1]);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+}
+
+// Forward: Y[Cout, B*oH*oW] = W[Cout, K] * X_gathered[K, B*oH*oW], K = Cin*kH*kW. TAPU (Cin % 8 == 0) orders K as
+// (kh, kw, ci), so a K tile shares one tap: each lane's input position and bounds check are computed once per tile and
+// the tap advances by addition. Otherwise K is W's natural (ci, kh, kw) order with per-element index math. Split-K
+// slices go to out + z * B*Cout*oH*oW and are summed in order by conv2d_wgrad_splitk_reduce.
+template <int BM, int BN, bool TAPU>
+__device__ __forceinline__ void conv2d_fprop_ig_body(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
+    constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256, BSTEP = 256 / BN;
+    const int L = outH * outW, N = batch * L, khw = kH * kW, K = inC * khw, HW = H * W;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int kBegin = blockIdx.z * kPerSplit, kEnd = min(K, kBegin + kPerSplit);
+    const int tiles = kBegin < kEnd ? (kEnd - kBegin + CE_BK - 1) / CE_BK : 0;
+    const int tid = threadIdx.x;
+    const int ak = tid & 7, am = tid >> 3;       // A: k column ak, rows am + 32 r
+    const int bn = tid % BN, bk = tid / BN;      // B: pixel column bn, k rows bk + BSTEP r
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int ih0 = 0, iw0 = 0, nb = 0;
+    if (nIn) { nb = n / L; int l = n - nb * L; int oh = l / outW; ih0 = oh * sH - pH; iw0 = (l - oh * outW) * sW - pW; }
+    const float* xBatch = input + (long long)nb * inC * HW;
+
+    int kc = kBegin;
+    int tap = 0, ci0 = 0, kh = 0, kw = 0;
+    if (TAPU) { tap = kBegin / inC; ci0 = kBegin - tap * inC; kh = tap / kW; kw = tap - kh * kW; }
+
+    float ra[RA], rb[RB];
+    auto load = [&]()
+    {
+        #pragma unroll
+        for (int r = 0; r < RA; r++)
+        {
+            int m = m0 + am + 32 * r;
+            if (TAPU)
+                ra[r] = m < outC ? kernel[(long long)m * K + (ci0 + ak) * khw + tap] : 0.0f;
+            else
+            {
+                int k = kc + ak;
+                ra[r] = (m < outC && k < kEnd) ? kernel[(long long)m * K + k] : 0.0f;
+            }
+        }
+        if (TAPU)
+        {
+            int ih = ih0 + kh * dH, iw = iw0 + kw * dW;
+            bool valid = nIn && ih >= 0 && ih < H && iw >= 0 && iw < W;
+            const float* src = xBatch + (long long)(ci0 + bk) * HW + (valid ? ih * W + iw : 0);
+            #pragma unroll
+            for (int r = 0; r < RB; r++)
+                rb[r] = valid ? src[(long long)(BSTEP * r) * HW] : 0.0f;
+        }
+        else
+        {
+            #pragma unroll
+            for (int r = 0; r < RB; r++)
+            {
+                int k = kc + bk + BSTEP * r;
+                float v = 0.0f;
+                if (nIn && k < kEnd)
+                {
+                    int ci = k / khw, t = k - ci * khw;
+                    int th = t / kW, tw = t - th * kW;
+                    int ih = ih0 + th * dH, iw = iw0 + tw * dW;
+                    if (ih >= 0 && ih < H && iw >= 0 && iw < W) v = xBatch[(long long)ci * HW + ih * W + iw];
+                }
+                rb[r] = v;
+            }
+        }
+    };
+    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
+    {
+        #pragma unroll
+        for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];
+        #pragma unroll
+        for (int r = 0; r < RB; r++) bs[bk + BSTEP * r][bn] = rb[r];
+    };
+    auto advance = [&]()
+    {
+        kc += CE_BK;
+        if (TAPU) { ci0 += CE_BK; if (ci0 == inC) { ci0 = 0; tap++; if (++kw == kW) { kw = 0; kh++; } } }
+    };
+
+    float acc[TM][TN];
+    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+
+    float* slice = out + (long long)blockIdx.z * batch * outC * L;
+    const int tx = tid & 15, ty = tid >> 4;
+    const bool vec = (L & 3) == 0;   // then a thread's 4 columns are 4 consecutive pixels of one image, 16-byte aligned
+    #pragma unroll
+    for (int g = 0; g < TN / 4; g++)
+    {
+        int nn = n0 + g * 64 + tx * 4;
+        if (nn >= N) continue;
+        int b = nn / L, l = nn - b * L;
+        #pragma unroll
+        for (int i = 0; i < TM; i++)
+        {
+            int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
+            if (m >= outC) continue;
+            if (vec)
+                *reinterpret_cast<float4*>(slice + ((long long)b * outC + m) * L + l) =
+                    make_float4(acc[i][g * 4], acc[i][g * 4 + 1], acc[i][g * 4 + 2], acc[i][g * 4 + 3]);
+            else
+            {
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                {
+                    int nj = nn + j;
+                    if (nj >= N) break;
+                    int bj = nj / L, lj = nj - bj * L;
+                    slice[((long long)bj * outC + m) * L + lj] = acc[i][g * 4 + j];
+                }
+            }
+        }
+    }
+}
+
+#define CE_FPROP_KERNEL(NAME, BM, TAPU) \
+extern ""C"" __global__ __launch_bounds__(256) void NAME( \
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ out, \
+    int batch, int inC, int H, int W, int outC, int outH, int outW, \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+{ \
+    conv2d_fprop_ig_body<BM, BM, TAPU>(input, kernel, out, batch, inC, H, W, outC, outH, outW, \
+        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+}
+CE_FPROP_KERNEL(conv2d_fprop_ig128_tap, 128, true)
+CE_FPROP_KERNEL(conv2d_fprop_ig128_gen, 128, false)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_tap, 64, true)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_gen, 64, false)
 ";
         }
 
@@ -1525,7 +1718,11 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
                 "conv2d_wgrad_splitk_reduce",
                 "conv2d_dgrad_implicit_gemm",
                 "conv2d_dgrad_implicit_gemm_c16",
-                "conv2d_dgrad_implicit_gemm_c16_phase"
+                "conv2d_dgrad_implicit_gemm_c16_phase",
+                "conv2d_fprop_ig128_tap",
+                "conv2d_fprop_ig128_gen",
+                "conv2d_fprop_ig64_tap",
+                "conv2d_fprop_ig64_gen"
             };
         }
     }
