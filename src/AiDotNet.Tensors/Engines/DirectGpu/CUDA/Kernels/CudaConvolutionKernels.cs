@@ -1004,8 +1004,9 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_implicit_gemm(
     int batch, int inC, int H, int W, int outC, int outH, int outW,
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
 {
-    __shared__ __align__(16) float As[WG_BK][WG_BM + 4];
-    __shared__ __align__(16) float Bs[WG_BK][WG_BN + 4];
+    // Two buffers each: the next K tile's global loads go to registers while this tile's FMAs run.
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
     const int L = outH * outW, P = inC * kH * kW, K = batch * L, khw = kH * kW;
     const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
     const int kBegin = blockIdx.z * kPerSplit;
@@ -1028,13 +1029,8 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_implicit_gemm(
         bkw[r] = rem - bkh[r] * kW;
     }
 
-    float acc[4][4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-        #pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
-
-    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    float ra[4], rb[4];
+    auto load = [&](int k0)
     {
         int k = k0 + lk;
         bool kIn = k < kEnd;
@@ -1045,7 +1041,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_implicit_gemm(
         for (int r = 0; r < 4; r++)
         {
             int m = m0 + lc + 16 * r;
-            As[lk][lc + 16 * r] = (kIn && m < outC) ? dyRow[(long long)m * L] : 0.0f;
+            ra[r] = (kIn && m < outC) ? dyRow[(long long)m * L] : 0.0f;
             float x = 0.0f;
             if (kIn && bValid[r])
             {
@@ -1054,21 +1050,53 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_implicit_gemm(
                 if (ih >= 0 && ih < H && iw >= 0 && iw < W)
                     x = input[(((long long)b * inC + bci[r]) * H + ih) * W + iw];
             }
-            Bs[lk][lc + 16 * r] = x;
+            rb[r] = x;
         }
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][lk][lc + 16 * r] = rb[r];
+        }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    if (kBegin < kEnd)
+    {
+        load(kBegin);
+        store(0);
         __syncthreads();
+    }
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < kEnd;
+        if (more) load(k0 + WG_BK);
         #pragma unroll
         for (int kk = 0; kk < WG_BK; kk++)
         {
-            float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);
-            float4 bv = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
             float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
             #pragma unroll
             for (int i = 0; i < 4; i++)
                 #pragma unroll
                 for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
         }
-        __syncthreads();
+        if (more)
+        {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
     }
 
     float* slice = out + (long long)blockIdx.z * outC * P;
@@ -1203,7 +1231,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm(
 // integer division. Unit stride is its own instantiation (no remainder test). Output columns go out as float4 when
 // H * W is a multiple of 4. Split-K slices as in the generic kernel.
 template <bool UNIT>
-__device__ __forceinline__ void conv2d_dgrad_c16_body(float (*As)[WG_BM + 4], float (*Bs)[WG_BN + 4],
+__device__ __forceinline__ void conv2d_dgrad_c16_body(float (*As)[WG_BK][WG_BM + 4], float (*Bs)[WG_BK][WG_BN + 4],
     const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
     int batch, int inC, int H, int W, int outC, int outH, int outW,
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
@@ -1225,23 +1253,18 @@ __device__ __forceinline__ void conv2d_dgrad_c16_body(float (*As)[WG_BM + 4], fl
     int t = kBegin / outC, co0 = kBegin - t * outC;
     int kh = t / kW, kw = t - kh * kW;
 
-    float acc[4][4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-        #pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
-
-    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    // Global -> register loads of one K tile; the stores to shared memory happen after the next compute, so the loads
+    // of tile i + 1 are in flight while tile i's FMAs run (two shared buffers, one barrier per tile).
+    float ra[4], rb[4];
+    auto load = [&]()
     {
-        // A tile: W[co0 + lk, m, t] for rows m.
         const float* wRow = kernel + (long long)(co0 + lk) * P + t;
         #pragma unroll
         for (int r = 0; r < 4; r++)
         {
             int m = m0 + lc + 16 * r;
-            As[lk][lc + 16 * r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+            ra[r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
         }
-        // B tile: this lane's pixel reads dY[b, co0 + kr, oh, ow] when the tap maps it onto an output position.
         int th = ihp - kh * dH, tw = iwp - kw * dW;
         int oh = th, ow = tw;
         bool valid = nIn && th >= 0 && tw >= 0;
@@ -1254,22 +1277,58 @@ __device__ __forceinline__ void conv2d_dgrad_c16_body(float (*As)[WG_BM + 4], fl
         const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
         #pragma unroll
         for (int r = 0; r < 4; r++)
-            Bs[bkRow + 4 * r][bn] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+            rb[r] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][bkRow + 4 * r][bn] = rb[r];
+        }
+    };
+    auto advance = [&]()
+    {
+        co0 += WG_BK;
+        if (co0 == outC) { co0 = 0; t++; if (++kw == kW) { kw = 0; kh++; } }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    if (kBegin < kEnd)
+    {
+        load();
+        store(0);
         __syncthreads();
+    }
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < kEnd;
+        if (more) { advance(); load(); }
         #pragma unroll
         for (int kk = 0; kk < WG_BK; kk++)
         {
-            float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);
-            float4 bv = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
             float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
             #pragma unroll
             for (int i = 0; i < 4; i++)
                 #pragma unroll
                 for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
         }
-        __syncthreads();
-        co0 += WG_BK;
-        if (co0 == outC) { co0 = 0; t++; if (++kw == kW) { kw = 0; kh++; } }
+        if (more)
+        {
+            // The other buffer was last read in the previous iteration, before its closing barrier.
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
     }
 
     float* slice = out + (long long)blockIdx.z * batch * inC * HW;
@@ -1309,9 +1368,9 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
     int batch, int inC, int H, int W, int outC, int outH, int outW,
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
 {
-    // Declared here, not in the body, so the two instantiations share one allocation.
-    __shared__ __align__(16) float As[WG_BK][WG_BM + 4];
-    __shared__ __align__(16) float Bs[WG_BK][WG_BN + 4];
+    // Declared here, not in the body, so the two instantiations share one allocation. Two buffers each (prefetch).
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
     if (sH == 1 && sW == 1)
         conv2d_dgrad_c16_body<true>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
             kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
@@ -1330,8 +1389,8 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
     int batch, int inC, int H, int W, int outC, int outH, int outW,
     int kH, int kW, int sH, int sW, int pH, int pW)
 {
-    __shared__ __align__(16) float As[WG_BK][WG_BM + 4];
-    __shared__ __align__(16) float Bs[WG_BK][WG_BN + 4];
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
     const int rh = blockIdx.z / sW, rw = blockIdx.z - rh * sW;
     // First input row / column of the phase: (ih + pH) % sH == rh.
     const int ih0 = ((rh - pH) % sH + sH) % sH, iw0 = ((rw - pW) % sW + sW) % sW;
@@ -1352,20 +1411,15 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
     const float* dyBatch = gradOutput + (long long)nb * outC * L;
 
     int co0 = 0, kh = rh, kw = rw;
-    float acc[4][4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-        #pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
-
-    for (int k0 = 0; k0 < K; k0 += WG_BK)
+    float ra[4], rb[4];
+    auto load = [&]()
     {
         const float* wRow = kernel + (long long)(co0 + lk) * P + kh * kW + kw;
         #pragma unroll
         for (int r = 0; r < 4; r++)
         {
             int m = m0 + lc + 16 * r;
-            As[lk][lc + 16 * r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+            ra[r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
         }
         // (ihp - kh) is a multiple of sH by construction; only the edges can fall outside dY.
         int oh = (ihp - kh) / sH, ow = (iwp - kw) / sW;
@@ -1373,22 +1427,54 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
         const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
         #pragma unroll
         for (int r = 0; r < 4; r++)
-            Bs[bkRow + 4 * r][bn] = valid ? src[(long long)(4 * r) * L] : 0.0f;
-        __syncthreads();
+            rb[r] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][bkRow + 4 * r][bn] = rb[r];
+        }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    load();
+    store(0);
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < K;
+        if (more)
+        {
+            co0 += WG_BK;
+            if (co0 == outC) { co0 = 0; kw += sW; if (kw >= kW) { kw = rw; kh += sH; } }
+            load();
+        }
         #pragma unroll
         for (int kk = 0; kk < WG_BK; kk++)
         {
-            float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);
-            float4 bv = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
             float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
             #pragma unroll
             for (int i = 0; i < 4; i++)
                 #pragma unroll
                 for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
         }
-        __syncthreads();
-        co0 += WG_BK;
-        if (co0 == outC) { co0 = 0; kw += sW; if (kw >= kW) { kw = rw; kh += sH; } }
+        if (more)
+        {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
     }
 
     #pragma unroll
