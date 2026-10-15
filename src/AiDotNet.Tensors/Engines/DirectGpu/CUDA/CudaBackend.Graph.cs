@@ -145,7 +145,7 @@ public sealed partial class CudaBackend
             // Inside the try: on net471 this call used to throw DllNotFoundException (no cuBLAS resolver), and from
             // after the try it left the gate held and the depth raised, so the next capture on any other thread
             // waited on the gate forever - the full net471 test run hung in DirectPtxGatherTests for hours.
-            CuBlasNative.cublasSetStream(_cublasHandle, _captureStream);
+            if (IsCublasAvailable) CuBlasNative.cublasSetStream(_cublasHandle, _captureStream);
         }
         catch
         {
@@ -222,7 +222,7 @@ public sealed partial class CudaBackend
             t_ambientBeforeCapture = default;
             t_captureMainStream = IntPtr.Zero;
             t_captureStream = IntPtr.Zero;
-            CuBlasNative.cublasSetStream(_cublasHandle, _mainStream);
+            if (IsCublasAvailable) CuBlasNative.cublasSetStream(_cublasHandle, _mainStream);
         }
         finally
         {
