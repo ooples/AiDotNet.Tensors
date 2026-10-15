@@ -7,15 +7,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <summary>
 /// CSR · dense → dense SpMM using AiDotNet's own managed CUDA kernels
 /// (<c>csr_spmm</c> / <c>csr_spmm_warp</c> / <c>csr_spmm_double</c> in
-/// <see cref="Kernels.CudaSparseKernels"/>), exposed with the same host-array entry
-/// shape as <see cref="CuSparseBackend"/>: allocate device buffers, upload the CSR
-/// triple + dense B, launch, download the dense result.
+/// <see cref="Kernels.CudaSparseKernels"/>), behind host-array entry points: allocate
+/// device buffers, upload the CSR triple + dense B, launch, download the dense result.
 ///
-/// <para>This is the supply-chain-removal replacement for native cuSPARSE
-/// (issue #515, P6): <see cref="LinearAlgebra.Sparse.SparseOps"/> makes this the
-/// default GPU SpMM path, keeping <see cref="CuSparseBackend"/> only as an
-/// availability fallback. Unlike cuSPARSE it needs no external library — only the
-/// CUDA driver + NVRTC the rest of <see cref="CudaBackend"/> already requires.</para>
+/// <para>This replaced native cuSPARSE (issue #515): it is the GPU SpMM path
+/// <see cref="LinearAlgebra.Sparse.SparseOps"/> uses on NVIDIA, and it needs no external
+/// library, only the CUDA driver + NVRTC the rest of <see cref="CudaBackend"/> already
+/// requires.</para>
 ///
 /// <para>The launched kernels accumulate each output element in a single thread over
 /// the row's stored order, so results are deterministic and match the managed CPU
@@ -72,9 +70,8 @@ internal static class CudaSparseBackend
 
     /// <summary>
     /// CSR · dense → dense, host-side <c>float[]</c> CSR inputs. Returns the dense
-    /// output flat array of length <c>rows · n</c>. Mirrors
-    /// <see cref="CuSparseBackend.SpMM"/> but dispatches the managed
-    /// <c>csr_spmm</c> / <c>csr_spmm_warp</c> kernels instead of <c>cusparseSpMM</c>.
+    /// output flat array of length <c>rows · n</c>, from the managed
+    /// <c>csr_spmm</c> / <c>csr_spmm_warp</c> / <c>csr_spmm_vec4</c> kernels.
     /// </summary>
     public static float[] SpMM(
         int[] rowPtr, int[] colIdx, float[] values,
@@ -89,7 +86,7 @@ internal static class CudaSparseBackend
 
         // Every allocation sits inside the try so a throw anywhere along the
         // upload chain still hits the finally and frees the device buffers
-        // already allocated (mirrors CuSparseBackend's leak-safe cleanup).
+        // already allocated.
         IGpuBuffer? valuesBuf = null, bBuf = null, outBuf = null;
         IGpuBuffer? rowPtrBuf = null, colIdxBuf = null;
         try
@@ -98,7 +95,7 @@ internal static class CudaSparseBackend
             bBuf = backend.AllocateBuffer(b);
             outBuf = backend.AllocateBuffer(output);
 
-            // int[] payloads ride a byte buffer (matches CuSparseBackend).
+            // int[] payloads ride a byte buffer.
             rowPtrBuf = backend.AllocateByteBuffer(rowPtr.Length * sizeof(int));
             colIdxBuf = backend.AllocateByteBuffer(colIdx.Length * sizeof(int));
             UploadInts(rowPtrBuf.Handle, rowPtr);
@@ -230,7 +227,7 @@ internal static class CudaSparseBackend
     }
 
     /// <summary>Synchronous host→device copy for an <c>int[]</c> payload via the
-    /// driver's <c>cuMemcpyHtoD</c> (same mechanism as <see cref="CuSparseBackend"/>).</summary>
+    /// driver's <c>cuMemcpyHtoD</c>.</summary>
     private static unsafe void UploadInts(IntPtr device, int[] host)
     {
         ulong byteCount = (ulong)host.Length * sizeof(int);
