@@ -264,6 +264,15 @@ public sealed partial class CudaBackend
         if (TryConv2DBackwardKernelImplicitNarrow(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             return true;
+        return TryConv2DBackwardKernelIm2col(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>The im2col + strided-batched SGEMM + batch-sum GEMM weight gradient alone. Overwrites gradKernel.</summary>
+    private bool TryConv2DBackwardKernelIm2col(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
         if (!ConvGemmUsable() || batch <= 0) return false;
         int L = outHeight * outWidth, P = inChannels * kernelH * kernelW;
         using var _ = PushContext();
@@ -310,6 +319,15 @@ public sealed partial class CudaBackend
         if (TryConv2DBackwardInputImplicitGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             return true;
+        return TryConv2DBackwardInputCol2im(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>The strided-batched SGEMM + col2im input gradient alone. Overwrites gradInput.</summary>
+    private bool TryConv2DBackwardInputCol2im(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
         if (!ConvGemmUsable() || batch <= 0) return false;
         int L = outHeight * outWidth, P = inChannels * kernelH * kernelW;
         using var _ = PushContext();
