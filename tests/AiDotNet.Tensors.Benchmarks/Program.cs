@@ -791,6 +791,14 @@ class Program
             return;
         }
 
+        // Issue #436: the AiDotNet side of tools/AisEvalH2H/driver.py, the paired, interleaved head-to-head against real
+        // PyTorch at its best CPU settings (stdin/stdout command server).
+        if (args[0] == "--aiseval-h2h-serve")
+        {
+            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalH2HServer.Run();
+            return;
+        }
+
         // Issue #436: same-machine head-to-head of the fused inference
         // primitives (MLP / MHA / LSTM) vs TorchSharp at the AIsEval shapes.
         // Win = AiDotNet p95 < PyTorch median.
