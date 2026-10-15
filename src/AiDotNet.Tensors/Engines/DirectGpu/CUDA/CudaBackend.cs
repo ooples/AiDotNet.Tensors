@@ -201,6 +201,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         get
         {
+            // Without cuBLAS the generated GEMMs allocate nothing, so capture never meets a cuBLAS allocation.
+            if (!IsCublasAvailable) return true;
             _ = _cublasHandle;   // materialize this thread's handle
             return _threadCublas?.Value?.Workspace is not null;
         }
@@ -2338,6 +2340,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// </summary>
     private void ApplyDeterministicGemmMathMode()
     {
+        // Without cuBLAS there is no handle: the generated fallback is strict FP32 in every mode.
+        if (!IsCublasAvailable) return;
         // Operate on THIS thread's handle + its tracked mode (the ThreadCublas is created in the current
         // determinism mode, so this only fires on an actual toggle after creation).
         var tc = (_threadCublas ??= new ThreadLocal<ThreadCublas>(CreateThreadCublas, trackAllValues: true)).Value!;
@@ -2367,14 +2371,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // C=A@B case; returns false until a shape is GPU-promoted, then falls to cuBLAS.
         if (alpha == 1.0f && beta == 0.0f && TryDirectPtxGemm(A, B, C, M, K, N)) return;
         if (TrySkinnyGemm(A, B, C, M, N, K, transB: false, alpha, beta)) return;
+        // #1265: a shape tuned and measured faster than cuBLAS in the current math mode runs its generated kernel.
+        if (TryRoutedGemm(A, B, C, M, N, K, alpha, beta)) return;
+        CublasGemm(A, B, C, M, N, K, alpha, beta);
+    }
+
+    // Row-major C = alpha * A @ B + beta * C on cuBLAS in the backend's current math mode (the caller pushed the context).
+    private void CublasGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
+        System.Threading.Volatile.Write(ref _lastGemmDispatchPath, (int)CudaGemmDispatchPath.Cublas);
         ApplyDeterministicGemmMathMode();
         float alphaVal = alpha;
         float betaVal = beta;
 
         // Row-major C = A * B. Use cuBLAS column-major trick: C^T = B^T * A^T.
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasSgemm(
-                _cublasHandle,
+        BlasSgemm(
                 CublasOperation.None,
                 CublasOperation.None,
                 N, M, K,
@@ -2382,8 +2393,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 B.Handle, N,
                 A.Handle, K,
                 ref betaVal,
-                C.Handle, N),
-            "cublasSgemm");
+                C.Handle, N, "cublasSgemm");
     }
 
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
@@ -2415,9 +2425,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         //   m_cu=N, n_cu=M, k_cu=K, ldA=K, ldB=K, ldC=N.
         // Earlier version had the transpose flags swapped — produced
         // wrong results for any non-square input.
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasSgemm(
-                _cublasHandle,
+        BlasSgemm(
                 CublasOperation.Transpose,   // op(my B) — transposed, becomes N×K
                 CublasOperation.None,        // op(my A) — no transpose, stays K×M
                 N, M, K,
@@ -2425,7 +2433,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 B.Handle, K,                 // lda for B_col[K,N] = K
                 A.Handle, K,                 // ldb for A_col[K,M] = K
                 ref betaVal,
-                C.Handle, N),                // ldc for C_col[N,M] = N
+                C.Handle, N, // ldc for C_col[N,M] = N
             "cublasSgemm(MatMulTransposed)");
     }
 
@@ -2459,9 +2467,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Transformer step). cuBLASLt takes this thread's workspace explicitly.
         if (TryLtMatmulColumnMajor(transA: false, transB: true, N, M, K, B.Handle, N, A.Handle, M, C.Handle, N, alpha, beta))
             return;
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasSgemm(
-                _cublasHandle,
+        BlasSgemm(
                 CublasOperation.None,
                 CublasOperation.Transpose,
                 N, M, K,
@@ -2469,8 +2475,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 B.Handle, N,
                 A.Handle, M,
                 ref betaVal,
-                C.Handle, N),
-            "cublasSgemm(MatMulTransposedA)");
+                C.Handle, N, "cublasSgemm(MatMulTransposedA)");
     }
 
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
@@ -2527,17 +2532,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 IntPtr aP = (IntPtr)((long)A.Handle + b * strideA * sizeof(float));
                 IntPtr bP = (IntPtr)((long)B.Handle + b * strideB * sizeof(float));
                 IntPtr cP = (IntPtr)((long)C.Handle + b * strideC * sizeof(float));
-                CuBlasNative.CheckCublasStatus(
-                    CuBlasNative.cublasSgemm(_cublasHandle, CublasOperation.None, CublasOperation.None,
-                        N, M, K, ref alphaVal, bP, N, aP, K, ref betaVal, cP, N),
-                    $"cublasSgemm(capture-sequential batch {b})");
+                BlasSgemm( CublasOperation.None, CublasOperation.None,
+                        N, M, K, ref alphaVal, bP, N, aP, K, ref betaVal, cP, N, $"cublasSgemm(capture-sequential batch {b})");
             }
             return;
         }
 
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasSgemmStridedBatched(
-                _cublasHandle,
+        BlasSgemmStridedBatched(
                 CublasOperation.None,
                 CublasOperation.None,
                 N, M, K,
@@ -2546,8 +2547,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 A.Handle, K, strideA,
                 ref betaVal,
                 C.Handle, N, strideC,
-                batchCount),
-            "cublasSgemmStridedBatched");
+                batchCount, "cublasSgemmStridedBatched");
     }
 
     /// <summary>
@@ -2617,9 +2617,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytesA);
                 IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytesA);
                 IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytesA);
-                CuBlasNative.CheckCublasStatus(
-                    CuBlasNative.cublasSgemm(
-                        _cublasHandle,
+                BlasSgemm(
                         CublasOperation.None,
                         CublasOperation.None,
                         N, M, K,
@@ -2627,8 +2625,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                         bPtr, N,
                         aPtr, K,
                         ref bVal,
-                        cPtr, N),
-                    $"cublasSgemm slice {slice}");
+                        cPtr, N, $"cublasSgemm slice {slice}");
             });
         }
 
@@ -2739,9 +2736,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                     // ask cuBLAS for K^T_col · Q_col which is K_row · Q_row^T.
                     // Result is stored in column-major scores; reading
                     // it as row-major gives the row-major Q · K^T we want.
-                    CuBlasNative.CheckCublasStatus(
-                        CuBlasNative.cublasSgemm(
-                            _cublasHandle,
+                    BlasSgemm(
                             CublasOperation.Transpose,  // K^T
                             CublasOperation.None,        // Q
                             seqLen, seqLen, headDim,
@@ -2749,8 +2744,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                             kPtr, headDim,
                             qPtr, headDim,
                             ref bVal,
-                            sPtr, seqLen),
-                        $"cublasSgemm MHA score batch={batchIdx} head={headIdx}");
+                            sPtr, seqLen, $"cublasSgemm MHA score batch={batchIdx} head={headIdx}");
                 });
             }
         }
@@ -2850,9 +2844,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                     IntPtr sPtr = (IntPtr)((long)scores.Handle
                         + (batchIdx * perBatchS + headIdx * perHeadScoreElems) * elemBytesOut);
 
-                    CuBlasNative.CheckCublasStatus(
-                        CuBlasNative.cublasGemmEx(
-                            _cublasHandle,
+                    CuBlasNative.CheckCublasStatus(BlasGemmEx(
                             CublasOperation.Transpose, CublasOperation.None,
                             seqLen, seqLen, headDim,
                             alphaPtr,
@@ -2861,8 +2853,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                             betaPtr,
                             sPtr, CuBlasNative.CUDA_R_32F, seqLen,
                             _fp32GemmComputeType,
-                            CuBlasNative.CUBLAS_GEMM_DEFAULT),
-                        $"cublasGemmEx MHA score batch={batchIdx} head={headIdx}");
+                            CuBlasNative.CUBLAS_GEMM_DEFAULT), $"cublasGemmEx MHA score batch={batchIdx} head={headIdx}");
                 });
             }
         }
@@ -2963,9 +2954,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                     // output[h] = attention[h] · V[h]
                     // Row-major attention [seqLen, seqLen] · V [seqLen, headDim] = output [seqLen, headDim].
                     // For cuBLAS column-major: V_col^T · attention_col^T -> output_col^T (which reads as row-major output).
-                    CuBlasNative.CheckCublasStatus(
-                        CuBlasNative.cublasSgemm(
-                            _cublasHandle,
+                    BlasSgemm(
                             CublasOperation.None,
                             CublasOperation.None,
                             headDim, seqLen, seqLen,
@@ -2973,8 +2962,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                             vPtr, headDim,
                             aPtr, seqLen,
                             ref bVal,
-                            oPtr, headDim),
-                        $"cublasSgemm MHA output batch={batchIdx} head={headIdx}");
+                            oPtr, headDim, $"cublasSgemm MHA output batch={batchIdx} head={headIdx}");
                 });
             }
         }
@@ -3045,9 +3033,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytesIn);
                 IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytesOut);
 
-                CuBlasNative.CheckCublasStatus(
-                    CuBlasNative.cublasGemmEx(
-                        _cublasHandle,
+                CuBlasNative.CheckCublasStatus(BlasGemmEx(
                         CublasOperation.None, CublasOperation.None,
                         N, M, K,
                         alphaPtr,
@@ -3056,8 +3042,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                         betaPtr,
                         cPtr, CuBlasNative.CUDA_R_32F, N,
                         _fp32GemmComputeType,
-                        CuBlasNative.CUBLAS_GEMM_DEFAULT),
-                    $"cublasGemmEx slice {slice}");
+                        CuBlasNative.CUBLAS_GEMM_DEFAULT), $"cublasGemmEx slice {slice}");
             });
         }
 
@@ -3100,9 +3085,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytes);
                 IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytes);
                 IntPtr cPtr = (IntPtr)((long)C.Handle + slice * strideC * elemBytes);
-                CuBlasNative.CheckCublasStatus(
-                    CuBlasNative.cublasDgemm(
-                        _cublasHandle,
+                BlasDgemm(
                         CublasOperation.None,
                         CublasOperation.None,
                         N, M, K,
@@ -3110,8 +3093,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                         bPtr, N,
                         aPtr, K,
                         ref bVal,
-                        cPtr, N),
-                    $"cublasDgemm slice {slice}");
+                        cPtr, N, $"cublasDgemm slice {slice}");
             });
         }
 
@@ -5656,6 +5638,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _ = PushContext();
         float alphaVal = alpha;
         float betaVal = beta;
+
+        if (!UsesCublas)
+        {
+            // Row-major C = A * B on the caller's stream (cuBLAS's column-major C^T = B^T * A^T).
+            FallbackGemm(PtxGemmPrecision.Fp32, CublasOperation.None, CublasOperation.None, N, M, K, alpha,
+                B.Handle, N, A.Handle, K, beta, C.Handle, N, 1, 0, 0, 0, stream.Handle);
+            return;
+        }
 
         // Set cuBLAS to use the specified stream. Read the handle once: the property re-binds it to _stream.
         IntPtr cublas = _cublasHandle;
@@ -13760,6 +13750,56 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             weightDecay, step, finiteGuard);
     }
 
+    // Must match SGD_MT_MAX / SGD_MT_CHUNK in CudaOptimizerKernels and SgdMultiTensorArgs' layout there.
+    private const int SgdMultiTensorMax = 48;
+    private const int SgdMultiTensorChunk = 1024;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private unsafe struct SgdMultiTensorArgs
+    {
+        public fixed ulong Param[SgdMultiTensorMax];
+        public fixed ulong Grad[SgdMultiTensorMax];
+        public fixed int Size[SgdMultiTensorMax];
+        public fixed int BlockStart[SgdMultiTensorMax + 1];
+        public int Count;
+    }
+
+    /// <summary>
+    /// Plain SGD over a tensor list in one launch per <see cref="SgdMultiTensorMax"/> tensors. The tensor list is
+    /// passed in the kernel's parameter block, so nothing is allocated or uploaded and the launch can be captured.
+    /// </summary>
+    public unsafe void SgdMultiTensorUpdate(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay)
+    {
+        PerTensorMultiTensorOptimizer.ValidateSgd(parameters, gradients, sizes);
+        int n = parameters.Count;
+        if (n == 0) return;
+        if (!_kernelCache.TryGetValue("sgd_multi_tensor_update", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_multi_tensor_update");
+
+        using var _ = PushContext();
+        var args = default(SgdMultiTensorArgs);
+        void** launchArgs = stackalloc void*[3];
+        for (int first = 0; first < n; first += SgdMultiTensorMax)
+        {
+            int count = Math.Min(SgdMultiTensorMax, n - first);
+            int blocks = 0;
+            for (int t = 0; t < count; t++)
+            {
+                args.Param[t] = unchecked((ulong)parameters[first + t].Handle.ToInt64());
+                args.Grad[t] = unchecked((ulong)gradients[first + t].Handle.ToInt64());
+                args.Size[t] = sizes[first + t];
+                args.BlockStart[t] = blocks;
+                blocks = checked(blocks + (sizes[first + t] + SgdMultiTensorChunk - 1) / SgdMultiTensorChunk);
+            }
+            args.BlockStart[count] = blocks;
+            args.Count = count;
+            launchArgs[0] = &args; launchArgs[1] = &learningRate; launchArgs[2] = &weightDecay;
+            LaunchKernel(kernel, (uint)blocks, DefaultBlockSize, launchArgs);
+        }
+    }
+
     private unsafe void MultiTensorAdamImpl(
         string kernelName,
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -15320,9 +15360,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         float aVal = alpha, bVal = beta;
         IntPtr alphaPtr = (IntPtr)(&aVal);
         IntPtr betaPtr = (IntPtr)(&bVal);
-        var status = CuBlasNative.cublasGemmEx(
-            _cublasHandle,
-            CublasOperation.None, CublasOperation.None,
+        var status = BlasGemmEx(CublasOperation.None, CublasOperation.None,
             N, M, K,
             alphaPtr,
             Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,

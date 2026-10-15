@@ -147,6 +147,9 @@ internal static class PtxTensorCoreGemmEvolution
         return await tuner.TuneAsync(seeds, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>The genome codec persisted records use (deployments and CUDA GEMM routes).</summary>
+    internal static IEvolutionGenomeCodec<PtxTensorCoreGemmConfiguration> GenomeCodec { get; } = new Codec();
+
     private sealed class Codec : IEvolutionGenomeCodec<PtxTensorCoreGemmConfiguration>
     {
         public string Id => "cuda-ptx-tensor-core-gemm-typed";

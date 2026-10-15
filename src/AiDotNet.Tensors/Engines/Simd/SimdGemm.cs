@@ -1614,6 +1614,30 @@ internal static partial class SimdGemm
         }
 
 #if NETCOREAPP
+#if NET5_0_OR_GREATER
+        // A tall product with a large A: row blocks that read A once, ahead of the column-panel route (see
+        // PrefersTallMForBigA). A transposed B is small here and is transposed once. Both store all of C.
+        if (UseParallelGemm && !transA && lda == k && (transB ? ldb == k : ldb == n) && PrefersTallMForBigA(m, k, n))
+        {
+            if (!transB)
+            {
+                SgemmTallM(a, lda, b, ldb, c, m, k, n, clearedOutput: true, allowParallel: true);
+                return;
+            }
+            float[] bt = Helpers.ThreadLocalTensorCache<float>.RentOrAllocateExact(k * n);
+            try
+            {
+                SimdTranspose.Transpose(b.Slice(0, n * k), bt, n, k);
+                SgemmTallM(a, lda, bt, n, c, m, k, n, clearedOutput: true, allowParallel: true);
+            }
+            finally
+            {
+                Helpers.ThreadLocalTensorCache<float>.TryReturn(bt);
+            }
+            return;
+        }
+#endif
+
         // Direct-2D first where it applies, as in SgemmAddInternal (measured faster than the column panel on every
         // shape both take). It needs a zeroed C; any route below overwrites C if it declines.
         if (UseParallelGemm && UseDirectParallel2D && !transA && !transB && lda == k && ldb == n
@@ -1655,7 +1679,6 @@ internal static partial class SimdGemm
             return;
         }
 
-        // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
         // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
         if (_jitGemm && !transA && !transB && lda == k && ldb == n
             && JitGemmAvx2.TryMultiply(a, b, c, m, n, k))
@@ -1703,6 +1726,20 @@ internal static partial class SimdGemm
             return;
         }
 
+#if NET5_0_OR_GREATER
+        // Both routes store every element of C, so C need not be cleared first: for a freshly allocated gradient the clear
+        // was also the first touch of its pages (~2.6% of a fused-attention training step's main-thread time).
+        if (QualifiesForTallM(transA, transB, m, k, n))
+        {
+            SgemmTallM(a, lda, b, ldb, c, m, k, n, clearedOutput: true, allowParallel: UseParallelGemm);
+            return;
+        }
+        if (QualifiesForLargeK(transA, transB, lda, m, k, n))
+        {
+            SgemmLargeK(a, lda, transA, b, ldb, c, m, k, n, clearedOutput: true, allowParallel: UseParallelGemm);
+            return;
+        }
+#endif
         c.Clear();
         SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: true);
     }
@@ -1915,6 +1952,16 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         // Not gated on allowParallel: the same shape must sum in the same order on one thread or many. .NET 5+ only,
         // like the direct kernels each slice runs.
+        if (QualifiesForTallM(transA, transB, m, k, n))
+        {
+            SgemmTallM(a, lda, b, ldb, c, m, k, n, clearedOutput, allowParallel);
+            return;
+        }
+        if (QualifiesForLargeK(transA, transB, lda, m, k, n))
+        {
+            SgemmLargeK(a, lda, transA, b, ldb, c, m, k, n, clearedOutput, allowParallel);
+            return;
+        }
         if (!t_inSplitK && QualifiesForSplitK(transA, transB, m, k, n))
         {
             SgemmSplitK(a, lda, b, ldb, c, m, k, n, clearedOutput, allowParallel);

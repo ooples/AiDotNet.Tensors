@@ -57,25 +57,15 @@ public sealed partial class CudaBackend
             return;
 
         using var _ = PushContext();
-        // alpha=1, beta=0 as FP16 bit patterns.
-        // 1.0 in IEEE 754 binary16 = 0x3C00. 0.0 = 0x0000.
-        ushort alpha = 0x3C00;
-        ushort beta = 0x0000;
-
-        // cuBLAS is column-major. To compute row-major C = A · B we
+        // C = A · B (alpha = 1, beta = 0). cuBLAS is column-major. To compute row-major C = A · B we
         // dispatch as C^T = B^T · A^T → cublas args (B, A, B->ldb=n,
         // A->lda=k, C->ldc=n) with swapped m/n.
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasHgemm(
-                _cublasHandle,
+        BlasHgemmUnit(
                 CublasOperation.None, CublasOperation.None,
                 n, m, k,
-                ref alpha,
                 bFp16.Handle, n,
                 aFp16.Handle, k,
-                ref beta,
-                cFp16.Handle, n),
-            "cublasHgemm");
+                cFp16.Handle, n, "cublasHgemm");
     }
 
     /// <inheritdoc/>
@@ -106,9 +96,7 @@ public sealed partial class CudaBackend
         IntPtr betaPtr = (IntPtr)(&betaF);
 
         // Same row-major-via-col-major swap pattern as Hgemm.
-        CuBlasNative.CheckCublasStatus(
-            CuBlasNative.cublasGemmEx(
-                _cublasHandle,
+        CuBlasNative.CheckCublasStatus(BlasGemmEx(
                 CublasOperation.None, CublasOperation.None,
                 n, m, k,
                 alphaPtr,
@@ -117,8 +105,7 @@ public sealed partial class CudaBackend
                 betaPtr,
                 cFp32.Handle, CuBlasNative.CUDA_R_32F, n,
                 CuBlasNative.CUBLAS_COMPUTE_32F,
-                CuBlasNative.CUBLAS_GEMM_DEFAULT),
-            "cublasGemmEx(FP16 in / FP32 out)");
+                CuBlasNative.CUBLAS_GEMM_DEFAULT), "cublasGemmEx(FP16 in / FP32 out)");
     }
 
     /// <summary>
@@ -164,9 +151,7 @@ public sealed partial class CudaBackend
         float alpha = 1f, beta = 0f;
         IntPtr alphaPointer = (IntPtr)(&alpha);
         IntPtr betaPointer = (IntPtr)(&beta);
-        var status = CuBlasNative.cublasGemmEx(
-            _cublasHandle,
-            CublasOperation.Transpose, CublasOperation.None,
+        var status = BlasGemmEx(CublasOperation.Transpose, CublasOperation.None,
             outFeatures, 1, inFeatures,
             alphaPointer,
             outputMajorWeightHalf.Handle, CuBlasNative.CUDA_R_16F, inFeatures,
@@ -227,9 +212,7 @@ public sealed partial class CudaBackend
         float alpha = 1f, beta = 0f;
         IntPtr alphaPointer = (IntPtr)(&alpha);
         IntPtr betaPointer = (IntPtr)(&beta);
-        var status = CuBlasNative.cublasGemmEx(
-            _cublasHandle,
-            CublasOperation.Transpose, CublasOperation.None,
+        var status = BlasGemmEx(CublasOperation.Transpose, CublasOperation.None,
             outFeatures, rows, inFeatures,
             alphaPointer,
             outputMajorWeightHalf.Handle, CuBlasNative.CUDA_R_16F, inFeatures,
@@ -273,9 +256,7 @@ public sealed partial class CudaBackend
         float aVal = alpha, bVal = beta;
         IntPtr alphaPtr = (IntPtr)(&aVal);
         IntPtr betaPtr = (IntPtr)(&bVal);
-        var status = CuBlasNative.cublasGemmEx(
-            _cublasHandle,
-            CublasOperation.None, CublasOperation.None,
+        var status = BlasGemmEx(CublasOperation.None, CublasOperation.None,
             N, M, K,
             alphaPtr,
             Bhalf.Handle, CuBlasNative.CUDA_R_16F, N,
@@ -349,9 +330,7 @@ public sealed partial class CudaBackend
         IntPtr betaPtr = (IntPtr)(&betaF);
 
         // gradA[M,K] = gradC · Bᵀ  →  col-major gradA[K,M] = Bᵀ_col · gradC_col.
-        var sA = CuBlasNative.cublasGemmEx(
-            _cublasHandle,
-            CublasOperation.Transpose, CublasOperation.None,
+        var sA = BlasGemmEx(CublasOperation.Transpose, CublasOperation.None,
             K, M, N,
             alphaPtr,
             bHalf.Handle, CuBlasNative.CUDA_R_16F, N,
@@ -364,9 +343,7 @@ public sealed partial class CudaBackend
         CuBlasNative.CheckCublasStatus(sA, "cublasGemmEx(MatMulBackwardFp16Fused gradA)");
 
         // gradB[K,N] = Aᵀ · gradC  →  col-major gradB[N,K] = gradC_col · Aᵀ_col.
-        var sB = CuBlasNative.cublasGemmEx(
-            _cublasHandle,
-            CublasOperation.None, CublasOperation.Transpose,
+        var sB = BlasGemmEx(CublasOperation.None, CublasOperation.Transpose,
             N, K, M,
             alphaPtr,
             gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,

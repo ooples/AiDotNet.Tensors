@@ -30,6 +30,14 @@ internal static partial class DirectPtxDenseLinearFullExperiment
     /// </summary>
     internal const string GemmGridEvolvedOperation = "gemm-grid-evolved";
 
+    /// <summary>
+    /// #1265: the grid through production routing. Per shape and math mode, <see cref="CudaBackend.TuneGemmRouteAsync"/>
+    /// evolves the generated kernel, checks it against cuBLAS's output and times it against cuBLAS in paired rounds
+    /// (its verdict is logged as JSON, not persisted); then <see cref="CudaBackend.Gemm"/> itself is timed next to the
+    /// cuBLAS lanes, routed or not as decided.
+    /// </summary>
+    internal const string GemmGridRoutedOperation = "gemm-grid-routed";
+
     private static readonly Dictionary<string, PtxGemmConfiguration> EvolvedWinners = new(StringComparer.Ordinal);
 
     private static AiDotNet.Evolution.EvolutionEngineOptions EvolutionOptions(string shape) => new()
@@ -64,8 +72,10 @@ internal static partial class DirectPtxDenseLinearFullExperiment
     private const double Fp32GridTolerance = 2e-4;
     private const double Tf32GridTolerance = 1e-2;
 
-    private static void RunGemmGrid(CudaBackend backend, int run, bool evolve = false)
+    private static void RunGemmGrid(CudaBackend backend, int run, bool evolve = false, bool routed = false)
     {
+        // The cuBLAS lanes must time cuBLAS even where a persisted or tuned route exists.
+        backend.GemmRoutingEnabled = false;
         foreach (var (name, m, k, n) in GemmGrid)
         {
             var random = new Random(20261261 + run * 101 + m * 7 + n);
@@ -114,6 +124,14 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             {
                 RunEvolvedLane(backend, run, name, operation, shape, m, n, k, work, launches, capture,
                     left, right, output, RelativeError);
+                continue;
+            }
+
+            if (routed)
+            {
+                foreach (bool strict in new[] { true, false })
+                    RunRoutedLane(backend, run, name, operation, shape, m, n, k, work, launches, capture, strict,
+                        left, right, output, RelativeError);
                 continue;
             }
 
@@ -199,6 +217,51 @@ internal static partial class DirectPtxDenseLinearFullExperiment
             () => kernel.Launch(left.Handle, right.Handle, output.Handle, m, n, k, k, n, n, 1f, 0f),
             () => relativeError(output), Resource(kernel.Audit), capture,
             tolerance: Fp32GridTolerance, deviceLaunches: launches);
+    }
+
+    private static void RunRoutedLane(CudaBackend backend, int run, string name, string operation, string shape,
+        int m, int n, int k, double work, int launches, bool capture, bool strict, IGpuBuffer left, IGpuBuffer right,
+        IGpuBuffer output, Func<IGpuBuffer, double> relativeError)
+    {
+        AiDotNetEngine.SetDeterministicMode(strict);
+        try
+        {
+            GpuBenchmarkEnvironment.WaitForCooldown(operation + "-route");
+            CudaGemmRouteDecision decision = backend.TuneGemmRouteAsync(m, n, k,
+                EvolutionOptions(name + (strict ? "-strict" : "-tf32")), persist: false).GetAwaiter().GetResult();
+            Console.WriteLine("gemm_grid_route_json=" + JsonSerializer.Serialize(new
+            {
+                run,
+                operation,
+                mode = strict ? "strict-fp32" : "tf32",
+                kernel = decision.Kernel,
+                routed = decision.UsesDirectPtx,
+                median_speedup = decision.MedianSpeedup,
+                minimum_speedup = decision.MinimumSpeedup,
+                cublas_us = decision.CublasMicroseconds,
+                ptx_us = decision.DirectPtxMicroseconds,
+                max_relative_difference = decision.MaxRelativeDifference,
+                reason = decision.Reason,
+            }));
+            backend.GemmRoutingEnabled = true;
+            GpuBenchmarkEnvironment.WaitForCooldown(operation);
+            string lane = (strict ? "Gemm routed FP32 strict (" : "Gemm routed TF32 (") +
+                (decision.UsesDirectPtx ? "PTX " + decision.Kernel : "cuBLAS") + ")";
+            BenchmarkRoute(backend, run, operation, shape, lane, work,
+                () => backend.Gemm(left, right, output, m, n, k), () => relativeError(output), Resources.None, capture,
+                tolerance: strict ? Fp32GridTolerance : Tf32GridTolerance, deviceLaunches: launches);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
+        {
+            // A shape no generated kernel admits (e.g. unaligned for the TF32 kernel) stays on cuBLAS: say so.
+            PrintUnsupported(run, operation, shape, strict ? "Gemm routed FP32 strict" : "Gemm routed TF32", exception.Message);
+        }
+        finally
+        {
+            backend.GemmRoutingEnabled = false;
+            backend.ClearGemmRoutes();
+            AiDotNetEngine.SetDeterministicMode(false);
+        }
     }
 
     // Loads nothing and keeps winners only in memory, so benchmark tuning neither reads nor writes the shared cache.

@@ -90,8 +90,8 @@ public class DevicePrimitivesTests
         dense[1, 0] = 3; dense[1, 1] = 4;
         dense[2, 0] = 5; dense[2, 1] = 6;
 
-        ISparseDeviceOps cuSparse = new CuSparse();
-        var result = cuSparse.SpMM(values, rowPtr, colIdx, rows: 2, cols: 3, dense);
+        ISparseDeviceOps sparse = new CpuSparseDeviceOps();
+        var result = sparse.SpMM(values, rowPtr, colIdx, rows: 2, cols: 3, dense);
 
         Assert.Equal(2, result._shape[0]);
         Assert.Equal(2, result._shape[1]);
@@ -114,7 +114,7 @@ public class DevicePrimitivesTests
         var x = new Tensor<float>(new[] { 3 });
         x[0] = 1; x[1] = 2; x[2] = 3;
 
-        var result = new CuSparse().SpMV(values, rowPtr, colIdx, rows: 2, cols: 3, x);
+        var result = new CpuSparseDeviceOps().SpMV(values, rowPtr, colIdx, rows: 2, cols: 3, x);
 
         Assert.Equal(2, result.Length);
         Assert.Equal(7f, result[0]);

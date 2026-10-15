@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 internal static class PtxGemmEvolution
 {
     internal static readonly KernelId EvolutionKernelId = new("gemm", "cuda-ptx-typed-evolution");
-    internal static readonly KernelSearchSpaceVersion SearchSpaceVersion = new(1);
+    internal static readonly KernelSearchSpaceVersion SearchSpaceVersion = new(2);
     internal static readonly KernelBenchmarkProtocolVersion BenchmarkProtocolVersion = new(1);
 
     /// <summary>
@@ -27,10 +27,18 @@ internal static class PtxGemmEvolution
     /// shape's default (<see cref="DefaultFor"/>): the incumbent every evolved winner must beat in the paired replay, so
     /// it has to be a sensible kernel for this shape, not an arbitrary one.
     /// </summary>
-    internal static IReadOnlyList<PtxGemmConfiguration> Seeds(PtxGemmLayout layout, int m, int n, int k, int multiprocessors = 68)
+    internal static IReadOnlyList<PtxGemmConfiguration> Seeds(PtxGemmLayout layout, int m, int n, int k, int multiprocessors = 68,
+        int ccMajor = 8)
     {
         var candidates = new[]
         {
+            // SM 8.0+: cp.async for the M/N-contiguous operand, register transposition for a K-contiguous one, split
+            // fragments, grouped rasterization, two blocks per multiprocessor (the best strict-FP32 probe kernel).
+            new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true),
+            new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, false, true, 8, 2, 2, true),
+            new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 4, false, false, 8, 2, 3, true),
+            // Any device: register staging.
+            new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2),
             new PtxGemmConfiguration(128, 128, 8, 8, 8, 4, 4, true),
             new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, true),
             new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 4, true),
@@ -42,7 +50,7 @@ internal static class PtxGemmEvolution
         };
         var seeds = new List<PtxGemmConfiguration>();
         foreach (var candidate in candidates)
-            if (Admits(candidate, layout, m, n, k)) seeds.Add(candidate);
+            if ((!candidate.IsAsync || ccMajor >= 8) && Admits(candidate, layout, m, n, k)) seeds.Add(candidate);
         if (seeds.Count == 0) throw new InvalidOperationException($"No GEMM seed admits M={m} N={n} K={k} ({layout.Name}).");
         PtxGemmConfiguration defaultSeed = DefaultFor(seeds, m, n, multiprocessors);
         seeds.Remove(defaultSeed);
@@ -115,7 +123,7 @@ internal static class PtxGemmEvolution
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
 
-        IReadOnlyList<PtxGemmConfiguration> seeds = Seeds(layout, m, n, k, MultiprocessorCount(runtime));
+        IReadOnlyList<PtxGemmConfiguration> seeds = Seeds(layout, m, n, k, MultiprocessorCount(runtime), runtime.ComputeCapabilityMajor);
         int lda = layout.TransposeA ? m : k, ldb = layout.TransposeB ? k : n;
         using var backend = new ExperimentBackend<PtxGemmConfiguration>(runtime, layout, m, n, k,
             configuration =>
@@ -141,7 +149,7 @@ internal static class PtxGemmEvolution
         var tuner = new EvolutionKernelAutotuner<PtxGemmConfiguration>(
             identity,
             new Codec(),
-            new Variation(layout, m, n, k),
+            new Variation(layout, m, n, k, runtime.ComputeCapabilityMajor),
             async (configuration, context, token) =>
             {
                 KernelTuningTrialResult result = await EvaluateAsync(configuration, context, token).ConfigureAwait(false);
@@ -463,29 +471,39 @@ internal static class PtxGemmEvolution
         }
     }
 
+    /// <summary>The genome codec persisted records use (deployments and CUDA GEMM routes).</summary>
+    internal static IEvolutionGenomeCodec<PtxGemmConfiguration> GenomeCodec { get; } = new Codec();
+
     private sealed class Codec : IEvolutionGenomeCodec<PtxGemmConfiguration>
     {
         public string Id => "cuda-ptx-gemm-typed";
-        public string VersionHash => "1";
+        public string VersionHash => "2";
 
         public string Serialize(PtxGemmConfiguration genome) => string.Join("|", new[]
         {
             F(genome.BlockM), F(genome.BlockN), F(genome.BlockK), F(genome.ThreadM), F(genome.ThreadN),
-            F(genome.VectorWidth), F(genome.SharedPad), genome.DoubleBuffer ? "1" : "0",
+            F(genome.VectorWidth), F(genome.SharedPad), genome.DoubleBuffer ? "1" : "0", genome.SplitTile ? "1" : "0",
+            F(genome.Swizzle), F(genome.MinBlocksPerSM), F(genome.AsyncStages), genome.RegisterTranspose ? "1" : "0",
         });
 
         public PtxGemmConfiguration Deserialize(string payload)
         {
             if (payload is null) throw new ArgumentNullException(nameof(payload));
             string[] v = payload.Split('|');
-            if (v.Length != 8) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
-            var genome = new PtxGemmConfiguration(P(v[0]), P(v[1]), P(v[2]), P(v[3]), P(v[4]), P(v[5]), P(v[6]),
-                v[7] switch { "0" => false, "1" => true, _ => throw new InvalidDataException("Invalid Boolean.") });
+            // Eight fields is the version-1 genome (no fragment split, plain rasterization, no occupancy floor, register
+            // staging).
+            if (v.Length is not (8 or 13)) throw new InvalidDataException("Invalid PTX GEMM genome field count.");
+            bool v2 = v.Length == 13;
+            var genome = new PtxGemmConfiguration(P(v[0]), P(v[1]), P(v[2]), P(v[3]), P(v[4]), P(v[5]), P(v[6]), B(v[7]),
+                v2 && B(v[8]), v2 ? P(v[9]) : 1, v2 ? P(v[10]) : 1, v2 ? P(v[11]) : 0, v2 && B(v[12]));
             if (genome.Invalidity() is { } reason) throw new InvalidDataException("Invalid PTX GEMM genome: " + reason);
             return genome;
         }
 
         private static string F(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+        private static bool B(string value) =>
+            value switch { "0" => false, "1" => true, _ => throw new InvalidDataException("Invalid Boolean.") };
 
         private static int P(string value) =>
             int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)
@@ -500,10 +518,11 @@ internal static class PtxGemmEvolution
         private static readonly int[] KTiles = { 8, 16, 32 };
         private static readonly int[] ThreadTiles = { 4, 8 };
         private readonly PtxGemmLayout _layout;
-        private readonly int _m, _n, _k;
+        private readonly int _m, _n, _k, _ccMajor;
 
-        internal Variation(PtxGemmLayout layout, int m, int n, int k)
+        internal Variation(PtxGemmLayout layout, int m, int n, int k, int ccMajor)
         {
+            _ccMajor = ccMajor;
             _layout = layout;
             _m = m;
             _n = n;
@@ -511,7 +530,7 @@ internal static class PtxGemmEvolution
         }
 
         public string Id => "cuda-ptx-gemm-constrained-variation";
-        public string VersionHash => "1";
+        public string VersionHash => "2";
 
         public ValueTask<PtxGemmConfiguration> ProposeAsync(
             EvolutionVariationContext<PtxGemmConfiguration> context, CancellationToken cancellationToken = default)
@@ -525,14 +544,15 @@ internal static class PtxGemmEvolution
                 PtxGemmConfiguration child = parent;
                 int mutations = 1 + context.Random.NextInt(3);
                 for (int i = 0; i < mutations; i++) child = Mutate(child, context.Random);
-                if (child != parent && child.Invalidity() is null && Admits(child, _layout, _m, _n, _k))
+                if (child != parent && child.Invalidity() is null && (!child.IsAsync || _ccMajor >= 8) &&
+                    Admits(child, _layout, _m, _n, _k))
                     return new ValueTask<PtxGemmConfiguration>(child);
             }
             return new ValueTask<PtxGemmConfiguration>(parent);
         }
 
         private static PtxGemmConfiguration Mutate(PtxGemmConfiguration value, StableRandom random) =>
-            random.NextInt(8) switch
+            random.NextInt(13) switch
             {
                 0 => value with { BlockM = Pick(Tiles, random) },
                 1 => value with { BlockN = Pick(Tiles, random) },
@@ -542,6 +562,12 @@ internal static class PtxGemmEvolution
                 5 => value with { VectorWidth = value.VectorWidth == 4 ? 1 : 4 },
                 6 => value with { SharedPad = value.SharedPad == 0 ? 4 : 0 },
                 7 => value with { DoubleBuffer = !value.DoubleBuffer },
+                8 => value with { SplitTile = !value.SplitTile },
+                9 => value with { Swizzle = Pick(PtxGemmConfiguration.Swizzles, random) },
+                10 => value with { MinBlocksPerSM = value.MinBlocksPerSM == 1 ? 2 : 1 },
+                // Switching to cp.async drops register double buffering (the pipeline replaces it).
+                11 => value with { AsyncStages = Pick(PtxGemmConfiguration.AsyncStageCounts, random), DoubleBuffer = false },
+                12 => value with { RegisterTranspose = !value.RegisterTranspose },
                 _ => throw new InvalidOperationException(),
             };
 

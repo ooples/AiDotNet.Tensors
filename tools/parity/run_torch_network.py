@@ -227,6 +227,11 @@ def main() -> int:
         f.write(y_np.tobytes(order="C"))
 
     device = torch.device(args.device)
+    # True fp32 on both sides. cuDNN's default is allow_tf32=True, which runs convolutions on tensor cores with a
+    # 10-bit mantissa: a different operation from the fp32 the Tensors side computes, and several times faster.
+    # matmul already defaults to fp32 since torch 1.12; it is pinned too so a changed default cannot creep in.
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     model = torch.nn.Sequential(*modules).to(device)
     x = torch.from_numpy(x_np).to(device)
     y = torch.from_numpy(y_np).to(device)
@@ -266,6 +271,7 @@ def main() -> int:
         "frameworkVersion": torch.__version__,
         "device": args.device,
         "threads": torch.get_num_threads(),
+        "tf32": {"cudnn": torch.backends.cudnn.allow_tf32, "matmul": torch.backends.cuda.matmul.allow_tf32},
         "machine": {
             "os": platform.system(),
             "arch": platform.machine(),

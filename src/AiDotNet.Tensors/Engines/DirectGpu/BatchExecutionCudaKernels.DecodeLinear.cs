@@ -15,10 +15,13 @@ internal static partial class BatchExecutionCudaKernels
     // The FP16 and quantized kernels read their operands through int words (little-endian: half i in word i / 2,
     // int8 i in word i / 4) because that is the one pointer type every translation carries; the caller guarantees
     // the buffers hold whole words. DL_HALF widens one half to FP32 on its bit pattern, exactly (zero, subnormals,
-    // infinity and NaN included), so the FP16 route has FP16 operands and FP32 accumulation like CUDA's. The int8
+    // infinity and NaN included), so the FP16 route has FP16 operands and FP32 accumulation like CUDA's. DL_GELU_STORE clamps the
+    // tanh argument to +-15, where tanh is already +-1 in float: some device tanh implementations (Vulkan on an RX 5500 XT)
+    // return NaN for a huge argument (W8A8 K=129 put a GELU input near -280, a tanh argument near -770000). The int8
     // products accumulate in int32 exactly: |x * w| <= 128 * 128, so the sum cannot overflow below K = 131,071, and
     // the launch code rejects anything larger.
     internal const string DecodeLinearSource = @"
+#define DL_GELU_STORE(Y, S) { float dl_u = 0.7978845608028654f * ((S) + 0.044715f * (S) * (S) * (S)); dl_u = dl_u < -15.0f ? -15.0f : (dl_u > 15.0f ? 15.0f : dl_u); Y = 0.5f * (S) * (1.0f + tanhf(dl_u)); }
 #define DL_HALF(V, W, I) { int dl_b = (W[(I) >> 1] >> (((I) & 1) * 16)) & 65535; int dl_e = (dl_b >> 10) & 31; int dl_m = dl_b & 1023; if (dl_e == 0) { float dl_f = dl_m; V = dl_f * 5.9604644775390625e-8f; } else { V = __int_as_float(((dl_e == 31 ? 255 : dl_e + 112) << 23) | (dl_m << 13)); } if ((dl_b & 32768) != 0) { V = -V; } }
 extern ""C"" __global__ __launch_bounds__(256) void dl_p_linear_gelu(const float* x, const float* w, const float* bias, float* y, int M, int K, int N) {
     int t = bx_gid(); if (t >= M * N) return;
@@ -26,7 +29,7 @@ extern ""C"" __global__ __launch_bounds__(256) void dl_p_linear_gelu(const float
     float s = 0.0f;
     for (int k = 0; k < K; k++) s += x[m * K + k] * w[n * K + k];
     s += bias[n];
-    y[t] = 0.5f * s * (1.0f + tanhf(0.7978845608028654f * (s + 0.044715f * s * s * s)));
+    DL_GELU_STORE(y[t], s)
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void dl_p_linear_gelu_fp16(const int* xh, const int* wh, const float* bias, float* y, int M, int K, int N) {
@@ -40,7 +43,7 @@ extern ""C"" __global__ __launch_bounds__(256) void dl_p_linear_gelu_fp16(const 
         s += xv * wv;
     }
     s += bias[n];
-    y[t] = 0.5f * s * (1.0f + tanhf(0.7978845608028654f * (s + 0.044715f * s * s * s)));
+    DL_GELU_STORE(y[t], s)
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void dl_p_w8a8_linear_gelu(const int* x8, const int* w8, const float* actScale, const float* wScales, const float* bias, float* y, int K, int N) {
@@ -54,14 +57,14 @@ extern ""C"" __global__ __launch_bounds__(256) void dl_p_w8a8_linear_gelu(const 
     }
     float af = acc;
     float s = af * actScale[0] * wScales[n] + bias[n];
-    y[n] = 0.5f * s * (1.0f + tanhf(0.7978845608028654f * (s + 0.044715f * s * s * s)));
+    DL_GELU_STORE(y[n], s)
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void dl_p_w8a8_epilogue(const int* acc, const float* actScale, const float* wScales, const float* bias, float* y, int N) {
     int n = bx_gid(); if (n >= N) return;
     float af = acc[n];
     float s = af * actScale[0] * wScales[n] + bias[n];
-    y[n] = 0.5f * s * (1.0f + tanhf(0.7978845608028654f * (s + 0.044715f * s * s * s)));
+    DL_GELU_STORE(y[n], s)
 }
 ";
 }
