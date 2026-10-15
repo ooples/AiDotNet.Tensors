@@ -10882,15 +10882,25 @@ public partial class CpuEngine : ITensorLevelEngine
         // the implicit-GEMM path below and the Fused / Winograd / SIMD-direct fallbacks at these
         // shapes. Measured against libtorch: 1x16x64x64 -> 32 (3x3): 1059 -> 466 µs (libtorch 320);
         // 1x3x224x224 -> 32: 4867 -> 1921 µs (libtorch 1032).
+        bool largeSpatial3x3 = kernelHeight == 3 && kernelWidth == 3
+            && stride == 1 && dilation == 1
+            && (long)outputHeight * outputWidth >= 64L * 64; // >= 4096 output positions
         if (!t_forceImplicitGemmForTest
             && Simd.SimdGemm.PrefersParallelN(outChannels, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, requireAlignedN: false))
         {
             if (!t_forceFullIm2Col && TryConv2DRowBlockParallelFloat(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
                 return false;   // the epilogue is left to the caller, as on every non-fusing path
-            Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
-                outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
-            return false;
+            // #653: the row-block conv declines a K (inChannels * 9) over 512, and the full-matrix N-parallel GEMM it
+            // then fell back to collapses on a large plane: 64->64ch@128x128 took 27.5 ms at 16 threads and 69.6 ms at 4
+            // (32 ms single-threaded), against 3.1 and 7.5 ms on the parallel implicit GEMM; 96->96ch@64x64 2-3x the
+            // same way. A large-spatial 3x3 goes on to that route below.
+            if (!largeSpatial3x3)
+            {
+                Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+                return false;
+            }
         }
 
         // Strategy 1.5: route to explicit im2col + BLAS GEMM (implicit-GEMM panels).
@@ -10915,9 +10925,6 @@ public partial class CpuEngine : ITensorLevelEngine
         //      FLOP cut is never realized by its current implementation at any measured
         //      shape, so implicit-GEMM is preferred for 3x3 stride-1 outright. End-to-end
         //      this cuts a VGG16 conv fwd+bwd step ~6800 ms -> ~820 ms (8.3x).
-        bool largeSpatial3x3 = kernelHeight == 3 && kernelWidth == 3
-            && stride == 1 && dilation == 1
-            && (long)outputHeight * outputWidth >= 64L * 64; // >= 4096 output positions
         bool highChannelNonWinograd = inChannels >= 256 &&
             !WinogradHelper.ShouldUseWinograd(kernelHeight, kernelWidth, stride, stride, dilation, dilation, outputHeight, outputWidth);
         if (highChannelNonWinograd || largeSpatial3x3)

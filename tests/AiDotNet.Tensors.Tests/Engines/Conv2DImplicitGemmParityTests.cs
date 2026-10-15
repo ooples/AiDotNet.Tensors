@@ -140,6 +140,7 @@ public class Conv2DImplicitGemmParityTests
     [InlineData(1, 512, 512, 3, 8, 16)]
     [InlineData(2, 256, 136, 3, 24, 3)]
     [InlineData(1, 128, 64, 3, 64, 16)]
+    [InlineData(1, 64, 64, 3, 64, 4)]      // K = 576: past the row-block conv, a low-channel shape on the implicit route
     public void FusedConv_IsBitIdentical_ToFullIm2Col_AtThreadCount(int batch, int inC, int outC, int k, int hw, int threads)
     {
         int previous = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
@@ -152,6 +153,34 @@ public class Conv2DImplicitGemmParityTests
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
         }
+    }
+
+    // #653: a large-spatial 3x3 whose K (inChannels * 9) is past the row-block conv's 512 takes the parallel implicit GEMM,
+    // not the full-matrix N-parallel GEMM that collapsed there (64->64ch@128x128: 27.5 ms at 16 threads against 3.1).
+    [SkippableTheory]
+    [InlineData(64, 64, 128, 4)]
+    [InlineData(64, 32, 128, 16)]
+    [InlineData(96, 96, 64, 16)]
+    public void LargeSpatialConv_PastRowBlockK_TakesImplicitGemm(int inC, int outC, int hw, int threads)
+    {
+        var e = new CpuEngine();
+        var x = Rand(new[] { 1, inC, hw, hw }, 505);
+        var kernel = Rand(new[] { outC, inC, 3, 3 }, 606);
+        int previous = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        int fullBefore = CpuEngine.FullIm2ColConvRunsOnThisThread, implicitBefore = CpuEngine.ImplicitGemmConvRunsOnThisThread;
+        try
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
+            e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = previous;
+        }
+        Skip.If(CpuEngine.FullIm2ColConvRunsOnThisThread == fullBefore && CpuEngine.ImplicitGemmConvRunsOnThisThread == implicitBefore,
+            "Another route (non-Windows im2col, or oneDNN) handled the convolution on this host.");
+        Assert.Equal(0, CpuEngine.FullIm2ColConvRunsOnThisThread - fullBefore);
+        Assert.Equal(1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }
 
     // #653: high-channel 3x3 convs take the full im2col GEMM at 8+ threads (or on a 64x64+ plane) while its column
