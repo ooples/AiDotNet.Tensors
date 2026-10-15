@@ -5556,7 +5556,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         float alphaVal = alpha;
         float betaVal = beta;
 
-        if (!IsCublasAvailable)
+        if (!UsesCublas)
         {
             // Row-major C = A * B on the caller's stream (cuBLAS's column-major C^T = B^T * A^T).
             FallbackGemm(PtxGemmPrecision.Fp32, CublasOperation.None, CublasOperation.None, N, M, K, alpha,

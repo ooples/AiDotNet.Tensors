@@ -152,6 +152,35 @@ public sealed class CublasOptionalTests
     }
 
     [SkippableFact]
+    public void UseCublasFalse_RunsTheGeneratedKernels_EvenWithCublasInstalled()
+    {
+        using var backend = RequireBackend();
+        backend.GemmRoutingEnabled = false;
+        const int m = 33, n = 65, k = 17;
+        using var a = backend.AllocateBuffer(Values(m * k, 1));
+        using var b = backend.AllocateBuffer(Values(k * n, 2));
+        using var c = backend.AllocateBuffer(m * n);
+        var prior = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        try
+        {
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(
+                new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions { UseCublas = false });
+            long before = backend.FallbackGemmDispatchCount;
+            backend.Gemm(a, b, c, m, n, k);
+            Assert.Equal(before + 1, backend.FallbackGemmDispatchCount);
+
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(
+                new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions { UseCublas = true });
+            backend.Gemm(a, b, c, m, n, k);
+            Assert.Equal(before + 1, backend.FallbackGemmDispatchCount);   // cuBLAS again
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(prior);
+        }
+    }
+
+    [SkippableFact]
     public void HalfAndDoubleEntries_ReproduceCublas_WithoutIt()
     {
         using var backend = RequireBackend();

@@ -56,11 +56,14 @@ public sealed partial class CudaBackend
         }
     }
 
+    // A GEMM calls cuBLAS when it is loadable and the user has not opted out (TensorCodecOptions.UseCublas).
+    private bool UsesCublas => IsCublasAvailable && CudaDispatchPolicy.UseCublasForMatMul;
+
     /// <summary><c>cublasSgemm</c>, or the generated FP32 GEMM without cuBLAS.</summary>
     private void BlasSgemm(CublasOperation opA, CublasOperation opB, int m, int n, int k, ref float alpha,
         IntPtr a, int lda, IntPtr b, int ldb, ref float beta, IntPtr c, int ldc, string what)
     {
-        if (IsCublasAvailable)
+        if (UsesCublas)
         {
             CuBlasNative.CheckCublasStatus(
                 CuBlasNative.cublasSgemm(_cublasHandle, opA, opB, m, n, k, ref alpha, a, lda, b, ldb, ref beta, c, ldc), what);
@@ -74,7 +77,7 @@ public sealed partial class CudaBackend
         IntPtr a, int lda, long strideA, IntPtr b, int ldb, long strideB, ref float beta, IntPtr c, int ldc, long strideC,
         int batch, string what)
     {
-        if (IsCublasAvailable)
+        if (UsesCublas)
         {
             CuBlasNative.CheckCublasStatus(
                 CuBlasNative.cublasSgemmStridedBatched(_cublasHandle, opA, opB, m, n, k, ref alpha, a, lda, strideA,
@@ -89,7 +92,7 @@ public sealed partial class CudaBackend
     private void BlasDgemm(CublasOperation opA, CublasOperation opB, int m, int n, int k, ref double alpha,
         IntPtr a, int lda, IntPtr b, int ldb, ref double beta, IntPtr c, int ldc, string what)
     {
-        if (IsCublasAvailable)
+        if (UsesCublas)
         {
             CuBlasNative.CheckCublasStatus(
                 CuBlasNative.cublasDgemm(_cublasHandle, opA, opB, m, n, k, ref alpha, a, lda, b, ldb, ref beta, c, ldc), what);
@@ -105,7 +108,7 @@ public sealed partial class CudaBackend
     private void BlasHgemmUnit(CublasOperation opA, CublasOperation opB, int m, int n, int k,
         IntPtr a, int lda, IntPtr b, int ldb, IntPtr c, int ldc, string what)
     {
-        if (IsCublasAvailable)
+        if (UsesCublas)
         {
             ushort one = 0x3C00, zero = 0x0000;  // FP16 bit patterns of 1 and 0
             CuBlasNative.CheckCublasStatus(
@@ -123,7 +126,7 @@ public sealed partial class CudaBackend
         IntPtr a, int aType, int lda, IntPtr b, int bType, int ldb, IntPtr beta, IntPtr c, int cType, int ldc,
         int computeType, int algorithm)
     {
-        if (IsCublasAvailable)
+        if (UsesCublas)
             return CuBlasNative.cublasGemmEx(_cublasHandle, opA, opB, m, n, k, alpha, a, aType, lda, b, bType, ldb,
                 beta, c, cType, ldc, computeType, algorithm);
         if (aType != bType) throw new NotSupportedException($"GEMM with operand types {aType} and {bType} needs cuBLAS.");

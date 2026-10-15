@@ -279,9 +279,9 @@ public sealed class TensorCodecOptions
     public bool UseCudnnBatchNorm { get; set; } = true;
 
     /// <summary>
-    /// When true (default) matmul / batched GEMM routes through the cuBLAS
-    /// wrapper on a CUDA backend when cuBLAS is available; set to false to
-    /// force the generic kernel.
+    /// When true (default) every GEMM on a CUDA backend calls cuBLAS when the cuBLAS library is loadable; set to
+    /// false to run them all on the library's generated kernels (what a machine without cuBLAS gets anyway). Read at
+    /// each GEMM, so it can change at run time.
     /// </summary>
     public bool UseCublas { get; set; } = true;
 }
