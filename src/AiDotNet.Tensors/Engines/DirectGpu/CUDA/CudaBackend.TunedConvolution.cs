@@ -133,10 +133,10 @@ public sealed partial class CudaBackend
         ApplyDeterministicGemmMathMode();
         float one = 1f, zero = 0f;
         // Column-major: out_b^T[L x Cout] = col_b^T-view[L x P] * W^T-view[P x Cout]; W is shared (stride 0).
-        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSgemmStridedBatched(_cublasHandle,
+        BlasSgemmStridedBatched(
             CublasOperation.None, CublasOperation.None, L, a.OutChannels, P,
             ref one, col.Handle, L, (long)P * L, a.Kernel.Handle, P, 0L,
-            ref zero, a.Output.Handle, L, (long)a.OutChannels * L, a.Batch), "cublasSgemmStridedBatched(conv fwd)");
+            ref zero, a.Output.Handle, L, (long)a.OutChannels * L, a.Batch, "cublasSgemmStridedBatched(conv fwd)");
         return true;
     }
 
