@@ -856,6 +856,14 @@ public sealed class TensorArena : IDisposable
                         cached.ArenaReshapeInPlace(shape);
                     // Re-issued to a new owner: drop any release mark the previous owner's data left behind.
                     cached.ClearReleaseMarks();
+                    // A reissued tensor is a new tensor and must not carry its previous owner's autograd history. A
+                    // backward kernel that fills it without recording left that GradFn in place, and the next step's graph
+                    // walk followed it into a node of an earlier step whose tensors the ring had since reissued under
+                    // other shapes (AiDotNet's StyleGAN after its R1 penalty's createGraph backward: "Multiples length (1)
+                    // must match tensor dimensions (3)" in ReduceSumBackward). AutoTensorCache resets the same state.
+                    cached.GradFn = null;
+                    cached.Grad = null;
+                    cached.LazySource = null;
                     return cached;
                 }
 

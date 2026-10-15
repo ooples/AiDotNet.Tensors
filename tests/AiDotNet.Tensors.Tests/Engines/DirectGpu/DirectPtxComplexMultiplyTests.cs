@@ -2383,7 +2383,12 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("op=wideband-log-bin-pool", ptx);
         Assert.Contains("div.u32 %r3, %r2, 40", ptx);         // seg
         Assert.Contains("rem.u32 %r4, %r2, 40", ptx);         // k
-        Assert.Equal(2, Count(ptx, "cvt.rzi.s32.f32"));       // binStart and binEnd floors
+        // binStart and binEnd are exact integer floors of k^2 (usable-1) / numBins^2, not float truncations
+        Assert.Equal(2, Count(ptx, "div.u64"));
+        Assert.Equal(2, Count(ptx, "mul.lo.u64 %rd") );
+        Assert.Contains(", 1600;", ptx);                      // numBins^2 = 40^2
+        Assert.Contains(", 255;", ptx);                       // usable - 1
+        Assert.Equal(0, Count(ptx, "cvt.rzi.s32.f32"));
         Assert.Contains("min.s32 %r6, %r6, 256", ptx);        // clamp to usable
         Assert.Contains("$WB_LOOP:", ptx);
         Assert.Equal(1, Count(ptx, ".pragma \"nounroll\";"));
@@ -2411,9 +2416,11 @@ public class DirectPtxComplexMultiplyTests
         for (int outIdx = 0; outIdx < seg * numBins; outIdx++)
         {
             int s = outIdx / numBins, k = outIdx % numBins;
-            float r0 = (float)k / numBins, r1 = (float)(k + 1) / numBins;
-            int binStart = 1 + (int)(r0 * r0 * (usable - 1));
-            int binEnd = 1 + (int)(r1 * r1 * (usable - 1));
+            // The definition, in exact integers: 1 + floor(k^2 (usable-1) / numBins^2). Float or double (k/numBins)^2 truncates
+            // exact integer edges to the bin below, which is what every backend did before.
+            long den = (long)numBins * numBins;
+            int binStart = 1 + (int)((long)k * k * (usable - 1) / den);
+            int binEnd = 1 + (int)((long)(k + 1) * (k + 1) * (usable - 1) / den);
             if (binEnd <= binStart) binEnd = binStart + 1;
             if (binEnd > usable) binEnd = usable;
             double sum = 0; int cnt = 0;

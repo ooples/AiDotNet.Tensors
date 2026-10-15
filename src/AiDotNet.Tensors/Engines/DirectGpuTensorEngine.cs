@@ -20838,6 +20838,83 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// ONE gradient of the 2-D matmul <c>Y[M,N] = A[M,K] · B[K,N]</c> as a single GEMM with a transpose flag:
+    /// <c>dA = dY · Bᵀ</c> when <paramref name="leftOperand"/>, else <c>dB = Aᵀ · dY</c>. For a matmul only one of whose
+    /// operands needs a gradient (a constant basis, a data batch) the generic backward materialized both transposes
+    /// with a transpose kernel each and also formed the gradient nothing reads: on N-BEATS (30 blocks) 61 such matmuls
+    /// per step, 122 transpose_2d launches and 61 discarded GEMMs. Float only; the same backend and residency rules as
+    /// <see cref="TryMatMulBackward2D{T}"/>, and false whenever the caller must keep its generic path.
+    /// </summary>
+    internal bool TryMatMulSingleGradient2D<T>(
+        Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, bool leftOperand, out Tensor<T>? gradient)
+    {
+        gradient = null;
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        var transposedA = backend as DirectGpu.ITransposedAGemm;
+        if (!leftOperand && transposedA is null) return false;
+        if (a.Rank != 2 || b.Rank != 2 || gradOutput.Rank != 2) return false;
+        if (!a.IsContiguous || !b.IsContiguous || !gradOutput.IsContiguous
+            || a._storageOffset != 0 || b._storageOffset != 0 || gradOutput._storageOffset != 0) return false;
+        int M = a._shape[0], K = a._shape[1], N = b._shape[1];
+        if (b._shape[0] != K || gradOutput._shape[0] != M || gradOutput._shape[1] != N) return false;
+        int rows = leftOperand ? M : K;
+        int cols = leftOperand ? K : N;
+        var operand = leftOperand ? b : a;
+        int operandLength = leftOperand ? K * N : M * K;
+
+        void Launch(IGpuBuffer dY, IGpuBuffer other, IGpuBuffer result)
+        {
+            if (leftOperand)
+                backend.MatMulTransposed(dY, other, result, M, K, N);           // dA[M,K] = dY[M,N] · B[K,N]ᵀ
+            else if (transposedA is not null)
+                transposedA.MatMulTransposedA(other, dY, result, K, N, M);      // dB[K,N] = A[M,K]ᵀ · dY[M,N]
+            else
+                throw new NotSupportedException("The backend has no transposed-A GEMM.");
+        }
+
+        try
+        {
+            if (ResidentStepActive)
+            {
+                // Captured step: read the existing resident buffers (no upload, capture-safe) and write a fresh
+                // resident-bound output, exactly as TryMatMulBackward2D does.
+                var bufG = ResolveResidentBufferNoUpload(backend, gradOutput, M * N);
+                var bufOperand = ResolveResidentBufferNoUpload(backend, operand, operandLength);
+                if (bufG is null || bufOperand is null) return false;
+                var result = new Tensor<T>(new T[(long)rows * cols], new[] { rows, cols });
+                var resultBuf = GetOrCreateResidentBuffer(backend, result, rows * cols, fullyWritten: true);
+                if (resultBuf.Handle == IntPtr.Zero || resultBuf.Size < (long)rows * cols) return false;
+                Launch(bufG, bufOperand, resultBuf);
+                ResidentSyncCheck("MatMulSingleGradient2D");
+                BindResidentBuffer(result, resultBuf, backend);
+                gradient = result;
+                return true;
+            }
+
+            using var ownedG = GetOrAllocateBuffer(backend, gradOutput);
+            using var ownedOperand = GetOrAllocateBuffer(backend, operand);
+            var bufOut = AllocateOutputBuffer(backend, rows * cols);
+            try
+            {
+                Launch(ownedG.Buffer, ownedOperand.Buffer, bufOut.Buffer);
+            }
+            catch
+            {
+                bufOut.Dispose();
+                throw;
+            }
+            gradient = DeferTensorResult<T>(backend, bufOut.Buffer, rows * cols, new[] { rows, cols });
+            return true;
+        }
+        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TryMatMulSingleGradient2D", ex);
+            AliasDiag($"MatMulSingleGradient2D FELLBACK M={M} N={N} K={K} left={leftOperand}: {ex.GetType().Name}: {ex.Message}");
+            gradient = null;
+            return false;
+        }
+    }
+
     public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled

@@ -8667,7 +8667,7 @@ public partial class CpuEngine : ITensorLevelEngine
     // summation order -- every output is accumulated by one thread in the same sequence as before -- so the result is
     // bit-identical to the serial loop at any thread count.
 
-    private static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
+    internal static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
     {
         // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
         // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
@@ -8719,7 +8719,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
-    private static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
+    internal static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
     {
         // Chunks of rows, about four per thread: a delegate call per row cost more than a short row's sum. The loop
         // lives in a static method so its arrays are locals (a closure's captured fields kept the JIT from hoisting).
@@ -10780,8 +10780,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight,
         int outputWidth)
     {
+        // A test scope that pins the full-im2col or implicit-GEMM route must reach it: the direct and batched routes
+        // below are chosen first, so a pinned comparison would otherwise compare one of them with itself.
+        bool routePinned = t_forceFullIm2Col || t_forceImplicitGemmForTest;
 #if NET5_0_OR_GREATER
-        if (input.Layout == LinearAlgebra.TensorLayout.Nchw
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.Forward, batch, inChannels, outChannels,
                 height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
         {
@@ -10800,7 +10803,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 #endif
-        if (input.Layout == LinearAlgebra.TensorLayout.Nchw
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))
         {
             Conv2DForwardBatchedFloat(
@@ -10809,7 +10812,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
             return;
         }
-        if (ShouldUseAdaptiveFloatConv2D(
+        // The adaptive route chain (Conv2DWithIm2ColFloat) runs on Windows only; a pinned route reaches it on every platform,
+        // or on Linux the pinned comparison would test Conv2DIm2colGemm against itself.
+        if (ShouldUseAdaptiveFloatConv2DForPlatform(IsWindowsPlatform || routePinned,
             input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
         {
             Conv2DWithIm2ColFloat(
@@ -10863,7 +10868,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
 #if NETCOREAPP
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
-        if (TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
+        // A pinned route (ForceFullIm2ColScope / ForceImplicitGemmScope) must reach that route: oneDNN, where installed (the
+        // Linux CI runners), would otherwise take the conv first and the pinned comparison would test oneDNN against itself.
+        if (!t_forceFullIm2Col && !t_forceImplicitGemmForTest && TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
         {
             return false;
@@ -10930,9 +10937,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // 7.09; 320ch@64x64 at 16 25.7 -> 17.5 and even at 1 thread 200 -> 133; 640ch@16x16 at 16 5.24 -> 4.08;
             // 256ch@32x32 at 16 4.38 -> 2.41. Below 8 threads small planes go either way (320ch@32x32 at 1: 43.1 vs
             // 49.8), so the implicit path keeps them. The full matrix is one image's [colH, colW] buffer, reused per
-            // image; above FullIm2ColMaxBytes the implicit path keeps its memory bound.
+            // image, taken from ThreadLocalTensorCache: FullIm2ColMaxBytes is the most that cache retains per thread, so a
+            // larger matrix (which would be a fresh large-object allocation on every call) keeps the implicit path.
             long fullIm2ColBytes = (long)inChannels * kernelHeight * kernelWidth * outputHeight * outputWidth * sizeof(float);
-            bool fullIm2ColScales = highChannelNonWinograd
+            bool fullIm2ColScales = highChannelNonWinograd && !t_forceImplicitGemmForTest
                 && (Helpers.CpuParallelSettings.MaxDegreeOfParallelism >= FullIm2ColMinThreads
                     || (long)outputHeight * outputWidth >= FullIm2ColMinPlane)
                 && fullIm2ColBytes <= FullIm2ColMaxBytes;
@@ -11185,6 +11193,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int outChannels, int kernelHeight, int kernelWidth,
         int stride, int padding, int dilation, int outputHeight, int outputWidth)
     {
+        t_fullIm2ColConvRuns++;
         int colH = inChannels * kernelHeight * kernelWidth;
         int colW = outputHeight * outputWidth;
         // Allocate only one batch-slice worth of im2col buffer, not batch * colH * colW
@@ -11280,7 +11289,7 @@ public partial class CpuEngine : ITensorLevelEngine
     // #653 full-im2col routing for high-channel 3x3 convs (see the gate in Conv2DWithIm2ColFloat).
     private const int FullIm2ColMinThreads = 8;
     private const long FullIm2ColMinPlane = 64L * 64;
-    private const long FullIm2ColMaxBytes = 128L * 1024 * 1024;
+    private const long FullIm2ColMaxBytes = 64L * 1024 * 1024;   // ThreadLocalTensorCache.MaxRetainedBytes
 
     // Test-only override: forces the high-channel float forward conv onto the full-matrix im2col
     // path instead of the fused (implicit-GEMM) path, so a parity test can assert the two are
@@ -11303,6 +11312,17 @@ public partial class CpuEngine : ITensorLevelEngine
     // The row-block route needs AVX2 SimdGemm, which .NET Framework does not have.
     internal static int RowBlockConvRunsOnThisThread => 0;
 #endif
+
+    // How many convolutions this thread ran through the implicit (row-blocked) GEMM and through the full-matrix im2col
+    // GEMM, so tests can prove which route a call took (the parity test compares the two, and is vacuous if both ran
+    // the same one).
+    [ThreadStatic]
+    private static int t_implicitGemmConvRuns;
+    [ThreadStatic]
+    private static int t_fullIm2ColConvRuns;
+
+    internal static int ImplicitGemmConvRunsOnThisThread => t_implicitGemmConvRuns;
+    internal static int FullIm2ColConvRunsOnThisThread => t_fullIm2ColConvRuns;
 
     // Test-only twin of t_forceFullIm2Col: keeps the implicit-GEMM path reachable for shapes the
     // short-wide routing above now sends to the full im2col path, so its parity test still runs it.
@@ -11364,6 +11384,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int outChannels, int kernelHeight, int kernelWidth,
         int stride, int padding, int dilation, int outputHeight, int outputWidth)
     {
+        t_implicitGemmConvRuns++;
         // Fail loud on int overflow of the shape products rather than silently wrapping to a
         // negative/wrong size (which would corrupt the panel Rent and the GEMM bounds below).
         int colH = checked(inChannels * kernelHeight * kernelWidth);
@@ -52550,8 +52571,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 int usable = fftSize / 2;
                 for (int k = 0; k < numBins; k++)
                 {
-                    int binStart = 1 + (int)(Math.Pow((double)k / numBins, 2) * (usable - 1));
-                    int binEnd = 1 + (int)(Math.Pow((double)(k + 1) / numBins, 2) * (usable - 1));
+                    // binStart = 1 + floor(k^2 (usable-1) / numBins^2) in exact integers: Math.Pow((double)k / numBins, 2)
+                    // truncated exact integer edges to the bin below (numBins=7, usable=50, k=1: 1 -> 0), and every GPU
+                    // backend computes the same exact edges.
+                    long binDen = (long)numBins * numBins;
+                    int binStart = 1 + (int)((long)k * k * (usable - 1) / binDen);
+                    int binEnd = 1 + (int)((long)(k + 1) * (k + 1) * (usable - 1) / binDen);
                     if (binEnd <= binStart) binEnd = binStart + 1;
                     if (binEnd > usable) binEnd = usable;
 

@@ -26,7 +26,7 @@ public class FusedAttentionDeviceTests : IClassFixture<DirectGpuTensorEngineTest
         Skip.If(!_fixture.IsAvailable, "No DirectGpu backend available.");
         DirectGpuTensorEngine gpu = _fixture.Engine!;
         Skip.IfNot(gpu.GetBackend() is IFusedAttentionBackend fused && fused.SupportsFusedAttention(64),
-            "The fused attention kernels are CUDA-only.");
+            "This GPU backend has no fused attention kernels for head dim 64.");
         return gpu;
     }
 
@@ -136,8 +136,9 @@ public class FusedAttentionDeviceTests : IClassFixture<DirectGpuTensorEngineTest
         finally { DirectGpuTensorEngine.ThrowOnGpuKernelFallback = saved; }
     }
 
-    // The default backward adds dQ with atomics (one fused pass, as torch's default); DeterministicReductions selects
-    // the two-pass kernels, whose every sum has a fixed order (torch.use_deterministic_algorithms).
+    // On CUDA the default backward adds dQ with atomics (one fused pass, as torch's default); DeterministicReductions
+    // selects the two-pass kernels, whose every sum has a fixed order (torch.use_deterministic_algorithms). The portable
+    // backends have only the fixed-order kernels, so there both settings must give the same launches and the same bits.
     [SkippableFact]
     public void Sdpa_DeterministicReductions_IsBitReproducible_AndTheDefaultMatchesIt()
     {
@@ -163,12 +164,22 @@ public class FusedAttentionDeviceTests : IClassFixture<DirectGpuTensorEngineTest
             GpuLaunchProbe.Reset();
             var fused = Step(gpu, F, q, k, v, w);
             Assert.Empty(GpuLaunchProbe.Fallbacks);
-            // Same step, one launch fewer: delta + fused instead of delta + kv pass + q pass.
-            Assert.Equal(twoPassLaunches - 1, GpuLaunchProbe.Count);
             Assert.Equal(first.O, fused.O);     // the forward is shared
             Assert.Equal(first.DK, fused.DK);   // dK / dV: same per-key sums in the same order
             Assert.Equal(first.DV, fused.DV);
-            AssertClose("fused dQ", first.DQ, fused.DQ, 1e-5f);
+            if (((DirectGpuTensorEngine)gpu).GetBackend() is CudaBackend)
+            {
+                // CUDA's default: one launch fewer, delta + fused instead of delta + kv pass + q pass, dQ by atomics.
+                Assert.Equal(twoPassLaunches - 1, GpuLaunchProbe.Count);
+                AssertClose("fused dQ", first.DQ, fused.DQ, 1e-5f);
+            }
+            else
+            {
+                // The portable kernels (PortableFusedAttention, every other backend) have only the fixed-order passes, so
+                // the default IS the deterministic backward: the same launches and a bit-identical dQ.
+                Assert.Equal(twoPassLaunches, GpuLaunchProbe.Count);
+                Assert.Equal(first.DQ, fused.DQ);
+            }
         }
         finally { AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = saved; }
     }

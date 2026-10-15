@@ -1696,13 +1696,16 @@ kernel void sum_axis_rows_split(
     constant uint& chunks [[buffer(3)]],
     constant uint& chunk_len [[buffer(4)]],
     uint2 group [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint lsz [[threads_per_threadgroup]])
+    uint2 lid2 [[thread_position_in_threadgroup]],
+    uint2 lsz2 [[threads_per_threadgroup]])
 {
+    // Metal wants the thread-position inputs all scalar or all the same vector width; the threadgroup is (256, 1, 1).
+    uint lid = lid2.x, lsz = lsz2.x;
     threadgroup float scratch[256];
     uint chunk = group.x, row = group.y;
     ulong start = (ulong)chunk * (ulong)chunk_len;
-    ulong end = min(start + (ulong)chunk_len, (ulong)reduce_size);
+    ulong stop = start + (ulong)chunk_len;
+    ulong end = stop < (ulong)reduce_size ? stop : (ulong)reduce_size;
     device const float* rowPtr = input + (ulong)row * (ulong)reduce_size;
     float sum = 0.0f;
     for (ulong i = start + lid; i < end; i += lsz) sum += rowPtr[i];
@@ -6021,10 +6024,12 @@ kernel void wideband_log_bin_pool(
     if ((int)outIdx >= total) return;
     int seg = (int)outIdx / numBins;
     int k = (int)outIdx % numBins;
-    float r0 = (float)k / (float)numBins;
-    float r1 = (float)(k + 1) / (float)numBins;
-    int binStart = 1 + (int)(r0 * r0 * (float)(usable - 1));
-    int binEnd = 1 + (int)(r1 * r1 * (float)(usable - 1));
+    // Logarithmic bin layout: binStart = 1 + floor(k^2 (usable-1) / numBins^2), in exact 64-bit integers. The float form
+    // (k/numBins)^2 * (usable-1) truncated exact integer edges to the bin below (numBins=10, usable=101, k=7: 49 -> 48),
+    // and fast-math division made it worse.
+    long binDen = (long)numBins * numBins;
+    int binStart = 1 + (int)((long)k * k * (usable - 1) / binDen);
+    int binEnd = 1 + (int)((long)(k + 1) * (k + 1) * (usable - 1) / binDen);
     if (binEnd <= binStart) binEnd = binStart + 1;
     if (binEnd > usable) binEnd = usable;
     int magOff = seg * fftSize;

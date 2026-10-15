@@ -51,6 +51,23 @@ internal readonly struct ClBlastDeviceInfo
         return new ClBlastDeviceInfo(type, vendor, architecture, deviceName);
     }
 
+    /// <summary>
+    /// The same database key an AMD device gets through OpenCL, so a HIP backend on that device reads the parameters
+    /// CLBlast tuned for it (#1266). OpenCL's architecture is the full gcnArchName with its feature suffix
+    /// ("gfx1012:xnack-") and its device is CL_DEVICE_BOARD_NAME_AMD ("AMD Radeon RX 5500 XT"); HIP reports the same
+    /// gcnArchName but drops the vendor from the marketing name ("Radeon RX 5500 XT"). Missing either one lands on the
+    /// vendor's default entry, which is a different tuning (MinIndirectSize 512 instead of 448 on that card).
+    /// </summary>
+    internal static ClBlastDeviceInfo ForAmdGpu(string gcnArchName, string marketingName)
+    {
+        string architecture = NormalizeArchitecture((gcnArchName ?? string.Empty).Trim());
+        string name = (marketingName ?? string.Empty).Trim();
+        if (name.Length == 0)
+            name = architecture;
+        else if (!name.StartsWith("AMD ", StringComparison.Ordinal))
+            name = "AMD " + name;
+        return new ClBlastDeviceInfo("GPU", "AMD", architecture, NormalizeDeviceName(name));
+    }
     private static bool HasExtension(string extensions, string extension)
     {
         return extensions.IndexOf(extension, StringComparison.OrdinalIgnoreCase) >= 0;

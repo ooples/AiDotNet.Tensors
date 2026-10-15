@@ -39,13 +39,12 @@ public static class SpecializedPerfBar
 
     // GPU SpMM (#515): AiDotNet's managed CUDA CSR kernels (csr_spmm / _warp / _vec4 /
     // _double) vs native cuSPARSE cusparseSpMM on the authoritative NVIDIA runner.
-    // Freeze from GpuSpMMBenchHarness output (AIDOTNET_PERF_RUNNER=1) in a gating
-    // commit; P7 (cuSPARSE/rocSPARSE removal) stays blocked until this is green.
-    public const int    GpuSpMMMinWinRatePercent = 0;     // TO BE SET after first runner bench
-    public const double GpuSpMMMaxLossMultiple    = 99.0; // TO BE SET after first runner bench
-
-    /// <summary>True once the owner has frozen the GPU SpMM bar (non-zero win rate).</summary>
-    public static bool GpuSpMMBarFrozen => GpuSpMMMinWinRatePercent > 0;
+    // Frozen 2026-10-14 from GpuSpMMResidentBench (device-resident, both arms cross-checked) on an RTX 3080:
+    // the managed kernels won all 5 catalog shapes in each of three runs, 1.10x to 2.88x. GpuSpMMResidentBench
+    // gates on these.
+    // (GpuSpMMBenchHarness times the host-array calls, whose cost is transfers and allocation, so it does not.)
+    public const int    GpuSpMMMinWinRatePercent = 100;
+    public const double GpuSpMMMaxLossMultiple    = 1.0;
 
     // GBMV vs OpenBLAS sgbmv/dgbmv on the authoritative runner.
     public const int    GbmvMinWinRatePercent = 0;     // TO BE SET after first bench

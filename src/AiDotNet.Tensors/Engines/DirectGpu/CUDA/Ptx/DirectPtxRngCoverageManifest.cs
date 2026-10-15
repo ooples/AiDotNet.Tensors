@@ -217,7 +217,7 @@ internal static class DirectPtxRngCoverageManifest
             DirectPtxRngCoverageStatus.ExperimentalDirectPtx,
             "admitted contiguous training calls route to one PtxFusedPhiloxRreluF32Kernel launch; evaluation and unsupported contracts retain the established path"),
         new("CuRand.Uniform",
-            "device-provider or CPU Philox fallback",
+            "cuRAND device generation (Philox; MRG32k3a and Sobol32 uniforms, bit-equal to their CPU generators) or the algorithm's CPU generator",
             "host Tensor output with counter-based uniform generation",
             "host-owned dense tensor storage",
             "FP32/FP64",

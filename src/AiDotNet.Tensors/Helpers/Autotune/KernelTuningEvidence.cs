@@ -286,22 +286,32 @@ public interface IKernelTuningExperimentBackend<TConfiguration>
     KernelTuningResourceUsage GetResourceUsage(TConfiguration configuration);
 }
 
-/// <summary>A correctness-oracle rejection carrying a typed trial status.</summary>
+/// <summary>
+/// A candidate rejection raised by an experiment backend, carrying the typed trial status the experiment records: an
+/// oracle mismatch from <c>ValidateAsync</c>, or a compilation, resource or execution failure from <c>PrepareAsync</c>
+/// or <c>ExecuteAsync</c>.
+/// </summary>
 public sealed class KernelTuningValidationException : Exception
 {
-    /// <summary>Creates an output- or gradient-mismatch failure.</summary>
+    /// <summary>Creates a typed rejection.</summary>
+    /// <remarks>
+    /// Only rejection statuses are accepted. Compilation, resource and benchmark statuses were refused here before,
+    /// so a backend that threw one (the OpenCL GEMM experiment does) had the constructor itself throw, and the
+    /// experiment recorded an unrelated <see cref="ArgumentOutOfRangeException"/> as a benchmark failure.
+    /// </remarks>
     public KernelTuningValidationException(KernelTuningTrialStatus status, string message)
         : base(message)
     {
-        if (status is not KernelTuningTrialStatus.OutputMismatch and
-            not KernelTuningTrialStatus.GradientMismatch)
+        if (status is not (KernelTuningTrialStatus.OutputMismatch or KernelTuningTrialStatus.GradientMismatch or
+            KernelTuningTrialStatus.CompilationFailed or KernelTuningTrialStatus.ResourceLimitExceeded or
+            KernelTuningTrialStatus.BenchmarkFailed))
         {
             throw new ArgumentOutOfRangeException(nameof(status));
         }
         Status = status;
     }
 
-    /// <summary>Gets the typed correctness failure.</summary>
+    /// <summary>Gets the typed rejection.</summary>
     public KernelTuningTrialStatus Status { get; }
 }
 

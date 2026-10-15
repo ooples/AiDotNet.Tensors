@@ -857,6 +857,12 @@ internal static class BackwardFunctions<T>
             && TrySelectiveLinearBackward(gradOutput, inputs, engine, grads))
             return;
 
+        // The GPU counterpart: the requested gradient as one transpose-flag GEMM. The paths below form both gradients,
+        // through a materialized transpose each on a GPU engine.
+        if (needsInputGradient != needsWeightGradient
+            && TryGpuSingleGradientMatMulBackward(gradOutput, inputs, needsInputGradient, engine, grads))
+            return;
+
         // Float32 + 2D fast paths (SimdGemm and BLAS): compute transposed GEMMs
         // into pooled buffers, then accumulate. Both bypass engine recording
         // (the kernels write directly to managed arrays without going through
@@ -2098,9 +2104,44 @@ internal static class BackwardFunctions<T>
     {
         var classIndices = (Tensor<T>)savedState[0];
         var values = inputs[0];
+
+        // Under create-graph the gradient is itself differentiated (a meta-learner's inner-loop gradient), so it has
+        // to come from recorded ops: the scatter kernel below records nothing, and the outer tape lost the edge from
+        // the upstream gradient (LEO's meta-gradient through a class-index cross-entropy failed in TransposeBackward).
+        // The same scatter as a constant one-hot mask selecting the upstream gradient broadcast over the class axis.
+        if (DifferentiableOps._isBackwardCreateGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, values, ClassValuesGradRecorded(gradOutput, classIndices, values._shape, engine), engine);
+            return;
+        }
+
         var cpu = engine as CpuEngine ?? new CpuEngine();
         var gradValues = cpu.ScatterClassValuesGrad(gradOutput, classIndices, values._shape);
         DifferentiableOps.AccumulateGrad(grads, values, gradValues, engine);
+    }
+
+    private static Tensor<T> ClassValuesGradRecorded(Tensor<T> gradOutput, Tensor<T> classIndices, int[] valuesShape, IEngine engine)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int numClasses = valuesShape[valuesShape.Length - 1];
+        var mask = new Tensor<T>((int[])valuesShape.Clone());
+        var classes = classIndices.IsContiguous ? classIndices : classIndices.Contiguous();
+        for (int row = 0; row < classes.Length; row++)
+        {
+            // The forward's rule (CpuEngine.ClassIndexOf): banker's rounding, NaN or out of range ignores the row.
+            double value = numOps.ToDouble(classes[row]);
+            if (double.IsNaN(value)) continue;
+            double rounded = Math.Round(value);
+            if (rounded >= 0 && rounded < numClasses)
+                mask[row * numClasses + (int)rounded] = numOps.One;
+        }
+
+        var rowShape = (int[])valuesShape.Clone();
+        rowShape[rowShape.Length - 1] = 1;
+        // A recorded select, not mask * gradient: an upstream Inf or NaN would turn 0 * g into NaN at every unselected class,
+        // where ScatterClassValuesGrad (the non-create-graph path) writes exactly 0.
+        var broadcastGrad = engine.TensorBroadcastTo(engine.Reshape(gradOutput, rowShape), (int[])valuesShape.Clone());
+        return engine.TensorWhere(mask, broadcastGrad, new Tensor<T>((int[])valuesShape.Clone()));
     }
 
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
@@ -7056,6 +7097,46 @@ internal static class BackwardFunctions<T>
     /// <summary>
     /// Computes only requested gradients for the common contiguous ND-by-2D linear projection.
     /// </summary>
+    /// <summary>
+    /// GPU backward of <c>A[..., K] · B[K, N]</c> when exactly one operand needs a gradient: that gradient as a single
+    /// transpose-flag GEMM (<see cref="DirectGpuTensorEngine.TryMatMulSingleGradient2D{T}"/>), A's leading axes
+    /// collapsed. Only when nothing records these ops (no outer tape, not tracing a graph), like the two-gradient GPU
+    /// path below. False leaves the caller on its generic path.
+    /// </summary>
+    private static bool TryGpuSingleGradientMatMulBackward(
+        Tensor<T> gradOutput,
+        Tensor<T>[] inputs,
+        bool leftOperand,
+        IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (engine is not DirectGpuTensorEngine gpu
+            || DifferentiableOps.IsRecording<T>()
+            || Compilation.GraphMode.IsActive
+            || inputs.Length != 2)
+            return false;
+        var a = inputs[0];
+        var b = inputs[1];
+        if (a.Rank < 2 || b.Rank != 2 || !a.IsContiguous || !b.IsContiguous || !gradOutput.IsContiguous)
+            return false;
+        int rows = 1;
+        for (int d = 0; d < a.Rank - 1; d++) rows = checked(rows * a._shape[d]);
+        int k = a._shape[a.Rank - 1];
+        int n = b._shape[1];
+        if (b._shape[0] != k || gradOutput.Length != (long)rows * n) return false;
+
+        var a2D = a.Rank == 2 ? a : engine.Reshape(a, new[] { rows, k });
+        var g2D = gradOutput.Rank == 2 ? gradOutput : engine.Reshape(gradOutput, new[] { rows, n });
+        if (!gpu.TryMatMulSingleGradient2D(g2D, a2D, b, leftOperand, out var gradient) || gradient is null)
+            return false;
+        if (leftOperand)
+            DifferentiableOps.AccumulateGrad(grads, a,
+                a.Rank == 2 ? gradient : engine.Reshape(gradient, (int[])a._shape.Clone()), engine);
+        else
+            DifferentiableOps.AccumulateGrad(grads, b, gradient, engine);
+        return true;
+    }
+
     private static bool TrySelectiveLinearBackward(
         Tensor<T> gradOutput,
         Tensor<T>[] inputs,

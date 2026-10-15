@@ -60,6 +60,9 @@ jobs:
           - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
           - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
           - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }
+          # The GPU matmul backward for a single needed gradient (a constant basis or a data batch) has no other CI device;
+          # its coverage is uploaded from here.
+          - { name: matmul-single-gradient, coverage: true, filter: "FullyQualifiedName~GpuMatMulSingleGradientBackwardTests" }
           # The non-CUDA device training paths (the resident step off CUDA, device-side gradient clipping, device
           # optimizer storage) run nowhere else in CI: the coverage job has no GPU. This shard runs them on POCL and
           # uploads their coverage, so codecov measures them instead of reporting them as missed.
