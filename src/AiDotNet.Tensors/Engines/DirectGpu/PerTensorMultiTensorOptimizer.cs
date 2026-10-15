@@ -68,6 +68,18 @@ internal static class PerTensorMultiTensorOptimizer
             backend.SgdUpdate(parameters[t], gradients[t], learningRate, weightDecay, sizes[t]);
     }
 
+    /// <summary><see cref="Sgd"/> skipped when the device-side finiteness guard is not finite (read back here).</summary>
+    public static void SgdGuarded(IDirectGpuBackend backend,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay, IGpuBuffer finiteGuard)
+    {
+        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        ValidateSgd(parameters, gradients, sizes);
+        double guard = BitConverter.ToDouble(backend.DownloadByteBuffer(finiteGuard, sizeof(double)), 0);
+        if (double.IsNaN(guard) || double.IsInfinity(guard)) return;
+        Sgd(backend, parameters, gradients, sizes, learningRate, weightDecay);
+    }
+
     /// <summary>The argument checks every <c>SgdMultiTensorUpdate</c> runs before launching anything.</summary>
     public static void ValidateSgd(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes)

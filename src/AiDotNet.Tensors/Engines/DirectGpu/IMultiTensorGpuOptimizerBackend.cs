@@ -90,4 +90,18 @@ public interface IMultiTensorGpuOptimizerBackend : IDirectGpuBackend
         IReadOnlyList<int> sizes,
         float learningRate,
         float weightDecay);
+
+    /// <summary>
+    /// <see cref="SgdMultiTensorUpdate"/> that writes nothing when <paramref name="finiteGuard"/> -- a double in the
+    /// buffer's first eight bytes, written earlier on this backend's queue -- is not finite, as
+    /// <see cref="AdamMultiTensorUpdateGuarded"/> does for Adam: the caller need not read the gradients' finiteness back
+    /// before launching the update.
+    /// </summary>
+    void SgdMultiTensorUpdateGuarded(
+        IReadOnlyList<IGpuBuffer> parameters,
+        IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<int> sizes,
+        float learningRate,
+        float weightDecay,
+        IGpuBuffer finiteGuard);
 }

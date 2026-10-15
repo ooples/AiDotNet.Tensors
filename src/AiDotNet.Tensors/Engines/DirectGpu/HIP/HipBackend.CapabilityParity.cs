@@ -42,6 +42,11 @@ public sealed partial class HipBackend : IFftBackend, IGenericFftBackend, IMeshg
         float learningRate, float weightDecay)
         => PerTensorMultiTensorOptimizer.Sgd(this, parameters, gradients, sizes, learningRate, weightDecay);
 
+    public void SgdMultiTensorUpdateGuarded(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay, IGpuBuffer finiteGuard)
+        => PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+
     public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
         int n0, int n1, bool xy)
     {

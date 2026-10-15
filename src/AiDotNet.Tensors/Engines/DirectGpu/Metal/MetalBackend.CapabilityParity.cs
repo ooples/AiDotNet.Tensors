@@ -47,6 +47,11 @@ public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend,
         float learningRate, float weightDecay)
         => PerTensorMultiTensorOptimizer.Sgd(this, parameters, gradients, sizes, learningRate, weightDecay);
 
+    public void SgdMultiTensorUpdateGuarded(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay, IGpuBuffer finiteGuard)
+        => PerTensorMultiTensorOptimizer.SgdGuarded(this, parameters, gradients, sizes, learningRate, weightDecay, finiteGuard);
+
     public void Meshgrid2DPair(IGpuBuffer source0, IGpuBuffer source1, IGpuBuffer output0, IGpuBuffer output1,
         int n0, int n1, bool xy)
         => Portable.Meshgrid2DPair(source0, source1, output0, output1, n0, n1, xy);
