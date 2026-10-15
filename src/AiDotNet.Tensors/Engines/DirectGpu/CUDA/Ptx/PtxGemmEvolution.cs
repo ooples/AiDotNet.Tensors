@@ -27,10 +27,18 @@ internal static class PtxGemmEvolution
     /// shape's default (<see cref="DefaultFor"/>): the incumbent every evolved winner must beat in the paired replay, so
     /// it has to be a sensible kernel for this shape, not an arbitrary one.
     /// </summary>
-    internal static IReadOnlyList<PtxGemmConfiguration> Seeds(PtxGemmLayout layout, int m, int n, int k, int multiprocessors = 68)
+    internal static IReadOnlyList<PtxGemmConfiguration> Seeds(PtxGemmLayout layout, int m, int n, int k, int multiprocessors = 68,
+        int ccMajor = 8)
     {
         var candidates = new[]
         {
+            // SM 8.0+: cp.async for the M/N-contiguous operand, register transposition for a K-contiguous one, split
+            // fragments, grouped rasterization, two blocks per multiprocessor (the best strict-FP32 probe kernel).
+            new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2, 2, true),
+            new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, false, true, 8, 2, 2, true),
+            new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 4, false, false, 8, 2, 3, true),
+            // Any device: register staging.
+            new PtxGemmConfiguration(128, 128, 16, 8, 8, 4, 4, false, true, 8, 2),
             new PtxGemmConfiguration(128, 128, 8, 8, 8, 4, 4, true),
             new PtxGemmConfiguration(128, 64, 16, 8, 4, 4, 4, true),
             new PtxGemmConfiguration(64, 64, 16, 4, 4, 4, 4, true),
@@ -42,7 +50,7 @@ internal static class PtxGemmEvolution
         };
         var seeds = new List<PtxGemmConfiguration>();
         foreach (var candidate in candidates)
-            if (Admits(candidate, layout, m, n, k)) seeds.Add(candidate);
+            if ((!candidate.IsAsync || ccMajor >= 8) && Admits(candidate, layout, m, n, k)) seeds.Add(candidate);
         if (seeds.Count == 0) throw new InvalidOperationException($"No GEMM seed admits M={m} N={n} K={k} ({layout.Name}).");
         PtxGemmConfiguration defaultSeed = DefaultFor(seeds, m, n, multiprocessors);
         seeds.Remove(defaultSeed);
@@ -115,7 +123,7 @@ internal static class PtxGemmEvolution
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
 
-        IReadOnlyList<PtxGemmConfiguration> seeds = Seeds(layout, m, n, k, MultiprocessorCount(runtime));
+        IReadOnlyList<PtxGemmConfiguration> seeds = Seeds(layout, m, n, k, MultiprocessorCount(runtime), runtime.ComputeCapabilityMajor);
         int lda = layout.TransposeA ? m : k, ldb = layout.TransposeB ? k : n;
         using var backend = new ExperimentBackend<PtxGemmConfiguration>(runtime, layout, m, n, k,
             configuration =>
@@ -141,7 +149,7 @@ internal static class PtxGemmEvolution
         var tuner = new EvolutionKernelAutotuner<PtxGemmConfiguration>(
             identity,
             new Codec(),
-            new Variation(layout, m, n, k),
+            new Variation(layout, m, n, k, runtime.ComputeCapabilityMajor),
             async (configuration, context, token) =>
             {
                 KernelTuningTrialResult result = await EvaluateAsync(configuration, context, token).ConfigureAwait(false);
@@ -507,10 +515,11 @@ internal static class PtxGemmEvolution
         private static readonly int[] KTiles = { 8, 16, 32 };
         private static readonly int[] ThreadTiles = { 4, 8 };
         private readonly PtxGemmLayout _layout;
-        private readonly int _m, _n, _k;
+        private readonly int _m, _n, _k, _ccMajor;
 
-        internal Variation(PtxGemmLayout layout, int m, int n, int k)
+        internal Variation(PtxGemmLayout layout, int m, int n, int k, int ccMajor)
         {
+            _ccMajor = ccMajor;
             _layout = layout;
             _m = m;
             _n = n;
@@ -532,7 +541,8 @@ internal static class PtxGemmEvolution
                 PtxGemmConfiguration child = parent;
                 int mutations = 1 + context.Random.NextInt(3);
                 for (int i = 0; i < mutations; i++) child = Mutate(child, context.Random);
-                if (child != parent && child.Invalidity() is null && Admits(child, _layout, _m, _n, _k))
+                if (child != parent && child.Invalidity() is null && (!child.IsAsync || _ccMajor >= 8) &&
+                    Admits(child, _layout, _m, _n, _k))
                     return new ValueTask<PtxGemmConfiguration>(child);
             }
             return new ValueTask<PtxGemmConfiguration>(parent);

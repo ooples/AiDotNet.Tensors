@@ -113,7 +113,8 @@ internal readonly record struct PtxGemmConfiguration(
         if (Array.IndexOf(Swizzles, Swizzle) < 0) return "swizzle must be 1, 4, 8 or 16";
         if (SplitTile && ThreadM == 4 && ThreadN == 4) return "a 4 x 4 thread tile is already one fragment";
         if (MinBlocksPerSM is not (1 or 2)) return "min blocks per multiprocessor must be 1 or 2";
-        if (MinBlocksPerSM > 1 && (Threads * MinBlocksPerSM > 1024 || SharedBytes * MinBlocksPerSM > 96 * 1024))
+        // An SM 8.6/8.9 multiprocessor holds 100 KiB of shared memory, less 1 KiB the driver reserves per block.
+        if (MinBlocksPerSM > 1 && (Threads * MinBlocksPerSM > 1024 || (SharedBytes + 1024) * MinBlocksPerSM > 100 * 1024))
             return "two blocks of this size do not fit one multiprocessor";
         return null;
     }
