@@ -80,6 +80,15 @@ public partial class CpuEngine
         int chunks = Math.Max(1, Math.Min(bh, CpuParallelSettings.MaxDegreeOfParallelism));
         PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
         {
+#if NET5_0_OR_GREATER
+            if (MhaDirectHeads)
+            {
+                float[] kTd = pool.Rent(sd), pd = pool.Rent(ss);
+                try { MhaForwardHeadsDirect(qkv, concat, lse, kTd, pd, chunk, chunks, bh, numHeads, seqLen, dHead, dModel, scale, mask); }
+                finally { pool.Return(kTd); pool.Return(pd); }
+                return;
+            }
+#endif
             float[] q = pool.Rent(sd), kT = pool.Rent(sd), v = pool.Rent(sd), o = pool.Rent(sd), p = pool.Rent(ss);
             try
             {
@@ -158,6 +167,22 @@ public partial class CpuEngine
             int chunks = Math.Max(1, Math.Min(bh, CpuParallelSettings.MaxDegreeOfParallelism));
             PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
             {
+#if NET5_0_OR_GREATER
+                if (MhaDirectHeads)
+                {
+                    float[] kTd = pool.Rent(sd), vTd = pool.Rent(sd), pd = pool.Rent(ss), pTd = pool.Rent(ss), dPd = pool.Rent(ss);
+                    try
+                    {
+                        MhaBackwardHeadsDirect(st.Qkv, st.Concat, dConcat, dQkv, st.Lse, kTd, vTd, pd, pTd, dPd,
+                            chunk, chunks, bh, heads, seq, dHead, dModel, scale, st.Mask);
+                    }
+                    finally
+                    {
+                        pool.Return(kTd); pool.Return(vTd); pool.Return(pd); pool.Return(pTd); pool.Return(dPd);
+                    }
+                    return;
+                }
+#endif
                 float[] q = pool.Rent(sd), k = pool.Rent(sd), kT = pool.Rent(sd), v = pool.Rent(sd), vT = pool.Rent(sd);
                 float[] o = pool.Rent(sd), dO = pool.Rent(sd), dQ = pool.Rent(sd), dK = pool.Rent(sd), dV = pool.Rent(sd);
                 float[] p = pool.Rent(ss), pT = pool.Rent(ss), dP = pool.Rent(ss);
