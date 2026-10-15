@@ -76,8 +76,15 @@ internal static partial class DirectPtxDenseLinearFullExperiment
     {
         // The cuBLAS lanes must time cuBLAS even where a persisted or tuned route exists.
         backend.GemmRoutingEnabled = false;
+        // AIDOTNET_GEMM_GRID_SHAPES=name,name,... runs only those shapes: resumes a grid a thermal or idle-GPU gate
+        // stopped part-way, without re-running the shapes it already measured.
+        string? only = Environment.GetEnvironmentVariable("AIDOTNET_GEMM_GRID_SHAPES");
+        var selected = string.IsNullOrWhiteSpace(only)
+            ? null
+            : new HashSet<string>(only!.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries), StringComparer.Ordinal);
         foreach (var (name, m, k, n) in GemmGrid)
         {
+            if (selected is not null && !selected.Contains(name)) continue;
             var random = new Random(20261261 + run * 101 + m * 7 + n);
             float[] leftHost = Values(random, m * k);
             float[] rightHost = Values(random, k * n, 0.0625f);
