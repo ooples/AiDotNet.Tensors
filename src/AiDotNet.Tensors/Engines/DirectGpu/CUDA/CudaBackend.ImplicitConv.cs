@@ -49,7 +49,7 @@ public sealed partial class CudaBackend
     /// parity CNN's second layer). Partials use the thread's cuBLAS workspace, in this stream's order. False -- nothing
     /// launched -- when the shape, workspace or kernel does not qualify.
     /// </summary>
-    internal unsafe bool TryConv2DBackwardKernelImplicitGemm(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+    internal unsafe bool TryConv2DBackwardKernelImplicitNarrow(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {

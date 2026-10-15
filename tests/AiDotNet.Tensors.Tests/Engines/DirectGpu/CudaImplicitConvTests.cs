@@ -81,7 +81,7 @@ public class CudaImplicitConvTests
             float[] dy = Enumerable.Range(0, batch * outC * outH * outW).Select(_ => (float)(random.NextDouble() * 2 - 1)).ToArray();
             using var dyBuf = backend.AllocateBuffer(dy);
             backend.UploadBufferInPlace(Enumerable.Repeat(float.NaN, outC * inC * kH * kW).ToArray(), dwBuf);
-            Assert.True(backend.TryConv2DBackwardKernelImplicitGemm(xBuf, dyBuf, dwBuf, batch, inC, inH, inW, outC, outH, outW,
+            Assert.True(backend.TryConv2DBackwardKernelImplicitNarrow(xBuf, dyBuf, dwBuf, batch, inC, inH, inW, outC, outH, outW,
                 kH, kW, sH, sW, pH, pW, dH, dW), "conv2d_weight_grad_implicit declined the shape");
             var dwGot = backend.DownloadBuffer(dwBuf);
             for (int oc = 0; oc < outC; oc++)
