@@ -738,16 +738,50 @@ internal static class BackwardFunctions<T>
     // The two GEMMs of a 2-D matmul backward, Y[M,N] = X[M,K]·W[K,N]. SimdGemm.Sgemm carries the backward routes
     // (large-K split for Xᵀ·dY, tall-M for dY·Wᵀ, the direct kernels) that the packed BlasManaged GEMM these used did
     // not. Measured on a 3950X (ms, BlasManaged DisableAutotune vs SimdGemm): dX = dY·Wᵀ 1.55 vs 1.30, 4.26 vs 3.00,
-    // 2.77 vs 1.85 at M = 1024-4096, and never slower; dW = Xᵀ·dY 7.28 vs 2.43 at M = 4096, 2.52 vs 2.21 at 1024, but
-    // 0.35 vs 0.68 at M = 256, where the packed GEMM keeps it.
-    private const int BackwardWeightGradientSimdMinRows = 1024;
+    // 2.77 vs 1.85 at M = 1024-4096, and never slower at those widths; dW = Xᵀ·dY 7.28 vs 2.43 at M = 4096 (the large-K
+    // split), but 0.35 vs 0.68 at M = 256, and SimdGemm's transposed-A path without the split was 11x slower on a tied
+    // LM head's vocabulary-wide weight gradient, so dW takes SimdGemm only where that split applies.
+    private const int BackwardInputGradientSimdMaxN = 4096;
 
     private static void BackwardGemmInputGradient(float[] dY, float[] w, float[] dX, int m, int k, int n)
-        => SimdGemm.Sgemm(dY.AsSpan(0, m * n), n, false, w.AsSpan(0, k * n), n, true, dX.AsSpan(0, m * k), m, n, k);
+    {
+        if (n <= BackwardInputGradientSimdMaxN)
+        {
+            SimdGemm.Sgemm(dY.AsSpan(0, m * n), n, false, w.AsSpan(0, k * n), n, true, dX.AsSpan(0, m * k), m, n, k);
+            return;
+        }
+        Engines.BlasManaged.BlasManaged.Gemm<float>(
+            dY, n, false, w, n, true, dX.AsSpan(0, m * k), k, m, k, n,
+            new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
+    }
+
+    // A narrow output (a classifier head: n <= 16 columns) with little work: dW = Xᵀ·dY is a [k, n] result too thin for
+    // either parallel GEMM's tiles, and their dispatch costs more than the product (256 x 512 x 10: 137 us packed, 201 us
+    // SimdGemm, PyTorch 34 us). Formed transposed instead - dWᵀ[n, k] = dYᵀ·X - on the calling thread, where X is the
+    // wide, contiguous B the direct kernel wants: 41 us. The two transposes move n * (m + k) floats.
+    private const int BackwardNarrowWeightGradientMaxN = 16;
+    private const long BackwardNarrowWeightGradientMaxWork = 8L << 20;
 
     private static void BackwardGemmWeightGradient(float[] x, float[] dY, float[] dW, int m, int k, int n)
     {
-        if (m >= BackwardWeightGradientSimdMinRows)
+        if (n <= BackwardNarrowWeightGradientMaxN && (long)m * k * n <= BackwardNarrowWeightGradientMaxWork)
+        {
+            var pool = System.Buffers.ArrayPool<float>.Shared;
+            float[] dYT = pool.Rent(n * m), dWT = pool.Rent(n * k);
+            try
+            {
+                SimdTranspose.Transpose(dY.AsSpan(0, m * n), dYT.AsSpan(0, n * m), m, n);
+                SimdGemm.SgemmSequential(dYT.AsSpan(0, n * m), x.AsSpan(0, m * k), dWT.AsSpan(0, n * k), n, m, k);
+                SimdTranspose.Transpose(dWT.AsSpan(0, n * k), dW.AsSpan(0, k * n), n, k);
+            }
+            finally
+            {
+                pool.Return(dYT);
+                pool.Return(dWT);
+            }
+            return;
+        }
+        if (SimdGemm.QualifiesForLargeK(transA: true, transB: false, lda: k, m: k, k: m, n: n))
         {
             SimdGemm.Sgemm(x.AsSpan(0, m * k), k, true, dY.AsSpan(0, m * n), n, false, dW.AsSpan(0, k * n), k, m, n);
             return;
@@ -6839,12 +6873,9 @@ internal static class BackwardFunctions<T>
                 // Parallel SimdGemm path — guaranteed multi-core on shapes at/above
                 // SimdGemm's internal parallel gate.
                 // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W is stored [K,N] (ldb=N), transB=true.
-                if (!BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K))
-                    SimdGemm.Sgemm(gArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
-                // dWeight[K,N] = inputᵀ[K,M] · dY[M,N]; input is stored [M,K] (lda=K), transA=true. The packed BLAS
-                // first: SimdGemm's transposed-A path is the slow one (11x on a tied LM head's weight gradient).
-                if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N))
-                    SimdGemm.Sgemm(inArr, K, true, gArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
+                // dInput[M,K] = dY[M,N] · Wᵀ[N,K] and dWeight[K,N] = inputᵀ[K,M] · dY[M,N], routed as MatMulBackward's.
+                BackwardGemmInputGradient(gArr, wArr, gradInputArr, M, K, N);
+                BackwardGemmWeightGradient(inArr, gArr, gradWeightArr, M, K, N);
                 used = true;
             }
             else
