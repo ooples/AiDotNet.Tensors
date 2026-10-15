@@ -63,6 +63,39 @@ public sealed class GpuResidencyTests
             AiDotNetEngine.Current = previous;
         }
     }
+    /// <summary>
+    /// The fused list update writes every parameter and each host read sees it, exactly as one TrySgdStep per tensor;
+    /// a list with one host-only gradient is refused before anything is launched, so no parameter changes.
+    /// </summary>
+    [SkippableFact]
+    public void SgdStepMultiTensor_UpdatesEveryParameter_OrRefusesWithoutWriting()
+    {
+        using var gpu = RequireGpu();
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            Tensor<float> Resident(int n, float value) =>
+                gpu.UploadToGpu(new Tensor<float>(Enumerable.Repeat(value, n).ToArray(), new[] { n }), GpuTensorRole.General);
+            var ps = new[] { Resident(36, 1f), Resident(1025, 2f), Resident(7, 3f) };
+            var gs = new[] { Resident(36, 1f), Resident(1025, 4f), Resident(7, -2f) };
+
+            Assert.True(GpuOptimizer.TrySgdStepMultiTensor(ps, gs, 0.25f), "The fused device-side SGD step was refused.");
+            Assert.All(ps[0].AsSpan().ToArray(), v => Assert.Equal(0.75f, v));
+            Assert.All(ps[1].AsSpan().ToArray(), v => Assert.Equal(1f, v));
+            Assert.All(ps[2].AsSpan().ToArray(), v => Assert.Equal(3.5f, v));
+
+            var hostGradient = new Tensor<float>(Enumerable.Repeat(1f, 7).ToArray(), new[] { 7 });
+            Assert.False(GpuOptimizer.TrySgdStepMultiTensor(ps, new[] { gs[0], gs[1], hostGradient }, 0.25f));
+            Assert.All(ps[0].AsSpan().ToArray(), v => Assert.Equal(0.75f, v));
+            Assert.All(ps[1].AsSpan().ToArray(), v => Assert.Equal(1f, v));
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
     /// <summary>The scope sees a real upload and a real download, with their byte counts and backend.</summary>
     [SkippableFact]
     public void Scope_CountsUploadsAndDownloadsWithBytes()

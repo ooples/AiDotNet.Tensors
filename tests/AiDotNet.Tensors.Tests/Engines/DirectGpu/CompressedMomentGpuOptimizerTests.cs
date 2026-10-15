@@ -227,6 +227,63 @@ public sealed class CompressedMomentGpuOptimizerTests :
         }
     }
 
+    // Multi-tensor plain SGD (torch.optim.SGD foreach) must equal one SgdUpdate per tensor bit for bit: the CUDA kernel
+    // uses sgd_update's arithmetic and the other backends loop SgdUpdate. 53 tensors cross CUDA's 48-tensor launch
+    // batch, and the lengths straddle its 1024-element block chunk.
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void MultiTensorSgd_MatchesPerTensorBitForBit(BackendKind kind)
+    {
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired);
+        Skip.If(backend is not IMultiTensorGpuOptimizerBackend,
+            $"{kind} backend does not implement IMultiTensorGpuOptimizerBackend.");
+        var mt = (IMultiTensorGpuOptimizerBackend)backend;
+
+        int[] pattern = { 1, 7, 255, 256, 1023, 1024, 1025, 3000, 4097 };
+        int n = 53;
+        var lengths = new int[n];
+        for (int t = 0; t < n; t++) lengths[t] = pattern[t % pattern.Length] + t / pattern.Length;
+        const float lr = 0.0375f;
+
+        foreach (float weightDecay in new[] { 0f, 0.0125f })
+        {
+            var refParam = new IGpuBuffer[n]; var refGrad = new IGpuBuffer[n];
+            var mParam = new IGpuBuffer[n]; var mGrad = new IGpuBuffer[n];
+            try
+            {
+                for (int t = 0; t < n; t++)
+                {
+                    int L = lengths[t];
+                    var initial = Vector(L, 0.3f - 0.004f * t, 0.0031f * (t % 5 - 2));
+                    var grad = Gradient(L);
+                    refParam[t] = backend.AllocateBuffer((float[])initial.Clone());
+                    refGrad[t] = backend.AllocateBuffer((float[])grad.Clone());
+                    mParam[t] = backend.AllocateBuffer((float[])initial.Clone());
+                    mGrad[t] = backend.AllocateBuffer((float[])grad.Clone());
+                }
+                for (int step = 0; step < 3; step++)
+                {
+                    for (int t = 0; t < n; t++) backend.SgdUpdate(refParam[t], refGrad[t], lr, weightDecay, lengths[t]);
+                    mt.SgdMultiTensorUpdate(mParam, mGrad, lengths, lr, weightDecay);
+                }
+                for (int t = 0; t < n; t++)
+                {
+                    float[] expected = backend.DownloadBuffer(refParam[t]), actual = backend.DownloadBuffer(mParam[t]);
+                    for (int i = 0; i < lengths[t]; i++)
+                        Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(expected[i]), 0) ==
+                                    BitConverter.ToInt32(BitConverter.GetBytes(actual[i]), 0),
+                            $"{kind} multi-tensor SGD (wd {weightDecay}) tensor {t}[{i}]: {actual[i]:R} vs per-tensor {expected[i]:R}");
+                }
+            }
+            finally
+            {
+                foreach (var b in refParam) b?.Dispose(); foreach (var b in refGrad) b?.Dispose();
+                foreach (var b in mParam) b?.Dispose(); foreach (var b in mGrad) b?.Dispose();
+            }
+        }
+    }
+
     [SkippableTheory]
     [MemberData(nameof(DenseOptimizerBackends))]
     public void DensePlanSupportedOptimizer_MatchesCpuReference(BackendKind kind, OptimizerType optimizer)

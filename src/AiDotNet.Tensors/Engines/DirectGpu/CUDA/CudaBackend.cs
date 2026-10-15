@@ -13602,6 +13602,56 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         => MultiTensorAdamImpl("adamw_multi_tensor_update", parameters, gradients, firstMoments,
             secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step);
 
+    // Must match SGD_MT_MAX / SGD_MT_CHUNK in CudaOptimizerKernels and SgdMultiTensorArgs' layout there.
+    private const int SgdMultiTensorMax = 48;
+    private const int SgdMultiTensorChunk = 1024;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private unsafe struct SgdMultiTensorArgs
+    {
+        public fixed ulong Param[SgdMultiTensorMax];
+        public fixed ulong Grad[SgdMultiTensorMax];
+        public fixed int Size[SgdMultiTensorMax];
+        public fixed int BlockStart[SgdMultiTensorMax + 1];
+        public int Count;
+    }
+
+    /// <summary>
+    /// Plain SGD over a tensor list in one launch per <see cref="SgdMultiTensorMax"/> tensors. The tensor list is
+    /// passed in the kernel's parameter block, so nothing is allocated or uploaded and the launch can be captured.
+    /// </summary>
+    public unsafe void SgdMultiTensorUpdate(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay)
+    {
+        PerTensorMultiTensorOptimizer.ValidateSgd(parameters, gradients, sizes);
+        int n = parameters.Count;
+        if (n == 0) return;
+        if (!_kernelCache.TryGetValue("sgd_multi_tensor_update", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_multi_tensor_update");
+
+        using var _ = PushContext();
+        var args = default(SgdMultiTensorArgs);
+        void** launchArgs = stackalloc void*[3];
+        for (int first = 0; first < n; first += SgdMultiTensorMax)
+        {
+            int count = Math.Min(SgdMultiTensorMax, n - first);
+            int blocks = 0;
+            for (int t = 0; t < count; t++)
+            {
+                args.Param[t] = unchecked((ulong)parameters[first + t].Handle.ToInt64());
+                args.Grad[t] = unchecked((ulong)gradients[first + t].Handle.ToInt64());
+                args.Size[t] = sizes[first + t];
+                args.BlockStart[t] = blocks;
+                blocks = checked(blocks + (sizes[first + t] + SgdMultiTensorChunk - 1) / SgdMultiTensorChunk);
+            }
+            args.BlockStart[count] = blocks;
+            args.Count = count;
+            launchArgs[0] = &args; launchArgs[1] = &learningRate; launchArgs[2] = &weightDecay;
+            LaunchKernel(kernel, (uint)blocks, DefaultBlockSize, launchArgs);
+        }
+    }
+
     private unsafe void MultiTensorAdamImpl(
         string kernelName,
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
