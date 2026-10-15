@@ -47,7 +47,16 @@ public sealed class SimdGemmLargeKAndTallMTests
 
     private static int Bits(float v) => BitConverter.ToInt32(BitConverter.GetBytes(v), 0);
 
-    [Theory]
+    // The routes are AVX2 + FMA kernels, compiled on .NET 5+ only.
+#if NET5_0_OR_GREATER
+    private static bool RoutesAvailable =>
+        System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported;
+#else
+    private static bool RoutesAvailable => false;
+#endif
+    private const string NoRoutes = "The large-K and tall-M routes need AVX2 + FMA on .NET 5+.";
+
+    [SkippableTheory]
     [InlineData(256, 4096, 256, true)]     // Cᵀ·dY of a 256-wide layer over 4096 rows
     [InlineData(128, 4096, 384, true)]     // Xᵀ·dQKV, n past one 256-column panel
     [InlineData(70, 3001, 50, true)]       // a K the slices do not divide; partial tiles in m and n
@@ -55,6 +64,7 @@ public sealed class SimdGemmLargeKAndTallMTests
     [InlineData(70, 3001, 300, false)]
     public void LargeK_MatchesDoubleReference(int m, int k, int n, bool transA)
     {
+        Skip.IfNot(RoutesAvailable, NoRoutes);
         int lda = transA ? m : k;
         Assert.True(SimdGemm.QualifiesForLargeK(transA, false, lda, m, k, n), "the shape must take the large-K route");
         var a = Fill(m * k, 3);
@@ -71,13 +81,14 @@ public sealed class SimdGemmLargeKAndTallMTests
         AssertClose(Reference(a, transA, b, false, c0, m, k, n), acc, k, $"accumulate {m}x{k}x{n} transA={transA}");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4096, 768, 256, false)]    // dQKV·W with W already [k x n]
     [InlineData(4096, 768, 256, true)]     // dQKV·Wᵀ, W stored [n x k]: B transposed once, then this route
     [InlineData(4096, 384, 128, true)]
     [InlineData(1501, 400, 70, false)]     // partial row block and partial panel
     public void TallM_MatchesDoubleReference(int m, int k, int n, bool transB)
     {
+        Skip.IfNot(RoutesAvailable, NoRoutes);
         Assert.True(SimdGemm.QualifiesForTallM(false, false, m, k, n), "the shape must take the tall-M route");
         var a = Fill(m * k, 11);
         var b = Fill(k * n, 13);
@@ -89,12 +100,13 @@ public sealed class SimdGemmLargeKAndTallMTests
     }
 
     // A tall product with an A of 2 MB or more takes the tall-M route ahead of the column-panel route, at any K.
-    [Theory]
+    [SkippableTheory]
     [InlineData(4096, 256, 768, false)]    // the fused attention's QKV projection
     [InlineData(4096, 128, 128, true)]     // dY·Woᵀ, Wo stored [n x k]
     [InlineData(2049, 300, 70, false)]
     public void BigA_TakesTallM_AndMatchesDoubleReference(int m, int k, int n, bool transB)
     {
+        Skip.IfNot(RoutesAvailable, NoRoutes);
         Assert.True(SimdGemm.PrefersTallMForBigA(m, k, n), "the shape must prefer the tall-M route");
         var a = Fill(m * k, 31);
         var b = Fill(k * n, 33);
@@ -104,12 +116,13 @@ public sealed class SimdGemmLargeKAndTallMTests
         Assert.Equal(before + 1, SimdGemm.TallMRunsOnThisThread);
         AssertClose(Reference(a, false, b, transB, null, m, k, n), c, k, $"{m}x{k}x{n} transB={transB}");
     }
-    [Theory]
+    [SkippableTheory]
     [InlineData(256, 4096, 768, true, false)]
     [InlineData(70, 3001, 300, false, false)]
     [InlineData(4096, 768, 256, false, true)]
     public void NewRoutes_AreBitIdentical_AcrossThreadBudgetsAndSerial(int m, int k, int n, bool transA, bool transB)
     {
+        Skip.IfNot(RoutesAvailable, NoRoutes);
         int lda = transA ? m : k, ldb = transB ? k : n;
         var a = Fill(m * k, 21);
         var b = Fill(k * n, 23);

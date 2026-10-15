@@ -27,12 +27,18 @@ internal static partial class SimdGemm
     private const long LargeKMaxOutput = 1L << 20;
     private const long LargeKMaxPartialFloats = 16L << 20;
 
+#if NET5_0_OR_GREATER
     [ThreadStatic] private static float[]? t_largeKSliceA;
     [ThreadStatic] private static int t_largeKRuns, t_tallMRuns;
 
     /// <summary>Products this thread ran on <see cref="SgemmLargeK"/> / <see cref="SgemmTallM"/> (test positive controls).</summary>
     internal static int LargeKRunsOnThisThread => t_largeKRuns;
     internal static int TallMRunsOnThisThread => t_tallMRuns;
+#else
+    // The routes need AVX2 + FMA intrinsics, so .NET Framework has neither them nor their counters.
+    internal static int LargeKRunsOnThisThread => 0;
+    internal static int TallMRunsOnThisThread => 0;
+#endif
 
     /// <summary>Whether <c>[m x k]·[k x n]</c> (A optionally stored transposed as [k x m]) takes <see cref="SgemmLargeK"/>.</summary>
     internal static bool QualifiesForLargeK(bool transA, bool transB, int lda, int m, int k, int n)
