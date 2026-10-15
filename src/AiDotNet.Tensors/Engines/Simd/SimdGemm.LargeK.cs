@@ -142,6 +142,26 @@ internal static partial class SimdGemm
     // Below this K the small-K direct and JIT kernels win: dY·Woᵀ at K = 128 and 256 ran 0.26 -> 0.51 ms and 0.59 -> 0.80 ms here.
     private const int TallMMinK = 384;
 
+    // The column-panel route (SgemmDirectParallelN) has each worker stream all of A for its panels: cheap while A stays
+    // in L3, as in a benchmark that repeats one product, but inside a training step other buffers evict it and A comes
+    // back from DRAM once per worker. In the fused-attention step on a 3950X, sending its tall forward and dY·Woᵀ
+    // products ([4096x256]·[256x768], [4096x256]·[256x256], [4096x128]·[128x384] ...) here instead, where each row
+    // block reads its slice of A once, took the whole step from 19.0-19.6 to 16.8-17.4 ms (32x128x256) and 6.8-7.05 to
+    // 6.0-6.3 ms (64x64x128), although the products alone were up to 2x slower here with A hot in cache.
+    private const long TallMBigABytes = 2L * 1024 * 1024;
+
+    /// <summary>Whether a tall <c>[m x k]·[k x n]</c> with a large A takes <see cref="SgemmTallM"/> ahead of the column-panel route.</summary>
+    internal static bool PrefersTallMForBigA(int m, int k, int n)
+    {
+#if NET5_0_OR_GREATER
+        return UseTallM && Avx2.IsSupported && Fma.IsSupported
+            && m >= TallMMinM && n >= Nr && k <= TallMMaxK
+            && (long)m * k * sizeof(float) >= TallMBigABytes
+            && (long)m * k * n >= ParallelWorkThreshold;
+#else
+        return false;
+#endif
+    }
     /// <summary>Whether the untransposed <c>[m x k]·[k x n]</c> takes <see cref="SgemmTallM"/>.</summary>
     internal static bool QualifiesForTallM(bool transA, bool transB, int m, int k, int n)
     {

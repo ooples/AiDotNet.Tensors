@@ -1614,6 +1614,30 @@ internal static partial class SimdGemm
         }
 
 #if NETCOREAPP
+#if NET5_0_OR_GREATER
+        // A tall product with a large A: row blocks that read A once, ahead of the column-panel route (see
+        // PrefersTallMForBigA). A transposed B is small here and is transposed once. Both store all of C.
+        if (UseParallelGemm && !transA && lda == k && (transB ? ldb == k : ldb == n) && PrefersTallMForBigA(m, k, n))
+        {
+            if (!transB)
+            {
+                SgemmTallM(a, lda, b, ldb, c, m, k, n, clearedOutput: true, allowParallel: true);
+                return;
+            }
+            float[] bt = Helpers.ThreadLocalTensorCache<float>.RentOrAllocateExact(k * n);
+            try
+            {
+                SimdTranspose.Transpose(b.Slice(0, n * k), bt, n, k);
+                SgemmTallM(a, lda, bt, n, c, m, k, n, clearedOutput: true, allowParallel: true);
+            }
+            finally
+            {
+                Helpers.ThreadLocalTensorCache<float>.TryReturn(bt);
+            }
+            return;
+        }
+#endif
+
         // Direct-2D first where it applies, as in SgemmAddInternal (measured faster than the column panel on every
         // shape both take). It needs a zeroed C; any route below overwrites C if it declines.
         if (UseParallelGemm && UseDirectParallel2D && !transA && !transB && lda == k && ldb == n
@@ -1655,27 +1679,6 @@ internal static partial class SimdGemm
             return;
         }
 
-        // #1307: the same A·Bᵀ with an A too large for the column-panel route (dX = dY·Wᵀ with a wide fan-out,
-        // [4096x384]·[128x384]ᵀ): transpose the small B once and dispatch the untransposed product, which reaches
-        // the tall-M route. The transposed-operand routes inside SgemmAddInternal ran it at 1.08 ms against 0.57 ms
-        // untransposed.
-        if (UseParallelGemm && !transA && transB && lda == k && ldb == k && m >= TallMMinM
-            && (long)m * k * sizeof(float) > ParallelNMaxABytes && (long)k * n * sizeof(float) <= ParallelNMaxABytes
-            && (long)m * k * n >= ParallelWorkThreshold)
-        {
-            float[] bt = Helpers.ThreadLocalTensorCache<float>.RentOrAllocateExact(k * n);
-            try
-            {
-                SimdTranspose.Transpose(b.Slice(0, n * k), bt, n, k);
-                Sgemm(a, lda, false, new ReadOnlySpan<float>(bt, 0, k * n), n, false, c, m, k, n);
-            }
-            finally
-            {
-                Helpers.ThreadLocalTensorCache<float>.TryReturn(bt);
-            }
-            return;
-        }
-        // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
         // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
         if (_jitGemm && !transA && !transB && lda == k && ldb == n
             && JitGemmAvx2.TryMultiply(a, b, c, m, n, k))

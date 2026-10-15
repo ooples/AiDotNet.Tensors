@@ -88,6 +88,22 @@ public sealed class SimdGemmLargeKAndTallMTests
         AssertClose(Reference(a, false, b, transB, null, m, k, n), c, k, $"{m}x{k}x{n} transB={transB}");
     }
 
+    // A tall product with an A of 2 MB or more takes the tall-M route ahead of the column-panel route, at any K.
+    [Theory]
+    [InlineData(4096, 256, 768, false)]    // the fused attention's QKV projection
+    [InlineData(4096, 128, 128, true)]     // dY·Woᵀ, Wo stored [n x k]
+    [InlineData(2049, 300, 70, false)]
+    public void BigA_TakesTallM_AndMatchesDoubleReference(int m, int k, int n, bool transB)
+    {
+        Assert.True(SimdGemm.PrefersTallMForBigA(m, k, n), "the shape must prefer the tall-M route");
+        var a = Fill(m * k, 31);
+        var b = Fill(k * n, 33);
+        var c = new float[m * n];
+        int before = SimdGemm.TallMRunsOnThisThread;
+        SimdGemm.Sgemm(a, k, false, b, transB ? k : n, transB, c, m, k, n);
+        Assert.Equal(before + 1, SimdGemm.TallMRunsOnThisThread);
+        AssertClose(Reference(a, false, b, transB, null, m, k, n), c, k, $"{m}x{k}x{n} transB={transB}");
+    }
     [Theory]
     [InlineData(256, 4096, 768, true, false)]
     [InlineData(70, 3001, 300, false, false)]
