@@ -1196,6 +1196,129 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm(
         }
     }
 }
+
+// #1313: conv2d_dgrad_implicit_gemm for Cout % 16 == 0 (every ResNet-style layer), with K ordered (kh, kw, co):
+// k = t * Cout + co, t = kh * kW + kw. A 16-wide K tile then shares one kernel tap, so each lane checks its pixel's
+// source position once per tile instead of once per element, and (t, co0) advance by addition: the K loop has no
+// integer division. Unit stride is its own instantiation (no remainder test). Output columns go out as float4 when
+// H * W is a multiple of 4. Split-K slices as in the generic kernel.
+template <bool UNIT>
+__device__ __forceinline__ void conv2d_dgrad_c16_body(float (*As)[WG_BM + 4], float (*Bs)[WG_BN + 4],
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    const int HW = H * W, N = batch * HW, khw = kH * kW, K = outC * khw, P = inC * khw, L = outH * outW;
+    const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
+    const int kBegin = blockIdx.z * kPerSplit;
+    const int kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int lk = tid & 15, lc = tid >> 4;
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / HW; int hw = n - nb * HW; int ih = hw / W; ihp = ih + pH; iwp = hw - ih * W + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    // Tile state: tap t = (kh, kw) and first output channel co0 of the tile at k0 (kBegin is a multiple of 16).
+    int t = kBegin / outC, co0 = kBegin - t * outC;
+    int kh = t / kW, kw = t - kh * kW;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        // A tile: W[co0 + lk, m, t] for rows m.
+        const float* wRow = kernel + (long long)(co0 + lk) * P + t;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            As[lk][lc + 16 * r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+        }
+        // B tile: this lane's pixel reads dY[b, co0 + kr, oh, ow] when the tap maps it onto an output position.
+        int th = ihp - kh * dH, tw = iwp - kw * dW;
+        int oh = th, ow = tw;
+        bool valid = nIn && th >= 0 && tw >= 0;
+        if (!UNIT && valid)
+        {
+            oh = th / sH; ow = tw / sW;
+            valid = oh * sH == th && ow * sW == tw;
+        }
+        valid = valid && oh < outH && ow < outW;
+        const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            Bs[bkRow + 4 * r][bn] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        __syncthreads();
+        co0 += WG_BK;
+        if (co0 == outC) { co0 = 0; t++; if (++kw == kW) { kw = 0; kh++; } }
+    }
+
+    float* slice = out + (long long)blockIdx.z * batch * inC * HW;
+    int nn = n0 + tx * 4;
+    if ((HW & 3) == 0)
+    {
+        // Four consecutive pixels of one image plane, 16-byte aligned.
+        if (nn >= N) return;
+        int b = nn / HW, hw = nn - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC)
+                *reinterpret_cast<float4*>(col + (long long)m * HW) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        }
+        return;
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        if (nn + j >= N) continue;
+        int b = (nn + j) / HW, hw = nn + j - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC) col[(long long)m * HW] = acc[i][j];
+        }
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c16(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    // Declared here, not in the body, so the two instantiations share one allocation.
+    __shared__ __align__(16) float As[WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[WG_BK][WG_BN + 4];
+    if (sH == 1 && sW == 1)
+        conv2d_dgrad_c16_body<true>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
+            kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
+    else
+        conv2d_dgrad_c16_body<false>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
+            kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
+}
 ";
         }
 
@@ -1227,7 +1350,8 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm(
                 "depthwise_conv2d_backward_weights",
                 "conv2d_wgrad_implicit_gemm",
                 "conv2d_wgrad_splitk_reduce",
-                "conv2d_dgrad_implicit_gemm"
+                "conv2d_dgrad_implicit_gemm",
+                "conv2d_dgrad_implicit_gemm_c16"
             };
         }
     }

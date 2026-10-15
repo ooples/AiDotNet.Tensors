@@ -72,8 +72,11 @@ public sealed partial class CudaBackend
         LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
-    /// <summary>AIDOTNET_CONV_IMPLICIT_WGRAD=0 restores the im2col + GEMM weight gradient (#1313).</summary>
-    private static readonly bool s_convImplicitWgrad =
+    /// <summary>
+    /// #1313: the implicit-GEMM weight gradient; AIDOTNET_CONV_IMPLICIT_WGRAD=0 starts it off (im2col + GEMM instead).
+    /// Settable so the A/B benchmark can interleave both paths in one process.
+    /// </summary>
+    internal bool UseImplicitConvWgrad { get; set; } =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CONV_IMPLICIT_WGRAD") != "0";
 
     private IGpuBuffer? _convWgradPartials;
@@ -91,7 +94,7 @@ public sealed partial class CudaBackend
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
-        if (!s_convGemmBackward || !s_convImplicitWgrad || batch <= 0) return false;
+        if (!s_convGemmBackward || !UseImplicitConvWgrad || batch <= 0) return false;
         if (!_kernelCache.TryGetValue("conv2d_wgrad_implicit_gemm", out var gemm) ||
             !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out var reduce))
             return false;
@@ -101,7 +104,7 @@ public sealed partial class CudaBackend
         if (kTotal <= 0 || kTotal > int.MaxValue || outputs > int.MaxValue) return false;
 
         int tilesN = (int)((p + WgradTile - 1) / WgradTile), tilesM = (outChannels + WgradTile - 1) / WgradTile;
-        int splits = ImplicitGemmSplits(tilesN * tilesM, kTotal, out int kPerSplit);
+        int splits = ImplicitGemmSplits(tilesN * tilesM, kTotal, blocksPerSm: 4, out int kPerSplit);
 
         using var _ = PushContext();
         IGpuBuffer destination = gradKernel;
@@ -133,20 +136,23 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
-    /// Split-K count for the implicit-GEMM conv kernels: enough blocks for four per SM, but never a split shorter
-    /// than eight K tiles. kPerSplit is a multiple of the K tile.
+    /// Split-K count for the implicit-GEMM conv kernels: enough blocks for <paramref name="blocksPerSm"/> per SM, but
+    /// never a split shorter than eight K tiles. kPerSplit is a multiple of the K tile.
     /// </summary>
-    private int ImplicitGemmSplits(int tiles, long kTotal, out int kPerSplit)
+    private int ImplicitGemmSplits(int tiles, long kTotal, int blocksPerSm, out int kPerSplit)
     {
-        int blockTarget = Math.Max(1, 4 * Math.Max(1, _multiProcessorCount));
+        int blockTarget = Math.Max(1, blocksPerSm * Math.Max(1, _multiProcessorCount));
         int maxSplits = (int)Math.Max(1, kTotal / (8L * WgradTileK));
         int splits = Math.Min(maxSplits, Math.Max(1, (blockTarget + tiles - 1) / tiles));
         kPerSplit = (int)(((kTotal + splits - 1) / splits + WgradTileK - 1) / WgradTileK * WgradTileK);
         return (int)((kTotal + kPerSplit - 1) / kPerSplit);
     }
 
-    /// <summary>AIDOTNET_CONV_IMPLICIT_DGRAD=0 restores the GEMM + col2im input gradient (#1313).</summary>
-    private static readonly bool s_convImplicitDgrad =
+    /// <summary>
+    /// #1313: the implicit-GEMM input gradient; AIDOTNET_CONV_IMPLICIT_DGRAD=0 starts it off (GEMM + col2im instead).
+    /// Settable like <see cref="UseImplicitConvWgrad"/>.
+    /// </summary>
+    internal bool UseImplicitConvDgrad { get; set; } =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CONV_IMPLICIT_DGRAD") != "0";
 
     private IGpuBuffer? _convDgradPartials;
@@ -160,8 +166,10 @@ public sealed partial class CudaBackend
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
-        if (!s_convGemmBackward || !s_convImplicitDgrad || batch <= 0) return false;
-        if (!_kernelCache.TryGetValue("conv2d_dgrad_implicit_gemm", out var gemm) ||
+        if (!s_convGemmBackward || !UseImplicitConvDgrad || batch <= 0) return false;
+        // Cout % 16 == 0 keeps every K tile on one kernel tap, which the _c16 kernel exploits.
+        bool c16 = outChannels % WgradTileK == 0;
+        if (!_kernelCache.TryGetValue(c16 ? "conv2d_dgrad_implicit_gemm_c16" : "conv2d_dgrad_implicit_gemm", out var gemm) ||
             !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out var reduce))
             return false;
         long nTotal = (long)batch * inChannels * inHeight * inWidth;
@@ -170,7 +178,9 @@ public sealed partial class CudaBackend
         if (nTotal <= 0 || kTotal <= 0 || nTotal > int.MaxValue) return false;
 
         int tilesN = (int)((columns + WgradTile - 1) / WgradTile), tilesM = (inChannels + WgradTile - 1) / WgradTile;
-        int splits = ImplicitGemmSplits(tilesN * tilesM, kTotal, out int kPerSplit);
+        // The input gradient's output is the activation-sized tensor, so a split's partials cost a full extra write and
+        // read of it: split only when the tiles cannot cover the SMs once.
+        int splits = ImplicitGemmSplits(tilesN * tilesM, kTotal, blocksPerSm: 1, out int kPerSplit);
 
         using var _ = PushContext();
         IGpuBuffer destination = gradInput;
