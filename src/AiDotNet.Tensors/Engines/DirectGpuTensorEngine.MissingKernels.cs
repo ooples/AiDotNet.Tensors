@@ -999,20 +999,22 @@ public partial class DirectGpuTensorEngine
         Action<IGpuBuffer> dispatch,
         bool fullyWritten = false)
     {
-        IGpuBuffer? output = null;
+        // Inside a compiled step's action the output comes from the step's scratch pool (a stable buffer, no allocation
+        // node in a captured graph); otherwise it is a fresh buffer the result owns.
+        var output = fullyWritten ? AllocateFullyWrittenOutputBuffer(backend, elementCount) : AllocateOutputBuffer(backend, elementCount);
         bool handedOff = false;
         try
         {
-            output = fullyWritten ? AllocateDeviceBufferUninitialized(backend, elementCount) : backend.AllocateBuffer(elementCount);
-            dispatch(output);
-            var result = DeferTensorResult<T>(backend, output, elementCount, shape);
+            dispatch(output.Buffer);
+            var result = DeferTensorResult<T>(backend, output.Buffer, elementCount, shape);
+            output.RelinquishOwnership();
             handedOff = true;
             return result;
         }
         finally
         {
             if (!handedOff)
-                output?.Dispose();
+                output.Dispose();
         }
     }
 
@@ -7098,6 +7100,19 @@ public partial class DirectGpuTensorEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (wIh is null) throw new ArgumentNullException(nameof(wIh));
         if (wHh is null) throw new ArgumentNullException(nameof(wHh));
+        // Compiled training: one fused forward + BPTT node in place of the per-timestep op chain (see
+        // TryRecordLstmSequenceTrain). The returnSequences = false slice is recorded after it, as the eager path does.
+        if (GraphMode.IsActive && !GraphMode.IsInferenceTrace && !wantState && h0 is null && c0 is null
+            && GraphMode.Current is { } trainScope
+            && TryRecordLstmSequenceTrain(trainScope, input, wIh, wHh, bIh, bHh) is { } recorded)
+        {
+            finalHidden = null;
+            finalCell = null;
+            int recordedSteps = input._shape[1], recordedHidden = wIh._shape[0] / 4;
+            return returnSequences ? recorded
+                : Reshape(TensorSlice(recorded, new[] { 0, recordedSteps - 1, 0 }, new[] { input._shape[0], 1, recordedHidden }),
+                    new[] { input._shape[0], recordedHidden });
+        }
         if (GraphMode.IsActive ||
             (wantState && DifferentiableOps.IsRecording<T>()) ||
             typeof(T) != typeof(float) || input.Rank != 3 || !TryGetBackend(out var backend))

@@ -8914,6 +8914,24 @@ public partial interface IEngine
     /// <summary>Cross-entropy with softmax. Returns scalar tensor.</summary>
     Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets);
 
+    /// <summary>
+    /// Soft-target softmax cross-entropy over the last axis, averaged over SUPERVISED rows:
+    /// <c>-Σ_r Σ_c target[r,c] · logSoftmax(logits)[r,c] / max(1, #rows whose target has nonzero mass)</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>Every target value counts (including negative ones), and a row whose target is all zero -- an ignored
+    /// row -- adds nothing to the numerator or the denominator. This is the objective of PyTorch's
+    /// <c>nn.CrossEntropyLoss(reduction='mean')</c> with probability targets and an ignore index. The gradient reaches
+    /// <paramref name="logits"/> only: <c>(softmax · Σ_c target − target) / count</c> per row.</para>
+    /// <para><b>For Beginners:</b> the standard classification loss, computed straight from the network's raw scores.
+    /// It is one operation instead of a chain of log-softmax, multiply and reductions, so an engine can run it (and
+    /// its gradient) as a few fused kernels.</para>
+    /// </remarks>
+    /// <param name="logits">Raw class scores, rank 2 or more; classes on the last axis.</param>
+    /// <param name="target">Target distribution per row, the same shape as <paramref name="logits"/>.</param>
+    /// <returns>The scalar loss.</returns>
+    Tensor<T> TensorSoftmaxCrossEntropy<T>(Tensor<T> logits, Tensor<T> target);
+
     /// <summary>NLL loss on log-probabilities. Returns scalar tensor.</summary>
     Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets);
 

@@ -124,6 +124,108 @@ public sealed class CuBlasLtMatmul : IDisposable
     }
 
     /// <summary>
+    /// Column-major <c>D[m,n] = alpha · op(A) · op(B) + beta · D</c> in FP32, with the operands described by their
+    /// stored shapes (cuBLAS <c>cublasSgemm</c> semantics: A is stored <c>[m,k]</c>, or <c>[k,m]</c> when
+    /// <paramref name="transA"/>; B is stored <c>[k,n]</c>, or <c>[n,k]</c> when <paramref name="transB"/>).
+    /// The algorithm is cuBLASLt's heuristic choice within <paramref name="workspaceSizeInBytes"/> of the caller's
+    /// workspace, so the call never allocates -- unlike cuBLAS's split-K path, which under CUDA graph capture takes
+    /// its workspace from the CUBLAS_WORKSPACE_CONFIG pool (graph allocation nodes) even with a user workspace set.
+    /// Split-K algorithms that reduce with atomics (<see cref="CublasLtReductionScheme.InPlace"/>) are excluded, so
+    /// a given problem always runs the same algorithm and gives the same bits. The choice is cached per problem.
+    /// Returns cuBLASLt's status; the caller falls back on anything but success.
+    /// </summary>
+    internal unsafe CublasStatus TryMatmulColumnMajor(
+        bool transA, bool transB, int m, int n, int k,
+        IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd,
+        float alpha, float beta, CublasComputeType computeType,
+        IntPtr workspace, ulong workspaceSizeInBytes, IntPtr stream)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CuBlasLtMatmul));
+        IntPtr opDesc = IntPtr.Zero, aDesc = IntPtr.Zero, bDesc = IntPtr.Zero, dDesc = IntPtr.Zero;
+        try
+        {
+            var status = CuBlasLtNative.cublasLtMatmulDescCreate(out opDesc, computeType, CublasDataType.Float32);
+            if (status != CublasStatus.Success) return status;
+            int tA = transA ? 1 : 0, tB = transB ? 1 : 0;
+            if ((status = SetAttrStatus(opDesc, CublasLtMatmulDescAttributes.TransA, ref tA)) != CublasStatus.Success
+                || (status = SetAttrStatus(opDesc, CublasLtMatmulDescAttributes.TransB, ref tB)) != CublasStatus.Success)
+                return status;
+            if ((status = CuBlasLtNative.cublasLtMatrixLayoutCreate(out aDesc, CublasDataType.Float32,
+                    (ulong)(transA ? k : m), (ulong)(transA ? m : k), lda)) != CublasStatus.Success
+                || (status = CuBlasLtNative.cublasLtMatrixLayoutCreate(out bDesc, CublasDataType.Float32,
+                    (ulong)(transB ? n : k), (ulong)(transB ? k : n), ldb)) != CublasStatus.Success
+                || (status = CuBlasLtNative.cublasLtMatrixLayoutCreate(out dDesc, CublasDataType.Float32,
+                    (ulong)m, (ulong)n, ldd)) != CublasStatus.Success)
+                return status;
+            var key = new LtProblem(transA, transB, m, n, k, lda, ldb, ldd, computeType, workspaceSizeInBytes);
+            CublasLtMatmulHeuristicResult chosen;
+            lock (_algoCache)
+            {
+                if (!_algoCache.TryGetValue(key, out chosen))
+                {
+                    if ((status = ChooseAlgorithm(opDesc, aDesc, bDesc, dDesc, workspaceSizeInBytes, out chosen))
+                        != CublasStatus.Success)
+                        return status;
+                    _algoCache[key] = chosen;
+                }
+            }
+            return CuBlasLtNative.cublasLtMatmul(_handle, opDesc, ref alpha, a, aDesc, b, bDesc, ref beta,
+                d, dDesc, d, dDesc, (IntPtr)chosen.Algo, workspace, workspaceSizeInBytes, stream);
+        }
+        finally
+        {
+            if (dDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(dDesc);
+            if (bDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(bDesc);
+            if (aDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatrixLayoutDestroy(aDesc);
+            if (opDesc != IntPtr.Zero) CuBlasLtNative.cublasLtMatmulDescDestroy(opDesc);
+        }
+    }
+
+    private static unsafe CublasStatus SetAttrStatus(IntPtr desc, CublasLtMatmulDescAttributes attr, ref int value)
+    {
+        fixed (int* p = &value)
+            return CuBlasLtNative.cublasLtMatmulDescSetAttribute(desc, attr, (IntPtr)p, sizeof(int));
+    }
+
+    private readonly record struct LtProblem(bool TransA, bool TransB, int M, int N, int K, int Lda, int Ldb, int Ldd,
+        CublasComputeType ComputeType, ulong WorkspaceBytes);
+
+    // The algorithm cuBLASLt's heuristic chose for each problem: the heuristic is host work worth tens of
+    // microseconds, and one fixed choice per problem is what keeps the results reproducible.
+    private readonly Dictionary<LtProblem, CublasLtMatmulHeuristicResult> _algoCache = new();
+
+    private unsafe CublasStatus ChooseAlgorithm(IntPtr opDesc, IntPtr aDesc, IntPtr bDesc, IntPtr dDesc,
+        ulong workspaceSizeInBytes, out CublasLtMatmulHeuristicResult chosen)
+    {
+        chosen = default;
+        var status = CuBlasLtNative.cublasLtMatmulPreferenceCreate(out var preference);
+        if (status != CublasStatus.Success) return status;
+        try
+        {
+            ulong maxWorkspace = workspaceSizeInBytes;
+            uint schemes = (uint)(CublasLtReductionScheme.ComputeType | CublasLtReductionScheme.OutputType);
+            if ((status = CuBlasLtNative.cublasLtMatmulPreferenceSetAttribute(preference,
+                    CublasLtMatmulPreferenceAttributes.MaxWorkspaceBytes, (IntPtr)(&maxWorkspace), sizeof(ulong)))
+                    != CublasStatus.Success
+                || (status = CuBlasLtNative.cublasLtMatmulPreferenceSetAttribute(preference,
+                    CublasLtMatmulPreferenceAttributes.ReductionSchemeMask, (IntPtr)(&schemes), sizeof(uint)))
+                    != CublasStatus.Success)
+                return status;
+            CublasLtMatmulHeuristicResult result;
+            status = CuBlasLtNative.cublasLtMatmulAlgoGetHeuristic(_handle, opDesc, aDesc, bDesc, dDesc, dDesc,
+                preference, 1, &result, out int found);
+            if (status != CublasStatus.Success) return status;
+            if (found < 1 || result.State != CublasStatus.Success) return CublasStatus.NotSupported;
+            chosen = result;
+            return CublasStatus.Success;
+        }
+        finally
+        {
+            CuBlasLtNative.cublasLtMatmulPreferenceDestroy(preference);
+        }
+    }
+
+    /// <summary>
     /// Resident signed-INT8 GEMM with exact INT32 accumulation/output. The
     /// caller supplies already-packed device operands; scaling and nonlinear
     /// epilogues are intentionally separate because cuBLASLt's INT32 compute

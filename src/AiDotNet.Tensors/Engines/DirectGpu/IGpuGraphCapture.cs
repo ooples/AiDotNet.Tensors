@@ -26,6 +26,12 @@ internal interface IGpuGraphCapture : IDirectGpuBackend
     /// <summary>Replays a graph <see cref="CaptureGraph"/> returned.</summary>
     void LaunchCapturedGraph(System.IntPtr graphExec);
 
+    /// <summary>
+    /// Queues a graph <see cref="CaptureGraph"/> returned without waiting for it: work queued on the backend's
+    /// stream afterwards runs after it, but the host must wait before reading anything it writes.
+    /// </summary>
+    void EnqueueCapturedGraph(System.IntPtr graphExec);
+
     /// <summary>Frees a graph <see cref="CaptureGraph"/> returned.</summary>
     void DestroyCapturedGraph(System.IntPtr graphExec);
 }

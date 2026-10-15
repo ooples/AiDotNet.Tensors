@@ -62,12 +62,99 @@ public partial class DirectGpuTensorEngine
         return base.MultiHeadAttentionCore(query!, key!, value!, numHeads, scale, causal);
     }
 
+    // What a recorded fused-attention node's forward leaves for its backward: the log-sum-exp rows, in one device
+    // buffer allocated at the node's first run and reused by every replay (a captured graph bakes its pointer).
+    private sealed class FusedAttentionRecordedNode
+    {
+        public Tensor<float>? Lse { get; set; }
+    }
+
+    // Under a compiled trace: ONE node whose forward is the fused FlashAttention-2 kernel and whose backward is its
+    // device backward. Without it the trace kept the per-head primitive chain (slices, two GEMMs and a softmax per
+    // head, forward and backward), which a captured CUDA graph replayed as ~200 kernels a step for a 2-layer encoder.
+    // Null (the caller records its decomposed ops) wherever the eager fused path would also decline. Masks are not
+    // recorded: the mask upload is host data, and the head-interleaved core has none.
+    private Tensor<T>? TryRecordFusedAttention<T>(string opName, Tensor<T> query, Tensor<T> key, Tensor<T> value,
+        Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK, int headDim, bool interleaved, double scale,
+        double softcap, bool causal, int causalOffset, int[] outputShape)
+    {
+        // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350).
+        if (typeof(T) != typeof(float) || mask is not null || Gpu.AutocastScope.IsEnabled
+            || GraphMode.Current is not { } scope
+            || PlacementBackend is not IFusedAttentionBackend fused || !fused.SupportsFusedAttention(headDim)
+            || !query.IsContiguous || !key.IsContiguous || !value.IsContiguous
+            || batch <= 0 || heads <= 0 || seqQ <= 0 || seqK < 0
+            || (long)batch * heads * Math.Max(seqQ, seqK) * headDim > int.MaxValue)
+            return null;
+        if (!scope.BindEngine(this)) return null;
+
+        var p = FusedParams(batch, heads, seqQ, seqK, headDim, interleaved, scale, softcap, causal, causalOffset);
+        var node = new FusedAttentionRecordedNode();
+        int outLength = batch * heads * seqQ * headDim, rows = batch * heads * seqQ;
+        return scope.RecordVariadic(LazyNodeType.Custom, opName, new[] { query, key, value }, outputShape,
+            (eng, output) =>
+            {
+                var gpu = (DirectGpuTensorEngine)eng;
+                var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
+                var attention = (IFusedAttentionBackend)backend;
+                node.Lse ??= Tensor<float>.FromGpuBuffer(backend, backend.AllocateBuffer(rows), new[] { rows },
+                    Gpu.GpuTensorRole.Intermediate, ownsBuffer: true);
+                using var q = gpu.GetOrAllocateBuffer(backend, query);
+                using var k = gpu.GetOrAllocateBuffer(backend, key);
+                using var v = gpu.GetOrAllocateBuffer(backend, value);
+                var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
+                bool ownsResult = true;
+                try
+                {
+                    attention.FusedAttentionForward(q.Buffer, k.Buffer, v.Buffer, result.Buffer,
+                        node.Lse._gpuBuffer ?? throw new InvalidOperationException("The attention node lost its log-sum-exp buffer."),
+                        null, p, headDim);
+                    var tensor = gpu.DeferTensorResult<T>(backend, result.Buffer, outLength, outputShape);
+                    result.RelinquishOwnership();
+                    ownsResult = false;
+                    CopyResultInto(eng, tensor, output);
+                }
+                finally
+                {
+                    if (ownsResult) result.Dispose();
+                }
+            },
+            (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                var lse = node.Lse ?? throw new InvalidOperationException("The fused attention node's backward ran before its forward.");
+                var gpu = (DirectGpuTensorEngine)engine;
+                // In a resident step an accumulator receiving its first contribution here is the kernel's output itself.
+                Tensor<T>? FirstWriteTarget(Tensor<T> input) =>
+                    Autodiff.DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add) is { } t && !add
+                        ? t : null;
+                var intoQ = FirstWriteTarget(inputs[0]);
+                var intoK = FirstWriteTarget(inputs[1]);
+                var intoV = FirstWriteTarget(inputs[2]);
+                var (dQ, dK, dV) = gpu.FusedAttentionBackwardOnDevice(gradOutput, inputs[0], inputs[1], inputs[2], output,
+                    lse, null, p, headDim, intoQ, intoK, intoV);
+                void Land(Tensor<T> input, Tensor<T>? into, Tensor<T> grad)
+                {
+                    if (into is not null && ReferenceEquals(grad, into))
+                        Autodiff.DifferentiableOps.CommitDirectGradWrite(grads, input, into);
+                    else
+                        Autodiff.DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+                }
+                Land(inputs[0], intoQ, dQ);
+                Land(inputs[1], intoK, dK);
+                Land(inputs[2], intoV, dV);
+            },
+            new object[] { node });
+    }
+
     // One fused attention on the device, or null when this call cannot take it (the caller then runs its base path).
     private Tensor<T>? TryFusedAttentionOnDevice<T>(string opName, Tensor<T> query, Tensor<T> key, Tensor<T> value,
         Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK, int headDim, bool interleaved, double scale,
         double softcap, bool causal, int causalOffset, int[] outputShape)
     {
-        if (typeof(T) != typeof(float) || GraphMode.IsActive || Gpu.AutocastScope.IsEnabled
+        if (GraphMode.IsActive)
+            return TryRecordFusedAttention(opName, query, key, value, mask, batch, heads, seqQ, seqK, headDim, interleaved,
+                scale, softcap, causal, causalOffset, outputShape);
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled
             || !TryGetBackend(out var backend) || backend is not IFusedAttentionBackend fused
             || !fused.SupportsFusedAttention(headDim) || batch <= 0 || heads <= 0 || seqQ <= 0 || seqK < 0
             || (long)batch * heads * Math.Max(seqQ, seqK) * headDim > int.MaxValue)
@@ -186,9 +273,14 @@ public partial class DirectGpuTensorEngine
         Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[2], dV, engine);
     }
 
+    /// <summary>dQ, dK and dV of a fused attention on the device. In a resident step, <paramref name="intoQ"/> /
+    /// <paramref name="intoK"/> / <paramref name="intoV"/> name gradient accumulators receiving their first contribution
+    /// of the step (<see cref="Autodiff.DifferentiableOps.PeekDirectDeviceGradTarget{T}"/>): the kernel writes those
+    /// gradients into them (its outputs are overwritten, never accumulated) and returns that accumulator as the
+    /// gradient, which the caller then commits instead of copying in.</summary>
     private (Tensor<T> DQ, Tensor<T> DK, Tensor<T> DV) FusedAttentionBackwardOnDevice<T>(Tensor<T> gradOutput,
         Tensor<T> query, Tensor<T> key, Tensor<T> value, Tensor<T> output, Tensor<float> lse, Tensor<int>? mask,
-        FusedAttentionParams p, int headDim)
+        FusedAttentionParams p, int headDim, Tensor<T>? intoQ = null, Tensor<T>? intoK = null, Tensor<T>? intoV = null)
     {
         if (!TryGetBackend(out var backend) || backend is not IFusedAttentionBackend fused)
             throw new InvalidOperationException("The GPU backend that recorded a fused attention node is no longer available.");
@@ -202,17 +294,38 @@ public partial class DirectGpuTensorEngine
             using var o = GetOrAllocateBuffer(backend, output);
             using var dO = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
             using var l = GetOrAllocateBuffer(backend, lse);
-            dq = AllocateFullyWrittenOutputBuffer(backend, query.Length); ownsQ = true;
-            dk = AllocateFullyWrittenOutputBuffer(backend, key.Length); ownsK = true;
-            dv = AllocateFullyWrittenOutputBuffer(backend, value.Length); ownsV = true;
+            // A target must differ from every buffer the kernel reads and from the other targets.
+            var targetQ = ResolveDirectGradTarget(backend, intoQ, query.Length, q.Buffer, k.Buffer, v.Buffer);
+            var targetK = ResolveDirectGradTarget(backend, intoK, key.Length, q.Buffer, k.Buffer, v.Buffer);
+            var targetV = ResolveDirectGradTarget(backend, intoV, value.Length, q.Buffer, k.Buffer, v.Buffer);
+            IGpuBuffer[] otherReads = { o.Buffer, dO.Buffer, l.Buffer };
+            if (targetQ is not null && Array.Exists(otherReads, r => r.Handle == targetQ.Handle)) targetQ = null;
+            if (targetK is not null && (Array.Exists(otherReads, r => r.Handle == targetK.Handle)
+                || (targetQ is not null && targetK.Handle == targetQ.Handle))) targetK = null;
+            if (targetV is not null && (Array.Exists(otherReads, r => r.Handle == targetV.Handle)
+                || (targetQ is not null && targetV.Handle == targetQ.Handle)
+                || (targetK is not null && targetV.Handle == targetK.Handle))) targetV = null;
+            if (targetQ is null) { dq = AllocateFullyWrittenOutputBuffer(backend, query.Length); ownsQ = true; }
+            if (targetK is null) { dk = AllocateFullyWrittenOutputBuffer(backend, key.Length); ownsK = true; }
+            if (targetV is null) { dv = AllocateFullyWrittenOutputBuffer(backend, value.Length); ownsV = true; }
             fused.FusedAttentionBackward(q.Buffer, k.Buffer, v.Buffer, o.Buffer, dO.Buffer, l.Buffer, mask?._gpuBuffer,
-                dq.Buffer, dk.Buffer, dv.Buffer, p, headDim);
-            var gq = DeferTensorResult<T>(backend, dq.Buffer, query.Length, (int[])query._shape.Clone());
-            dq.RelinquishOwnership(); ownsQ = false;
-            var gk = DeferTensorResult<T>(backend, dk.Buffer, key.Length, (int[])key._shape.Clone());
-            dk.RelinquishOwnership(); ownsK = false;
-            var gv = DeferTensorResult<T>(backend, dv.Buffer, value.Length, (int[])value._shape.Clone());
-            dv.RelinquishOwnership(); ownsV = false;
+                targetQ ?? dq.Buffer, targetK ?? dk.Buffer, targetV ?? dv.Buffer, p, headDim);
+            Tensor<T> Written(Tensor<T>? into, IGpuBuffer? target, ref OwnedBuffer owned, ref bool owns, Tensor<T> input)
+            {
+                if (into is not null && target is not null)
+                {
+                    into.IncrementVersion();
+                    BindResidentBuffer(into, target, backend);
+                    return into;
+                }
+                var result = DeferTensorResult<T>(backend, owned.Buffer, input.Length, (int[])input._shape.Clone());
+                owned.RelinquishOwnership();
+                owns = false;
+                return result;
+            }
+            var gq = Written(intoQ, targetQ, ref dq, ref ownsQ, query);
+            var gk = Written(intoK, targetK, ref dk, ref ownsK, key);
+            var gv = Written(intoV, targetV, ref dv, ref ownsV, value);
             return (gq, gk, gv);
         }
         finally

@@ -116,9 +116,15 @@ public sealed partial class CudaBackend : IFusedAttentionBackend
         int d = headDim;
         if (rows > 0)
         {
-            void** dargs = stackalloc void*[5];
-            dargs[0] = &pg; dargs[1] = &po; dargs[2] = &pd; dargs[3] = &args0; dargs[4] = &d;
-            LaunchKernel(deltaKernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, dargs);
+            // A row per D/4 threads (one float4 each) when D/4 is a power of two up to 32 and every row of O and dO
+            // starts 16-byte aligned; else a thread per row.
+            int quads = headDim / 4;
+            bool aligned = ((po.ToInt64() | pg.ToInt64()) & 15) == 0 && p.Ob % 4 == 0 && p.Oh % 4 == 0 && p.Or % 4 == 0;
+            int lanes = headDim % 4 == 0 && quads > 1 && quads <= 32 && (quads & (quads - 1)) == 0 && aligned ? quads : 1;
+            long threads = (long)rows * lanes;
+            void** dargs = stackalloc void*[6];
+            dargs[0] = &pg; dargs[1] = &po; dargs[2] = &pd; dargs[3] = &args0; dargs[4] = &d; dargs[5] = &lanes;
+            LaunchKernel(deltaKernel, (uint)((threads + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, dargs);
         }
         // Default: one fused pass with atomic dQ (as torch's default backward). DeterministicReductions keeps the
         // two-pass kernels, whose every sum has a fixed order (torch.use_deterministic_algorithms).

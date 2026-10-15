@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -72,5 +73,78 @@ public class MaxPool2DBackwardGpuCorrectnessTests
             AiDotNetEngine.Current = prior;
             gpu?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// A winnerless window (every element -inf, or NaN) routes its gradient to its own first in-bounds cell, as the CPU
+    /// engine and PyTorch do. The CUDA forward stored cell 0 of the plane for such a window, and the deterministic
+    /// backward scanned the whole output plane for cell 0 to honour it -- one slow thread per plane, ~135 us per step on
+    /// the parity CNN. Padded and unpadded pools; the backward runs under GpuDeterminism (the bounded gather kernel).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void WinnerlessWindow_RoutesToItsFirstCell_InTheForwardAndTheDeterministicBackward(int pad)
+    {
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        const int batch = 1, channels = 2, inH = 6, inW = 6, k = 2, s = 2;
+        int outH = (inH + 2 * pad - k) / s + 1, outW = (inW + 2 * pad - k) / s + 1;
+        var x = new float[batch * channels * inH * inW];
+        for (int i = 0; i < x.Length; i++) x[i] = (i % 7) * 0.25f - 1f;
+        // Channel 0: window (1,1) -- rows and cols [2 - pad, 3 - pad] -- is all -inf; channel 1: the same cells all NaN.
+        foreach (int h in new[] { 2 - pad, 3 - pad })
+            foreach (int w in new[] { 2 - pad, 3 - pad })
+            {
+                x[h * inW + w] = float.NegativeInfinity;
+                x[inH * inW + h * inW + w] = float.NaN;
+            }
+        var g = new float[batch * channels * outH * outW];
+        for (int i = 0; i < g.Length; i++) g[i] = 1f + i;
+
+        using var xBuf = backend.AllocateBuffer(x);
+        using var outBuf = backend.AllocateBuffer(g.Length);
+        using var idxBuf = backend.AllocateBuffer(g.Length);
+        using var gBuf = backend.AllocateBuffer(g);
+        using var dxBuf = backend.AllocateBuffer(Enumerable.Repeat(123.25f, x.Length).ToArray());
+        backend.MaxPool2D(xBuf, outBuf, idxBuf, batch, channels, inH, inW, outH, outW, k, k, s, s, pad, pad);
+        var prior = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(true);
+        try
+        {
+            backend.MaxPool2DBackward(gBuf, idxBuf, dxBuf, batch, channels, inH, inW, outH, outW, k, k, s, s, pad, pad);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(prior);
+        }
+
+        // Reference: each window's winner (first strict maximum in scan order, else its first in-bounds cell) takes the
+        // window's gradient.
+        var indices = backend.DownloadBuffer(idxBuf);
+        var expected = new float[x.Length];
+        for (int c = 0; c < channels; c++)
+            for (int oh = 0; oh < outH; oh++)
+                for (int ow = 0; ow < outW; ow++)
+                {
+                    int firstH = Math.Min(Math.Max(oh * s - pad, 0), inH - 1), firstW = Math.Min(Math.Max(ow * s - pad, 0), inW - 1);
+                    int winner = firstH * inW + firstW;
+                    float best = float.NegativeInfinity;
+                    for (int kh = 0; kh < k; kh++)
+                        for (int kw = 0; kw < k; kw++)
+                        {
+                            int ih = oh * s - pad + kh, iw = ow * s - pad + kw;
+                            if (ih < 0 || ih >= inH || iw < 0 || iw >= inW) continue;
+                            float v = x[c * inH * inW + ih * inW + iw];
+                            if (v > best) { best = v; winner = ih * inW + iw; }
+                        }
+                    int o = (c * outH + oh) * outW + ow;
+                    int stored = BitConverter.ToInt32(BitConverter.GetBytes(indices[o]), 0);
+                    Assert.True(stored == winner, $"pad {pad}, channel {c}, window ({oh},{ow}): index {stored}, expected {winner}");
+                    expected[c * inH * inW + winner] += g[o];
+                }
+        var got = backend.DownloadBuffer(dxBuf);
+        for (int i = 0; i < x.Length; i++)
+            Assert.True(got[i] == expected[i], $"pad {pad}: gradInput[{i}] = {got[i]}, expected {expected[i]}");
     }
 }

@@ -45,6 +45,31 @@ internal sealed class LayerNormStateRef<T>
 internal static class BackwardFunctions<T>
 {
     /// <summary>
+    /// A max pool recorded without indices (a compiled plan's lazy node): on a GPU engine in a resident step, the
+    /// non-overlapping pool's input gradient comes from one kernel that finds each window's winner again from the input,
+    /// written straight into the input's accumulator on its first contribution
+    /// (<see cref="DirectGpuTensorEngine.TryMaxPool2DBackwardRecomputeResident{T}"/>); anything else runs
+    /// <paramref name="fallback"/> (replaying the pool under a tape).
+    /// </summary>
+    internal static BackwardFunction<T> MaxPool2DRecomputeOnDeviceOr(int[] poolSize, int[] stride, BackwardFunction<T> fallback) =>
+        (gradOutput, inputs, output, savedState, engine, grads) =>
+        {
+            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
+            {
+                var into = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add);
+                if (gpu.TryMaxPool2DBackwardRecomputeResident(gradOutput, inputs[0], poolSize, stride, add ? null : into,
+                        out var grad) && grad is not null)
+                {
+                    if (!add && into is not null && ReferenceEquals(grad, into))
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], into);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+                    return;
+                }
+            }
+            fallback(gradOutput, inputs, output, savedState, engine, grads);
+        };
+    /// <summary>
     /// A backward for a compiled-graph node whose op has a differentiable EAGER implementation but no dedicated graph
     /// backward: re-runs the op under a fresh <see cref="GradientTape{T}"/> and seeds that result with the node's
     /// output gradient, which yields exactly the vector-Jacobian product the tape path would. Graph nodes used to be
@@ -541,6 +566,14 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // In a resident step a first contribution is written straight into the input's gradient accumulator.
+        if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+            && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add) is { } into && !add
+            && gpu.TryReluBackwardInto(gradOutput, inputs[0], into))
+        {
+            DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], into);
+            return;
+        }
         var grad = engine.ReluBackward(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -1022,13 +1055,24 @@ internal static class BackwardFunctions<T>
             if (needsInputGradient && needsWeightGradient
                 && engine is DirectGpuTensorEngine gpuBackward
                 && !DifferentiableOps.IsRecording<T>()
-                && !Compilation.GraphMode.IsActive
-                && gpuBackward.TryMatMulBackward2D(g2D, a2D, inputs[1], out var gpuGradA, out var gpuGradB)
-                && gpuGradA is not null && gpuGradB is not null)
+                && !Compilation.GraphMode.IsActive)
             {
-                DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(gpuGradA, (int[])inputs[0]._shape.Clone()), engine);
-                DifferentiableOps.AccumulateGrad(grads, inputs[1], gpuGradB, engine);
-                return;
+                // In a resident step the GEMMs write into the gradient accumulators themselves.
+                var intoA = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool addA);
+                var intoB = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out bool addB);
+                if (gpuBackward.TryMatMulBackward2D(g2D, a2D, inputs[1], out var gpuGradA, out var gpuGradB, intoA, addA, intoB, addB)
+                    && gpuGradA is not null && gpuGradB is not null)
+                {
+                    if (intoA is not null && ReferenceEquals(gpuGradA, intoA))
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], intoA);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(gpuGradA, (int[])inputs[0]._shape.Clone()), engine);
+                    if (intoB is not null && ReferenceEquals(gpuGradB, intoB))
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[1], intoB);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, inputs[1], gpuGradB, engine);
+                    return;
+                }
             }
 
             // Explicit transpose + TensorMatMul. Two earlier alternatives
@@ -1741,6 +1785,34 @@ internal static class BackwardFunctions<T>
                 "never populated it before this replay (lazy/compiled-path wiring bug).")
             : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+
+        // In a resident step the three gradients land in their accumulators directly (the input's added in the same
+        // pass when it is not its first contribution, where the backend can).
+        if (engine is DirectGpuTensorEngine gpuNorm
+            && !DifferentiableOps.IsRecording<T>()
+            && !Compilation.GraphMode.IsActive)
+        {
+            var intoInput = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool addInput);
+            var intoGamma = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out bool addGamma);
+            var intoBeta = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[2], engine, out bool addBeta);
+            if (gpuNorm.TryLayerNormBackwardResident(gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
+                    intoInput, addInput, intoGamma, addGamma, intoBeta, addBeta,
+                    out var residentInput, out var residentGamma, out var residentBeta)
+                && residentInput is not null && residentGamma is not null && residentBeta is not null)
+            {
+                void Land(Tensor<T> input, Tensor<T>? into, Tensor<T> grad)
+                {
+                    if (into is not null && ReferenceEquals(grad, into))
+                        DifferentiableOps.CommitDirectGradWrite(grads, input, into);
+                    else
+                        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+                }
+                Land(inputs[0], intoInput, residentInput);
+                Land(inputs[1], intoGamma, residentGamma);
+                Land(inputs[2], intoBeta, residentBeta);
+                return;
+            }
+        }
 
         var gradInput = engine.LayerNormBackward(
             gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
@@ -2486,6 +2558,7 @@ internal static class BackwardFunctions<T>
         // generic expand-and-tile below took the host path. No axes (a traced full sum records none) means every axis,
         // as the tiling below treats it.
         var reducedAxes = axes.Length == 0 ? Enumerable.Range(0, inputShape.Length).ToArray() : axes;
+        if (TryReducedGradientInto(gradOutput, inputs[0], reducedAxes, mean: false, engine, grads)) return;
         if (engine is DirectGpuTensorEngine gpu && gpu.TryBroadcastReducedGradient(gradOutput, inputShape, reducedAxes, 1f) is { } onDevice)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], onDevice, engine);
@@ -2510,12 +2583,35 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>
+    /// A sum's or mean's gradient over one contiguous block of axes, written by the GPU broadcast straight into the
+    /// input's gradient accumulator when this is its first contribution of a resident step. False when it was not.
+    /// </summary>
+    private static bool TryReducedGradientInto(Tensor<T> gradOutput, Tensor<T> input, int[] axes, bool mean,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (engine is not DirectGpuTensorEngine gpu || DifferentiableOps.IsRecording<T>() || Compilation.GraphMode.IsActive
+            || DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add) is not { } into || add)
+            return false;
+        float scale = 1f;
+        if (mean)
+        {
+            long count = 1;
+            foreach (int axis in axes) count *= input._shape[axis < 0 ? axis + input._shape.Length : axis];
+            if (count <= 0) return false;
+            scale = 1f / count;
+        }
+        if (!gpu.TryBroadcastReducedGradientInto(gradOutput, input._shape, axes, scale, into)) return false;
+        DifferentiableOps.CommitDirectGradWrite(grads, input, into);
+        return true;
+    }
     /// <summary>d(mean(x))/dx = grad / N (broadcast and scale)</summary>
     internal static void ReduceMeanBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axes = (int[])savedState[0];
+        if (TryReducedGradientInto(gradOutput, inputs[0], axes, mean: true, engine, grads)) return;
         var grad = engine.ReduceMeanBackward(gradOutput, inputs[0]._shape, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6877,30 +6973,93 @@ internal static class BackwardFunctions<T>
                 var gFlat = rowsG == gradOutput.Length / N && gradOutput.Rank == 2
                     ? gradOutput
                     : engine.Reshape(gradOutput, new[] { rowsG, N });
-                var wT = engine.TensorTranspose(inputs[1]); // [N, K] — 2D transpose is cheap
-                var inputGradFlat = engine.TensorMatMul(gFlat, wT);
-                var inputGradFast = inputs[0].Rank == 2
-                    ? inputGradFlat
-                    : engine.Reshape(inputGradFlat, inputs[0]._shape);
-                DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFast, engine);
-
-                // dL/dWeight = input^T @ gradOutput   (shapes: [K, rowsI] × [rowsG, N] = [K, N])
                 var iFlat = inputs[0].Rank == 2
                     ? inputs[0]
                     : engine.Reshape(inputs[0], new[] { rowsI, K });
-                var iFlatT = engine.TensorTranspose(iFlat);
-                var weightGradFast = engine.TensorMatMul(iFlatT, gFlat);
-                DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFast, engine);
+                Tensor<T>? inputGradFlat = null;
+                Tensor<T>? weightGradFast = null;
+                // GPU: the GEMMs read their operands transposed in place (cuBLAS op flags). Materializing Wᵀ and Xᵀ
+                // cost two transpose kernels per linear layer per step -- 16 of a Transformer step's 24 -- and a layer
+                // whose input gradient nothing reads (the first one) computed and discarded that GEMM as well.
+                bool gpuDone = false;
+                if (engine is DirectGpuTensorEngine gpuLinear
+                    && !DifferentiableOps.IsRecording<T>()
+                    && !Compilation.GraphMode.IsActive)
+                {
+                    // In a resident step the GEMMs write into the gradient accumulators themselves.
+                    bool addInput = false, addWeight = false;
+                    var intoInput = needsInputGradient
+                        ? DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out addInput) : null;
+                    var intoWeight = needsWeightGradient
+                        ? DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out addWeight) : null;
+                    if (needsInputGradient && needsWeightGradient
+                        && gpuLinear.TryMatMulBackward2D(gFlat, iFlat, inputs[1], out var gpuInputGrad, out var gpuWeightGrad,
+                            intoInput, addInput, intoWeight, addWeight)
+                        && gpuInputGrad is not null && gpuWeightGrad is not null)
+                    {
+                        inputGradFlat = gpuInputGrad;
+                        weightGradFast = gpuWeightGrad;
+                        gpuDone = true;
+                    }
+                    else if (!needsInputGradient && needsWeightGradient
+                        && gpuLinear.TryMatMulWeightGradient2D(gFlat, iFlat, N, out var gpuWeightOnly, intoWeight, addWeight)
+                        && gpuWeightOnly is not null)
+                    {
+                        weightGradFast = gpuWeightOnly;
+                        gpuDone = true;
+                    }
+                    if (gpuDone && intoInput is not null && ReferenceEquals(inputGradFlat, intoInput))
+                    {
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], intoInput);
+                        inputGradFlat = null;
+                    }
+                    if (gpuDone && intoWeight is not null && ReferenceEquals(weightGradFast, intoWeight))
+                    {
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[1], intoWeight);
+                        weightGradFast = null;
+                    }
+                }
+                if (!gpuDone)
+                {
+                    var wT = engine.TensorTranspose(inputs[1]); // [N, K] — 2D transpose is cheap
+                    inputGradFlat = engine.TensorMatMul(gFlat, wT);
+                    // dL/dWeight = input^T @ gradOutput   (shapes: [K, rowsI] × [rowsG, N] = [K, N])
+                    var iFlatT = engine.TensorTranspose(iFlat);
+                    weightGradFast = engine.TensorMatMul(iFlatT, gFlat);
+                }
+                if (inputGradFlat is not null)
+                {
+                    var inputGradFast = inputs[0].Rank == 2
+                        ? inputGradFlat
+                        : engine.Reshape(inputGradFlat, inputs[0]._shape);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGradFast, engine);
+                }
+                if (weightGradFast is not null)
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFast, engine);
 
                 if (inputs.Length > 2)
                 {
-                    // Pass the original-rank gradOutput (not the leading-dim-flattened
-                    // gFlat) so rank-promoted biases like [1, 1, N] reduce correctly
-                    // — SumToShape needs to see the same rank it's reducing into,
-                    // matching the slow-path behaviour below. Flattening here would
-                    // drop broadcast axes and produce [1, 1] for a [1, 1, N] bias.
-                    var biasGradFast = SumToShape(gradOutput, inputs[2]._shape, engine);
-                    DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGradFast, engine);
+                    // A bias of N elements (any rank) gets the column sums of [rowsG, N]; in a resident step they are
+                    // summed straight into its accumulator.
+                    if (engine is DirectGpuTensorEngine gpuBias
+                        && inputs[2].Length == N
+                        && !DifferentiableOps.IsRecording<T>()
+                        && !Compilation.GraphMode.IsActive
+                        && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[2], engine, out bool addBias) is { } intoBias
+                        && gpuBias.TrySumRowsIntoGradient(gradOutput, rowsG, N, intoBias, addBias))
+                    {
+                        DifferentiableOps.CommitDirectGradWrite(grads, inputs[2], intoBias);
+                    }
+                    else
+                    {
+                        // Pass the original-rank gradOutput (not the leading-dim-flattened
+                        // gFlat) so rank-promoted biases like [1, 1, N] reduce correctly
+                        // — SumToShape needs to see the same rank it's reducing into,
+                        // matching the slow-path behaviour below. Flattening here would
+                        // drop broadcast axes and produce [1, 1] for a [1, 1, N] bias.
+                        var biasGradFast = SumToShape(gradOutput, inputs[2]._shape, engine);
+                        DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGradFast, engine);
+                    }
                 }
                 return;
             }
