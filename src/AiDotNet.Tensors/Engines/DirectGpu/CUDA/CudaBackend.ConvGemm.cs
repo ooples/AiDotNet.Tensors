@@ -157,6 +157,35 @@ public sealed partial class CudaBackend
 
     private IGpuBuffer? _convDgradPartials;
 
+    /// <summary>Split-K target of the implicit input gradient, in blocks per SM (see <see cref="ImplicitGemmSplits"/>).</summary>
+    internal int ConvDgradBlocksPerSm { get; set; } = 4;
+
+    /// <summary>
+    /// #1313: strided input gradient through conv2d_dgrad_implicit_gemm_c16_phase, one grid layer (blockIdx.z) per
+    /// sub-pixel phase; each phase writes its own disjoint pixels of gradInput, so there is no split and no reduction.
+    /// </summary>
+    private unsafe bool TryConv2DBackwardInputPhaseGemm(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        if (!_kernelCache.TryGetValue("conv2d_dgrad_implicit_gemm_c16_phase", out var gemm)) return false;
+        // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image; smaller phases exit their spare blocks.
+        long columns = (long)batch * ((inHeight + strideH - 1) / strideH) * ((inWidth + strideW - 1) / strideW);
+        if ((long)batch * inChannels * inHeight * inWidth > int.MaxValue) return false;
+        int tilesN = (int)((columns + WgradTile - 1) / WgradTile), tilesM = (inChannels + WgradTile - 1) / WgradTile;
+
+        using var _ = PushContext();
+        IntPtr dyPtr = gradOutput.Handle, wPtr = kernel.Handle, outPtr = gradInput.Handle;
+        void** args = stackalloc void*[17];
+        args[0] = &dyPtr; args[1] = &wPtr; args[2] = &outPtr;
+        args[3] = &batch; args[4] = &inChannels; args[5] = &inHeight; args[6] = &inWidth;
+        args[7] = &outChannels; args[8] = &outHeight; args[9] = &outWidth;
+        args[10] = &kernelH; args[11] = &kernelW; args[12] = &strideH; args[13] = &strideW;
+        args[14] = &padH; args[15] = &padW;
+        LaunchKernel3D(gemm, (uint)tilesN, (uint)tilesM, (uint)(strideH * strideW), (uint)DefaultBlockSize, 1, 1, args, 0);
+        return true;
+    }
+
     /// <summary>
     /// #1313: gradInput[B, Cin, H, W] as an implicit GEMM over K = Cout * kH * kW, gathering gradOutput instead of
     /// writing a col buffer and scattering it back with col2im. Split-K and its fixed-order sum as in the weight
@@ -167,8 +196,11 @@ public sealed partial class CudaBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
         if (!s_convGemmBackward || !UseImplicitConvDgrad || batch <= 0) return false;
-        // Cout % 16 == 0 keeps every K tile on one kernel tap, which the _c16 kernel exploits.
+        // Cout % 16 == 0 keeps every K tile on one kernel tap, which the _c16 kernels exploit.
         bool c16 = outChannels % WgradTileK == 0;
+        if (c16 && (strideH > 1 || strideW > 1) && dilationH == 1 && dilationW == 1 && kernelH >= strideH && kernelW >= strideW)
+            return TryConv2DBackwardInputPhaseGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW);
         if (!_kernelCache.TryGetValue(c16 ? "conv2d_dgrad_implicit_gemm_c16" : "conv2d_dgrad_implicit_gemm", out var gemm) ||
             !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out var reduce))
             return false;
@@ -178,9 +210,13 @@ public sealed partial class CudaBackend
         if (nTotal <= 0 || kTotal <= 0 || nTotal > int.MaxValue) return false;
 
         int tilesN = (int)((columns + WgradTile - 1) / WgradTile), tilesM = (inChannels + WgradTile - 1) / WgradTile;
-        // The input gradient's output is the activation-sized tensor, so a split's partials cost a full extra write and
-        // read of it: split only when the tiles cannot cover the SMs once.
-        int splits = ImplicitGemmSplits(tilesN * tilesM, kTotal, blocksPerSm: 1, out int kPerSplit);
+        // The partials of a split cost an extra write and read of the activation-sized dX, which pays only when the tiles
+        // cannot cover the SMs once (measured on ResNet-18: 64x64 @32 slows with any split; 512x512 @4 gains 25% at four
+        // blocks per SM).
+        int tiles = tilesN * tilesM;
+        int splits = tiles >= _multiProcessorCount ? 1 : ImplicitGemmSplits(tiles, kTotal, ConvDgradBlocksPerSm, out int _unusedKPerSplit);
+        int kPerSplit = (int)(((kTotal + splits - 1) / splits + WgradTileK - 1) / WgradTileK * WgradTileK);
+        splits = (int)((kTotal + kPerSplit - 1) / kPerSplit);
 
         using var _ = PushContext();
         IGpuBuffer destination = gradInput;

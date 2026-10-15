@@ -35,6 +35,8 @@ public sealed class ConvImplicitGemmBackwardTests
         new object[] { 2, 17, 13, 11, 70, 5, 3, 1, 2, 2, 1, 1, 1 },     // P = 255, Cout = 70: partial tiles in both dims
         new object[] { 2, 5, 7, 9, 32, 3, 3, 1, 1, 2, 2, 2, 2 },        // Cout % 16 == 0, H*W = 63: scalar stores, dilation
         new object[] { 2, 6, 9, 11, 16, 3, 2, 2, 3, 1, 1, 1, 1 },       // Cout % 16 == 0, unequal strides, non-square kernel
+        new object[] { 2, 7, 11, 13, 32, 3, 4, 2, 3, 1, 2, 1, 1 },      // phase path: strides 2 x 3, kernel 3 x 4, odd sizes
+        new object[] { 3, 70, 9, 9, 48, 3, 3, 3, 3, 2, 2, 1, 1 },        // phase path: stride 3 (9 phases), Cin not a tile multiple
     };
 
     [SkippableTheory]
@@ -181,6 +183,8 @@ public sealed class ConvImplicitGemmBackwardTests
             "Set AIDOTNET_PERF_RUNNER=1 on a quiet GPU machine.");
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
+        if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_BENCH_DGRAD_BPS"), out int bps)) backend.ConvDgradBlocksPerSm = bps;
+        _out.WriteLine($"input-gradient split target: {backend.ConvDgradBlocksPerSm} blocks per SM");
         const int batch = 8, rounds = 41, burst = 10;
         // count, Cin, H (= W), Cout, k, stride, pad; the stem's input gradient is not needed in training.
         var layers = new (string Name, int Count, int InC, int Hw, int OutC, int K, int S, int P, bool NeedsDx)[]

@@ -1319,6 +1319,93 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
         conv2d_dgrad_c16_body<false>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
             kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
 }
+// #1313: strided input gradient by sub-pixel (phase) decomposition, for Cout % 16 == 0, unit dilation and kH >= sH,
+// kW >= sW. Input pixels split into sH * sW phases by (ih + pH) mod sH and (iw + pW) mod sW; in phase (rh, rw) only the
+// taps kh = rh, rh + sH, ... and kw = rw, rw + sW, ... reach an output position, and every one of them does. So each
+// phase is a dense GEMM C[Cin, pixels of the phase] over K = Cout * (its taps), with no zero-filled gathers: the generic
+// kernel at stride 2 spends three quarters of its B tile on taps that miss. blockIdx.z is the phase; no split-K, the
+// phases write disjoint pixels of dX directly. K is ordered (tap row, tap column, co) as in the _c16 kernel.
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c16_phase(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW)
+{
+    __shared__ __align__(16) float As[WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[WG_BK][WG_BN + 4];
+    const int rh = blockIdx.z / sW, rw = blockIdx.z - rh * sW;
+    // First input row / column of the phase: (ih + pH) % sH == rh.
+    const int ih0 = ((rh - pH) % sH + sH) % sH, iw0 = ((rw - pW) % sW + sW) % sW;
+    const int Hp = ih0 < H ? (H - ih0 + sH - 1) / sH : 0, Wp = iw0 < W ? (W - iw0 + sW - 1) / sW : 0;
+    const int plane = Hp * Wp, N = batch * plane;
+    const int n0 = blockIdx.x * WG_BN;
+    if (n0 >= N) return;
+    const int tapsH = (kH - rh + sH - 1) / sH, tapsW = (kW - rw + sW - 1) / sW;
+    const int K = outC * tapsH * tapsW, HW = H * W, L = outH * outW, khw = kH * kW, P = inC * khw;
+    const int m0 = blockIdx.y * WG_BM;
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int lk = tid & 15, lc = tid >> 4;
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / plane; int q = n - nb * plane; int i = q / Wp; ihp = ih0 + i * sH + pH; iwp = iw0 + (q - i * Wp) * sW + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    int co0 = 0, kh = rh, kw = rw;
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += WG_BK)
+    {
+        const float* wRow = kernel + (long long)(co0 + lk) * P + kh * kW + kw;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            As[lk][lc + 16 * r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+        }
+        // (ihp - kh) is a multiple of sH by construction; only the edges can fall outside dY.
+        int oh = (ihp - kh) / sH, ow = (iwp - kw) / sW;
+        bool valid = nIn && ihp >= kh && iwp >= kw && oh < outH && ow < outW;
+        const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            Bs[bkRow + 4 * r][bn] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        __syncthreads();
+        co0 += WG_BK;
+        if (co0 == outC) { co0 = 0; kw += sW; if (kw >= kW) { kw = rw; kh += sH; } }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        int nn = n0 + tx * 4 + j;
+        if (nn >= N) continue;
+        int b = nn / plane, q = nn - b * plane, i = q / Wp;
+        float* col = out + (long long)b * inC * HW + (ih0 + i * sH) * W + iw0 + (q - i * Wp) * sW;
+        #pragma unroll
+        for (int i2 = 0; i2 < 4; i2++)
+        {
+            int m = m0 + ty * 4 + i2;
+            if (m < inC) col[(long long)m * HW] = acc[i2][j];
+        }
+    }
+}
 ";
         }
 
@@ -1351,7 +1438,8 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
                 "conv2d_wgrad_implicit_gemm",
                 "conv2d_wgrad_splitk_reduce",
                 "conv2d_dgrad_implicit_gemm",
-                "conv2d_dgrad_implicit_gemm_c16"
+                "conv2d_dgrad_implicit_gemm_c16",
+                "conv2d_dgrad_implicit_gemm_c16_phase"
             };
         }
     }
