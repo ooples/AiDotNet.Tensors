@@ -109,13 +109,26 @@ public sealed partial class MetalBackend : IWinogradF23Transforms
     };
 
     // The direct kernels: one thread per input element (input gradient) or per weight (weight gradient).
+    // The direct reference kernels, the fallback whenever the Winograd route declines a shape: a thread count past int
+    // overflows instead of wrapping to a non-positive count that dispatches nothing, and a failed dispatch throws rather
+    // than leaving the gradient unwritten (as Conv2DDirectReference does).
     private void LaunchDxDirect(in TunedConv2DBackwardArgs a)
-        => TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_input",
-            a.Batch * a.InChannels * a.InHeight * a.InWidth, new[] { a.First, a.Second, a.Output }, BackwardInts(a));
+    {
+        int threads = checked(a.Batch * a.InChannels * a.InHeight * a.InWidth);
+        if (threads == 0) return; // an empty tensor: nothing to compute
+        if (!TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_input",
+                threads, new[] { a.First, a.Second, a.Output }, BackwardInts(a)))
+            throw new GpuCapabilityUnavailableException("The Metal conv2d_backward_input kernel is unavailable.");
+    }
 
     private void LaunchDwDirect(in TunedConv2DBackwardArgs a)
-        => TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_weights",
-            a.OutChannels * a.InChannels * a.KernelH * a.KernelW, new[] { a.First, a.Second, a.Output }, BackwardInts(a));
+    {
+        int threads = checked(a.OutChannels * a.InChannels * a.KernelH * a.KernelW);
+        if (threads == 0) return; // an empty tensor: nothing to compute
+        if (!TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_weights",
+                threads, new[] { a.First, a.Second, a.Output }, BackwardInts(a)))
+            throw new GpuCapabilityUnavailableException("The Metal conv2d_backward_weights kernel is unavailable.");
+    }
 
     private void RunWinograd(string name, long threads, IGpuBuffer read, IGpuBuffer write, params int[] ints)
         => TryDispatchConvPoolMetal(_winogradLibrary, WinogradLibraryName, name, checked((int)threads),

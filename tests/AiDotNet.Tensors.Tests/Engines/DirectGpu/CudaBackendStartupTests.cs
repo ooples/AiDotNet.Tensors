@@ -28,7 +28,7 @@ public class CudaBackendStartupTests
     }
 
     [SkippableFact]
-    public void Nvrtc_13_compiles_with_the_device_as_the_default_execution_space()
+    public void Nvrtc_13_selects_the_device_as_the_default_execution_space()
     {
         Skip.IfNot(NvrtcNativeBindings.IsAvailable, "No NVRTC.");
         Assert.Equal(NvrtcResult.Success, NvrtcNativeBindings.nvrtcVersion(out int major, out _));

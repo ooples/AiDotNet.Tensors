@@ -998,11 +998,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         var (major, minor) = GetComputeCapability(device);
         string arch = $"--gpu-architecture=sm_{major}{minor}";
-        string[] jitOptions = NvrtcNativeBindings.JitCompatibilityOptions;
+        IReadOnlyList<string> jitOptions = NvrtcNativeBindings.JitCompatibilityOptions;
 
-        // Try loading from disk cache first. The key covers every option that changes the binary.
+        // Try loading from disk cache first. The key covers every option that changes the binary, and the NVRTC version,
+        // so cubins from a previous toolkit are never loaded after an upgrade.
         string? cacheDir = GetKernelCacheDirectory();
-        string cacheKey = ComputeCacheKey(source, string.Join(" ", new[] { arch }.Concat(jitOptions)), useFastMath);
+        string cacheKey = ComputeCacheKey(source,
+            string.Join(" ", new[] { arch, NvrtcNativeBindings.VersionTag }.Concat(jitOptions)), useFastMath);
         string? cacheFile = cacheDir != null ? Path.Combine(cacheDir, $"{moduleName}_{cacheKey}.cubin") : null;
 
         if (cacheFile != null && File.Exists(cacheFile))

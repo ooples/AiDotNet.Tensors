@@ -154,7 +154,15 @@ public class WinogradF23PortTests
         Compare("dX " + label, BackwardData(dy, w, batch, inC, outC, size, pad), backend.DownloadBuffer(bdx));
         Compare("dW " + label, BackwardFilter(x, dy, batch, inC, outC, size, pad), backend.DownloadBuffer(bdw));
 
-        // The public entry points, whichever route the slots pick, must agree with the same reference.
+        // The public entry points, whichever route the slots pick, must agree with the same reference. The outputs are
+        // poisoned with NaN first (Compare rejects NaN), so an entry point that dispatches nothing cannot pass on the
+        // results the first pass left behind.
+        backend.Fill(by, float.NaN, batch * outC * outSize * outSize);
+        backend.Fill(bdx, float.NaN, batch * inC * size * size);
+        backend.Fill(bdw, float.NaN, outC * inC * 9);
+        backend.Synchronize();
+        Assert.True(float.IsNaN(backend.DownloadBuffer(by)[0]) && float.IsNaN(backend.DownloadBuffer(bdx)[0])
+            && float.IsNaN(backend.DownloadBuffer(bdw)[0]), "the outputs were not poisoned before the entry-point pass");
         backend.Conv2D(bx, bw, by, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
         backend.Conv2DBackwardInput(bdy, bw, bdx, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
         backend.Conv2DBackwardKernel(bx, bdy, bdw, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);

@@ -127,13 +127,24 @@ public sealed unsafe partial class VulkanBackend : IWinogradF23Transforms
     };
 
     // The direct shaders: one invocation per input element (input gradient) or per weight (weight gradient).
+    // The direct reference kernels, the fallback whenever the Winograd route declines a shape: a thread count past int
+    // overflows instead of wrapping, and a failed dispatch throws rather than leaving the gradient unwritten (as
+    // Conv2DDirectReference does).
     private void LaunchDxDirect(in TunedConv2DBackwardArgs a)
-        => TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardInput, BackwardPush(a),
-            a.Batch * a.InChannels * a.InHeight * a.InWidth, a.First, a.Second, a.Output);
+    {
+        int threads = checked(a.Batch * a.InChannels * a.InHeight * a.InWidth);
+        if (threads == 0) return; // an empty tensor: nothing to compute
+        if (!TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardInput, BackwardPush(a), threads, a.First, a.Second, a.Output))
+            throw new GpuCapabilityUnavailableException("The Vulkan conv2d backward-input shader is unavailable.");
+    }
 
     private void LaunchDwDirect(in TunedConv2DBackwardArgs a)
-        => TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardKernel, BackwardPush(a),
-            a.OutChannels * a.InChannels * a.KernelH * a.KernelW, a.First, a.Second, a.Output);
+    {
+        int threads = checked(a.OutChannels * a.InChannels * a.KernelH * a.KernelW);
+        if (threads == 0) return; // an empty tensor: nothing to compute
+        if (!TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardKernel, BackwardPush(a), threads, a.First, a.Second, a.Output))
+            throw new GpuCapabilityUnavailableException("The Vulkan conv2d backward-kernel shader is unavailable.");
+    }
 
     private void RunWinograd(string name, long threads, IGpuBuffer read, IGpuBuffer write, params int[] ints)
     {
