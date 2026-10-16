@@ -280,6 +280,30 @@ internal static class NvrtcNativeBindings
         return Api.Version(out major, out minor);
     }
 
+    private static string[]? s_jitCompatibilityOptions;
+
+    /// <summary>
+    /// Options every runtime compile needs on this NVRTC, after the architecture: <c>-default-device</c> on NVRTC 13 and
+    /// later, nothing before.
+    /// </summary>
+    /// <remarks>
+    /// NVRTC 13 treats a function with no execution-space annotation as a host function, and refuses host functions in
+    /// JIT mode. Generic lambdas inside kernels (<c>auto store = [&amp;](auto as, auto bs)</c> in the conv engine, whose
+    /// shared-memory row stride differs between the FMA and tensor-core main loops) are such functions, so on a CUDA 13
+    /// toolkit the convolution module failed to compile and the whole CUDA backend came up unavailable -- silently, as a
+    /// device with no GPU. Runtime-compiled sources hold no host code at all, so making the device the default execution
+    /// space changes nothing else. Older NVRTCs keep exactly the options they had.
+    /// </remarks>
+    internal static string[] JitCompatibilityOptions
+    {
+        get
+        {
+            if (s_jitCompatibilityOptions is { } cached) return cached;
+            bool needsDefaultDevice = nvrtcVersion(out int major, out _) == NvrtcResult.Success && major >= 13;
+            return s_jitCompatibilityOptions = needsDefaultDevice ? new[] { "-default-device" } : Array.Empty<string>();
+        }
+    }
+
     public static NvrtcResult nvrtcCreateProgram(
         ref IntPtr prog,
         string src,
