@@ -16,7 +16,12 @@ namespace AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 /// output within the harness tolerance; only a correct candidate is timed. Timing is paired and interleaved on the
 /// device clock (candidate and reference alternate, order flipping each pair), after a reference-versus-reference
 /// control replay that measures the noise floor. A candidate becomes the default for the shape only when its
-/// median within-pair speedup clears both 2% and the noise floor AND it won every pair but at most one. One pair is
+/// median within-pair speedup clears both 2% and the noise floor AND it won every pair but at most one. A candidate that
+/// clears 2% by median but fails only the noise floor or the pair test leaves the measurement inconclusive: the slot
+/// measures once more, and if it still cannot tell it serves the reference without persisting that verdict
+/// (<see cref="TunedKernelDecisionReason.Inconclusive"/>). A burst of device noise during tuning used to persist a
+/// genuine "reference won" for routes that win in every quiet run (measured: four Winograd convolutions on an RTX 3080
+/// within eight seconds of one process, ~6% of a ResNet-18 step for every later process). One pair is
 /// forgiven, in the noise floor too, because a single sample can stall for reasons unrelated to the kernel (a host
 /// preemption, a display-driver scheduling hiccup on a desktop GPU): measured on an RTX 3080 under Windows, a kernel
 /// 1.1-1.4x faster by median lost its decision to one pair at 0.1x in most attempts. Winning 8 of 9 pairs is still
@@ -227,12 +232,20 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             try
             {
                 var (chosen, decision) = Gate(shape, args, reference, applicable, rejected);
+                // An inconclusive measurement (noise, not a loss) gets one fresh measurement before it is accepted.
+                if (decision?.Reason == TunedKernelDecisionReason.Inconclusive)
+                {
+                    var retryRejected = new List<string>(rejected.Count);
+                    (chosen, decision) = Gate(shape, args, reference, applicable, retryRejected);
+                }
                 // No decision: the reference output was not finite, so nothing could be compared. Serve the reference
                 // uncached and unpersisted, and tune this shape on a later call with usable data.
                 if (decision is null) return chosen;
                 map[shape] = new Entry(chosen, decision);
                 TunedKernelRegistry.Record(decision);
-                TunedKernelProfiles.Persist(decision, deterministic, _poolKey);
+                // Still inconclusive: the reference for this process, but a later process measures again.
+                if (decision.Reason != TunedKernelDecisionReason.Inconclusive)
+                    TunedKernelProfiles.Persist(decision, deterministic, _poolKey);
                 return chosen;
             }
             finally
@@ -288,6 +301,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
 
         ITunedKernelCandidate<TArgs> best = reference;
         KernelTuningPairedEvidence? bestEvidence = null;
+        bool inconclusive = false;
         double bestError = 0;
         for (int k = 1; k < applicable.Count; k++)
         {
@@ -344,6 +358,8 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             bool wins = evidence.MedianSpeedup >= Math.Max(MinimumSpeedup, noise) && secondLowest > 1.0;
             if (!wins)
             {
+                // Faster by median, refused only for consistency or for the noise floor: undecided, not a loss.
+                if (evidence.MedianSpeedup >= MinimumSpeedup) inconclusive = true;
                 rejected.Add($"{c.Id}: {evidence.MedianSpeedup:F3}x median, {evidence.LowerSpeedupBound:F3}x min pair, " +
                              $"{secondLowest:F3}x second-lowest pair (noise {noise:F3})");
                 continue;
@@ -364,7 +380,8 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
 
         if (bestEvidence is null)
             return (reference, new TunedKernelDecision(Op, Device, shape, reference.Id, reference.Origin,
-                TunedKernelDecisionReason.ReferenceWon, reference.Id, noiseRatio: noise, rejected: rejected.ToArray()));
+                inconclusive ? TunedKernelDecisionReason.Inconclusive : TunedKernelDecisionReason.ReferenceWon,
+                reference.Id, noiseRatio: noise, rejected: rejected.ToArray()));
 
         return (best, new TunedKernelDecision(Op, Device, shape, best.Id, best.Origin, TunedKernelDecisionReason.Tuned,
             reference.Id,

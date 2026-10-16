@@ -51,6 +51,21 @@ internal static class DirectConvAvx2
     // (and the summation order) never depends on the thread budget.
     private const long MaxBackwardKernelPartialFloats = 4L * 1024 * 1024;
 
+    // Set only through SuppressOnThisThread(): tests that pin the choice between the im2col routes run their shapes with
+    // the direct route out of the way, without a process-wide switch that would reach convolutions on other threads.
+    [ThreadStatic]
+    private static bool t_suppressed;
+
+    /// <summary>Keeps this thread's convolutions off the direct kernels until disposed (restores the previous state).</summary>
+    internal static IDisposable SuppressOnThisThread() => new Suppression();
+
+    private sealed class Suppression : IDisposable
+    {
+        private readonly bool _previous;
+        internal Suppression() { _previous = t_suppressed; t_suppressed = true; }
+        public void Dispose() => t_suppressed = _previous;
+    }
+
     /// <summary>Passes allowed onto the direct kernels (process-wide; for A/B measurement and kernel tuning).</summary>
     internal static DirectConvPasses EnabledPasses { get; set; } = DirectConvPasses.All;
 
@@ -78,7 +93,7 @@ internal static class DirectConvAvx2
     public static bool TryChoose(in DirectConvShape shape, out int targetTasks)
     {
         targetTasks = 0;
-        if (!IsEligible(shape)) return false;
+        if (t_suppressed || !IsEligible(shape)) return false;
         if (DirectConvTuning.TryGet(shape, out DirectConvConfiguration configuration))
         {
             targetTasks = configuration.TargetTasks;
@@ -114,9 +129,30 @@ internal static class DirectConvAvx2
     }
 
     /// <summary>The measured routing rules (see the constants above) for a shape with no activated configuration.</summary>
+    /// <summary>
+    /// #653: a single image whose stride-1 output plane is past the batch rule's 1024 positions, up to 160x160, with at
+    /// least 64 input channels. Measured in-process against the im2col GEMM routes (alternating calls, 1 and 16 threads),
+    /// direct over GEMM: 64ch@40 1.15-1.86x, 64ch@48 1.29-2.29x, 64ch@64 1.27-1.44x, 96ch@64 1.42-1.94x, 128ch@64
+    /// 1.10-1.72x, 64ch@80 1.41-1.49x, and with the staged output store 64ch@112 1.51-1.54x, 64ch@128 1.4-1.5x,
+    /// 96ch@128 1.68-1.88x, 128ch@128 1.54-1.71x, 256ch@128 1.27-1.72x, 64ch@160 1.34-1.52x. Outside it the GEMM routes
+    /// win: 32 channels at 16 threads (0.6-0.7x) and planes of 1024 or less at one thread (0.94-0.97x). Larger planes are
+    /// unmeasured. Shape-only, so the route (and the result) is the same at every thread count.
+    /// </summary>
+    internal static bool SingleImageLargePlaneForward(in DirectConvShape shape)
+    {
+        if (shape.Pass != DirectConvPass.Forward || shape.Batch != 1 || shape.StrideH != 1 || shape.StrideW != 1) return false;
+        long plane = (long)shape.OutputHeight * shape.OutputWidth;
+        return shape.InChannels >= 64 && plane > MaxStride1PlanePositions && plane <= MaxSingleImagePlanePositions;
+    }
+
+    // Largest output plane SingleImageLargePlaneForward takes: the largest measured (160x160).
+    private const int MaxSingleImagePlanePositions = 160 * 160;
+
     public static bool DefaultChoosesDirect(in DirectConvShape shape)
     {
-        if (shape.Batch < 2 || shape.KernelHeight * shape.KernelWidth == 1) return false;
+        if (shape.KernelHeight * shape.KernelWidth == 1) return false;
+        bool singleImage = SingleImageLargePlaneForward(shape);
+        if (shape.Batch < 2 && !singleImage) return false;
         // A partial input-channel block (an image stem) wastes most of the forward tile; measured slower on 32x32
         // (3 channels: 0.30 ms existing, 0.41 direct), so it is left to tuning.
         if (shape.Pass == DirectConvPass.Forward && shape.InChannels % Block != 0) return false;
@@ -124,7 +160,7 @@ internal static class DirectConvAvx2
         int plane = shape.Pass == DirectConvPass.BackwardInput
             ? shape.Height * shape.Width
             : shape.OutputHeight * shape.OutputWidth;
-        if (!strided && plane > MaxStride1PlanePositions) return false;
+        if (!strided && plane > MaxStride1PlanePositions && !singleImage) return false;
         return shape.Pass switch
         {
             DirectConvPass.BackwardInput => !strided
@@ -520,6 +556,9 @@ internal static class DirectConvAvx2
         }, deterministicSafe: true);
     }
 
+    // A/B switch for the staged output store (on by default).
+    internal static bool s_stagedStore = true;
+
     private static void ForwardPacked(float[] packedInput, float[] packedKernel, float[] output, int outputOffset, bool accumulate,
         ForwardGeometry geometry, int targetTasks)
     {
@@ -566,6 +605,9 @@ internal static class DirectConvAvx2
             int kernelHeight, int kernelWidth, int strideH, int strideW, int dilationH, int dilationW, int outputHeight, int outputWidth)
             => new ForwardGeometry(batch, inBlocks, paddedH * paddedW * Block, paddedW, outChannels, kernelHeight, kernelWidth,
                 strideH, strideW, dilationH, dilationW, outputHeight, outputWidth, 0, outputHeight, outputWidth, 1, 1, 0, 0);
+
+        // Consecutive positions of one image are consecutive output floats (stride-1 grid covering whole rows).
+        public bool PlainContiguous => StepH == 1 && StepW == 1 && OffsetH == 0 && OffsetW == 0 && GridWidth == OutWidth;
 
         public int InBlocks { get; }
         public int PlaneIn { get; }
@@ -618,6 +660,13 @@ internal static class DirectConvAvx2
         fixed (float* po = output)
         {
             float* tileKernel = pw + kernelOffset + tile * OutputBlocksPerTile * blockStride;
+            // #653: a position's 32 channels sit a whole output plane apart, so storing them per position wrote 32 scattered
+            // floats each time (64 KB apart on a 128x128 plane). A run of positions is staged and written as one contiguous
+            // run per channel instead: 64ch@128 single-threaded 38-41 -> 21-22 ms, bit-identical. One image only, so a run
+            // never crosses into the next image's planes.
+            bool staged = s_stagedStore && g.PlainContiguous && g.TotalPositions == g.GridPositions;
+            float* stage = stackalloc float[(StageRun + PositionUnroll) * 32];
+            int runStart = first;
             for (int q = first; q < last; q += PositionUnroll)
             {
                 int count = Math.Min(PositionUnroll, last - q);
@@ -668,12 +717,46 @@ internal static class DirectConvAvx2
                     }
                 }
                 int channelBase = tile * OutputBlocksPerTile * Block;
+                if (staged)
+                {
+                    // Stage this position chunk's 32 channels, flushed as contiguous per-channel runs (the plain grid's
+                    // consecutive positions are consecutive output floats).
+                    int slot = q - runStart;
+                    Avx.Store(stage + slot * 32, a00); Avx.Store(stage + slot * 32 + 8, a01); Avx.Store(stage + slot * 32 + 16, a02); Avx.Store(stage + slot * 32 + 24, a03);
+                    if (count > 1) { Avx.Store(stage + (slot + 1) * 32, a10); Avx.Store(stage + (slot + 1) * 32 + 8, a11); Avx.Store(stage + (slot + 1) * 32 + 16, a12); Avx.Store(stage + (slot + 1) * 32 + 24, a13); }
+                    if (count > 2) { Avx.Store(stage + (slot + 2) * 32, a20); Avx.Store(stage + (slot + 2) * 32 + 8, a21); Avx.Store(stage + (slot + 2) * 32 + 16, a22); Avx.Store(stage + (slot + 2) * 32 + 24, a23); }
+                    int runEnd = q + count;
+                    if (runEnd - runStart >= StageRun || runEnd >= last)
+                    {
+                        FlushStage(po + outputOffset, accumulate, g, channelBase, runStart, runEnd - runStart, stage);
+                        runStart = runEnd;
+                    }
+                }
+                else
+                {
                 StorePosition(po + outputOffset, accumulate, g, channelBase, q, a00, a01, a02, a03);
                 if (count > 1) StorePosition(po + outputOffset, accumulate, g, channelBase, q + 1, a10, a11, a12, a13);
                 if (count > 2) StorePosition(po + outputOffset, accumulate, g, channelBase, q + 2, a20, a21, a22, a23);
+                }
             }
         }
     }
+    private const int StageRun = 48;
+
+    // Writes `run` consecutive positions x 32 channels from the stage ([position][channel]) as one contiguous run per
+    // channel. Only for the plain grid, where position q's output index is q's offset in the plane.
+    private static unsafe void FlushStage(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q0, int run, float* stage)
+    {
+        int index = g.OutputIndex(q0, out int b);
+        float* d = output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
+        for (int ch = 0; ch < 32; ch++)
+        {
+            float* dst = d + (long)ch * g.OutPlane;
+            if (accumulate) for (int i = 0; i < run; i++) dst[i] += stage[i * 32 + ch];
+            else for (int i = 0; i < run; i++) dst[i] = stage[i * 32 + ch];
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void StorePosition(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q,
         Vector256<float> v0, Vector256<float> v1, Vector256<float> v2, Vector256<float> v3)

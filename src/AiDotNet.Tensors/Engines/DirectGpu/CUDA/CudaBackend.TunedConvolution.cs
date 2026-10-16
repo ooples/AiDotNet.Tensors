@@ -117,6 +117,17 @@ public sealed partial class CudaBackend
                                     a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
                                     a.PadH, a.PadW, a.DilationH, a.DilationW);
                         }));
+                    // The same F(2x2) arithmetic fused into one kernel after the filter transform: no V/M round trips
+                    // through global memory.
+                    candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.winograd_f23_fused",
+                        TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradFusedModule(),
+                        (in CudaConv2DArgs a) =>
+                        {
+                            if (!TryConv2DForwardWinogradF23Fused(a))
+                                LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                                    a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+                                    a.PadH, a.PadW, a.DilationH, a.DilationW);
+                        }));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
                         true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,

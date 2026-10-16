@@ -503,7 +503,7 @@ public sealed class WebGpuTunedKernelTests
             backend.Softmax(input, output, rows, n);
             var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
             var reason = Assert.Single(backend.SoftmaxSlot.CachedDecisions, d => d.Shape.Equals(shape)).Reason;
-            Assert.True(reason == TunedKernelDecisionReason.Tuned || reason == TunedKernelDecisionReason.ReferenceWon, $"measured decision expected, got {reason}");
+            Assert.True(reason is TunedKernelDecisionReason.Tuned or TunedKernelDecisionReason.ReferenceWon or TunedKernelDecisionReason.Inconclusive, $"measured decision expected, got {reason}");
             Assert.True(GpuLaunchProbe.TuningReadbacks > tuningBefore, "the gate snapshots candidate outputs, so tuning must read back");
             Assert.Equal(0, scope.Downloads);
         }

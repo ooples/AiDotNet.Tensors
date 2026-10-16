@@ -118,6 +118,12 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23(a)) LaunchDxDirect(a); }));
+                    // The same F(2x2) arithmetic fused into one kernel after the filter transform (cuDNN's input gradient for
+                    // ResNet's 32x32 and 16x16 layers): no V/M round trips through global memory.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23_fused",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradFusedModule(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23Fused(a)) LaunchDxDirect(a); }));
                     // Winograd F(4x4,3x3): registered ONLY under the explicit reduced-precision opt-in (owner decision,
                     // #1335): ~20x the fp32 rounding error of F(2x2). Unregistered otherwise, so the persisted-decision key
                     // differs between the two settings.

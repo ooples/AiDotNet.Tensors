@@ -2108,6 +2108,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return true;
         }
 
+        /// <summary>
+        /// CLBlast's own choice between its two GEMM kernels (<c>Xgemm::UseDirectKernel</c>): the packed indirect
+        /// kernel once the problem's volume M·N·K reaches MinIndirectSize³, the direct kernel below it.
+        /// </summary>
+        /// <remarks>
+        /// This used to switch to the indirect kernel as soon as M or N alone reached MinIndirectSize. That sent skinny
+        /// problems, such as 32x1024x1024 or 1024x64x1024 (both direct in CLBlast at a threshold of 448), through
+        /// padding and packing kernels sized for the long side, at 0.34x and 0.40x the native library's speed.
+        /// </remarks>
+        internal static bool UsesClBlastIndirectKernel(int m, int n, int k, int minIndirectSize)
+        {
+            if (minIndirectSize <= 0) return false;
+            long threshold = (long)minIndirectSize * minIndirectSize * minIndirectSize;
+            return (long)m * n * k >= threshold;
+        }
+
         private bool TryExecuteClBlastBaselineGemm(
             IGpuBuffer A,
             IGpuBuffer B,
@@ -2131,9 +2147,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // row-major swap path is tuned for matrix-shaped GEMM and corrupts
             // N=1 results once M crosses the CLBlast MinIndirectSize threshold.
             bool isVectorLikeGemm = M == 1 || N == 1;
-            bool useIndirectPath = !isVectorLikeGemm &&
-                _clblastMinIndirectSize > 0 &&
-                (M >= _clblastMinIndirectSize || N >= _clblastMinIndirectSize);
+            bool useIndirectPath = !isVectorLikeGemm && UsesClBlastIndirectKernel(M, N, K, _clblastMinIndirectSize);
 
             // Try direct path only for small matrices (below MinIndirectSize threshold)
             if (allowDirectSubstitution && (!useIndirectPath || forceDirect))
