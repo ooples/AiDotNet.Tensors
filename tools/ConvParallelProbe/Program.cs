@@ -91,6 +91,7 @@ internal static partial class Program
         var o = eng.Conv2D(input, kernel, 1, 1, 1);   // 3x3 stride1 pad1 -> same spatial
         sw.Stop();
         double warm = sw.Elapsed.TotalMilliseconds;
+        WarmUntilTiered(args, () => o = eng.Conv2D(input, kernel, 1, 1, 1));
 
         var times = new double[reps];
         for (int i = 0; i < reps; i++)
@@ -285,6 +286,7 @@ internal static partial class Program
         for (int b = 0; b < blocks; b++) yy = blk(yy);
         sw.Stop();
         double warm = sw.Elapsed.TotalMilliseconds;
+        WarmUntilTiered(a, () => { var w = x0; for (int b = 0; b < blocks; b++) w = blk(w); });
 
         // #653/#657 follow-up: forward caching-allocator. With --arena, ONE TensorArena lives
         // across the whole rep loop and Reset()s before each full forward — so every per-op
@@ -768,6 +770,7 @@ internal static partial class Program
 
         var o = eng.BatchMatMul(lhs, rhs); // warm
         float sink = o[0];
+        WarmUntilTiered(a, () => o = eng.BatchMatMul(lhs, rhs));
 
         var times = new double[reps];
         for (int i = 0; i < reps; i++)
@@ -1076,6 +1079,7 @@ internal static partial class Program
         for (int b = 0; b < blocks; b++) y = block(y);
         sw.Stop();
         double warm = sw.Elapsed.TotalMilliseconds;
+        WarmUntilTiered(a, () => { var w = x0; for (int b = 0; b < blocks; b++) w = block(w); });
 
         var times = new double[reps];
         for (int i = 0; i < reps; i++)
@@ -1377,6 +1381,19 @@ internal static partial class Program
             $"bytes_per_op={(double)bytes / reps:F1} ns_per_op={sw.Elapsed.TotalMilliseconds * 1e6 / reps:F1} " +
             $"total_MB={bytes / 1048576.0:F1} (sink={sink:E1})");
         return 0;
+    }
+
+    /// <summary>
+    /// Keeps running <paramref name="op"/> for <c>--warmms</c> milliseconds (default 3000) after the first, timed call.
+    /// One warm-up call is not enough: until tiered JIT has promoted the hot methods it suspends every managed thread to
+    /// patch call-counting stubs, so the first ~2 s of a run carry multi-millisecond all-thread stalls (an im2col that
+    /// takes 0.03 ms warmed showed 1.4 ms on ~35% of calls). Timing that window measured the JIT, not the op (#653).
+    /// </summary>
+    private static void WarmUntilTiered(string[] a, Action op)
+    {
+        int warmMs = ArgI(a, "--warmms", 3000);
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < warmMs) op();
     }
 
     private static int ArgI(string[] a, string f, int d)

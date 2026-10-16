@@ -406,6 +406,31 @@ internal static class Avx2Pack
             // PackBTailFp64 for rationale.
             PackBTailFp32(b, ldb, packed, numStripes, nc - numStripes * nr, kc, nr);
         }
+        else if (nr % 8 == 0)
+        {
+            // Wider stripes (PackBoth's 16/24/32-column kernels): the same row copy, nr/8 vectors per k. The scalar
+            // fallback did it with one CopyTo per k per stripe, and that memmove call overhead was 31% of a
+            // single-threaded 64-channel 128x128 3x3 conv (#653). Bit-identical: packing only moves values.
+            int numStripes = nc / nr;
+            int vectors = nr / 8;
+            fixed (float* bPtr = b)
+            fixed (float* pPtr = packed)
+            {
+                for (int stripe = 0; stripe < numStripes; stripe++)
+                {
+                    float* src = bPtr + stripe * nr;
+                    float* dst = pPtr + (long)stripe * kc * nr;
+                    for (int k = 0; k < kc; k++)
+                    {
+                        float* s = src + (long)k * ldb;
+                        float* d = dst + (long)k * nr;
+                        for (int v = 0; v < vectors; v++)
+                            Avx.Store(d + v * 8, Avx.LoadVector256(s + v * 8));
+                    }
+                }
+            }
+            PackBTailFp32(b, ldb, packed, numStripes, nc - numStripes * nr, kc, nr);
+        }
         else
         {
             ScalarPack.PackB<float>(b, ldb, transB, packed, nc, kc, nr);
