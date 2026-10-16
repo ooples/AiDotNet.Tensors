@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// <see cref="SimdGemm.TryGemmSmallJit"/> (the small-K panel routes for a linear layer's forward and dX = dY·Wᵀ)
 /// against a double-precision product, and the compiled FusedLinear+ReLU backward that uses them.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class SmallJitGemmTests
 {
     public static TheoryData<int, int, int, bool, bool> Shapes => new()
@@ -163,6 +164,81 @@ public class SmallJitGemmTests
                 if (BitConverter.SingleToInt32Bits(got) != BitConverter.SingleToInt32Bits(acc))
                     Assert.Fail($"c[{i},{j}] = {got:R}, the ordered scalar sum is {acc:R}");
             }
+    }
+
+    /// <summary>
+    /// SimdGemm.TrySgemmTransADeepK, the weight-gradient route C = Aᵀ·B over thousands of rows: full 6x16 tiles, edge
+    /// rows (m % 6), an edge column block with an 8-wide vector and scalars (n % 16 &gt; 8) and one under 16 columns,
+    /// against a double product; then the same call at one thread and at the machine's width must agree bit for bit
+    /// (fixed row slices, each output one FMA chain).
+    /// </summary>
+    [Theory]
+    [InlineData(64, 2048, 128)]
+    [InlineData(70, 1900, 59)]
+    [InlineData(5, 600, 12)]
+    public async Task TransADeepK_MatchesDoubleProduct_AndIsThreadCountIndependent(int m, int k, int n)
+    {
+        await Task.Yield();
+        if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return;
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(m * 17 + k + n * 5);
+        var a = new float[k * m];   // stored [k, m]
+        var b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        var c = new float[m * n];
+        Array.Fill(c, float.NaN);
+        Assert.True(SimdGemm.TrySgemmTransADeepK(a, m, b, n, c, m, k, n), "the deep-K route declined an in-band shape");
+
+        double maxErr = 0, maxRef = 0;
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double s = 0;
+                for (int p = 0; p < k; p++) s += (double)a[p * m + i] * b[p * n + j];
+                maxErr = Math.Max(maxErr, Math.Abs(s - c[i * n + j]));
+                maxRef = Math.Max(maxRef, Math.Abs(s));
+            }
+        Assert.True(maxErr <= 1e-4 * Math.Max(1, maxRef), $"max |error| {maxErr:G4} (max |reference| {maxRef:G4})");
+
+        int priorDop = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        var serial = new float[m * n];
+        try
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = 1;
+            Assert.True(SimdGemm.TrySgemmTransADeepK(a, m, b, n, serial, m, k, n));
+        }
+        finally { AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = priorDop; }
+        for (int i = 0; i < c.Length; i++)
+            if (BitConverter.SingleToInt32Bits(c[i]) != BitConverter.SingleToInt32Bits(serial[i]))
+                Assert.Fail($"c[{i}] = {c[i]:R} in parallel, {serial[i]:R} on one thread");
+    }
+
+    /// <summary>
+    /// An output column's value must not depend on where the width puts it: columns 8-11 are the scalar tail of a
+    /// 12-wide C and vector lanes of a full 6x16 tile of a 16-wide C over the same data, and agree bit for bit (both
+    /// fused multiply-add chains over the same row slices).
+    /// </summary>
+    [Fact]
+    public async Task TransADeepK_ScalarEdgeColumns_EqualTheVectorTile()
+    {
+        await Task.Yield();
+        if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return;
+        const int m = 6, k = 1024;
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(4242);
+        var a = new float[k * m];
+        var b16 = new float[k * 16];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b16.Length; i++) b16[i] = (float)(rng.NextDouble() * 2 - 1);
+        var b12 = new float[k * 12];
+        for (int r = 0; r < k; r++) Array.Copy(b16, r * 16, b12, r * 12, 12);
+        var c16 = new float[m * 16];
+        var c12 = new float[m * 12];
+        Assert.True(SimdGemm.TrySgemmTransADeepK(a, m, b16, 16, c16, m, k, 16));
+        Assert.True(SimdGemm.TrySgemmTransADeepK(a, m, b12, 12, c12, m, k, 12));
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < 12; j++)
+                if (BitConverter.SingleToInt32Bits(c12[i * 12 + j]) != BitConverter.SingleToInt32Bits(c16[i * 16 + j]))
+                    Assert.Fail($"C[{i},{j}]: {c12[i * 12 + j]:R} at width 12, {c16[i * 16 + j]:R} at width 16");
     }
 
     /// <summary>
