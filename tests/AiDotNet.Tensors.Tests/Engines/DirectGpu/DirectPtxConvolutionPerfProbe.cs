@@ -157,6 +157,43 @@ public sealed class DirectPtxConvolutionPerfProbe
                 $"{candidate} mismatch at {i}: expected {expected[i]}, actual {actual[i]}");
     }
 
+    /// <summary>
+    /// The F(2,3) Winograd variants on the ResNet-18 (CIFAR, batch 8) stage shapes, where cuDNN's convolution beats the
+    /// implicit-GEMM engine ~2.5x mid-network (128@16x16, 256@8x8). Opt in with AIDOTNET_WINOGRAD_RESNET18_PROBE=1.
+    /// </summary>
+    [Fact]
+    public void Measure_Winograd_ResNet18Stages()
+    {
+        if (Environment.GetEnvironmentVariable("AIDOTNET_WINOGRAD_RESNET18_PROBE") != "1") return;
+        if (!DirectPtxRuntime.IsAvailable) { _out.WriteLine("no CUDA device"); return; }
+        using var runtime = new DirectPtxRuntime();
+        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+                runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
+        { _out.WriteLine("no SM86 specialization"); return; }
+        bool prior = DirectPtxFeatureGate.ConvolutionExperimentOverride;
+        DirectPtxFeatureGate.ConvolutionExperimentOverride = true;
+        try
+        {
+            foreach (var (c, s) in new[] { (64, 32), (128, 16), (256, 8), (512, 4) })
+            {
+                void Try(string what, Action measure)
+                {
+                    try { measure(); }
+                    catch (Exception ex) { _out.WriteLine($"{what} N8/C{c}/{s}x{s}: {ex.GetType().Name}: {ex.Message}"); }
+                }
+                Try("winograd", () => MeasureWinograd(runtime, new Conv2DWinogradShape(8, c, s, s, c)));
+                Try("winograd-pretf", () => MeasureWinogradPretransformed(runtime, 8, c, s, s, c));
+                Try("winograd-fused", () => MeasureWinogradFused(runtime, 8, c, s, s, c));
+                Try("winograd-batched", () => MeasureWinogradBatched(runtime, 8, c, s, s, c));
+                Try("winograd-fusedRB", () => MeasureWinogradFusedRB(runtime, 8, c, s, s, c));
+            }
+        }
+        finally
+        {
+            DirectPtxFeatureGate.ConvolutionExperimentOverride = prior;
+        }
+    }
+
     [Fact]
     public void Measure_V1_And_Tiled_ResNetC64()
     {
