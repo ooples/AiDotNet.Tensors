@@ -99,8 +99,9 @@ internal static class CudaDispatchPolicy
 
     /// <summary>
     /// Explicit opt-in to plain TF32 (10-bit mantissa products, fp32 accumulate) in the implicit-GEMM convolution engine
-    /// (#1335). Default false: on Ampere+ the engine multiplies in 3xTF32, which keeps fp32-level accuracy on the Tensor
-    /// Cores. Unlike <see cref="AllowTF32"/> (default true, the cuBLAS math mode) this is a deliberate reduced-precision
+    /// (#1335). Default false: the engine's default mainloop is FP32 FMA, and on Ampere+ 3xTF32 (fp32-level accuracy on
+    /// the Tensor Cores) is only a tuned candidate after it; the opt-in puts plain TF32 first. Unlike
+    /// <see cref="AllowTF32"/> (default true, the cuBLAS math mode) this is a deliberate reduced-precision
     /// choice: set <c>AIDOTNET_CONV_TF32=1</c> before startup or this property before creating a backend.
     /// </summary>
     public static bool ConvReducedPrecisionTF32
