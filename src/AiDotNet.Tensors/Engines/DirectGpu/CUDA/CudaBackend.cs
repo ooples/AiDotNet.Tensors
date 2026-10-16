@@ -7056,7 +7056,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // #1325: per-shape route through the tuned-kernel slot; the fixed chain below when the slot has none.
         if (batch > 0 && outHeight > 0 && outWidth > 0)
         {
-            var tuned = new CudaConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
+            var tuned = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
             if (Conv2DBackwardDataSlot.TryExecute(tuned.Shape(), tuned)) return;
         }
@@ -7115,7 +7115,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // #1325: per-shape route through the tuned-kernel slot; the fixed chain below when the slot has none.
         if (batch > 0 && outHeight > 0 && outWidth > 0)
         {
-            var tuned = new CudaConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
+            var tuned = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
             if (Conv2DBackwardFilterSlot.TryExecute(tuned.Shape(), tuned)) return;
         }

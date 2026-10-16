@@ -147,16 +147,16 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         // 256@8x8 is logged only, its kernel margin over the reference is smaller than the gate's noise band on some runs.
         using var gy = cuda.AllocateBuffer(Rand(batch * c * s * s, 3, 1f));
         using var dw = cuda.AllocateBuffer(c * c * 9);
-        var dwArgs = new CudaConv2DBackwardArgs(x, gy, dw, true, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
+        var dwArgs = new TunedConv2DBackwardArgs(x, gy, dw, true, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
         string? dwChosen = ResolveFilter(dwArgs, "N8 C128 16x16", 3);
         int c2 = 256, s2 = 8;
         using var x2 = cuda.AllocateBuffer(Rand(batch * c2 * s2 * s2, 4, 1f));
         using var gy2 = cuda.AllocateBuffer(Rand(batch * c2 * s2 * s2, 5, 1f));
         using var dw2 = cuda.AllocateBuffer(c2 * c2 * 9);
-        ResolveFilter(new CudaConv2DBackwardArgs(x2, gy2, dw2, true, batch, c2, s2, s2, c2, s2, s2, 3, 3, 1, 1, 1, 1, 1, 1), "N8 C256 8x8", 1);
+        ResolveFilter(new TunedConv2DBackwardArgs(x2, gy2, dw2, true, batch, c2, s2, s2, c2, s2, s2, 3, 3, 1, 1, 1, 1, 1, 1), "N8 C256 8x8", 1);
         Assert.Equal("nvrtc.conv2d_dw.winograd_f32", dwChosen);
 
-        string? ResolveFilter(CudaConv2DBackwardArgs a, string label, int attempts)
+        string? ResolveFilter(TunedConv2DBackwardArgs a, string label, int attempts)
         {
             var slot = cuda.Conv2DBackwardFilterSlot;
             double saved = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds;
@@ -211,8 +211,8 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         using var dwWin = cuda.AllocateBuffer(outC * inC * 9);
         using var dwTuned = cuda.AllocateBuffer(outC * inC * 9);
         void Tuned() => cuda.Conv2DBackwardKernel(x, gy, dwTuned, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
-        var refArgs = new CudaConv2DBackwardArgs(x, gy, dwRef, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
-        var winArgs = new CudaConv2DBackwardArgs(x, gy, dwWin, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        var refArgs = new TunedConv2DBackwardArgs(x, gy, dwRef, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        var winArgs = new TunedConv2DBackwardArgs(x, gy, dwWin, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
         Assert.True(cuda.Conv2DBackwardKernelViaIm2col(refArgs), "im2col reference refused the weight-gradient shape");
         Assert.True(cuda.TryConv2DBackwardFilterWinogradF32(winArgs), "Winograd refused an admitted weight-gradient shape");
 
@@ -266,8 +266,8 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         using var dxWin = cuda.AllocateBuffer(batch * inC * size * size);
         using var dxTuned = cuda.AllocateBuffer(batch * inC * size * size);
         void Tuned() => cuda.Conv2DBackwardInput(gy, w, dxTuned, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
-        var refArgs = new CudaConv2DBackwardArgs(gy, w, dxRef, false, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
-        var winArgs = new CudaConv2DBackwardArgs(gy, w, dxWin, false, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        var refArgs = new TunedConv2DBackwardArgs(gy, w, dxRef, false, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        var winArgs = new TunedConv2DBackwardArgs(gy, w, dxWin, false, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
         Assert.True(cuda.Conv2DBackwardInputViaCol2im(refArgs), "col2im reference refused the input-gradient shape");
         Assert.True(cuda.TryConv2DBackwardDataWinogradF23(winArgs), "Winograd refused an admitted input-gradient shape");
 

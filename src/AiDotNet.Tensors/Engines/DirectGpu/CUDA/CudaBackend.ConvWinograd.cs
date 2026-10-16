@@ -85,7 +85,7 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>True for the input-gradient shapes this path computes (the forward conv's 3x3, stride 1, dilation 1).</summary>
-    internal static bool WinogradF23AdmitsData(in CudaConv2DBackwardArgs a)
+    internal static bool WinogradF23AdmitsData(in TunedConv2DBackwardArgs a)
         => !a.WeightGradient && a.KernelH == 3 && a.KernelW == 3 && a.StrideH == 1 && a.StrideW == 1
            && a.DilationH == 1 && a.DilationW == 1 && a.PadH == a.PadW && a.PadH <= 2 && a.OutHeight > 0 && a.OutWidth > 0;
 
@@ -93,7 +93,7 @@ public sealed partial class CudaBackend
     /// Input gradient dX = conv(dY, w') with w' the 180-degree-rotated, channel-transposed filter and padding 2 - pad:
     /// the forward Winograd pipeline over dY (K channels, outH x outW) producing dX (C channels, H x W).
     /// </summary>
-    internal bool TryConv2DBackwardDataWinogradF23(in CudaConv2DBackwardArgs a)
+    internal bool TryConv2DBackwardDataWinogradF23(in TunedConv2DBackwardArgs a)
     {
         if (!WinogradF23AdmitsData(a) || !EnsureWinogradModule()) return false;
         return RunWinogradF23(a.First, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth, 2 - a.PadH,
@@ -103,7 +103,7 @@ public sealed partial class CudaBackend
     private IGpuBuffer? _winogradWu, _winogradWv, _winogradWm;
 
     /// <summary>True for the weight-gradient shapes this path computes (the forward conv's 3x3, stride 1, dilation 1).</summary>
-    internal static bool WinogradF32AdmitsFilter(in CudaConv2DBackwardArgs a)
+    internal static bool WinogradF32AdmitsFilter(in TunedConv2DBackwardArgs a)
         => a.WeightGradient && a.KernelH == 3 && a.KernelW == 3 && a.StrideH == 1 && a.StrideW == 1
            && a.DilationH == 1 && a.DilationW == 1 && a.PadH == a.PadW && a.PadH <= 2 && a.OutHeight > 0 && a.OutWidth > 0;
 
@@ -112,7 +112,7 @@ public sealed partial class CudaBackend
     /// over the P tiles (split along P when the K x C grid alone would leave SMs idle), and the output transform that sums
     /// the splits into dW[K][C][3][3]. Overwrites the gradient.
     /// </summary>
-    internal unsafe bool TryConv2DBackwardFilterWinogradF32(in CudaConv2DBackwardArgs a)
+    internal unsafe bool TryConv2DBackwardFilterWinogradF32(in TunedConv2DBackwardArgs a)
     {
         if (!WinogradF32AdmitsFilter(a) || !EnsureWinogradModule()) return false;
         int n = a.Batch, c = a.InChannels, k = a.OutChannels, h = a.InHeight, w = a.InWidth, pad = a.PadH;
