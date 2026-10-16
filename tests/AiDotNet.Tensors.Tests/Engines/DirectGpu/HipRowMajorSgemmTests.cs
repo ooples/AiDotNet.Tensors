@@ -101,6 +101,34 @@ public sealed class HipRowMajorSgemmTests
         }
     }
 
+    /// <summary>On RDNA1, Gemm sends a shape to the row-major kernel exactly when the measured table says so, and the
+    /// result is right on either route. The table's anchor shapes are pinned so a change to it is a visible decision.</summary>
+    [SkippableTheory]
+    [InlineData(256, 256, 2304, true)]
+    [InlineData(256, 256, 256, true)]
+    [InlineData(200, 500, 300, true)]
+    [InlineData(32, 1024, 1024, true)]
+    [InlineData(1024, 1024, 1024, false)]
+    [InlineData(1024, 4096, 1024, false)]
+    public void Gemm_RoutesByTheMeasuredTable_AndStaysCorrect(int m, int n, int k, bool rowMajorExpected)
+    {
+        using var backend = CreateBackend();
+        Skip.If(backend is null, "A HIP device is required.");
+        Skip.IfNot(backend.RowMajorGemmTableApplies, "The routing table was measured on RDNA1 (gfx1010/gfx1012) only.");
+        var choice = backend.ChooseRowMajorGemm(m, n, k, backend.IsHipBlasAvailable);
+        Assert.Equal(rowMajorExpected, choice is not null);
+        float[] a = Values(m * k, 21), b = Values(k * n, 23);
+        float[] expected = CpuGemm(a, b, m, n, k);
+        using var gA = backend.AllocateBuffer(a);
+        using var gB = backend.AllocateBuffer(b);
+        using var gC = backend.AllocateBuffer(new float[m * n]);
+        long before = backend.RowMajorGemmRuns;
+        backend.Gemm(gA, gB, gC, m, n, k);
+        Assert.Equal(rowMajorExpected ? 1 : 0, backend.RowMajorGemmRuns - before);
+        double error = MaxError(expected, backend.DownloadBuffer(gC));
+        Assert.True(error <= 2e-6 * k + 1e-5, $"{m}x{n}x{k}: max error {error:E2}");
+    }
+
     private static float[] Values(int count, int seed)
     {
         var random = RandomHelper.CreateSeededRandom(seed);

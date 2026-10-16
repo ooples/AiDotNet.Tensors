@@ -1669,6 +1669,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
+        // #377: on the architecture the table was measured on, the row-major kernel takes the shapes where it beat both
+        // hipBLAS and the CLBlast indirect kernel. AIDOTNET_GPU_GEMM_IMPL=hipblas still forces the vendor library.
+        if (UseRowMajorGemmTable && RowMajorGemmTableApplies && !IsVendorGemmForced(Environment.GetEnvironmentVariable(GemmVendorImplEnvVar))
+            && ChooseRowMajorGemm(M, N, K, () => IsHipBlasAvailable) is { } rowMajor
+            && TryExecuteRowMajorGemm(rowMajor.Tile, A, B, C, M, N, K, alpha, beta, rowMajor.SplitK))
+        {
+            return;
+        }
+
         if (TryExecuteHipBlasGemm(A, B, C, M, N, K, alpha, beta))
         {
             return;

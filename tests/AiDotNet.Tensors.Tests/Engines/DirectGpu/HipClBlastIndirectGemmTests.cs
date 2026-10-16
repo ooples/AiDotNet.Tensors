@@ -24,6 +24,9 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
 
     private bool EnsureReady()
     {
+        // These tests pin the CLBlast indirect route and its thresholds; the RDNA1 row-major table (#377, covered by
+        // HipRowMajorSgemmTests) would otherwise take many of these shapes first.
+        Backend.UseRowMajorGemmTable = false;
         if (Backend.IsAvailable && !Backend.IsHipBlasAvailable && Backend.EnsureClBlastIndirectGemm()) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException(
@@ -96,6 +99,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     {
         Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
         using var backend = new HipBackend();
+        backend.UseRowMajorGemmTable = false;
         Assert.True(backend.IsAvailable);
         Assert.False(backend.HipBlasInitializationAttempted);
 
@@ -114,6 +118,7 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
     {
         Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
         using var backend = new HipBackend();
+        backend.UseRowMajorGemmTable = false;
         Assert.True(backend.EnsureClBlastIndirectGemm());
         GemmConfig database = Assert.NotNull(backend.ClBlastDefaultConfig);
         // The database configuration with its stride flags swapped: a different kernel, same tiles.
