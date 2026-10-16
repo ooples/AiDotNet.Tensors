@@ -1849,6 +1849,19 @@ CE_WGRAD_KERNEL(conv2d_wgrad_ce128_x3, 128, 1)
 CE_WGRAD_KERNEL(conv2d_wgrad_ce64_x3, 64, 1)
 CE_WGRAD_KERNEL(conv2d_wgrad_ce128_tf32, 128, 2)
 CE_WGRAD_KERNEL(conv2d_wgrad_ce64_tf32, 64, 2)
+// Rectangular weight-gradient tiles on the same body: Cout (the GEMM's rows) is often 64 while P = Cin*kH*kW runs into
+// the thousands, so a 64 x 128 tile keeps the 8-wide column micro-tile without wasting half a 128-row tile.
+#define CE_WGRAD_KERNEL_RECT(NAME, BM, BN, MAIN) \
+extern ""C"" __global__ __launch_bounds__(256) void NAME( \
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out, \
+    int batch, int inC, int H, int W, int outC, int outH, int outW, \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+{ \
+    conv2d_wgrad_ce_body<BM, BN, MAIN>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
+        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+}
+CE_WGRAD_KERNEL_RECT(conv2d_wgrad_ce64x128, 64, 128, 0)
+CE_WGRAD_KERNEL_RECT(conv2d_wgrad_ce128x64, 128, 64, 0)
 
 #define CE_DGRAD_KERNEL(NAME, BM, PHASE, MAIN) \
 extern ""C"" __global__ __launch_bounds__(256) void NAME( \
@@ -2282,6 +2295,8 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
                 "conv2d_fprop_ig64_gen_tf32",
                 "conv2d_wgrad_ce128_tf32",
                 "conv2d_wgrad_ce64_tf32",
+                "conv2d_wgrad_ce64x128",
+                "conv2d_wgrad_ce128x64",
                 "conv2d_dgrad_ce128_tf32",
                 "conv2d_dgrad_ce128_phase_tf32",
                 "conv2d_dgrad_ce64_tf32",
