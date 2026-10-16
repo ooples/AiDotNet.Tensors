@@ -477,13 +477,13 @@ public static class TensorAllocator
 
 #if NET5_0_OR_GREATER
         // Tier 1: Thread-local cache — zero allocation after warmup.
-        T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
+        T[]? cached = ThreadLocalTensorCache<T>.TryRentForResult(totalSize, out var cachedOwner);
         if (cached is not null)
         {
             // Exactly totalSize elements (see RentExactArray), so there is no padding to carry a
             // previous renter's bytes; clearing it gives Rent's zero-init contract.
             PooledArrayClear.Clear(cached, 0, cached.Length);
-            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false, owner: cachedOwner);
         }
 
         // Tier 3: pooled sizes get an exact-size array marked as pooled, so Return can recycle it. A large miss
@@ -539,7 +539,7 @@ public static class TensorAllocator
 
 #if NET5_0_OR_GREATER
         // Thread-local cache: skip Array.Clear
-        T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
+        T[]? cached = ThreadLocalTensorCache<T>.TryRentForResult(totalSize, out var cachedOwner);
         if (cached is not null)
         {
             // Reference types: must clear so we don't retain stale objects in the GC graph. Value
@@ -547,7 +547,7 @@ public static class TensorAllocator
             // there is no padding past the logical region for a previous renter's bytes to sit in.
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 Array.Clear(cached, 0, cached.Length);
-            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false);
+            return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached, track: false, owner: cachedOwner);
         }
 
         if (UsesArrayPool<T>(totalSize))

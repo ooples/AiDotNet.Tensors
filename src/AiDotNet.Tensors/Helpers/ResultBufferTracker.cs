@@ -43,6 +43,14 @@ internal sealed class ResultBufferState
 
     /// <summary>The array this state's tracker entry holds, until the entry is released.</summary>
     internal Array? TrackedArray;
+
+    /// <summary>
+    /// Vectors and matrices that have attached this owner: 1 for the result that tracked the array, plus one per
+    /// zero-copy wrap <see cref="ResultBufferTracker.Find(Array)"/> handed it to. Never decremented, since wrappers are
+    /// not disposed. While it is 1, the result's own vector is the only wrapper, so disposing the result's last
+    /// storage leaves nothing that can still read the array.
+    /// </summary>
+    internal int Wrappers = 1;
 }
 
 /// <summary>
@@ -75,6 +83,11 @@ internal static class ResultBufferTracker
         internal Array Array = null!;
         internal long Bytes;
         internal List<Entry> Group = null!;
+        /// <summary>
+        /// The array sits in a thread cache after its result was disposed (<see cref="Park"/>): no owner, but never
+        /// free, since the cache hands it out next.
+        /// </summary>
+        internal bool Parked;
     }
 
     private sealed class ArrayIdentity : IEqualityComparer<Array>
@@ -91,6 +104,7 @@ internal static class ResultBufferTracker
     private static readonly Dictionary<List<Entry>, long> s_groupAsked = new();
     private static long s_askTick;
     private static int s_count;
+    private static int s_parked;
     private static long s_trackedBytes;
 
     // Collection pacing: large bytes handed to results (reused and fresh) since the last gen-0 collection, natural or
@@ -233,7 +247,12 @@ internal static class ResultBufferTracker
         lock (s_lock)
         {
             if (!s_byArray.TryGetValue(array, out var entry)) return null;
-            if (entry.Owner.Target is ResultBufferOwner owner) return owner;
+            if (entry.Owner.Target is ResultBufferOwner owner)
+            {
+                // A second wrapper: disposing the result no longer proves the array unreachable.
+                Interlocked.Increment(ref owner.State.Wrappers);
+                return owner;
+            }
 
             // Every wrapper is gone, yet something still had the array to wrap: raw access outlived its result.
             if (Stress)
@@ -257,6 +276,65 @@ internal static class ResultBufferTracker
                 Interlocked.Increment(ref EscapedArrays);
             }
             state.TrackedArray = null;
+        }
+    }
+
+    /// <summary>
+    /// Keeps the entry of a disposed result's array while the array waits in a thread cache, so the next result the
+    /// cache hands it to is tracked again by <see cref="Reissue"/> without a fresh registration. False when the entry is
+    /// not <paramref name="state"/>'s (the array then has to be untracked).
+    /// </summary>
+    internal static bool Park(Array array, ResultBufferState state)
+    {
+        lock (s_lock)
+        {
+            if (!s_byArray.TryGetValue(array, out var entry) || !ReferenceEquals(entry.State, state) || state.Escaped)
+                return false;
+            if (!entry.Parked) { entry.Parked = true; s_parked++; }
+            entry.Owner.Target = null;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The owner a new result takes over a parked array the thread cache just handed out; null when the array is not
+    /// parked (an explicitly returned array, which stays untracked). Free when nothing is parked.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static ResultBufferOwner? Reissue(Array array)
+    {
+        if (Volatile.Read(ref s_parked) == 0) return null;
+        return ReissueSlow(array);
+    }
+
+    private static ResultBufferOwner? ReissueSlow(Array array)
+    {
+        lock (s_lock)
+        {
+            if (!s_byArray.TryGetValue(array, out var entry) || !entry.Parked) return null;
+            // No wrapper yet: the new result's vector is created over the array after this, and counts itself when
+            // it attaches the owner (through Find, or Tensor.FromPooledMemory).
+            var state = new ResultBufferState { TrackedArray = array, Wrappers = 0 };
+            var owner = new ResultBufferOwner(state);
+            entry.Parked = false;
+            s_parked--;
+            entry.State = state;
+            entry.Owner.Target = owner;
+            return owner;
+        }
+    }
+
+    /// <summary>
+    /// Drops the entry of a parked array a thread cache handed out (or evicted) on a path that does not take it over
+    /// with <see cref="Reissue"/>. Free when nothing is parked.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void Unpark(Array array)
+    {
+        if (Volatile.Read(ref s_parked) == 0) return;
+        lock (s_lock)
+        {
+            if (s_byArray.TryGetValue(array, out var entry) && entry.Parked) RemoveLocked(entry);
         }
     }
 
@@ -352,7 +430,7 @@ internal static class ResultBufferTracker
             for (int i = group.Count - 1; i >= 0; i--)
             {
                 var candidate = group[i];
-                if (candidate.Owner.Target is not null) continue;
+                if (candidate.Parked || candidate.Owner.Target is not null) continue;
                 RemoveLocked(candidate);
                 // Raw access that is not a lease reached it: whatever holds that access may still be using it, so it
                 // is left to the GC, never reused.
@@ -381,7 +459,7 @@ internal static class ResultBufferTracker
             List<Entry>? candidates = null;
             foreach (var entry in s_byArray.Values)
             {
-                if (entry.Owner.Target is not null) continue;
+                if (entry.Parked || entry.Owner.Target is not null) continue;
                 free += entry.Bytes;
                 (candidates ??= new List<Entry>()).Add(entry);
             }
@@ -405,6 +483,7 @@ internal static class ResultBufferTracker
 
     private static void RemoveLocked(Entry entry)
     {
+        if (entry.Parked) { entry.Parked = false; s_parked--; }
         entry.State.TrackedArray = null;
         entry.Owner.Free();
         entry.Group.Remove(entry);
@@ -419,7 +498,7 @@ internal static class ResultBufferTracker
         s_count--;
     }
 
-    private static void Poison(Array array)
+    internal static void Poison(Array array)
     {
         switch (array)
         {

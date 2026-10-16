@@ -252,7 +252,7 @@ public partial class CpuEngine
             if (eligible)
             {
                 var result = AutoTensorCache.RentOrAllocate<T>(new[] { M, finalN });
-                var outArr = (float[])(object)result.GetDataArray();
+                var outArr = (float[])(object)result.GetDataArrayUnmarked();
                 var pool = System.Buffers.ArrayPool<float>.Shared;
                 float[] bufA = maxIntermediate > 0 ? pool.Rent(maxIntermediate) : System.Array.Empty<float>();
                 float[] bufB = maxIntermediate > 0 ? pool.Rent(maxIntermediate) : System.Array.Empty<float>();
