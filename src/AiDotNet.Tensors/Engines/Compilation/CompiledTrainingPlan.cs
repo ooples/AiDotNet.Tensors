@@ -1672,6 +1672,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 continue;
             }
 
+            // The clip's sum of squares already decided it (a ~2 MB re-read per step for the parity MLP).
+            if (HostClipCovers(gradients, gradOffsets[p], lengths[p]))
+            {
+                gradientsFinite = _hostClipSumFinite;
+                continue;
+            }
+
             fixed (float* pGrad = &gradients[gradOffsets[p]])
             {
                 gradientsFinite = FusedOptimizer.AllFiniteParallel(pGrad, lengths[p]);
@@ -1771,6 +1778,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
 
+    // The host float gradients (array, logical length) this step's global-norm clip summed, and whether that double sum
+    // of squares was finite -- it is exactly when every summed element is, and a finite clip scale keeps them so. The
+    // CPU finiteness check then skips re-reading them. Cleared after every optimizer update, like the device record.
+    private readonly List<(float[] Array, int Length)> _hostClipCovered = new List<(float[] Array, int Length)>();
+    private bool _hostClipSumFinite;
+
+    private bool HostClipCovers(float[] gradients, int offset, int length)
+    {
+        if (offset != 0) return false;
+        foreach (var (array, len) in _hostClipCovered)
+            if (ReferenceEquals(array, gradients) && len == length) return true;
+        return false;
+    }
+
     // The device double the multi-tensor Adam guard and the deferred finiteness readback read this step: the plan's own
     // sum of squares, or the clip's when it covered the same gradients.
     private Engines.DirectGpu.IGpuBuffer? _finitenessGuard;
@@ -1817,6 +1838,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             _clipSumCoveredBuffers.Clear();
             _clipSumCoveredSizes.Clear();
             _clipSumCoveredBackend = null;
+            _hostClipCovered.Clear();
         }
     }
 
@@ -9912,6 +9934,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // uninitialised pool-padding tail does not leak into the norm.
         var numOps = MathHelper.GetNumericOperations<T>();
         double totalNormSq = 0.0;
+        _hostClipCovered.Clear();
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
@@ -9926,7 +9949,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (tensor.IsContiguous && offset == 0 && arr is double[] dNorm)
                 totalNormSq += SumSquaresVectorized(dNorm, len);
             else if (tensor.IsContiguous && offset == 0 && arr is float[] fNorm)
+            {
                 totalNormSq += SumSquaresChunked(fNorm, len);
+                _hostClipCovered.Add((fNorm, len));
+            }
             else if (tensor.IsContiguous && arr is not null)
                 for (int i = 0; i < len; i++)
                 {
@@ -9940,6 +9966,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     totalNormSq += v * v;
                 }
         }
+        _hostClipSumFinite = !double.IsNaN(totalNormSq) && !double.IsInfinity(totalNormSq);
         if (totalNormSq == 0.0) return;
         double totalNorm = Math.Sqrt(totalNormSq);
         if (totalNorm <= maxNorm) return;
