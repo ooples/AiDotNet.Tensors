@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
 using Xunit.Abstractions;
@@ -34,7 +35,7 @@ public sealed class StridedInputGradientBenchTests
             using var dy = backend.AllocateBuffer(Fill(batch * outC * o * o));
             using var w = backend.AllocateBuffer(Fill(outC * inC * k * k));
             using var dx = backend.AllocateBuffer(batch * inC * hw * hw);
-            var a = new CudaConv2DBackwardArgs(dy, w, dx, false, batch, inC, hw, hw, outC, o, o, k, k, 2, 2, pad, pad, 1, 1);
+            var a = new TunedConv2DBackwardArgs(dy, w, dx, false, batch, inC, hw, hw, outC, o, o, k, k, 2, 2, pad, pad, 1, 1);
             var chosen = backend.Conv2DBackwardDataSlot.Resolve(a.Shape(), a);
             Func<bool>[] run =
             {
