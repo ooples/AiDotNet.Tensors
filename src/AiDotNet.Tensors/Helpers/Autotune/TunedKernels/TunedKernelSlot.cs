@@ -256,7 +256,11 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
     private (ITunedKernelCandidate<TArgs> Chosen, TunedKernelDecision? Decision) Gate(in TunedShape shape, in TArgs args,
         ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected)
     {
-        reference.Execute(args);
+        // The correctness runs below are the registry's evidence, like its snapshots and timings: TryExecute runs the
+        // chosen candidate again for the caller's result. Their transfers (an im2col candidate's shape-table upload)
+        // were charged to the op, so a residency check failed whenever a shape class was tuned in-process.
+        using (Engines.DirectGpu.GpuLaunchProbe.TuningScope())
+            reference.Execute(args);
         float[] expected = _harness.SnapshotOutput(args);
         double scale = 0;
         for (int i = 0; i < expected.Length; i++)
@@ -292,7 +296,8 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             try
             {
                 _harness.PoisonOutput(args);
-                c.Execute(args);
+                using (Engines.DirectGpu.GpuLaunchProbe.TuningScope())
+                    c.Execute(args);
                 float[] actual = _harness.SnapshotOutput(args);
                 error = MaxRelativeError(expected, actual, scale);
             }
