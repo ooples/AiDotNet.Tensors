@@ -15845,10 +15845,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var gammaBuffer = GetOrAllocateBuffer(backend, gamma);
             using var saveMeanBuffer = GetOrAllocateBuffer(backend, mean);
             using var trueVarianceBuffer = GetOrAllocateBuffer(backend, variance);
-            using var saveInvVarBuffer = AllocateOutputBuffer(backend, channels);
-            backend.AddScalar(trueVarianceBuffer.Buffer, saveInvVarBuffer.Buffer, (float)epsilon, channels);
-            backend.Sqrt(saveInvVarBuffer.Buffer, saveInvVarBuffer.Buffer, channels);
-            backend.Reciprocal(saveInvVarBuffer.Buffer, saveInvVarBuffer.Buffer, channels);
+            using var saveInvVarBuffer = AllocateFullyWrittenOutputBuffer(backend, channels);
+            // One launch where the backend has LayerNorm's fused 1/sqrt(var + eps) (the same arithmetic as the three below).
+            if (!(backend is DirectGpu.ILayerNormBackwardPartsBackend parts
+                  && parts.TryLayerNormInverseStd(trueVarianceBuffer.Buffer, saveInvVarBuffer.Buffer, channels, (float)epsilon)))
+            {
+                backend.AddScalar(trueVarianceBuffer.Buffer, saveInvVarBuffer.Buffer, (float)epsilon, channels);
+                backend.Sqrt(saveInvVarBuffer.Buffer, saveInvVarBuffer.Buffer, channels);
+                backend.Reciprocal(saveInvVarBuffer.Buffer, saveInvVarBuffer.Buffer, channels);
+            }
 
             var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
             var gradGammaBuffer = AllocateOutputBuffer(backend, channels);
@@ -23072,12 +23077,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
             bufOut = AllocateOutputBuffer(backend, input.Length);
-            using var bufRunMean = AllocateOutputBuffer(backend, channels);
-            using var bufRunVar = AllocateOutputBuffer(backend, channels);
+            // Running statistics: the training kernel blends the batch statistics into them, but this op never returns
+            // or reads them, so whatever the buffers held only affects values that are thrown away. They are not
+            // initialised (two fills and two memsets a call - ResNet-18 runs 20 BatchNorms a step).
+            using var bufRunMean = AllocateFullyWrittenOutputBuffer(backend, channels);
+            using var bufRunVar = AllocateFullyWrittenOutputBuffer(backend, channels);
             bufSaveMean = AllocateOutputBuffer(backend, channels);
             bufSaveInvVar = AllocateOutputBuffer(backend, channels);
-            backend.Fill(bufRunMean.Buffer, 0f, channels);
-            backend.Fill(bufRunVar.Buffer, 1f, channels);
             backend.BatchNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufRunMean.Buffer, bufRunVar.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer,
                 batch, channels, spatial, (float)epsilon, 0.1f, true);
@@ -23087,9 +23093,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // that `variance` is TRUE variance (BatchNormBackward + any consumer re-derive invVar as
             // 1/sqrt(variance+eps)). Returning invVar made both the CPU-fallback backward AND the new
             // GPU BatchNormBackward mis-read it, diverging gradients (op-parity #775). Convert here.
-            backend.Multiply(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, channels);
-            backend.Reciprocal(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, channels);
-            backend.SubScalar(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, (float)epsilon, channels);
+            // One launch where the backend has LayerNorm's fused conversion (the same arithmetic as the three below).
+            if (!(backend is DirectGpu.ILayerNormBackwardPartsBackend parts
+                  && parts.TryLayerNormVarianceFromInverseStd(bufSaveInvVar.Buffer, channels, (float)epsilon)))
+            {
+                backend.Multiply(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, channels);
+                backend.Reciprocal(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, channels);
+                backend.SubScalar(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, (float)epsilon, channels);
+            }
             variance = DeferTensorResult<T>(backend, bufSaveInvVar.Buffer, channels, new[] { channels });
             ownershipTransferred = true;
             // Same node and saved state CpuEngine records: batch mean and TRUE variance per channel.
