@@ -167,6 +167,7 @@ public sealed class HipVendorGemmComparisonTests
             double best = double.MaxValue; string bestName = string.Empty;
             foreach (var tile in AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipRowMajorSgemmKernels.Tiles)
             {
+                if (!tile.Supports(m, n, k)) continue;
                 double ms = Time(() => Assert.True(backend.TryExecuteRowMajorGemm(tile, ga, gb, gc, m, n, k, 1f, 0f)));
                 AssertClose(reference, backend.DownloadBuffer(gc), k, $"{tile.KernelName} {m}x{n}x{k}");
                 if (ms < best) { best = ms; bestName = tile.KernelName; }

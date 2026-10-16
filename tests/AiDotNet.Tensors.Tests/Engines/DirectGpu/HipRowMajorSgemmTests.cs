@@ -28,6 +28,7 @@ public sealed class HipRowMajorSgemmTests
     [InlineData(32, 1024, 1024)]
     [InlineData(64, 4096, 1024)]
     [InlineData(200, 500, 300)]
+    [InlineData(68, 132, 36)]
     public void EveryTile_MatchesCpu(int m, int n, int k)
     {
         using var backend = CreateBackend();
@@ -38,12 +39,16 @@ public sealed class HipRowMajorSgemmTests
         using var gB = backend.AllocateBuffer(b);
         using var gC = backend.AllocateBuffer(new float[m * n]);
         double tolerance = 2e-6 * k + 1e-5;
+        int ran = 0;
         foreach (var tile in HipRowMajorSgemmKernels.Tiles)
         {
+            if (!tile.Supports(m, n, k)) { Assert.False(backend.TryExecuteRowMajorGemm(tile, gA, gB, gC, m, n, k, 1f, 0f)); continue; }
+            ran++;
             Assert.True(backend.TryExecuteRowMajorGemm(tile, gA, gB, gC, m, n, k, 1f, 0f), tile.KernelName);
             double error = MaxError(expected, backend.DownloadBuffer(gC));
             Assert.True(error <= tolerance, $"{tile.KernelName} {m}x{n}x{k}: max error {error:E2} > {tolerance:E2}");
         }
+        Assert.True(ran >= 6, $"only {ran} tiles ran {m}x{n}x{k}");
     }
 
     [SkippableFact]

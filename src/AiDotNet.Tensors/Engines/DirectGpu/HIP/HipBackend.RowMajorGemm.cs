@@ -35,7 +35,7 @@ public sealed partial class HipBackend
     internal unsafe bool TryExecuteRowMajorGemm(HipRowMajorSgemmTile tile, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C,
         int M, int N, int K, float alpha, float beta)
     {
-        if (M <= 0 || N <= 0 || K <= 0 || !tile.IsValid || !EnsureRowMajorGemm()) return false;
+        if (!tile.IsValid || !tile.Supports(M, N, K) || !EnsureRowMajorGemm()) return false;
         if (!_kernelCache.TryGetValue(tile.KernelName, out IntPtr kernel)) return false;
         IntPtr pa = A.Handle, pb = B.Handle, pc = C.Handle;
         void** args = stackalloc void*[8];
