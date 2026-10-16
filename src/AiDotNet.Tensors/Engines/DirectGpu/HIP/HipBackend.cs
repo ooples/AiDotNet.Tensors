@@ -611,9 +611,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             if (_kernelCache.TryGetValue("rdna_gemm_wave32", out var rdnaWave32))
                 _rdnaGemmWave32 = rdnaWave32;
 
-            // Compile Activation kernels
+            // Compile Activation kernels. Not fast-math: -ffast-math lets the compiler assume no NaN or infinity, so
+            // powf of a negative base with a fractional exponent returned powf(|x|, e) and atanhf past |x| = 1 a finite
+            // value where the CPU (and IEEE) give NaN. These kernels are memory-bound, so precise math costs little.
             CompileKernelModule(HipActivationKernels.GetSource(), "activation", ref _activationModule,
-                HipActivationKernels.GetKernelNames());
+                HipActivationKernels.GetKernelNames(), useFastMath: false);
 
             // Compile Neural Net kernels
             CompileKernelModule(HipNeuralNetKernels.GetSource(), "neural_net", ref _neuralNetModule,
@@ -5734,17 +5736,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("dropout_backward", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: dropout_backward");
 
-        float scale = 1.0f / (1.0f - dropoutRate);
             {
             IntPtr _p0 = gradOutput.Handle;
             IntPtr _p1 = mask.Handle;
             IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[5];
+            void** args = stackalloc void*[4];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
-            args[3] = &scale;
-            args[4] = &size;
+            args[3] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);

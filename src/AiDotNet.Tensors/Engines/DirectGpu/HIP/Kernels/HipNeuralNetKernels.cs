@@ -1457,7 +1457,7 @@ extern ""C"" __global__ __launch_bounds__(256) void dropout_dotnet_random_serial
     for (int i = 1; i < 55; ++i) { int ii = (21 * i) % 55; seedArray[ii] = mk; mk = mj - mk; if (mk < 0) mk += 2147483647; mj = seedArray[ii]; }
     for (int pass = 1; pass < 5; ++pass) for (int i = 1; i < 56; ++i) { seedArray[i] -= seedArray[1 + (i + 30) % 55]; if (seedArray[i] < 0) seedArray[i] += 2147483647; }
     int inext = 0, inextp = 21; float scale = 1.0f / (1.0f - rate);
-    for (int i = 0; i < size; ++i) { if (++inext >= 56) inext = 1; if (++inextp >= 56) inextp = 1; int sample = seedArray[inext] - seedArray[inextp]; if (sample == 2147483647) --sample; if (sample < 0) sample += 2147483647; seedArray[inext] = sample; bool keep = ((double)sample / 2147483647.0) > (double)rate; mask[i] = keep ? 1.0f : 0.0f; output[i] = keep ? input[i] * scale : 0.0f; }
+    for (int i = 0; i < size; ++i) { if (++inext >= 56) inext = 1; if (++inextp >= 56) inextp = 1; int sample = seedArray[inext] - seedArray[inextp]; if (sample == 2147483647) --sample; if (sample < 0) sample += 2147483647; seedArray[inext] = sample; bool keep = ((double)sample / 2147483647.0) > (double)rate; mask[i] = keep ? scale : 0.0f; output[i] = keep ? input[i] * scale : 0.0f; }
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void dropout_forward(
@@ -1469,13 +1469,14 @@ extern ""C"" __global__ __launch_bounds__(256) void dropout_forward(
     output[idx] = input[idx] * mask[idx] * scale;
 }
 
+// The mask holds the inverted-dropout scale for kept units (0 for dropped ones), as on OpenCL and Metal, so the
+// gradient is gradOutput * mask with no further scaling.
 extern ""C"" __global__ __launch_bounds__(256) void dropout_backward(
-    const float* gradOutput, const float* mask, float* gradInput,
-    float scale, int size)
+    const float* gradOutput, const float* mask, float* gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    gradInput[idx] = gradOutput[idx] * mask[idx] * scale;
+    gradInput[idx] = gradOutput[idx] * mask[idx];
 }
 
 // IMPORTANT: Caller MUST ensure indices[i] >= 0 and < vocabSize to avoid undefined behavior.

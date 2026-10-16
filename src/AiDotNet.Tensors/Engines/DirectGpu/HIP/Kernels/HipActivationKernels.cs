@@ -918,13 +918,14 @@ extern ""C"" __global__ __launch_bounds__(256) void threshold_backward(const flo
     gradInput[idx] = input[idx] > thresh ? gradOutput[idx] : 0.0f;
 }
 
-// Reciprocal backward: -1/x^2
+// Reciprocal backward. The engine passes the forward OUTPUT y = 1/x, so d/dx(1/x) = -1/x^2 = -y^2: multiply by
+// y*y, never divide (matches CpuEngine.ReciprocalBackward and the CUDA/OpenCL kernels).
 extern ""C"" __global__ __launch_bounds__(256) void reciprocal_backward(const float* gradOutput, const float* input, float* gradInput, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float x = input[idx];
-    gradInput[idx] = -gradOutput[idx] / (x * x);
+    float y = input[idx];
+    gradInput[idx] = -gradOutput[idx] * (y * y);
 }
 
 // Variance backward: dx = gradOutput * 2*(x - mean)/n
