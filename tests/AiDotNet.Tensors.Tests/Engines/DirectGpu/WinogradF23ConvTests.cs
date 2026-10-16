@@ -123,7 +123,8 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         AiDotNet.Tensors.Helpers.Autotune.TunedKernels.ITunedKernelCandidate<CudaConv2DArgs>? chosen = null;
         try
         {
-            for (int attempt = 1; attempt <= 3 && chosen?.Id != "nvrtc.conv2d.winograd_f23"; attempt++)
+            // Either F(2x2) route: the fused kernel (WinogradF23FusedConvTests) measures faster than the unfused one here.
+            for (int attempt = 1; attempt <= 3 && chosen?.Id.StartsWith("nvrtc.conv2d.winograd_f23", StringComparison.Ordinal) != true; attempt++)
             {
                 // An earlier test (or attempt) may have cached a decision for this shape.
                 cuda.Conv2DForwardSlot.InvalidateDecisions();
@@ -141,7 +142,7 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         {
             AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds = budget;
         }
-        Assert.Equal("nvrtc.conv2d.winograd_f23", chosen?.Id);
+        Assert.StartsWith("nvrtc.conv2d.winograd_f23", chosen?.Id ?? "<none>", StringComparison.Ordinal);
 
         // The weight-gradient slot, same protocol: 128@16x16 (Winograd F(3,2) ~1.3x the reference's kernel) must pick it;
         // 256@8x8 is logged only, its kernel margin over the reference is smaller than the gate's noise band on some runs.
