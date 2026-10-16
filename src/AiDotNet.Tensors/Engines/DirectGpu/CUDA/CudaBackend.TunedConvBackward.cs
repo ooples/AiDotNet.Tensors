@@ -67,6 +67,11 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f32",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF32(a)) LaunchDwDirect(a); }));
+                    // Winograd F(3x3,4x4): opt-in only (owner decision, #1335), like the F(4x4) input gradient.
+                    if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f34",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradF43Module(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF34(a)) LaunchDwDirect(a); }));
                     if (candidates.Count == 0)
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.direct", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_backward_kernel"), (in TunedConv2DBackwardArgs a) => LaunchDwDirect(a)));
@@ -113,6 +118,13 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23(a)) LaunchDxDirect(a); }));
+                    // Winograd F(4x4,3x3): registered ONLY under the explicit reduced-precision opt-in (owner decision,
+                    // #1335): ~20x the fp32 rounding error of F(2x2). Unregistered otherwise, so the persisted-decision key
+                    // differs between the two settings.
+                    if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f43",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradF43Module(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF43(a)) LaunchDxDirect(a); }));
                     if (candidates.Count == 0)
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_backward_input"), (in TunedConv2DBackwardArgs a) => LaunchDxDirect(a)));

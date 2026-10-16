@@ -1768,6 +1768,74 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Backward of a training BatchNorm followed by ReLU, fused by the compiled plan
+    /// (<see cref="Compilation.BatchNormReluFusionPattern"/>): <paramref name="output"/> is the ReLU's output, which masks
+    /// the incoming gradient exactly as the ReLU's input would (ReLU(z) &gt; 0 exactly when z &gt; 0); then the BatchNorm
+    /// backward. One launch on a backend with the register-resident kernel, else ReluBackward and BatchNormBackward.
+    /// </summary>
+    internal static void BatchNormReluBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+        Tensor<T> gradInput, gradGamma, gradBeta;
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon,
+                out var fusedGamma, out var fusedBeta) is { } fusedInput)
+        {
+            gradInput = fusedInput;
+            gradGamma = fusedGamma!;
+            gradBeta = fusedBeta!;
+        }
+        else
+        {
+            var masked = engine.ReluBackward(gradOutput, output);
+            gradInput = engine.BatchNormBackward(masked, inputs[0], inputs[1], mean, variance, epsilon,
+                out gradGamma, out gradBeta);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+    }
+
+    /// <summary>
+    /// Backward of a training BatchNorm whose output, plus a residual, feeds a ReLU -- fused by the compiled plan
+    /// (<see cref="Compilation.BatchNormAddReluFusionPattern"/>). inputs = x, gamma, beta, residual; <paramref name="output"/>
+    /// is the ReLU's output. The masked gradient is the residual's gradient and the BatchNorm output's. One launch on a
+    /// backend with the register-resident kernel, else ReluBackward and BatchNormBackward.
+    /// </summary>
+    internal static void BatchNormAddReluBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+        Tensor<T> gradInput, gradGamma, gradBeta, gradResidual;
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon, true,
+                out var fusedGamma, out var fusedBeta, out var fusedResidual) is { } fusedInput)
+        {
+            gradInput = fusedInput;
+            gradGamma = fusedGamma!;
+            gradBeta = fusedBeta!;
+            gradResidual = fusedResidual!;
+        }
+        else
+        {
+            gradResidual = engine.ReluBackward(gradOutput, output);
+            gradInput = engine.BatchNormBackward(gradResidual, inputs[0], inputs[1], mean, variance, epsilon,
+                out gradGamma, out gradBeta);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[3], gradResidual, engine);
+    }
+
+    /// <summary>
     /// #639: backward for the AFFINE batch-norm (running-stats inference form), the single
     /// differentiable op that replaces the ~6-primitive batch=1 BN fallback. mean/variance are
     /// CONSTANTS (running stats), so only inputs[0]=x, inputs[1]=gamma, inputs[2]=beta get

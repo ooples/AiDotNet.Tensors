@@ -113,6 +113,20 @@ internal static class CudaDispatchPolicy
     private static bool? _convTF32Override;
 
     /// <summary>
+    /// Explicit opt-in to Winograd F(4x4, 3x3) convolution candidates (#1335): 4x fewer multiplies than the direct sum on
+    /// 3x3 stride-1 layers, but about 2e-6 of sum|terms| fp32 error against F(2x2, 3x3)'s 1e-7. Default false; F(2x2) is
+    /// the default Winograd. A reduced-precision choice: set <c>AIDOTNET_CONV_WINOGRAD_F4=1</c> before startup or this
+    /// property before creating a backend (the tuned slots read it when they are built).
+    /// </summary>
+    public static bool ConvWinogradF4
+    {
+        get => _convWinogradF4Override ?? Environment.GetEnvironmentVariable("AIDOTNET_CONV_WINOGRAD_F4") == "1";
+        set => _convWinogradF4Override = value;
+    }
+
+    private static bool? _convWinogradF4Override;
+
+    /// <summary>
     /// Push a <see cref="PerformanceProfiler"/> scope with a kernel-path
     /// label so downstream telemetry can distinguish vendor vs generic
     /// kernel runs.
