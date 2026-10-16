@@ -731,7 +731,10 @@ public static partial class BlasManaged
             && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
             && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
             && (GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
-                || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget))
+                || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget)
+                // #653: on one thread PackBoth re-packs the whole A operand every call; the Goto tile loop measured
+                // 22% faster on a 256x256x2304 conv GEMM (4.4 -> 3.4 ms) and 14% on 256x3072x768 (18.2 -> 15.8 ms).
+                || gotoThreadBudget == 1)
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
         {

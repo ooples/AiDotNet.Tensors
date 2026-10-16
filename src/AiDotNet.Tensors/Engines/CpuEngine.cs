@@ -10949,6 +10949,10 @@ public partial class CpuEngine : ITensorLevelEngine
             long fullIm2ColBytes = (long)inChannels * kernelHeight * kernelWidth * outputHeight * outputWidth * sizeof(float);
             bool fullIm2ColIsDefault = highChannelNonWinograd
                 && (Helpers.CpuParallelSettings.MaxDegreeOfParallelism >= FullIm2ColMinThreads
+                    // #653: on one thread the full matrix feeds the serial Goto GEMM, which beat the implicit route's
+                    // per-block PackBoth: [1,256,16,16] 3x3 min 3.5 vs 5.0 ms (PyTorch 3.4-3.9). At 2 and 4 threads the
+                    // implicit route measured equal or better, so it keeps them.
+                    || Helpers.CpuParallelSettings.MaxDegreeOfParallelism == 1
                     || (long)outputHeight * outputWidth >= FullIm2ColMinPlane)
                 && fullIm2ColBytes <= FullIm2ColMaxBytes;
             // The two routes give bit-identical results, so they share a GEMM plan chosen by the shape, not the route.

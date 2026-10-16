@@ -207,11 +207,13 @@ public class Conv2DImplicitGemmParityTests
         Assert.Equal(1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }
 
-    // #653: high-channel 3x3 convs take the full im2col GEMM at 8+ threads (or on a 64x64+ plane) while its column
-    // matrix fits ThreadLocalTensorCache's 64 MB, and the implicit GEMM otherwise.
+    // #653: high-channel 3x3 convs take the full im2col GEMM at 8+ threads, on one thread (where its matrix feeds the
+    // serial Goto GEMM) or on a 64x64+ plane, while the column matrix fits ThreadLocalTensorCache's 64 MB; the implicit
+    // GEMM otherwise. Single-threaded 320ch@32x32 measured full 36.8-44.4 ms vs implicit 41.4-48.5 (medians).
     [SkippableTheory]
     [InlineData(320, 32, 16, true)]    // 320ch@32x32 at 16 threads: 11.8 MB matrix -> full
-    [InlineData(320, 32, 1, false)]    // the same shape single-threaded keeps the implicit path
+    [InlineData(320, 32, 1, true)]     // single-threaded: full im2col + serial Goto GEMM
+    [InlineData(320, 32, 4, false)]    // 2-7 threads keep the implicit path (equal or better there)
     [InlineData(320, 64, 1, true)]     // a 64x64 plane takes the full path at any thread count (47 MB)
     [InlineData(640, 64, 16, false)]   // 94 MB matrix: past the cache, keeps the implicit path
     public void HighChannelConv_RoutesByThreadsAndMatrixSize(int channels, int hw, int threads, bool expectFull)
