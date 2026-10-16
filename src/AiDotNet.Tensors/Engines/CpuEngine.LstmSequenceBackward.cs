@@ -296,16 +296,14 @@ public partial class CpuEngine
             new BlasManaged.BlasOptions<float> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
 
     /// <summary>
-    /// The [G, k] weight gradient from the chunks' partials. A single chunk computes its partial directly in the [G, k]
-    /// layout (a transposed-A GEMM, no operand or result transposes), so it is copied as is; several chunks keep the
-    /// [k, G] partials, summed in chunk order and transposed once.
+    /// The [G, k] weight gradient a single chunk formed directly in the [G, k] layout (a transposed-A GEMM, no operand
+    /// or result transposes), copied as is. Several chunks form the weight gradients after the recurrence instead.
     /// </summary>
-    private static Tensor<float> LstmWeightGradient(float[][] parts, int chunks, int k, int G)
+    private static Tensor<float> LstmWeightGradient(float[] part, int k, int G)
     {
-        if (chunks != 1) return SumChunkPartialsTransposed(parts, chunks, k, G);
         var grad = new Tensor<float>(new[] { G, k });
         using var gradKeep1 = new KeepAliveScope(grad);
-        parts[0].AsSpan(0, G * k).CopyTo(grad.AsWritableSpanUnmarked());
+        part.AsSpan(0, G * k).CopyTo(grad.AsWritableSpanUnmarked());
         return grad;
     }
 
@@ -644,7 +642,8 @@ public partial class CpuEngine
     /// <summary>
     /// Per-chunk backward scratch of a <see cref="LstmTrainWorkspace"/> (G = 4 * hidden, R = rows * seqLen): the
     /// current step's dgates [rows, G], the dh/dc carries [rows, hidden], the previous hiddens [R, hidden] and the
-    /// weight and bias [G] gradients a single chunk forms (several chunks form the weight gradients after the recurrence).
+    /// weight and bias [G] gradients a single chunk forms. Several chunks form the weight gradients after the recurrence
+    /// over every row at once, so the previous hiddens and the weight partials are allocated only for a single chunk.
     /// </summary>
     private sealed class LstmBackwardScratch
     {
@@ -654,18 +653,16 @@ public partial class CpuEngine
             DGatesT = new float[chunks][];
             DH = new float[chunks][];
             DC = new float[chunks][];
-            HT = new float[chunks][];
-            PartWIh = new float[chunks][];
-            PartWHh = new float[chunks][];
+            bool soloChunk = chunks == 1;
+            HT = soloChunk ? new float[hidden * seqRows] : Array.Empty<float>();
+            PartWIh = soloChunk ? new float[inFeatures * g] : Array.Empty<float>();
+            PartWHh = soloChunk ? new float[hidden * g] : Array.Empty<float>();
             PartB = new float[chunks][];
             for (int c = 0; c < chunks; c++)
             {
                 DGatesT[c] = new float[rows * g];
                 DH[c] = new float[rows * hidden];
                 DC[c] = new float[rows * hidden];
-                HT[c] = new float[hidden * seqRows];
-                PartWIh[c] = new float[inFeatures * g];
-                PartWHh[c] = new float[hidden * g];
                 PartB[c] = new float[g];
             }
         }
@@ -673,9 +670,9 @@ public partial class CpuEngine
         public float[][] DGatesT { get; }
         public float[][] DH { get; }
         public float[][] DC { get; }
-        public float[][] HT { get; }
-        public float[][] PartWIh { get; }
-        public float[][] PartWHh { get; }
+        public float[] HT { get; }
+        public float[] PartWIh { get; }
+        public float[] PartWHh { get; }
         public float[][] PartB { get; }
     }
 
@@ -848,9 +845,9 @@ public partial class CpuEngine
             DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
 
         if (needWIh)
-            DifferentiableOps.AccumulateGrad(grads, wIh, fullWIh ?? LstmWeightGradient(scratch.PartWIh, chunks, inFeatures, G), engine);
+            DifferentiableOps.AccumulateGrad(grads, wIh, fullWIh ?? LstmWeightGradient(scratch.PartWIh, inFeatures, G), engine);
         if (needWHh)
-            DifferentiableOps.AccumulateGrad(grads, wHh, fullWHh ?? LstmWeightGradient(scratch.PartWHh, chunks, hidden, G), engine);
+            DifferentiableOps.AccumulateGrad(grads, wHh, fullWHh ?? LstmWeightGradient(scratch.PartWHh, hidden, G), engine);
 
         if (needBias)
         {
@@ -892,20 +889,6 @@ public partial class CpuEngine
         }
     }
 
-    /// <summary>Σ_c parts[c] ([k, G], chunk order) transposed into a fresh [G, k] gradient tensor.</summary>
-    private static Tensor<float> SumChunkPartialsTransposed(float[][] parts, int chunks, int k, int G)
-    {
-        var sum = parts[0];
-        for (int c = 1; c < chunks; c++) LstmAddInto(sum, parts[c], k * G);
-        var grad = new Tensor<float>(new[] { G, k });
-        using var dstLease = grad.LeaseWritable();
-        var dst = dstLease.Span;
-        for (int g = 0; g < G; g++)
-            for (int i = 0; i < k; i++)
-                dst[g * k + i] = sum[i * G + g];
-        return grad;
-    }
-
     /// <summary>
     /// One chunk's BPTT: walks t = seqLen-1..0 over the chunk's rows (cell rows, then dh_{t-1} = dgates_t·WHh), then
     /// forms the chunk's input-gradient rows (dgates·WIh) and its partial weight/bias gradients
@@ -920,8 +903,8 @@ public partial class CpuEngine
         int rows = nb * seqLen;
         // One chunk = the whole batch on the calling thread: its GEMMs may use the pool (see LstmForwardChunk).
         bool soloChunk = ws.Chunks == 1;
-        var partWIh = scratch.PartWIh[c];
-        var partWHh = scratch.PartWHh[c];
+        var partWIh = scratch.PartWIh;
+        var partWHh = scratch.PartWHh;
         var partB = scratch.PartB[c];
         // Partials are summed over every chunk afterwards, so each starts from zero even when the chunk is empty.
         // The weight partials are used only by a single chunk; several chunks form the weight gradients after the
@@ -994,7 +977,7 @@ public partial class CpuEngine
             {
                 LstmSoloGemm(dgChunk, G, wIhArr.AsSpan(0, G * inFeatures), inFeatures, gi, rows, inFeatures, G);
             }
-            // Several chunks: formed after the recurrence as one GEMM over every row (LstmBackwardFullGemms).
+            // Several chunks: formed after the recurrence as one GEMM over every row (LstmSequenceBackwardFloat).
         }
 
         // dWIh = dgatesᵀ·x in the [G, in] gradient layout on the parallel dispatcher (see LstmWeightGradient). Several
@@ -1010,7 +993,7 @@ public partial class CpuEngine
         {
             // h_{t-1} rows of each sample are contiguous in the saved hiddens; gather them row-major and form
             // dWHh = dgatesᵀ·h_{t-1} directly in the [G, hidden] layout.
-            var hp = scratch.HT[c];
+            var hp = scratch.HT;
             for (int b = b0; b < b1; b++)
                 Array.Copy(hiddens, b * hStride, hp, (b - b0) * seqLen * hidden, seqLen * hidden);
             LstmSoloGemm(dgChunk, G, hp.AsSpan(0, rows * hidden), hidden, partWHh.AsSpan(0, G * hidden), G, hidden, rows,
