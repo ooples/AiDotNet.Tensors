@@ -1644,13 +1644,13 @@ internal static partial class SimdGemm
 #endif
 
         // Direct-2D first where it applies, as in SgemmAddInternal (measured faster than the column panel on every
-        // shape both take). It needs a zeroed C; any route below overwrites C if it declines.
+        // shape both take). Its store kernels write every element of C, so C is not cleared first (that pass was ~3%
+        // of a CPU MLP training step); any route below overwrites C if it declines.
         if (UseParallelGemm && UseDirectParallel2D && !transA && !transB && lda == k && ldb == n
             && Avx2.IsSupported && Fma.IsSupported && m >= Mr
             && m <= DirectParallel2DMaxM && k <= DirectParallel2DMaxK && n >= Nr
             && (long)m * k * n >= ParallelWorkThreshold)
         {
-            c.Slice(0, m * n).Clear();
             if (TrySgemmDirectParallel2D(a, lda, b, ldb, c, m, k, n, allowParallel: true))
                 return;
         }

@@ -155,6 +155,21 @@ public class SimdGemmDirectParallel2DTests
         }
     }
 
+    [Theory]
+    [InlineData(64, 784, 512)]
+    [InlineData(67, 100, 37)]    // ragged rows (67 = 11*6 + 1) and columns (37 = 2*16 + 5)
+    [InlineData(6, 9, 16)]
+    public void OverwritesEveryElementOfC_WithoutAClearedOutput(int m, int k, int n)
+    {
+        // Sgemm and BlasManaged hand the 2D kernel an uncleared C: every element must be stored, edges included.
+        var a = Rand(m * k, 5);
+        var b = Rand(k * n, 6);
+        var c = new float[m * n];
+        Array.Fill(c, float.NaN);
+        Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, c, m, k, n, allowParallel: true));
+        AssertMatchesReference(Reference(a, b, m, k, n), c, k, "C over a NaN-filled destination");
+    }
+
     [Fact]
     public void BlasManagedThinM_RoutesABatchSizedNoTransposeGemmToTheDirect2DPath()
     {
