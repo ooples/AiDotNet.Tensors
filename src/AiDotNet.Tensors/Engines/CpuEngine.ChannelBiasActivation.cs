@@ -167,7 +167,7 @@ public partial class CpuEngine
             Conv2DInto(output, input, kernel, stride, padding, dilation);
         // The eager epilogue, not ChannelBiasActivationInto: FusedConv2D's ReLU keeps a NaN (as torch.relu does),
         // where the compiled plan's matches the standalone ReLU kernel and stores +0.
-        CpuFusedOperations.ApplyBiasActivationNCHWInPlace(output.GetDataArray(), bias.GetReadOnlyDataArray(),
+        CpuFusedOperations.ApplyBiasActivationNCHWInPlace(output.GetDataArrayUnmarked(), bias.GetReadOnlyDataArray(),
             output._shape[0], output._shape[1], outputHeight, outputWidth, activation);
         Autodiff.DifferentiableOps.RecordIfActive("FusedConv2D", output, new[] { input, kernel, bias },
             Autodiff.BackwardFunctions<float>.FusedConv2DBiasActivationBackward,

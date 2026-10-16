@@ -532,6 +532,60 @@ public class GetStreamSchedulerTests
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void BatchedGemmFanout_RunsEachSliceOnItsLeasedStream(bool cublas)
+    {
+        // #1315: the slices used to run one after another on the backend's own stream, whatever the scheduler leased
+        // them, so the leases' completion events covered no work. The scheduler handing out several streams (the test
+        // below) never showed that; this records the stream each slice's GEMM was actually bound to.
+        using var engine = new DirectGpuTensorEngine();
+        var asyncBackend = engine.GetAsyncBackend();
+        if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;
+        using var scheduler = engine.GetStreamScheduler();
+        if (scheduler is null) return;
+        if (engine.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend) return;
+
+        // Odd sizes keep the whole-batch direct-PTX path (alpha 1, beta 0, tiled shapes) out of the way.
+        const int M = 48, N = 40, K = 24, batchCount = 6;
+        const float Alpha = 0.5f;
+        var hostA = new float[M * K * batchCount];
+        var hostB = new float[K * N * batchCount];
+        for (int i = 0; i < hostA.Length; i++) hostA[i] = (i % 17 - 8) * 0.125f;
+        for (int i = 0; i < hostB.Length; i++) hostB[i] = (i % 13 - 6) * 0.25f;
+
+        var previousCublas = cudaBackend.CublasEnabledOverride;
+        cudaBackend.CublasEnabledOverride = cublas ? null : false;
+        if (cublas && !cudaBackend.IsCublasAvailable) { cudaBackend.CublasEnabledOverride = previousCublas; return; }
+        var sliceStreams = new System.Collections.Generic.List<System.IntPtr>();
+        cudaBackend.FanoutSliceStreamObserver = s => sliceStreams.Add(s);
+        try
+        {
+            using var a = cudaBackend.AllocateBuffer(hostA);
+            using var b = cudaBackend.AllocateBuffer(hostB);
+            using var fanoutC = cudaBackend.AllocateBuffer(M * N * batchCount);
+            using var stridedC = cudaBackend.AllocateBuffer(M * N * batchCount);
+
+            cudaBackend.BatchedGemmFanout(a, b, fanoutC, M, N, K, batchCount, scheduler, Alpha);
+            cudaBackend.BatchedGemm(a, b, stridedC, M, N, K, batchCount, Alpha);
+
+            Assert.Equal(batchCount, sliceStreams.Count);
+            Assert.True(new System.Collections.Generic.HashSet<System.IntPtr>(sliceStreams).Count > 1,
+                $"every one of the {batchCount} slices ran on one stream ({sliceStreams[0]}).");
+            var fanout = cudaBackend.DownloadBuffer(fanoutC);
+            var strided = cudaBackend.DownloadBuffer(stridedC);
+            for (int i = 0; i < strided.Length; i++)
+                Assert.True(System.Math.Abs(fanout[i] - strided[i]) <= 1e-4f * (1 + System.Math.Abs(strided[i])),
+                    $"element {i}: fanout {fanout[i]}, strided-batched {strided[i]}");
+        }
+        finally
+        {
+            cudaBackend.FanoutSliceStreamObserver = null;
+            cudaBackend.CublasEnabledOverride = previousCublas;
+        }
+    }
+
     [Fact]
     public void BatchedGemmFanout_FansSlicesAcrossStreams_OnMultiStreamHost()
     {

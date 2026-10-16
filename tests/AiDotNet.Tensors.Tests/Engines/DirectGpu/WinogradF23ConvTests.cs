@@ -185,8 +185,10 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         }
     }
 
-    // Weight gradient through Winograd F(3x3, 2x2) against the backend's tuned weight-gradient route. The reduction runs over
-    // every output pixel (batch * outH * outW), so the comparison allows the longer sum's rounding.
+    // Weight gradient through Winograd F(3x3, 2x2) against the fixed im2col route, timed against the backend's tuned
+    // weight-gradient route. The reference cannot be the tuned route: that slot may pick the Winograd candidate under
+    // test and compare it with itself. The reduction runs over every output pixel (batch * outH * outW), so the
+    // comparison allows the longer sum's rounding.
     [SkippableTheory]
     [InlineData(8, 64, 64, 32, 1)]
     [InlineData(8, 128, 128, 16, 1)]
@@ -207,9 +209,11 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         using var gy = cuda.AllocateBuffer(Rand(batch * outC * outSize * outSize, 6, 1f));
         using var dwRef = cuda.AllocateBuffer(outC * inC * 9);
         using var dwWin = cuda.AllocateBuffer(outC * inC * 9);
-        void Reference() => cuda.Conv2DBackwardKernel(x, gy, dwRef, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        using var dwTuned = cuda.AllocateBuffer(outC * inC * 9);
+        void Tuned() => cuda.Conv2DBackwardKernel(x, gy, dwTuned, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        var refArgs = new CudaConv2DBackwardArgs(x, gy, dwRef, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
         var winArgs = new CudaConv2DBackwardArgs(x, gy, dwWin, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
-        Reference();
+        Assert.True(cuda.Conv2DBackwardKernelViaIm2col(refArgs), "im2col reference refused the weight-gradient shape");
         Assert.True(cuda.TryConv2DBackwardFilterWinogradF32(winArgs), "Winograd refused an admitted weight-gradient shape");
 
         var expected = cuda.DownloadBuffer(dwRef);
@@ -217,7 +221,7 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         double scale = expected.Max(v => Math.Abs((double)v)), maxErr = 0;
         for (int i = 0; i < expected.Length; i++)
             maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / Math.Max(1.0, scale));
-        _output.WriteLine($"[dW N{batch} C{inC}->K{outC} {size}x{size} pad{pad}] max err / max|dW| vs backend {maxErr:E2}");
+        _output.WriteLine($"[dW N{batch} C{inC}->K{outC} {size}x{size} pad{pad}] max err / max|dW| vs im2col {maxErr:E2}");
         Assert.True(maxErr < 1e-5, $"Winograd F(3,2) weight gradient disagrees: max err / max|dW| {maxErr:E2}");
 
         double Time(Action launch)
@@ -234,12 +238,13 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
             }
             return best;
         }
-        double backendUs = Time(Reference);
+        double backendUs = Time(Tuned);
         double winUs = Time(() => cuda.TryConv2DBackwardFilterWinogradF32(winArgs));
         _output.WriteLine($"[dW N{batch} C{inC}->K{outC} {size}x{size}] backend {backendUs:F1} us, winograd F(3,2) {winUs:F1} us ({backendUs / winUs:F2}x)");
     }
 
-    // Input gradient through the flipped-filter Winograd pipeline against the backend's tuned input-gradient route.
+    // Input gradient through the flipped-filter Winograd pipeline against the fixed col2im route, timed against the
+    // backend's tuned input-gradient route (which may itself pick the Winograd candidate, so it cannot be the reference).
     [SkippableTheory]
     [InlineData(8, 64, 64, 32, 1)]
     [InlineData(8, 128, 128, 16, 1)]
@@ -259,9 +264,11 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         using var w = cuda.AllocateBuffer(Rand(outC * inC * 9, 4, 1f / MathF.Sqrt(outC * 9)));
         using var dxRef = cuda.AllocateBuffer(batch * inC * size * size);
         using var dxWin = cuda.AllocateBuffer(batch * inC * size * size);
-        void Reference() => cuda.Conv2DBackwardInput(gy, w, dxRef, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        using var dxTuned = cuda.AllocateBuffer(batch * inC * size * size);
+        void Tuned() => cuda.Conv2DBackwardInput(gy, w, dxTuned, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        var refArgs = new CudaConv2DBackwardArgs(gy, w, dxRef, false, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
         var winArgs = new CudaConv2DBackwardArgs(gy, w, dxWin, false, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
-        Reference();
+        Assert.True(cuda.Conv2DBackwardInputViaCol2im(refArgs), "col2im reference refused the input-gradient shape");
         Assert.True(cuda.TryConv2DBackwardDataWinogradF23(winArgs), "Winograd refused an admitted input-gradient shape");
 
         var expected = cuda.DownloadBuffer(dxRef);
@@ -269,7 +276,7 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         double maxErr = 0;
         for (int i = 0; i < expected.Length; i++)
             maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / Math.Max(1.0, Math.Abs(expected[i])));
-        _output.WriteLine($"[dX N{batch} C{inC}<-K{outC} {size}x{size} pad{pad}] max rel err vs backend {maxErr:E2}");
+        _output.WriteLine($"[dX N{batch} C{inC}<-K{outC} {size}x{size} pad{pad}] max rel err vs col2im {maxErr:E2}");
         Assert.True(maxErr < 1e-4, $"Winograd F(2,3) input gradient disagrees: max rel err {maxErr:E2}");
 
         double Time(Action launch)
@@ -286,7 +293,7 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
             }
             return best;
         }
-        double backendUs = Time(Reference);
+        double backendUs = Time(Tuned);
         double winUs = Time(() => cuda.TryConv2DBackwardDataWinogradF23(winArgs));
         _output.WriteLine($"[dX N{batch} C{inC}<-K{outC} {size}x{size}] backend {backendUs:F1} us, winograd F(2,3) {winUs:F1} us ({backendUs / winUs:F2}x)");
     }

@@ -199,15 +199,37 @@ public sealed partial class CudaBackend
         using var context = PushContext();
         if (phase)
         {
-            // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image; one grid layer per phase, no split.
+            // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image and ceil(kH / sH) * ceil(kW / sW) taps.
+            // One grid layer per (phase, split): on deep layers the phases alone gave 32 blocks on 68 SMs (256 -> 512 s2:
+            // 213 us in the ResNet-18 step), so K is split like the other engine paths when the blocks cannot fill the
+            // device, each split writing a disjoint-pixel partial slice summed in order afterwards.
             long columns = (long)batch * ((inHeight + strideH - 1) / strideH) * ((inWidth + strideW - 1) / strideW);
-            ConvEnginePlan(columns, inChannels, kTotal, out int ptile, out int ptilesN, out int ptilesM, out _, out _);
+            long phaseK = (long)outChannels * ((kernelH + strideH - 1) / strideH) * ((kernelW + strideW - 1) / strideW);
+            int phases = strideH * strideW;
+            ConvEnginePlan(columns, inChannels, phaseK, out int ptile, out int ptilesN, out int ptilesM, out _, out _);
+            int sms = Math.Max(1, _multiProcessorCount);
+            long blocks = (long)ptilesN * ptilesM * phases;
+            int psplits = 1;
+            if (blocks < sms)
+                psplits = (int)Math.Min(Math.Max(1, phaseK / (8L * ConvEngineTileK)), (2L * sms + blocks - 1) / blocks);
+            int pkPerSplit = (int)(((phaseK + psplits - 1) / psplits + ConvEngineTileK - 1) / ConvEngineTileK * ConvEngineTileK);
+            psplits = (int)((phaseK + pkPerSplit - 1) / pkPerSplit);
             if (!_kernelCache.TryGetValue((ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase")
                     + ConvMainloopSuffix(mainloop), out var pgemm))
                 return false;
-            LaunchConvEngine(pgemm, gradOutput, kernel, gradInput, ptilesN, ptilesM, strideH * strideW, 0, batch, inChannels,
-                inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
+            IntPtr preduce = IntPtr.Zero;
+            if (psplits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out preduce)) return false;
+            IGpuBuffer pdestination = gradInput;
+            if (psplits > 1)
+            {
+                var partials = TryConvScratch(ref _convEngineDgradPartials, psplits * outputs);
+                if (partials is null) return false;
+                pdestination = partials;
+            }
+            LaunchConvEngine(pgemm, gradOutput, kernel, pdestination, ptilesN, ptilesM, phases * psplits, pkPerSplit, batch,
+                inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
                 dilationH, dilationW);
+            if (psplits > 1) LaunchSplitKReduce(preduce, pdestination, gradInput, (int)outputs, psplits);
             return true;
         }
 

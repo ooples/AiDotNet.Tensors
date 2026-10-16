@@ -132,6 +132,13 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     internal Helpers.ResultBufferOwner? ResultOwner;
 
     /// <summary>
+    /// Tensor storages wrapping this vector that have not released their last reference. Views share one storage, but
+    /// a tensor built over an existing vector gets a storage of its own, so one storage reaching zero does not mean
+    /// no tensor still reads this vector.
+    /// </summary>
+    internal int LiveStorages;
+
+    /// <summary>
     /// Gets the pooled array backing this vector, or null if not pooled.
     /// </summary>
     internal T[]? PooledArray => _pooledArray;
