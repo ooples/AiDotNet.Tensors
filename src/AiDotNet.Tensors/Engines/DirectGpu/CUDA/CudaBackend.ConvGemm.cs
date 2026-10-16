@@ -256,7 +256,8 @@ public sealed partial class CudaBackend
         // (conv2d_weight_grad_implicit) for the shapes it admits, each taking over when the one before declines
         // (switched off, or split-K partials that cannot be sized during a capture).
         if (TryConv2DBackwardKernelEngine(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
-                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW,
+                ConvEngineMainloop))
             return true;
         if (TryConv2DBackwardKernelImplicitGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
@@ -314,7 +315,8 @@ public sealed partial class CudaBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
         if (TryConv2DBackwardInputEngine(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
-                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW,
+                ConvEngineMainloop))
             return true;
         if (TryConv2DBackwardInputImplicitGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))

@@ -17,6 +17,34 @@ public sealed partial class CudaBackend
 
     private IGpuBuffer? _convFpropPartials;
 
+    // #1335: the engine's inner product. FMA = SIMT fp32; X3 = 3xTF32 on the Tensor Cores (fp32-level accuracy);
+    // TF32 = plain TF32 (explicit reduced-precision opt-in, CudaDispatchPolicy.ConvReducedPrecisionTF32).
+    internal const int ConvMainloopFma = 0, ConvMainloop3xTf32 = 1, ConvMainloopTf32 = 2;
+
+    private static string ConvMainloopSuffix(int mainloop) => mainloop switch
+    {
+        ConvMainloop3xTf32 => "_x3",
+        ConvMainloopTf32 => "_tf32",
+        _ => "",
+    };
+
+    /// <summary>mma.sync TF32 needs compute capability 8.0+.</summary>
+    internal bool ConvTensorCoresAvailable => _ccMajor >= 8;
+
+    private int? _convEngineMainloopOverride;
+
+    /// <summary>
+    /// The mainloop the engine runs outside the tuned slots (the fixed fallback chain and the per-route entry points):
+    /// plain TF32 under the explicit opt-in on Ampere+, else FP32 FMA (see ConvEngineMainloopsInOrder for why 3xTF32 is
+    /// not the default yet). Settable for tests and the benchmark.
+    /// </summary>
+    internal int ConvEngineMainloop
+    {
+        get => _convEngineMainloopOverride ?? (ConvTensorCoresAvailable && CudaDispatchPolicy.ConvReducedPrecisionTF32
+            ? ConvMainloopTf32 : ConvMainloopFma);
+        set => _convEngineMainloopOverride = value;
+    }
+
     /// <summary>
     /// Tile size and split-K of an engine launch: 128 x 128 tiles when they already give every SM a block, else 64 x 64;
     /// when even those leave SMs idle, K is split so there are about two blocks per SM, never with a split shorter
@@ -50,8 +78,11 @@ public sealed partial class CudaBackend
     /// Y = conv(X, W) through conv2d_fprop_ig*. Overwrites the output. False (nothing launched) when the kernels are
     /// missing, the sizes overflow a 32-bit index, or split-K partials cannot be sized (during a capture).
     /// </summary>
-    internal unsafe bool TryConv2DForwardEngine(in CudaConv2DArgs a)
+    internal unsafe bool TryConv2DForwardEngine(in CudaConv2DArgs a) => TryConv2DForwardEngine(a, ConvEngineMainloop);
+
+    internal unsafe bool TryConv2DForwardEngine(in CudaConv2DArgs a, int mainloop)
     {
+        if (mainloop != ConvMainloopFma && !ConvTensorCoresAvailable) return false;
         if (a.Batch <= 0 || a.OutHeight <= 0 || a.OutWidth <= 0 || a.OutChannels <= 0) return false;
         long columns = (long)a.Batch * a.OutHeight * a.OutWidth;
         long kTotal = (long)a.InChannels * a.KernelH * a.KernelW;
@@ -65,7 +96,8 @@ public sealed partial class CudaBackend
             out int splits, out int kPerSplit);
         // Cin % 8 == 0 keeps every K tile on one kernel tap (the _tap variant); otherwise per-element index math.
         bool tapUniform = a.InChannels % ConvEngineTileK == 0;
-        string name = (tile == 128 ? "conv2d_fprop_ig128_" : "conv2d_fprop_ig64_") + (tapUniform ? "tap" : "gen");
+        string name = (tile == 128 ? "conv2d_fprop_ig128_" : "conv2d_fprop_ig64_") + (tapUniform ? "tap" : "gen")
+                      + ConvMainloopSuffix(mainloop);
         if (!_kernelCache.TryGetValue(name, out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
         if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
@@ -114,9 +146,10 @@ public sealed partial class CudaBackend
     /// <summary>gradKernel[Cout, Cin*kH*kW] through conv2d_wgrad_ce*. Overwrites gradKernel. False: nothing launched.</summary>
     private bool TryConv2DBackwardKernelEngine(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int mainloop)
     {
         if (!s_convGemmBackward || !UseConvEngineBackward || batch <= 0 || outChannels <= 0) return false;
+        if (mainloop != ConvMainloopFma && !ConvTensorCoresAvailable) return false;
         long p = (long)inChannels * kernelH * kernelW;
         long kTotal = (long)batch * outHeight * outWidth;
         long outputs = outChannels * p;
@@ -125,7 +158,8 @@ public sealed partial class CudaBackend
             || (long)batch * outChannels * outHeight * outWidth > int.MaxValue)
             return false;
         ConvEnginePlan(p, outChannels, kTotal, out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit);
-        if (!_kernelCache.TryGetValue(tile == 128 ? "conv2d_wgrad_ce128" : "conv2d_wgrad_ce64", out var gemm)) return false;
+        if (!_kernelCache.TryGetValue((tile == 128 ? "conv2d_wgrad_ce128" : "conv2d_wgrad_ce64") + ConvMainloopSuffix(mainloop),
+                out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
         if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
 
@@ -150,8 +184,9 @@ public sealed partial class CudaBackend
     /// </summary>
     private bool TryConv2DBackwardInputEngine(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int mainloop)
     {
+        if (mainloop != ConvMainloopFma && !ConvTensorCoresAvailable) return false;
         if (!s_convGemmBackward || !UseConvEngineBackward || batch <= 0 || inChannels <= 0
             || outChannels % ConvEngineTileK != 0) return false;
         long outputs = (long)batch * inChannels * inHeight * inWidth;
@@ -167,7 +202,8 @@ public sealed partial class CudaBackend
             // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image; one grid layer per phase, no split.
             long columns = (long)batch * ((inHeight + strideH - 1) / strideH) * ((inWidth + strideW - 1) / strideW);
             ConvEnginePlan(columns, inChannels, kTotal, out int ptile, out int ptilesN, out int ptilesM, out _, out _);
-            if (!_kernelCache.TryGetValue(ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase", out var pgemm))
+            if (!_kernelCache.TryGetValue((ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase")
+                    + ConvMainloopSuffix(mainloop), out var pgemm))
                 return false;
             LaunchConvEngine(pgemm, gradOutput, kernel, gradInput, ptilesN, ptilesM, strideH * strideW, 0, batch, inChannels,
                 inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
@@ -177,7 +213,8 @@ public sealed partial class CudaBackend
 
         ConvEnginePlan((long)batch * inHeight * inWidth, inChannels, kTotal, out int tile, out int tilesN, out int tilesM,
             out int splits, out int kPerSplit);
-        if (!_kernelCache.TryGetValue(tile == 128 ? "conv2d_dgrad_ce128" : "conv2d_dgrad_ce64", out var gemm)) return false;
+        if (!_kernelCache.TryGetValue((tile == 128 ? "conv2d_dgrad_ce128" : "conv2d_dgrad_ce64") + ConvMainloopSuffix(mainloop),
+                out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
         if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
         IGpuBuffer destination = gradInput;
@@ -220,6 +257,8 @@ public sealed partial class CudaBackend
     // Entry points for the per-path forward benchmark (Bench_ResNet18ConvForward): each runs one route regardless of
     // what the tuned-kernel slot would pick. False when that route declines the shape.
     internal bool Conv2DForwardViaEngine(in CudaConv2DArgs a) => TryConv2DForwardEngine(a);
+
+    internal bool Conv2DForwardViaEngine(in CudaConv2DArgs a, int mainloop) => TryConv2DForwardEngine(a, mainloop);
 
     internal bool Conv2DForwardViaNarrowImplicit(in CudaConv2DArgs a) =>
         TryConv2DImplicitGemm(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,

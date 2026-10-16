@@ -79,10 +79,17 @@ public sealed partial class CudaBackend
                     // The first applicable candidate is the slot's reference (served under capture and once the online
                     // tuning budget is spent), so #1325's engine, fastest on every ResNet-18 layer, goes first when on.
                     var candidates = new List<ITunedKernelCandidate<CudaConv2DArgs>>();
+                    // #1335: one candidate per engine mainloop, the precision default first (plain TF32 only under the
+                    // explicit opt-in, then 3xTF32 on Ampere+), so the reference keeps the requested precision.
                     if (s_convEngineFprop)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.implicit_engine",
-                            TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_fprop_ig128_tap"),
-                            (in CudaConv2DArgs a) => ExecuteConv2DForwardEngine(a)));
+                        foreach (int mainloop in ConvEngineMainloopsInOrder())
+                        {
+                            int ml = mainloop;
+                            candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>(
+                                "nvrtc.conv2d.implicit_engine" + ConvMainloopSuffix(ml), TunedKernelOrigin.Builtin, true,
+                                _ => HasTunedKernel("conv2d_fprop_ig128_tap" + ConvMainloopSuffix(ml)),
+                                (in CudaConv2DArgs a) => ExecuteConv2DForwardEngine(a, ml)));
+                        }
                     candidates.Add(
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.generic", TunedKernelOrigin.Builtin,
                             true, _ => true, (in CudaConv2DArgs a) => LaunchConv2DGeneric(a.Input, a.Kernel, a.Output,
@@ -143,11 +150,25 @@ public sealed partial class CudaBackend
                 a.PadH, a.PadW, a.DilationH, a.DilationW);
     }
 
-    private void ExecuteConv2DForwardEngine(in CudaConv2DArgs a)
+    /// <summary>
+    /// The engine mainloops to register, the default (the slot's reference) first: plain TF32 under the explicit
+    /// reduced-precision opt-in, else FP32 FMA. 3xTF32 (fp32-level accuracy, Ampere+) competes as a measured candidate:
+    /// on the RTX 3080 it is still 20-25% slower than FMA (the engine is data-path bound, not math bound), so it is not
+    /// the default until it measures faster (#1335).
+    /// </summary>
+    private int[] ConvEngineMainloopsInOrder()
+    {
+        if (!ConvTensorCoresAvailable) return new[] { ConvMainloopFma };
+        return CudaDispatchPolicy.ConvReducedPrecisionTF32
+            ? new[] { ConvMainloopTf32, ConvMainloopFma, ConvMainloop3xTf32 }
+            : new[] { ConvMainloopFma, ConvMainloop3xTf32 };
+    }
+
+    private void ExecuteConv2DForwardEngine(in CudaConv2DArgs a, int mainloop)
     {
         // Declines only transiently (split-K partials not yet sized during a capture): the generic kernel computes the
         // same convolution.
-        if (!TryConv2DForwardEngine(a))
+        if (!TryConv2DForwardEngine(a, mainloop))
             LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                 a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
                 a.PadH, a.PadW, a.DilationH, a.DilationW);
