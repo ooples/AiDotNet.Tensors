@@ -11,7 +11,8 @@ internal readonly record struct HipRowMajorSgemmTile(int BlockM, int BlockN, int
     internal const int Threads = 256;
 
     internal string KernelName =>
-        string.Create(CultureInfo.InvariantCulture, $"rm_sgemm{(Vectorized ? "_v4" : string.Empty)}_{BlockM}x{BlockN}_{ThreadM}x{ThreadN}");
+        string.Format(CultureInfo.InvariantCulture, "rm_sgemm{0}_{1}x{2}_{3}x{4}",
+            Vectorized ? "_v4" : string.Empty, BlockM, BlockN, ThreadM, ThreadN);
 
     internal bool IsValid =>
         BlockM > 0 && BlockN > 0 && ThreadM > 0 && ThreadN > 0 &&
@@ -267,10 +268,11 @@ extern ""C"" __global__ __launch_bounds__(256) void rm_sgemm_splitk_reduce(const
         var sb = new StringBuilder(Body);
         foreach (var t in Tiles)
         {
-            sb.Append(CultureInfo.InvariantCulture,
-                $"extern \"C\" __global__ __launch_bounds__(256) void {t.KernelName}(const float* A, const float* B, float* C, int M, int N, int K, float alpha, float beta, int kChunk, size_t cStride)\n");
-            sb.Append(CultureInfo.InvariantCulture,
-                $"{{ {(t.Vectorized ? "rm_sgemm_vec_body" : "rm_sgemm_body")}<{t.BlockM}, {t.BlockN}, {t.ThreadM}, {t.ThreadN}>(A, B, C, M, N, K, alpha, beta, kChunk, cStride); }}\n");
+            sb.Append("extern \"C\" __global__ __launch_bounds__(256) void ").Append(t.KernelName)
+                .Append("(const float* A, const float* B, float* C, int M, int N, int K, float alpha, float beta, int kChunk, size_t cStride)\n");
+            sb.Append(string.Format(CultureInfo.InvariantCulture,
+                "{{ {0}<{1}, {2}, {3}, {4}>(A, B, C, M, N, K, alpha, beta, kChunk, cStride); }}\n",
+                t.Vectorized ? "rm_sgemm_vec_body" : "rm_sgemm_body", t.BlockM, t.BlockN, t.ThreadM, t.ThreadN));
         }
         return sb.ToString();
     }
