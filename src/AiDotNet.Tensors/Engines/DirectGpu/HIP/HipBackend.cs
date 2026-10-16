@@ -1927,7 +1927,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
 
             // 3D grid: (N tiles, M tiles, batches) — must match BATCHED_TILE_SIZE in kernel
-            const int tileSize = 32;
+            const int tileSize = 16;
             uint gridX = (uint)((N + tileSize - 1) / tileSize);
             uint gridY = (uint)((M + tileSize - 1) / tileSize);
             uint gridZ = (uint)batchCount;
@@ -6211,8 +6211,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             var pGradWeights = gradWeights.Handle;
             int hasMask = mask != null ? 1 : 0;
             void** args = stackalloc void*[23];
-            args[0] = &pGradOutput;
-            args[1] = &pInput;
+            args[0] = &pInput;
+            args[1] = &pGradOutput;
             args[2] = &pOffsets;
             args[3] = &pMask;
             args[4] = &pGradWeights;
@@ -6266,9 +6266,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             var pGradOffsets = gradOffsets.Handle;
             int hasMask = mask != null ? 1 : 0;
             void** args = stackalloc void*[24];
-            args[0] = &pGradOutput;
-            args[1] = &pInput;
-            args[2] = &pWeights;
+            args[0] = &pInput;
+            args[1] = &pWeights;
+            args[2] = &pGradOutput;
             args[3] = &pOffsets;
             args[4] = &pMask;
             args[5] = &pGradOffsets;
@@ -6293,11 +6293,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
 
             // Grid for offset gradients: outWidth x outHeight x (batch * 2*kH*kW*deformGroups)
-            int offsetChannels = 2 * kernelH * kernelW * deformGroups;
-            uint gridX = (uint)((outWidth + 15) / 16);
-            uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * offsetChannels);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
+            // The kernel indexes one thread per offset element in 1D, so the launch is 1D too.
+            int totalOffsets = batch * deformGroups * 2 * kernelH * kernelW * outHeight * outWidth;
+            uint grid = (uint)((totalOffsets + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
             Synchronize();
             }
     }
@@ -6321,9 +6320,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             var pOffsets = offsets.Handle;
             var pGradMask = gradMask.Handle;
             void** args = stackalloc void*[22];
-            args[0] = &pGradOutput;
-            args[1] = &pInput;
-            args[2] = &pWeights;
+            args[0] = &pInput;
+            args[1] = &pWeights;
+            args[2] = &pGradOutput;
             args[3] = &pOffsets;
             args[4] = &pGradMask;
             args[5] = &batch;
@@ -6346,11 +6345,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
 
             // Grid for mask gradients: outWidth x outHeight x (batch * kH*kW*deformGroups)
-            int maskChannels = kernelH * kernelW * deformGroups;
-            uint gridX = (uint)((outWidth + 15) / 16);
-            uint gridY = (uint)((outHeight + 15) / 16);
-            uint gridZ = (uint)(batch * maskChannels);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
+            // The kernel indexes one thread per mask element in 1D, so the launch is 1D too.
+            int totalMask = batch * deformGroups * kernelH * kernelW * outHeight * outWidth;
+            uint grid = (uint)((totalMask + DefaultBlockSize - 1) / DefaultBlockSize);
+            LaunchKernel(krnl, grid, DefaultBlockSize, args);
             Synchronize();
             }
     }
