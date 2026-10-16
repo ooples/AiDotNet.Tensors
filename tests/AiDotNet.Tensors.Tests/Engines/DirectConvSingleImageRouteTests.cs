@@ -22,9 +22,10 @@ public sealed class DirectConvSingleImageRouteTests
     [Theory]
     [InlineData(1, 64, 64, 1, true)]     // inside the rule
     [InlineData(1, 64, 40, 1, true)]     // 1600 positions: just past the batch rule's 1024
-    [InlineData(1, 640, 80, 1, true)]    // the 80x80 upper bound
-    [InlineData(1, 64, 81, 1, false)]    // past 80x80
-    [InlineData(1, 64, 128, 1, false)]   // 128x128 planes measured slower on the direct kernels
+    [InlineData(1, 640, 80, 1, true)]
+    [InlineData(1, 64, 128, 1, true)]    // 128x128 planes win once the output store is staged
+    [InlineData(1, 64, 160, 1, true)]    // the 160x160 upper bound
+    [InlineData(1, 64, 161, 1, false)]   // past it (unmeasured)
     [InlineData(1, 32, 64, 1, false)]    // 32 channels measured slower at 16 threads
     [InlineData(1, 256, 16, 1, false)]   // a 256-position plane stays on the GEMM routes for a single image
     [InlineData(1, 64, 64, 2, false)]    // stride 2 is outside the single-image rule
@@ -39,6 +40,8 @@ public sealed class DirectConvSingleImageRouteTests
     [InlineData(64, 64, 1)]
     [InlineData(96, 64, 16)]
     [InlineData(64, 48, 4)]
+    [InlineData(64, 128, 16)]
+    [InlineData(64, 41, 1)]      // 1681 positions: the last staged run is partial
     public void SingleImageDirectConv_MatchesFullIm2Col(int channels, int hw, int threads)
     {
         Skip.IfNot(DirectConvAvx2.IsSupported, "The direct kernels need AVX2 and FMA.");
@@ -71,6 +74,40 @@ public sealed class DirectConvSingleImageRouteTests
         }
         // Positive control: identical bits everywhere would mean both calls ran the same route.
         Assert.True(anyDifferent, "the default call did not take a different route from the pinned full im2col");
+    }
+
+    /// <summary>The staged output store only reorders the writes: it must match the per-position store bit for bit,
+    /// including a partial last run and both thread counts.</summary>
+    [SkippableTheory]
+    [InlineData(64, 41, 1)]
+    [InlineData(64, 128, 16)]
+    [InlineData(96, 64, 4)]
+    public void StagedOutputStore_IsBitIdentical_ToPerPositionStore(int channels, int hw, int threads)
+    {
+        Skip.IfNot(DirectConvAvx2.IsSupported, "The direct kernels need AVX2 and FMA.");
+        var e = new CpuEngine();
+        var x = Rand(new[] { 1, channels, hw, hw }, 909);
+        var kernel = Rand(new[] { channels, channels, 3, 3 }, 1010);
+        int previous = CpuParallelSettings.MaxDegreeOfParallelism;
+        bool previousStaged = DirectConvAvx2.s_stagedStore;
+        float[] staged, perPosition;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = threads;
+            DirectConvAvx2.s_stagedStore = true;
+            staged = e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }).ToArray();
+            DirectConvAvx2.s_stagedStore = false;
+            perPosition = e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 }).ToArray();
+        }
+        finally
+        {
+            DirectConvAvx2.s_stagedStore = previousStaged;
+            CpuParallelSettings.MaxDegreeOfParallelism = previous;
+        }
+        Assert.Equal(perPosition.Length, staged.Length);
+        for (int i = 0; i < staged.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(staged[i]) == BitConverter.SingleToInt32Bits(perPosition[i]),
+                $"index {i}: staged {staged[i]} per-position {perPosition[i]}");
     }
 
     private static Tensor<float> Rand(int[] shape, int seed)
