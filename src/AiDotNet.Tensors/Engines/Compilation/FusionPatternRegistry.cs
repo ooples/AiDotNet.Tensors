@@ -35,6 +35,8 @@ internal static class FusionPatternRegistry
         Register(new SparseLinearFusionPattern());
         Register(new DDIMStepFusionPattern());
         Register(new LinearFusionPattern());
+        Register(new BatchNormAddReluFusionPattern());
+        Register(new BatchNormReluFusionPattern());
     }
 
     /// <summary>

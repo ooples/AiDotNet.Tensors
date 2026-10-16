@@ -757,8 +757,15 @@ public static partial class BlasManaged
             && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
             && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
             && (GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
-                || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget))
-            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
+                || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget)
+                // #653: on one thread PackBoth re-packs the whole A operand every call; the Goto tile loop measured
+                // 22% faster on a 256x256x2304 conv GEMM (4.4 -> 3.4 ms) and 14% on 256x3072x768 (18.2 -> 15.8 ms).
+                || gotoThreadBudget == 1)
+            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork
+            // BeatsPackBoth cedes thin-M wide-N to PackBoth's N-axis path because that path shares A across threads; on
+            // one thread nothing is shared, and Goto measured 2x on the implicit conv's 64x2048x576 (7.5 -> 3.8 ms) and
+            // 32x4096x288 (3.9 -> 2.1 ms) (#653).
+            && (gotoThreadBudget == 1 || GotoGemmFp32.BeatsPackBoth(m, n, k))
             && GotoGemmFp32.IsAvailable)
         {
             // The fp32 GotoGemm routes (per-tile RunTile, CCX RunTilePackedB / RunMacroPanelStep) are write-first:

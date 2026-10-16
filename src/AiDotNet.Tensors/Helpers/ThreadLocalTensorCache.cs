@@ -114,6 +114,27 @@ internal static class ThreadLocalTensorCache<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static T[]? TryRent(int minSize)
     {
+        var array = Pop(minSize);
+        // A parked array (a disposed result's) goes to a caller that does not track it, so its entry goes.
+        if (array is not null) ResultBufferTracker.Unpark(array);
+        return array;
+    }
+
+    /// <summary>
+    /// <see cref="TryRent"/> for a tensor result: when the array is a disposed result's, parked with the tracker,
+    /// <paramref name="owner"/> is the new result's owner over it (null otherwise, as for an explicitly returned array).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static T[]? TryRentForResult(int minSize, out ResultBufferOwner? owner)
+    {
+        var array = Pop(minSize);
+        owner = array is null ? null : ResultBufferTracker.Reissue(array);
+        return array;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static T[]? Pop(int minSize)
+    {
         if (_cache is null) return null;
 
         if (_cache.TryGetValue(minSize, out var bucket) && bucket.Buffers.Count > 0)
@@ -159,14 +180,17 @@ internal static class ThreadLocalTensorCache<T>
     /// <see cref="MaxRetainedBytes"/> even after trimming, the buffer is not cached (let GC collect
     /// it or caller can fall through to ArrayPool.Return).
     /// </summary>
+    /// <param name="array">The buffer.</param>
+    /// <param name="parkState">
+    /// The tracker state of a disposed result that owned the array: its entry is kept (parked) while the array is
+    /// cached, so the next result is tracked again. Null for an explicit return, whose array leaves the tracker.
+    /// </param>
     /// <returns>true if cached for reuse, false if not cached (caller should dispose otherwise).</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool TryReturn(T[] array)
+    public static bool TryReturn(T[] array, ResultBufferState? parkState = null)
     {
-        // The array's owner is gone and the next rent hands it to another tensor: drop device copies keyed by it, and
-        // its tracking entry, so a result that still held the array can never also hand it back later.
+        // The array's owner is done with it, cached or not: drop device copies keyed by it.
         PooledArrayRecycling.Notify(array);
-        ResultBufferTracker.Untrack(array);
         _cache ??= new Dictionary<int, Bucket>();
 
         int size = array.Length;
@@ -194,6 +218,10 @@ internal static class ThreadLocalTensorCache<T>
         if (_retainedBytes + bytes > MaxRetainedBytes)
             return false; // Still over budget after trimming — this thread is saturated
 
+        // Taken: the next rent hands the array to another tensor, so drop its tracking entry, so a result that still
+        // held the array can never also hand it back later. A declined array keeps its entry: the tracker reuses it
+        // once its result is collected, as for any result nobody returned.
+        if (parkState is null || !ResultBufferTracker.Park(array, parkState)) ResultBufferTracker.Untrack(array);
         bucket.Buffers.Push(array);
         _retainedBytes += bytes;
         return true;
@@ -230,6 +258,8 @@ internal static class ThreadLocalTensorCache<T>
             {
                 var array = bucket.Buffers.Pop();
                 _retainedBytes -= (long)array.Length * ElementSize;
+                // Evicted to the GC: a parked entry would hold it strongly forever.
+                ResultBufferTracker.Unpark(array);
             }
 
             // Drop the entry when it holds nothing — that is what relieves count pressure, and an
@@ -244,7 +274,12 @@ internal static class ThreadLocalTensorCache<T>
     /// </summary>
     public static void Clear()
     {
-        _cache?.Clear();
+        if (_cache is not null)
+        {
+            foreach (var bucket in _cache.Values)
+                foreach (var array in bucket.Buffers) ResultBufferTracker.Unpark(array);
+            _cache.Clear();
+        }
         _retainedBytes = 0;
     }
 }

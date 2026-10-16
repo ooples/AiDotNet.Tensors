@@ -112,6 +112,18 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("cublas.conv2d_dw.im2col_gemm",
                             TunedKernelOrigin.Vendor, true, _ => true,
                             (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaIm2col(a)) LaunchDwDirect(a); }));
+                    // Winograd F(3x3,2x2) weight gradient (16 GEMMs over 2x2 dY tiles, split along the tiles when the
+                    // K x C grid is small). Registered after the references: it wins ResNet's 128- and 256-channel
+                    // layers and loses where the tile count or the channel count is small.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f32",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
+                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF32(a)) LaunchDwDirect(a); }));
+                    // Winograd F(3x3,4x4): opt-in only (owner decision, #1335), like the F(4x4) input gradient.
+                    if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f34",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradF43Module(),
+                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF34(a)) LaunchDwDirect(a); }));
                     if (candidates.Count == 0)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.direct", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_backward_kernel"), (in CudaConv2DBackwardArgs a) => LaunchDwDirect(a)));
@@ -152,6 +164,19 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("cublas.conv2d_dx.gemm_col2im",
                             TunedKernelOrigin.Vendor, true, _ => true,
                             (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaCol2im(a)) LaunchDxDirect(a); }));
+                    // Winograd F(2x2,3x3) on the flipped, channel-transposed filter (cuDNN's input-gradient algorithm for
+                    // ResNet's mid layers). Registered after the references: it loses where the tile count is small.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
+                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23(a)) LaunchDxDirect(a); }));
+                    // Winograd F(4x4,3x3): registered ONLY under the explicit reduced-precision opt-in (owner decision,
+                    // #1335): ~20x the fp32 rounding error of F(2x2). Unregistered otherwise, so the persisted-decision key
+                    // differs between the two settings.
+                    if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f43",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradF43Module(),
+                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF43(a)) LaunchDxDirect(a); }));
                     if (candidates.Count == 0)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_backward_input"), (in CudaConv2DBackwardArgs a) => LaunchDxDirect(a)));

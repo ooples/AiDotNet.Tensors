@@ -141,7 +141,7 @@ public sealed partial class CudaBackend
     internal bool UseConvEngineBackward { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_CONV_ENGINE_BACKWARD") != "0";
 
-    private IGpuBuffer? _convEngineWgradPartials, _convEngineDgradPartials;
+    private IGpuBuffer? _convEngineWgradPartials, _convEngineDgradPartials, _convEngineDgradWeights;
 
     /// <summary>gradKernel[Cout, Cin*kH*kW] through conv2d_wgrad_ce*. Overwrites gradKernel. False: nothing launched.</summary>
     private bool TryConv2DBackwardKernelEngine(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -197,22 +197,83 @@ public sealed partial class CudaBackend
         bool phase = (strideH > 1 || strideW > 1) && dilationH == 1 && dilationW == 1
                      && kernelH >= strideH && kernelW >= strideW;
         using var context = PushContext();
+        // Every column tile reads all of its rows' weights; in the forward layout each lane of those reads is its own
+        // 32-byte sector (consecutive ci are kH*kW floats apart). Relaying the weights out tap-major (one pass over
+        // them) pays off once enough tiles reread them: measured on ResNet-18 at batch 8, 64->128 s2 (32 column tiles)
+        // 77 -> 61 us, 128->256 s2 (8) unchanged, 256->512 s2 (2) 63.5 -> 71.5 us.
+        int tapMajor = 0;
+        bool TryTapMajor(int columnTiles)
+        {
+            if (kernelH * kernelW == 1 || columnTiles < 16) return true;
+            if (!_kernelCache.TryGetValue("conv2d_dgrad_weight_tapmajor", out var relayout)) return false;
+            var relaid = TryConvScratch(ref _convEngineDgradWeights, kTotal * inChannels);
+            if (relaid is null) return false;
+            LaunchWeightTapMajor(relayout, kernel, relaid, outChannels, inChannels, kernelH * kernelW);
+            kernel = relaid;
+            tapMajor = 1;
+            return true;
+        }
         if (phase)
         {
-            // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image; one grid layer per phase, no split.
+            // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image and ceil(kH / sH) * ceil(kW / sW) taps;
+            // a 3x3 stride-2 kernel's four phases have 4, 2, 2 and 1 taps. One grid layer per (phase, split). While the
+            // phases alone cannot fill the device (256 -> 512 s2: 32 blocks on 68 SMs), K is split with one slice length
+            // for every phase, so a phase gets slices in proportion to its taps and every layer carries the same K (a
+            // uniform split count left the 1-tap phase's blocks idle behind the 4-tap phase's); each split writes a
+            // disjoint-pixel partial slice and conv2d_dgrad_phase_reduce sums each pixel's slices in order.
             long columns = (long)batch * ((inHeight + strideH - 1) / strideH) * ((inWidth + strideW - 1) / strideW);
-            ConvEnginePlan(columns, inChannels, kTotal, out int ptile, out int ptilesN, out int ptilesM, out _, out _);
+            long phaseK = (long)outChannels * ((kernelH + strideH - 1) / strideH) * ((kernelW + strideW - 1) / strideW);
+            int phases = strideH * strideW;
+            ConvEnginePlan(columns, inChannels, phaseK, out int ptile, out int ptilesN, out int ptilesM, out _, out _);
+            int sms = Math.Max(1, _multiProcessorCount);
+            long tileBlocks = (long)ptilesN * ptilesM;
+            long PhaseUnits(long slice)
+            {
+                long units = 0;
+                for (int ph = 0; ph < strideH; ph++)
+                    for (int pw = 0; pw < strideW; pw++)
+                        units += ((long)outChannels * ((kernelH - ph + strideH - 1) / strideH) * ((kernelW - pw + strideW - 1) / strideW)
+                                  + slice - 1) / slice;
+                return units;
+            }
+            // No split while the phases fill the device; else one tap's channels per slice, halved (to multiples of
+            // ConvEngineTileK, at least 8 tiles) until the grid covers two blocks per SM.
+            long pkPerSplit = phaseK;
+            if (tileBlocks * phases < sms)
+            {
+                pkPerSplit = outChannels;
+                while (tileBlocks * PhaseUnits(pkPerSplit) < 2L * sms && pkPerSplit / 2 >= 8L * ConvEngineTileK
+                       && pkPerSplit / 2 % ConvEngineTileK == 0)
+                    pkPerSplit /= 2;
+            }
+            if (!TryTapMajor(ptilesN)) return false;
+            long gridZ = PhaseUnits(pkPerSplit);
+            bool split = gridZ > phases;
+            int maxSplits = (int)((phaseK + pkPerSplit - 1) / pkPerSplit);
             if (!_kernelCache.TryGetValue((ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase")
                     + ConvMainloopSuffix(mainloop), out var pgemm))
                 return false;
-            LaunchConvEngine(pgemm, gradOutput, kernel, gradInput, ptilesN, ptilesM, strideH * strideW, 0, batch, inChannels,
-                inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
-                dilationH, dilationW);
+            IntPtr preduce = IntPtr.Zero;
+            if (split && !_kernelCache.TryGetValue("conv2d_dgrad_phase_reduce", out preduce)) return false;
+            IGpuBuffer pdestination = gradInput;
+            if (split)
+            {
+                var partials = TryConvScratch(ref _convEngineDgradPartials, maxSplits * outputs);
+                if (partials is null) return false;
+                pdestination = partials;
+            }
+            LaunchConvEngine(pgemm, gradOutput, kernel, pdestination, ptilesN, ptilesM, (int)gridZ, (int)pkPerSplit, batch,
+                inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
+                dilationH, dilationW, tapMajor);
+            if (split)
+                LaunchPhaseReduce(preduce, pdestination, gradInput, (int)outputs, inHeight, inWidth, outChannels, kernelH, kernelW,
+                    strideH, strideW, padH, padW, (int)pkPerSplit);
             return true;
         }
 
         ConvEnginePlan((long)batch * inHeight * inWidth, inChannels, kTotal, out int tile, out int tilesN, out int tilesM,
             out int splits, out int kPerSplit);
+        if (!TryTapMajor(tilesN)) return false;
         if (!_kernelCache.TryGetValue((tile == 128 ? "conv2d_dgrad_ce128" : "conv2d_dgrad_ce64") + ConvMainloopSuffix(mainloop),
                 out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
@@ -225,24 +286,47 @@ public sealed partial class CudaBackend
             destination = partials;
         }
         LaunchConvEngine(gemm, gradOutput, kernel, destination, tilesN, tilesM, splits, kPerSplit, batch, inChannels, inHeight,
-            inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW,
+            tapMajor);
         if (splits > 1) LaunchSplitKReduce(reduce, destination, gradInput, (int)outputs, splits);
         return true;
     }
 
-    // Every engine kernel shares the 19-parameter ABI (two operands, output, the 15 conv sizes, kPerSplit).
+    // Every engine kernel shares the 19-parameter ABI (two operands, output, the 15 conv sizes, kPerSplit); the input
+    // gradient kernels take a 20th, tapMajor (the weights' layout, see conv2d_dgrad_ce_body): pass it as dgradTapMajor.
     private unsafe void LaunchConvEngine(IntPtr function, IGpuBuffer first, IGpuBuffer second, IGpuBuffer output,
         int tilesN, int tilesM, int gridZ, int kPerSplit, int batch, int inC, int inH, int inW, int outC, int outH, int outW,
-        int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+        int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int dgradTapMajor = -1)
     {
         IntPtr aPtr = first.Handle, bPtr = second.Handle, outPtr = output.Handle;
-        void** args = stackalloc void*[19];
+        void** args = stackalloc void*[20];
+        args[19] = &dgradTapMajor;
         args[0] = &aPtr; args[1] = &bPtr; args[2] = &outPtr;
         args[3] = &batch; args[4] = &inC; args[5] = &inH; args[6] = &inW;
         args[7] = &outC; args[8] = &outH; args[9] = &outW;
         args[10] = &kH; args[11] = &kW; args[12] = &sH; args[13] = &sW;
         args[14] = &pH; args[15] = &pW; args[16] = &dH; args[17] = &dW; args[18] = &kPerSplit;
         LaunchKernel3D(function, (uint)tilesN, (uint)tilesM, (uint)gridZ, (uint)DefaultBlockSize, 1, 1, args, 0);
+    }
+
+    // wt[tap][co][ci] = w[co][ci][tap] (conv2d_dgrad_weight_tapmajor).
+    private unsafe void LaunchWeightTapMajor(IntPtr relayout, IGpuBuffer weights, IGpuBuffer tapMajor, int outC, int inC, int khw)
+    {
+        IntPtr wPtr = weights.Handle, tPtr = tapMajor.Handle;
+        int count = outC * inC * khw;
+        void** args = stackalloc void*[5];
+        args[0] = &wPtr; args[1] = &tPtr; args[2] = &outC; args[3] = &inC; args[4] = &khw;
+        LaunchKernel(relayout, (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
+    }
+
+    private unsafe void LaunchPhaseReduce(IntPtr reduce, IGpuBuffer partials, IGpuBuffer destination, int count, int h, int w,
+        int outC, int kH, int kW, int sH, int sW, int pH, int pW, int kPerSplit)
+    {
+        IntPtr partPtr = partials.Handle, dstPtr = destination.Handle;
+        void** rargs = stackalloc void*[13];
+        rargs[0] = &partPtr; rargs[1] = &dstPtr; rargs[2] = &count; rargs[3] = &h; rargs[4] = &w; rargs[5] = &outC;
+        rargs[6] = &kH; rargs[7] = &kW; rargs[8] = &sH; rargs[9] = &sW; rargs[10] = &pH; rargs[11] = &pW; rargs[12] = &kPerSplit;
+        LaunchKernel(reduce, (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, rargs);
     }
 
     // dst[i] = sum over z of partials[z][i], in z order (conv2d_wgrad_splitk_reduce).

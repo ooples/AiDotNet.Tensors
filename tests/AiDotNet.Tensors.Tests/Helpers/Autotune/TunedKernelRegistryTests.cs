@@ -83,11 +83,16 @@ public sealed class TunedKernelRegistryTests : IDisposable
         {
             for (int i = 0; i < args.Output.Length; i++) args.Output[i] = float.NaN;
         }
+        /// <summary>Scripted stalls: (candidate id, 1-based measurement number of that candidate) -> time factor.</summary>
+        public Dictionary<(string Id, int Call), double> Stalls { get; } = new();
+        private readonly Dictionary<string, int> _calls = new();
         public double MeasureMilliseconds(ITunedKernelCandidate<Args> candidate, in Args args, int repetitions)
         {
             Measurements++;
             candidate.Execute(args);
-            return ((Fake)candidate).Milliseconds * repetitions;
+            _calls[candidate.Id] = _calls.TryGetValue(candidate.Id, out int n) ? n + 1 : 1;
+            double factor = Stalls.TryGetValue((candidate.Id, _calls[candidate.Id]), out double f) ? f : 1.0;
+            return ((Fake)candidate).Milliseconds * repetitions * factor;
         }
     }
 
@@ -206,6 +211,54 @@ public sealed class TunedKernelRegistryTests : IDisposable
         var decision = Assert.Single(slot.CachedDecisions);
         Assert.Equal(TunedKernelDecisionReason.ReferenceWon, decision.Reason);
         Assert.Contains(decision.Rejected, r => r.StartsWith("noop: error", StringComparison.Ordinal));
+    }
+
+    // Measurement order per decision: the reference once (sizing), 7 control pairs (reference twice each: calls 2..15),
+    // then per candidate one warm-up call and 9 timed pairs (candidate calls 2..10, reference calls 16..24 for the first).
+
+    [Fact]
+    public void OneStalledPair_DoesNotRejectAClearlyFasterCandidate()
+    {
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.7);
+        var harness = new Harness();
+        harness.Stalls[("fast", 5)] = 10.0;   // one timed candidate sample stalls 10x: that pair reads 0.14x
+        var slot = Slot(harness, false, reference, fast);
+
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Equal(TunedKernelDecisionReason.Tuned, decision.Reason);
+        Assert.True(decision.LowerSpeedupBound < 1.0, decision.ToString());   // the stalled pair is still reported
+    }
+
+    [Fact]
+    public void TwoLostPairs_StillRejectTheCandidate()
+    {
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.7);
+        var harness = new Harness();
+        harness.Stalls[("fast", 3)] = 10.0;
+        harness.Stalls[("fast", 7)] = 10.0;
+        var slot = Slot(harness, false, reference, fast);
+
+        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Equal(TunedKernelDecisionReason.ReferenceWon, decision.Reason);
+        Assert.Contains(decision.Rejected, r => r.StartsWith("fast:", StringComparison.Ordinal) && r.Contains("second-lowest pair"));
+    }
+
+    [Fact]
+    public void OneStalledControlPair_DoesNotInflateTheNoiseFloor()
+    {
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.7);
+        var harness = new Harness();
+        harness.Stalls[("ref", 4)] = 10.0;   // inside the reference-versus-reference control replay
+        var slot = Slot(harness, false, reference, fast);
+
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.True(decision.NoiseRatio < 1.5, decision.ToString());
     }
 
     [Fact]

@@ -596,8 +596,8 @@ public partial class CpuEngine
 
             using var outArrLease = output.LeaseArray();
             var outArr = (float[])(object)outArrLease.Array;
-            float[]? fhArr = wantState ? (float[])(object)finalHidden.GetDataArray() : null;
-            float[]? fcArr = wantState ? (float[])(object)finalCell.GetDataArray() : null;
+            float[]? fhArr = wantState ? (float[])(object)finalHidden.GetDataArrayUnmarked() : null;
+            float[]? fcArr = wantState ? (float[])(object)finalCell.GetDataArrayUnmarked() : null;
 
             if (numChunks <= 1)
             {

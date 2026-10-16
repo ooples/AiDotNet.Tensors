@@ -1119,7 +1119,14 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_sum_squares(
             for (int k = threadIdx.x; k < nvec; k += blockDim.x)
             {
                 float4 x = p4[k];
-                v += (double)x.x * (double)x.x + (double)x.y * (double)x.y + (double)x.z * (double)x.z + (double)x.w * (double)x.w;
+                // Four squares summed in float, one double add per float4: the double multiply-adds ran at consumer
+                // GPUs' 1/64-rate FP64 and made the kernel compute-bound (128 us for ResNet-18's 11.2M gradients on an
+                // RTX 3080, ~2x its memory time). A float partial that is not finite -- a non-finite element, or
+                // squares beyond float range (|x| > ~1.8e19) -- is redone in double, so the result stays finite
+                // exactly when every element is.
+                float s = x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+                v += isfinite(s) ? (double)s
+                    : (double)x.x * (double)x.x + (double)x.y * (double)x.y + (double)x.z * (double)x.z + (double)x.w * (double)x.w;
             }
             i = start + (nvec << 2);
         }
