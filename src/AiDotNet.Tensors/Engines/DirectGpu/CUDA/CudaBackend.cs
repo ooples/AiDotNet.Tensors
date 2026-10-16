@@ -958,11 +958,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// <summary>
     /// Computes a hash key for the kernel cache based on source code and compilation options.
     /// </summary>
-    private static string ComputeCacheKey(string source, string arch, bool useFastMath)
+    private static string ComputeCacheKey(string source, string compileOptions)
     {
         using var sha = System.Security.Cryptography.SHA256.Create();
-        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(
-            source + "|" + arch + "|fastMath=" + useFastMath));
+        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(source + "|" + compileOptions));
         return BitConverter.ToString(hash).Replace("-", "").Substring(0, 32);
     }
 
@@ -999,9 +998,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var (major, minor) = GetComputeCapability(device);
         string arch = $"--gpu-architecture=sm_{major}{minor}";
 
-        // Try loading from disk cache first
+        // Kernel sources hold device code only, so an unannotated function is a device function: NVRTC 13 treats one
+        // as a host function and rejects it in JIT mode, which the generic lambdas the conv-engine mainloops take
+        // (`auto store = [&](auto as, auto bs)`) are -- the whole convolution module then failed to compile,
+        // CompileAllKernels threw, and the backend reported CUDA unavailable on a working GPU (CUDA 13.1, GTX 1660 Ti),
+        // every caller falling back to OpenCL.
+        var optionsList = new List<string> { arch, "--device-as-default-execution-space" };
+        if (useFastMath)
+            optionsList.Add("--use_fast_math");
+        var cudaInclude = GetCudaIncludePath();
+        if (cudaInclude != null)
+            optionsList.Add($"--include-path={cudaInclude}");
+        string[] options = optionsList.ToArray();
+
+        // Try loading from disk cache first. The key covers every compile option, not just the architecture: a cubin
+        // built under other options is a different binary (and one built while the module compiled can hide that it
+        // no longer does).
         string? cacheDir = GetKernelCacheDirectory();
-        string cacheKey = ComputeCacheKey(source, arch, useFastMath);
+        string cacheKey = ComputeCacheKey(source, string.Join(" ", options));
         string? cacheFile = cacheDir != null ? Path.Combine(cacheDir, $"{moduleName}_{cacheKey}.cubin") : null;
 
         if (cacheFile != null && File.Exists(cacheFile))
@@ -1041,15 +1055,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         // Compile with NVRTC
-        var optionsList = new List<string> { arch };
-        if (useFastMath)
-            optionsList.Add("--use_fast_math");
-        var cudaInclude = GetCudaIncludePath();
-        if (cudaInclude != null)
-            optionsList.Add($"--include-path={cudaInclude}");
-
-        string[] options = optionsList.ToArray();
-
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(
             ref program, source, moduleName + ".cu", 0, IntPtr.Zero, IntPtr.Zero);
