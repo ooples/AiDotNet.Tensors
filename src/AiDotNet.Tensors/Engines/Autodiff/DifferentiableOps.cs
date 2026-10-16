@@ -676,7 +676,14 @@ internal static class DifferentiableOps
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                     $"[ALIAS] firstwrite-copy op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={contribution.Length} sharesStorage={contribution.SharesStorageWith(buffer)}" + System.Environment.NewLine); } catch { }
             }
+            var gpuEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+            var contributionDevice = gpuEngine?.FirstWriteRedirects is not null ? contribution.TryGetGpuBuffer() : null;
             engine.TensorCopy(contribution, buffer);
+            // The next run's op writes this accumulator directly (DirectGpuTensorEngine.FirstWriteRedirects). Only a
+            // whole, contiguous accumulator qualifies: the op then owns every element of its buffer.
+            if (contributionDevice is not null && buffer.IsContiguous && buffer._storageOffset == 0
+                && contribution.Length == buffer.Length && buffer.TryGetGpuBuffer() is { } accumulatorDevice)
+                gpuEngine!.RecordFirstWriteRedirect(contributionDevice, accumulatorDevice, buffer.Length);
         }
         return buffer;
     }
@@ -939,6 +946,10 @@ internal static class DifferentiableOps
         // allocated, never read, and immediately garbage. Backward ops that permute, reshape or
         // slice always hand in a non-contiguous view, so this fired on exactly the ops most likely
         // to carry a full parameter-sized gradient.
+        // First-write redirection (DirectGpuTensorEngine.FirstWriteRedirects) needs to know every buffer a contribution
+        // reaches: one consumed twice must stay a separate buffer.
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { FirstWriteRedirects: { } redirectTable })
+            redirectTable.NoteContribution(grad.TryGetGpuBuffer());
         Tensor<T>? gradForInPlaceCache = null;
         Tensor<T> GradForInPlace() =>
             gradForInPlaceCache ??= (grad.IsContiguous ? grad : grad.Contiguous());
