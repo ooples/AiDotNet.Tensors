@@ -199,7 +199,7 @@ __device__ __forceinline__ float bn_block_sum(float v, float* red)
     return v;
 }
 
-template <int K4>
+template <int K4, bool RELU>
 __device__ __forceinline__ void bn_fwd_reg(const float* __restrict__ input, float* __restrict__ output,
     const float* __restrict__ gamma, const float* __restrict__ beta,
     float* __restrict__ saveMean, float* __restrict__ saveVar,
@@ -247,13 +247,17 @@ __device__ __forceinline__ void bn_fwd_reg(const float* __restrict__ input, floa
             y.y = g * ((v[k].y - mean) * inv) + bt;
             y.z = g * ((v[k].z - mean) * inv) + bt;
             y.w = g * ((v[k].w - mean) * inv) + bt;
+            if (RELU) { y.x = fmaxf(y.x, 0.0f); y.y = fmaxf(y.y, 0.0f); y.z = fmaxf(y.z, 0.0f); y.w = fmaxf(y.w, 0.0f); }
             reinterpret_cast<float4*>(output + ((long long)b * channels + c) * spatial)[q - b * s4] = y;
         }
     }
 }
 
-template <int K4>
-__device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput, const float* __restrict__ input,
+// RELU: the forward was BatchNorm followed by ReLU and reluOutput is that ReLU's output; dY is masked where it is not
+// positive (ReLU(z) > 0 exactly when z > 0), so the ReLU backward needs no pass of its own.
+template <int K4, bool RELU>
+__device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput, const float* __restrict__ reluOutput,
+    const float* __restrict__ input,
     const float* __restrict__ gamma, const float* __restrict__ saveMean, const float* __restrict__ saveVar,
     float* __restrict__ gradInput, float* __restrict__ gradGamma, float* __restrict__ gradBeta,
     int batch, int channels, int spatial, float epsilon)
@@ -273,6 +277,12 @@ __device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput,
             long long row = ((long long)b * channels + c) * spatial;
             x[k] = reinterpret_cast<const float4*>(input + row)[q - b * s4];
             dy[k] = reinterpret_cast<const float4*>(gradOutput + row)[q - b * s4];
+            if (RELU)
+            {
+                float4 o = reinterpret_cast<const float4*>(reluOutput + row)[q - b * s4];
+                dy[k].x = o.x > 0.0f ? dy[k].x : 0.0f; dy[k].y = o.y > 0.0f ? dy[k].y : 0.0f;
+                dy[k].z = o.z > 0.0f ? dy[k].z : 0.0f; dy[k].w = o.w > 0.0f ? dy[k].w : 0.0f;
+            }
             sdy += (dy[k].x + dy[k].y) + (dy[k].z + dy[k].w);
             sdyx += (dy[k].x * ((x[k].x - mean) * inv) + dy[k].y * ((x[k].y - mean) * inv))
                   + (dy[k].z * ((x[k].z - mean) * inv) + dy[k].w * ((x[k].w - mean) * inv));
@@ -300,20 +310,24 @@ __device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput,
     }
 }
 
-#define BN_REG_ENTRY(K4) \
-extern ""C"" __global__ __launch_bounds__(256) void batchnorm_fwd_reg##K4(const float* input, float* output, \
+#define BN_REG_ENTRY(K4, RELU, SUFFIX) \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_fwd##SUFFIX##_reg##K4(const float* input, float* output, \
     const float* gamma, const float* beta, float* saveMean, float* saveVar, int batch, int channels, int spatial, \
     float epsilon) \
-{ bn_fwd_reg<K4>(input, output, gamma, beta, saveMean, saveVar, batch, channels, spatial, epsilon); } \
-extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd_reg##K4(const float* gradOutput, const float* input, \
-    const float* gamma, const float* saveMean, const float* saveVar, float* gradInput, float* gradGamma, \
-    float* gradBeta, int batch, int channels, int spatial, float epsilon) \
-{ bn_bwd_reg<K4>(gradOutput, input, gamma, saveMean, saveVar, gradInput, gradGamma, gradBeta, batch, channels, \
-    spatial, epsilon); }
-BN_REG_ENTRY(1)
-BN_REG_ENTRY(2)
-BN_REG_ENTRY(4)
-BN_REG_ENTRY(8)
+{ bn_fwd_reg<K4, RELU>(input, output, gamma, beta, saveMean, saveVar, batch, channels, spatial, epsilon); } \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd##SUFFIX##_reg##K4(const float* gradOutput, \
+    const float* reluOutput, const float* input, const float* gamma, const float* saveMean, const float* saveVar, \
+    float* gradInput, float* gradGamma, float* gradBeta, int batch, int channels, int spatial, float epsilon) \
+{ bn_bwd_reg<K4, RELU>(gradOutput, reluOutput, input, gamma, saveMean, saveVar, gradInput, gradGamma, gradBeta, \
+    batch, channels, spatial, epsilon); }
+BN_REG_ENTRY(1, false, )
+BN_REG_ENTRY(2, false, )
+BN_REG_ENTRY(4, false, )
+BN_REG_ENTRY(8, false, )
+BN_REG_ENTRY(1, true, _relu)
+BN_REG_ENTRY(2, true, _relu)
+BN_REG_ENTRY(4, true, _relu)
+BN_REG_ENTRY(8, true, _relu)
 
 // Layer Normalization forward pass
 // 1 block per batch element, 256 threads parallel reduce across normalizedSize
@@ -942,6 +956,8 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "batchnorm_backward",
                 "batchnorm_fwd_reg1", "batchnorm_fwd_reg2", "batchnorm_fwd_reg4", "batchnorm_fwd_reg8",
                 "batchnorm_bwd_reg1", "batchnorm_bwd_reg2", "batchnorm_bwd_reg4", "batchnorm_bwd_reg8",
+                "batchnorm_fwd_relu_reg1", "batchnorm_fwd_relu_reg2", "batchnorm_fwd_relu_reg4", "batchnorm_fwd_relu_reg8",
+                "batchnorm_bwd_relu_reg1", "batchnorm_bwd_relu_reg2", "batchnorm_bwd_relu_reg4", "batchnorm_bwd_relu_reg8",
                 "layernorm_forward",
                 "layernorm_backward",
                 "layernorm_grad_params",

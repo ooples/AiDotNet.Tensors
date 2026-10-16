@@ -47,6 +47,7 @@ public class CompiledConvBnGraphStepTests : IDisposable
         public double[] Losses = Array.Empty<double>();
         public float[][] FinalWeights = Array.Empty<float[]>();
         public bool ReplayedAGraph;
+        public string[] StepNames = Array.Empty<string>();
     }
 
     private static Run Train(IEngine engine, bool onDevice)
@@ -87,8 +88,13 @@ public class CompiledConvBnGraphStepTests : IDisposable
             }
             run.FinalWeights = parameters.Select(p => p.ToArray()).ToArray();
             if (plan is CompiledTrainingPlan<float> concrete)
+            {
                 run.ReplayedAGraph = (IntPtr)typeof(CompiledTrainingPlan<float>)
                     .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)! != IntPtr.Zero;
+                var steps = (CompiledStep<float>[]?)typeof(CompiledTrainingPlan<float>)
+                    .GetField("_forwardSteps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete);
+                run.StepNames = steps?.Select(s => s.OpName).ToArray() ?? Array.Empty<string>();
+            }
             return run;
         }
     }
@@ -120,6 +126,12 @@ public class CompiledConvBnGraphStepTests : IDisposable
             _output.WriteLine("losses captured: " + string.Join(", ", captured.Losses.Select(l => l.ToString("G7"))));
 
             Assert.True(captured.ReplayedAGraph, "the plan is not replaying a graph after warm-up");
+            // The first BatchNorm feeds only a ReLU: the GPU plan fuses the pair (BatchNormReluFusionPattern); the second
+            // feeds the residual add, so it stays a BatchNorm. The CPU plan fuses nothing.
+            _output.WriteLine("captured steps: " + string.Join(", ", captured.StepNames));
+            Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNormReLU"));
+            Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNorm"));
+            Assert.DoesNotContain("BatchNormReLU", reference.StepNames);
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(reference.Losses[s] - captured.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(reference.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G7} != cpu {reference.Losses[s]:G7}");

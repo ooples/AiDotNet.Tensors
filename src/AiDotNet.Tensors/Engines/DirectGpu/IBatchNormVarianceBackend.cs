@@ -11,12 +11,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal interface IBatchNormVarianceBackend
 {
     /// <summary>Training forward over [batch, channels, spatial]: every element of <paramref name="output"/> and of
-    /// <paramref name="saveMean"/> / <paramref name="saveVariance"/> (biased variance) is written.</summary>
+    /// <paramref name="saveMean"/> / <paramref name="saveVariance"/> (biased variance) is written. With
+    /// <paramref name="relu"/> the output is ReLU of the normalized values (a BatchNorm followed by a ReLU).</summary>
     bool TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
-        IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels, int spatial, float epsilon);
+        IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels, int spatial, float epsilon, bool relu = false);
 
-    /// <summary>Backward from the saved mean and biased variance: every element of the three gradients is written.</summary>
+    /// <summary>Backward from the saved mean and biased variance: every element of the three gradients is written. With
+    /// <paramref name="reluOutput"/> (the output of a BatchNorm followed by a ReLU), <paramref name="gradOutput"/> is the
+    /// ReLU's output gradient and is masked where that output is not positive.</summary>
     bool TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveMean,
         IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
-        int batch, int channels, int spatial, float epsilon);
+        int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput = null);
 }

@@ -23,13 +23,13 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
 
     unsafe bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
-        int batch, int channels, int spatial, float epsilon)
+        int batch, int channels, int spatial, float epsilon, bool relu)
     {
         int k4 = BatchNormRegisterVariant(batch, spatial, out int threads);
         long n = (long)batch * channels * spatial;
         if (k4 == 0 || channels <= 0 || !IsAvailable || input.Size < n || output.Size < n || gamma.Size < channels
             || beta.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
-            || !_kernelCache.TryGetValue("batchnorm_fwd_reg" + k4, out var kernel))
+            || !_kernelCache.TryGetValue((relu ? "batchnorm_fwd_relu_reg" : "batchnorm_fwd_reg") + k4, out var kernel))
             return false;
         using var _ = PushContext();
         IntPtr pi = input.Handle, po = output.Handle, pg = gamma.Handle, pb = beta.Handle, pm = saveMean.Handle,
@@ -45,23 +45,24 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
 
     unsafe bool IBatchNormVarianceBackend.TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
-        IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon)
+        IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput)
     {
         int k4 = BatchNormRegisterVariant(batch, spatial, out int threads);
         long n = (long)batch * channels * spatial;
         if (k4 == 0 || channels <= 0 || !IsAvailable || gradOutput.Size < n || input.Size < n || gradInput.Size < n
             || gamma.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
-            || gradGamma.Size < channels || gradBeta.Size < channels
-            || !_kernelCache.TryGetValue("batchnorm_bwd_reg" + k4, out var kernel))
+            || gradGamma.Size < channels || gradBeta.Size < channels || (reluOutput is not null && reluOutput.Size < n)
+            || !_kernelCache.TryGetValue((reluOutput is null ? "batchnorm_bwd_reg" : "batchnorm_bwd_relu_reg") + k4, out var kernel))
             return false;
         using var _ = PushContext();
+        IntPtr pro = reluOutput?.Handle ?? IntPtr.Zero;
         IntPtr pdy = gradOutput.Handle, px = input.Handle, pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle,
             pdx = gradInput.Handle, pdg = gradGamma.Handle, pdb = gradBeta.Handle;
         int b = batch, c = channels, s = spatial;
         float eps = epsilon;
-        void** args = stackalloc void*[12];
-        args[0] = &pdy; args[1] = &px; args[2] = &pg; args[3] = &pm; args[4] = &pv; args[5] = &pdx; args[6] = &pdg;
-        args[7] = &pdb; args[8] = &b; args[9] = &c; args[10] = &s; args[11] = &eps;
+        void** args = stackalloc void*[13];
+        args[0] = &pdy; args[1] = &pro; args[2] = &px; args[3] = &pg; args[4] = &pm; args[5] = &pv; args[6] = &pdx;
+        args[7] = &pdg; args[8] = &pdb; args[9] = &b; args[10] = &c; args[11] = &s; args[12] = &eps;
         LaunchKernel(kernel, (uint)channels, (uint)threads, args);
         return true;
     }
