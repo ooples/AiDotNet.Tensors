@@ -12,7 +12,72 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// </summary>
 internal static class CudaConvWinogradKernels
 {
-    public static string GetSource() => CudaConvolutionKernels.ConvEngineCore + @"
+    /// <summary>
+    /// The engine main loop (<see cref="CudaConvolutionKernels.ConvEngineCore"/>) plus the batched Winograd GEMM template
+    /// <c>wino_gemm_body&lt;BM, BN&gt;</c>, with no <c>extern "C"</c> entry point: every Winograd module (this one, and any
+    /// other tile size) prepends it and instantiates its own entry points, so there is one GEMM definition.
+    /// </summary>
+    public const string WinogradGemmCore = CudaConvolutionKernels.ConvEngineCore + @"
+
+// Batched GEMM on the engine main loop: Cm[x][s] = A[x] (M x Kd, row-major) * B[x] (Kd x Nc, row-major) over the
+// reduction slice s of kPerSplit, x = blockIdx.z / splits, s = blockIdx.z % splits. One split: the plain batched GEMM.
+template <int BM, int BN>
+__device__ __forceinline__ void wino_gemm_body(const float* __restrict__ A, const float* __restrict__ B,
+    float* __restrict__ Cm, int M, int Nc, int Kd, int splits, int kPerSplit)
+{
+    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
+    constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256, BSTEP = 256 / BN;
+    const long long x = blockIdx.z / splits, s = blockIdx.z - x * splits;
+    A += x * M * Kd; B += x * Kd * Nc; Cm += (x * splits + s) * M * Nc;
+    const int kBegin = (int)s * kPerSplit, kEnd = min(Kd, kBegin + kPerSplit);
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN, tid = threadIdx.x;
+    const int ak = tid & 7, am = tid >> 3, bn = tid % BN, bk = tid / BN;
+    const int tiles = kBegin < kEnd ? (kEnd - kBegin + CE_BK - 1) / CE_BK : 0;
+    const int kLimit = kEnd;   // loads past this slice's end read as zero (Kd stays the row stride)
+    int kc = kBegin;
+    float ra[RA], rb[RB];
+    auto load = [&]()
+    {
+        #pragma unroll
+        for (int r = 0; r < RA; r++)
+        {
+            int m = m0 + am + 32 * r, k = kc + ak;
+            ra[r] = (m < M && k < kLimit) ? A[(long long)m * Kd + k] : 0.0f;
+        }
+        #pragma unroll
+        for (int r = 0; r < RB; r++)
+        {
+            int k = kc + bk + BSTEP * r, n = n0 + bn;
+            rb[r] = (k < kLimit && n < Nc) ? B[(long long)k * Nc + n] : 0.0f;
+        }
+    };
+    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
+    {
+        #pragma unroll
+        for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];
+        #pragma unroll
+        for (int r = 0; r < RB; r++) bs[bk + BSTEP * r][bn] = rb[r];
+    };
+    auto advance = [&]() { kc += CE_BK; };
+    float acc[TM][TN];
+    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+    const int tx = tid & 15, ty = tid >> 4;
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+    {
+        int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
+        if (m >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < TN; j++)
+        {
+            int n = n0 + (j >> 2) * 64 + tx * 4 + (j & 3);
+            if (n < Nc) Cm[(long long)m * Nc + n] = acc[i][j];
+        }
+    }
+}
+";
+
+    public static string GetSource() => WinogradGemmCore + @"
 
 // U[x][k][c] = (G g G^T)[x], G = [[1,0,0],[1/2,1/2,1/2],[1/2,-1/2,1/2],[0,0,1]].
 extern ""C"" __global__ void wino_f23_filter(const float* __restrict__ w, float* __restrict__ u, int K, int C)
@@ -122,62 +187,6 @@ extern ""C"" __global__ void wino_f23_input(const float* __restrict__ x, float* 
     }
 }
 
-// Batched GEMM on the engine main loop: Cm[x][s] = A[x] (M x Kd, row-major) * B[x] (Kd x Nc, row-major) over the
-// reduction slice s of kPerSplit, x = blockIdx.z / splits, s = blockIdx.z % splits. One split: the plain batched GEMM.
-template <int BM, int BN>
-__device__ __forceinline__ void wino_gemm_body(const float* __restrict__ A, const float* __restrict__ B,
-    float* __restrict__ Cm, int M, int Nc, int Kd, int splits, int kPerSplit)
-{
-    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
-    constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256, BSTEP = 256 / BN;
-    const long long x = blockIdx.z / splits, s = blockIdx.z - x * splits;
-    A += x * M * Kd; B += x * Kd * Nc; Cm += (x * splits + s) * M * Nc;
-    const int kBegin = (int)s * kPerSplit, kEnd = min(Kd, kBegin + kPerSplit);
-    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN, tid = threadIdx.x;
-    const int ak = tid & 7, am = tid >> 3, bn = tid % BN, bk = tid / BN;
-    const int tiles = kBegin < kEnd ? (kEnd - kBegin + CE_BK - 1) / CE_BK : 0;
-    const int kLimit = kEnd;   // loads past this slice's end read as zero (Kd stays the row stride)
-    int kc = kBegin;
-    float ra[RA], rb[RB];
-    auto load = [&]()
-    {
-        #pragma unroll
-        for (int r = 0; r < RA; r++)
-        {
-            int m = m0 + am + 32 * r, k = kc + ak;
-            ra[r] = (m < M && k < kLimit) ? A[(long long)m * Kd + k] : 0.0f;
-        }
-        #pragma unroll
-        for (int r = 0; r < RB; r++)
-        {
-            int k = kc + bk + BSTEP * r, n = n0 + bn;
-            rb[r] = (k < kLimit && n < Nc) ? B[(long long)k * Nc + n] : 0.0f;
-        }
-    };
-    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
-    {
-        #pragma unroll
-        for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];
-        #pragma unroll
-        for (int r = 0; r < RB; r++) bs[bk + BSTEP * r][bn] = rb[r];
-    };
-    auto advance = [&]() { kc += CE_BK; };
-    float acc[TM][TN];
-    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
-    const int tx = tid & 15, ty = tid >> 4;
-    #pragma unroll
-    for (int i = 0; i < TM; i++)
-    {
-        int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
-        if (m >= M) continue;
-        #pragma unroll
-        for (int j = 0; j < TN; j++)
-        {
-            int n = n0 + (j >> 2) * 64 + tx * 4 + (j & 3);
-            if (n < Nc) Cm[(long long)m * Nc + n] = acc[i][j];
-        }
-    }
-}
 extern ""C"" __global__ __launch_bounds__(256) void wino_gemm128(const float* A, const float* B, float* Cm, int M, int Nc, int Kd, int splits, int kPerSplit)
 { wino_gemm_body<128, 128>(A, B, Cm, M, Nc, Kd, splits, kPerSplit); }
 extern ""C"" __global__ __launch_bounds__(256) void wino_gemm64(const float* A, const float* B, float* Cm, int M, int Nc, int Kd, int splits, int kPerSplit)
