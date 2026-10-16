@@ -8951,10 +8951,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Scale(B, B, 1.0f / reduceSize, outerSize);
     }
 
+    // var_axis reduces each [reduceSize] row of [outerSize, reduceSize], one thread per row. This used to launch
+    // compute_mean_var, BatchNorm's kernel, which reduces over the OUTER axis and writes reduceSize means and
+    // variances: wrong values, and for a whole-tensor variance (outerSize 1) a write of reduceSize floats into
+    // one-element buffers, corrupting whatever device memory followed them.
     public unsafe void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("compute_mean_var", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: compute_mean_var");
+        if (!_kernelCache.TryGetValue("var_axis", out var krnl))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: var_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -8968,7 +8972,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[4] = &reduceSize;
 
 
-            uint grid = (uint)((reduceSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel(krnl, grid, DefaultBlockSize, args);
             Synchronize();
             }
