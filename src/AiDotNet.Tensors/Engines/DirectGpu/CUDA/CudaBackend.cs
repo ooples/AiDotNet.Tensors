@@ -2600,19 +2600,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         long elemBytesA = sizeof(float);
 
         // Build one launch action per slice. Each captures its slice
-        // offsets; the scheduler binds cuBLAS to the lease stream before
-        // calling each lambda, so each cublasSgemm queues onto the
-        // assigned stream.
+        // offsets and binds its GEMM to the stream the scheduler leased it.
+        using var fanout = BeginGemmFanout();
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
         for (int b = 0; b < batchCount; b++)
         {
             int slice = b;
-            launches.Add(_ =>
+            launches.Add(stream =>
             {
-                // The scheduler binds cuBLAS to this stream prior to
-                // invoking the lambda (see GpuStreamScheduler.Dispatch's
-                // per-lease cublasSetStream call). We just issue the
-                // launch — it queues onto the bound stream.
+                fanout.Bind(stream);
                 float aVal = alpha, bVal = beta;
                 IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytesA);
                 IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytesA);
@@ -2715,14 +2711,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 $"scores buffer too small: capacity={scores.Size} elements, required={requiredS} for shape [B={batch}, H={numHeads}, S={seqLen}].",
                 nameof(scores));
 
+        using var fanout = BeginGemmFanout();
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
         for (int bi = 0; bi < batch; bi++)
         {
             for (int h = 0; h < numHeads; h++)
             {
                 int batchIdx = bi, headIdx = h;
-                launches.Add(_ =>
+                launches.Add(stream =>
                 {
+                    fanout.Bind(stream);
                     float aVal = alpha, bVal = beta;
                     IntPtr qPtr = (IntPtr)((long)Q.Handle
                         + (batchIdx * perBatchQ + headIdx * perHeadQ) * elemBytes);
@@ -2826,14 +2824,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 $"scores buffer too small: capacity={scores.Size} elements, required={requiredS} for shape [B={batch}, H={numHeads}, S={seqLen}].",
                 nameof(scores));
 
+        using var fanout = BeginGemmFanout();
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
         for (int bi = 0; bi < batch; bi++)
         {
             for (int h = 0; h < numHeads; h++)
             {
                 int batchIdx = bi, headIdx = h;
-                launches.Add(_ =>
+                launches.Add(stream =>
                 {
+                    fanout.Bind(stream);
                     float aVal = alpha, bVal = beta;
                     IntPtr alphaPtr = (IntPtr)(&aVal);
                     IntPtr betaPtr = (IntPtr)(&bVal);
@@ -2935,14 +2935,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 $"output buffer too small: capacity={output.Size} elements, required={requiredO} for shape [B={batch}, H={numHeads}, S={seqLen}, D={headDim}].",
                 nameof(output));
 
+        using var fanout = BeginGemmFanout();
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batch * numHeads);
         for (int bi = 0; bi < batch; bi++)
         {
             for (int h = 0; h < numHeads; h++)
             {
                 int batchIdx = bi, headIdx = h;
-                launches.Add(_ =>
+                launches.Add(stream =>
                 {
+                    fanout.Bind(stream);
                     float aVal = alpha, bVal = beta;
                     IntPtr aPtr = (IntPtr)((long)attention.Handle
                         + (batchIdx * perBatchA + headIdx * perHeadA) * elemBytes);
@@ -3020,12 +3022,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         long elemBytesIn = 2;
         long elemBytesOut = sizeof(float);
 
+        using var fanout = BeginGemmFanout();
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
         for (int b = 0; b < batchCount; b++)
         {
             int slice = b;
-            launches.Add(_ =>
+            launches.Add(stream =>
             {
+                fanout.Bind(stream);
                 float aVal = alpha, bVal = beta;
                 IntPtr alphaPtr = (IntPtr)(&aVal);
                 IntPtr betaPtr = (IntPtr)(&bVal);
@@ -3075,12 +3079,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         long strideC = (long)M * N;
         long elemBytes = sizeof(double);
 
+        using var fanout = BeginGemmFanout();
         var launches = new System.Collections.Generic.List<System.Action<AiDotNet.Tensors.Engines.Gpu.IGpuStream>>(batchCount);
         for (int b = 0; b < batchCount; b++)
         {
             int slice = b;
-            launches.Add(_ =>
+            launches.Add(stream =>
             {
+                fanout.Bind(stream);
                 double aVal = alpha, bVal = beta;
                 IntPtr aPtr = (IntPtr)((long)A.Handle + slice * strideA * elemBytes);
                 IntPtr bPtr = (IntPtr)((long)B.Handle + slice * strideB * elemBytes);
@@ -6160,11 +6166,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         get
         {
             var tc = (_threadCublas ??= new ThreadLocal<ThreadCublas>(CreateThreadCublas, trackAllValues: true)).Value!;
-            IntPtr stream = _stream;
+            // A fan-out slice (#1315) runs on its leased stream; otherwise the thread's current stream.
+            IntPtr fanout = GemmLaunchStream;
+            IntPtr stream = fanout != IntPtr.Zero ? fanout : _stream;
             if (tc.Stream != stream)
             {
                 CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(tc.Handle, stream), "cublasSetStream(follow current stream)");
-                ReattachCublasWorkspace(tc);
+                // Fan-out slices run concurrently on different streams, so they must not share the handle's one
+                // workspace: on a lease the handle keeps cuBLAS's default pool (cublasSetStream just reset it to that),
+                // and the workspace comes back when the handle returns to the backend's stream.
+                if (fanout == IntPtr.Zero) ReattachCublasWorkspace(tc);
                 tc.Stream = stream;
             }
             return tc.Handle;
