@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// Fused Winograd F(2x2, 3x3) (one kernel after the filter transform) against a float64 reference, for the input gradient
-/// and the forward, in both launch variants (two blocks per SM and one): error as max |err| / max(1, sum|terms|), bit
+/// and the forward: error as max |err| / max(1, sum|terms|), bit
 /// reproducibility across two runs into NaN-poisoned outputs (every element must be stored), and an interleaved bench
 /// against the unfused F(2x2) route and the engine.
 /// </summary>
@@ -25,8 +25,6 @@ public sealed class WinogradF23FusedConvTests
         for (int i = 0; i < n; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
         return v;
     }
-
-    private static string VariantName(int variant) => variant switch { 1 => "1 block/SM", 2 => "double-buffered", 3 => "512 threads double-buffered", 4 => "512 threads", _ => "2 blocks/SM" };
 
     private void CheckAgainst(double[] sum, double[] magnitude, float[] got, float[] again, string what)
     {
@@ -89,7 +87,6 @@ public sealed class WinogradF23FusedConvTests
 
         using var dDy = backend.AllocateBuffer(dy);
         using var dW = backend.AllocateBuffer(weights);
-        foreach (int variant in new[] { 0, 1, 2, 3, 4 })
         {
             var poison = Enumerable.Repeat(float.NaN, sum.Length).ToArray();
             using var dX1 = backend.AllocateBuffer(poison);
@@ -97,11 +94,11 @@ public sealed class WinogradF23FusedConvTests
             foreach (var target in new[] { dX1, dX2 })
             {
                 var a = new CudaConv2DBackwardArgs(dDy, dW, target, false, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
-                Assert.True(backend.TryConv2DBackwardDataWinogradF23Fused(a, variant), "fused Winograd refused an admitted shape");
+                Assert.True(backend.TryConv2DBackwardDataWinogradF23Fused(a), "fused Winograd refused an admitted shape");
             }
             backend.Synchronize();
             CheckAgainst(sum, magnitude, backend.DownloadBuffer(dX1), backend.DownloadBuffer(dX2),
-                $"dX N{batch} C{inC} K{outC} {size}x{size} pad{pad} {VariantName(variant)}");
+                $"dX N{batch} C{inC} K{outC} {size}x{size} pad{pad}");
         }
     }
 
@@ -149,7 +146,6 @@ public sealed class WinogradF23FusedConvTests
 
         using var dx = backend.AllocateBuffer(x);
         using var dw = backend.AllocateBuffer(weights);
-        foreach (int variant in new[] { 0, 1, 2, 3, 4 })
         {
             var poison = Enumerable.Repeat(float.NaN, sum.Length).ToArray();
             using var y1 = backend.AllocateBuffer(poison);
@@ -157,17 +153,17 @@ public sealed class WinogradF23FusedConvTests
             foreach (var target in new[] { y1, y2 })
             {
                 var a = new CudaConv2DArgs(dx, dw, target, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
-                Assert.True(backend.TryConv2DForwardWinogradF23Fused(a, variant), "fused Winograd refused an admitted shape");
+                Assert.True(backend.TryConv2DForwardWinogradF23Fused(a), "fused Winograd refused an admitted shape");
             }
             backend.Synchronize();
             CheckAgainst(sum, magnitude, backend.DownloadBuffer(y1), backend.DownloadBuffer(y2),
-                $"y N{batch} C{inC} K{outC} {size}x{size} pad{pad} {VariantName(variant)}");
+                $"y N{batch} C{inC} K{outC} {size}x{size} pad{pad}");
         }
     }
 
-    // The wiring: the input-gradient slot registers the fused route as its own candidate, never as the reference.
+    // The wiring: the forward and input-gradient slots register the fused route as its own candidate, never the reference.
     [SkippableFact]
-    public void The_input_gradient_slot_registers_the_fused_candidate()
+    public void The_conv_slots_register_the_fused_candidates()
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
@@ -176,11 +172,71 @@ public sealed class WinogradF23FusedConvTests
         Assert.Contains("nvrtc.conv2d_dx.winograd_f23_fused", ids);
         Assert.Contains("nvrtc.conv2d_dx.winograd_f23", ids);
         Assert.NotEqual("nvrtc.conv2d_dx.winograd_f23_fused", ids[0]);
+        var forwardIds = backend.Conv2DForwardSlot.CandidateIds;
+        Assert.Contains("nvrtc.conv2d.winograd_f23_fused", forwardIds);
+        Assert.NotEqual("nvrtc.conv2d.winograd_f23_fused", forwardIds[0]);
+    }
+
+    // The measured choice: at ResNet-18's 64@32x32 layer (batch 8) the fused route is ~2x the unfused F(2x2) route and the
+    // engine for both the forward and the input gradient, so both slots must pick it. Up to three fresh decisions each (a
+    // decision can lose a round to noise on a shared GPU; see WinogradF23ConvTests).
+    [SkippableFact]
+    public void The_conv_slots_pick_the_fused_candidate_for_resnet_64_at_32()
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_REGISTRY_PERSIST") != "0",
+            "The measured choice is checked with persisted tuning off (AIDOTNET_KERNEL_REGISTRY_PERSIST=0).");
+        using var backend = CudaBackend.CreateOrThrow();
+        Skip.IfNot(backend.EnsureWinogradFusedModule(), "Fused Winograd kernels did not compile.");
+        const int batch = 8, c = 64, s = 32;
+        var rng = new Random(64);
+        using var a0 = backend.AllocateBuffer(Rand(batch * c * s * s, rng));
+        using var wt = backend.AllocateBuffer(Rand(c * c * 9, rng));
+        using var o = backend.AllocateBuffer(batch * c * s * s);
+        var fwd = new CudaConv2DArgs(a0, wt, o, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
+        var dx = new CudaConv2DBackwardArgs(a0, wt, o, false, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
+
+        double budget = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds;
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds =
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.SpentMilliseconds + 60_000;
+        string? fwdChosen = null, dxChosen = null;
+        try
+        {
+            for (int attempt = 1; attempt <= 3 && fwdChosen != "nvrtc.conv2d.winograd_f23_fused"; attempt++)
+            {
+                backend.Conv2DForwardSlot.InvalidateDecisions();
+                fwdChosen = backend.Conv2DForwardSlot.Resolve(fwd.Shape(), fwd)?.Id;
+                _out.WriteLine($"attempt {attempt}: forward slot picked {fwdChosen ?? "<none>"} for N8 C64 32x32; " + Describe(
+                    AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.Conv2DForward, fwd.Shape()));
+            }
+            for (int attempt = 1; attempt <= 3 && dxChosen != "nvrtc.conv2d_dx.winograd_f23_fused"; attempt++)
+            {
+                backend.Conv2DBackwardDataSlot.InvalidateDecisions();
+                dxChosen = backend.Conv2DBackwardDataSlot.Resolve(dx.Shape(), dx)?.Id;
+                _out.WriteLine($"attempt {attempt}: input-gradient slot picked {dxChosen ?? "<none>"} for N8 C64 32x32; " + Describe(
+                    AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.Conv2DBackwardData, dx.Shape()));
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds = budget;
+        }
+        Assert.Equal("nvrtc.conv2d.winograd_f23_fused", fwdChosen);
+        Assert.Equal("nvrtc.conv2d_dx.winograd_f23_fused", dxChosen);
+
+        static string Describe(AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp op,
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedShape shape)
+        {
+            var d = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.Decisions
+                .LastOrDefault(r => r.Op == op && r.Shape.Equals(shape));
+            return $"reason {d?.Reason}, reference {d?.ReferenceMilliseconds:F3} ms, chosen {d?.CandidateMilliseconds:F3} ms, " +
+                   $"max rel err {d?.MaxRelativeError:E2}, rejected [{string.Join("; ", d?.Rejected ?? Array.Empty<string>())}]";
+        }
     }
 
     /// <summary>
     /// Per ResNet-18 3x3 stride-1 layer at batch 8, interleaved round by round (min / median us per call): input gradient
-    /// fused (2 and 1 blocks/SM) vs unfused F(2x2) vs the engine, and the same for the forward. Gated on
+    /// fused vs unfused F(2x2) vs the engine, and the same for the forward. Gated on
     /// AIDOTNET_PERF_RUNNER=1.
     /// </summary>
     [SkippableFact]
@@ -192,7 +248,7 @@ public sealed class WinogradF23FusedConvTests
         Skip.IfNot(backend.EnsureWinogradFusedModule() && backend.EnsureWinogradModule(), "Winograd kernels did not compile.");
         const int batch = 8, rounds = 41, burst = 10;
         var rng = new Random(23);
-        string[] routes = { "fusedDB", "f512DB", "f512", "F(2x2)", "engine" };
+        string[] routes = { "fused", "F(2x2)", "engine" };
         var totalsDx = new double[routes.Length];
         var totalsFwd = new double[routes.Length];
         foreach (var (c, hw, count) in new[] { (64, 32, 4), (128, 16, 3), (256, 8, 3), (512, 4, 3) })
@@ -204,17 +260,13 @@ public sealed class WinogradF23FusedConvTests
             var f = new CudaConv2DArgs(a0, wt, o, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
             Func<bool>[] dxRuns =
             {
-                () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 2),
-                () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 3),
-                () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 4),
+                () => backend.TryConv2DBackwardDataWinogradF23Fused(b),
                 () => backend.TryConv2DBackwardDataWinogradF23(b),
                 () => backend.Conv2DBackwardInputViaEngine(b),
             };
             Func<bool>[] fwdRuns =
             {
-                () => backend.TryConv2DForwardWinogradF23Fused(f, 2),
-                () => backend.TryConv2DForwardWinogradF23Fused(f, 3),
-                () => backend.TryConv2DForwardWinogradF23Fused(f, 4),
+                () => backend.TryConv2DForwardWinogradF23Fused(f),
                 () => backend.TryConv2DForwardWinogradF23(f),
                 () => backend.TryConv2DForwardEngine(f),
             };
