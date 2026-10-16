@@ -373,6 +373,17 @@ internal static class HeadToHeadNetworkHarness
     /// Trains through <see cref="AiDotNet.Tensors.Engines.Compilation.TensorCodec.CompileTraining{T}"/>: one Step() is
     /// the whole training step, so only the "step" phase is measured (the per-phase entries repeat it for the report).
     /// </summary>
+    /// <summary>
+    /// The warmup lasts "warmupSteps" steps AND at least "warmupMs" milliseconds (default 1000), on both sides. A
+    /// step count alone timed the device side while an idle GPU was still raising its clocks: at 5 steps (~50 ms) a
+    /// ResNet-18 arm that happened to warm the card first (e.g. with online kernel tuning) measured ~1.2 ms a step
+    /// faster than the same kernels without it.
+    /// </summary>
+    internal static double WarmupMilliseconds(JsonElement spec)
+        => spec.TryGetProperty("warmupMs", out var w) && w.ValueKind == JsonValueKind.Number ? w.GetDouble() : DefaultWarmupMs;
+
+    internal const double DefaultWarmupMs = 1000;
+
     private static SideResult TrainCompiled(JsonElement spec, IEngine engine, List<Func<Tensor<float>, Tensor<float>>> layers,
         List<Tensor<float>> parameters, Tensor<float> x, Tensor<float> y, double lr, DirectGpuTensorEngine? gpu)
     {
@@ -389,18 +400,22 @@ internal static class HeadToHeadNetworkHarness
         int warmup = spec.GetProperty("warmupSteps").GetInt32();
         int measured = spec.GetProperty("measuredSteps").GetInt32();
         int lossSteps = spec.GetProperty("lossAgreementSteps").GetInt32();
+        double warmupMs = WarmupMilliseconds(spec);
         var steps = new List<double>();
         var losses = new List<double>();
         var sw = new Stopwatch();
-        for (int step = 0; step < warmup + measured; step++)
+        var warmClock = Stopwatch.StartNew();
+        int measuredSoFar = 0;
+        for (int step = 0; measuredSoFar < measured; step++)
         {
+            bool measuring = step >= warmup && warmClock.Elapsed.TotalMilliseconds >= warmupMs;
             Sync();
             sw.Restart();
             var loss = plan.Step();
             Sync();
             double t = sw.Elapsed.TotalMilliseconds;
             if (step < lossSteps) losses.Add(loss.GetFlat(0));
-            if (step >= warmup) steps.Add(t);
+            if (measuring) { steps.Add(t); measuredSoFar++; }
         }
 
         var stats = Stats(steps);
@@ -627,6 +642,8 @@ internal static class HeadToHeadNetworkHarness
 
         int warmup = capture?.MeasuredStep ?? spec.GetProperty("warmupSteps").GetInt32();
         int measured = capture is null ? spec.GetProperty("measuredSteps").GetInt32() : 1;
+        // The crossing capture inspects one exact step, so it keeps the step-count warmup alone.
+        double warmupMs = capture is null ? WarmupMilliseconds(spec) : 0;
         int lossSteps = spec.GetProperty("lossAgreementSteps").GetInt32();
         var phases = new Dictionary<string, List<double>>
         {
@@ -641,8 +658,11 @@ internal static class HeadToHeadNetworkHarness
         // (one every ~1.5 MLP steps) rather than the framework. CPU only: device buffers don't come from it.
         using var stepArena = gpu is null ? AiDotNet.Tensors.Helpers.TensorArena.Create() : null;
 
-        for (int step = 0; step < warmup + measured; step++)
+        var warmClock = Stopwatch.StartNew();
+        int measuredSoFar = 0;
+        for (int step = 0; measuredSoFar < measured; step++)
         {
+            bool measuring = step >= warmup && warmClock.Elapsed.TotalMilliseconds >= warmupMs;
             Sync();
             // Disposed on failure too, so a throwing step leaves no scope registered on this thread collecting transfers.
             using var crossingScope = capture is not null && step == capture.MeasuredStep
@@ -692,8 +712,9 @@ internal static class HeadToHeadNetworkHarness
             }
 
             if (step < lossSteps) losses.Add(loss.GetFlat(0));
-            if (step >= warmup)
+            if (measuring)
             {
+                measuredSoFar++;
                 phases["forward"].Add(t1);
                 phases["backward"].Add(t2 - t1);
                 phases["optimizer"].Add(t3 - t2);
