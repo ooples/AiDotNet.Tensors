@@ -183,6 +183,151 @@ extern ""C"" __global__ void wino_f43_output(const float* __restrict__ mm, float
     }
 }
 
+// ---- Weight gradient: F(3x3, 4x4), the transpose dual of F(4x4, 3x3) (A and G trade places, B is unchanged). ----
+// dW[k][c][i][j] = sum over n, h, w of dY[n][k][h][w] * x[n][c][h + i - pad][w + j - pad]. dY is cut into 4x4 tiles g, each
+// paired with the 6x6 x window it touches; U = A g A^T with A = F(4,3)'s A (6x4), V = B^T d B, M[x] = sum over tiles of
+// U[x] V[x] (the GEMM), and the 3x3 gradient is G^T M G with F(4,3)'s G (6x3).
+// A (6x4) rows: [1,0,0,0], [1,1,1,1], [1,-1,1,-1], [1,2,4,8], [1,-2,4,-8], [0,0,0,1].
+__device__ __forceinline__ void wino4_a(const float* g, float* o)
+{
+    o[0] = g[0];
+    o[1] = g[0] + g[1] + g[2] + g[3];
+    o[2] = g[0] - g[1] + g[2] - g[3];
+    o[3] = g[0] + 2.0f * g[1] + 4.0f * g[2] + 8.0f * g[3];
+    o[4] = g[0] - 2.0f * g[1] + 4.0f * g[2] - 8.0f * g[3];
+    o[5] = g[3];
+}
+
+// G^T (3x6) rows: [1/4,-1/6,-1/6,1/24,1/24,0], [0,-1/6,1/6,1/12,-1/12,0], [0,-1/6,-1/6,1/6,1/6,1].
+__device__ __forceinline__ void wino4_gt(const float* m, float* o)
+{
+    o[0] = 0.25f * m[0] - (m[1] + m[2]) * (1.0f / 6.0f) + (m[3] + m[4]) * (1.0f / 24.0f);
+    o[1] = (m[2] - m[1]) * (1.0f / 6.0f) + (m[3] - m[4]) * (1.0f / 12.0f);
+    o[2] = (m[3] + m[4] - m[1] - m[2]) * (1.0f / 6.0f) + m[5];
+}
+
+// U[x][k][p] = (A g A^T)[x] for dY tile p of channel k (zero past the edge).
+extern ""C"" __global__ void wino_f34w_dy(const float* __restrict__ dy, float* __restrict__ u,
+    int N, int K, int outH, int outW, int tilesH, int tilesW)
+{
+    int P = N * tilesH * tilesW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx = k*P + p
+    if (idx >= K * P) return;
+    int k = idx / P, p = idx - k * P;
+    int n = p / (tilesH * tilesW), t = p - n * (tilesH * tilesW);
+    int th = t / tilesW, tw = t - th * tilesW;
+    const float* src = dy + ((long long)n * K + k) * outH * outW;
+    float g[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+        int h = th * 4 + i;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            int w = tw * 4 + j;
+            g[i][j] = (h < outH && w < outW) ? __ldg(&src[h * outW + w]) : 0.0f;
+        }
+    }
+    float s[6][4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        float col[4] = { g[0][j], g[1][j], g[2][j], g[3][j] }, o[6];
+        wino4_a(col, o);
+        #pragma unroll
+        for (int i = 0; i < 6; i++) s[i][j] = o[i];
+    }
+    long long plane = (long long)K * P;
+    #pragma unroll
+    for (int i = 0; i < 6; i++)
+    {
+        float o[6];
+        wino4_a(s[i], o);
+        #pragma unroll
+        for (int j = 0; j < 6; j++) u[(i * 6 + j) * plane + idx] = o[j];
+    }
+}
+
+// V[x][p][c] = (B^T d B)[x] for the 6x6 x window of dY tile p (rows th*4 - pad .. +5), stored tile-major so the GEMM
+// reads it as its row-major (P x C) operand.
+extern ""C"" __global__ void wino_f34w_input(const float* __restrict__ x, float* __restrict__ v,
+    int N, int C, int H, int W, int pad, int tilesH, int tilesW)
+{
+    int P = N * tilesH * tilesW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx = p*C + c
+    if (idx >= C * P) return;
+    int p = idx / C, c = idx - p * C;
+    int n = p / (tilesH * tilesW), t = p - n * (tilesH * tilesW);
+    int th = t / tilesW, tw = t - th * tilesW;
+    int h0 = th * 4 - pad, w0 = tw * 4 - pad;
+    const float* src = x + ((long long)n * C + c) * H * W;
+    float d[6][6];
+    #pragma unroll
+    for (int i = 0; i < 6; i++)
+    {
+        int hh = h0 + i;
+        #pragma unroll
+        for (int j = 0; j < 6; j++)
+        {
+            int ww = w0 + j;
+            d[i][j] = (hh >= 0 && hh < H && ww >= 0 && ww < W) ? __ldg(&src[hh * W + ww]) : 0.0f;
+        }
+    }
+    float s[6][6];
+    #pragma unroll
+    for (int j = 0; j < 6; j++)
+    {
+        float col[6] = { d[0][j], d[1][j], d[2][j], d[3][j], d[4][j], d[5][j] }, o[6];
+        wino4_bt(col, o);
+        #pragma unroll
+        for (int i = 0; i < 6; i++) s[i][j] = o[i];
+    }
+    long long plane = (long long)C * P;
+    #pragma unroll
+    for (int i = 0; i < 6; i++)
+    {
+        float o[6];
+        wino4_bt(s[i], o);
+        #pragma unroll
+        for (int j = 0; j < 6; j++) v[(i * 6 + j) * plane + idx] = o[j];
+    }
+}
+
+// dW[k][c] = G^T M G (3x3) from M[x][split][k][c], summing the split-K partials in order.
+extern ""C"" __global__ void wino_f34w_output(const float* __restrict__ mm, float* __restrict__ dw, int K, int C, int splits)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;   // idx = k*C + c
+    if (idx >= K * C) return;
+    long long plane = (long long)K * C;
+    float m[6][6];
+    #pragma unroll
+    for (int x = 0; x < 36; x++)
+    {
+        float acc = 0.0f;
+        for (int s = 0; s < splits; s++) acc += mm[((long long)x * splits + s) * plane + idx];
+        m[x / 6][x % 6] = acc;
+    }
+    float t[3][6];
+    #pragma unroll
+    for (int j = 0; j < 6; j++)
+    {
+        float col[6] = { m[0][j], m[1][j], m[2][j], m[3][j], m[4][j], m[5][j] }, o[3];
+        wino4_gt(col, o);
+        #pragma unroll
+        for (int i = 0; i < 3; i++) t[i][j] = o[i];
+    }
+    float* dst = dw + (long long)idx * 9;
+    #pragma unroll
+    for (int i = 0; i < 3; i++)
+    {
+        float o[3];
+        wino4_gt(t[i], o);
+        #pragma unroll
+        for (int j = 0; j < 3; j++) dst[i * 3 + j] = o[j];
+    }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void wino4_gemm128(const float* A, const float* B, float* Cm, int M, int Nc, int Kd, int splits, int kPerSplit)
 { wino_gemm_body<128, 128>(A, B, Cm, M, Nc, Kd, splits, kPerSplit); }
 extern ""C"" __global__ __launch_bounds__(256) void wino4_gemm64(const float* A, const float* B, float* Cm, int M, int Nc, int Kd, int splits, int kPerSplit)
@@ -191,6 +336,7 @@ extern ""C"" __global__ __launch_bounds__(256) void wino4_gemm64(const float* A,
 
     public static string[] GetKernelNames() => new[]
     {
-        "wino_f43_filter", "wino_f43_filter_flip", "wino_f43_input", "wino_f43_output", "wino4_gemm128", "wino4_gemm64",
+        "wino_f43_filter", "wino_f43_filter_flip", "wino_f43_input", "wino_f43_output",
+        "wino_f34w_dy", "wino_f34w_input", "wino_f34w_output", "wino4_gemm128", "wino4_gemm64",
     };
 }
