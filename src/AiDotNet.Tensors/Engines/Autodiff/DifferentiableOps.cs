@@ -676,7 +676,14 @@ internal static class DifferentiableOps
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                     $"[ALIAS] firstwrite-copy op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={contribution.Length} sharesStorage={contribution.SharesStorageWith(buffer)}" + System.Environment.NewLine); } catch { }
             }
+            var gpuEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+            var contributionDevice = gpuEngine?.FirstWriteRedirects is not null ? contribution.TryGetGpuBuffer() : null;
             engine.TensorCopy(contribution, buffer);
+            // The next run's op writes this accumulator directly (DirectGpuTensorEngine.FirstWriteRedirects). Only a
+            // whole, contiguous accumulator qualifies: the op then owns every element of its buffer.
+            if (contributionDevice is not null && buffer.IsContiguous && buffer._storageOffset == 0
+                && contribution.Length == buffer.Length && buffer.TryGetGpuBuffer() is { } accumulatorDevice)
+                gpuEngine!.RecordFirstWriteRedirect(contributionDevice, accumulatorDevice, buffer.Length);
         }
         return buffer;
     }
@@ -992,6 +999,8 @@ internal static class DifferentiableOps
                             try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                                 $"[ALIAS] inplace-add op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length}" + System.Environment.NewLine); } catch { }
                         }
+                        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { FirstWriteRedirects: not null } redirecting)
+                            redirecting.NoteRedirectedAccumulation(GradForInPlace().TryGetGpuBuffer(), existing.TryGetGpuBuffer());
                         using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
                             engine.TensorAddInPlace(existing, GradForInPlace());
                         accumulated = existing;

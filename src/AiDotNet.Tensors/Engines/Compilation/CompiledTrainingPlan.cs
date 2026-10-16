@@ -182,6 +182,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// write them in place after the backward) and the reshape-view aliases, which share storage with written buffers.</summary>
     private HashSet<Tensor<T>>? _alwaysZeroedGrads;
 
+    /// <summary>This plan's first-write redirects, lent to the engine while the captured step body runs (see
+    /// <see cref="Engines.DirectGpuTensorEngine.FirstWriteRedirects"/>). Dropped by the eager step.</summary>
+    private readonly Dictionary<long, Engines.DirectGpu.IGpuBuffer> _firstWriteRedirects = new();
+
     /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
     /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
     /// the backward is all-specialized, pooled, or has no such buffer. Entries are cleared by
@@ -3271,6 +3275,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.IDirectGpuBackend backend)
     {
+        // Lend this plan's first-write redirects to the engine for the body only: the eager optimizer, evaluation and
+        // any other plan on the engine never see them.
+        var redirectEngine = _engine as Engines.DirectGpuTensorEngine;
+        if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = _firstWriteRedirects;
+        try { RunGpuStepBodyForCaptureCore(backend); }
+        finally { if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null; }
+    }
+
+    private void RunGpuStepBodyForCaptureCore(Engines.DirectGpu.IDirectGpuBackend backend)
+    {
         var engine = _engine;
         // Stream capture exists only on CUDA; every other backend runs this body uncaptured.
         var cb = backend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } capture ? capture : null;
@@ -3485,6 +3499,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         var engine = _engine;
         _gradHeldZero = null;   // the eager step writes gradient buffers outside the captured body's record
+        _firstWriteRedirects.Clear();
         // #226 race fix: a compiled training step is ATOMIC — every forward activation it
         // caches is consumed by its own backward. Suspend the engine's mid-step activation
         // eviction for the duration of the step so the within-step VRAM-pressure offload
