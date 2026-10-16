@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.139.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.138.1...v0.139.0) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **gpu-sparse:** AiDotNet.Tensors.Engines.DirectGpu.CUDA.CuSparse is removed; use CpuSparseDeviceOps, which it always delegated to.
+
+### Features
+
+* **#1265:** cuBLAS optional — every CUDA GEMM falls back to generated kernels (FP32/FP16/BF16/FP64); native-library inventory ([#1316](https://github.com/ooples/AiDotNet.Tensors/issues/1316)) ([01d8a7f](https://github.com/ooples/AiDotNet.Tensors/commit/01d8a7fe5685e11002650923d52bcc384c7f7a48))
+
+
+### Bug Fixes
+
+* **compile:** a training-mode BatchNorm no longer blocks whole-step CUDA-graph capture ([#1327](https://github.com/ooples/AiDotNet.Tensors/issues/1327)) ([1eaf48a](https://github.com/ooples/AiDotNet.Tensors/commit/1eaf48a083a0b329d9121fc9c247603449c45577))
+* **cuda-conv:** resolve duplicate TryConv2DBackwardKernelImplicitGemm (CS0111 on main) ([#1329](https://github.com/ooples/AiDotNet.Tensors/issues/1329)) ([9a58451](https://github.com/ooples/AiDotNet.Tensors/commit/9a5845190f4c5b369032f98230b65eadd6444a4e)), closes [#1328](https://github.com/ooples/AiDotNet.Tensors/issues/1328)
+* **gpu:** clamp the decode-linear gelu tanh argument so vulkan returns no nan ([#1318](https://github.com/ooples/AiDotNet.Tensors/issues/1318)) ([6489db1](https://github.com/ooples/AiDotNet.Tensors/commit/6489db11cf44339bec75632984dc1d0af045e987))
+* **gpu:** eager results own their device buffer, so dispose returns it to the pool ([#1324](https://github.com/ooples/AiDotNet.Tensors/issues/1324)) ([0726bf6](https://github.com/ooples/AiDotNet.Tensors/commit/0726bf6c8b1d9f56179f38970385232fa0c00f0c)), closes [#1302](https://github.com/ooples/AiDotNet.Tensors/issues/1302)
+* **hip:** batched gemm launch bounds and deformable conv backward argument order ([#1342](https://github.com/ooples/AiDotNet.Tensors/issues/1342)) ([b46835d](https://github.com/ooples/AiDotNet.Tensors/commit/b46835da21792bc7ff37cbd16a4ec0e0b9636ba1))
+* **hip:** gemm beta-zero nan, variance layout, fast-math nan, dropout and reciprocal gradients ([#1346](https://github.com/ooples/AiDotNet.Tensors/issues/1346)) ([f3a0b6c](https://github.com/ooples/AiDotNet.Tensors/commit/f3a0b6c4c312fc63e9fcf6b404e3e4ee05424d68))
+* **metal:** make five shader libraries compile with Apple's compiler, and check all of them ([#1299](https://github.com/ooples/AiDotNet.Tensors/issues/1299)) ([490f969](https://github.com/ooples/AiDotNet.Tensors/commit/490f9694571dfd047cdc685810f867a8cdd773ce))
+
+
+### Performance
+
+* **#1265:** strict-FP32 cp.async SGEMM + tuned per-shape routing of CUDA Gemm where it beats cuBLAS ([#1310](https://github.com/ooples/AiDotNet.Tensors/issues/1310)) ([ccba3fd](https://github.com/ooples/AiDotNet.Tensors/commit/ccba3fd119a7bd40da0062b755f613fe098327f9))
+* **#1321:** GEMM routing measures and follows separate eager and CUDA-graph verdicts ([#1322](https://github.com/ooples/AiDotNet.Tensors/issues/1322)) ([7a27b7c](https://github.com/ooples/AiDotNet.Tensors/commit/7a27b7cc4dd5bb7e6ee74329f4ff42258536075a))
+* **#436:** fused CPU MLP/MHA/LSTM inference beat PyTorch's best settings by 2.4-2.9x (real PyTorch, paired rounds) ([#1332](https://github.com/ooples/AiDotNet.Tensors/issues/1332)) ([9ff5279](https://github.com/ooples/AiDotNet.Tensors/commit/9ff5279c418ab880618bb54ae6b1099e8a7a128d))
+* **autodiff:** direct per-head attention, vectorized softmax for the fused mha node ([#1320](https://github.com/ooples/AiDotNet.Tensors/issues/1320)) ([8b47413](https://github.com/ooples/AiDotNet.Tensors/commit/8b4741356f3ee1691ea6c9ea7fb90b28129ee4bd))
+* **autodiff:** fused float multi-head attention backward as one tape node ([#1307](https://github.com/ooples/AiDotNet.Tensors/issues/1307)) ([93679cf](https://github.com/ooples/AiDotNet.Tensors/commit/93679cf95072aa37e883a0da23dc824888285946))
+* **compile:** plain SGD takes the one-launch, device-guarded multi-tensor path ([#1338](https://github.com/ooples/AiDotNet.Tensors/issues/1338)) ([1696304](https://github.com/ooples/AiDotNet.Tensors/commit/1696304b322822d5ee2fbb6ee851cce5311b0c54))
+* **compile:** shared-operand matmul backward accumulates in place, column-bias broadcast without a materialized result ([#1303](https://github.com/ooples/AiDotNet.Tensors/issues/1303)) ([83782c4](https://github.com/ooples/AiDotNet.Tensors/commit/83782c451c274d1af0145d09b86f43043c8e9ab2))
+* **conv:** parallel implicit-gemm conv; route k&gt;512 large-spatial convs to it ([#1305](https://github.com/ooples/AiDotNet.Tensors/issues/1305)) ([193e1ac](https://github.com/ooples/AiDotNet.Tensors/commit/193e1ac74979d9ac558fd9741e20c6a24459e44d))
+* **cpu:** default the parallel width to physical cores, like pytorch ([#1333](https://github.com/ooples/AiDotNet.Tensors/issues/1333)) ([e431cf6](https://github.com/ooples/AiDotNet.Tensors/commit/e431cf63bc4937381bf9738c91dd100c760ba5ac))
+* **cpu:** training-step gemm routing and lstm backward vs pytorch ([#1330](https://github.com/ooples/AiDotNet.Tensors/issues/1330)) ([d4e7352](https://github.com/ooples/AiDotNet.Tensors/commit/d4e7352c0ba71c0abfa1615f9e23a99a80e4f75d))
+* **cuda-conv:** implicit-GEMM conv engine (forward + backward) with per-shape tuned routing ([#1336](https://github.com/ooples/AiDotNet.Tensors/issues/1336)) ([6c7df8f](https://github.com/ooples/AiDotNet.Tensors/commit/6c7df8f52c6d978a2a6ed85494b0e062feb7124d))
+* **cuda-conv:** implicit-GEMM Conv2D backward (weight and input gradients) without im2col ([#1323](https://github.com/ooples/AiDotNet.Tensors/issues/1323)) ([614981a](https://github.com/ooples/AiDotNet.Tensors/commit/614981a8734b76046e081fac4ab86ed38f476dad))
+* **cuda-conv:** tensor-core mainloops (3xTF32, opt-in TF32) as measured conv-engine candidates ([#1344](https://github.com/ooples/AiDotNet.Tensors/issues/1344)) ([bc58001](https://github.com/ooples/AiDotNet.Tensors/commit/bc5800154c09beaeff326efda063ffaebf22d4d7))
+* **cuda:** LSTM and Transformer training - GEMM-form LSTM, fused attention node, sync-free compiled step ([#1274](https://github.com/ooples/AiDotNet.Tensors/issues/1274)) ([4e9f54a](https://github.com/ooples/AiDotNet.Tensors/commit/4e9f54a9311be0260b84a63831958fb7a501a2e3))
+* **gemm:** split-k and tall-m routes for backward-pass gemms ([#1319](https://github.com/ooples/AiDotNet.Tensors/issues/1319)) ([c3cee65](https://github.com/ooples/AiDotNet.Tensors/commit/c3cee65dd01482fb8391481849b0022019498b68))
+* **gpu:** BatchNorm converts its saved statistic in one launch each way and skips the dead running-stat fills ([#1340](https://github.com/ooples/AiDotNet.Tensors/issues/1340)) ([a6e092f](https://github.com/ooples/AiDotNet.Tensors/commit/a6e092f8afaa305f0e0c46df93676cf541e6d9f8))
+* **hip:** run clblast's indirect gemm from 64, not from opencl's 448 ([#1334](https://github.com/ooples/AiDotNet.Tensors/issues/1334)) ([7214c57](https://github.com/ooples/AiDotNet.Tensors/commit/7214c5738db168dc8e270c50878b7c072821c49c)), closes [#1266](https://github.com/ooples/AiDotNet.Tensors/issues/1266)
+* parallel cpu adam and hash-encoding capture in training traces ([#1341](https://github.com/ooples/AiDotNet.Tensors/issues/1341)) ([381fffc](https://github.com/ooples/AiDotNet.Tensors/commit/381fffc69a97bb43146d5267b1c0214719e31118))
+* **parity:** fp32 PyTorch side, multi-tensor SGD, ResNet-18 CUDA baseline ([#1317](https://github.com/ooples/AiDotNet.Tensors/issues/1317)) ([a24c082](https://github.com/ooples/AiDotNet.Tensors/commit/a24c08283b7b8f609f08008923581a7a02034a4f))
+* **ptx:** direct-PTX FP32 CSR SpMM (experimental) + [#852](https://github.com/ooples/AiDotNet.Tensors/issues/852) sparse coverage manifest ([#1312](https://github.com/ooples/AiDotNet.Tensors/issues/1312)) ([f2dc89c](https://github.com/ooples/AiDotNet.Tensors/commit/f2dc89ca36a0e90a2704fad9c16eb4d25adc96d5))
+
+
+### Refactoring
+
+* **gpu-sparse:** remove cuSPARSE from the library ([#1308](https://github.com/ooples/AiDotNet.Tensors/issues/1308)) ([beb11dc](https://github.com/ooples/AiDotNet.Tensors/commit/beb11dc91042ac8ac9b99e5f927387ebb161f840))
+
 ## [0.138.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.138.0...v0.138.1) (2026-10-14)
 
 
