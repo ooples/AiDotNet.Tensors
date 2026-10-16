@@ -113,6 +113,27 @@ public sealed class HipClBlastIndirectGemmTests : IClassFixture<HipBackendTestFi
         // Below MinIndirectSize the threshold is decided from the database alone: no CLBlast module is compiled.
         Assert.False(backend.ClBlastModulesAttempted);
     }
+    /// <summary>#377: on RDNA1 the indirect path's default is the measured RDNA1 configuration, which builds and matches
+    /// the reference; elsewhere it is the database's.</summary>
+    [SkippableFact]
+    public void DefaultConfiguration_IsTheRdnaOneConfiguration_OnRdnaOne_AndStaysCorrect()
+    {
+        Skip.IfNot(EnsureReady(), "HIP device with the CLBlast indirect GEMM and no hipBLAS is required.");
+        Assert.True(ClBlastXgemmDatabase.TryGetConfig(Backend.ClBlastDevice, out var database));
+        var expected = Backend.RowMajorGemmTableApplies ? HipBackend.RdnaOneClBlastDefault(database) : database;
+        Assert.Equal(expected, Backend.ClBlastDefaultConfig);
+        Assert.True(HipClBlastGemmKernels.Supports(HipBackend.RdnaOneClBlastDefault(database)));
+        const int m = 300, n = 520, k = 270;
+        var (a, b, c0) = Inputs(m, n, k, seed: 41);
+        using var ga = Backend.AllocateBuffer(a);
+        using var gb = Backend.AllocateBuffer(b);
+        using var gc = Backend.AllocateBuffer(c0);
+        long before = Backend.ClBlastIndirectGemmRuns;
+        Backend.Gemm(ga, gb, gc, m, n, k, 1f, 0.5f);
+        Assert.Equal(before + 1, Backend.ClBlastIndirectGemmRuns);
+        AssertMatches(Backend.DownloadBuffer(gc), a, b, c0, m, n, k, 1f, 0.5f);
+    }
+
     [SkippableFact]
     public void DeployedConfiguration_RunsItsShape_AndLeavesOtherShapesOnTheDatabaseConfiguration()
     {

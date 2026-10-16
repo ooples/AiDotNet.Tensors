@@ -180,6 +180,41 @@ public sealed class HipVendorGemmComparisonTests
         }
     }
 
+    /// <summary>The CLBlast database default against the configuration the per-shape evolution converged on for large
+    /// shapes (64x64 tiles, 8x8 threads, VWM 1 / VWN 4, MDIMA/NDIMB 16), and hipBLAS, on the same buffers.</summary>
+    [SkippableFact]
+    [Trait("Category", "HardwareProof")]
+    public void ClBlastDefault_VersusConvergedConfig_Measured()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable(ProofEnvironmentVariable), "1", StringComparison.Ordinal),
+            $"Set {ProofEnvironmentVariable}=1 to run the hipBLAS comparison.");
+        using var backend = new HipBackend();
+        Skip.IfNot(backend.IsAvailable && backend.EnsureClBlastIndirectGemm(), "A HIP device with the CLBlast indirect GEMM is required.");
+        Assert.True(AiDotNet.Tensors.Engines.DirectGpu.OpenCL.ClBlastXgemmDatabase.TryGetConfig(backend.ClBlastDevice, out var database));
+        var converged = HipBackend.RdnaOneClBlastDefault(database);
+        _output.WriteLine($"database: {database}");
+        bool vendor = backend.IsHipBlasAvailable;
+        _output.WriteLine("M x N x K | hipBLAS ms | database ms | converged ms | converged / database");
+        foreach (var s in new[] { new[] { 512, 512, 512 }, new[] { 1024, 1024, 1024 }, new[] { 2048, 2048, 2048 }, new[] { 1024, 4096, 1024 },
+                     new[] { 1024, 1024, 4096 }, new[] { 4096, 1024, 1024 }, new[] { 768, 3072, 768 }, new[] { 1536, 1536, 1536 } })
+        {
+            int m = s[0], n = s[1], k = s[2];
+            float[] a = Values(m * k, 11), b = Values(k * n, 23);
+            using var ga = backend.AllocateBuffer(a);
+            using var gb = backend.AllocateBuffer(b);
+            using var gc = backend.AllocateBuffer(new float[m * n]);
+            using var gr = backend.AllocateBuffer(new float[m * n]);
+            double vendorMs = vendor ? Time(() => Assert.True(backend.TryExecuteHipBlasGemm(ga, gb, gr, m, n, k, 1f, 0f))) : double.NaN;
+            double dbMs = Time(() => { Assert.True(backend.TryExecuteClBlastIndirectGemm(database, ga, gb, gc, m, n, k)); backend.Synchronize(); });
+            float[] dbOut = backend.DownloadBuffer(gc);
+            double cvMs = Time(() => { Assert.True(backend.TryExecuteClBlastIndirectGemm(converged, ga, gb, gc, m, n, k)); backend.Synchronize(); });
+            float[] cvOut = backend.DownloadBuffer(gc);
+            double diff = 0; for (int i = 0; i < dbOut.Length; i++) diff = Math.Max(diff, Math.Abs(dbOut[i] - cvOut[i]));
+            Assert.True(diff <= 1e-3 * Math.Sqrt(k), $"{m}x{n}x{k}: configurations disagree by {diff:E2}");
+            _output.WriteLine($"{m} x {n} x {k} | {vendorMs:F3} | {dbMs:F3} | {cvMs:F3} | {cvMs / dbMs:F2}");
+        }
+    }
+
     private static double Time(Action gemm)
     {
         for (int i = 0; i < 3; i++) gemm();

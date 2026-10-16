@@ -93,10 +93,24 @@ public sealed partial class HipBackend
             var device = ClBlastDevice;
             if (!IsAvailable || !ClBlastXgemmDatabase.TryGetConfig(device, out GemmConfig config) || !EnsureClBlastPacking(device))
                 return false;
+            if (RowMajorGemmTableApplies) config = RdnaOneClBlastDefault(config);
             _clblastDefault = BuildClBlastVariant(config, HipClBlastGemmKernels.IndirectKernelName);
             return _clblastDefault is not null;
         }
     }
+
+    /// <summary>
+    /// #377: the configuration per-shape evolution converged on for large GEMMs on RDNA1 (RX 5500 XT): the database's
+    /// 64x64x16 tiles and 8x8 threads with vector widths 1 x 4 (database 4 x 4) and MDIMA/NDIMB 16 x 16 (database 16 x 8).
+    /// Measured against the database configuration on the same buffers (ms): 512^3 0.378 -> 0.223, 1024^3 0.945 -> 0.820,
+    /// 1536^3 2.660 -> 2.296, 2048^3 6.005 -> 5.275, 1024x4096x1024 2.893 -> 2.535, 1024x1024x4096 3.469 -> 2.963
+    /// (hipBLAS 2.904), 4096x1024x1024 3.373 -> 2.957, 768x3072x768 1.324 -> 1.148.
+    /// </summary>
+    internal static GemmConfig RdnaOneClBlastDefault(GemmConfig database) => database with
+    {
+        TileM = 64, TileN = 64, TileK = 16, ThreadTileM = 8, ThreadTileN = 8, VectorWidthM = 1, VectorWidthN = 4,
+        KReg = 1, KUnroll = 2, StrideM = true, StrideN = true, CacheA = true, CacheB = true, MdimaSize = 16, NdimbSize = 16
+    };
 
     /// <summary>
     /// The compiled variant for <paramref name="config"/>, building it (and the packing kernels) on first use. Null when
