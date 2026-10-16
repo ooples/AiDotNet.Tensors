@@ -1267,7 +1267,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Narrow row-major GEMMs (TrySkinnyGemm / TrySkinnyGemmTransposedA), tried before cuBLAS.
         _skinnyGemmModule = CompileKernelModule(device, Kernels.CudaSkinnyGemmKernels.GetSource(), "skinny_gemm_kernels",
             Kernels.CudaSkinnyGemmKernels.GetKernelNames());
-        // Narrow convolutions as an implicit GEMM (TryConv2DImplicitGemm), tried before the tuned/generic kernels.
+        // Narrow convolutions as an implicit GEMM (TryConv2DImplicitGemm), a candidate of the forward tuned-kernel slot.
         _implicitConvModule = CompileKernelModule(device, Kernels.CudaImplicitConvKernels.GetSource(), "implicit_conv_kernels",
             Kernels.CudaImplicitConvKernels.GetKernelNames());
 
@@ -6725,9 +6725,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _profile = CudaDispatchPolicy.Scope(
             "Conv2D",
             useVendor: false);
-        if (TryConv2DImplicitGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
-                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
-            return;
         // Tuned-kernel registry seam (#1096 E-1): the generic Winograd/tiled/direct dispatch below is the
         // reference; im2col + cuBLAS GEMM and the explicit tiled/direct kernels compete per shape class.
         if (batch > 0 && outHeight > 0 && outWidth > 0)
@@ -7043,9 +7040,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        // #1325: per-shape route through the tuned-kernel slot; the fixed chain below when the slot has none.
+        if (batch > 0 && outHeight > 0 && outWidth > 0)
+        {
+            var tuned = new CudaConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (Conv2DBackwardDataSlot.TryExecute(tuned.Shape(), tuned)) return;
+        }
         if (TryConv2DBackwardInputGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             return;
+        LaunchConv2DBackwardInputDirect(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    private unsafe void LaunchConv2DBackwardInputDirect(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
         if (!_kernelCache.TryGetValue("conv2d_backward_input", out var cudaKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_backward_input");
 
@@ -7087,9 +7099,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        // #1325: per-shape route through the tuned-kernel slot; the fixed chain below when the slot has none.
+        if (batch > 0 && outHeight > 0 && outWidth > 0)
+        {
+            var tuned = new CudaConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (Conv2DBackwardFilterSlot.TryExecute(tuned.Shape(), tuned)) return;
+        }
         if (TryConv2DBackwardKernelGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             return;
+        LaunchConv2DBackwardKernelDirect(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    private unsafe void LaunchConv2DBackwardKernelDirect(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
         if (!_kernelCache.TryGetValue("conv2d_backward_kernel", out var cudaKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: conv2d_backward_kernel");
 

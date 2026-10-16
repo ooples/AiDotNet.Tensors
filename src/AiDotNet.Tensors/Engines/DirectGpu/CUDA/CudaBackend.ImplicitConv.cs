@@ -13,6 +13,22 @@ public sealed partial class CudaBackend
     private const int ImplicitConvTilePixels = 64, ImplicitConvTileChannels = 32, ImplicitConvThreads = 64;
 
     /// <summary>
+    /// The shapes conv2d_implicit_gemm takes: at most 64 output channels and a reduction (inChannels * kH * kW) from 32
+    /// to 2048 over at least 1024 output pixels. Shared by <see cref="TryConv2DImplicitGemm"/> and its tuned-slot
+    /// applicability.
+    /// </summary>
+    private static bool ImplicitConvAdmits(int batch, int inChannels, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int dilationH, int dilationW)
+    {
+        long pixels = (long)batch * outHeight * outWidth;
+        long reduction = (long)inChannels * kernelH * kernelW;
+        return ImplicitConvEnabled && batch > 0 && outHeight > 0 && outWidth > 0 && outChannels > 0
+            && outChannels <= 64 && reduction >= 32 && reduction <= 2048 && pixels >= 1024
+            && (pixels + ImplicitConvTilePixels - 1) / ImplicitConvTilePixels <= int.MaxValue
+            && strideH >= 1 && strideW >= 1 && dilationH >= 1 && dilationW >= 1;
+    }
+
+    /// <summary>
     /// Conv2D forward through conv2d_implicit_gemm for a layer with at most 64 output channels and a reduction
     /// (inChannels * kH * kW) from 32 to 2048 over at least 1024 output pixels -- the shapes where the im2col route
     /// spent as long writing the im2col matrix as multiplying it. False -- nothing launched -- otherwise.
@@ -22,11 +38,8 @@ public sealed partial class CudaBackend
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
     {
         long pixels = (long)batch * outHeight * outWidth;
-        long reduction = (long)inChannels * kernelH * kernelW;
-        if (!ImplicitConvEnabled || !IsAvailable || batch <= 0 || outHeight <= 0 || outWidth <= 0 || outChannels <= 0
-            || outChannels > 64 || reduction < 32 || reduction > 2048 || pixels < 1024
-            || (pixels + ImplicitConvTilePixels - 1) / ImplicitConvTilePixels > int.MaxValue
-            || strideH < 1 || strideW < 1 || dilationH < 1 || dilationW < 1
+        if (!IsAvailable || !ImplicitConvAdmits(batch, inChannels, outChannels, outHeight, outWidth, kernelH, kernelW,
+                strideH, strideW, dilationH, dilationW)
             || !_kernelCache.TryGetValue("conv2d_implicit_gemm", out var implicitKernel))
             return false;
         using var _ = PushContext();

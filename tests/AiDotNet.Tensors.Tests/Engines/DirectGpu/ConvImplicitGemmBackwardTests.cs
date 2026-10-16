@@ -39,10 +39,17 @@ public sealed class ConvImplicitGemmBackwardTests
         new object[] { 3, 70, 9, 9, 48, 3, 3, 3, 3, 2, 2, 1, 1 },        // phase path: stride 3 (9 phases), Cin not a tile multiple
     };
 
+    /// <summary>
+    /// Every shape through each route: the #1325 engine, #1323's implicit GEMM, and the public API (the tuned slot's
+    /// pick, so the candidate it measures fastest is checked too).
+    /// </summary>
+    public static System.Collections.Generic.IEnumerable<object[]> ShapesAllRoutes() =>
+        Shapes().SelectMany(s => new[] { "engine", "implicit", "public" }.Select(r => s.Concat(new object[] { r }).ToArray()));
+
     [SkippableTheory]
-    [MemberData(nameof(Shapes))]
+    [MemberData(nameof(ShapesAllRoutes))]
     public void WeightGradient_MatchesFloat64ReferenceAndIsBitReproducible(
-        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, string route)
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
@@ -61,8 +68,15 @@ public sealed class ConvImplicitGemmBackwardTests
         using var dDy = backend.AllocateBuffer(dy);
         using var dW1 = backend.AllocateBuffer(outC * p);
         using var dW2 = backend.AllocateBuffer(outC * p);
-        backend.Conv2DBackwardKernel(dX, dDy, dW1, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
-        backend.Conv2DBackwardKernel(dX, dDy, dW2, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+        foreach (var target in new[] { dW1, dW2 })
+        {
+            var a = new CudaConv2DBackwardArgs(dX, dDy, target, true, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+            if (route == "public")
+                backend.Conv2DBackwardKernel(dX, dDy, target, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+            else
+                Assert.True(route == "engine" ? backend.Conv2DBackwardKernelViaEngine(a) : backend.Conv2DBackwardKernelViaImplicit(a),
+                    $"the {route} route declined the shape");
+        }
         backend.Synchronize();
         float[] got = backend.DownloadBuffer(dW1), again = backend.DownloadBuffer(dW2);
 
@@ -102,9 +116,9 @@ public sealed class ConvImplicitGemmBackwardTests
     }
 
     [SkippableTheory]
-    [MemberData(nameof(Shapes))]
+    [MemberData(nameof(ShapesAllRoutes))]
     public void InputGradient_MatchesFloat64ReferenceAndIsBitReproducible(
-        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, string route)
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
@@ -151,8 +165,17 @@ public sealed class ConvImplicitGemmBackwardTests
         for (int i = 0; i < poison.Length; i++) poison[i] = float.NaN;
         using var dX1 = backend.AllocateBuffer(poison);
         using var dX2 = backend.AllocateBuffer(poison);
-        backend.Conv2DBackwardInput(dDy, dWt, dX1, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
-        backend.Conv2DBackwardInput(dDy, dWt, dX2, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+        // The engine's input gradient takes Cout % 8 == 0 only; #1323's kernels cover the rest.
+        Skip.If(route == "engine" && outC % 8 != 0, "the engine input gradient needs Cout % 8 == 0");
+        foreach (var target in new[] { dX1, dX2 })
+        {
+            var a = new CudaConv2DBackwardArgs(dDy, dWt, target, false, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+            if (route == "public")
+                backend.Conv2DBackwardInput(dDy, dWt, target, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+            else
+                Assert.True(route == "engine" ? backend.Conv2DBackwardInputViaEngine(a) : backend.Conv2DBackwardInputViaImplicit(a),
+                    $"the {route} route declined the shape");
+        }
         backend.Synchronize();
         float[] got = backend.DownloadBuffer(dX1), again = backend.DownloadBuffer(dX2);
 
@@ -205,8 +228,10 @@ public sealed class ConvImplicitGemmBackwardTests
         float[] Fill(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
         double Median(List<double> v) { var o = v.OrderBy(x => x).ToList(); return o[o.Count / 2]; }
 
-        double[] totMin = new double[4], totMed = new double[4];   // dW implicit, dW im2col, dX implicit, dX im2col
-        _out.WriteLine("layer                    x  | dW implicit min/med | dW im2col min/med | dX implicit min/med | dX col2im min/med  (us per call)");
+        // Arms: dW via the #1325 engine / #1323 implicit / im2col, then dX via the same three.
+        string[] arms = { "dW engine", "dW #1323", "dW im2col", "dX engine", "dX #1323", "dX col2im" };
+        double[] totMin = new double[6], totMed = new double[6];
+        _out.WriteLine("layer                    x  | " + string.Join(" | ", arms.Select(a => $"{a,19}")) + "  (us per call, min / median)");
         foreach (var l in layers)
         {
             int outHw = (l.Hw + 2 * l.P - l.K) / l.S + 1;
@@ -215,20 +240,28 @@ public sealed class ConvImplicitGemmBackwardTests
             using var w = backend.AllocateBuffer(Fill(l.OutC * l.InC * l.K * l.K));
             using var dw = backend.AllocateBuffer(l.OutC * l.InC * l.K * l.K);
             using var dx = backend.AllocateBuffer(batch * l.InC * l.Hw * l.Hw);
-            var samples = new[] { new List<double>(), new List<double>(), new List<double>(), new List<double>() };
+            var samples = arms.Select(_ => new List<double>()).ToArray();
             for (int r = 0; r < rounds; r++)
             {
-                for (int arm = 0; arm < 4; arm++)
+                for (int arm = 0; arm < arms.Length; arm++)
                 {
-                    bool implicitPath = arm % 2 == 0, input = arm >= 2;
+                    int path = arm % 3;
+                    bool input = arm >= 3;
                     if (input && !l.NeedsDx) continue;
-                    backend.UseImplicitConvWgrad = backend.UseImplicitConvDgrad = implicitPath;
+                    var da = new CudaConv2DBackwardArgs(dy, w, dx, false, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
+                    var wa = new CudaConv2DBackwardArgs(x, dy, dw, true, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
                     void Call()
                     {
-                        if (input)
-                            backend.Conv2DBackwardInput(dy, w, dx, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
-                        else
-                            backend.Conv2DBackwardKernel(x, dy, dw, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
+                        bool ran = (input, path) switch
+                        {
+                            (false, 0) => backend.Conv2DBackwardKernelViaEngine(wa),
+                            (false, 1) => backend.Conv2DBackwardKernelViaImplicit(wa),
+                            (false, _) => backend.Conv2DBackwardKernelViaIm2col(wa),
+                            (true, 0) => backend.Conv2DBackwardInputViaEngine(da),
+                            (true, 1) => backend.Conv2DBackwardInputViaImplicit(da),
+                            _ => backend.Conv2DBackwardInputViaCol2im(da),
+                        };
+                        Assert.True(ran, $"{arms[arm]} declined {l.Name}");
                     }
                     Call();
                     backend.Synchronize();
@@ -238,18 +271,17 @@ public sealed class ConvImplicitGemmBackwardTests
                     if (r > 0) samples[arm].Add(sw.Elapsed.TotalMilliseconds * 1000.0 / burst);
                 }
             }
-            backend.UseImplicitConvWgrad = backend.UseImplicitConvDgrad = true;
             string Cell(int arm)
             {
-                if (samples[arm].Count == 0) return "         -         ";
+                if (samples[arm].Count == 0) return $"{"-",19}";
                 double mn = samples[arm].Min(), md = Median(samples[arm]);
                 totMin[arm] += l.Count * mn; totMed[arm] += l.Count * md;
                 return $"{mn,8:F1} / {md,8:F1}";
             }
-            _out.WriteLine($"{l.Name,-22} {l.Count,2}  | {Cell(0)} | {Cell(1)} | {Cell(2)} | {Cell(3)}");
+            _out.WriteLine($"{l.Name,-22} {l.Count,2}  | " + string.Join(" | ", Enumerable.Range(0, arms.Length).Select(Cell)));
         }
-        _out.WriteLine($"step total (weighted)       | {totMin[0],8:F1} / {totMed[0],8:F1} | {totMin[1],8:F1} / {totMed[1],8:F1} | {totMin[2],8:F1} / {totMed[2],8:F1} | {totMin[3],8:F1} / {totMed[3],8:F1}");
-        _out.WriteLine($"conv backward per step: implicit {(totMin[0] + totMin[2]) / 1000:F3} ms min, {(totMed[0] + totMed[2]) / 1000:F3} ms median; " +
-                       $"im2col {(totMin[1] + totMin[3]) / 1000:F3} ms min, {(totMed[1] + totMed[3]) / 1000:F3} ms median");
+        _out.WriteLine("step total (weighted)       | " + string.Join(" | ", Enumerable.Range(0, arms.Length).Select(a => $"{totMin[a],8:F1} / {totMed[a],8:F1}")));
+        _out.WriteLine($"conv backward per step (min): engine {(totMin[0] + totMin[3]) / 1000:F3} ms, #1323 {(totMin[1] + totMin[4]) / 1000:F3} ms, " +
+                       $"im2col {(totMin[2] + totMin[5]) / 1000:F3} ms");
     }
 }
