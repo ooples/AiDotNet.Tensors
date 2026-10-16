@@ -47,6 +47,8 @@ public class CompiledConvBnGraphStepTests : IDisposable
         public double[] Losses = Array.Empty<double>();
         public float[][] FinalWeights = Array.Empty<float[]>();
         public bool ReplayedAGraph;
+        public string[] StepNames = Array.Empty<string>();
+        public float[][] Statistics = Array.Empty<float[]>();
     }
 
     private static Run Train(IEngine engine, bool onDevice)
@@ -65,12 +67,14 @@ public class CompiledConvBnGraphStepTests : IDisposable
         if (onDevice) foreach (var p in parameters) p.Gpu();
 
         ICompiledTrainingPlan<float> plan;
+        Tensor<float>[] statistics;
         using (var scope = GraphMode.EnableTraining(parameters))
         {
             var h = engine.FusedConv2D(x, w1, null, 1, 1, 1, 1, 1, 1, FusedActivationType.None);
-            h = engine.ReLU(engine.BatchNorm(h, g1, b1, 1e-5, out _, out _));
+            h = engine.ReLU(engine.BatchNorm(h, g1, b1, 1e-5, out var mean1, out var variance1));
             h = engine.FusedConv2D(h, w2, null, 1, 1, 1, 1, 1, 1, FusedActivationType.None);
-            h = engine.ReLU(engine.TensorAdd(engine.BatchNorm(h, g2, b2, 1e-5, out _, out _), x));
+            h = engine.ReLU(engine.TensorAdd(engine.BatchNorm(h, g2, b2, 1e-5, out var mean2, out var variance2), x));
+            statistics = new[] { mean1, variance1, mean2, variance2 };
             engine.TensorMSELoss(engine.ReduceMean(h, new[] { 2, 3 }, keepDims: false), y);
             plan = scope.CompileTraining(parameters);
         }
@@ -86,9 +90,18 @@ public class CompiledConvBnGraphStepTests : IDisposable
                 run.Losses[s] = plan.Step().ToArray()[0];
             }
             run.FinalWeights = parameters.Select(p => p.ToArray()).ToArray();
+            // The batch mean and variance the BatchNorms hand out (on the GPU plan, written by the fused nodes in place
+            // of the statistic nodes they absorbed), after the last step: what a running-statistics update outside the
+            // graph would read.
+            run.Statistics = statistics.Select(s => s.ToArray()).ToArray();
             if (plan is CompiledTrainingPlan<float> concrete)
+            {
                 run.ReplayedAGraph = (IntPtr)typeof(CompiledTrainingPlan<float>)
                     .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)! != IntPtr.Zero;
+                var steps = (CompiledStep<float>[]?)typeof(CompiledTrainingPlan<float>)
+                    .GetField("_forwardSteps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete);
+                run.StepNames = steps?.Select(s => s.OpName).ToArray() ?? Array.Empty<string>();
+            }
             return run;
         }
     }
@@ -120,6 +133,14 @@ public class CompiledConvBnGraphStepTests : IDisposable
             _output.WriteLine("losses captured: " + string.Join(", ", captured.Losses.Select(l => l.ToString("G7"))));
 
             Assert.True(captured.ReplayedAGraph, "the plan is not replaying a graph after warm-up");
+            // The GPU plan fuses the first BatchNorm with its ReLU (BatchNormReluFusionPattern) and the second with the
+            // residual add and the ReLU after it (BatchNormAddReluFusionPattern); the CPU plan fuses neither.
+            _output.WriteLine("captured steps: " + string.Join(", ", captured.StepNames));
+            Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNormReLU"));
+            Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNormAddReLU"));
+            Assert.DoesNotContain("BatchNorm", captured.StepNames);
+            Assert.DoesNotContain("BatchNormReLU", reference.StepNames);
+            Assert.DoesNotContain("BatchNormAddReLU", reference.StepNames);
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(reference.Losses[s] - captured.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(reference.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G7} != cpu {reference.Losses[s]:G7}");
@@ -130,11 +151,21 @@ public class CompiledConvBnGraphStepTests : IDisposable
                     maxErr = Math.Max(maxErr, Math.Abs(reference.FinalWeights[p][i] - captured.FinalWeights[p][i]));
                 Assert.True(maxErr <= 1e-4, $"parameter {p}: max |captured - cpu| {maxErr:E2} after {Steps} steps");
             }
-            // Measured on an RTX 3080: 2 memset and 3 memcpy nodes (the loss mean's output, the loss seed, and the residual
-            // add's gradient handed to both of its inputs). Before, this graph carried 24 memset and 13 memcpy nodes.
+            // The batch statistics: mean1, variance1 (biased, the engine's contract), mean2, variance2, as the CPU plan's.
+            string[] statisticNames = { "mean1", "variance1", "mean2", "variance2" };
+            for (int s = 0; s < reference.Statistics.Length; s++)
+            {
+                double maxErr = 0;
+                for (int i = 0; i < reference.Statistics[s].Length; i++)
+                    maxErr = Math.Max(maxErr, Math.Abs(reference.Statistics[s][i] - captured.Statistics[s][i])
+                                              / Math.Max(1.0, Math.Abs(reference.Statistics[s][i])));
+                Assert.True(maxErr <= 1e-4, $"{statisticNames[s]}: max rel |captured - cpu| {maxErr:E2} after {Steps} steps");
+            }
+            // Measured on an RTX 3080: 2 memset nodes (the loss mean's output) and 1 memcpy (the loss seed). Before, this
+            // graph carried 24 memset and 13 memcpy nodes; the residual add's gradient copies went with the fused add.
             Assert.True(cuda.LastCaptureMemsetNodeCount <= 2,
                 $"{cuda.LastCaptureMemsetNodeCount} memset nodes in the captured step: a dead zero-fill came back");
-            Assert.True(cuda.LastCaptureMemcpyNodeCount <= 3,
+            Assert.True(cuda.LastCaptureMemcpyNodeCount <= 1,
                 $"{cuda.LastCaptureMemcpyNodeCount} memcpy nodes in the captured step: a first-write gradient copy came back");
         }
     }
