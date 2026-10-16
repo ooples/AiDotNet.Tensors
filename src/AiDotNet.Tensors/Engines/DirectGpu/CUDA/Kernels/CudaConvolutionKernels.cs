@@ -1638,10 +1638,15 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const int tid = threadIdx.x;
 
     // Column space: every pixel (PHASE = false) or the pixels of one phase.
-    int rh = 0, rw = 0, ih0 = 0, iw0 = 0, Hp = H, Wp = W, tapsH = kH, tapsW = kW;
+    // PHASE: blockIdx.z = phase * splits + split (splits = gridDim.z / (sH * sW)); each split takes a CE_BK-aligned K
+    // range of its phase's taps and writes a disjoint-pixel partial slice, summed in order afterwards when splits > 1.
+    int rh = 0, rw = 0, ih0 = 0, iw0 = 0, Hp = H, Wp = W, tapsH = kH, tapsW = kW, split = 0;
     if (PHASE)
     {
-        rh = blockIdx.z / sW; rw = blockIdx.z - rh * sW;
+        const int splits = gridDim.z / (sH * sW);
+        const int phase = blockIdx.z / splits;
+        split = blockIdx.z - phase * splits;
+        rh = phase / sW; rw = phase - rh * sW;
         ih0 = ((rh - pH) % sH + sH) % sH; iw0 = ((rw - pW) % sW + sW) % sW;
         Hp = ih0 < H ? (H - ih0 + sH - 1) / sH : 0; Wp = iw0 < W ? (W - iw0 + sW - 1) / sW : 0;
         tapsH = (kH - rh + sH - 1) / sH; tapsW = (kW - rw + sW - 1) / sW;
@@ -1649,8 +1654,7 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const int plane = Hp * Wp, N = batch * plane;
     if (n0 >= N) return;
     const int K = outC * tapsH * tapsW;
-    int kBegin = 0, kEnd = K;
-    if (!PHASE) { kBegin = blockIdx.z * kPerSplit; kEnd = min(K, kBegin + kPerSplit); }
+    const int kBegin = (PHASE ? split : (int)blockIdx.z) * kPerSplit, kEnd = min(K, kBegin + kPerSplit);
     const int tiles = kBegin < kEnd ? (kEnd - kBegin + CE_BK - 1) / CE_BK : 0;
 
     const int ak = tid & 7, am = tid >> 3;
@@ -1718,7 +1722,7 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
 
     using Map = CeMap<BM, BN, MAIN>;
     constexpr int VEC = Map::VEC;
-    float* slice = out + (PHASE ? 0LL : (long long)blockIdx.z * batch * inC * HW);
+    float* slice = out + (long long)(PHASE ? split : (int)blockIdx.z) * batch * inC * HW;
     const bool vec = !PHASE && (HW % VEC) == 0;
     #pragma unroll
     for (int jg = 0; jg < TN; jg += VEC)
