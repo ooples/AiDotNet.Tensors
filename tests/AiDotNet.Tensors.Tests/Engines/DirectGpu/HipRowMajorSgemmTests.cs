@@ -80,6 +80,8 @@ public sealed class HipRowMajorSgemmTests
     [InlineData(37, 53, 300, 7)]
     [InlineData(4096, 64, 1024, 2)]
     [InlineData(20, 20, 40, 8)]
+    [InlineData(256, 256, 2048, 8)]
+    [InlineData(256, 256, 2048, 1)]
     public void SplitK_MatchesCpu_WithAlphaBeta(int m, int n, int k, int splits)
     {
         using var backend = CreateBackend();
@@ -127,6 +129,36 @@ public sealed class HipRowMajorSgemmTests
         Assert.Equal(rowMajorExpected ? 1 : 0, backend.RowMajorGemmRuns - before);
         double error = MaxError(expected, backend.DownloadBuffer(gC));
         Assert.True(error <= 2e-6 * k + 1e-5, $"{m}x{n}x{k}: max error {error:E2}");
+    }
+
+    /// <summary>At a size the CPU reference would make slow, every tile's split-K result matches its own unsplit result
+    /// (same tile, so only the K split and the reduce differ).</summary>
+    [SkippableTheory]
+    [InlineData(1024, 1024, 1024)]
+    [InlineData(1024, 4096, 1024)]
+    public void SplitK_MatchesUnsplit_AtLargeSizes(int m, int n, int k)
+    {
+        using var backend = CreateBackend();
+        Skip.If(backend is null, "A HIP device is required.");
+        float[] a = Values(m * k, 31), b = Values(k * n, 37);
+        using var gA = backend.AllocateBuffer(a);
+        using var gB = backend.AllocateBuffer(b);
+        using var gRef = backend.AllocateBuffer(new float[m * n]);
+        using var gC = backend.AllocateBuffer(new float[m * n]);
+        var report = new System.Text.StringBuilder();
+        foreach (var tile in HipRowMajorSgemmKernels.Tiles)
+        {
+            if (!tile.Supports(m, n, k)) continue;
+            Assert.True(backend.TryExecuteRowMajorGemm(tile, gA, gB, gRef, m, n, k, 1f, 0f, 1));
+            float[] reference = backend.DownloadBuffer(gRef);
+            foreach (int split in new[] { 2, 4, 8 })
+            {
+                Assert.True(backend.TryExecuteRowMajorGemm(tile, gA, gB, gC, m, n, k, 1f, 0f, split));
+                double error = MaxError(reference, backend.DownloadBuffer(gC));
+                if (error > 1e-2) report.AppendLine($"{tile.KernelName} split {split}: max error {error:E2}");
+            }
+        }
+        Assert.True(report.Length == 0, report.ToString());
     }
 
     private static float[] Values(int count, int seed)
