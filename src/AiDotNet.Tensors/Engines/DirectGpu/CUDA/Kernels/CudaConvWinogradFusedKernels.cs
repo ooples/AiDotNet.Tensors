@@ -81,12 +81,14 @@ extern ""C"" __global__ void wfz_filter_flip(const float* __restrict__ w, float*
 //  - Compute role: thread (x = tid >> 4, s = tid & 15) accumulates component x of an 8 (o) x 8 (p) sub-tile.
 //  - Epilogue: the products go through shared memory in two halves of 16 output channels; each (o, tile) pair's 16
 //    components are reduced by A^T m A, A^T = [[1,1,1,0],[0,1,-1,-1]], into its in-bounds 2x2 outputs.
-__device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, const float* __restrict__ u,
+// STAGES = 1: one U | V buffer, stored between two barriers per step. STAGES = 2: two buffers, the next step's stored
+// while this step's is read, one barrier per step. sm holds STAGES * 2 * 16 * WFZ_CK * 32 floats; the epilogue reuses
+// the first 16 * 16 * 32 of them.
+#define WFZ_STAGE_FLOATS (2 * 16 * WFZ_CK * 32)
+template <int STAGES>
+__device__ __forceinline__ void wfz_conv_body(float* __restrict__ sm, const float* __restrict__ in, const float* __restrict__ u,
     float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
 {
-    __shared__ __align__(16) float sm[2 * 16 * WFZ_CK * 32];   // U | V; the epilogue reuses all of it
-    float* us = sm;
-    float* vs = sm + 16 * WFZ_CK * 32;
     const int tid = threadIdx.x;
     const int tilesPerImage = tilesH * tilesW;
     const int P = N * tilesPerImage;
@@ -138,8 +140,10 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
         #pragma unroll
         for (int q = 0; q < 16; q++) ur[q] = uv ? __ldg(usrc + q * uPlane) : 0.0f;
     };
-    auto store = [&]()
+    auto store = [&](int stage)
     {
+        float* us = sm + stage * WFZ_STAGE_FLOATS;
+        float* vs = us + 16 * WFZ_CK * 32;
         float t[4][4];
         #pragma unroll
         for (int j = 0; j < 4; j++)
@@ -165,14 +169,19 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
 
     const int steps = (R + WFZ_CK - 1) / WFZ_CK;
     load(0);
+    if (STAGES == 2) { store(0); __syncthreads(); }
     for (int step = 0; step < steps; step++)
     {
-        __syncthreads();
-        store();
-        __syncthreads();
+        const int stage = STAGES == 2 ? (step & 1) : 0;
+        if (STAGES == 1)
+        {
+            __syncthreads();
+            store(0);
+            __syncthreads();
+        }
         if (step + 1 < steps) load((step + 1) * WFZ_CK);
-        const float* ub = us + x * WFZ_CK * 32 + oo;
-        const float* vb = vs + x * WFZ_CK * 32 + pp;
+        const float* ub = sm + stage * WFZ_STAGE_FLOATS + x * WFZ_CK * 32 + oo;
+        const float* vb = sm + stage * WFZ_STAGE_FLOATS + 16 * WFZ_CK * 32 + x * WFZ_CK * 32 + pp;
         #pragma unroll
         for (int r = 0; r < WFZ_CK; r++)
         {
@@ -186,6 +195,11 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
             for (int i = 0; i < 8; i++)
                 #pragma unroll
                 for (int j = 0; j < 8; j++) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        if (STAGES == 2 && step + 1 < steps)
+        {
+            store(stage ^ 1);   // last read during step - 1, before that step's closing barrier
+            __syncthreads();
         }
     }
 
@@ -239,11 +253,24 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
 // Two blocks per SM (128 registers, a small spill) and one (no spill): the tuned slot measures both.
 extern ""C"" __global__ __launch_bounds__(256, 2) void wfz_conv(const float* __restrict__ in, const float* __restrict__ u,
     float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
-{ wfz_conv_body(in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW); }
+{
+    __shared__ __align__(16) float sm[WFZ_STAGE_FLOATS];
+    wfz_conv_body<1>(sm, in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW);
+}
 extern ""C"" __global__ __launch_bounds__(256, 1) void wfz_conv1(const float* __restrict__ in, const float* __restrict__ u,
     float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
-{ wfz_conv_body(in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW); }
+{
+    __shared__ __align__(16) float sm[WFZ_STAGE_FLOATS];
+    wfz_conv_body<1>(sm, in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW);
+}
+// Double-buffered: 64 KB of dynamic shared memory (the host raises the function's limit), one block per SM.
+extern ""C"" __global__ __launch_bounds__(256, 1) void wfz_conv_db(const float* __restrict__ in, const float* __restrict__ u,
+    float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
+{
+    extern __shared__ __align__(16) float smd[];
+    wfz_conv_body<2>(smd, in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW);
+}
 ";
 
-    public static string[] GetKernelNames() => new[] { "wfz_filter", "wfz_filter_flip", "wfz_conv", "wfz_conv1" };
+    public static string[] GetKernelNames() => new[] { "wfz_filter", "wfz_filter_flip", "wfz_conv", "wfz_conv1", "wfz_conv_db" };
 }
