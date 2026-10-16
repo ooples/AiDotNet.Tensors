@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 using AiDotNet.Tensors.Engines.Simd;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -65,7 +66,7 @@ internal static class FusedOptimizer
     /// to run inline. Keeps each chunk &gt;= <see cref="ParallelThreshold"/> so tiny
     /// partitions never pay dispatch overhead for no bandwidth gain.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static int ChunkPlan(int length, int simdWidth, out int chunk)
     {
         chunk = length;
@@ -103,7 +104,7 @@ internal static class FusedOptimizer
     /// that is orders of magnitude more expensive.
     /// </para>
     /// </remarks>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe bool AllFiniteSimd(float* values, int length)
     {
         int i = 0;
@@ -135,6 +136,7 @@ internal static class FusedOptimizer
     /// element-parallel chunking (<see cref="ChunkPlan"/>) as the update kernels. A boolean, so the answer cannot
     /// depend on the split; a chunk that finds a non-finite value lets the others skip their scan.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe bool AllFiniteParallel(float* values, int length)
     {
         int nChunks = ChunkPlan(length, FloatSimdWidth, out int chunk);
@@ -155,7 +157,7 @@ internal static class FusedOptimizer
     /// <summary>
     /// Double-precision counterpart to <see cref="AllFiniteSimd(float*, int)"/>.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe bool AllFiniteSimd(double* values, int length)
     {
         int i = 0;
@@ -181,7 +183,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 SGD: param -= lr * grad</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void SgdUpdateSimd(float* param, float* grad, int length, float lr)
     {
         int i = 0;
@@ -211,7 +213,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 SGD+Momentum: v = mu*v + grad; param -= lr*v</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void SgdMomentumUpdateSimd(
         float* param, float* grad, float* velocity, int length,
         float lr, float momentum, bool nesterov)
@@ -242,7 +244,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 Adam: m = b1*m + (1-b1)*g; v = b2*v + (1-b2)*g^2; p -= lr*mhat/(sqrt(vhat)+eps)</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdamUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, int step)
@@ -260,6 +262,7 @@ internal static class FusedOptimizer
     /// disjoint SIMD-aligned chunks, so the result is bit-identical to the serial pass. Serial, this
     /// kernel was the largest phase of a CPU training step on a 7.2M-parameter N-BEATS (13.7 ms of
     /// 44.6 ms on 32 cores).</remarks>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float bc1, float bc2)
@@ -284,6 +287,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>The float Adam update over the element range [start, end).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateRangeF(
         float* param, float* grad, float* m, float* v, int start, int end,
         float lr, float beta1, float beta2, float eps, float bc1, float bc2)
@@ -349,7 +353,7 @@ internal static class FusedOptimizer
     // ────────────────────────────────────────────────────────────────────
 
     /// <summary>Widen a bfloat16 (the top 16 bits of a float32) to float32.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe float Bf16ToFloat(ushort b)
     {
         uint u = (uint)b << 16;
@@ -361,7 +365,7 @@ internal static class FusedOptimizer
     /// quiet bf16 NaN (never silently truncated into an infinity), matching the
     /// IEEE/​PyTorch bf16 cast.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe ushort Bf16FromFloat(float f)
     {
         uint bits = *(uint*)&f;
@@ -372,6 +376,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>Adam update with bfloat16 moment storage (fp32 params/grads, fp32 math).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateBf16Simd(
         float* param, float* grad, ushort* m, ushort* v, int length,
         float lr, float beta1, float beta2, float eps, int step)
@@ -391,6 +396,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AdamW (decoupled weight decay) with bfloat16 moment storage.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateBf16Simd(
         float* param, float* grad, ushort* m, ushort* v, int length,
         float lr, float beta1, float beta2, float eps, float weightDecay, int step)
@@ -405,6 +411,7 @@ internal static class FusedOptimizer
     /// state is one byte per m/v element plus one fp64 scale per block; update
     /// math widens to fp32 and then requantizes the new moments.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateInt8BlockQuantized(
         float* param,
         float* grad,
@@ -499,7 +506,7 @@ internal static class FusedOptimizer
     // ────────────────────────────────────────────────────────────────────
 
     /// <summary>AVX2 SGD (double): param -= lr * grad</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void SgdUpdateSimd(double* param, double* grad, int length, double lr)
     {
         int i = 0;
@@ -529,7 +536,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 Adam (double): m = β1·m + (1-β1)·g; v = β2·v + (1-β2)·g²; param -= lr·m̂/(√v̂ + ε)</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdamUpdateSimd(
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, int step)
@@ -548,6 +555,7 @@ internal static class FusedOptimizer
     /// caller (bc1 = 1-β1^step, bc2 = 1-β2^step). Bit-identical to the step overload;
     /// exists so a per-parameter loop pays the two Math.Pow once per step, not per
     /// parameter.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateSimd(
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, double bc1, double bc2)
@@ -571,6 +579,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>The element range [start, end) of the kernel above; chunks start on a SIMD-width multiple.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateRangeD(
         double* param, double* grad, double* m, double* v, int start, int end,
         double lr, double beta1, double beta2, double eps, double bc1, double bc2)
@@ -615,7 +624,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 AdamW (double): Adam with decoupled weight decay</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdamWUpdateSimd(
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, double weightDecay, int step)
@@ -644,6 +653,7 @@ internal static class FusedOptimizer
     /// One plain-SGD step (param -= lr * grad) over host arrays, the SIMD kernel split into fixed chunks across the
     /// pool. Element-wise, so the result does not depend on the thread count.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SgdStepHost(float[] param, float[] grad, int length, float lr)
     {
         ValidateHostRange(param, 0, length, nameof(param));
@@ -664,6 +674,7 @@ internal static class FusedOptimizer
     /// <see cref="AdamWUpdateSimd(float*, float*, float*, float*, int, float, float, float, float, float, float, float)"/>
     /// kernel split into fixed chunks across the pool. For eager optimizers that update a parameter tensor in place.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWStepHost(
         float[] param, int paramOffset, float[] grad, int gradOffset, float[] m, int mOffset, float[] v, int vOffset,
         int length, float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
@@ -771,6 +782,7 @@ internal static class FusedOptimizer
         return total;
     }
 
+    [MethodImpl(Hot)]
     private static unsafe double SumSquaresFloat(float[] a, int start, int n)
     {
         double s = 0;
@@ -799,6 +811,7 @@ internal static class FusedOptimizer
         return s;
     }
 
+    [MethodImpl(Hot)]
     private static unsafe double SumSquaresDouble(double[] a, int start, int n)
     {
         double s = 0;
@@ -828,6 +841,7 @@ internal static class FusedOptimizer
     }
 
     /// <inheritdoc cref="AdamWStepHost(float[], int, float[], int, float[], int, float[], int, int, float, float, float, float, float, float, float)"/>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWStepHost(
         double[] param, int paramOffset, double[] grad, int gradOffset, double[] m, int mOffset, double[] v, int vOffset,
         int length, double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
@@ -848,6 +862,7 @@ internal static class FusedOptimizer
 
     /// <summary>Single-pass fused AdamW with precomputed step-global bias corrections
     /// (bc1 = 1-β1^step, bc2 = 1-β2^step). Bit-identical to the step overload.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateSimd(
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
@@ -871,6 +886,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>The element range [start, end) of the kernel above; chunks start on a SIMD-width multiple.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateRangeD(
         double* param, double* grad, double* m, double* v, int start, int end,
         double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
@@ -937,6 +953,7 @@ internal static class FusedOptimizer
     /// SIMD / scalar-tail split per tensor. Tensors with <c>lengths[t] == 0</c> (unexercised
     /// params with no live gradient) are skipped, matching the per-param loop's guard.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateSimdMulti(
         double[][] paramArrays, double[][] gradArrays, double[][] mArrays, double[][] vArrays,
         int[] lengths, int count,
@@ -999,6 +1016,7 @@ internal static class FusedOptimizer
     /// <summary>Multi-tensor (foreach-style) Adam over a LIST of double parameter tensors.
     /// Builds the SIMD constants once, reuses across every tensor; bit-identical to the
     /// per-parameter bc1/bc2 Adam overload. (Adam == AdamW without the decoupled decay.)</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateSimdMulti(
         double[][] paramArrays, double[][] gradArrays, double[][] mArrays, double[][] vArrays,
         int[] lengths, int count,
@@ -1087,6 +1105,7 @@ internal static class FusedOptimizer
     /// fallback for the contiguous path when NOT every tensor is active this step: a single
     /// pass over the whole flat range would decay the moments of grad-absent tensors, which
     /// the per-tensor loop must not do.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateSimdMultiFlatMoments(
         double[][] paramArrays, double[][] gradArrays, double[] mFlat, double[] vFlat,
         int[] lengths, int[] offsets, int count,
@@ -1110,6 +1129,7 @@ internal static class FusedOptimizer
     /// <summary>Multi-tensor Adam (double, no weight decay) with FLAT resident moments.
     /// Fallback for the contiguous Adam path when some tensors are inactive. Bit-identical
     /// to <see cref="AdamUpdateSimdMulti"/>.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateSimdMultiFlatMoments(
         double[][] paramArrays, double[][] gradArrays, double[] mFlat, double[] vFlat,
         int[] lengths, int[] offsets, int count,
@@ -1136,6 +1156,7 @@ internal static class FusedOptimizer
     /// <paramref name="totalLen"/>); <paramref name="offsets"/>[t] is tensor t's start in the
     /// flat layout. Matches <see cref="AdamWUpdateSimdMulti"/> to ≤1 ULP (uniform FMA on the
     /// tails; see the section comment above).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateSimdContiguous(
         double[][] paramArrays, double[][] gradArrays, int[] lengths, int[] offsets, int count,
         double[] paramFlat, double[] gradFlat, double[] mFlat, double[] vFlat, int totalLen,
@@ -1149,6 +1170,7 @@ internal static class FusedOptimizer
 
     /// <summary>Contiguous fused Adam (double, no weight decay). Matches
     /// <see cref="AdamUpdateSimdMulti"/> to ≤1 ULP (uniform FMA on the tails).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateSimdContiguous(
         double[][] paramArrays, double[][] gradArrays, int[] lengths, int[] offsets, int count,
         double[] paramFlat, double[] gradFlat, double[] mFlat, double[] vFlat, int totalLen,
@@ -1160,6 +1182,7 @@ internal static class FusedOptimizer
         ScatterParam(paramArrays, lengths, offsets, count, paramFlat);
     }
 
+    [MethodImpl(Hot)]
     private static void GatherParamGrad(
         double[][] paramArrays, double[][] gradArrays, int[] lengths, int[] offsets, int count,
         double[] paramFlat, double[] gradFlat)
@@ -1175,6 +1198,7 @@ internal static class FusedOptimizer
         }
     }
 
+    [MethodImpl(Hot)]
     private static void ScatterParam(
         double[][] paramArrays, int[] lengths, int[] offsets, int count, double[] paramFlat)
     {
@@ -1189,7 +1213,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 AdamW: Adam with decoupled weight decay</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdamWUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float weightDecay, int step)
@@ -1203,6 +1227,7 @@ internal static class FusedOptimizer
 
     /// <summary>Single-pass fused AdamW (float) with precomputed step-global bias
     /// corrections. Bit-identical to the step overload.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
@@ -1235,6 +1260,7 @@ internal static class FusedOptimizer
     /// Folds decoupled weight decay into the Adam update so `param` is read+written
     /// once. SIMD head runs from `start` (8-aligned for every non-final chunk) + a
     /// scalar tail, so it is bit-identical to the whole-tensor serial loop.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void AdamWUpdateRangeF(
         float* param, float* grad, float* m, float* v, int start, int end,
         float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
@@ -1285,6 +1311,7 @@ internal static class FusedOptimizer
     /// <summary>Multi-tensor (foreach-style) fused AdamW over a LIST of float parameter
     /// tensors — see the double overload. Builds the SIMD constants once, reuses across
     /// every tensor; bit-identical to the per-parameter bc1/bc2 overload.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamWUpdateSimdMulti(
         float[][] paramArrays, float[][] gradArrays, float[][] mArrays, float[][] vArrays,
         int[] lengths, int count,
@@ -1346,6 +1373,7 @@ internal static class FusedOptimizer
 
     /// <summary>Multi-tensor (foreach-style) Adam over a LIST of float parameter tensors —
     /// constants built once, bit-identical to the per-parameter bc1/bc2 Adam overload.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamUpdateSimdMulti(
         float[][] paramArrays, float[][] gradArrays, float[][] mArrays, float[][] vArrays,
         int[] lengths, int count,
@@ -1402,7 +1430,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 Adagrad: accum += g^2; param -= lr*g/(sqrt(accum)+eps)</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdagradUpdateSimd(
         float* param, float* grad, float* accumSq, int length, float lr, float eps)
     {
@@ -1436,7 +1464,7 @@ internal static class FusedOptimizer
     ///   v     = ρ·v + (1−ρ)·g²
     ///   denom = sqrt(v − g_avg²) + eps
     /// Falls back to plain RMSprop when <paramref name="gradAvg"/> is <c>null</c>.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void RMSpropCenteredUpdate(
         float* param, float* grad, float* v, float* gradAvg, int length,
         float lr, float rho, float eps)
@@ -1453,7 +1481,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 RMSprop: v = rho*v + (1-rho)*g^2; param -= lr*g/(sqrt(v)+eps)</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void RMSpropUpdateSimd(
         float* param, float* grad, float* v, int length,
         float lr, float rho, float eps)
@@ -1485,7 +1513,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 Lion: sign-based optimizer (Chen et al., 2023)</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void LionUpdateSimd(
         float* param, float* grad, float* m, int length,
         float lr, float beta1, float beta2, float weightDecay)
@@ -1532,7 +1560,7 @@ internal static class FusedOptimizer
 
     /// <summary>AVX2 AdaMax: Adam variant with infinity norm (max instead of L2).
     /// Caller-supplied <paramref name="eps"/> matches PyTorch <c>torch.optim.Adamax(eps=)</c>.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdaMaxUpdateSimd(
         float* param, float* grad, float* m, float* u, int length,
         float lr, float beta1, float beta2, float eps, int step)
@@ -1609,7 +1637,7 @@ internal static class FusedOptimizer
         eps = eps / (sqrtBc2 * sqrtC2);
     }
     /// <summary>AVX2 AMSGrad: Adam with max of past squared gradients</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AMSGradUpdateSimd(
         float* param, float* grad, float* m, float* v, float* vMax, int length,
         float lr, float beta1, float beta2, float eps, int step)
@@ -1660,7 +1688,7 @@ internal static class FusedOptimizer
     /// exactly so a double-precision CompiledTrainingPlan keeps the same
     /// non-increasing-denominator guarantee (Reddi, Kale, Kumar 2018) that the
     /// FeedForwardNeuralNetwork default relies on (drift fix, AiDotNet #1332).</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AMSGradUpdateSimd(
         double* param, double* grad, double* m, double* v, double* vMax, int length,
         double lr, double beta1, double beta2, double eps, int step)
@@ -1707,7 +1735,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 Nadam: Adam with Nesterov momentum</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void NadamUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, int step)
@@ -1765,7 +1793,7 @@ internal static class FusedOptimizer
     /// The lr scaling is applied only on the final parameter write so that the
     /// running-RMS-of-updates accumulator remains scale-invariant. This makes
     /// param-group LR overrides and LR schedulers actually take effect.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdaDeltaUpdateSimd(
         float* param, float* grad, float* accumGrad, float* accumUpdate, int length,
         float lr, float rho, float eps)
@@ -1838,7 +1866,7 @@ internal static class FusedOptimizer
     /// </description></item>
     /// </list>
     /// </remarks>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void LARSUpdateSimd(
         float* param, float* grad, float* velocity, int length,
         float lr, float momentum, float weightDecay, float trustCoeff, float eps)
@@ -1904,7 +1932,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>AVX2 LAMB: Layer-wise Adaptive Moments (LARS + Adam)</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void LAMBUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float weightDecay, int step,
@@ -1994,7 +2022,7 @@ internal static class FusedOptimizer
     /// <summary>AVX2 RAdam: Rectified Adam (Liu et al., 2020).
     /// Variance-rectification: when ρ_t > 4, use the corrected adaptive term;
     /// otherwise fall back to plain SGD-like momentum step.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void RAdamUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, int step)
@@ -2084,6 +2112,7 @@ internal static class FusedOptimizer
     /// Caller supplies <paramref name="indices"/> (compact view) of length <paramref name="nnz"/>;
     /// <paramref name="values"/> are the corresponding gradient values. Only those
     /// (param, m, v) entries are updated; bias correction uses <paramref name="step"/>.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseAdamUpdate(
         float* param, int* indices, float* values, float* m, float* v, int nnz,
         float lr, float beta1, float beta2, float eps, int step)
@@ -2120,6 +2149,7 @@ internal static class FusedOptimizer
 
     /// <summary>SparseAdamW: AdamW restricted to non-zero indices.
     /// Decoupled weight decay (PyTorch parity) applies at touched positions only.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseAdamWUpdate(
         float* param, int* indices, float* values, float* m, float* v, int nnz,
         float lr, float beta1, float beta2, float eps, float wd, int step)
@@ -2144,6 +2174,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>SparseSGD: SGD + optional momentum + Nesterov + weight decay, restricted to non-zero indices.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseSgdUpdate(
         float* param, int* indices, float* values, float* momentum, int nnz,
         float lr, float mom, float dampening, float wd, bool nesterov, bool hasMomentum)
@@ -2164,6 +2195,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>SparseNadam: Nesterov-momentum Adam, restricted to non-zero indices.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseNadamUpdate(
         float* param, int* indices, float* values, float* m, float* v, int nnz,
         float lr, float beta1, float beta2, float eps, float wd, int step)
@@ -2188,6 +2220,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>SparseAdamax: Adam with L∞ norm (u-state), restricted to non-zero indices.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseAdamaxUpdate(
         float* param, int* indices, float* values, float* m, float* u, int nnz,
         float lr, float beta1, float beta2, float eps, float wd, int step)
@@ -2209,6 +2242,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>SparseAdagrad: per-parameter accumulator update, restricted to non-zero indices.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseAdagradUpdate(
         float* param, int* indices, float* values, float* accum, int nnz,
         float lr, float eps, float wd, float lrDecay, int step)
@@ -2226,6 +2260,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>SparseRmsProp: RMSProp restricted to non-zero indices.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseRmsPropUpdate(
         float* param, int* indices, float* values, float* sqAvg, float* momentumBuf, int nnz,
         float lr, float alpha, float eps, float wd, float momentum, bool centered, float* gradAvg,
@@ -2264,6 +2299,7 @@ internal static class FusedOptimizer
 
     /// <summary>SparseAdaDelta: AdaDelta restricted to non-zero indices. Maintains EMA of
     /// squared grad and squared update.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseAdaDeltaUpdate(
         float* param, int* indices, float* values, float* sqAvg, float* accDelta, int nnz,
         float lr, float rho, float eps, float wd)
@@ -2283,6 +2319,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>SparseLion: sign-of-EMA update restricted to non-zero indices.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseLionUpdate(
         float* param, int* indices, float* values, float* m, int nnz,
         float lr, float beta1, float beta2, float wd)
@@ -2302,6 +2339,7 @@ internal static class FusedOptimizer
     }
 
     /// <summary>SparseFtrl: FTRL-proximal restricted to non-zero indices.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseFtrlUpdate(
         float* param, int* indices, float* values, float* accumulator, float* linear, int nnz,
         float lr, float lrPower, float lambda1, float lambda2)
@@ -2325,6 +2363,7 @@ internal static class FusedOptimizer
 
     /// <summary>SparseRAdam: Rectified Adam restricted to non-zero indices.
     /// When variance rectification is inactive (early-step), falls back to plain momentum.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseRAdamUpdate(
         float* param, int* indices, float* values, float* m, float* v, int nnz,
         float lr, float beta1, float beta2, float eps, float wd, int step)
@@ -2384,6 +2423,7 @@ internal static class FusedOptimizer
     /// Adam moments and parameter step are scatter-updated at touched indices only.
     /// Since untouched indices have zero update, ‖update‖₂ across all i equals
     /// ‖update_sparse‖₂ across touched i — both yield the same trust ratio.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseLAMBUpdate(
         float* param, int* indices, float* values, float* m, float* v, int paramLen, int nnz,
         float lr, float beta1, float beta2, float eps, float wd, int step)
@@ -2429,6 +2469,7 @@ internal static class FusedOptimizer
     /// <summary>SparseLARS: trust-ratio scaled SGD-momentum restricted to non-zero
     /// indices. ‖p‖₂ via full reduction; ‖g_sparse‖₂² = sum over touched values²
     /// (equals dense ‖g‖₂² since untouched indices have zero gradient).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseLARSUpdate(
         float* param, int* indices, float* values, float* velocity, int paramLen, int nnz,
         float lr, float momentum, float wd, float trustCoeff, float eps)
@@ -2466,6 +2507,7 @@ internal static class FusedOptimizer
     /// gaps when an embedding row is rarely touched. Differs from dense Rprop
     /// (which writes prev_grad[i] = grad[i] = 0 at every untouched i), but is
     /// the right behavior for sparse use cases.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseRpropUpdate(
         float* param, int* indices, float* values, float* prevGrad, float* stepSize, int nnz,
         float etaPlus, float etaMinus, float stepMin, float stepMax)
@@ -2498,6 +2540,7 @@ internal static class FusedOptimizer
     /// index and applies missed (1 - mu) decays when next touched. This kernel does
     /// the per-touched-index update assuming caller has already applied lazy catch-up
     /// to ax[idx] for the missed steps.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void SparseASGDUpdate(
         float* param, int* indices, float* values, float* ax, int nnz,
         float eta, float lambd, float wd, float mu)
@@ -2539,7 +2582,7 @@ internal static class FusedOptimizer
     /// <summary>AVX2 ASGD: Averaged SGD (Polyak/Ruppert).
     /// Step decay <c>η_t = lr / (1 + λ·lr·t)^α</c>, weight decay applied to gradient,
     /// and exponential moving average of params written to <paramref name="ax"/>.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void ASGDUpdateSimd(
         float* param, float* grad, float* ax, int length,
         float lr, float lambd, float alpha, float weightDecay, float mu)
@@ -2593,7 +2636,7 @@ internal static class FusedOptimizer
     /// Branchless in the SIMD body: the sign is recovered by masking off the sign bit and re-applying it,
     /// so no per-element compare/branch is needed and the shrink is a single max against zero.
     /// </remarks>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void ProximalL1UpdateSimd(
         float* param, float* grad, int length, float lr, float l1Strength)
     {
@@ -2661,7 +2704,7 @@ internal static class FusedOptimizer
     /// split, so one parameter covers both cases without a mode flag.
     /// </para>
     /// </remarks>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void AdmmUpdateSimd(
         float* param, float* grad, float* z, float* u, int length,
         float lr, float rho, float l1)
@@ -2719,6 +2762,7 @@ internal static class FusedOptimizer
     /// sign changes of consecutive gradients.
     /// Reference: Riedmiller &amp; Braun, 1993.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RpropUpdate(
         float* param, float* grad, float* prevGrad, float* stepSize, int length,
         float etaPlus, float etaMinus, float stepMin, float stepMax)
@@ -2754,7 +2798,7 @@ internal static class FusedOptimizer
     /// <summary>AVX2 FTRL: Follow The Regularized Leader.
     /// Partial vectorization: n accumulation and z update use FMA,
     /// soft-thresholding uses SIMD compare+blend for branchless L1 proximal.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void FTRLUpdateSimd(
         float* param, float* grad, float* z, float* n, int length,
         float lr, float l1Reg, float l2Reg, float lrPower, float beta = 0f)
@@ -2869,7 +2913,7 @@ internal static class FusedOptimizer
     /// The +sign on the inner product is correct: ∂L/∂lr = -⟨g_t, g_{t-1}⟩,
     /// so descent on lr adds the inner product to lr. Returns the new lr
     /// so the caller can persist it across steps.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe float HypergradientSgdUpdateSimd(
         float* param, float* grad, float* prevGrad, int length,
         float lr, float hyperLr)
@@ -2930,7 +2974,7 @@ internal static class FusedOptimizer
     ///   x      = (1-c_t) x + c_t z      — running weighted average
     /// Caller persists <paramref name="weightSum"/> across steps. Returns
     /// the new weightSum.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe float ScheduleFreeSgdUpdateSimd(
         float* z, float* x, float* grad, int length,
         float lr, float weightSum)
@@ -2974,7 +3018,7 @@ internal static class FusedOptimizer
     /// reads from <paramref name="y"/>. PyTorch's eager implementation
     /// does this per-element in Python, which dominates wall time on
     /// small models — fusing it removes that overhead entirely.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe void ScheduleFreeYUpdateSimd(
         float* y, float* z, float* x, int length, float beta)
     {
@@ -3014,7 +3058,7 @@ internal static class FusedOptimizer
     /// <paramref name="growthRate"/> caps per-step growth so a too-small
     /// initial d_0 can't blow up the trajectory on steep problems —
     /// matches the Prodigy "growth_rate" hyperparameter.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     internal static unsafe float DAdaptationSgdUpdateSimd(
         float* param, float* grad, float* sBuf, int length,
         float d, ref float rAccum, float lr, float growthRate)
