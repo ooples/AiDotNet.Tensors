@@ -3,11 +3,11 @@
   "cases": {
     "cnn:cuda": {
       "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti": 59.53,
-      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.828
+      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.643
     },
     "mlp:cuda": {
       "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti": 1.123,
-      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.649
+      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.566
     },
     "cnn:cpu": {
       "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 21.72,
@@ -18,13 +18,13 @@
       "linux-x64-4cpu-amd-epyc-9v74-80-core-processor-cpu": 2.931
     },
     "lstm:cuda": {
-      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 1.02
+      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.369
     },
     "transformer:cuda": {
-      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.721
+      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.483
     },
     "resnet18:cuda": {
-      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 1.73
+      "windows-x64-128cpu-amd-ryzen-threadripper-3990x-64-core-processor-cuda-nvidia-geforce-rtx-3080": 0.685
     }
   }
 }
