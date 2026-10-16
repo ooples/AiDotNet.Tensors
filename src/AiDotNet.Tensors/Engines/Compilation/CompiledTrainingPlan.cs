@@ -184,7 +184,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     /// <summary>This plan's first-write redirects, lent to the engine while the captured step body runs (see
     /// <see cref="Engines.DirectGpuTensorEngine.FirstWriteRedirects"/>). Dropped by the eager step.</summary>
-    private readonly Dictionary<long, Engines.DirectGpu.IGpuBuffer> _firstWriteRedirects = new();
+    private readonly Engines.FirstWriteRedirectTable _firstWriteRedirects = new();
 
     /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
     /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
@@ -3278,9 +3278,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Lend this plan's first-write redirects to the engine for the body only: the eager optimizer, evaluation and
         // any other plan on the engine never see them.
         var redirectEngine = _engine as Engines.DirectGpuTensorEngine;
+        bool executed = !(backend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } capturing
+                          && capturing.IsStreamCapturing());
+        bool completed = false;
+        _firstWriteRedirects.BeginRun();
         if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = _firstWriteRedirects;
-        try { RunGpuStepBodyForCaptureCore(backend); }
-        finally { if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null; }
+        try { RunGpuStepBodyForCaptureCore(backend); completed = true; }
+        finally
+        {
+            if (redirectEngine is not null) redirectEngine.FirstWriteRedirects = null;
+            // Only a whole executed run is evidence; a capture records, and a body that threw left its pairing unknown.
+            _firstWriteRedirects.EndRun(executed && completed);
+        }
     }
 
     private void RunGpuStepBodyForCaptureCore(Engines.DirectGpu.IDirectGpuBackend backend)

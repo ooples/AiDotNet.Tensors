@@ -946,6 +946,10 @@ internal static class DifferentiableOps
         // allocated, never read, and immediately garbage. Backward ops that permute, reshape or
         // slice always hand in a non-contiguous view, so this fired on exactly the ops most likely
         // to carry a full parameter-sized gradient.
+        // First-write redirection (DirectGpuTensorEngine.FirstWriteRedirects) needs to know every buffer a contribution
+        // reaches: one consumed twice must stay a separate buffer.
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { FirstWriteRedirects: { } redirectTable })
+            redirectTable.NoteContribution(grad.TryGetGpuBuffer());
         Tensor<T>? gradForInPlaceCache = null;
         Tensor<T> GradForInPlace() =>
             gradForInPlaceCache ??= (grad.IsContiguous ? grad : grad.Contiguous());
@@ -999,8 +1003,6 @@ internal static class DifferentiableOps
                             try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                                 $"[ALIAS] inplace-add op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={grad.Length}" + System.Environment.NewLine); } catch { }
                         }
-                        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { FirstWriteRedirects: not null } redirecting)
-                            redirecting.NoteRedirectedAccumulation(GradForInPlace().TryGetGpuBuffer(), existing.TryGetGpuBuffer());
                         using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
                             engine.TensorAddInPlace(existing, GradForInPlace());
                         accumulated = existing;

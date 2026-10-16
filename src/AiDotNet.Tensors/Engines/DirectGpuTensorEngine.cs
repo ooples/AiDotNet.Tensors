@@ -5107,39 +5107,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private readonly System.Collections.Generic.Dictionary<IGpuBuffer, long> _actionScratchKeys = new();
 
     /// <summary>
-    /// The running compiled plan's first-write redirects (null outside its captured step body): a pooled scratch slot
-    /// whose output an earlier run of the body copied, as a step's first contribution, into a gradient accumulator,
-    /// mapped to that accumulator's device buffer. The slot then hands the op the accumulator itself, so the kernel
-    /// writes the gradient in place and the copy (a memcpy node per gradient per captured step) disappears: the copy
-    /// finds source and destination are one buffer. The backward runs in a fixed order, so the same slot is the
-    /// same accumulator's first write every step; <see cref="NoteRedirectedAccumulation"/> catches a violation.
+    /// The running compiled plan's first-write redirects (null outside its captured step body; see
+    /// <see cref="FirstWriteRedirectTable"/>): a pooled scratch slot whose output is a gradient accumulator's first
+    /// contribution of the step is handed that accumulator's device buffer, so the op writes the gradient in place and
+    /// the first-write copy (a memcpy node per gradient per captured step) finds one buffer and issues nothing.
     /// </summary>
-    internal System.Collections.Generic.Dictionary<long, IGpuBuffer>? FirstWriteRedirects { get; set; }
+    internal FirstWriteRedirectTable? FirstWriteRedirects { get; set; }
 
-    /// <summary>Records that the pooled buffer <paramref name="contribution"/> was copied into
-    /// <paramref name="accumulator"/> as its first write of the step (see <see cref="FirstWriteRedirects"/>).</summary>
+    /// <summary>Offers <paramref name="contribution"/>'s pooled slot for redirection into <paramref name="accumulator"/>,
+    /// which it just first-wrote by copy (see <see cref="FirstWriteRedirectTable"/>).</summary>
     internal void RecordFirstWriteRedirect(IGpuBuffer contribution, IGpuBuffer accumulator, int length)
     {
-        if (FirstWriteRedirects is not { } redirects || ReferenceEquals(contribution, accumulator)
+        if (FirstWriteRedirects is not { } table || ReferenceEquals(contribution, accumulator)
             || !_actionScratchKeys.TryGetValue(contribution, out long key) || accumulator.Size < length)
             return;
-        redirects[key] = accumulator;
-    }
-
-    /// <summary>
-    /// A contribution ADDED into an accumulator whose device buffer it shares can only be a redirected slot that was
-    /// not that accumulator's first write this step: adding it to itself would double the gradient. Drops every
-    /// redirect and fails the step's device body with <see cref="NotSupportedException"/>, which the compiled plan
-    /// answers by falling back (and the next run copies again).
-    /// </summary>
-    internal void NoteRedirectedAccumulation(IGpuBuffer? contribution, IGpuBuffer? accumulator)
-    {
-        if (contribution is null || !ReferenceEquals(contribution, accumulator) || FirstWriteRedirects is not { } redirects
-            || !redirects.ContainsValue(accumulator))
-            return;
-        redirects.Clear();
-        throw new NotSupportedException(
-            "A first-write redirected gradient slot was accumulated into its own accumulator; redirects are dropped.");
+        table.Offer(key, contribution, accumulator);
     }
 
     /// <summary>Mark the compiled action whose transient scratch allocs are pooled by (action, local) for
@@ -5157,7 +5139,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private IGpuBuffer RentActionScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
         long key = ((long)_currentScratchAction << 32) | (uint)_currentScratchLocal++;
-        if (FirstWriteRedirects is { } redirects && redirects.TryGetValue(key, out var target))
+        if (FirstWriteRedirects is { } redirects && redirects.TryGetTarget(key, out var target))
         {
             if (target.Handle != System.IntPtr.Zero && target.Size >= length)
             {
@@ -5169,7 +5151,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 return target;
             }
-            redirects.Remove(key);
+            redirects.Drop(key);
         }
         if (_actionScratchPool.TryGetValue(key, out var b) && b is not null
             && b.Handle != System.IntPtr.Zero && b.Size >= length)
@@ -5204,7 +5186,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _actionScratchPool.Clear();
         _actionScratchBuffers.Clear();
         _actionScratchKeys.Clear();
-        FirstWriteRedirects?.Clear();
+        FirstWriteRedirects?.Clear();   // the pooled slots it maps are gone
         _currentScratchAction = -1;
         _currentScratchLocal = 0;
     }
