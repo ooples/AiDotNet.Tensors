@@ -232,8 +232,27 @@ public sealed class TunedKernelRegistryTests : IDisposable
     }
 
     [Fact]
-    public void TwoLostPairs_StillRejectTheCandidate()
+    public void TwoLostPairs_InEveryMeasurement_LeaveTheDecisionInconclusive_AndUnpersisted()
     {
+        // Faster by median but two stalled pairs in the first measurement (candidate calls 3, 7 of 2..10) and in the
+        // retry (calls 13, 17 of 12..20): the slot cannot tell, so it serves the reference and does not persist that.
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.7);
+        var harness = new Harness();
+        foreach (int call in new[] { 3, 7, 13, 17 }) harness.Stalls[("fast", call)] = 10.0;
+        var slot = Slot(harness, false, reference, fast);
+
+        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Equal(TunedKernelDecisionReason.Inconclusive, decision.Reason);
+        Assert.Contains(decision.Rejected, r => r.StartsWith("fast:", StringComparison.Ordinal) && r.Contains("second-lowest pair"));
+    }
+
+    [Fact]
+    public void An_inconclusive_measurement_is_retried_once_and_a_clean_retry_decides()
+    {
+        // Two stalled pairs only in the first measurement (a burst of device noise): the retry is clean and the
+        // candidate is promoted.
         var reference = new Fake("ref", 1f, 1.0);
         var fast = new Fake("fast", 1f, 0.7);
         var harness = new Harness();
@@ -241,10 +260,40 @@ public sealed class TunedKernelRegistryTests : IDisposable
         harness.Stalls[("fast", 7)] = 10.0;
         var slot = Slot(harness, false, reference, fast);
 
-        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
-        var decision = Assert.Single(slot.CachedDecisions);
-        Assert.Equal(TunedKernelDecisionReason.ReferenceWon, decision.Reason);
-        Assert.Contains(decision.Rejected, r => r.StartsWith("fast:", StringComparison.Ordinal) && r.Contains("second-lowest pair"));
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+        Assert.Equal(TunedKernelDecisionReason.Tuned, Assert.Single(slot.CachedDecisions).Reason);
+    }
+
+    [Fact]
+    public void An_inconclusive_verdict_is_not_persisted_but_a_clean_loss_is()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "tuned-inconclusive-" + Guid.NewGuid().ToString("N"));
+        string? priorPath = Environment.GetEnvironmentVariable("AIDOTNET_AUTOTUNE_CACHE_PATH");
+        Environment.SetEnvironmentVariable("AIDOTNET_AUTOTUNE_CACHE_PATH", dir);
+        TunedKernelPolicy.PersistDecisions = true;
+        // Only this test's decisions count: the cache root is process-wide while it is redirected, so a test running
+        // in parallel could persist its own there. These slots' device is "test:device".
+        int Persisted() => Directory.Exists(dir)
+            ? Directory.GetFiles(dir, "*.json", SearchOption.AllDirectories)
+                .Count(f => Uri.UnescapeDataString(Path.GetFileName(f)).Contains("test:device"))
+            : 0;
+        try
+        {
+            var noisy = new Harness();
+            foreach (int call in new[] { 3, 7, 13, 17 }) noisy.Stalls[("fast", call)] = 10.0;
+            Slot(noisy, false, new Fake("ref", 1f, 1.0), new Fake("fast", 1f, 0.7)).Resolve(Shape(4, 8), NewArgs());
+            Assert.Equal(0, Persisted());
+
+            // A clean loss (no faster median) still persists its ReferenceWon.
+            Slot(new Harness(), false, new Fake("ref", 1f, 1.0), new Fake("slow", 1f, 1.5)).Resolve(Shape(4, 16), NewArgs());
+            Assert.True(Persisted() == 1, "a clean ReferenceWon should still be persisted");
+        }
+        finally
+        {
+            TunedKernelPolicy.PersistDecisions = false;
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOTUNE_CACHE_PATH", priorPath);
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch (IOException) { }
+        }
     }
 
     [Fact]
