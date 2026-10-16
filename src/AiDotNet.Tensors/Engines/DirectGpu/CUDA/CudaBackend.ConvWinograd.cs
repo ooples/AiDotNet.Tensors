@@ -74,6 +74,63 @@ public sealed partial class CudaBackend
             "wino_f23_filter_flip", a.Second, a.OutChannels, a.InChannels, a.Output, a.InChannels, a.InHeight, a.InWidth);
     }
 
+    private IGpuBuffer? _winogradWu, _winogradWv, _winogradWm;
+
+    /// <summary>True for the weight-gradient shapes this path computes (the forward conv's 3x3, stride 1, dilation 1).</summary>
+    internal static bool WinogradF32AdmitsFilter(in CudaConv2DBackwardArgs a)
+        => a.WeightGradient && a.KernelH == 3 && a.KernelW == 3 && a.StrideH == 1 && a.StrideW == 1
+           && a.DilationH == 1 && a.DilationW == 1 && a.PadH == a.PadW && a.PadH <= 2 && a.OutHeight > 0 && a.OutWidth > 0;
+
+    /// <summary>
+    /// Weight gradient through Winograd F(3x3, 2x2): dY transform U[16][K][P], x transform V[16][P][C], sixteen GEMMs
+    /// over the P tiles (split along P when the K x C grid alone would leave SMs idle), and the output transform that sums
+    /// the splits into dW[K][C][3][3]. Overwrites the gradient.
+    /// </summary>
+    internal unsafe bool TryConv2DBackwardFilterWinogradF32(in CudaConv2DBackwardArgs a)
+    {
+        if (!WinogradF32AdmitsFilter(a) || !EnsureWinogradModule()) return false;
+        int n = a.Batch, c = a.InChannels, k = a.OutChannels, h = a.InHeight, w = a.InWidth, pad = a.PadH;
+        int outH = a.OutHeight, outW = a.OutWidth, tilesH = (outH + 1) / 2, tilesW = (outW + 1) / 2;
+        long p = (long)n * tilesH * tilesW;
+        if (16L * k * p > int.MaxValue || 16L * c * p > int.MaxValue) return false;
+        int pi = (int)p;
+        int tile = (long)((c + 127) / 128) * ((k + 127) / 128) * 16 >= Math.Max(1, _multiProcessorCount) ? 128 : 64;
+        int gx = (c + tile - 1) / tile, gy = (k + tile - 1) / tile;
+        int sms = Math.Max(1, _multiProcessorCount);
+        long blocks = (long)gx * gy * 16;
+        int splits = 1;
+        if (blocks < 2L * sms) splits = (int)Math.Max(1, Math.Min((2L * sms + blocks - 1) / blocks, pi / 64));
+        int kPerSplit = ((pi + splits - 1) / splits + 7) / 8 * 8;
+        splits = (pi + kPerSplit - 1) / kPerSplit;
+        if (16L * splits * k * c > int.MaxValue) return false;
+        var u = TryConvScratch(ref _winogradWu, 16L * k * p);
+        var v = TryConvScratch(ref _winogradWv, 16L * p * c);
+        var m = TryConvScratch(ref _winogradWm, 16L * splits * k * c);
+        if (u is null || v is null || m is null) return false;
+
+        using var _ = PushContext();
+        IntPtr dyPtr = a.Second.Handle, xPtr = a.First.Handle, uPtr = u.Handle, vPtr = v.Handle, mPtr = m.Handle, dwPtr = a.Output.Handle;
+        uint block = (uint)DefaultBlockSize;
+
+        void** da = stackalloc void*[8];
+        da[0] = &dyPtr; da[1] = &uPtr; da[2] = &n; da[3] = &k; da[4] = &outH; da[5] = &outW; da[6] = &tilesH; da[7] = &tilesW;
+        LaunchKernel(_kernelCache["wino_f32w_dy"], (uint)((k * p + block - 1) / block), block, da);
+
+        void** ia = stackalloc void*[9];
+        ia[0] = &xPtr; ia[1] = &vPtr; ia[2] = &n; ia[3] = &c; ia[4] = &h; ia[5] = &w; ia[6] = &pad; ia[7] = &tilesH; ia[8] = &tilesW;
+        LaunchKernel(_kernelCache["wino_f32w_input"], (uint)((c * p + block - 1) / block), block, ia);
+
+        // M[x][s] (K x C) = U[x] (K x P) * V[x] (P x C) over the P slice s.
+        void** ga = stackalloc void*[8];
+        ga[0] = &uPtr; ga[1] = &vPtr; ga[2] = &mPtr; ga[3] = &k; ga[4] = &c; ga[5] = &pi; ga[6] = &splits; ga[7] = &kPerSplit;
+        LaunchKernel3D(_kernelCache[tile == 128 ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, (uint)(16 * splits), block, 1, 1, ga, 0);
+
+        void** oa = stackalloc void*[5];
+        oa[0] = &mPtr; oa[1] = &dwPtr; oa[2] = &k; oa[3] = &c; oa[4] = &splits;
+        LaunchKernel(_kernelCache["wino_f32w_output"], (uint)((k * c + block - 1) / block), block, oa);
+        return true;
+    }
+
     // The pipeline for y[n][outC][outH][outW] = conv3x3_s1(x[n][inC][h][w], padding pad): the named filter transform of
     // w (forward layout [fwdK][fwdC][3][3]) into U[16][outC][inC], the input transform, sixteen GEMMs, the output transform.
     private unsafe bool RunWinogradF23(IGpuBuffer x, int n, int inC, int h, int w, int pad,
@@ -103,8 +160,9 @@ public sealed partial class CudaBackend
         // 128x128 tiles only while they still fill the SMs (the sixteen GEMMs share the grid through z).
         int tile = (long)((pi + 127) / 128) * ((outC + 127) / 128) * 16 >= Math.Max(1, _multiProcessorCount) ? 128 : 64;
         int gx = (pi + tile - 1) / tile, gy = (outC + tile - 1) / tile;
-        void** ga = stackalloc void*[6];
-        ga[0] = &uPtr; ga[1] = &vPtr; ga[2] = &mPtr; ga[3] = &outC; ga[4] = &pi; ga[5] = &inC;
+        int oneSplit = 1, wholeK = inC;
+        void** ga = stackalloc void*[8];
+        ga[0] = &uPtr; ga[1] = &vPtr; ga[2] = &mPtr; ga[3] = &outC; ga[4] = &pi; ga[5] = &inC; ga[6] = &oneSplit; ga[7] = &wholeK;
         LaunchKernel3D(_kernelCache[tile == 128 ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, 16, block, 1, 1, ga, 0);
 
         void** oa = stackalloc void*[8];
