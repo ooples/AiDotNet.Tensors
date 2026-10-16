@@ -13,6 +13,21 @@ public sealed partial class CudaBackend
     private bool _winogradModuleTried, _winogradModuleReady;
     private IGpuBuffer? _winogradU, _winogradV, _winogradM;
 
+    // Batched-GEMM tile edges: the wino_gemm128 and wino_gemm64 instantiations.
+    private const int WinogradLargeTile = 128, WinogradSmallTile = 64;
+    // Weight-gradient split-K: split the P reduction until the grid holds this many blocks per SM, never leaving a
+    // split with fewer than WinogradMinTilesPerSplit tiles of P.
+    private const long WinogradSplitOccupancy = 2;
+    private const int WinogradMinTilesPerSplit = 64;
+
+    /// <summary>
+    /// The batched-GEMM tile edge: 128x128 tiles only while they still fill the SMs (the sixteen GEMMs share the grid
+    /// through z), 64x64 otherwise.
+    /// </summary>
+    private int ChooseWinogradTile(long rows, long cols)
+        => (rows + WinogradLargeTile - 1) / WinogradLargeTile * ((cols + WinogradLargeTile - 1) / WinogradLargeTile) * 16
+           >= Math.Max(1, _multiProcessorCount) ? WinogradLargeTile : WinogradSmallTile;
+
     internal bool EnsureWinogradModule()
     {
         lock (_winogradModuleLock)
@@ -22,11 +37,22 @@ public sealed partial class CudaBackend
             try
             {
                 using var _ = PushContext();
-                if (CudaNativeBindings.cuCtxGetDevice(out int device) != CudaResult.Success) return false;
+                // Every refusal is logged: the result is cached for the backend's lifetime, so a silent one would
+                // leave every 3x3 conv skipping the Winograd candidate with nothing to say why.
+                var deviceResult = CudaNativeBindings.cuCtxGetDevice(out int device);
+                if (deviceResult != CudaResult.Success)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"Winograd convolution kernels unavailable: cuCtxGetDevice returned {deviceResult}.");
+                    return false;
+                }
                 CompileKernelModule(device, Kernels.CudaConvWinogradKernels.GetSource(), "conv_winograd_kernels",
                     Kernels.CudaConvWinogradKernels.GetKernelNames());
                 foreach (var name in Kernels.CudaConvWinogradKernels.GetKernelNames())
-                    if (!_kernelCache.ContainsKey(name)) return false;
+                    if (!_kernelCache.ContainsKey(name))
+                    {
+                        System.Diagnostics.Trace.TraceWarning($"Winograd convolution kernels unavailable: '{name}' missing after compile.");
+                        return false;
+                    }
                 _winogradModuleReady = true;
             }
             catch (Exception ex)
@@ -94,13 +120,16 @@ public sealed partial class CudaBackend
         long p = (long)n * tilesH * tilesW;
         if (16L * k * p > int.MaxValue || 16L * c * p > int.MaxValue) return false;
         int pi = (int)p;
-        int tile = (long)((c + 127) / 128) * ((k + 127) / 128) * 16 >= Math.Max(1, _multiProcessorCount) ? 128 : 64;
+        int tile = ChooseWinogradTile(c, k);
         int gx = (c + tile - 1) / tile, gy = (k + tile - 1) / tile;
         int sms = Math.Max(1, _multiProcessorCount);
         long blocks = (long)gx * gy * 16;
+        long targetBlocks = WinogradSplitOccupancy * sms;
         int splits = 1;
-        if (blocks < 2L * sms) splits = (int)Math.Max(1, Math.Min((2L * sms + blocks - 1) / blocks, pi / 64));
-        int kPerSplit = ((pi + splits - 1) / splits + 7) / 8 * 8;
+        if (blocks < targetBlocks)
+            splits = (int)Math.Max(1, Math.Min((targetBlocks + blocks - 1) / blocks, pi / WinogradMinTilesPerSplit));
+        // Each split's slice of P is a whole number of the GEMM main loop's K tiles (CE_BK).
+        int kPerSplit = ((pi + splits - 1) / splits + ConvEngineTileK - 1) / ConvEngineTileK * ConvEngineTileK;
         splits = (pi + kPerSplit - 1) / kPerSplit;
         if (16L * splits * k * c > int.MaxValue) return false;
         var u = TryConvScratch(ref _winogradWu, 16L * k * p);
@@ -123,7 +152,7 @@ public sealed partial class CudaBackend
         // M[x][s] (K x C) = U[x] (K x P) * V[x] (P x C) over the P slice s.
         void** ga = stackalloc void*[8];
         ga[0] = &uPtr; ga[1] = &vPtr; ga[2] = &mPtr; ga[3] = &k; ga[4] = &c; ga[5] = &pi; ga[6] = &splits; ga[7] = &kPerSplit;
-        LaunchKernel3D(_kernelCache[tile == 128 ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, (uint)(16 * splits), block, 1, 1, ga, 0);
+        LaunchKernel3D(_kernelCache[tile == WinogradLargeTile ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, (uint)(16 * splits), block, 1, 1, ga, 0);
 
         void** oa = stackalloc void*[5];
         oa[0] = &mPtr; oa[1] = &dwPtr; oa[2] = &k; oa[3] = &c; oa[4] = &splits;
@@ -157,13 +186,12 @@ public sealed partial class CudaBackend
         ia[0] = &xPtr; ia[1] = &vPtr; ia[2] = &n; ia[3] = &inC; ia[4] = &h; ia[5] = &w; ia[6] = &pad; ia[7] = &tilesH; ia[8] = &tilesW;
         LaunchKernel(_kernelCache["wino_f23_input"], (uint)((inC * p + block - 1) / block), block, ia);
 
-        // 128x128 tiles only while they still fill the SMs (the sixteen GEMMs share the grid through z).
-        int tile = (long)((pi + 127) / 128) * ((outC + 127) / 128) * 16 >= Math.Max(1, _multiProcessorCount) ? 128 : 64;
+        int tile = ChooseWinogradTile(pi, outC);
         int gx = (pi + tile - 1) / tile, gy = (outC + tile - 1) / tile;
         int oneSplit = 1, wholeK = inC;
         void** ga = stackalloc void*[8];
         ga[0] = &uPtr; ga[1] = &vPtr; ga[2] = &mPtr; ga[3] = &outC; ga[4] = &pi; ga[5] = &inC; ga[6] = &oneSplit; ga[7] = &wholeK;
-        LaunchKernel3D(_kernelCache[tile == 128 ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, 16, block, 1, 1, ga, 0);
+        LaunchKernel3D(_kernelCache[tile == WinogradLargeTile ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, 16, block, 1, 1, ga, 0);
 
         void** oa = stackalloc void*[8];
         oa[0] = &mPtr; oa[1] = &yPtr; oa[2] = &n; oa[3] = &outC; oa[4] = &outH; oa[5] = &outW; oa[6] = &tilesH; oa[7] = &tilesW;

@@ -10,6 +10,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// transform. 2.25x fewer multiplies than the direct sum, with fp32 rounding close to it (all transform coefficients are
 /// 0, +-1 and +-1/2).
 /// </summary>
+/// <remarks>
+/// CUDA only for now. The other backends' follow-ups: HIP #1368, Metal #1369, OpenCL #1370, Vulkan #1371,
+/// WebGPU #1372. Until each lands, those backends serve their existing conv routes for these shapes.
+/// </remarks>
 internal static class CudaConvWinogradKernels
 {
     /// <summary>
