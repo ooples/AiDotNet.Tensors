@@ -104,6 +104,8 @@ public sealed class WinogradF23FusedConvTests
 
     [SkippableTheory]
     [InlineData(8, 64, 64, 32, 1)]
+    [InlineData(8, 512, 512, 4, 1)]  // deep layer: the channel reduction is split across blocks
+    [InlineData(8, 256, 256, 8, 1)]
     [InlineData(3, 5, 7, 9, 1)]
     [InlineData(2, 16, 40, 11, 0)]
     [InlineData(1, 33, 70, 7, 2)]

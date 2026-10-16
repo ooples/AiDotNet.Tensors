@@ -85,7 +85,8 @@ extern ""C"" __global__ void wfz_filter_flip(const float* __restrict__ w, float*
 //  - Epilogue: the products go through shared memory in two halves of 16 output channels; each (o, tile) pair's 16
 //    components are reduced by A^T m A, A^T = [[1,1,1,0],[0,1,-1,-1]], into its in-bounds 2x2 outputs.
 extern ""C"" __global__ __launch_bounds__(512, 1) void wfz_conv(const float* __restrict__ in, const float* __restrict__ u,
-    float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
+    float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW,
+    int rPerSplit)
 {
     __shared__ __align__(16) float sm[2 * 16 * WFZ_CK * 32];   // U | V; the epilogue reuses all of it
     float* us = sm;
@@ -94,6 +95,9 @@ extern ""C"" __global__ __launch_bounds__(512, 1) void wfz_conv(const float* __r
     const int tilesPerImage = tilesH * tilesW;
     const int P = N * tilesPerImage;
     const int p0 = blockIdx.x * WFZ_BP, o0 = blockIdx.y * WFZ_BO;
+    // Reduction split: blockIdx.z takes channels [rBegin, rEnd) (rPerSplit a multiple of WFZ_CK) and writes its own
+    // partial output slice; with one split the slice is the output itself.
+    const int rBegin = blockIdx.z * rPerSplit, rEnd = min(R, rBegin + rPerSplit);
 
     const bool patchLoader = tid < 256;
     const int lp = tid & 31, lc = (tid >> 5) & 7;
@@ -130,7 +134,7 @@ extern ""C"" __global__ __launch_bounds__(512, 1) void wfz_conv(const float* __r
     auto load = [&](int r0)
     {
         const int r = r0 + lc;
-        const bool rv = r < R;
+        const bool rv = r < rEnd;
         if (patchLoader)
         {
             const float* src = in + inOff + (long long)r * chanStride;
@@ -174,14 +178,15 @@ extern ""C"" __global__ __launch_bounds__(512, 1) void wfz_conv(const float* __r
         for (int q = 0; q < 8; q++) uu[2 * q * WFZ_CK * 32] = ur[q];
     };
 
-    const int steps = (R + WFZ_CK - 1) / WFZ_CK;
-    load(0);
+    const int steps = rBegin < rEnd ? (rEnd - rBegin + WFZ_CK - 1) / WFZ_CK : 0;
+    out += (long long)blockIdx.z * N * O * OH * OW;
+    load(rBegin);
     for (int step = 0; step < steps; step++)
     {
         __syncthreads();
         store();
         __syncthreads();
-        if (step + 1 < steps) load((step + 1) * WFZ_CK);
+        if (step + 1 < steps) load(rBegin + (step + 1) * WFZ_CK);
         const float* ub = us + x * WFZ_CK * 32 + oo;
         const float* vb = vs + x * WFZ_CK * 32 + pp;
         #pragma unroll
