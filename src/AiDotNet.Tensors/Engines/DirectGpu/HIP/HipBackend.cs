@@ -1927,7 +1927,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
 
             // 3D grid: (N tiles, M tiles, batches) — must match BATCHED_TILE_SIZE in kernel
-            const int tileSize = 32;
+            const int tileSize = 16;
             uint gridX = (uint)((N + tileSize - 1) / tileSize);
             uint gridY = (uint)((M + tileSize - 1) / tileSize);
             uint gridZ = (uint)batchCount;
