@@ -124,10 +124,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             RunWinograd(kernel, (long)k * n * tilesH * tilesW);
         }
 
-        void IWinogradF23Transforms.FilterGradient(IGpuBuffer m, IGpuBuffer dw, int k, int c)
+        void IWinogradF23Transforms.FilterGradient(IGpuBuffer m, IGpuBuffer dw, int k, int c, int splits)
         {
             var kernel = WinogradKernel(WinogradF23KernelTemplate.FilterGradient, m, dw);
-            kernel.SetArg(2, k); kernel.SetArg(3, c);
+            kernel.SetArg(2, k); kernel.SetArg(3, c); kernel.SetArg(4, splits);
             RunWinograd(kernel, (long)k * c);
         }
     }

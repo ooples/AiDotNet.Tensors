@@ -64,6 +64,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("webgpu.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                             shape => IsAvailable && TunedConv2DArgs.GemmScratchFits(shape),
                             (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
+                        // #1372: Winograd F(2x2,3x3) as transforms around one batched GEMM.
+                        new DelegateTunedKernelCandidate<TunedConv2DArgs>("webgpu.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
+                            shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) Conv2DDirectReference(a); }),
                     };
                     _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                         new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => CanMeasureTunedKernels,

@@ -60,15 +60,11 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
-        try
-        {
-            int total = batch * inChannels * inHeight * inWidth;
-            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
-            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardInput, pc, total, gradOutput, kernel, gradInput)) return;
-        }
-        catch { throw; }
+        // Registry dispatch (#1371): the direct shader or Winograd F(2x2,3x3), chosen per shape class.
+        var args = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardDataSlot.TryExecute(args.Shape(), args)) return;
+        LaunchDxDirect(args);
     }
 
     public void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -79,15 +75,11 @@ public sealed unsafe partial class VulkanBackend
         int dilationH, int dilationW)
     {
         EnsureInitialized();
-        try
-        {
-            int total = outChannels * inChannels * kernelH * kernelW;
-            var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
-                (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
-            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2DBackwardKernel, pc, total, input, gradOutput, gradKernel)) return;
-        }
-        catch { throw; }
+        // Registry dispatch (#1371): the direct shader or Winograd F(3x3,2x2), chosen per shape class.
+        var args = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardFilterSlot.TryExecute(args.Shape(), args)) return;
+        LaunchDwDirect(args);
     }
 
     public void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,

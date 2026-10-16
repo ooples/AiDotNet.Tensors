@@ -1,6 +1,8 @@
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -40,6 +42,86 @@ public class WinogradF23PortTests
             a => backend.TryConv2DForwardWinograd(a),
             a => backend.TryConv2DBackwardDataWinograd(a),
             a => backend.TryConv2DBackwardFilterWinograd(a));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void Vulkan_winograd_routes_match_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
+    {
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
+        Check(backend, batch, inC, outC, size, pad,
+            a => backend.TryConv2DForwardWinograd(a),
+            a => backend.TryConv2DBackwardDataWinograd(a),
+            a => backend.TryConv2DBackwardFilterWinograd(a));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void Metal_winograd_routes_match_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
+    {
+        Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal is only available on macOS/iOS.");
+        using var backend = new MetalBackend();
+        Skip.IfNot(backend.IsAvailable, "Metal is not available.");
+        Check(backend, batch, inC, outC, size, pad,
+            a => backend.TryConv2DForwardWinograd(a),
+            a => backend.TryConv2DBackwardDataWinograd(a),
+            a => backend.TryConv2DBackwardFilterWinograd(a));
+    }
+
+#if NET7_0_OR_GREATER
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void WebGpu_winograd_routes_match_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        Check(backend, batch, inC, outC, size, pad,
+            a => backend.TryConv2DForwardWinograd(a),
+            a => backend.TryConv2DBackwardDataWinograd(a),
+            a => backend.TryConv2DBackwardFilterWinograd(a));
+    }
+#endif
+
+    /// <summary>
+    /// The HIP instance cannot run here without an AMD GPU, but its dialect is CUDA C++ with nothing HIP-specific, so
+    /// NVRTC compiles it: a syntax or type error in the template's HIP emission fails on any CUDA machine, not only on
+    /// the ROCm runner.
+    /// </summary>
+    [SkippableFact]
+    public void Hip_winograd_module_compiles_as_cuda_cxx()
+    {
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.IsAvailable, "NVRTC is not available.");
+        string source = WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Hip);
+        IntPtr program = IntPtr.Zero;
+        Assert.Equal(AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcResult.Success,
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.nvrtcCreateProgram(ref program, source, "winograd_hip",
+                0, IntPtr.Zero, IntPtr.Zero));
+        try
+        {
+            var result = AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.nvrtcCompileProgram(program, 1,
+                new[] { "--gpu-architecture=compute_75" });
+            Assert.True(result == AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcResult.Success,
+                $"the HIP dialect did not compile ({result}): {ProgramLog(program)}");
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.nvrtcDestroyProgram(ref program);
+        }
+    }
+
+    private static string ProgramLog(IntPtr program)
+    {
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.nvrtcGetProgramLogSize(program, out var size);
+        var buffer = System.Runtime.InteropServices.Marshal.AllocHGlobal((int)size.ToUInt64() + 1);
+        try
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.nvrtcGetProgramLog(program, buffer);
+            return System.Runtime.InteropServices.Marshal.PtrToStringAnsi(buffer) ?? string.Empty;
+        }
+        finally
+        {
+            System.Runtime.InteropServices.Marshal.FreeHGlobal(buffer);
+        }
     }
 
     private void Check(IDirectGpuBackend backend, int batch, int inC, int outC, int size, int pad,

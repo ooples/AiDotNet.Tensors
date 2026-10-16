@@ -31,8 +31,11 @@ internal interface IWinogradF23Transforms
     /// <summary>Weight gradient: V[16][P][C], the input transform stored tile-major so it is the GEMM's P x C operand.</summary>
     void InputTilesTileMajor(IGpuBuffer x, IGpuBuffer v, int n, int c, int h, int w, int pad, int tilesH, int tilesW);
 
-    /// <summary>Weight gradient: dW[K][C][3][3] = G^T M G of M[16][K][C]. Overwrites the gradient.</summary>
-    void FilterGradient(IGpuBuffer m, IGpuBuffer dw, int k, int c);
+    /// <summary>
+    /// Weight gradient: dW[K][C][3][3] = G^T M G of M[16][splits][K][C], summing the split-K partials in order (one
+    /// split where the GEMM did not split the tile reduction). Overwrites the gradient.
+    /// </summary>
+    void FilterGradient(IGpuBuffer m, IGpuBuffer dw, int k, int c, int splits);
 }
 
 /// <summary>
@@ -111,7 +114,7 @@ internal static class WinogradF23Pipeline
         transforms.InputTilesTileMajor(a.First, v, n, c, a.InHeight, a.InWidth, a.PadH, tilesH, tilesW);
         // M[x] (K x C) = U[x] (K x P) * V[x] (P x C), one GEMM per Winograd point.
         backend.BatchedGemm(u, v, m, k, c, pi, WinogradPoints);
-        transforms.FilterGradient(m, a.Output, k, c);
+        transforms.FilterGradient(m, a.Output, k, c, splits: 1);
         return true;
     }
 

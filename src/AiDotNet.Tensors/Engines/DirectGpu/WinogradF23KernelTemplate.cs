@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
-// One definition of the Winograd F(2x2, 3x3) / F(3x3, 2x2) tile transforms, emitted as OpenCL C, HIP C++ and Vulkan
-// GLSL (#1368, #1370, #1371). WGSL has no C-like dialect and keeps its own copy (WebGpu/WebGpuWinogradKernels.cs).
+// One definition of the Winograd F(2x2, 3x3) / F(3x3, 2x2) tile transforms, emitted as OpenCL C, HIP C++, Vulkan GLSL
+// and Metal Shading Language (#1368, #1369, #1370, #1371). WGSL has no C-like dialect and keeps its own copy
+// (WebGpu/WebGpuWinogradKernels.cs).
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -13,6 +14,7 @@ internal enum WinogradKernelDialect
     OpenCl,
     Hip,
     Glsl,
+    Metal,
 }
 
 /// <summary>
@@ -201,13 +203,19 @@ internal static class WinogradF23KernelTemplate
     }
 "),
 
-        // dW[k][c] = G^T M G (3x3), G^T = [[1,1/2,1/2,0],[0,1/2,-1/2,0],[0,1/2,1/2,1]]; idx = k*C + c.
-        new Spec(FilterGradient, new[] { "mm", "dw" }, new[] { "K", "C" }, @"
+        // dW[k][c] = G^T M G (3x3), G^T = [[1,1/2,1/2,0],[0,1/2,-1/2,0],[0,1/2,1/2,1]], from M[x][split][k][c] with the
+        // split-K partials summed in order; idx = k*C + c.
+        new Spec(FilterGradient, new[] { "mm", "dw" }, new[] { "K", "C", "splits" }, @"
     int idx = gid;
     if (idx >= K * C) return;
     int plane = K * C;
     float m[16];
-    for (int q = 0; q < 16; q++) m[q] = mm[q * plane + idx];
+    for (int q = 0; q < 16; q++)
+    {
+        float acc = 0.0f;
+        for (int sp = 0; sp < splits; sp++) acc += mm[(q * splits + sp) * plane + idx];
+        m[q] = acc;
+    }
     float t[12];
     for (int j = 0; j < 4; j++)
     {
@@ -241,30 +249,53 @@ internal static class WinogradF23KernelTemplate
         throw new ArgumentException($"No Winograd kernel named '{name}'.", nameof(name));
     }
 
-    /// <summary>Every kernel in one OpenCL C or HIP C++ module.</summary>
+    /// <summary>
+    /// Every kernel in one OpenCL C, HIP C++ or Metal Shading Language module. Metal's buffers sit at indices 0 and 1 and
+    /// its int parameters at 2.., one <c>constant int&amp;</c> each, which is how MetalBackend's 1-D conv dispatcher binds
+    /// them (buffers, then each int by setBytes).
+    /// </summary>
     internal static string GetModuleSource(WinogradKernelDialect dialect)
     {
         if (dialect == WinogradKernelDialect.Glsl)
             throw new ArgumentException("GLSL has one kernel per shader; use GetGlslSource.", nameof(dialect));
         var sb = new StringBuilder();
+        if (dialect == WinogradKernelDialect.Metal) sb.Append("#include <metal_stdlib>\nusing namespace metal;\n");
         foreach (var spec in Kernels)
         {
             sb.Append('\n');
-            sb.Append(dialect == WinogradKernelDialect.OpenCl ? "__kernel void " : "extern \"C\" __global__ void ");
+            sb.Append(dialect switch
+            {
+                WinogradKernelDialect.OpenCl => "__kernel void ",
+                WinogradKernelDialect.Metal => "kernel void ",
+                _ => "extern \"C\" __global__ void ",
+            });
             sb.Append(spec.Name).Append('(');
             var parameters = new List<string>();
             for (int i = 0; i < spec.Buffers.Length; i++)
             {
                 bool read = i == 0;
-                parameters.Add(dialect == WinogradKernelDialect.OpenCl
-                    ? (read ? "__global const float* restrict " : "__global float* restrict ") + spec.Buffers[i]
-                    : (read ? "const float* __restrict__ " : "float* __restrict__ ") + spec.Buffers[i]);
+                parameters.Add(dialect switch
+                {
+                    WinogradKernelDialect.OpenCl => (read ? "__global const float* restrict " : "__global float* restrict ") + spec.Buffers[i],
+                    WinogradKernelDialect.Metal => (read ? "device const float* " : "device float* ") + spec.Buffers[i] + " [[buffer(" + i + ")]]",
+                    _ => (read ? "const float* __restrict__ " : "float* __restrict__ ") + spec.Buffers[i],
+                });
             }
-            foreach (var p in spec.Ints) parameters.Add((dialect == WinogradKernelDialect.OpenCl ? "const int " : "int ") + p);
+            for (int i = 0; i < spec.Ints.Length; i++)
+                parameters.Add(dialect switch
+                {
+                    WinogradKernelDialect.OpenCl => "const int " + spec.Ints[i],
+                    WinogradKernelDialect.Metal => "constant int& " + spec.Ints[i] + " [[buffer(" + (spec.Buffers.Length + i) + ")]]",
+                    _ => "int " + spec.Ints[i],
+                });
+            if (dialect == WinogradKernelDialect.Metal) parameters.Add("uint gidU [[thread_position_in_grid]]");
             sb.Append(string.Join(", ", parameters)).Append(")\n{\n");
-            sb.Append(dialect == WinogradKernelDialect.OpenCl
-                ? "    int gid = (int)get_global_id(0);\n"
-                : "    int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n");
+            sb.Append(dialect switch
+            {
+                WinogradKernelDialect.OpenCl => "    int gid = (int)get_global_id(0);\n",
+                WinogradKernelDialect.Metal => "    int gid = (int)gidU;\n",
+                _ => "    int gid = (int)(blockIdx.x * blockDim.x + threadIdx.x);\n",
+            });
             sb.Append(spec.Body).Append("}\n");
         }
         return sb.ToString();

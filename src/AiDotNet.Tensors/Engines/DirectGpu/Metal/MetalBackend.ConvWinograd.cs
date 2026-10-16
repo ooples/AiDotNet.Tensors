@@ -1,0 +1,145 @@
+// Copyright (c) AiDotNet. All rights reserved.
+// #1369: Winograd F(2x2, 3x3) forward and input gradient and F(3x3, 2x2) weight gradient on Metal, through the shared
+// WinogradF23Pipeline: the tile transforms (Metal Shading Language emitted from WinogradF23KernelTemplate) around
+// BatchedGemm. Backward convolution gets tuned slots here for the first time, with the direct kernels it always ran as
+// the references, so Winograd is served only on the shape classes where it measures faster.
+// NOTE: validated only on a Metal runner -- the dev box has no Apple GPU. The template emits the same bodies as the
+// OpenCL instance, whose WinogradF23PortTests run on a real device.
+using System;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
+
+public sealed partial class MetalBackend : IWinogradF23Transforms
+{
+    private const string WinogradLibraryName = "Winograd";
+    private IntPtr _winogradLibrary;
+    private bool? _winogradReady;
+    private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataSlot, _conv2DBackwardFilterSlot;
+
+    // The library, compiled on first need. A compile the driver rejects turns three tuned candidates off, and says why.
+    private bool WinogradKernelsReady
+    {
+        get
+        {
+            if (_winogradReady is { } ready) return ready;
+            lock (_tunedSlotsLock)
+            {
+                if (_winogradReady is null)
+                {
+                    try
+                    {
+                        _winogradLibrary = _shaderLibrary.CompileLibrary(WinogradLibraryName,
+                            WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal));
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Trace.TraceWarning($"Metal Winograd kernels unavailable: {ex.Message}");
+                        _winogradLibrary = IntPtr.Zero;
+                    }
+                    _winogradReady = _winogradLibrary != IntPtr.Zero;
+                }
+                return _winogradReady.Value;
+            }
+        }
+    }
+
+    internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardDataSlot
+    {
+        get
+        {
+            if (_conv2DBackwardDataSlot is { } s) return s;
+            lock (_tunedSlotsLock)
+            {
+                _conv2DBackwardDataSlot ??= new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardData,
+                    TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, new ITunedKernelCandidate<TunedConv2DBackwardArgs>[]
+                    {
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("metal.conv2d_dx.direct", TunedKernelOrigin.Builtin,
+                            true, _ => true, (in TunedConv2DBackwardArgs a) => LaunchDxDirect(a)),
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("metal.conv2d_dx.winograd_f23", TunedKernelOrigin.Builtin,
+                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinograd(a)) LaunchDxDirect(a); }),
+                    });
+                return _conv2DBackwardDataSlot;
+            }
+        }
+    }
+
+    internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardFilterSlot
+    {
+        get
+        {
+            if (_conv2DBackwardFilterSlot is { } s) return s;
+            lock (_tunedSlotsLock)
+            {
+                _conv2DBackwardFilterSlot ??= new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardFilter,
+                    TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, new ITunedKernelCandidate<TunedConv2DBackwardArgs>[]
+                    {
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("metal.conv2d_dw.direct", TunedKernelOrigin.Builtin,
+                            true, _ => true, (in TunedConv2DBackwardArgs a) => LaunchDwDirect(a)),
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("metal.conv2d_dw.winograd_f32", TunedKernelOrigin.Builtin,
+                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
+                    });
+                return _conv2DBackwardFilterSlot;
+            }
+        }
+    }
+
+    private BackendTunedKernelHarness<TunedConv2DBackwardArgs> BackwardHarness() =>
+        new(this, ConvolutionTolerance, () => IsAvailable, MeasureTunedKernelMilliseconds,
+            a => new[] { (a.Output, a.OutputCount) },
+            a => SameBuffer(a.Output, a.First) || SameBuffer(a.Output, a.Second));
+
+    // Per-route entry points, for the slot candidates above and for the tests, which run one route regardless of what
+    // the slot would pick. False when the route declines the shape (or its library did not compile).
+    internal bool TryConv2DForwardWinograd(in TunedConv2DArgs a)
+        => WinogradKernelsReady && WinogradF23Pipeline.TryForward(this, this, a);
+
+    internal bool TryConv2DBackwardDataWinograd(in TunedConv2DBackwardArgs a)
+        => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardData(this, this, a);
+
+    internal bool TryConv2DBackwardFilterWinograd(in TunedConv2DBackwardArgs a)
+        => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilter(this, this, a);
+
+    private static int[] BackwardInts(in TunedConv2DBackwardArgs a) => new[]
+    {
+        a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW,
+        a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW,
+    };
+
+    // The direct kernels: one thread per input element (input gradient) or per weight (weight gradient).
+    private void LaunchDxDirect(in TunedConv2DBackwardArgs a)
+        => TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_input",
+            a.Batch * a.InChannels * a.InHeight * a.InWidth, new[] { a.First, a.Second, a.Output }, BackwardInts(a));
+
+    private void LaunchDwDirect(in TunedConv2DBackwardArgs a)
+        => TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_backward_weights",
+            a.OutChannels * a.InChannels * a.KernelH * a.KernelW, new[] { a.First, a.Second, a.Output }, BackwardInts(a));
+
+    private void RunWinograd(string name, long threads, IGpuBuffer read, IGpuBuffer write, params int[] ints)
+        => TryDispatchConvPoolMetal(_winogradLibrary, WinogradLibraryName, name, checked((int)threads),
+            new[] { read, write }, ints);
+
+    void IWinogradF23Transforms.Filter(IGpuBuffer w, IGpuBuffer u, int k, int c, bool flip)
+        => RunWinograd(flip ? WinogradF23KernelTemplate.FilterFlip : WinogradF23KernelTemplate.Filter, (long)k * c, w, u, k, c);
+
+    void IWinogradF23Transforms.Input(IGpuBuffer x, IGpuBuffer v, int n, int c, int h, int w, int pad, int tilesH, int tilesW)
+        => RunWinograd(WinogradF23KernelTemplate.Input, (long)c * n * tilesH * tilesW, x, v, n, c, h, w, pad, tilesH, tilesW);
+
+    void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW)
+        => RunWinograd(WinogradF23KernelTemplate.Output, (long)k * n * tilesH * tilesW, m, y, n, k, outH, outW, tilesH, tilesW);
+
+    void IWinogradF23Transforms.GradOutputTiles(IGpuBuffer dy, IGpuBuffer u, int n, int k, int outH, int outW, int tilesH,
+        int tilesW)
+        => RunWinograd(WinogradF23KernelTemplate.GradOutputTiles, (long)k * n * tilesH * tilesW, dy, u, n, k, outH, outW,
+            tilesH, tilesW);
+
+    void IWinogradF23Transforms.InputTilesTileMajor(IGpuBuffer x, IGpuBuffer v, int n, int c, int h, int w, int pad,
+        int tilesH, int tilesW)
+        => RunWinograd(WinogradF23KernelTemplate.InputTilesTileMajor, (long)c * n * tilesH * tilesW, x, v, n, c, h, w, pad,
+            tilesH, tilesW);
+
+    void IWinogradF23Transforms.FilterGradient(IGpuBuffer m, IGpuBuffer dw, int k, int c, int splits)
+        => RunWinograd(WinogradF23KernelTemplate.FilterGradient, (long)k * c, m, dw, k, c, splits);
+}
