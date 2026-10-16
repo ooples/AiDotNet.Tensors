@@ -44,7 +44,7 @@ public sealed class CrossBackendKernelCoverageTests
     {
         "CopyMatrix", "CopyMatrixFast", "CopyPadMatrix", "TransposeMatrix", "TransposeMatrixFast",
         "TransposePadMatrix", "XgemmDirectNN", "XgemmDirectNT", "XgemmDirectTN", "XgemmDirectTT",
-        "copy_block_2d", "copy_rows", "copy_submatrix", "fill_buffer", "gemm_batched_persistent",
+        "copy_block_2d", "copy_rows", "copy_submatrix", "fill_buffer", "gemm_batched_tiled",
         "gemm_clblast_rdna1", "gemm_coalesced", "gemm_double_buffered", "gemm_fp16_backward",
         "gemm_fp16in_fp16out", "gemm_fp16in_fp32out", "gemm_kreg4", "gemm_low_register", "gemm_medium_tile",
         "gemm_prefetch", "gemm_small", "gemm_small_tile", "gemm_tiled_simple", "gemm_vectorized",

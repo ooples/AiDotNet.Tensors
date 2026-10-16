@@ -525,73 +525,47 @@ __kernel void gemm_vectorized(
 }
 
 // ===========================================================================
-// Batched Persistent GEMM with Work-Stealing
-// Processes multiple small matrices efficiently
+// Batched GEMM: C[b] = alpha * A[b] * B[b] + beta * C[b], row-major, contiguous batches
+// One 16x16 output tile per work group, the batch in the third grid dimension, A and B staged through local memory.
+// It replaced a work-stealing kernel that gave each WHOLE matrix to one work group and computed every element as an
+// untiled dot product from global memory: sixteen 128x512 matrices took 17 ms there, against 0.04 ms for one of them
+// through the tuned GEMM. Each element still accumulates fma over k in increasing order, as that kernel did; the
+// zero-padded tail of the last k tile adds exact zeros.
 // ===========================================================================
-__kernel void gemm_batched_persistent(
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void gemm_batched_tiled(
     __global const float* restrict A,
     __global const float* restrict B,
     __global float* restrict C,
     const int M,
     const int N,
     const int K,
-    const int batchCount,
-    __global volatile int* batchCounter,
     const float alpha,
     const float beta)
 {
-    const int localRow = get_local_id(0);
-    const int localCol = get_local_id(1);
-    const int localId = localRow * get_local_size(1) + localCol;
-    const int wgSize = get_local_size(0) * get_local_size(1);
+    const int lc = get_local_id(0);
+    const int lr = get_local_id(1);
+    const int col = get_group_id(0) * 16 + lc;
+    const int row = get_group_id(1) * 16 + lr;
+    const long batch = get_group_id(2);
+    __global const float* a = A + batch * M * K;
+    __global const float* b = B + batch * K * N;
+    __global float* c = C + batch * M * N;
 
-    // Use local memory for batch index coordination
-    __local int sharedBatchIdx;
-
-    // Each work group processes batches via work-stealing
-    while (true) {
-        // Work-steal: atomically get next batch index
-        if (localId == 0) {
-            sharedBatchIdx = atomic_inc(batchCounter);
-        }
+    __local float as[16][16];
+    __local float bs[16][17];
+    float sum = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        as[lr][lc] = (row < M && k0 + lc < K) ? a[(long)row * K + k0 + lc] : 0.0f;
+        bs[lr][lc] = (k0 + lr < K && col < N) ? b[(long)(k0 + lr) * N + col] : 0.0f;
         barrier(CLK_LOCAL_MEM_FENCE);
-
-        int batchIdx = sharedBatchIdx;
-        if (batchIdx >= batchCount) break;
-
-        // Pointers to this batch's matrices
-        __global const float* batchA = A + batchIdx * M * K;
-        __global const float* batchB = B + batchIdx * K * N;
-        __global float* batchC = C + batchIdx * M * N;
-
-        // Simple per-element computation for batched case
-        int elementsPerBatch = M * N;
-        int elementsPerThread = (elementsPerBatch + wgSize - 1) / wgSize;
-
-        for (int e = 0; e < elementsPerThread; e++) {
-            int elemIdx = localId + e * wgSize;
-            if (elemIdx >= elementsPerBatch) break;
-
-            int row = elemIdx / N;
-            int col = elemIdx % N;
-
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum = fma(batchA[row * K + k], batchB[k * N + col], sum);
-            }
-
-            int outIdx = row * N + col;
-            if (beta != 0.0f) {
-                batchC[outIdx] = alpha * sum + beta * batchC[outIdx];
-            } else {
-                batchC[outIdx] = alpha * sum;
-            }
-        }
-
+        for (int kk = 0; kk < 16; kk++) sum = fma(as[lr][kk], bs[kk][lc], sum);
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+    if (row >= M || col >= N) return;
+    long outIdx = (long)row * N + col;
+    c[outIdx] = beta != 0.0f ? alpha * sum + beta * c[outIdx] : alpha * sum;
 }
-
 // ===========================================================================
 // GEMM Variation 1: Small Tile (16x16 tiles, 1x1 output per thread)
 // Hypothesis: Minimal register pressure for higher occupancy baseline
@@ -1651,7 +1625,7 @@ void gemm_clblast_rdna1(
                 "gemm_tiled_simple",
                 "gemm_small",
                 "gemm_vectorized",
-                "gemm_batched_persistent",
+                "gemm_batched_tiled",
                 "gemm_small_tile",
                 "gemm_medium_tile",
                 "gemm_coalesced",

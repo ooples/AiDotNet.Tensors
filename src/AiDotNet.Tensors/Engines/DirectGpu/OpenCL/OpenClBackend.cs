@@ -2977,37 +2977,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (batchCount <= 0)
                 throw new ArgumentException("Batch count must be positive", nameof(batchCount));
 
+            if (M <= 0 || N <= 0) return;
+
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
             var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
 
-            // Allocate atomic counter buffer and initialize to 0
-            var counterData = new int[] { 0 };
-            using var counterBuffer = new DirectOpenClIntBuffer(_context, counterData);
-
-            var kernel = _kernelCache["gemm_batched_persistent"];
-
+            // One 16x16 output tile per work group, the batch in z (see gemm_batched_tiled).
+            var kernel = _kernelCache["gemm_batched_tiled"];
             kernel.SetArg(0, bufferA.Handle);
             kernel.SetArg(1, bufferB.Handle);
             kernel.SetArg(2, bufferC.Handle);
             kernel.SetArg(3, M);
             kernel.SetArg(4, N);
             kernel.SetArg(5, K);
-            kernel.SetArg(6, batchCount);
-            kernel.SetArg(7, counterBuffer.Handle);
-            kernel.SetArg(8, alpha);
-            kernel.SetArg(9, beta);
-
-            // Calculate optimal work group size based on GPU capabilities
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
-
-            // Launch enough workgroups to saturate the GPU
-            // Each workgroup processes batches via work-stealing until all are done
-            int numWorkgroups = Math.Max(batchCount, ComputeUnits * 2);
-            int globalSizeX = numWorkgroups * localSizeX;
-            int globalSizeY = localSizeY;
-
-            kernel.Execute2D(globalSizeX, globalSizeY, localSizeX, localSizeY);
+            kernel.SetArg(6, alpha);
+            kernel.SetArg(7, beta);
+            kernel.Execute3D(RoundUpToMultiple(N, 16), RoundUpToMultiple(M, 16), batchCount, 16, 16, 1);
             _context?.Finish();  // Sync for batched - ensures all batches complete
         }
 
