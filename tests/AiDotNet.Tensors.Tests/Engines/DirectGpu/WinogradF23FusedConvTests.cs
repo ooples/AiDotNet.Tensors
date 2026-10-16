@@ -26,7 +26,7 @@ public sealed class WinogradF23FusedConvTests
         return v;
     }
 
-    private static string VariantName(int variant) => variant switch { 1 => "1 block/SM", 2 => "double-buffered", _ => "2 blocks/SM" };
+    private static string VariantName(int variant) => variant switch { 1 => "1 block/SM", 2 => "double-buffered", 3 => "512 threads double-buffered", 4 => "512 threads", _ => "2 blocks/SM" };
 
     private void CheckAgainst(double[] sum, double[] magnitude, float[] got, float[] again, string what)
     {
@@ -89,7 +89,7 @@ public sealed class WinogradF23FusedConvTests
 
         using var dDy = backend.AllocateBuffer(dy);
         using var dW = backend.AllocateBuffer(weights);
-        foreach (int variant in new[] { 0, 1, 2 })
+        foreach (int variant in new[] { 0, 1, 2, 3, 4 })
         {
             var poison = Enumerable.Repeat(float.NaN, sum.Length).ToArray();
             using var dX1 = backend.AllocateBuffer(poison);
@@ -149,7 +149,7 @@ public sealed class WinogradF23FusedConvTests
 
         using var dx = backend.AllocateBuffer(x);
         using var dw = backend.AllocateBuffer(weights);
-        foreach (int variant in new[] { 0, 1, 2 })
+        foreach (int variant in new[] { 0, 1, 2, 3, 4 })
         {
             var poison = Enumerable.Repeat(float.NaN, sum.Length).ToArray();
             using var y1 = backend.AllocateBuffer(poison);
@@ -192,7 +192,7 @@ public sealed class WinogradF23FusedConvTests
         Skip.IfNot(backend.EnsureWinogradFusedModule() && backend.EnsureWinogradModule(), "Winograd kernels did not compile.");
         const int batch = 8, rounds = 41, burst = 10;
         var rng = new Random(23);
-        string[] routes = { "fused2", "fused1", "fusedDB", "F(2x2)", "engine" };
+        string[] routes = { "fusedDB", "f512DB", "f512", "F(2x2)", "engine" };
         var totalsDx = new double[routes.Length];
         var totalsFwd = new double[routes.Length];
         foreach (var (c, hw, count) in new[] { (64, 32, 4), (128, 16, 3), (256, 8, 3), (512, 4, 3) })
@@ -204,17 +204,17 @@ public sealed class WinogradF23FusedConvTests
             var f = new CudaConv2DArgs(a0, wt, o, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
             Func<bool>[] dxRuns =
             {
-                () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 0),
-                () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 1),
                 () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 2),
+                () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 3),
+                () => backend.TryConv2DBackwardDataWinogradF23Fused(b, 4),
                 () => backend.TryConv2DBackwardDataWinogradF23(b),
                 () => backend.Conv2DBackwardInputViaEngine(b),
             };
             Func<bool>[] fwdRuns =
             {
-                () => backend.TryConv2DForwardWinogradF23Fused(f, 0),
-                () => backend.TryConv2DForwardWinogradF23Fused(f, 1),
                 () => backend.TryConv2DForwardWinogradF23Fused(f, 2),
+                () => backend.TryConv2DForwardWinogradF23Fused(f, 3),
+                () => backend.TryConv2DForwardWinogradF23Fused(f, 4),
                 () => backend.TryConv2DForwardWinogradF23(f),
                 () => backend.TryConv2DForwardEngine(f),
             };

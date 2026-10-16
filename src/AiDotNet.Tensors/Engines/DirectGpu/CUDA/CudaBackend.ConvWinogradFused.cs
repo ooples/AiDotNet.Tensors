@@ -31,7 +31,9 @@ public sealed partial class CudaBackend
                     if (!_kernelCache.ContainsKey(name)) return false;
                 // The double-buffered kernel's two U | V stages need 64 KB of dynamic shared memory (above the 48 KB default).
                 _winogradFusedDoubleBufferReady = CudaNativeBindings.cuFuncSetAttribute(_kernelCache["wfz_conv_db"],
-                    CudaFunctionAttribute.MaxDynamicSharedSizeBytes, WinogradFusedDoubleBufferBytes) == CudaResult.Success;
+                    CudaFunctionAttribute.MaxDynamicSharedSizeBytes, WinogradFusedDoubleBufferBytes) == CudaResult.Success
+                    && CudaNativeBindings.cuFuncSetAttribute(_kernelCache["wfz512_db"],
+                        CudaFunctionAttribute.MaxDynamicSharedSizeBytes, WinogradFusedDoubleBufferBytes) == CudaResult.Success;
                 _winogradFusedModuleReady = true;
             }
             catch (Exception ex)
@@ -70,7 +72,7 @@ public sealed partial class CudaBackend
         int tilesH = (outH + 1) / 2, tilesW = (outW + 1) / 2;
         long p = (long)n * tilesH * tilesW;
         if (p > int.MaxValue || 16L * inC * outC > int.MaxValue || (long)n * inC * h * w > int.MaxValue) return false;
-        if (variant == 2 && !_winogradFusedDoubleBufferReady) return false;
+        if ((variant == 2 || variant == 3) && !_winogradFusedDoubleBufferReady) return false;
         var u = TryConvScratch(ref _winogradFusedU, 16L * inC * outC);
         if (u is null) return false;
 
@@ -85,9 +87,9 @@ public sealed partial class CudaBackend
         void** ca = stackalloc void*[14];
         ca[0] = &xPtr; ca[1] = &uPtr; ca[2] = &yPtr; ca[3] = &n; ca[4] = &inC; ca[5] = &h; ca[6] = &w; ca[7] = &outC;
         ca[8] = &outH; ca[9] = &outW; ca[10] = &pad; ca[11] = &tilesH; ca[12] = &tilesW;
-        string kernel = variant switch { 1 => "wfz_conv1", 2 => "wfz_conv_db", _ => "wfz_conv" };
-        LaunchKernel3D(_kernelCache[kernel], (uint)((p + 31) / 32), (uint)((outC + 31) / 32), 1, 256, 1, 1, ca,
-            variant == 2 ? (uint)WinogradFusedDoubleBufferBytes : 0);
+        string kernel = variant switch { 1 => "wfz_conv1", 2 => "wfz_conv_db", 3 => "wfz512_db", 4 => "wfz512", _ => "wfz_conv" };
+        LaunchKernel3D(_kernelCache[kernel], (uint)((p + 31) / 32), (uint)((outC + 31) / 32), 1, variant >= 3 ? 512u : 256u, 1, 1, ca,
+            variant == 2 || variant == 3 ? (uint)WinogradFusedDoubleBufferBytes : 0);
         return true;
     }
 }

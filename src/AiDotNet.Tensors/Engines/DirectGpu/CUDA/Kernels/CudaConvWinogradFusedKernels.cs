@@ -270,7 +270,189 @@ extern ""C"" __global__ __launch_bounds__(256, 1) void wfz_conv_db(const float* 
     extern __shared__ __align__(16) float smd[];
     wfz_conv_body<2>(smd, in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW);
 }
+// The same tile (32 output channels x 32 tiles x 16 components, 8 reduction channels per step) on 512 threads: warp x
+// owns component x, lane (oq = lane >> 3, pq = lane & 7) an 8 (o) x 4 (p) sub-tile, so a warp's shared reads per
+// reduction channel are 32 U and 32 V floats (all broadcast) and sixteen warps per SM hide the global loads. Loaders:
+// warps 0-7 load one 4x4 patch each (tile lp, channel lc), every thread 8 of the 16 U planes (x = (tid >> 8) + 2q).
+template <int STAGES>
+__device__ __forceinline__ void wfz512_body(float* __restrict__ sm, const float* __restrict__ in, const float* __restrict__ u,
+    float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
+{
+    const int tid = threadIdx.x;
+    const int tilesPerImage = tilesH * tilesW;
+    const int P = N * tilesPerImage;
+    const int p0 = blockIdx.x * WFZ_BP, o0 = blockIdx.y * WFZ_BO;
+
+    const bool patchLoader = tid < 256;
+    const int lp = tid & 31, lc = (tid >> 5) & 7;
+    const int gp = p0 + lp;
+    unsigned rowOk = 0, colOk = 0;
+    long long inOff = 0;
+    if (patchLoader && gp < P)
+    {
+        int n = gp / tilesPerImage, t = gp - n * tilesPerImage;
+        int th = t / tilesW, tw = t - th * tilesW;
+        int h0 = th * 2 - pad, w0 = tw * 2 - pad;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            if (h0 + i >= 0 && h0 + i < IH) rowOk |= 1u << i;
+            if (w0 + i >= 0 && w0 + i < IW) colOk |= 1u << i;
+        }
+        inOff = (long long)n * R * IH * IW + (long long)h0 * IW + w0;
+    }
+    const long long chanStride = (long long)IH * IW;
+    const long long uPlane = (long long)R * O;
+    const int uo = o0 + (tid & 31), ux0 = tid >> 8;
+
+    const int x = tid >> 5, lane = tid & 31;
+    const int oo = (lane >> 3) * 8, pp = (lane & 7) * 4;
+
+    float acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    float d[16], ur[8];
+    auto load = [&](int r0)
+    {
+        const int r = r0 + lc;
+        const bool rv = r < R;
+        if (patchLoader)
+        {
+            const float* src = in + inOff + (long long)r * chanStride;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    d[i * 4 + j] = (rv && ((rowOk >> i) & 1u) && ((colOk >> j) & 1u)) ? __ldg(src + i * IW + j) : 0.0f;
+        }
+        const bool uv = rv && uo < O;
+        const float* usrc = u + (long long)(ux0 * R + r) * O + uo;
+        #pragma unroll
+        for (int q = 0; q < 8; q++) ur[q] = uv ? __ldg(usrc + 2 * q * uPlane) : 0.0f;
+    };
+    auto store = [&](int stage)
+    {
+        float* us = sm + stage * WFZ_STAGE_FLOATS;
+        float* vs = us + 16 * WFZ_CK * 32;
+        if (patchLoader)
+        {
+            float t[4][4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                t[0][j] = d[0 * 4 + j] - d[2 * 4 + j];
+                t[1][j] = d[1 * 4 + j] + d[2 * 4 + j];
+                t[2][j] = d[2 * 4 + j] - d[1 * 4 + j];
+                t[3][j] = d[1 * 4 + j] - d[3 * 4 + j];
+            }
+            float* v = vs + lc * 32 + lp;
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                v[(i * 4 + 0) * WFZ_CK * 32] = t[i][0] - t[i][2];
+                v[(i * 4 + 1) * WFZ_CK * 32] = t[i][1] + t[i][2];
+                v[(i * 4 + 2) * WFZ_CK * 32] = t[i][2] - t[i][1];
+                v[(i * 4 + 3) * WFZ_CK * 32] = t[i][1] - t[i][3];
+            }
+        }
+        float* uu = us + ux0 * WFZ_CK * 32 + (tid & 255);   // (x = ux0 + 2q, r = lc, o = tid & 31)
+        #pragma unroll
+        for (int q = 0; q < 8; q++) uu[2 * q * WFZ_CK * 32] = ur[q];
+    };
+
+    const int steps = (R + WFZ_CK - 1) / WFZ_CK;
+    load(0);
+    if (STAGES == 2) { store(0); __syncthreads(); }
+    for (int step = 0; step < steps; step++)
+    {
+        const int stage = STAGES == 2 ? (step & 1) : 0;
+        if (STAGES == 1)
+        {
+            __syncthreads();
+            store(0);
+            __syncthreads();
+        }
+        if (step + 1 < steps) load((step + 1) * WFZ_CK);
+        const float* ub = sm + stage * WFZ_STAGE_FLOATS + x * WFZ_CK * 32 + oo;
+        const float* vb = sm + stage * WFZ_STAGE_FLOATS + 16 * WFZ_CK * 32 + x * WFZ_CK * 32 + pp;
+        #pragma unroll
+        for (int r = 0; r < WFZ_CK; r++)
+        {
+            float4 a0 = *reinterpret_cast<const float4*>(ub + r * 32);
+            float4 a1 = *reinterpret_cast<const float4*>(ub + r * 32 + 4);
+            float4 b0 = *reinterpret_cast<const float4*>(vb + r * 32);
+            float a[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+            float b[4] = { b0.x, b0.y, b0.z, b0.w };
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        if (STAGES == 2 && step + 1 < steps)
+        {
+            store(stage ^ 1);
+            __syncthreads();
+        }
+    }
+
+    // Epilogue as in wfz_conv_body: two halves of 16 output channels, one (o, tile) pair per thread per half.
+    #pragma unroll
+    for (int half = 0; half < 2; half++)
+    {
+        __syncthreads();
+        if ((oo >> 4) == half)
+        {
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                *reinterpret_cast<float4*>(sm + (x * 16 + oo - 16 * half + i) * 32 + pp) =
+                    make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        }
+        __syncthreads();
+        const int ol = tid >> 5, pl = tid & 31;
+        const int o = o0 + 16 * half + ol, p = p0 + pl;
+        if (o < O && p < P)
+        {
+            float m[16];
+            #pragma unroll
+            for (int c = 0; c < 16; c++) m[c] = sm[(c * 16 + ol) * 32 + pl];
+            float t0[4], t1[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                t0[j] = m[0 * 4 + j] + m[1 * 4 + j] + m[2 * 4 + j];
+                t1[j] = m[1 * 4 + j] - m[2 * 4 + j] - m[3 * 4 + j];
+            }
+            int n = p / tilesPerImage, t = p - n * tilesPerImage;
+            int th = t / tilesW, tw = t - th * tilesW;
+            int h = th * 2, w = tw * 2;
+            float* dst = out + (((long long)n * O + o) * OH + h) * OW + w;
+            dst[0] = t0[0] + t0[1] + t0[2];
+            if (w + 1 < OW) dst[1] = t0[1] - t0[2] - t0[3];
+            if (h + 1 < OH)
+            {
+                dst[OW] = t1[0] + t1[1] + t1[2];
+                if (w + 1 < OW) dst[OW + 1] = t1[1] - t1[2] - t1[3];
+            }
+        }
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(512, 1) void wfz512_db(const float* __restrict__ in, const float* __restrict__ u,
+    float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
+{
+    extern __shared__ __align__(16) float smd[];
+    wfz512_body<2>(smd, in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW);
+}
+extern ""C"" __global__ __launch_bounds__(512, 1) void wfz512(const float* __restrict__ in, const float* __restrict__ u,
+    float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW)
+{
+    __shared__ __align__(16) float sm[WFZ_STAGE_FLOATS];
+    wfz512_body<1>(sm, in, u, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW);
+}
 ";
 
-    public static string[] GetKernelNames() => new[] { "wfz_filter", "wfz_filter_flip", "wfz_conv", "wfz_conv1", "wfz_conv_db" };
+    public static string[] GetKernelNames() => new[] { "wfz_filter", "wfz_filter_flip", "wfz_conv", "wfz_conv1", "wfz_conv_db", "wfz512_db", "wfz512" };
 }
