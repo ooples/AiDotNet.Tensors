@@ -373,7 +373,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
     internal static double SecondLowestSpeedup(KernelTuningPairedEvidence evidence)
     {
         var speedups = evidence.Samples.Select(s => s.Speedup).OrderBy(v => v).ToArray();
-        return speedups.Length > 1 ? speedups[1] : speedups[0];
+        return speedups.Length > 1 ? speedups[1] : speedups.Length == 1 ? speedups[0] : 0.0;   // no pairs: never a win
     }
 
     /// <summary>
@@ -384,7 +384,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
     internal static double RobustNoiseRatio(IReadOnlyList<KernelTuningPairedSample> control)
     {
         var deviations = control.Select(s => Math.Max(s.Speedup, 1.0 / s.Speedup)).OrderBy(v => v).ToArray();
-        return deviations.Length > 1 ? deviations[deviations.Length - 2] : deviations[0];
+        return deviations.Length > 1 ? deviations[deviations.Length - 2] : deviations.Length == 1 ? deviations[0] : 1.0;
     }
 
     // FNV-1a over the ordered candidate ids, as 8 hex digits: a short, stable name for the candidate set.
