@@ -287,12 +287,6 @@ internal static partial class SimdGemm
             return true;
         }
 
-        // Deep reductions into a small output (a weight gradient over thousands of rows): L2-sized row slices, each
-        // tile's chain in registers with A read in place. [64,2048]x[2048,64]: 95-103 us vs 210 for the split-k panel
-        // below, [64,2048]x[2048,128]: 189-198 vs 292 (Ryzen 4800H).
-        if (transA && !transB && TrySgemmTransADeepK(a, lda, b, ldb, c, m, k, n))
-            return true;
-
         if (transA && !transB && s_splitKTransA)
         {
             // dW = Xᵀ·dY: A stored [k, m] with k the deep reduction (batch rows), C [m, n] small. Split k into fixed
