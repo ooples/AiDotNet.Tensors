@@ -182,6 +182,16 @@ public static partial class BlasManaged
                     MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
                     MemoryMarshal.Cast<T, double>(c), m, k, n);
         }
+        else if (isFloat && Simd.SimdGemm.UseDirectParallel2D
+            && m <= Simd.SimdGemm.DirectParallel2DMaxM && k <= Simd.SimdGemm.DirectParallel2DMaxK
+            && Simd.SimdGemm.TrySgemmDirectParallel2D(MemoryMarshal.Cast<T, float>(a), lda, MemoryMarshal.Cast<T, float>(b), ldb,
+                MemoryMarshal.Cast<T, float>(c), m, k, n, allowParallel: true))
+        {
+            // A batch-sized M splits the OUTPUT COLUMNS first: each worker reads its own slab of B once. The row split
+            // below has every worker stream all of B, which held while B was cache-resident but not in a training step,
+            // where the optimizer has just rewritten the weights and evicted them: [64,784]x[784,512] with the cache
+            // evicted ran 674-1160 us that way against 284-336 us here (Ryzen 4800H), and no slower with it hot.
+        }
         else if (isFloat)
         {
             // FP64 no-trans and both trans variants already OVERWRITE every C element
