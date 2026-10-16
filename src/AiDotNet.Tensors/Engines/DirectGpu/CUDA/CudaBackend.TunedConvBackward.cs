@@ -165,6 +165,12 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                             (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23(a)) LaunchDxDirect(a); }));
+                    // The same F(2x2) arithmetic fused into one kernel after the filter transform (cuDNN's input gradient for
+                    // ResNet's 32x32 and 16x16 layers): no V/M round trips through global memory.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23_fused",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradFusedModule(),
+                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23Fused(a)) LaunchDxDirect(a); }));
                     if (candidates.Count == 0)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_backward_input"), (in CudaConv2DBackwardArgs a) => LaunchDxDirect(a)));
