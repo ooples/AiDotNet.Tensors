@@ -1125,6 +1125,16 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce(
     gradKernel[i] = sum;
 }
 
+// The dgrad engine's weight layout: wt[tap][co][ci] = w[co][ci][tap] (tap = kh * kW + kw).
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_weight_tapmajor(
+    const float* __restrict__ w, float* __restrict__ wt, int outC, int inC, int khw)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= outC * inC * khw) return;
+    int tap = i % khw, ci = (i / khw) % inC, co = i / (khw * inC);
+    wt[((long long)tap * outC + co) * inC + ci] = w[i];
+}
+
 // Sums the phase input gradient's split-K slices in split order: pixel (ih, iw) belongs to phase
 // ((ih + pH) mod sH, (iw + pW) mod sW), which has ceil(outC * taps / kPerSplit) slices (see conv2d_dgrad_ce_body).
 extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_phase_reduce(
@@ -1637,7 +1647,10 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
 }
 
 // Input gradient on the engine core, Cout % 8 == 0: dX[Cin, B*H*W] = W'[Cin, K] * dY_gathered[K, B*H*W] with K ordered
-// (kh, kw, co), so a K tile shares one tap. PHASE = false: unit stride or any stride with per-tile divisibility checks,
+// (kh, kw, co), so a K tile shares one tap. The A loader's lanes run along ci. tapMajor: the weights arrive as
+// wt[kh*kW + kw][co][ci] (conv2d_dgrad_weight_tapmajor), so those lanes read contiguous floats; else the forward layout
+// w[co][ci][kh][kw], where consecutive ci are kH*kW floats apart (a 1x1 kernel's layout is the same either way). The
+// host relays out only when enough column tiles reread the weights to pay for the copy. PHASE = false: unit stride or any stride with per-tile divisibility checks,
 // split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation, kernel >= stride): blockIdx.z is the
 // sub-pixel phase (rh, rw); the block's columns are that phase's pixels and only the taps kh = rh (mod sH),
 // kw = rw (mod sW) are visited, every one of which hits; phases write disjoint pixels. With split-K, each phase's K
@@ -1647,7 +1660,7 @@ template <int BM, int BN, bool PHASE, int MAIN>
 __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
     int batch, int inC, int H, int W, int outC, int outH, int outW,
-    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit, int tapMajor)
 {
     __shared__ __align__(16) float smem[2 * CE_BK * (BM + CePad<MAIN>::value) + 2 * CE_BK * (BN + CePad<MAIN>::value)];
     constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256, BSTEP = 256 / BN;
@@ -1683,7 +1696,8 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const int kBegin = (PHASE ? split : (int)blockIdx.z) * kPerSplit, kEnd = min(K, kBegin + kPerSplit);
     const int tiles = kBegin < kEnd ? (kEnd - kBegin + CE_BK - 1) / CE_BK : 0;
 
-    const int ak = tid & 7, am = tid >> 3;
+    constexpr int ASTEP = 256 / BM;   // A tile rows (K) per pass: lane runs along m (ci), RA passes of ASTEP rows
+    const int am = tid % BM, ak = tid / BM;
     const int bn = tid % BN, bk = tid / BN;
     const int n = n0 + bn;
     const bool nIn = n < N;
@@ -1704,13 +1718,14 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     float ra[RA], rb[RB];
     auto load = [&]()
     {
-        const float* wTap = kernel + (long long)(co0 + ak) * P + kh * kW + kw;
+        const int m = m0 + am;
+        const int tap = kh * kW + kw;
+        const float* wTap = tapMajor ? kernel + ((long long)tap * outC + co0 + ak) * inC + m
+                                     : kernel + ((long long)(co0 + ak) * inC + m) * khw + tap;
+        const long long rowStep = tapMajor ? (long long)ASTEP * inC : (long long)ASTEP * P;
         #pragma unroll
         for (int r = 0; r < RA; r++)
-        {
-            int m = m0 + am + 32 * r;
-            ra[r] = m < inC ? wTap[(long long)m * khw] : 0.0f;
-        }
+            ra[r] = m < inC ? wTap[r * rowStep] : 0.0f;
         int ty_ = ihp - kh * dH, tx_ = iwp - kw * dW;
         int oh = ty_, ow = tx_;
         bool valid = nIn && ty_ >= 0 && tx_ >= 0;
@@ -1728,7 +1743,7 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     auto store = [&](auto as, auto bs)
     {
         #pragma unroll
-        for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];
+        for (int r = 0; r < RA; r++) as[ak + ASTEP * r][am] = ra[r];
         #pragma unroll
         for (int r = 0; r < RB; r++) bs[bk + BSTEP * r][bn] = rb[r];
     };
@@ -1840,10 +1855,10 @@ CE_WGRAD_KERNEL(conv2d_wgrad_ce64_tf32, 64, 2)
 extern ""C"" __global__ __launch_bounds__(256) void NAME( \
     const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out, \
     int batch, int inC, int H, int W, int outC, int outH, int outW, \
-    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit, int tapMajor) \
 { \
     conv2d_dgrad_ce_body<BM, BM, PHASE, MAIN>(gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW, \
-        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit, tapMajor); \
 }
 CE_DGRAD_KERNEL(conv2d_dgrad_ce128, 128, false, 0)
 CE_DGRAD_KERNEL(conv2d_dgrad_ce64, 64, false, 0)
@@ -2230,7 +2245,7 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
                 "depthwise_conv2d_backward_input",
                 "depthwise_conv2d_backward_weights",
                 "conv2d_wgrad_implicit_gemm",
-                "conv2d_wgrad_splitk_reduce", "conv2d_dgrad_phase_reduce",
+                "conv2d_wgrad_splitk_reduce", "conv2d_dgrad_phase_reduce", "conv2d_dgrad_weight_tapmajor",
                 "conv2d_dgrad_implicit_gemm",
                 "conv2d_dgrad_implicit_gemm_c16",
                 "conv2d_dgrad_implicit_gemm_c16_phase",
