@@ -142,6 +142,47 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
             AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds = budget;
         }
         Assert.Equal("nvrtc.conv2d.winograd_f23", chosen?.Id);
+
+        // The weight-gradient slot, same protocol: 128@16x16 (Winograd F(3,2) ~1.3x the reference's kernel) must pick it;
+        // 256@8x8 is logged only, its kernel margin over the reference is smaller than the gate's noise band on some runs.
+        using var gy = cuda.AllocateBuffer(Rand(batch * c * s * s, 3, 1f));
+        using var dw = cuda.AllocateBuffer(c * c * 9);
+        var dwArgs = new CudaConv2DBackwardArgs(x, gy, dw, true, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
+        string? dwChosen = ResolveFilter(dwArgs, "N8 C128 16x16", 3);
+        int c2 = 256, s2 = 8;
+        using var x2 = cuda.AllocateBuffer(Rand(batch * c2 * s2 * s2, 4, 1f));
+        using var gy2 = cuda.AllocateBuffer(Rand(batch * c2 * s2 * s2, 5, 1f));
+        using var dw2 = cuda.AllocateBuffer(c2 * c2 * 9);
+        ResolveFilter(new CudaConv2DBackwardArgs(x2, gy2, dw2, true, batch, c2, s2, s2, c2, s2, s2, 3, 3, 1, 1, 1, 1, 1, 1), "N8 C256 8x8", 1);
+        Assert.Equal("nvrtc.conv2d_dw.winograd_f32", dwChosen);
+
+        string? ResolveFilter(CudaConv2DBackwardArgs a, string label, int attempts)
+        {
+            var slot = cuda.Conv2DBackwardFilterSlot;
+            double saved = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds;
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds =
+                AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.SpentMilliseconds + 60_000;
+            string? id = null;
+            try
+            {
+                for (int attempt = 1; attempt <= attempts && id != "nvrtc.conv2d_dw.winograd_f32"; attempt++)
+                {
+                    slot.InvalidateDecisions();
+                    id = slot.Resolve(a.Shape(), a)?.Id;
+                    var d = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.Decisions
+                        .LastOrDefault(r => r.Op == AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.Conv2DBackwardFilter
+                                            && r.Shape.Equals(a.Shape()));
+                    _output.WriteLine($"attempt {attempt}: weight-gradient slot picked {id ?? "<none>"} for {label} (reason {d?.Reason}, " +
+                                      $"reference {d?.ReferenceMilliseconds:F3} ms, chosen {d?.CandidateMilliseconds:F3} ms); " +
+                                      $"rejected [{string.Join("; ", d?.Rejected ?? Array.Empty<string>())}]");
+                }
+            }
+            finally
+            {
+                AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds = saved;
+            }
+            return id;
+        }
     }
 
     // Weight gradient through Winograd F(3x3, 2x2) against the backend's tuned weight-gradient route. The reduction runs over
