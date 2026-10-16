@@ -151,14 +151,7 @@ public static partial class BlasManaged
         if (options.PackedA is not null || options.PackedB is not null) return false;
         // both-transposed is rare and would need strided A *and* strided B (no
         // contiguous vector dimension) — left on the strategy.
-        if (transA && transB) return false;
-        if (ldc != n || (n & 7) != 0) return false;
-        // B transposed runs the NT dot-product kernel, which reads Bᵀ rows contiguously and does not re-stream a
-        // [k, n] B per row chunk, so its N ceiling is wider: a linear layer's input gradient dY·W at 784 outputs
-        // fell to the streaming strategy at 2.2x the time (128x512x784: 0.38 ms vs 0.17 here).
-        int maxN = transB && !transA ? ThinMDirectTransBMaxN : ThinMDirectMaxN;
-        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > maxN || k > ThinMDirectMaxK) return false;
-        if ((long)m * n * k < ThinMDirectMinWork) return false; // tiny GEMMs stay on the strategy/autotune path
+        if (ldc != n || !ThinMDirectServesShape(m, n, k, transA, transB)) return false;
         // Each operand must be contiguous in its stored (possibly transposed) layout:
         // !transA → A is [m,k] (lda=k); transA → Aᵀ is [k,m] (lda=m). Likewise B.
         if (lda != (transA ? m : k)) return false;
@@ -217,6 +210,29 @@ public static partial class BlasManaged
         return true;
     }
 #endif
+
+    /// <summary>
+    /// Whether <see cref="Gemm{T}"/> runs a dense, unpacked GEMM of this shape (row-major, ldc = n) through the thin-M
+    /// direct-parallel kernel. Other kernels consult it to stand aside where that kernel wins.
+    /// </summary>
+    internal static bool ThinMDirectServesShape(int m, int n, int k, bool transA, bool transB)
+    {
+#if NET5_0_OR_GREATER
+        if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return false;
+        // both-transposed is rare and would need strided A *and* strided B (no
+        // contiguous vector dimension) — left on the strategy.
+        if (transA && transB) return false;
+        if ((n & 7) != 0) return false;
+        // B transposed runs the NT dot-product kernel, which reads Bᵀ rows contiguously and does not re-stream a
+        // [k, n] B per row chunk, so its N ceiling is wider: a linear layer's input gradient dY·W at 784 outputs
+        // fell to the streaming strategy at 2.2x the time (128x512x784: 0.38 ms vs 0.17 here).
+        int maxN = transB && !transA ? ThinMDirectTransBMaxN : ThinMDirectMaxN;
+        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > maxN || k > ThinMDirectMaxK) return false;
+        return (long)m * n * k >= ThinMDirectMinWork; // tiny GEMMs stay on the strategy/autotune path
+#else
+        return false;
+#endif
+    }
 
     /// <summary>
     /// Sub-issue F (#374): when true, <see cref="Helpers.BlasProvider.TryGemm"/> and

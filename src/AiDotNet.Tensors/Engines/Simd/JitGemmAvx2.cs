@@ -222,18 +222,32 @@ internal static unsafe class JitGemmAvx2
         if (Mfull < M && Nfull > 0) EdgeBlock(a, b, c, M, N, K, Mfull, M, 0, Nfull);
     }
 
+    // Each output starts at zero and adds a[i,k] * b[k,j] for k in order, a multiply then an add, so a lane gives the
+    // same bits as the scalar sum. It walks B along its rows: the column-at-a-time loop this replaces read B with a
+    // stride of N, and when M is not a multiple of 6 the leftover rows of a thin GEMM went through it --
+    // [64,128]x[128,512] spent ~240 of its 260 µs on 4 edge rows (Ryzen 4800H), where a vectorized pass takes a few.
     [MethodImpl(Hot)]
     private static void EdgeBlock(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int M, int N, int K, int i0, int i1, int j0, int j1)
     {
+        int width = j1 - j0;
+        int w = System.Numerics.Vector<float>.Count;
+        int vecEnd = width - width % w;
         for (int i = i0; i < i1; i++)
         {
-            int aRow = i * K, cRow = i * N;
-            for (int j = j0; j < j1; j++)
+            int aRow = i * K;
+            var cRow = c.Slice(i * N + j0, width);
+            cRow.Clear();
+            for (int k = 0; k < K; k++)
             {
-                float acc = 0f;
-                for (int k = 0; k < K; k++) acc += a[aRow + k] * b[k * N + j];
-                c[cRow + j] = acc;
+                float av = a[aRow + k];
+                var bRow = b.Slice(k * N + j0, width);
+                var avv = new System.Numerics.Vector<float>(av);
+                int j = 0;
+                for (; j < vecEnd; j += w)
+                    (new System.Numerics.Vector<float>(cRow.Slice(j)) + avv * new System.Numerics.Vector<float>(bRow.Slice(j)))
+                        .CopyTo(cRow.Slice(j));
+                for (; j < width; j++) cRow[j] += av * bRow[j];
             }
         }
     }

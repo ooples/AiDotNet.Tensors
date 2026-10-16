@@ -271,7 +271,7 @@ internal static partial class SimdGemm
         if (!transA && transB)
         {
             // B is stored [n, k]; Bᵀ [k, n] is the small operand.
-            if (lda != k || ldb != k || (long)k * n > SmallJitMaxTransposeElements || !InJitSmallKBand(m, n, k))
+            if (lda != k || ldb != k || (long)k * n > SmallJitMaxTransposeElements || !InJitSmallKBand(m, n, k, transB: true))
                 return false;
             var bt = System.Buffers.ArrayPool<float>.Shared.Rent(k * n);
             try
@@ -346,13 +346,18 @@ internal static partial class SimdGemm
 
 
     /// <summary>Shapes the small-K panel kernel wins at: shallow k, enough rows to parallelize, and either total work
-    /// under <see cref="JitSmallKMaxWork"/> or B re-read traffic under <see cref="JitSmallKMaxBTrafficBytes"/>.</summary>
-    private static bool InJitSmallKBand(int m, int n, int k)
+    /// under <see cref="JitSmallKMaxWork"/> or B re-read traffic under <see cref="JitSmallKMaxBTrafficBytes"/> -- less
+    /// the thin-M box BlasManaged's direct-parallel kernel serves. Inside that box the panel's 6-row blocks leave M
+    /// unsplit enough to idle most cores, and the transposed-B route adds a serial transpose of B: [64,128]x[128,512]
+    /// took 72 µs here vs 36 there, and dY[64,128]·Wᵀ (W [512,128]) 204 vs 34 (Ryzen 4800H). Past its bounds (M 2048)
+    /// the panel still wins, 62 vs 139 µs at [2048,64]x[64,64].</summary>
+    private static bool InJitSmallKBand(int m, int n, int k, bool transB)
     {
         long work = (long)m * n * k;
         long bTraffic = (long)(m / 6) * k * n * sizeof(float);
         return k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16 && work >= JitSmallKMinWork
-            && (work <= JitSmallKMaxWork || bTraffic <= JitSmallKMaxBTrafficBytes);
+            && (work <= JitSmallKMaxWork || bTraffic <= JitSmallKMaxBTrafficBytes)
+            && !BlasManaged.BlasManaged.ThinMDirectServesShape(m, n, k, transA: false, transB);
     }
 
     // B re-read traffic ceiling for the panel route (bytes): the giant-M regressions were at 22-33 MB.
@@ -392,7 +397,7 @@ internal static partial class SimdGemm
         // The work ceiling stands in for B re-read traffic, (m/6)*k*n*4 bytes, which is what regressed at giant M
         // (22-33 MB). A shape just over the ceiling with modest traffic -- the [2048,64]x[64,128] FFN GEMM, 16.8M MACs
         // and 11 MB -- is admitted on the traffic test.
-        if (_jitSmallK && JitGemmAvx2.Available && InJitSmallKBand(m, n, k))
+        if (_jitSmallK && JitGemmAvx2.Available && InJitSmallKBand(m, n, k, transB: false))
         {
             JitGemmAvx2.RunJit(a, b.Slice(0, k * n), c, m, n, k);
             return true;
