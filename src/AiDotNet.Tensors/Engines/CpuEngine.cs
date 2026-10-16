@@ -42563,6 +42563,41 @@ public partial class CpuEngine : ITensorLevelEngine
                 new[] { positions }.Concat(hashTables).ToArray(),
                 engine => engine.MultiresolutionHashEncoding(
                     positions, hashTables, resolutions, featuresPerLevel));
+
+        // A training trace records the encoding as one node whose backward scatters the feature gradient into every
+        // level's table, so a compiled training plan replays it on each step's positions and trains the tables
+        // (Müller et al. 2022). Untraced, it was invisible to the plan and the caller fell back to the eager tape.
+        // The positions are sample coordinates, not parameters: they receive no gradient.
+        var scope = GraphMode.Current;
+        if (scope != null)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedPositions = positions;
+            var capturedTables = (Tensor<T>[])hashTables.Clone();
+            var capturedResolutions = (int[])resolutions.Clone();
+            int levels = capturedTables.Length;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "MultiresolutionHashEncoding",
+                new[] { capturedPositions }.Concat(capturedTables).ToArray(),
+                new[] { positions._shape[0], checked(levels * featuresPerLevel) },
+                (eng, output) =>
+                {
+                    var result = eng.MultiresolutionHashEncoding(
+                        capturedPositions, capturedTables, capturedResolutions, featuresPerLevel);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                (gradOutput, inputs, _, _, eng, grads) =>
+                {
+                    var tables = new Tensor<T>[inputs.Length - 1];
+                    Array.Copy(inputs, 1, tables, 0, tables.Length);
+                    var tableGradients = eng.MultiresolutionHashEncodingBackward(
+                        inputs[0], tables, capturedResolutions, featuresPerLevel, gradOutput);
+                    for (int level = 0; level < tables.Length; level++)
+                        DifferentiableOps.AccumulateGrad(grads, tables[level], tableGradients[level], eng);
+                });
+        }
+
         return InstantNGPOperations.MultiresolutionHashEncoding(
             positions, hashTables, resolutions, featuresPerLevel);
     }
