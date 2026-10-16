@@ -73,6 +73,34 @@ public sealed class HipRowMajorSgemmTests
         Assert.True(MaxError(tripled, backend.DownloadBuffer(gC)) <= 3e-4);
     }
 
+    /// <summary>Split-K sums the K pieces in a fixed order and applies alpha/beta once, on partial tiles and on a K
+    /// that does not divide evenly; a split larger than K's 16-blocks falls back to fewer pieces.</summary>
+    [SkippableTheory]
+    [InlineData(32, 1024, 1024, 4)]
+    [InlineData(37, 53, 300, 7)]
+    [InlineData(4096, 64, 1024, 2)]
+    [InlineData(20, 20, 40, 8)]
+    public void SplitK_MatchesCpu_WithAlphaBeta(int m, int n, int k, int splits)
+    {
+        using var backend = CreateBackend();
+        Skip.If(backend is null, "A HIP device is required.");
+        float[] a = Values(m * k, 13), b = Values(k * n, 17), c0 = Values(m * n, 19);
+        float[] ab = CpuGemm(a, b, m, n, k);
+        var expected = new float[m * n];
+        for (int i = 0; i < expected.Length; i++) expected[i] = 0.5f * ab[i] + 2f * c0[i];
+        using var gA = backend.AllocateBuffer(a);
+        using var gB = backend.AllocateBuffer(b);
+        double tolerance = 2e-6 * k + 1e-5;
+        foreach (var tile in HipRowMajorSgemmKernels.Tiles)
+        {
+            if (!tile.Supports(m, n, k)) continue;
+            using var gC = backend.AllocateBuffer((float[])c0.Clone());
+            Assert.True(backend.TryExecuteRowMajorGemm(tile, gA, gB, gC, m, n, k, 0.5f, 2f, splits), tile.KernelName);
+            double error = MaxError(expected, backend.DownloadBuffer(gC));
+            Assert.True(error <= tolerance, $"{tile.KernelName} {m}x{n}x{k} split {splits}: max error {error:E2}");
+        }
+    }
+
     private static float[] Values(int count, int seed)
     {
         var random = RandomHelper.CreateSeededRandom(seed);

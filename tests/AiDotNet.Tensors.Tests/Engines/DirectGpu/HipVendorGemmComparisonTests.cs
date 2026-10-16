@@ -168,9 +168,13 @@ public sealed class HipVendorGemmComparisonTests
             foreach (var tile in AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipRowMajorSgemmKernels.Tiles)
             {
                 if (!tile.Supports(m, n, k)) continue;
-                double ms = Time(() => Assert.True(backend.TryExecuteRowMajorGemm(tile, ga, gb, gc, m, n, k, 1f, 0f)));
-                AssertClose(reference, backend.DownloadBuffer(gc), k, $"{tile.KernelName} {m}x{n}x{k}");
-                if (ms < best) { best = ms; bestName = tile.KernelName; }
+                foreach (int split in new[] { 1, 2, 4, 8 })
+                {
+                    if (split > 1 && k < 64 * split) continue;
+                    double ms = Time(() => Assert.True(backend.TryExecuteRowMajorGemm(tile, ga, gb, gc, m, n, k, 1f, 0f, split)));
+                    AssertClose(reference, backend.DownloadBuffer(gc), k, $"{tile.KernelName} split {split} {m}x{n}x{k}");
+                    if (ms < best) { best = ms; bestName = $"{tile.KernelName} split {split}"; }
+                }
             }
             _output.WriteLine($"{m} x {n} x {k} | {vendorMs:F3} | {best:F3} | {best / vendorMs:F2} | {bestName}");
         }

@@ -50,8 +50,12 @@ internal static class HipRowMajorSgemmKernels
     private const string Body = @"
 template <int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void rm_sgemm_body(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
-    int M, int N, int K, float alpha, float beta)
+    int M, int N, int K, float alpha, float beta, int kChunk, size_t cStride)
 {
+    // Split-K: block z covers K range [z * kChunk, min(K, (z + 1) * kChunk)) and writes its own C slice.
+    const int kBeg = blockIdx.z * kChunk;
+    const int kEnd = min(K, kBeg + kChunk);
+    C += blockIdx.z * cStride;
     constexpr int BK = 16;
     constexpr int NT = (BM / TM) * (BN / TN);
     constexpr int AL = (BM * BK) / NT;
@@ -75,13 +79,13 @@ __device__ __forceinline__ void rm_sgemm_body(const float* __restrict__ A, const
         for (int i = 0; i < AL; i++)
         {
             int idx = tid + i * NT, r = idx / BK, c = idx % BK, gm = bm + r, gk = k0 + c;
-            ra[i] = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
+            ra[i] = (gm < M && gk < kEnd) ? A[(size_t)gm * K + gk] : 0.0f;
         }
 #pragma unroll
         for (int i = 0; i < BL; i++)
         {
             int idx = tid + i * NT, r = idx / BN, c = idx % BN, gk = k0 + r, gn = bn + c;
-            rb[i] = (gk < K && gn < N) ? B[(size_t)gk * N + gn] : 0.0f;
+            rb[i] = (gk < kEnd && gn < N) ? B[(size_t)gk * N + gn] : 0.0f;
         }
     };
     auto stash = [&](int buf)
@@ -92,13 +96,13 @@ __device__ __forceinline__ void rm_sgemm_body(const float* __restrict__ A, const
         for (int i = 0; i < BL; i++) { int idx = tid + i * NT; Bs[buf][idx / BN][idx % BN] = rb[i]; }
     };
 
-    fetch(0);
+    fetch(kBeg);
     stash(0);
     __syncthreads();
     int buf = 0;
-    for (int k0 = 0; k0 < K; k0 += BK)
+    for (int k0 = kBeg; k0 < kEnd; k0 += BK)
     {
-        bool more = k0 + BK < K;
+        bool more = k0 + BK < kEnd;
         if (more) fetch(k0 + BK);
 #pragma unroll
         for (int kk = 0; kk < BK; kk++)
@@ -139,8 +143,12 @@ __device__ __forceinline__ void rm_sgemm_body(const float* __restrict__ A, const
 // float4 LDS reads of a wavefront hit consecutive 16-byte words instead of 2-way conflicting at a 32-byte stride.
 template <int BM, int BN, int TM, int TN>
 __device__ __forceinline__ void rm_sgemm_vec_body(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
-    int M, int N, int K, float alpha, float beta)
+    int M, int N, int K, float alpha, float beta, int kChunk, size_t cStride)
 {
+    // Split-K: block z covers K range [z * kChunk, min(K, (z + 1) * kChunk)) and writes its own C slice.
+    const int kBeg = blockIdx.z * kChunk;
+    const int kEnd = min(K, kBeg + kChunk);
+    C += blockIdx.z * cStride;
     constexpr int BK = 16;
     constexpr int NT = (BM / TM) * (BN / TN);
     constexpr int AL = (BM * BK) / (4 * NT);
@@ -166,13 +174,13 @@ __device__ __forceinline__ void rm_sgemm_vec_body(const float* __restrict__ A, c
         for (int i = 0; i < AL; i++)
         {
             int idx = tid + i * NT, r = idx / (BK / 4), c = (idx % (BK / 4)) * 4, gm = bm + r, gk = k0 + c;
-            ra[i] = (gm < M && gk < K) ? *reinterpret_cast<const float4*>(A + (size_t)gm * K + gk) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            ra[i] = (gm < M && gk < kEnd) ? *reinterpret_cast<const float4*>(A + (size_t)gm * K + gk) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
 #pragma unroll
         for (int i = 0; i < BL; i++)
         {
             int idx = tid + i * NT, r = idx / (BN / 4), c = (idx % (BN / 4)) * 4, gk = k0 + r, gn = bn + c;
-            rb[i] = (gk < K && gn < N) ? *reinterpret_cast<const float4*>(B + (size_t)gk * N + gn) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            rb[i] = (gk < kEnd && gn < N) ? *reinterpret_cast<const float4*>(B + (size_t)gk * N + gn) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
     };
     auto stash = [&](int buf)
@@ -191,13 +199,13 @@ __device__ __forceinline__ void rm_sgemm_vec_body(const float* __restrict__ A, c
         }
     };
 
-    fetch(0);
+    fetch(kBeg);
     stash(0);
     __syncthreads();
     int buf = 0;
-    for (int k0 = 0; k0 < K; k0 += BK)
+    for (int k0 = kBeg; k0 < kEnd; k0 += BK)
     {
-        bool more = k0 + BK < K;
+        bool more = k0 + BK < kEnd;
         if (more) fetch(k0 + BK);
 #pragma unroll
         for (int kk = 0; kk < BK; kk++)
@@ -240,7 +248,19 @@ __device__ __forceinline__ void rm_sgemm_vec_body(const float* __restrict__ A, c
         }
     }
 }
+// Split-K reduction: C = alpha * sum_z partial[z] + beta * C, summed in z order (deterministic).
+extern ""C"" __global__ __launch_bounds__(256) void rm_sgemm_splitk_reduce(const float* __restrict__ partial, float* __restrict__ C,
+    int count, int splits, float alpha, float beta)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float s = 0.0f;
+    for (int z = 0; z < splits; z++) s += partial[(size_t)z * count + i];
+    C[i] = beta == 0.0f ? alpha * s : alpha * s + beta * C[i];
+}
 ";
+
+    internal const string SplitKReduceName = "rm_sgemm_splitk_reduce";
 
     internal static string BuildSource()
     {
@@ -248,17 +268,18 @@ __device__ __forceinline__ void rm_sgemm_vec_body(const float* __restrict__ A, c
         foreach (var t in Tiles)
         {
             sb.Append(CultureInfo.InvariantCulture,
-                $"extern \"C\" __global__ __launch_bounds__(256) void {t.KernelName}(const float* A, const float* B, float* C, int M, int N, int K, float alpha, float beta)\n");
+                $"extern \"C\" __global__ __launch_bounds__(256) void {t.KernelName}(const float* A, const float* B, float* C, int M, int N, int K, float alpha, float beta, int kChunk, size_t cStride)\n");
             sb.Append(CultureInfo.InvariantCulture,
-                $"{{ {(t.Vectorized ? "rm_sgemm_vec_body" : "rm_sgemm_body")}<{t.BlockM}, {t.BlockN}, {t.ThreadM}, {t.ThreadN}>(A, B, C, M, N, K, alpha, beta); }}\n");
+                $"{{ {(t.Vectorized ? "rm_sgemm_vec_body" : "rm_sgemm_body")}<{t.BlockM}, {t.BlockN}, {t.ThreadM}, {t.ThreadN}>(A, B, C, M, N, K, alpha, beta, kChunk, cStride); }}\n");
         }
         return sb.ToString();
     }
 
     internal static string[] KernelNames()
     {
-        var names = new string[Tiles.Length];
+        var names = new string[Tiles.Length + 1];
         for (int i = 0; i < Tiles.Length; i++) names[i] = Tiles[i].KernelName;
+        names[Tiles.Length] = SplitKReduceName;
         return names;
     }
 }
