@@ -60,7 +60,9 @@ public class WinogradF23PortTests
     [MemberData(nameof(Shapes))]
     public void Metal_winograd_routes_match_the_cpu_convolution(int batch, int inC, int outC, int size, int pad)
     {
-        Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal is only available on macOS/iOS.");
+        // RuntimeInformation rather than OperatingSystem.IsMacOS: the test project also targets .NET Framework.
+        Skip.IfNot(System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX),
+            "Metal is only available on macOS.");
         using var backend = new MetalBackend();
         Skip.IfNot(backend.IsAvailable, "Metal is not available.");
         Check(backend, batch, inC, outC, size, pad,
