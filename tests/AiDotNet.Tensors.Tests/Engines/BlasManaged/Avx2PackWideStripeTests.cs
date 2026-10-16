@@ -1,3 +1,4 @@
+#if NET5_0_OR_GREATER
 using System;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using Xunit;
@@ -35,3 +36,4 @@ public sealed class Avx2PackWideStripeTests
                 $"nr={nr} nc={nc} kc={kc}: packed[{i}] {actual[i]} != {expected[i]}");
     }
 }
+#endif
