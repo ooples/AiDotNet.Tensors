@@ -196,6 +196,7 @@ internal sealed class TensorStorage<T>
     {
         _data = data ?? throw new ArgumentNullException(nameof(data));
         _refCount = 1;
+        Interlocked.Increment(ref data.LiveStorages);
         if (shareExternalGpuCacheEpoch
             && data.TryGetBackingArrayIdentity(out var externalArray, out _)   // identity: the epoch table key
             && externalArray is not null)
@@ -223,6 +224,7 @@ internal sealed class TensorStorage<T>
         if (size < 0) throw new ArgumentOutOfRangeException(nameof(size), "Storage size must be non-negative.");
         _data = new Vector<T>(size);
         _refCount = 1;
+        _data.LiveStorages = 1;
     }
 
     /// <summary>
@@ -259,9 +261,10 @@ internal sealed class TensorStorage<T>
     /// Decrements the reference count. When it reaches zero, the storage is marked as disposed
     /// and the pooled array (if any) can be reclaimed by TensorAllocator.
     /// </summary>
+    /// <returns>True when this call released the last reference.</returns>
     /// <exception cref="InvalidOperationException">Thrown on double-release (refCount already 0).</exception>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal void Release()
+    internal bool Release()
     {
         int newCount = Interlocked.Decrement(ref _refCount);
         if (newCount < 0)
@@ -280,7 +283,10 @@ internal sealed class TensorStorage<T>
             owner?.Dispose();
             var gpuOwner = Interlocked.Exchange(ref _gpuBufferOwner, null);
             gpuOwner?.Dispose();
+            Interlocked.Decrement(ref _data.LiveStorages);
+            return true;
         }
+        return false;
     }
 
     /// <summary>

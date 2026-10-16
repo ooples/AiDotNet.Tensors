@@ -340,7 +340,7 @@ public partial class CpuEngine
             {
                 ProjectMhaFloat(
                     concatBuf, outWeight, oQ8, oQ4,
-                    (float[])(object)output.GetDataArray(), batchSeqRows, dModel);
+                    (float[])(object)output.GetDataArrayUnmarked(), batchSeqRows, dModel);
             }
             else
             {
@@ -758,7 +758,7 @@ public partial class CpuEngine
                 1.0 / Math.Sqrt(dHead), batch, numHeads, seqLen, dHead, concatBuf, dModel);
 
             // Output projection: concat[totalRows, dModel] @ outWeight[dModel, dModel] -> output.
-            var outArr = output.GetDataArray();
+            var outArr = output.GetDataArrayUnmarked();
             Array.Clear(outArr, 0, proj);
             MatrixMultiplyHelper.MultiplyBlocked(ops,
                 new ReadOnlyMemory<double>(concatBuf, 0, proj),
