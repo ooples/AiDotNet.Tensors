@@ -91,6 +91,12 @@ public enum TunedKernelDecisionReason
     Pinned,
     /// <summary>The process tuning budget was exhausted before this shape was measured.</summary>
     BudgetExhausted,
+    /// <summary>
+    /// No candidate passed, but one beat the reference by median and failed only the noise or pair-consistency test:
+    /// the measurement could not tell, as when the device was busy during it. The reference is served for this process
+    /// and the verdict is not persisted, so a later process measures the shape again.
+    /// </summary>
+    Inconclusive,
 }
 
 /// <summary>

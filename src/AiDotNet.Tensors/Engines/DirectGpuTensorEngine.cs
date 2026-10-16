@@ -15883,6 +15883,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var gammaBuffer = GetOrAllocateBuffer(backend, gamma);
             using var saveMeanBuffer = GetOrAllocateBuffer(backend, mean);
             using var trueVarianceBuffer = GetOrAllocateBuffer(backend, variance);
+            if (backend is DirectGpu.IBatchNormVarianceBackend varianceBackend)
+            {
+                // From the saved variance directly (no inverse-std launch), reading x and dY once each.
+                var gradInputDirect = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+                var gradGammaDirect = AllocateFullyWrittenOutputBuffer(backend, channels);
+                var gradBetaDirect = AllocateFullyWrittenOutputBuffer(backend, channels);
+                if (varianceBackend.TryBatchNormBackwardFromVariance(gradOutBuffer.Buffer, inputBuffer.Buffer,
+                        gammaBuffer.Buffer, saveMeanBuffer.Buffer, trueVarianceBuffer.Buffer, gradInputDirect.Buffer,
+                        gradGammaDirect.Buffer, gradBetaDirect.Buffer, batch, channels, spatialSize, (float)epsilon))
+                {
+                    gradGamma = DeferTensorResult<T>(backend, gradGammaDirect.Buffer, channels, gamma.Shape.ToArray());
+                    gradBeta = DeferTensorResult<T>(backend, gradBetaDirect.Buffer, channels, gamma.Shape.ToArray());
+                    return DeferTensorResult<T>(backend, gradInputDirect.Buffer, input.Length, input.Shape.ToArray());
+                }
+                gradInputDirect.Dispose();
+                gradGammaDirect.Dispose();
+                gradBetaDirect.Dispose();
+            }
             using var saveInvVarBuffer = AllocateFullyWrittenOutputBuffer(backend, channels);
             // One launch where the backend has LayerNorm's fused 1/sqrt(var + eps) (the same arithmetic as the three below).
             if (!(backend is DirectGpu.ILayerNormBackwardPartsBackend parts
@@ -15919,6 +15937,90 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("MaxPool2DBackwardWithTensorIndices", capabilityGap);
             return base.BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
         }
+    }
+
+    /// <summary>
+    /// Training BatchNorm followed by ReLU in one launch (<see cref="DirectGpu.IBatchNormVarianceBackend"/>): the ReLU'd
+    /// output plus the batch mean and biased variance. Null -- nothing launched -- when the backend or shape does not
+    /// take the register-resident kernel; the caller then runs BatchNorm and ReLU. Records nothing: the compiled plan's
+    /// BatchNorm+ReLU fusion supplies the backward (<see cref="Autodiff.BackwardFunctions{T}.BatchNormReluBackward"/>).
+    /// </summary>
+    internal Tensor<T>? TryBatchNormReluForward<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon,
+        out Tensor<T>? mean, out Tensor<T>? variance, Tensor<T>? residual = null)
+    {
+        mean = null;
+        variance = null;
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+            || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
+            return null;
+        using var bufIn = GetOrAllocateBuffer(backend, input);
+        using var bufGamma = GetOrAllocateBuffer(backend, gamma);
+        using var bufBeta = GetOrAllocateBuffer(backend, beta);
+        if (residual is not null && residual.Length != input.Length) return null;
+        using var bufResidual = residual is null ? default : GetOrAllocateBuffer(backend, residual);
+        var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+        var bufMean = AllocateFullyWrittenOutputBuffer(backend, channels);
+        var bufVar = AllocateFullyWrittenOutputBuffer(backend, channels);
+        if (!varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
+                bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
+                residual: residual is null ? null : bufResidual.Buffer))
+        {
+            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
+            return null;
+        }
+        mean = DeferTensorResult<T>(backend, bufMean.Buffer, channels, new[] { channels });
+        variance = DeferTensorResult<T>(backend, bufVar.Buffer, channels, new[] { channels });
+        return DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
+    }
+
+    /// <summary>
+    /// Backward of a training BatchNorm followed by ReLU in one launch: <paramref name="gradOutput"/> is the ReLU's output
+    /// gradient, masked where <paramref name="reluOutput"/> is not positive, then the BatchNorm backward from the saved
+    /// mean and variance. Null -- nothing launched -- when unavailable; the caller then composes ReluBackward and
+    /// BatchNormBackward.
+    /// </summary>
+    internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
+        Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta)
+        => TryBatchNormReluBackward(gradOutput, reluOutput, input, gamma, mean, variance, epsilon, false,
+            out gradGamma, out gradBeta, out _);
+
+    /// <summary>As <see cref="TryBatchNormReluBackward{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, out Tensor{T}?, out Tensor{T}?)"/>;
+    /// with <paramref name="withResidual"/> the forward added a residual before the ReLU, and
+    /// <paramref name="gradResidual"/> receives its gradient (the masked output gradient).</summary>
+    internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
+        Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, bool withResidual,
+        out Tensor<T>? gradGamma, out Tensor<T>? gradBeta, out Tensor<T>? gradResidual)
+    {
+        gradGamma = null;
+        gradBeta = null;
+        gradResidual = null;
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+            || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
+            return null;
+        using var bufDy = GetOrAllocateBuffer(backend, gradOutput);
+        using var bufOut = GetOrAllocateBuffer(backend, reluOutput);
+        using var bufIn = GetOrAllocateBuffer(backend, input);
+        using var bufGamma = GetOrAllocateBuffer(backend, gamma);
+        using var bufMean = GetOrAllocateBuffer(backend, mean);
+        using var bufVar = GetOrAllocateBuffer(backend, variance);
+        var bufDx = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+        var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
+        var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
+        var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
+        if (!varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer, bufMean.Buffer,
+                bufVar.Buffer, bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial, (float)epsilon,
+                reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null))
+        {
+            bufDx.Dispose(); bufDg.Dispose(); bufDb.Dispose();
+            if (withResidual) bufDr.Dispose();
+            return null;
+        }
+        if (withResidual) gradResidual = DeferTensorResult<T>(backend, bufDr.Buffer, input.Length, input.Shape.ToArray());
+        gradGamma = DeferTensorResult<T>(backend, bufDg.Buffer, channels, gamma.Shape.ToArray());
+        gradBeta = DeferTensorResult<T>(backend, bufDb.Buffer, channels, gamma.Shape.ToArray());
+        return DeferTensorResult<T>(backend, bufDx.Buffer, input.Length, input.Shape.ToArray());
     }
 
     // #775: GPU InstanceNormBackward. Same shape of contract as BatchNormBackward, but the
@@ -23121,6 +23223,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
             // The training kernel stores every output element and both saved statistics on every backend.
             bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            if (backend is DirectGpu.IBatchNormVarianceBackend varianceBackend)
+            {
+                bufSaveMean = AllocateFullyWrittenOutputBuffer(backend, channels);
+                bufSaveInvVar = AllocateFullyWrittenOutputBuffer(backend, channels);
+                // One launch that reads the input once and stores the mean and the biased variance this op reports.
+                if (varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer,
+                        bufBeta.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer, batch, channels, spatial, (float)epsilon))
+                {
+                    var fusedResult = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
+                    mean = DeferTensorResult<T>(backend, bufSaveMean.Buffer, channels, new[] { channels });
+                    variance = DeferTensorResult<T>(backend, bufSaveInvVar.Buffer, channels, new[] { channels });
+                    ownershipTransferred = true;
+                    Autodiff.DifferentiableOps.RecordIfActive("BatchNorm", fusedResult, new[] { input, gamma, beta },
+                        Autodiff.BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+                    return fusedResult;
+                }
+                bufSaveMean.Dispose();
+                bufSaveInvVar.Dispose();
+            }
             // Running statistics: the training kernel blends the batch statistics into them, but this op never returns
             // or reads them, so whatever the buffers held only affects values that are thrown away. They are not
             // initialised (two fills and two memsets a call - ResNet-18 runs 20 BatchNorms a step).
