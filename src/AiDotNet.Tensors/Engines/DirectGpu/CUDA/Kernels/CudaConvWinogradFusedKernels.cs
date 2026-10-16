@@ -38,9 +38,12 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
     float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW,
     int rPerSplit)
 {
-    __shared__ __align__(16) float sm[2 * 16 * WFZ_CK * 32];   // U | V; the epilogue reuses all of it
+    // Shared U row stride: the forward layout's filter stores put 8 r x 4 o on a warp, so its rows are padded to 36
+    // floats (32 banks); the input-gradient stores run along o and need no padding.
+    constexpr int WFZ_ULD = WMODE == 1 ? 36 : 32;
+    __shared__ __align__(16) float sm[16 * WFZ_CK * WFZ_ULD + 16 * WFZ_CK * 32];   // U | V; the epilogue reuses 8192 of it
     float* us = sm;
-    float* vs = sm + 16 * WFZ_CK * 32;
+    float* vs = sm + 16 * WFZ_CK * WFZ_ULD;
     const int tid = threadIdx.x;
     const int tilesPerImage = tilesH * tilesW;
     const int P = N * tilesPerImage;
@@ -147,15 +150,15 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
                 t[2][j] = 0.5f * (g0 - g1 + g2);
                 t[3][j] = g2;
             }
-            float* uu = us + fr * 32 + fo;
+            float* uu = us + fr * WFZ_ULD + fo;
             #pragma unroll
             for (int i = 0; i < 4; i++)
             {
                 float a = t[i][0], b = t[i][1], c = t[i][2];
-                uu[(i * 4 + 0) * WFZ_CK * 32] = a;
-                uu[(i * 4 + 1) * WFZ_CK * 32] = 0.5f * (a + b + c);
-                uu[(i * 4 + 2) * WFZ_CK * 32] = 0.5f * (a - b + c);
-                uu[(i * 4 + 3) * WFZ_CK * 32] = c;
+                uu[(i * 4 + 0) * WFZ_CK * WFZ_ULD] = a;
+                uu[(i * 4 + 1) * WFZ_CK * WFZ_ULD] = 0.5f * (a + b + c);
+                uu[(i * 4 + 2) * WFZ_CK * WFZ_ULD] = 0.5f * (a - b + c);
+                uu[(i * 4 + 3) * WFZ_CK * WFZ_ULD] = c;
             }
         }
     };
@@ -169,13 +172,13 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
         store();
         __syncthreads();
         if (step + 1 < steps) load(rBegin + (step + 1) * WFZ_CK);
-        const float* ub = us + x * WFZ_CK * 32 + oo;
+        const float* ub = us + x * WFZ_CK * WFZ_ULD + oo;
         const float* vb = vs + x * WFZ_CK * 32 + pp;
         #pragma unroll
         for (int r = 0; r < WFZ_CK; r++)
         {
-            float4 a0 = *reinterpret_cast<const float4*>(ub + r * 32);
-            float4 a1 = *reinterpret_cast<const float4*>(ub + r * 32 + 4);
+            float4 a0 = *reinterpret_cast<const float4*>(ub + r * WFZ_ULD);
+            float4 a1 = *reinterpret_cast<const float4*>(ub + r * WFZ_ULD + 4);
             float4 b0 = *reinterpret_cast<const float4*>(vb + r * 32);
             float a[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
             float b[4] = { b0.x, b0.y, b0.z, b0.w };
