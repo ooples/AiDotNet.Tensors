@@ -11270,7 +11270,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     im2colSpan.Slice(0, sliceSize), colW, false,
                     outputSpan.Slice(outputOffset, outChannels * colW), colW,
                     outChannels, colW, colH,
-                    ImplicitConvGemmOptions(Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism)));
+                    // One thread: the same default route as the implicit conv's blocks, so the two routes stay bit-identical.
+                    Helpers.CpuParallelSettings.MaxDegreeOfParallelism == 1 && s_singleThreadImplicitConvAutoGemm
+                        ? SingleThreadImplicitConvGemmOptions()
+                        : ImplicitConvGemmOptions(Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism)));
                 gemmHandled = true;
             }
 #if NET5_0_OR_GREATER
@@ -11500,7 +11503,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 new ReadOnlySpan<float>(panel, 0, colH * ncBlock), ncBlock, false,     // B = panel [colH x ncBlock]
                 new Span<float>((float*)pOut + cOffset, (int)(outputLength - cOffset)), colW,
                 mRows, ncBlock, colH,
-                ImplicitConvGemmOptions());
+                threads == 1 && s_singleThreadImplicitConvAutoGemm ? SingleThreadImplicitConvGemmOptions() : ImplicitConvGemmOptions());
         }
 
         if (workers >= Math.Min(threads, units))
@@ -11608,6 +11611,12 @@ public partial class CpuEngine : ITensorLevelEngine
         PackingMode = Engines.BlasManaged.PackingMode.ForcePackBoth,
         Mc = ImplicitConvGemmMc, Nc = ImplicitConvGemmNc, Kc = ImplicitConvGemmKc,
     };
+    // #653: with one thread there is no A panel to share, so each block's GEMM takes BlasManaged's default route, the
+    // serial Goto tile loop (same Kc of 256, so the result matches the forced PackBoth route bit for bit). It measured 2x
+    // on the 64x2048x576 block GEMM of a 64-channel 128x128 3x3 conv (7.5 -> 3.8 ms).
+    private static Engines.BlasManaged.BlasOptions<float> SingleThreadImplicitConvGemmOptions() => new();
+    // A/B switch for the single-thread default route above (in-process benchmarks flip it between calls).
+    internal static bool s_singleThreadImplicitConvAutoGemm = true;
     // Narrowest block (output columns) the implicit conv GEMM is given: narrower GEMMs fall off the packed kernel's speed.
     private const int ImplicitGemmMinBlockColumns = 64;
 

@@ -164,6 +164,8 @@ public class Conv2DImplicitGemmParityTests
     [InlineData(1, 128, 64, 3, 64, 16)]
     [InlineData(1, 512, 48, 3, 63, 16)]    // 73 MB matrix keeps the implicit route; 16-row tile blocks cap it at 3 workers
     [InlineData(1, 64, 64, 3, 64, 4)]      // K = 576: past the row-block conv, a low-channel shape on the implicit route
+    [InlineData(1, 64, 64, 3, 64, 1)]      // single thread: both routes' block GEMMs take the default (Goto) route
+    [InlineData(1, 32, 32, 3, 128, 1)]
     public void FusedConv_IsBitIdentical_ToFullIm2Col_AtThreadCount(int batch, int inC, int outC, int k, int hw, int threads)
     {
         int previous = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
