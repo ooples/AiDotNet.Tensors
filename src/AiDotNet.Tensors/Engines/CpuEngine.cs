@@ -38996,6 +38996,14 @@ public partial class CpuEngine : ITensorLevelEngine
         using var outputDataKeep4 = new KeepAliveScope(output);
         var dstSpan = output.DataUnmarked.Span;
 
+        // Merge adjacent output axes that the source also keeps adjacent
+        // (stride[i] == stride[i+1] * dim[i+1]); when the merged innermost
+        // axis is stride-1 in the source, every innermost row is one
+        // contiguous run, so the walk becomes a block copy per run. The
+        // attention head split/merge ([0,2,1,3]) is this case: runs of head_dim.
+        if (rank >= 2 && output.Length > 0 && TryPermuteContiguousRuns(srcSpan, dstSpan, dstShape, permutedSrcStrides))
+            return;
+
         // For rank ≤ 4 (the diffusion / transformer hot path), unroll the
         // index walk into nested loops; for higher ranks, fall back to a
         // generic odometer loop.
@@ -39070,6 +39078,65 @@ public partial class CpuEngine : ITensorLevelEngine
                 idx[d] = 0;
             }
         }
+    }
+
+    /// <summary>
+    /// Dense permute as a block copy per contiguous source run. Returns false
+    /// (caller falls back to the element walk) when the merged innermost axis
+    /// is not stride-1 in the source or its runs are too short to amortise a copy.
+    /// </summary>
+    private static bool TryPermuteContiguousRuns<T>(ReadOnlySpan<T> src, Span<T> dst, int[] dstShape, int[] srcStrides)
+    {
+        const int MinRun = 4;
+        int rank = dstShape.Length;
+        if (rank > 16) return false;
+        Span<int> dims = stackalloc int[rank];
+        Span<int> st = stackalloc int[rank];
+        int m = 0;
+        for (int i = 0; i < rank; i++)
+        {
+            int d = dstShape[i];
+            if (d == 1) continue;
+            if (m > 0 && st[m - 1] == srcStrides[i] * d)
+            {
+                dims[m - 1] *= d;
+                st[m - 1] = srcStrides[i];
+            }
+            else
+            {
+                dims[m] = d;
+                st[m] = srcStrides[i];
+                m++;
+            }
+        }
+
+        if (m == 0)
+        {
+            dst[0] = src[0];
+            return true;
+        }
+        if (st[m - 1] != 1) return false;
+        int run = dims[m - 1];
+        if (m > 1 && run < MinRun) return false;
+
+        int outer = 1;
+        for (int k = 0; k < m - 1; k++) outer *= dims[k];
+        Span<int> idx = stackalloc int[rank];
+        idx.Clear();
+        int srcBase = 0, off = 0;
+        for (int o = 0; o < outer; o++)
+        {
+            src.Slice(srcBase, run).CopyTo(dst.Slice(off, run));
+            off += run;
+            for (int k = m - 2; k >= 0; k--)
+            {
+                srcBase += st[k];
+                if (++idx[k] < dims[k]) break;
+                srcBase -= st[k] * dims[k];
+                idx[k] = 0;
+            }
+        }
+        return true;
     }
 
     [MethodImpl(Hot)]
