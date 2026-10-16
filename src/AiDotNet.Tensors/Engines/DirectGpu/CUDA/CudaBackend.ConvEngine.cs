@@ -199,37 +199,58 @@ public sealed partial class CudaBackend
         using var context = PushContext();
         if (phase)
         {
-            // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image and ceil(kH / sH) * ceil(kW / sW) taps.
-            // One grid layer per (phase, split): on deep layers the phases alone gave 32 blocks on 68 SMs (256 -> 512 s2:
-            // 213 us in the ResNet-18 step), so K is split like the other engine paths when the blocks cannot fill the
-            // device, each split writing a disjoint-pixel partial slice summed in order afterwards.
+            // The largest phase has ceil(H / sH) x ceil(W / sW) pixels per image and ceil(kH / sH) * ceil(kW / sW) taps;
+            // a 3x3 stride-2 kernel's four phases have 4, 2, 2 and 1 taps. One grid layer per (phase, split). While the
+            // phases alone cannot fill the device (256 -> 512 s2: 32 blocks on 68 SMs), K is split with one slice length
+            // for every phase, so a phase gets slices in proportion to its taps and every layer carries the same K (a
+            // uniform split count left the 1-tap phase's blocks idle behind the 4-tap phase's); each split writes a
+            // disjoint-pixel partial slice and conv2d_dgrad_phase_reduce sums each pixel's slices in order.
             long columns = (long)batch * ((inHeight + strideH - 1) / strideH) * ((inWidth + strideW - 1) / strideW);
             long phaseK = (long)outChannels * ((kernelH + strideH - 1) / strideH) * ((kernelW + strideW - 1) / strideW);
             int phases = strideH * strideW;
             ConvEnginePlan(columns, inChannels, phaseK, out int ptile, out int ptilesN, out int ptilesM, out _, out _);
             int sms = Math.Max(1, _multiProcessorCount);
-            long blocks = (long)ptilesN * ptilesM * phases;
-            int psplits = 1;
-            if (blocks < sms)
-                psplits = (int)Math.Min(Math.Max(1, phaseK / (8L * ConvEngineTileK)), (2L * sms + blocks - 1) / blocks);
-            int pkPerSplit = (int)(((phaseK + psplits - 1) / psplits + ConvEngineTileK - 1) / ConvEngineTileK * ConvEngineTileK);
-            psplits = (int)((phaseK + pkPerSplit - 1) / pkPerSplit);
+            long tileBlocks = (long)ptilesN * ptilesM;
+            long PhaseUnits(long slice)
+            {
+                long units = 0;
+                for (int ph = 0; ph < strideH; ph++)
+                    for (int pw = 0; pw < strideW; pw++)
+                        units += ((long)outChannels * ((kernelH - ph + strideH - 1) / strideH) * ((kernelW - pw + strideW - 1) / strideW)
+                                  + slice - 1) / slice;
+                return units;
+            }
+            // No split while the phases fill the device; else one tap's channels per slice, halved (to multiples of
+            // ConvEngineTileK, at least 8 tiles) until the grid covers two blocks per SM.
+            long pkPerSplit = phaseK;
+            if (tileBlocks * phases < sms)
+            {
+                pkPerSplit = outChannels;
+                while (tileBlocks * PhaseUnits(pkPerSplit) < 2L * sms && pkPerSplit / 2 >= 8L * ConvEngineTileK
+                       && pkPerSplit / 2 % ConvEngineTileK == 0)
+                    pkPerSplit /= 2;
+            }
+            long gridZ = PhaseUnits(pkPerSplit);
+            bool split = gridZ > phases;
+            int maxSplits = (int)((phaseK + pkPerSplit - 1) / pkPerSplit);
             if (!_kernelCache.TryGetValue((ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase")
                     + ConvMainloopSuffix(mainloop), out var pgemm))
                 return false;
             IntPtr preduce = IntPtr.Zero;
-            if (psplits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out preduce)) return false;
+            if (split && !_kernelCache.TryGetValue("conv2d_dgrad_phase_reduce", out preduce)) return false;
             IGpuBuffer pdestination = gradInput;
-            if (psplits > 1)
+            if (split)
             {
-                var partials = TryConvScratch(ref _convEngineDgradPartials, psplits * outputs);
+                var partials = TryConvScratch(ref _convEngineDgradPartials, maxSplits * outputs);
                 if (partials is null) return false;
                 pdestination = partials;
             }
-            LaunchConvEngine(pgemm, gradOutput, kernel, pdestination, ptilesN, ptilesM, phases * psplits, pkPerSplit, batch,
+            LaunchConvEngine(pgemm, gradOutput, kernel, pdestination, ptilesN, ptilesM, (int)gridZ, (int)pkPerSplit, batch,
                 inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
                 dilationH, dilationW);
-            if (psplits > 1) LaunchSplitKReduce(preduce, pdestination, gradInput, (int)outputs, psplits);
+            if (split)
+                LaunchPhaseReduce(preduce, pdestination, gradInput, (int)outputs, inHeight, inWidth, outChannels, kernelH, kernelW,
+                    strideH, strideW, padH, padW, (int)pkPerSplit);
             return true;
         }
 
@@ -268,6 +289,16 @@ public sealed partial class CudaBackend
     }
 
     // dst[i] = sum over z of partials[z][i], in z order (conv2d_wgrad_splitk_reduce).
+    private unsafe void LaunchPhaseReduce(IntPtr reduce, IGpuBuffer partials, IGpuBuffer destination, int count, int h, int w,
+        int outC, int kH, int kW, int sH, int sW, int pH, int pW, int kPerSplit)
+    {
+        IntPtr partPtr = partials.Handle, dstPtr = destination.Handle;
+        void** rargs = stackalloc void*[13];
+        rargs[0] = &partPtr; rargs[1] = &dstPtr; rargs[2] = &count; rargs[3] = &h; rargs[4] = &w; rargs[5] = &outC;
+        rargs[6] = &kH; rargs[7] = &kW; rargs[8] = &sH; rargs[9] = &sW; rargs[10] = &pH; rargs[11] = &pW; rargs[12] = &kPerSplit;
+        LaunchKernel(reduce, (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, rargs);
+    }
+
     private unsafe void LaunchSplitKReduce(IntPtr reduce, IGpuBuffer partials, IGpuBuffer destination, int count, int splits)
     {
         IntPtr partPtr = partials.Handle, dstPtr = destination.Handle;

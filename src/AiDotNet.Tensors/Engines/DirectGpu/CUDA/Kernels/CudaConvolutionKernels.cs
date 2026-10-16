@@ -1125,6 +1125,22 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce(
     gradKernel[i] = sum;
 }
 
+// Sums the phase input gradient's split-K slices in split order: pixel (ih, iw) belongs to phase
+// ((ih + pH) mod sH, (iw + pW) mod sW), which has ceil(outC * taps / kPerSplit) slices (see conv2d_dgrad_ce_body).
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_phase_reduce(
+    const float* __restrict__ partials, float* __restrict__ gradInput, int count, int H, int W,
+    int outC, int kH, int kW, int sH, int sW, int pH, int pW, int kPerSplit)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int iw = i % W, ih = (i / W) % H;
+    int rh = (ih + pH) % sH, rw = (iw + pW) % sW;
+    int units = (outC * ((kH - rh + sH - 1) / sH) * ((kW - rw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit;
+    float sum = 0.0f;
+    for (int z = 0; z < units; z++) sum += partials[(long long)z * count + i];
+    gradInput[i] = sum;
+}
+
 // #1313: Conv2D input gradient as an implicit GEMM, without the col buffer and col2im scatter.
 //   dX[b, ci, ih, iw] = sum over k = (co, kh, kw) of W[co, ci, kh, kw] * dY[b, co, oh, ow],
 //   oh = (ih + pH - kh*dH) / sH and ow = (iw + pW - kw*dW) / sW when both divide exactly and land inside dY.
@@ -1624,7 +1640,9 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
 // (kh, kw, co), so a K tile shares one tap. PHASE = false: unit stride or any stride with per-tile divisibility checks,
 // split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation, kernel >= stride): blockIdx.z is the
 // sub-pixel phase (rh, rw); the block's columns are that phase's pixels and only the taps kh = rh (mod sH),
-// kw = rw (mod sW) are visited, every one of which hits; phases write disjoint pixels, no split.
+// kw = rw (mod sW) are visited, every one of which hits; phases write disjoint pixels. With split-K, each phase's K
+// is cut into ceil(K_phase / kPerSplit) slices (a 4-tap phase gets four times the slices of a 1-tap one, so every grid
+// layer carries the same K) and conv2d_dgrad_phase_reduce sums each pixel's slices in order.
 template <int BM, int BN, bool PHASE, int MAIN>
 __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
@@ -1638,14 +1656,22 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const int tid = threadIdx.x;
 
     // Column space: every pixel (PHASE = false) or the pixels of one phase.
-    // PHASE: blockIdx.z = phase * splits + split (splits = gridDim.z / (sH * sW)); each split takes a CE_BK-aligned K
-    // range of its phase's taps and writes a disjoint-pixel partial slice, summed in order afterwards when splits > 1.
+    // PHASE: blockIdx.z enumerates (phase, split) with phase-major order and ceil(K_phase / kPerSplit) splits per
+    // phase; each split takes a CE_BK-aligned K range of its phase's taps and writes a disjoint-pixel partial slice,
+    // summed in order afterwards when any phase has more than one split.
     int rh = 0, rw = 0, ih0 = 0, iw0 = 0, Hp = H, Wp = W, tapsH = kH, tapsW = kW, split = 0;
     if (PHASE)
     {
-        const int splits = gridDim.z / (sH * sW);
-        const int phase = blockIdx.z / splits;
-        split = blockIdx.z - phase * splits;
+        const int phases = sH * sW;
+        int phase = 0, rem = blockIdx.z;
+        for (; phase < phases - 1; phase++)
+        {
+            const int ph = phase / sW, pw = phase - ph * sW;
+            const int units = (outC * ((kH - ph + sH - 1) / sH) * ((kW - pw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit;
+            if (rem < units) break;
+            rem -= units;
+        }
+        split = rem;
         rh = phase / sW; rw = phase - rh * sW;
         ih0 = ((rh - pH) % sH + sH) % sH; iw0 = ((rw - pW) % sW + sW) % sW;
         Hp = ih0 < H ? (H - ih0 + sH - 1) / sH : 0; Wp = iw0 < W ? (W - iw0 + sW - 1) / sW : 0;
@@ -2173,7 +2199,7 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
                 "depthwise_conv2d_backward_input",
                 "depthwise_conv2d_backward_weights",
                 "conv2d_wgrad_implicit_gemm",
-                "conv2d_wgrad_splitk_reduce",
+                "conv2d_wgrad_splitk_reduce", "conv2d_dgrad_phase_reduce",
                 "conv2d_dgrad_implicit_gemm",
                 "conv2d_dgrad_implicit_gemm_c16",
                 "conv2d_dgrad_implicit_gemm_c16_phase",
