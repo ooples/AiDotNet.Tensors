@@ -4841,6 +4841,34 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     mtParams = candidateParams; mtGrads = candidateGrads; mtM = candidateM; mtV = candidateV; mtSizes = candidateSizes;
                 }
             }
+            // Plain SGD the same way: one launch across every tensor, guarded on the device (no host read of the
+            // gradients' finiteness). Was one SgdUpdate launch per tensor after a blocking finiteness readback - 62
+            // launches and a stream sync every ResNet-18 step.
+            bool mtSgd = false;
+            if (optType == OptimizerType.SGD
+                && paramCount > 0
+                && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend sgdCandidate
+                && !(gpuBackends[0] is Engines.DirectGpu.IGpuGraphCapture cbSgd && cbSgd.IsStreamCapturing()))
+            {
+                var candidateParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var candidateGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+                var candidateSizes = new List<int>(paramCount);
+                bool eligible = true;
+                for (int p = 0; eligible && p < paramCount; p++)
+                {
+                    if (!ReferenceEquals(gpuBackends[p], sgdCandidate)) { eligible = false; break; }
+                    if (gpuParam[p] is not { } gp) { eligible = false; break; }
+                    if (lengths[p] <= 0) { eligible = false; break; }
+                    if (gpuGrad[p] is not { } gradResident) { eligible = false; break; }
+                    candidateParams.Add(gp); candidateGrads.Add(gradResident); candidateSizes.Add(lengths[p]);
+                }
+                if (eligible)
+                {
+                    mtBackend = sgdCandidate;
+                    mtParams = candidateParams; mtGrads = candidateGrads; mtSizes = candidateSizes;
+                    mtSgd = true;
+                }
+            }
             bool deviceGuarded = mtBackend is not null;
             if (TryDiscardNonFiniteOptimizerStep(
                 gradArrays, gradOffsets, gpuGrad, gpuBackends, gpuFinitenessScratch,
@@ -5198,6 +5226,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // zero length, mixed backends) falls through to the per-tensor loop below, which is
             // unchanged and remains the fallback. Numerically identical to that loop — same kernel
             // math per element, only the launch batching differs.
+            if (mtSgd && mtBackend is not null && mtParams is not null && mtGrads is not null && mtSizes is not null)
+            {
+                if (_finitenessDeferred && _finitenessGuard is { } sgdGuard)
+                    mtBackend.SgdMultiTensorUpdateGuarded(mtParams, mtGrads, mtSizes, lr, (float)wd, sgdGuard);
+                else
+                    mtBackend.SgdMultiTensorUpdate(mtParams, mtGrads, mtSizes, lr, (float)wd);
+                for (int p = 0; p < paramCount; p++)
+                {
+                    _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+                    if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                    {
+                        rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                        CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
+                    }
+                }
+                return;
+            }
             if (mtBackend is not null && mtParams is not null && mtGrads is not null && mtM is not null
                 && mtV is not null && mtSizes is not null)
             {
