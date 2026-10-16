@@ -1749,7 +1749,38 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     using Map = CeMap<BM, BN, MAIN>;
     constexpr int VEC = Map::VEC;
     float* slice = out + (long long)(PHASE ? split : (int)blockIdx.z) * batch * inC * HW;
-    const bool vec = !PHASE && (HW % VEC) == 0;
+    if (PHASE)
+    {
+        // A phase's pixels are sH apart in dX, so the register layout (a lane's 4 columns, lanes 4 columns apart) put
+        // every lane of a store in its own 32-byte sector. The tile goes through shared memory 32 rows at a time instead
+        // and consecutive lanes store consecutive phase pixels (32 rows * (BN + 1) floats fit the main loop's buffers).
+        constexpr int CR = 32, LD = BN + 1;
+        float* cs = smem;
+        for (int r0 = 0; r0 < BM; r0 += CR)
+        {
+            __syncthreads();
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+            {
+                const int rr = Map::row(i) - r0;
+                if (rr < 0 || rr >= CR) continue;
+                #pragma unroll
+                for (int j = 0; j < TN; j++) cs[rr * LD + Map::col(j)] = acc[i][j];
+            }
+            __syncthreads();
+            for (int e = tid; e < CR * BN; e += 256)
+            {
+                const int rr = e / BN, nl = e - rr * BN;
+                const int m = m0 + r0 + rr, nj = n0 + nl;
+                if (m >= inC || nj >= N) continue;
+                const int b = nj / plane, q = nj - b * plane, i2 = q / Wp;
+                const int pix = (ih0 + i2 * sH) * W + iw0 + (q - i2 * Wp) * sW;
+                slice[((long long)b * inC + m) * HW + pix] = cs[rr * LD + nl];
+            }
+        }
+        return;
+    }
+    const bool vec = (HW % VEC) == 0;
     #pragma unroll
     for (int jg = 0; jg < TN; jg += VEC)
     {
