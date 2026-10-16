@@ -197,7 +197,10 @@ public class Conv2DImplicitGemmParityTests
         try
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
-            e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+            // This pins the choice between the two im2col routes; single-image 64x64 planes now go to the direct
+            // kernels first (DirectConvRouteTests), so those are kept out of the way on this thread.
+            using (DirectConvAvx2Suppression())
+                e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
         }
         finally
         {
@@ -208,6 +211,17 @@ public class Conv2DImplicitGemmParityTests
         Assert.Equal(0, CpuEngine.FullIm2ColConvRunsOnThisThread - fullBefore);
         Assert.Equal(1, CpuEngine.ImplicitGemmConvRunsOnThisThread - implicitBefore);
     }
+
+    private static IDisposable DirectConvAvx2Suppression()
+    {
+#if NET5_0_OR_GREATER
+        return AiDotNet.Tensors.Engines.Simd.DirectConvAvx2.SuppressOnThisThread();
+#else
+        return new NoScope();
+#endif
+    }
+
+    private sealed class NoScope : IDisposable { public void Dispose() { } }
 
     // #653: high-channel 3x3 convs take the full im2col GEMM at 8+ threads, on one thread (where its matrix feeds the
     // serial Goto GEMM) or on a 64x64+ plane, while the column matrix fits ThreadLocalTensorCache's 64 MB; the implicit
@@ -229,7 +243,10 @@ public class Conv2DImplicitGemmParityTests
         try
         {
             AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
-            e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+            // This pins the choice between the two im2col routes; single-image 64x64 planes now go to the direct
+            // kernels first (DirectConvRouteTests), so those are kept out of the way on this thread.
+            using (DirectConvAvx2Suppression())
+                e.Conv2D(x, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
         }
         finally
         {

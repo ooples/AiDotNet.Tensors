@@ -51,6 +51,21 @@ internal static class DirectConvAvx2
     // (and the summation order) never depends on the thread budget.
     private const long MaxBackwardKernelPartialFloats = 4L * 1024 * 1024;
 
+    // Set only through SuppressOnThisThread(): tests that pin the choice between the im2col routes run their shapes with
+    // the direct route out of the way, without a process-wide switch that would reach convolutions on other threads.
+    [ThreadStatic]
+    private static bool t_suppressed;
+
+    /// <summary>Keeps this thread's convolutions off the direct kernels until disposed (restores the previous state).</summary>
+    internal static IDisposable SuppressOnThisThread() => new Suppression();
+
+    private sealed class Suppression : IDisposable
+    {
+        private readonly bool _previous;
+        internal Suppression() { _previous = t_suppressed; t_suppressed = true; }
+        public void Dispose() => t_suppressed = _previous;
+    }
+
     /// <summary>Passes allowed onto the direct kernels (process-wide; for A/B measurement and kernel tuning).</summary>
     internal static DirectConvPasses EnabledPasses { get; set; } = DirectConvPasses.All;
 
@@ -78,7 +93,7 @@ internal static class DirectConvAvx2
     public static bool TryChoose(in DirectConvShape shape, out int targetTasks)
     {
         targetTasks = 0;
-        if (!IsEligible(shape)) return false;
+        if (t_suppressed || !IsEligible(shape)) return false;
         if (DirectConvTuning.TryGet(shape, out DirectConvConfiguration configuration))
         {
             targetTasks = configuration.TargetTasks;
@@ -114,9 +129,29 @@ internal static class DirectConvAvx2
     }
 
     /// <summary>The measured routing rules (see the constants above) for a shape with no activated configuration.</summary>
+    /// <summary>
+    /// #653: a single image whose stride-1 output plane is past the batch rule's 1024 positions, up to 80x80, with at least
+    /// 64 input channels. Measured in-process against the im2col GEMM routes (alternating calls, 1 and 16 threads, two
+    /// rounds each), direct over GEMM: 64ch@40 1.15-1.86x, 64ch@48 1.29-2.29x, 64ch@64 1.27-1.44x, 96ch@64 1.42-1.94x,
+    /// 128ch@64 1.10-1.72x, 64ch@80 1.41-1.49x. Outside it the GEMM routes win: 128x128 planes (0.54-0.92x), 32 channels
+    /// at 16 threads (0.60x), and planes of 1024 or less at one thread (0.94-0.97x). Shape-only, so the route (and the
+    /// result) is the same at every thread count.
+    /// </summary>
+    internal static bool SingleImageLargePlaneForward(in DirectConvShape shape)
+    {
+        if (shape.Pass != DirectConvPass.Forward || shape.Batch != 1 || shape.StrideH != 1 || shape.StrideW != 1) return false;
+        long plane = (long)shape.OutputHeight * shape.OutputWidth;
+        return shape.InChannels >= 64 && plane > MaxStride1PlanePositions && plane <= MaxSingleImagePlanePositions;
+    }
+
+    // Largest output plane (80x80) SingleImageLargePlaneForward takes; 128x128 planes measured slower than the GEMM routes.
+    private const int MaxSingleImagePlanePositions = 80 * 80;
+
     public static bool DefaultChoosesDirect(in DirectConvShape shape)
     {
-        if (shape.Batch < 2 || shape.KernelHeight * shape.KernelWidth == 1) return false;
+        if (shape.KernelHeight * shape.KernelWidth == 1) return false;
+        bool singleImage = SingleImageLargePlaneForward(shape);
+        if (shape.Batch < 2 && !singleImage) return false;
         // A partial input-channel block (an image stem) wastes most of the forward tile; measured slower on 32x32
         // (3 channels: 0.30 ms existing, 0.41 direct), so it is left to tuning.
         if (shape.Pass == DirectConvPass.Forward && shape.InChannels % Block != 0) return false;
@@ -124,7 +159,7 @@ internal static class DirectConvAvx2
         int plane = shape.Pass == DirectConvPass.BackwardInput
             ? shape.Height * shape.Width
             : shape.OutputHeight * shape.OutputWidth;
-        if (!strided && plane > MaxStride1PlanePositions) return false;
+        if (!strided && plane > MaxStride1PlanePositions && !singleImage) return false;
         return shape.Pass switch
         {
             DirectConvPass.BackwardInput => !strided
