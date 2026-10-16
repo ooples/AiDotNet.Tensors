@@ -6234,8 +6234,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             workspace?.Dispose();
             workspace = null;
         }
-        // Uploaded zeros: skinny_gemm_tn requires every counter at zero between launches (its last block resets one).
-        IGpuBuffer? skinnyCounters = workspace is null ? null : AllocateBuffer(new float[SkinnyCounterSlots]);
+        // Zeroed: skinny_gemm_tn requires every counter at zero between launches (its last block resets one). The sized
+        // allocation zero-fills on the device; uploading a zero array was a host-to-device transfer counted against
+        // whichever op first used cuBLAS on this thread (a residency scope saw it as that op leaving the device).
+        IGpuBuffer? skinnyCounters = workspace is null ? null : AllocateBuffer(SkinnyCounterSlots);
         return new ThreadCublas
         {
             Handle = h, IsDeterministic = det, Stream = _stream, Workspace = workspace, SkinnyCounters = skinnyCounters,
