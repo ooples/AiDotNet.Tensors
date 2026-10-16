@@ -258,13 +258,15 @@ internal static class HipNativeBindings
             return null;
         }
 
-        // Check common ROCm installation paths
+        // An explicit ROCM_PATH / HIP_PATH wins over the default install location: a user who points them at a
+        // different ROCm tree (for example one carrying rocBLAS kernels built for an architecture the official
+        // HIP SDK omits, such as gfx1010/gfx1012) must get that tree, not whatever sits under Program Files.
         string[] basePaths = new[]
         {
-            System.IO.Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AMD", "ROCm"),
+            Environment.GetEnvironmentVariable("ROCM_PATH") ?? "",
             Environment.GetEnvironmentVariable("HIP_PATH") ?? "",
-            Environment.GetEnvironmentVariable("ROCM_PATH") ?? ""
+            System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AMD", "ROCm")
         };
 
         foreach (var basePath in basePaths)
