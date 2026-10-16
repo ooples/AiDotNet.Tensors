@@ -40,6 +40,9 @@ internal static class FusedOptimizer
     /// </summary>
     private const int FloatSimdWidth = 8;
 
+    /// <summary>Elements per SIMD register for <see cref="double"/> kernels: Vector256&lt;double&gt; holds 4 lanes.</summary>
+    private const int DoubleSimdWidth = 4;
+
     /// <summary>
     /// Minimum element count per worker before parallel dispatch pays for itself. Below this
     /// the tensor runs inline on the caller thread with no closure allocation. Overridable via
@@ -253,15 +256,43 @@ internal static class FusedOptimizer
 
     /// <summary>Adam (float) with precomputed step-global bias corrections. Bit-identical
     /// to the step overload; lets a per-parameter loop pay the two MathF.Pow once/step.</summary>
+    /// <remarks>Element-parallel like <see cref="AdamWUpdateSimd(float*, float*, float*, float*, int, float, float, float, float, float, float, float)"/>:
+    /// disjoint SIMD-aligned chunks, so the result is bit-identical to the serial pass. Serial, this
+    /// kernel was the largest phase of a CPU training step on a 7.2M-parameter N-BEATS (13.7 ms of
+    /// 44.6 ms on 32 cores).</remarks>
     internal static unsafe void AdamUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
         float lr, float beta1, float beta2, float eps, float bc1, float bc2)
     {
+        int nChunks = ChunkPlan(length, FloatSimdWidth, out int chunk);
+        if (nChunks <= 1)
+        {
+            AdamUpdateRangeF(param, grad, m, v, 0, length, lr, beta1, beta2, eps, bc1, bc2);
+            return;
+        }
+        nint pP = (nint)param, pG = (nint)grad, pM = (nint)m, pV = (nint)v;
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
+        {
+            int s = c * chunk;
+            int e = s + chunk; if (e > length) e = length;
+            unsafe
+            {
+                AdamUpdateRangeF((float*)pP, (float*)pG, (float*)pM, (float*)pV, s, e,
+                    lr, beta1, beta2, eps, bc1, bc2);
+            }
+        });
+    }
+
+    /// <summary>The float Adam update over the element range [start, end).</summary>
+    internal static unsafe void AdamUpdateRangeF(
+        float* param, float* grad, float* m, float* v, int start, int end,
+        float lr, float beta1, float beta2, float eps, float bc1, float bc2)
+    {
         float lrAdj = lr / bc1;
 
-        int i = 0;
+        int i = start;
 #if NET5_0_OR_GREATER
-        if (Fma.IsSupported && length >= 8)
+        if (Fma.IsSupported && end - start >= 8)
         {
             var vB1 = Vector256.Create(beta1);
             var v1mB1 = Vector256.Create(1f - beta1);
@@ -270,7 +301,7 @@ internal static class FusedOptimizer
             var vLr = Vector256.Create(-lrAdj);
             var vEps = Vector256.Create(eps);
             var vBc2Inv = Vector256.Create(1f / bc2);
-            int simdLen = length & ~7;
+            int simdLen = end & ~7;
 
             for (; i < simdLen; i += 8)
             {
@@ -286,7 +317,7 @@ internal static class FusedOptimizer
             }
         }
 #endif
-        for (; i < length; i++)
+        for (; i < end; i++)
         {
             m[i] = beta1 * m[i] + (1f - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1f - beta2) * grad[i] * grad[i];
@@ -521,11 +552,34 @@ internal static class FusedOptimizer
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, double bc1, double bc2)
     {
+        int nChunks = ChunkPlan(length, DoubleSimdWidth, out int chunk);
+        if (nChunks <= 1)
+        {
+            AdamUpdateRangeD(param, grad, m, v, 0, length, lr, beta1, beta2, eps, bc1, bc2);
+            return;
+        }
+        nint pP = (nint)param, pG = (nint)grad, pM = (nint)m, pV = (nint)v;
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
+        {
+            int s = c * chunk;
+            int e = s + chunk; if (e > length) e = length;
+            unsafe
+            {
+                AdamUpdateRangeD((double*)pP, (double*)pG, (double*)pM, (double*)pV, s, e, lr, beta1, beta2, eps, bc1, bc2);
+            }
+        });
+    }
+
+    /// <summary>The element range [start, end) of the kernel above; chunks start on a SIMD-width multiple.</summary>
+    internal static unsafe void AdamUpdateRangeD(
+        double* param, double* grad, double* m, double* v, int start, int end,
+        double lr, double beta1, double beta2, double eps, double bc1, double bc2)
+    {
         double lrAdj = lr / bc1;
 
-        int i = 0;
+        int i = start;
 #if NET5_0_OR_GREATER
-        if (Fma.IsSupported && length >= 4)
+        if (Fma.IsSupported && end - start >= 4)
         {
             var vB1 = Vector256.Create(beta1);
             var v1mB1 = Vector256.Create(1.0 - beta1);
@@ -534,7 +588,7 @@ internal static class FusedOptimizer
             var vLr = Vector256.Create(-lrAdj);
             var vEps = Vector256.Create(eps);
             var vBc2Inv = Vector256.Create(1.0 / bc2);
-            int simdLen = length & ~3;
+            int simdLen = end & ~3;
 
             for (; i < simdLen; i += 4)
             {
@@ -550,7 +604,7 @@ internal static class FusedOptimizer
             }
         }
 #endif
-        for (; i < length; i++)
+        for (; i < end; i++)
         {
             m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];
@@ -798,6 +852,29 @@ internal static class FusedOptimizer
         double* param, double* grad, double* m, double* v, int length,
         double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
     {
+        int nChunks = ChunkPlan(length, DoubleSimdWidth, out int chunk);
+        if (nChunks <= 1)
+        {
+            AdamWUpdateRangeD(param, grad, m, v, 0, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            return;
+        }
+        nint pP = (nint)param, pG = (nint)grad, pM = (nint)m, pV = (nint)v;
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
+        {
+            int s = c * chunk;
+            int e = s + chunk; if (e > length) e = length;
+            unsafe
+            {
+                AdamWUpdateRangeD((double*)pP, (double*)pG, (double*)pM, (double*)pV, s, e, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            }
+        });
+    }
+
+    /// <summary>The element range [start, end) of the kernel above; chunks start on a SIMD-width multiple.</summary>
+    internal static unsafe void AdamWUpdateRangeD(
+        double* param, double* grad, double* m, double* v, int start, int end,
+        double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
+    {
         // SINGLE-PASS fused AdamW. The prior form did a separate full pass over
         // `param` (read+write every element) to apply the decoupled weight decay,
         // then called AdamUpdateSimd which read+wrote `param` AGAIN — two
@@ -810,9 +887,9 @@ internal static class FusedOptimizer
         double lrAdj = lr / bc1;
         double wdScale = 1.0 - weightDecay * lr;   // hoisted out of the loop
 
-        int i = 0;
+        int i = start;
 #if NET5_0_OR_GREATER
-        if (Fma.IsSupported && length >= 4)
+        if (Fma.IsSupported && end - start >= 4)
         {
             var vB1 = Vector256.Create(beta1);
             var v1mB1 = Vector256.Create(1.0 - beta1);
@@ -822,7 +899,7 @@ internal static class FusedOptimizer
             var vEps = Vector256.Create(eps);
             var vBc2Inv = Vector256.Create(1.0 / bc2);
             var vWd = Vector256.Create(wdScale);
-            int simdLen = length & ~3;
+            int simdLen = end & ~3;
 
             for (; i < simdLen; i += 4)
             {
@@ -839,7 +916,7 @@ internal static class FusedOptimizer
             }
         }
 #endif
-        for (; i < length; i++)
+        for (; i < end; i++)
         {
             m[i] = beta1 * m[i] + (1.0 - beta1) * grad[i];
             v[i] = beta2 * v[i] + (1.0 - beta2) * grad[i] * grad[i];

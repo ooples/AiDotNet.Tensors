@@ -23,10 +23,25 @@ public static class CpuParallelSettings
     /// Gets or sets the maximum degree of parallelism for CPU operations.
     /// </summary>
     /// <remarks>
-    /// Default is Environment.ProcessorCount, which uses all available cores.
+    /// Default is the physical core count (<see cref="PhysicalCoreCount"/>, the logical count when it cannot be
+    /// detected), as PyTorch and OpenMP default to; the <c>AIDOTNET_CPU_THREADS</c> environment variable overrides it.
     /// Set to 1 to disable parallelism.
     /// </remarks>
-    public static int MaxDegreeOfParallelism { get; set; } = Environment.ProcessorCount;
+    public static int MaxDegreeOfParallelism { get; set; } = DefaultDegreeOfParallelism();
+
+    // #653: a dispatch as wide as every logical processor cost ~90-120 us before any work on a 16-core / 32-thread 3950X:
+    // the 31 workers plus the dispatching thread leave no hardware thread spare, so the pool parks them between
+    // dispatches (spinning there oversubscribes) and every op re-wakes 31 threads through the OS. At the physical core
+    // count the workers stay warm and a dispatch costs ~3-5 us; FMA-bound kernels gain nothing from the SMT sibling.
+    // Measured at 16 against 32 threads: a 256x[784,512,512,10] MLP training step 1.53 vs 1.70 ms, 1024^3 GEMM 1.38 vs
+    // 1.62 ms, a 1024-wide MLP 30.0 vs 31.5 ms, an LSTM step 16.6 vs 16.0 ms, 2048^3 GEMM 32.0 vs 32.5 ms.
+    private static int DefaultDegreeOfParallelism()
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_CPU_THREADS"), out int requested) && requested > 0)
+            return requested;
+        int physical = DetectPhysicalCores();
+        return physical > 0 && physical <= Environment.ProcessorCount ? physical : Environment.ProcessorCount;
+    }
 
     // #475 thread-scaling: FMA-bound GEMM gets nothing from SMT and the 2nd-thread contention HURTS
     // (measured: ffn scaling peaks at 16 physical cores, regresses at 24/32). GEMM fan-out should cap
@@ -126,16 +141,42 @@ public static class CpuParallelSettings
     private const string LinuxCpuInfoPath = "/proc/cpuinfo";
 
     [MethodImpl(Hot)]
-    private static int DetectPhysicalCoresLinux()
+    private static int DetectPhysicalCoresLinux() => CountPhysicalCores(File.ReadLines(LinuxCpuInfoPath));
+
+    /// <summary>
+    /// Distinct (physical id, core id) pairs in /proc/cpuinfo text, one per processor record (records are separated by a
+    /// blank line). A record missing either id makes the topology unknown, so the count falls back to
+    /// <see cref="Environment.ProcessorCount"/>: carrying an id over from the previous record could merge distinct
+    /// cores and under-count, which now sets the default parallel width.
+    /// </summary>
+    internal static int CountPhysicalCores(IEnumerable<string> cpuInfoLines)
     {
-        var seen = new HashSet<string>();
-        string phys = "";
-        foreach (var line in File.ReadLines(LinuxCpuInfoPath))
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        string? physicalId = null, coreId = null;
+        bool inRecord = false, complete = true;
+
+        void EndRecord()
         {
-            if (line.StartsWith("physical id", StringComparison.Ordinal)) phys = line;
-            else if (line.StartsWith("core id", StringComparison.Ordinal)) seen.Add(phys + "|" + line);
+            if (!inRecord) return;
+            if (physicalId is null || coreId is null) complete = false;
+            else seen.Add(physicalId + "|" + coreId);
+            physicalId = null;
+            coreId = null;
+            inRecord = false;
         }
-        return seen.Count > 0 ? seen.Count : Environment.ProcessorCount;
+
+        foreach (var line in cpuInfoLines)
+        {
+            if (line.Trim().Length == 0) { EndRecord(); continue; }
+            inRecord = true;
+            int colon = line.IndexOf(':');
+            if (colon < 0) continue;
+            string key = line.Substring(0, colon).Trim(), value = line.Substring(colon + 1).Trim();
+            if (key == "physical id") physicalId = value;
+            else if (key == "core id") coreId = value;
+        }
+        EndRecord();
+        return complete && seen.Count > 0 ? seen.Count : Environment.ProcessorCount;
     }
 
     /// <summary>

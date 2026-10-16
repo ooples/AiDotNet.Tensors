@@ -168,8 +168,10 @@ struct SgdMultiTensorArgs
 };
 
 extern ""C"" __global__ __launch_bounds__(256) void sgd_multi_tensor_update(
-    SgdMultiTensorArgs a, float learningRate, float weightDecay)
+    SgdMultiTensorArgs a, float learningRate, float weightDecay, const double* __restrict__ finiteGuard)
 {
+    // Guarded launch: the gradients' double sum of squares, written earlier on this stream; not finite = skip the step.
+    if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
     int b = blockIdx.x;
     int t = 0;
     while (t + 1 < a.count && a.blockStart[t + 1] <= b) t++;

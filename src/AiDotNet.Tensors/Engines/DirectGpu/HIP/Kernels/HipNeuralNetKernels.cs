@@ -2526,7 +2526,9 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
 
 // Batched General Matrix Multiply: C[b] = alpha * A[b] * B[b] + beta * C[b]
 // Uses tiled approach with shared memory for better memory access patterns
-#define BATCHED_TILE_SIZE 32
+// 16 x 16 = 256 threads per block, the kernel's __launch_bounds__: a 32 x 32 tile launched 1024 threads and HIP
+// rejected the launch (hipErrorLaunchFailure, which then poisoned the context for later kernels).
+#define BATCHED_TILE_SIZE 16
 
 extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
     const float* A, const float* B, float* C,

@@ -13795,9 +13795,27 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// Plain SGD over a tensor list in one launch per <see cref="SgdMultiTensorMax"/> tensors. The tensor list is
     /// passed in the kernel's parameter block, so nothing is allocated or uploaded and the launch can be captured.
     /// </summary>
-    public unsafe void SgdMultiTensorUpdate(
+    public void SgdMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay)
+        => SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, IntPtr.Zero);
+
+    /// <summary>
+    /// <see cref="SgdMultiTensorUpdate"/> whose kernel reads <paramref name="finiteGuard"/> (a double) on the device and
+    /// writes nothing when it is not finite: no host read before the launch, so the step never waits on the device.
+    /// </summary>
+    public void SgdMultiTensorUpdateGuarded(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay, IGpuBuffer finiteGuard)
+    {
+        if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
+        if (finiteGuard.Size < 2) throw new ArgumentException("The double guard needs two float slots.", nameof(finiteGuard));
+        SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, finiteGuard.Handle);
+    }
+
+    private unsafe void SgdMultiTensorImpl(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
+        float learningRate, float weightDecay, IntPtr finiteGuard)
     {
         PerTensorMultiTensorOptimizer.ValidateSgd(parameters, gradients, sizes);
         int n = parameters.Count;
@@ -13807,7 +13825,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         using var _ = PushContext();
         var args = default(SgdMultiTensorArgs);
-        void** launchArgs = stackalloc void*[3];
+        void** launchArgs = stackalloc void*[4];
         for (int first = 0; first < n; first += SgdMultiTensorMax)
         {
             int count = Math.Min(SgdMultiTensorMax, n - first);
@@ -13822,7 +13840,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
             args.BlockStart[count] = blocks;
             args.Count = count;
-            launchArgs[0] = &args; launchArgs[1] = &learningRate; launchArgs[2] = &weightDecay;
+            launchArgs[0] = &args; launchArgs[1] = &learningRate; launchArgs[2] = &weightDecay; launchArgs[3] = &finiteGuard;
             LaunchKernel(kernel, (uint)blocks, DefaultBlockSize, launchArgs);
         }
     }

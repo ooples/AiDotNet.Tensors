@@ -284,6 +284,66 @@ public sealed class CompressedMomentGpuOptimizerTests :
         }
     }
 
+    // The guarded multi-tensor SGD reads the gradients' finiteness (a double sum of squares) from a device buffer so the
+    // compiled step never waits on a readback: a finite guard updates exactly like the unguarded call, a non-finite one
+    // leaves every parameter untouched.
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void GuardedMultiTensorSgd_UpdatesOnlyWhenTheGuardIsFinite(BackendKind kind)
+    {
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired);
+        Skip.If(backend is not IMultiTensorGpuOptimizerBackend,
+            $"{kind} backend does not implement IMultiTensorGpuOptimizerBackend.");
+        var mt = (IMultiTensorGpuOptimizerBackend)backend;
+
+        int[] lengths = { 1, 255, 1025, 3000 };
+        int n = lengths.Length;
+        const float lr = 0.05f, weightDecay = 0.01f;
+        static float[] GuardOf(double value)
+        {
+            var bytes = BitConverter.GetBytes(value);
+            return new[] { BitConverter.ToSingle(bytes, 0), BitConverter.ToSingle(bytes, 4) };
+        }
+
+        foreach (double guardValue in new[] { 3.25, double.NaN, double.PositiveInfinity })
+        {
+            var refParam = new IGpuBuffer[n]; var refGrad = new IGpuBuffer[n];
+            var gParam = new IGpuBuffer[n]; var gGrad = new IGpuBuffer[n];
+            var initials = new float[n][];
+            using var guard = backend.AllocateBuffer(GuardOf(guardValue));
+            try
+            {
+                for (int t = 0; t < n; t++)
+                {
+                    initials[t] = Vector(lengths[t], 0.25f + 0.01f * t, 0.002f * (t - 1));
+                    var grad = Gradient(lengths[t]);
+                    refParam[t] = backend.AllocateBuffer((float[])initials[t].Clone());
+                    refGrad[t] = backend.AllocateBuffer((float[])grad.Clone());
+                    gParam[t] = backend.AllocateBuffer((float[])initials[t].Clone());
+                    gGrad[t] = backend.AllocateBuffer((float[])grad.Clone());
+                }
+                mt.SgdMultiTensorUpdate(refParam, refGrad, lengths, lr, weightDecay);
+                mt.SgdMultiTensorUpdateGuarded(gParam, gGrad, lengths, lr, weightDecay, guard);
+                bool finite = !double.IsNaN(guardValue) && !double.IsInfinity(guardValue);
+                for (int t = 0; t < n; t++)
+                {
+                    float[] expected = finite ? backend.DownloadBuffer(refParam[t]) : initials[t];
+                    float[] actual = backend.DownloadBuffer(gParam[t]);
+                    for (int i = 0; i < lengths[t]; i++)
+                        Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(expected[i]), 0) ==
+                                    BitConverter.ToInt32(BitConverter.GetBytes(actual[i]), 0),
+                            $"{kind} guarded SGD (guard {guardValue}) tensor {t}[{i}]: {actual[i]:R} vs expected {expected[i]:R}");
+                }
+            }
+            finally
+            {
+                foreach (var b in refParam) b?.Dispose(); foreach (var b in refGrad) b?.Dispose();
+                foreach (var b in gParam) b?.Dispose(); foreach (var b in gGrad) b?.Dispose();
+            }
+        }
+    }
+
     [SkippableTheory]
     [MemberData(nameof(DenseOptimizerBackends))]
     public void DensePlanSupportedOptimizer_MatchesCpuReference(BackendKind kind, OptimizerType optimizer)
