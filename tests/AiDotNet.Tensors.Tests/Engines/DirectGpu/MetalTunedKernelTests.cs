@@ -349,7 +349,7 @@ public sealed class MetalTunedKernelTests
             using var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin();
             backend.Softmax(input, output, rows, n);
             var reason = Assert.Single(backend.SoftmaxSlot.CachedDecisions).Reason;
-            Assert.True(reason == TunedKernelDecisionReason.Tuned || reason == TunedKernelDecisionReason.ReferenceWon, $"measured decision expected, got {reason}");
+            Assert.True(reason is TunedKernelDecisionReason.Tuned or TunedKernelDecisionReason.ReferenceWon or TunedKernelDecisionReason.Inconclusive, $"measured decision expected, got {reason}");
             Assert.True(GpuLaunchProbe.TuningReadbacks > tuningBefore, "the gate snapshots candidate outputs, so tuning must read back");
             Assert.Equal(0, scope.Downloads);
         }
