@@ -583,7 +583,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_2x4(
     int row = blockIdx.y * blockDim.y + threadIdx.y, column = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= M || column >= N) return; float sum = 0.0f; int groupsPerRow = K / 4;
     for (int group = 0; group < groupsPerRow; ++group) { int compressed = row * groupsPerRow + group; unsigned char packed = sparseIndices[compressed]; int first = packed & 3, second = (packed >> 2) & 3; sum += sparseValues[compressed * 2] * B[(group * 4 + first) * N + column]; sum += sparseValues[compressed * 2 + 1] * B[(group * 4 + second) * N + column]; }
-    int outputIndex = row * N + column; C[outputIndex] = alpha * sum + beta * C[outputIndex];
+    int outputIndex = row * N + column; C[outputIndex] = beta == 0.0f ? alpha * sum : alpha * sum + beta * C[outputIndex];
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void sparse_gemm_bias_relu(

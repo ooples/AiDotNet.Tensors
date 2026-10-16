@@ -611,9 +611,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             if (_kernelCache.TryGetValue("rdna_gemm_wave32", out var rdnaWave32))
                 _rdnaGemmWave32 = rdnaWave32;
 
-            // Compile Activation kernels
+            // Compile Activation kernels. Not fast-math: -ffast-math lets the compiler assume no NaN or infinity, so
+            // powf of a negative base with a fractional exponent returned powf(|x|, e) and atanhf past |x| = 1 a finite
+            // value where the CPU (and IEEE) give NaN. These kernels are memory-bound, so precise math costs little.
             CompileKernelModule(HipActivationKernels.GetSource(), "activation", ref _activationModule,
-                HipActivationKernels.GetKernelNames());
+                HipActivationKernels.GetKernelNames(), useFastMath: false);
 
             // Compile Neural Net kernels
             CompileKernelModule(HipNeuralNetKernels.GetSource(), "neural_net", ref _neuralNetModule,
@@ -5734,17 +5736,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("dropout_backward", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: dropout_backward");
 
-        float scale = 1.0f / (1.0f - dropoutRate);
             {
             IntPtr _p0 = gradOutput.Handle;
             IntPtr _p1 = mask.Handle;
             IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[5];
+            void** args = stackalloc void*[4];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
-            args[3] = &scale;
-            args[4] = &size;
+            args[3] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -8951,10 +8951,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Scale(B, B, 1.0f / reduceSize, outerSize);
     }
 
+    // var_axis reduces each [reduceSize] row of [outerSize, reduceSize], one thread per row. This used to launch
+    // compute_mean_var, BatchNorm's kernel, which reduces over the OUTER axis and writes reduceSize means and
+    // variances: wrong values, and for a whole-tensor variance (outerSize 1) a write of reduceSize floats into
+    // one-element buffers, corrupting whatever device memory followed them.
     public unsafe void VarAxis(IGpuBuffer A, IGpuBuffer mean, IGpuBuffer variance, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("compute_mean_var", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: compute_mean_var");
+        if (!_kernelCache.TryGetValue("var_axis", out var krnl))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: var_axis");
 
             {
             IntPtr _p0 = A.Handle;
@@ -8968,7 +8972,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[4] = &reduceSize;
 
 
-            uint grid = (uint)((reduceSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
             LaunchKernel(krnl, grid, DefaultBlockSize, args);
             Synchronize();
             }
