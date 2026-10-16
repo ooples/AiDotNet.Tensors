@@ -69,7 +69,7 @@ public sealed partial class CudaBackend
                 CuBlasNative.cublasSgemm(_cublasHandle, opA, opB, m, n, k, ref alpha, a, lda, b, ldb, ref beta, c, ldc), what);
             return;
         }
-        FallbackGemm(PtxGemmPrecision.Fp32, opA, opB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, 1, 0, 0, 0, IntPtr.Zero);
+        FallbackGemm(PtxGemmPrecision.Fp32, opA, opB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, 1, 0, 0, 0, GemmLaunchStream);
     }
 
     /// <summary><c>cublasSgemmStridedBatched</c>, or the generated FP32 GEMM batched over grid z without cuBLAS.</summary>
@@ -85,7 +85,7 @@ public sealed partial class CudaBackend
             return;
         }
         FallbackGemm(PtxGemmPrecision.Fp32, opA, opB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, batch,
-            strideA, strideB, strideC, IntPtr.Zero);
+            strideA, strideB, strideC, GemmLaunchStream);
     }
 
     /// <summary><c>cublasDgemm</c>, or the generated FP64 GEMM without cuBLAS.</summary>
@@ -98,7 +98,7 @@ public sealed partial class CudaBackend
                 CuBlasNative.cublasDgemm(_cublasHandle, opA, opB, m, n, k, ref alpha, a, lda, b, ldb, ref beta, c, ldc), what);
             return;
         }
-        FallbackGemm(PtxGemmPrecision.Fp64, opA, opB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, 1, 0, 0, 0, IntPtr.Zero);
+        FallbackGemm(PtxGemmPrecision.Fp64, opA, opB, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc, 1, 0, 0, 0, GemmLaunchStream);
     }
 
     /// <summary>
@@ -115,7 +115,7 @@ public sealed partial class CudaBackend
                 CuBlasNative.cublasHgemm(_cublasHandle, opA, opB, m, n, k, ref one, a, lda, b, ldb, ref zero, c, ldc), what);
             return;
         }
-        FallbackGemm(PtxGemmPrecision.Fp16InFp16Out, opA, opB, m, n, k, 1, a, lda, b, ldb, 0, c, ldc, 1, 0, 0, 0, IntPtr.Zero);
+        FallbackGemm(PtxGemmPrecision.Fp16InFp16Out, opA, opB, m, n, k, 1, a, lda, b, ldb, 0, c, ldc, 1, 0, 0, 0, GemmLaunchStream);
     }
 
     /// <summary>
@@ -139,7 +139,7 @@ public sealed partial class CudaBackend
             _ => throw new NotSupportedException($"GEMM with operand type {aType} and output type {cType} needs cuBLAS."),
         };
         FallbackGemm(precision, opA, opB, m, n, k, *(float*)alpha, a, lda, b, ldb, *(float*)beta, c, ldc, 1, 0, 0, 0,
-            IntPtr.Zero);
+            GemmLaunchStream);
         return AiDotNet.Tensors.Engines.CublasStatus.Success;
     }
 
