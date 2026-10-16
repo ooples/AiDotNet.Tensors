@@ -152,6 +152,12 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("cublas.conv2d_dx.gemm_col2im",
                             TunedKernelOrigin.Vendor, true, _ => true,
                             (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaCol2im(a)) LaunchDxDirect(a); }));
+                    // Winograd F(2x2,3x3) on the flipped, channel-transposed filter (cuDNN's input-gradient algorithm for
+                    // ResNet's mid layers). Registered after the references: it loses where the tile count is small.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
+                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23(a)) LaunchDxDirect(a); }));
                     if (candidates.Count == 0)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_backward_input"), (in CudaConv2DBackwardArgs a) => LaunchDxDirect(a)));

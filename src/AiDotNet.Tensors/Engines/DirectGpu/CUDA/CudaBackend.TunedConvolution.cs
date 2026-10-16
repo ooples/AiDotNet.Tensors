@@ -106,6 +106,17 @@ public sealed partial class CudaBackend
                             shape => HasTunedKernel("conv2d_implicit_gemm") && ImplicitConvAdmits(shape[0], shape[1],
                                 shape[4], shape[13], shape[14], shape[5], shape[6], shape[7], shape[8], shape[11], shape[12]),
                             (in CudaConv2DArgs a) => ExecuteConv2DForwardNarrow(a)));
+                    // Winograd F(2x2,3x3): 2.25x fewer multiplies for 3x3 stride-1 (what cuDNN runs for ResNet's mid
+                    // layers). Never the reference: it loses where the tile count is small (ResNet-18's 512@4x4).
+                    candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.winograd_f23",
+                        TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
+                        (in CudaConv2DArgs a) =>
+                        {
+                            if (!TryConv2DForwardWinogradF23(a))
+                                LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                                    a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+                                    a.PadH, a.PadW, a.DilationH, a.DilationW);
+                        }));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
                         true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,
