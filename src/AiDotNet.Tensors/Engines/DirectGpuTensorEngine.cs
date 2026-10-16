@@ -15946,7 +15946,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// BatchNorm+ReLU fusion supplies the backward (<see cref="Autodiff.BackwardFunctions{T}.BatchNormReluBackward"/>).
     /// </summary>
     internal Tensor<T>? TryBatchNormReluForward<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon,
-        out Tensor<T>? mean, out Tensor<T>? variance)
+        out Tensor<T>? mean, out Tensor<T>? variance, Tensor<T>? residual = null)
     {
         mean = null;
         variance = null;
@@ -15957,11 +15957,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufIn = GetOrAllocateBuffer(backend, input);
         using var bufGamma = GetOrAllocateBuffer(backend, gamma);
         using var bufBeta = GetOrAllocateBuffer(backend, beta);
+        if (residual is not null && residual.Length != input.Length) return null;
+        using var bufResidual = residual is null ? default : GetOrAllocateBuffer(backend, residual);
         var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufMean = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufVar = AllocateFullyWrittenOutputBuffer(backend, channels);
         if (!varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
-                bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true))
+                bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
+                residual: residual is null ? null : bufResidual.Buffer))
         {
             bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             return null;
@@ -15979,9 +15982,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
         Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T>? gradGamma, out Tensor<T>? gradBeta)
+        => TryBatchNormReluBackward(gradOutput, reluOutput, input, gamma, mean, variance, epsilon, false,
+            out gradGamma, out gradBeta, out _);
+
+    /// <summary>As <see cref="TryBatchNormReluBackward{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, out Tensor{T}?, out Tensor{T}?)"/>;
+    /// with <paramref name="withResidual"/> the forward added a residual before the ReLU, and
+    /// <paramref name="gradResidual"/> receives its gradient (the masked output gradient).</summary>
+    internal Tensor<T>? TryBatchNormReluBackward<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
+        Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, bool withResidual,
+        out Tensor<T>? gradGamma, out Tensor<T>? gradBeta, out Tensor<T>? gradResidual)
     {
         gradGamma = null;
         gradBeta = null;
+        gradResidual = null;
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
             || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
@@ -15995,13 +16008,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufDx = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
+        var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
         if (!varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer, bufMean.Buffer,
                 bufVar.Buffer, bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial, (float)epsilon,
-                reluOutput: bufOut.Buffer))
+                reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null))
         {
             bufDx.Dispose(); bufDg.Dispose(); bufDb.Dispose();
+            if (withResidual) bufDr.Dispose();
             return null;
         }
+        if (withResidual) gradResidual = DeferTensorResult<T>(backend, bufDr.Buffer, input.Length, input.Shape.ToArray());
         gradGamma = DeferTensorResult<T>(backend, bufDg.Buffer, channels, gamma.Shape.ToArray());
         gradBeta = DeferTensorResult<T>(backend, bufDb.Buffer, channels, gamma.Shape.ToArray());
         return DeferTensorResult<T>(backend, bufDx.Buffer, input.Length, input.Shape.ToArray());

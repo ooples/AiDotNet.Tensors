@@ -126,12 +126,14 @@ public class CompiledConvBnGraphStepTests : IDisposable
             _output.WriteLine("losses captured: " + string.Join(", ", captured.Losses.Select(l => l.ToString("G7"))));
 
             Assert.True(captured.ReplayedAGraph, "the plan is not replaying a graph after warm-up");
-            // The first BatchNorm feeds only a ReLU: the GPU plan fuses the pair (BatchNormReluFusionPattern); the second
-            // feeds the residual add, so it stays a BatchNorm. The CPU plan fuses nothing.
+            // The GPU plan fuses the first BatchNorm with its ReLU (BatchNormReluFusionPattern) and the second with the
+            // residual add and the ReLU after it (BatchNormAddReluFusionPattern); the CPU plan fuses neither.
             _output.WriteLine("captured steps: " + string.Join(", ", captured.StepNames));
             Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNormReLU"));
-            Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNorm"));
+            Assert.Equal(1, captured.StepNames.Count(n => n == "BatchNormAddReLU"));
+            Assert.DoesNotContain("BatchNorm", captured.StepNames);
             Assert.DoesNotContain("BatchNormReLU", reference.StepNames);
+            Assert.DoesNotContain("BatchNormAddReLU", reference.StepNames);
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(reference.Losses[s] - captured.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(reference.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G7} != cpu {reference.Losses[s]:G7}");
@@ -142,11 +144,11 @@ public class CompiledConvBnGraphStepTests : IDisposable
                     maxErr = Math.Max(maxErr, Math.Abs(reference.FinalWeights[p][i] - captured.FinalWeights[p][i]));
                 Assert.True(maxErr <= 1e-4, $"parameter {p}: max |captured - cpu| {maxErr:E2} after {Steps} steps");
             }
-            // Measured on an RTX 3080: 2 memset and 3 memcpy nodes (the loss mean's output, the loss seed, and the residual
-            // add's gradient handed to both of its inputs). Before, this graph carried 24 memset and 13 memcpy nodes.
+            // Measured on an RTX 3080: 2 memset nodes (the loss mean's output) and 1 memcpy (the loss seed). Before, this
+            // graph carried 24 memset and 13 memcpy nodes; the residual add's gradient copies went with the fused add.
             Assert.True(cuda.LastCaptureMemsetNodeCount <= 2,
                 $"{cuda.LastCaptureMemsetNodeCount} memset nodes in the captured step: a dead zero-fill came back");
-            Assert.True(cuda.LastCaptureMemcpyNodeCount <= 3,
+            Assert.True(cuda.LastCaptureMemcpyNodeCount <= 1,
                 $"{cuda.LastCaptureMemcpyNodeCount} memcpy nodes in the captured step: a first-write gradient copy came back");
         }
     }

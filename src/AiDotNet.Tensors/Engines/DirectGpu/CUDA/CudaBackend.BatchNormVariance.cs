@@ -23,46 +23,51 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
 
     unsafe bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
-        int batch, int channels, int spatial, float epsilon, bool relu)
+        int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)
     {
         int k4 = BatchNormRegisterVariant(batch, spatial, out int threads);
         long n = (long)batch * channels * spatial;
+        string name = residual is not null ? "batchnorm_fwd_addrelu_reg" : relu ? "batchnorm_fwd_relu_reg" : "batchnorm_fwd_reg";
         if (k4 == 0 || channels <= 0 || !IsAvailable || input.Size < n || output.Size < n || gamma.Size < channels
             || beta.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
-            || !_kernelCache.TryGetValue((relu ? "batchnorm_fwd_relu_reg" : "batchnorm_fwd_reg") + k4, out var kernel))
+            || (residual is not null && (!relu || residual.Size < n))
+            || !_kernelCache.TryGetValue(name + k4, out var kernel))
             return false;
         using var _ = PushContext();
+        IntPtr pr = residual?.Handle ?? IntPtr.Zero;
         IntPtr pi = input.Handle, po = output.Handle, pg = gamma.Handle, pb = beta.Handle, pm = saveMean.Handle,
             pv = saveVariance.Handle;
         int b = batch, c = channels, s = spatial;
         float eps = epsilon;
-        void** args = stackalloc void*[10];
-        args[0] = &pi; args[1] = &po; args[2] = &pg; args[3] = &pb; args[4] = &pm; args[5] = &pv;
-        args[6] = &b; args[7] = &c; args[8] = &s; args[9] = &eps;
+        void** args = stackalloc void*[11];
+        args[0] = &pi; args[1] = &pr; args[2] = &po; args[3] = &pg; args[4] = &pb; args[5] = &pm; args[6] = &pv;
+        args[7] = &b; args[8] = &c; args[9] = &s; args[10] = &eps;
         LaunchKernel(kernel, (uint)channels, (uint)threads, args);
         return true;
     }
 
     unsafe bool IBatchNormVarianceBackend.TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
-        IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput)
+        IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput, IGpuBuffer? gradResidual)
     {
         int k4 = BatchNormRegisterVariant(batch, spatial, out int threads);
         long n = (long)batch * channels * spatial;
         if (k4 == 0 || channels <= 0 || !IsAvailable || gradOutput.Size < n || input.Size < n || gradInput.Size < n
             || gamma.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
             || gradGamma.Size < channels || gradBeta.Size < channels || (reluOutput is not null && reluOutput.Size < n)
-            || !_kernelCache.TryGetValue((reluOutput is null ? "batchnorm_bwd_reg" : "batchnorm_bwd_relu_reg") + k4, out var kernel))
+            || (gradResidual is not null && (reluOutput is null || gradResidual.Size < n))
+            || !_kernelCache.TryGetValue((gradResidual is not null ? "batchnorm_bwd_addrelu_reg"
+                : reluOutput is null ? "batchnorm_bwd_reg" : "batchnorm_bwd_relu_reg") + k4, out var kernel))
             return false;
         using var _ = PushContext();
-        IntPtr pro = reluOutput?.Handle ?? IntPtr.Zero;
+        IntPtr pro = reluOutput?.Handle ?? IntPtr.Zero, pgr = gradResidual?.Handle ?? IntPtr.Zero;
         IntPtr pdy = gradOutput.Handle, px = input.Handle, pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle,
             pdx = gradInput.Handle, pdg = gradGamma.Handle, pdb = gradBeta.Handle;
         int b = batch, c = channels, s = spatial;
         float eps = epsilon;
-        void** args = stackalloc void*[13];
-        args[0] = &pdy; args[1] = &pro; args[2] = &px; args[3] = &pg; args[4] = &pm; args[5] = &pv; args[6] = &pdx;
-        args[7] = &pdg; args[8] = &pdb; args[9] = &b; args[10] = &c; args[11] = &s; args[12] = &eps;
+        void** args = stackalloc void*[14];
+        args[0] = &pdy; args[1] = &pro; args[2] = &pgr; args[3] = &px; args[4] = &pg; args[5] = &pm; args[6] = &pv;
+        args[7] = &pdx; args[8] = &pdg; args[9] = &pdb; args[10] = &b; args[11] = &c; args[12] = &s; args[13] = &eps;
         LaunchKernel(kernel, (uint)channels, (uint)threads, args);
         return true;
     }

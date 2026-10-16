@@ -35,81 +35,18 @@ internal sealed class BatchNormReluFusionPattern : IFusionPattern
         out ILazyNode? fused)
     {
         fused = null;
-        if (nodes[index] is not LazyNode<float> bn || bn.OpName != "BatchNorm"
-            || bn.RecordingEngine is not DirectGpuTensorEngine
-            || bn.BackwardFn is null || bn.SavedState is not { Length: 3 } saved
-            || saved[0] is not Tensor<float> mean || saved[1] is not Tensor<float> variance || saved[2] is not double epsilon
-            || bn.GetInputsArray() is not { Length: 3 } bnInputs)
+        if (!BatchNormFusionMatch.TryMatchBatchNorm(nodes, index, consumerCounts, alreadyRemoved,
+                consumer => consumer is LazyNode<float> { OpType: LazyNodeType.ReLU },
+                out var bn, out var relu, out var statistics, out var mean, out var variance, out var epsilon))
             return false;
-
-        LazyNode<float>? relu = null;
-        var statistics = new List<LazyNode<float>>(2);
-        int consumersSeen = 0;
-        for (int j = index + 1; j < nodes.Count; j++)
-        {
-            var candidate = nodes[j];
-            if (alreadyRemoved.Contains(candidate) || !PatternHelpers.IsConsumerOf(candidate, bn)) continue;
-            consumersSeen++;
-            if (candidate is LazyNode<float> { OpType: LazyNodeType.ReLU } r && relu is null) relu = r;
-            else if (candidate is LazyNode<float> s && (s.OpName == "BatchNormBatchMean" || s.OpName == "BatchNormBatchVariance")
-                     && PatternHelpers.FanOutAtMostOne(s, consumerCounts)
-                     && !(consumerCounts.TryGetValue(s, out int statConsumers) && statConsumers > 0))
-                statistics.Add(s);
-            else return false;   // another reader of the normalized values, or a statistic something consumes
-        }
-        if (relu is null || !consumerCounts.TryGetValue(bn, out int bnConsumers) || bnConsumers != consumersSeen)
-            return false;
-
-        var x = bnInputs[0];
-        var gamma = bnInputs[1];
-        var beta = bnInputs[2];
-        var statisticOutputs = new (Tensor<float> Output, Tensor<float> Source)[statistics.Count];
-        for (int s = 0; s < statistics.Count; s++)
-            statisticOutputs[s] = (statistics[s].Output, statistics[s].OpName == "BatchNormBatchMean" ? mean : variance);
-
-        var node = new LazyNode<float>(LazyNodeType.Custom, "BatchNormReLU", new[] { x, gamma, beta }, relu.Output,
-            (eng, output) =>
-            {
-                Tensor<float> result, freshMean, freshVar;
-                Tensor<float>? fusedResult = null, fusedMean = null, fusedVar = null;
-                if (eng is DirectGpuTensorEngine gpu)
-                    fusedResult = gpu.TryBatchNormReluForward(x, gamma, beta, epsilon, out fusedMean, out fusedVar);
-                if (fusedResult is not null && fusedMean is not null && fusedVar is not null)
-                {
-                    result = fusedResult;
-                    freshMean = fusedMean;
-                    freshVar = fusedVar;
-                }
-                else
-                {
-                    var normalized = eng.BatchNorm(x, gamma, beta, epsilon, out freshMean, out freshVar);
-                    result = eng.ReLU(normalized);
-                    Helpers.TensorAllocator.Return(normalized);
-                }
-                try
-                {
-                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
-                    DirectGpuTensorEngine.CopyResultInto(eng, freshMean, mean);
-                    DirectGpuTensorEngine.CopyResultInto(eng, freshVar, variance);
-                    foreach (var (statisticOutput, source) in statisticOutputs)
-                        DirectGpuTensorEngine.CopyResultInto(eng, source, statisticOutput);
-                }
-                finally
-                {
-                    Helpers.TensorAllocator.Return(result);
-                    Helpers.TensorAllocator.Return(freshMean);
-                    Helpers.TensorAllocator.Return(freshVar);
-                }
-            },
-            BackwardFunctions<float>.BatchNormReluBackward, new object[] { mean, variance, epsilon })
-        {
-            RecordingEngine = bn.RecordingEngine,
-        };
+        var bnInputs = bn!.GetInputsArray();
+        var node = BatchNormFusionMatch.BuildFusedNode(bn, bnInputs[0], bnInputs[1], bnInputs[2], null, relu!.Output,
+            statistics!, mean!, variance!, epsilon, "BatchNormReLU", BackwardFunctions<float>.BatchNormReluBackward);
         fused = node;
         PatternHelpers.SetLazySource(node);
         alreadyRemoved.Add(bn);
         alreadyRemoved.Add(relu);
-        foreach (var s in statistics) alreadyRemoved.Add(s);
+        foreach (var s in statistics!) alreadyRemoved.Add(s);
         return true;
     }
 }
