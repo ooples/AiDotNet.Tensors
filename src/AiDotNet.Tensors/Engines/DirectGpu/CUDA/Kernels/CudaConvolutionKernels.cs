@@ -1647,7 +1647,7 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
 }
 
 // Input gradient on the engine core, Cout % 8 == 0: dX[Cin, B*H*W] = W'[Cin, K] * dY_gathered[K, B*H*W] with K ordered
-// (kh, kw, co), so a K tile shares one tap. The A loader's lanes run along ci. tapMajor: the weights arrive as
+// (co / 8, kh, kw, co % 8), so a K tile shares one tap. The A loader's lanes run along ci. tapMajor: the weights arrive as
 // wt[kh*kW + kw][co][ci] (conv2d_dgrad_weight_tapmajor), so those lanes read contiguous floats; else the forward layout
 // w[co][ci][kh][kw], where consecutive ci are kH*kW floats apart (a 1x1 kernel's layout is the same either way). The
 // host relays out only when enough column tiles reread the weights to pay for the copy. PHASE = false: unit stride or any stride with per-tile divisibility checks,
@@ -1711,7 +1711,10 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const float* dyBatch = gradOutput + (long long)nb * outC * L;
 
     // Tile state: tap (kh, kw) and first output channel co0 (K tiles never straddle a tap: Cout % 8 == 0).
-    int tapIndex = kBegin / outC, co0 = kBegin - tapIndex * outC;
+    // K order (co group of CE_BK, tap, co within the group), as in the forward: the taps of one group read the weights
+    // w[co][ci][0 .. kH*kW-1] back to back, so in the forward layout each (co, ci) run stays in L1 across its taps.
+    const int taps = tapsH * tapsW;
+    int g0 = kBegin / (CE_BK * taps), tapIndex = (kBegin - g0 * CE_BK * taps) / CE_BK, co0 = g0 * CE_BK;
     int th = tapIndex / tapsW, tw = tapIndex - th * tapsW;
     int kh = PHASE ? rh + th * sH : th, kw = PHASE ? rw + tw * sW : tw;
 
@@ -1749,13 +1752,9 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     };
     auto advance = [&]()
     {
-        co0 += CE_BK;
-        if (co0 == outC)
-        {
-            co0 = 0;
-            if (++tw == tapsW) { tw = 0; th++; }
-            kh = PHASE ? rh + th * sH : th; kw = PHASE ? rw + tw * sW : tw;
-        }
+        if (++tw == tapsW) { tw = 0; th++; }
+        if (th == tapsH) { th = 0; co0 += CE_BK; }
+        kh = PHASE ? rh + th * sH : th; kw = PHASE ? rw + tw * sW : tw;
     };
 
     float acc[TM][TN];
