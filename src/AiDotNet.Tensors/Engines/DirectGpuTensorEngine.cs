@@ -8924,7 +8924,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // NOTE: not `using` — under a DeferredScope the no-bias path hands this buffer to
         // FinishGpuOp (the activation cache then owns its lifetime so the lazy download can
         // run after scope.Execute()). The `finally` disposes it on every other path. #642 P3.
-        var outputBuffer = AllocateOutputBuffer(backend, batch * outChannels * outHeight * outWidth);
+        // Every convolution route (each backend's kernels and every tuned CUDA candidate) stores the whole output.
+        var outputBuffer = AllocateFullyWrittenOutputBuffer(backend, batch * outChannels * outHeight * outWidth);
         bool outputHandedOff = false;
 
         try
@@ -15855,9 +15856,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 backend.Reciprocal(saveInvVarBuffer.Buffer, saveInvVarBuffer.Buffer, channels);
             }
 
-            var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
-            var gradGammaBuffer = AllocateOutputBuffer(backend, channels);
-            var gradBetaBuffer = AllocateOutputBuffer(backend, channels);
+            // Every backend's batch-norm backward stores all three outputs (Metal zeroes its affine gradients in the
+            // kernel before accumulating), so none needs a zero-filled buffer: inside a captured step each fill was a
+            // memset node, three per BatchNorm per step.
+            var gradInputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            var gradGammaBuffer = AllocateFullyWrittenOutputBuffer(backend, channels);
+            var gradBetaBuffer = AllocateFullyWrittenOutputBuffer(backend, channels);
             bool handedOff = false;
             try
             {
@@ -17481,7 +17485,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return DispatchDeferredGpuOp<T>(backend, outputLength, inputShape, output =>
                 backend.Conv2DBackwardInput(gradOutBuffer.Buffer, kernelBuffer.Buffer, output,
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW));
+                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW),
+                fullyWritten: true);   // every input-gradient route stores the whole gradient
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("EmbeddingBackwardGpu", capabilityGap);
             return base.Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
@@ -17529,7 +17534,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return DispatchDeferredGpuOp<T>(backend, outputLength, kernelShape, output =>
                 backend.Conv2DBackwardKernel(inputBuffer.Buffer, gradOutBuffer.Buffer, output,
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW));
+                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW),
+                fullyWritten: true);   // every weight-gradient route stores the whole gradient (split-K sums in order)
         }
         catch (Exception ex)
         {
@@ -23076,14 +23082,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
-            bufOut = AllocateOutputBuffer(backend, input.Length);
+            // The training kernel stores every output element and both saved statistics on every backend.
+            bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
             // Running statistics: the training kernel blends the batch statistics into them, but this op never returns
             // or reads them, so whatever the buffers held only affects values that are thrown away. They are not
             // initialised (two fills and two memsets a call - ResNet-18 runs 20 BatchNorms a step).
             using var bufRunMean = AllocateFullyWrittenOutputBuffer(backend, channels);
             using var bufRunVar = AllocateFullyWrittenOutputBuffer(backend, channels);
-            bufSaveMean = AllocateOutputBuffer(backend, channels);
-            bufSaveInvVar = AllocateOutputBuffer(backend, channels);
+            bufSaveMean = AllocateFullyWrittenOutputBuffer(backend, channels);
+            bufSaveInvVar = AllocateFullyWrittenOutputBuffer(backend, channels);
             backend.BatchNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufRunMean.Buffer, bufRunVar.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer,
                 batch, channels, spatial, (float)epsilon, 0.1f, true);

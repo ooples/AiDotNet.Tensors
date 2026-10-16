@@ -169,6 +169,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// until one ran): the only ones that body zeroes per step. See RunGpuStepBodyForCapture.</summary>
     private int[]? _unwrittenGradIndices;
 
+    /// <summary>
+    /// Per gradient buffer: the device buffer an uncaptured run of the captured step body zeroed and that no backward
+    /// action has written since (null entry otherwise). A gradient of a non-differentiable leaf (the input batch, the
+    /// labels, BatchNorm's running statistics) is never written, so once zeroed it stays zero and re-zeroing it every
+    /// step was pure overhead: in a whole-step CUDA graph each zero is a memset node (42 per ResNet-18 step, ~0.4 ms of
+    /// graph time with the bubbles between them). Reset by the eager step, which writes gradients outside this record.
+    /// </summary>
+    private Engines.DirectGpu.IGpuBuffer?[]? _gradHeldZero;
+
+    /// <summary>Gradient buffers whose zeroing is never skipped: the parameter gradients (L2 regularization and clipping
+    /// write them in place after the backward) and the reshape-view aliases, which share storage with written buffers.</summary>
+    private HashSet<Tensor<T>>? _alwaysZeroedGrads;
+
     /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
     /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
     /// the backward is all-specialized, pooled, or has no such buffer. Entries are cleared by
@@ -3240,6 +3253,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// is deliberately NOT captured — it runs eagerly in Step() so its per-step LR /
     /// bias-correction scalars are recomputed each replay instead of frozen at capture.
     /// </summary>
+    private HashSet<Tensor<T>> AlwaysZeroedGradients()
+    {
+        var set = new HashSet<Tensor<T>>();   // Tensor equality is reference equality, as the gradient map relies on
+        foreach (var g in _gradients) if (g is not null) set.Add(g);
+        if (_aliasedGradViews is { } views)
+            foreach (var (view, target) in views) { set.Add(view); set.Add(target); }
+        return set;
+    }
+
     private static void ZeroDeviceBuffer(Engines.DirectGpu.IDirectGpuBackend backend, Engines.DirectGpu.IGpuBuffer buffer,
         int length, int elementSize)
     {
@@ -3337,14 +3359,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int gradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
         var zeroIndices = _unwrittenGradIndices;
         int zeroCount = zeroIndices?.Length ?? _preAllocatedGrads.Length;
+        // A buffer still held at zero (zeroed by an earlier uncaptured run, unwritten since) is skipped, so a capture
+        // records no memset node for it. Only uncaptured runs update the record: a capture executes nothing.
+        var alwaysZeroed = _alwaysZeroedGrads ??= AlwaysZeroedGradients();
+        var heldZero = _gradHeldZero ??= new Engines.DirectGpu.IGpuBuffer?[_preAllocatedGrads.Length];
+        int zeroed = 0;
         for (int z = 0; z < zeroCount; z++)
         {
             int i = zeroIndices is null ? z : zeroIndices[z];
             if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
             {
+                if (ReferenceEquals(heldZero[i], gb) && !alwaysZeroed.Contains(_preAllocatedGrads[i])) continue;
                 ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[i].Length, esz);
                 residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, backend);
+                if (!capturingNow) heldZero[i] = gb;
+                zeroed++;
             }
+        }
+        if (capDiag)
+        {
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                $"[GRAD-ZERO] captured step zeroes {zeroed} of {zeroCount} unwritten gradient buffers ({_preAllocatedGrads.Length} total)" + System.Environment.NewLine); } catch { }
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
         {
@@ -3391,6 +3426,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
                 if (_preAllocatedGrads[i]._gradWriteGeneration != gradWriteGeneration)
                     unwritten.Add(i);
+                else
+                    heldZero[i] = null;   // written this step: no longer known zero
             _unwrittenGradIndices = unwritten.ToArray();
         }
         de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
@@ -3447,6 +3484,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private Tensor<T> StepEager()
     {
         var engine = _engine;
+        _gradHeldZero = null;   // the eager step writes gradient buffers outside the captured body's record
         // #226 race fix: a compiled training step is ATOMIC — every forward activation it
         // caches is consumed by its own backward. Suspend the engine's mid-step activation
         // eviction for the duration of the step so the within-step VRAM-pressure offload
