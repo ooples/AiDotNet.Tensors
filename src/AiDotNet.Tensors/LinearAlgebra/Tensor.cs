@@ -63,6 +63,46 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         _pooledArray = null;
     }
+
+    /// <summary>
+    /// Returns this result's pooled array to the thread cache once <see cref="TensorBase{T}.Dispose"/> released its
+    /// last storage reference, so <c>using var y = engine.Op(x)</c> in a loop reuses one array instead of allocating
+    /// a fresh one per call (#1331). Before, the array came back only through <see cref="Helpers.ResultBufferTracker"/>
+    /// after a collection cleared the result's owner.
+    /// </summary>
+    /// <remarks>
+    /// Disposing proves only that no view of this tensor is left. The array is returned only when nothing else can
+    /// still read it either:
+    /// <list type="bullet">
+    /// <item>it is a tracked result (large enough to qualify), so every zero-copy wrap of it went through
+    /// <see cref="Helpers.ResultBufferTracker.Find(Array)"/> and is counted in <c>Wrappers</c>; smaller arrays carry no
+    /// such record, and the gen-0 allocator already serves them within a fraction of a microsecond;</item>
+    /// <item>no raw accessor escaped it (<c>Escaped</c>), and this result's vector is its only wrapper;</item>
+    /// <item>no other tensor storage over the same vector is still live (a tensor built over an existing vector gets
+    /// a storage of its own).</item>
+    /// </list>
+    /// Anything else is left to the tracker, exactly as before.
+    /// </remarks>
+    internal override void OnLastStorageReferenceReleased(TensorStorage<T> storage)
+    {
+#if NET5_0_OR_GREATER
+        if (_pooledArray is not { } array) return;
+        var vector = storage.GetVector();
+        if (vector.ResultOwner is not { } owner) return;
+        var state = owner.State;
+        if (state.Escaped || Volatile.Read(ref state.Wrappers) != 1 || !ReferenceEquals(state.TrackedArray, array)) return;
+        if (Volatile.Read(ref vector.LiveStorages) != 0) return;
+
+        _pooledArray = null;
+        vector.ResultOwner = null;
+        // A deferred GPU download registered against this array must not land in it after it is handed to a new owner.
+        Helpers.HostSync.Forget(array);
+        if (Helpers.ResultBufferTracker.Stress) Helpers.ResultBufferTracker.Poison(array);
+        // Taken: the tracker entry stays (parked) so the next result over the array is tracked again. Declined: the
+        // tracker keeps the array and reuses it after a collection, as for any result nobody disposed.
+        Helpers.ThreadLocalTensorCache<T>.TryReturn(array, state);
+#endif
+    }
     /// <summary>
     /// Creates a new tensor with the specified dimensions, initialized with default values.
     /// </summary>
@@ -872,12 +912,23 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     // per call: about 1-2 us on a 1M-element subtract + Return loop. A result the caller drops instead is not lost to
     // recycling: its array is collected, the next rent misses the cache, and that result (from the free list or fresh)
     // is tracked as usual.
-    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray, bool track = true)
+    internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray, bool track = true,
+        Helpers.ResultBufferOwner? owner = null)
     {
         var vector = Vector<T>.FromMemory(memory);
         // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
         // cache once this tensor, its views (which share this vector through the storage) and any zero-copy wraps has been collected.
-        if (track) vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
+        // An owner passed in took over a disposed result's parked entry (ThreadLocalTensorCache.TryRentForResult).
+        if (owner is not null)
+        {
+            // The vector's constructor already found the re-issued owner (and counted itself) unless the lookup missed.
+            if (!ReferenceEquals(vector.ResultOwner, owner))
+            {
+                Interlocked.Increment(ref owner.State.Wrappers);
+                vector.ResultOwner = owner;
+            }
+        }
+        else if (track) vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         var tensor = new Tensor<T>(vector, dimensions);
         tensor._pooledArray = pooledArray;
         return tensor;

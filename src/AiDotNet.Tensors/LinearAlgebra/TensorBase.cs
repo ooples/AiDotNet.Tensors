@@ -4173,7 +4173,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // alone: clearing it left the surviving view with no device buffer and a pending download, so its next device
         // use read the data back to the host and uploaded it again. The buffer is freed with the last reference.
         bool sharedDeviceStateOutlivesThis = CoversWholeVector && _storage.RefCount > 1;
-        _storage.Release();
+        var storage = _storage;
+        bool lastReference = storage.Release();
         if (!sharedDeviceStateOutlivesThis)
         {
             if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
@@ -4182,6 +4183,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             }
             _gpuBuffer = null;
         }
+        if (lastReference) OnLastStorageReferenceReleased(storage);
         GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Runs when <see cref="Dispose"/> released the last reference to <paramref name="storage"/>: no view of this
+    /// tensor remains. <see cref="Tensor{T}"/> returns its pooled array to the thread cache here when nothing else
+    /// can still reach it.
+    /// </summary>
+    internal virtual void OnLastStorageReferenceReleased(TensorStorage<T> storage)
+    {
     }
 }

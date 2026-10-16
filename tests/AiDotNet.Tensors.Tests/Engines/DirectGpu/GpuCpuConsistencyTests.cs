@@ -264,7 +264,9 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             double Read() => BitConverter.ToDouble(cuda.DownloadByteBuffer(sumSq, sizeof(double)), 0);
 
             cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
-            Assert.True(Math.Abs(Read() - exact) <= 1e-9 * exact, $"sum of squares {Read()} vs exact {exact}");
+            // Each float4's four squares are summed in float before the double accumulation (FP64 is 1/64 rate on
+            // consumer GPUs), so the sum carries float rounding: ~1e-7 relative, far inside what a clip norm needs.
+            Assert.True(Math.Abs(Read() - exact) <= 1e-6 * exact, $"sum of squares {Read()} vs exact {exact}");
 
             // clip_grad_norm_: every element scaled by min(1, max / (norm + 1e-6)).
             double norm = Math.Sqrt(exact);
@@ -292,6 +294,26 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             buffers[0] = cuda.AllocateBuffer(new[] { float.NaN });
             cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
             Assert.True(double.IsNaN(Read()) || double.IsInfinity(Read()), "a NaN gradient read as finite");
+
+            // The same two cases inside a float4 of an aligned tensor (tensor 4, 4096 elements), where the squares are
+            // summed in float: a float overflow there must be redone in double, a NaN must still surface.
+            buffers[0].Dispose();
+            buffers[0] = cuda.AllocateBuffer(new[] { 0.5f });
+            var bigInVector = (float[])host[4].Clone();
+            bigInVector[1001] = 3e30f;
+            buffers[4].Dispose();
+            buffers[4] = cuda.AllocateBuffer(bigInVector);
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            double expectedBig = exact - (double)host[0][0] * host[0][0] + 0.25
+                                 - (double)host[4][1001] * host[4][1001] + 9e60;
+            Assert.True(Math.Abs(Read() - expectedBig) <= 1e-6 * expectedBig,
+                $"a float-overflowing square in a float4: {Read()} vs {expectedBig}");
+            var nanInVector = (float[])host[4].Clone();
+            nanInVector[2050] = float.NaN;
+            buffers[4].Dispose();
+            buffers[4] = cuda.AllocateBuffer(nanInVector);
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            Assert.True(double.IsNaN(Read()) || double.IsInfinity(Read()), "a NaN inside a float4 read as finite");
         }
         finally
         {

@@ -244,8 +244,15 @@ def main() -> int:
 
     losses: list[float] = []
     phases = {"forward": [], "backward": [], "optimizer": [], "step": []}
-    total = spec["warmupSteps"] + spec["measuredSteps"]
-    for step in range(total):
+    # The warmup lasts warmupSteps steps AND at least warmupMs milliseconds (default 1000), as on the Tensors side
+    # (HeadToHeadNetworkHarness.WarmupMilliseconds): a step count alone times an idle GPU still raising its clocks.
+    warmup_ms = float(spec.get("warmupMs", 1000))
+    warm_start = time.perf_counter()
+    measured = 0
+    step = -1
+    while measured < spec["measuredSteps"]:
+        step += 1
+        measuring = step >= spec["warmupSteps"] and (time.perf_counter() - warm_start) * 1e3 >= warmup_ms
         sync()
         t0 = time.perf_counter()
         loss = loss_fn(model(x), y)
@@ -260,7 +267,8 @@ def main() -> int:
         t3 = time.perf_counter()
         if step < spec["lossAgreementSteps"]:
             losses.append(float(loss.item()))
-        if step >= spec["warmupSteps"]:
+        if measuring:
+            measured += 1
             phases["forward"].append((t1 - t0) * 1e3)
             phases["backward"].append((t2 - t1) * 1e3)
             phases["optimizer"].append((t3 - t2) * 1e3)

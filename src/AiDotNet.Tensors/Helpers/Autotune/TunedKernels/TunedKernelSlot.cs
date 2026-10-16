@@ -16,7 +16,11 @@ namespace AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 /// output within the harness tolerance; only a correct candidate is timed. Timing is paired and interleaved on the
 /// device clock (candidate and reference alternate, order flipping each pair), after a reference-versus-reference
 /// control replay that measures the noise floor. A candidate becomes the default for the shape only when its
-/// median within-pair speedup clears both 2% and the noise floor AND it won every single pair.</para>
+/// median within-pair speedup clears both 2% and the noise floor AND it won every pair but at most one. One pair is
+/// forgiven, in the noise floor too, because a single sample can stall for reasons unrelated to the kernel (a host
+/// preemption, a display-driver scheduling hiccup on a desktop GPU): measured on an RTX 3080 under Windows, a kernel
+/// 1.1-1.4x faster by median lost its decision to one pair at 0.1x in most attempts. Winning 8 of 9 pairs is still
+/// a sign test at p ~ 0.02 against "no faster".</para>
 /// <para>When numerical determinism is requested (<c>requireDeterministic</c> returns true) only candidates that
 /// declare <see cref="ITunedKernelCandidate{TArgs}.IsDeterministic"/> are eligible, and those decisions are cached
 /// separately from the non-deterministic ones.</para>
@@ -276,7 +280,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         for (int i = 0; i < ControlPairs; i++)
             control.Add(new KernelTuningPairedSample(Span(_harness.MeasureMilliseconds(reference, args, reps)),
                 Span(_harness.MeasureMilliseconds(reference, args, reps))));
-        double noise = KernelTuningPairedEvidence.SymmetricNoiseRatio(control);
+        double noise = RobustNoiseRatio(control);
 
         ITunedKernelCandidate<TArgs> best = reference;
         KernelTuningPairedEvidence? bestEvidence = null;
@@ -331,10 +335,12 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
                 continue;
             }
 
-            bool wins = evidence.MedianSpeedup >= Math.Max(MinimumSpeedup, noise) && evidence.LowerSpeedupBound > 1.0;
+            double secondLowest = SecondLowestSpeedup(evidence);
+            bool wins = evidence.MedianSpeedup >= Math.Max(MinimumSpeedup, noise) && secondLowest > 1.0;
             if (!wins)
             {
-                rejected.Add($"{c.Id}: {evidence.MedianSpeedup:F3}x median, {evidence.LowerSpeedupBound:F3}x min pair (noise {noise:F3})");
+                rejected.Add($"{c.Id}: {evidence.MedianSpeedup:F3}x median, {evidence.LowerSpeedupBound:F3}x min pair, " +
+                             $"{secondLowest:F3}x second-lowest pair (noise {noise:F3})");
                 continue;
             }
             if (bestEvidence is null || evidence.MedianSpeedup > bestEvidence.MedianSpeedup)
@@ -361,6 +367,24 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             candidateMs: bestEvidence.CandidateTiming.Median.TotalMilliseconds / reps,
             medianSpeedup: bestEvidence.MedianSpeedup, lowerSpeedup: bestEvidence.LowerSpeedupBound,
             noiseRatio: noise, maxRelativeError: bestError, rejected: rejected.ToArray()));
+    }
+
+    /// <summary>The second-lowest within-pair speedup: above one when the candidate won every pair but at most one.</summary>
+    internal static double SecondLowestSpeedup(KernelTuningPairedEvidence evidence)
+    {
+        var speedups = evidence.Samples.Select(s => s.Speedup).OrderBy(v => v).ToArray();
+        return speedups.Length > 1 ? speedups[1] : speedups.Length == 1 ? speedups[0] : 0.0;   // no pairs: never a win
+    }
+
+    /// <summary>
+    /// The control replay's noise floor with its single worst pair dropped: the largest remaining reference-versus-
+    /// reference deviation (max(r, 1/r)). One stalled control sample otherwise sets the floor (a 10x stall made every
+    /// candidate's median fail it).
+    /// </summary>
+    internal static double RobustNoiseRatio(IReadOnlyList<KernelTuningPairedSample> control)
+    {
+        var deviations = control.Select(s => Math.Max(s.Speedup, 1.0 / s.Speedup)).OrderBy(v => v).ToArray();
+        return deviations.Length > 1 ? deviations[deviations.Length - 2] : deviations.Length == 1 ? deviations[0] : 1.0;
     }
 
     // FNV-1a over the ordered candidate ids, as 8 hex digits: a short, stable name for the candidate set.

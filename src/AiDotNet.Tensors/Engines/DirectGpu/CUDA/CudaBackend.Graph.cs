@@ -194,6 +194,12 @@ public sealed partial class CudaBackend
     /// <summary>Kernel nodes in the most recent step capture: work another thread enqueued would show up here.</summary>
     internal int LastCaptureKernelNodeCount { get; private set; }
 
+    /// <summary>Memset nodes in the most recent step capture: each is a zero-fill replayed every step.</summary>
+    internal int LastCaptureMemsetNodeCount { get; private set; }
+
+    /// <summary>Memcpy nodes in the most recent step capture: each is a device copy replayed every step.</summary>
+    internal int LastCaptureMemcpyNodeCount { get; private set; }
+
     private static int CountNodes(IntPtr graph, int nodeType)
     {
         ulong count = 0;
@@ -309,6 +315,8 @@ public sealed partial class CudaBackend
         // replay reproduces a frozen output that ignores refreshed inputs.
         LastCaptureFreeNodeCount = CountNodes(graph, nodeType: 11); // CU_GRAPH_NODE_TYPE_MEM_FREE
         LastCaptureKernelNodeCount = CountNodes(graph, nodeType: 0); // CU_GRAPH_NODE_TYPE_KERNEL
+        LastCaptureMemcpyNodeCount = CountNodes(graph, nodeType: 1); // CU_GRAPH_NODE_TYPE_MEMCPY
+        LastCaptureMemsetNodeCount = CountNodes(graph, nodeType: 2); // CU_GRAPH_NODE_TYPE_MEMSET
         { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})");
           // Node-type breakdown (KERNEL/MEMCPY/MEMSET/MEM_ALLOC/MEM_FREE/…) — tells us how much of the chain is
           // fusable kernels vs memcpy/alloc overhead. Only when capture-debug is on.
