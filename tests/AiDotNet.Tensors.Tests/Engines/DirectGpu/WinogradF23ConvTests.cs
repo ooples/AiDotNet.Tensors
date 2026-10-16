@@ -109,8 +109,28 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         using var w = cuda.AllocateBuffer(Rand(c * c * 9, 2, 1f / MathF.Sqrt(c * 9)));
         using var y = cuda.AllocateBuffer(batch * c * s * s);
         var args = new CudaConv2DArgs(x, w, y, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
-        var chosen = cuda.Conv2DForwardSlot.Resolve(args.Shape(), args);
-        _output.WriteLine($"forward slot picked {chosen?.Id ?? "<none>"} for N8 C128 16x16 among [{string.Join(", ", forwardIds)}]");
+        // The per-process tuning budget is shared with every earlier test in this process; once spent the slot serves
+        // its reference without measuring. Give this one decision room to measure, then restore the budget.
+        double budget = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds;
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds =
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.SpentMilliseconds + 60_000;
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.ITunedKernelCandidate<CudaConv2DArgs>? chosen;
+        try
+        {
+            // An earlier test may have cached a budget-exhausted decision (the reference) for this shape.
+            cuda.Conv2DForwardSlot.InvalidateDecisions();
+            chosen = cuda.Conv2DForwardSlot.Resolve(args.Shape(), args);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds = budget;
+        }
+        var decision = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelRegistry.Decisions
+            .LastOrDefault(d => d.Op == AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.Conv2DForward
+                                && d.Shape.Equals(args.Shape()));
+        _output.WriteLine($"forward slot picked {chosen?.Id ?? "<none>"} for N8 C128 16x16 (reason {decision?.Reason}, " +
+                          $"reference {decision?.ReferenceMilliseconds:F3} ms, chosen {decision?.CandidateMilliseconds:F3} ms, " +
+                          $"max rel err {decision?.MaxRelativeError:E2}) among [{string.Join(", ", forwardIds)}]");
         Assert.Equal("nvrtc.conv2d.winograd_f23", chosen?.Id);
     }
 
