@@ -184,8 +184,11 @@ internal static class Im2ColHelper
     {
         int kHW = kernelH * kernelW;
         int ncBlock = (ohEndBlock - ohStartBlock) * outputW;
-        output.Slice(0, channels * kHW * ncBlock).Clear(); // padding handled once up front
         bool fast = strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1;
+        // The strided path writes only in-bounds positions, so its padding is cleared up front. The stride-1 path clears
+        // only the padding cells of each row it writes (#653): the whole-panel clear then overwrite was 7.6% of a
+        // single-threaded 64-channel 128x128 3x3 conv.
+        if (!fast) output.Slice(0, channels * kHW * ncBlock).Clear();
         long work = (long)channels * kHW * ncBlock;
         fixed (float* inP = input)
         fixed (float* outP = output)
@@ -211,18 +214,29 @@ internal static class Im2ColHelper
                                 int owStart = Math.Max(0, padW - kw);
                                 int owEnd = Math.Min(outputW, width + padW - kw);
                                 int validWidth = owEnd - owStart;
-                                if (validWidth > 0)
+                                if (validWidth <= 0 || ohHi <= ohLo)
                                 {
+                                    new Span<float>(outRow, ncBlock).Clear();
+                                }
+                                else
+                                {
+                                    // Output rows of the block above / below the input are all padding.
+                                    if (ohLo > ohStartBlock) new Span<float>(outRow, (ohLo - ohStartBlock) * outputW).Clear();
+                                    if (ohHi < ohEndBlock)
+                                        new Span<float>(outRow + (ohHi - ohStartBlock) * outputW, (ohEndBlock - ohHi) * outputW).Clear();
+                                    int leftPad = owStart, rightPad = outputW - owEnd;
                                     for (int oh = ohLo; oh < ohHi; oh++)
                                     {
                                         int ih = oh + kh - padH;
                                         int inputStart = channelOffset + ih * width + (owStart + kw - padW);
-                                        int outputStart = (oh - ohStartBlock) * outputW + owStart;
+                                        float* dst = outRow + (oh - ohStartBlock) * outputW;
+                                        if (leftPad > 0) new Span<float>(dst, leftPad).Clear();
                                         Buffer.MemoryCopy(
                                             inputPtr + inputStart,
-                                            outRow + outputStart,
+                                            dst + owStart,
                                             validWidth * sizeof(float),
                                             validWidth * sizeof(float));
+                                        if (rightPad > 0) new Span<float>(dst + owEnd, rightPad).Clear();
                                     }
                                 }
                             }
