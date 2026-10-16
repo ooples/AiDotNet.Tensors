@@ -15883,6 +15883,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var gammaBuffer = GetOrAllocateBuffer(backend, gamma);
             using var saveMeanBuffer = GetOrAllocateBuffer(backend, mean);
             using var trueVarianceBuffer = GetOrAllocateBuffer(backend, variance);
+            if (backend is DirectGpu.IBatchNormVarianceBackend varianceBackend)
+            {
+                // From the saved variance directly (no inverse-std launch), reading x and dY once each.
+                var gradInputDirect = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+                var gradGammaDirect = AllocateFullyWrittenOutputBuffer(backend, channels);
+                var gradBetaDirect = AllocateFullyWrittenOutputBuffer(backend, channels);
+                if (varianceBackend.TryBatchNormBackwardFromVariance(gradOutBuffer.Buffer, inputBuffer.Buffer,
+                        gammaBuffer.Buffer, saveMeanBuffer.Buffer, trueVarianceBuffer.Buffer, gradInputDirect.Buffer,
+                        gradGammaDirect.Buffer, gradBetaDirect.Buffer, batch, channels, spatialSize, (float)epsilon))
+                {
+                    gradGamma = DeferTensorResult<T>(backend, gradGammaDirect.Buffer, channels, gamma.Shape.ToArray());
+                    gradBeta = DeferTensorResult<T>(backend, gradBetaDirect.Buffer, channels, gamma.Shape.ToArray());
+                    return DeferTensorResult<T>(backend, gradInputDirect.Buffer, input.Length, input.Shape.ToArray());
+                }
+                gradInputDirect.Dispose();
+                gradGammaDirect.Dispose();
+                gradBetaDirect.Dispose();
+            }
             using var saveInvVarBuffer = AllocateFullyWrittenOutputBuffer(backend, channels);
             // One launch where the backend has LayerNorm's fused 1/sqrt(var + eps) (the same arithmetic as the three below).
             if (!(backend is DirectGpu.ILayerNormBackwardPartsBackend parts
@@ -23121,6 +23139,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
             // The training kernel stores every output element and both saved statistics on every backend.
             bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            if (backend is DirectGpu.IBatchNormVarianceBackend varianceBackend)
+            {
+                bufSaveMean = AllocateFullyWrittenOutputBuffer(backend, channels);
+                bufSaveInvVar = AllocateFullyWrittenOutputBuffer(backend, channels);
+                // One launch that reads the input once and stores the mean and the biased variance this op reports.
+                if (varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer,
+                        bufBeta.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer, batch, channels, spatial, (float)epsilon))
+                {
+                    var fusedResult = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
+                    mean = DeferTensorResult<T>(backend, bufSaveMean.Buffer, channels, new[] { channels });
+                    variance = DeferTensorResult<T>(backend, bufSaveInvVar.Buffer, channels, new[] { channels });
+                    ownershipTransferred = true;
+                    Autodiff.DifferentiableOps.RecordIfActive("BatchNorm", fusedResult, new[] { input, gamma, beta },
+                        Autodiff.BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+                    return fusedResult;
+                }
+                bufSaveMean.Dispose();
+                bufSaveInvVar.Dispose();
+            }
             // Running statistics: the training kernel blends the batch statistics into them, but this op never returns
             // or reads them, so whatever the buffers held only affects values that are thrown away. They are not
             // initialised (two fills and two memsets a call - ResNet-18 runs 20 BatchNorms a step).
