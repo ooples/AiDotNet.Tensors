@@ -37,12 +37,7 @@ public sealed class HipVendorGemmComparisonTests
             Skip.IfNot(backend.IsAvailable && backend.IsHipBlasAvailable,
                 "A HIP device with a working hipBLAS/rocBLAS for its architecture is required.");
 
-            int[][] shapes =
-            {
-                new[] { 128, 128, 128 }, new[] { 256, 256, 256 }, new[] { 512, 512, 512 }, new[] { 1024, 1024, 1024 },
-                new[] { 2048, 2048, 2048 }, new[] { 64, 4096, 1024 }, new[] { 4096, 64, 1024 }, new[] { 256, 256, 2304 },
-                new[] { 1024, 4096, 1024 }, new[] { 1024, 1024, 4096 }, new[] { 200, 500, 300 }, new[] { 32, 1024, 1024 }
-            };
+            int[][] shapes = ComparisonShapes;
 
             _output.WriteLine("M x N x K | hipBLAS ms | built-in ms | built-in / hipBLAS");
             foreach (var s in shapes)
@@ -70,6 +65,84 @@ public sealed class HipVendorGemmComparisonTests
             Environment.SetEnvironmentVariable(GemmImplEnvironmentVariable, previousImpl);
         }
     }
+
+    /// <summary>
+    /// Evolves the built-in CLBlast GEMM for each shape (AIDOTNET_HIP_VENDOR_TUNE_ATTEMPTS evaluations, default 64; shapes
+    /// filtered by AIDOTNET_HIP_VENDOR_TUNE_SHAPES, e.g. "1024x1024x1024;2048x2048x2048"), then times the deployed kernel
+    /// against hipBLAS: the per-shape ceiling of the built-in route. 128-wide tiles are seeded, since a short random
+    /// search never reaches them from the 64-wide default.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "HardwareProof")]
+    public async System.Threading.Tasks.Task TunedBuiltInGemm_VersusHipBlas_Measured()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable(ProofEnvironmentVariable), "1", StringComparison.Ordinal),
+            $"Set {ProofEnvironmentVariable}=1 to run the hipBLAS comparison.");
+        int attempts = int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_HIP_VENDOR_TUNE_ATTEMPTS"), out int parsed) && parsed >= 3
+            ? parsed : 64;
+        string? filter = Environment.GetEnvironmentVariable("AIDOTNET_HIP_VENDOR_TUNE_SHAPES");
+
+        string? previousImpl = Environment.GetEnvironmentVariable(GemmImplEnvironmentVariable);
+        try
+        {
+            using var backend = new HipBackend();
+            Skip.IfNot(backend.IsAvailable && backend.IsHipBlasAvailable && backend.EnsureClBlastIndirectGemm(),
+                "A HIP device with a working hipBLAS/rocBLAS and the CLBlast indirect GEMM is required.");
+            var baseline = backend.ClBlastDefaultConfig ?? throw new InvalidOperationException("No CLBlast default configuration.");
+            var seeds = new System.Collections.Generic.List<AiDotNet.Tensors.Engines.DirectGpu.OpenCL.GemmConfig>
+            {
+                baseline with { TileM = 128, TileN = 128, TileK = 16, ThreadTileM = 16, ThreadTileN = 16, VectorWidthM = 4, VectorWidthN = 4, MdimaSize = 16, NdimbSize = 16 },
+                baseline with { TileM = 128, TileN = 64, TileK = 16, ThreadTileM = 16, ThreadTileN = 8, VectorWidthM = 4, VectorWidthN = 4, MdimaSize = 16, NdimbSize = 8 },
+                baseline with { TileM = 64, TileN = 128, TileK = 16, ThreadTileM = 8, ThreadTileN = 16, VectorWidthM = 4, VectorWidthN = 4, MdimaSize = 8, NdimbSize = 16 },
+            };
+
+            _output.WriteLine("M x N x K | hipBLAS ms | tuned ms | tuned / hipBLAS | config");
+            foreach (var s in ComparisonShapes)
+            {
+                int m = s[0], n = s[1], k = s[2];
+                if (!string.IsNullOrEmpty(filter) && Array.IndexOf(filter.Split(';'), $"{m}x{n}x{k}") < 0) continue;
+                var options = new AiDotNet.Evolution.EvolutionEngineOptions
+                {
+                    RunId = $"hip-vendor-compare-{m}x{n}x{k}",
+                    Seed = 377,
+                    MaxEvaluationAttempts = attempts,
+                    MaxProposals = attempts * 2,
+                    MaxGenerations = Math.Max(3, attempts / 4),
+                    ProposalBatchSize = 4,
+                    MaxDegreeOfParallelism = 1,
+                    IslandCount = 1,
+                    MigrationInterval = 0,
+                    MigrantsPerIsland = 1
+                };
+                var tuning = await backend.TuneGemmWithEvolutionAsync(m, n, k, additionalSeeds: seeds, engineOptions: options);
+
+                float[] a = Values(m * k, 11), b = Values(k * n, 23);
+                float[] reference = CpuGemm(a, b, m, n, k);
+                using var ga = backend.AllocateBuffer(a);
+                using var gb = backend.AllocateBuffer(b);
+                using var gc = backend.AllocateBuffer(new float[m * n]);
+
+                Environment.SetEnvironmentVariable(GemmImplEnvironmentVariable, "hipblas");
+                double vendorMs = Time(() => Assert.True(backend.TryExecuteHipBlasGemm(ga, gb, gc, m, n, k, 1f, 0f)));
+                Environment.SetEnvironmentVariable(GemmImplEnvironmentVariable, "builtin");
+                double tunedMs = Time(() => backend.Gemm(ga, gb, gc, m, n, k));
+                AssertClose(reference, backend.DownloadBuffer(gc), k, $"tuned {m}x{n}x{k}");
+
+                _output.WriteLine($"{m} x {n} x {k} | {vendorMs:F3} | {tunedMs:F3} | {tunedMs / vendorMs:F2} | {tuning.ActiveDeployment.Configuration}");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(GemmImplEnvironmentVariable, previousImpl);
+        }
+    }
+
+    private static readonly int[][] ComparisonShapes =
+    {
+        new[] { 128, 128, 128 }, new[] { 256, 256, 256 }, new[] { 512, 512, 512 }, new[] { 1024, 1024, 1024 },
+        new[] { 2048, 2048, 2048 }, new[] { 64, 4096, 1024 }, new[] { 4096, 64, 1024 }, new[] { 256, 256, 2304 },
+        new[] { 1024, 4096, 1024 }, new[] { 1024, 1024, 4096 }, new[] { 200, 500, 300 }, new[] { 32, 1024, 1024 }
+    };
 
     private static double Time(Action gemm)
     {
