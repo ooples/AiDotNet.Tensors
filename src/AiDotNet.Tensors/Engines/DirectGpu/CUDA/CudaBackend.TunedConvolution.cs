@@ -151,15 +151,17 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
-    /// The engine mainloops to register, the precision default first: plain TF32 only under the explicit
-    /// reduced-precision opt-in, then 3xTF32 (Ampere+), then FMA.
+    /// The engine mainloops to register, the default (the slot's reference) first: plain TF32 under the explicit
+    /// reduced-precision opt-in, else FP32 FMA. 3xTF32 (fp32-level accuracy, Ampere+) competes as a measured candidate:
+    /// on the RTX 3080 it is still 20-25% slower than FMA (the engine is data-path bound, not math bound), so it is not
+    /// the default until it measures faster (#1335).
     /// </summary>
     private int[] ConvEngineMainloopsInOrder()
     {
         if (!ConvTensorCoresAvailable) return new[] { ConvMainloopFma };
         return CudaDispatchPolicy.ConvReducedPrecisionTF32
-            ? new[] { ConvMainloopTf32, ConvMainloop3xTf32, ConvMainloopFma }
-            : new[] { ConvMainloop3xTf32, ConvMainloopFma };
+            ? new[] { ConvMainloopTf32, ConvMainloopFma, ConvMainloop3xTf32 }
+            : new[] { ConvMainloopFma, ConvMainloop3xTf32 };
     }
 
     private void ExecuteConv2DForwardEngine(in CudaConv2DArgs a, int mainloop)

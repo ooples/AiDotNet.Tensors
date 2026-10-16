@@ -35,12 +35,13 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// The mainloop the engine runs outside the tuned slots (the fixed fallback chain and the per-route entry points):
-    /// plain TF32 under the explicit opt-in, else 3xTF32 on Ampere+, else FMA. Settable for tests and the benchmark.
+    /// plain TF32 under the explicit opt-in on Ampere+, else FP32 FMA (see ConvEngineMainloopsInOrder for why 3xTF32 is
+    /// not the default yet). Settable for tests and the benchmark.
     /// </summary>
     internal int ConvEngineMainloop
     {
-        get => _convEngineMainloopOverride ?? (!ConvTensorCoresAvailable ? ConvMainloopFma
-            : CudaDispatchPolicy.ConvReducedPrecisionTF32 ? ConvMainloopTf32 : ConvMainloop3xTf32);
+        get => _convEngineMainloopOverride ?? (ConvTensorCoresAvailable && CudaDispatchPolicy.ConvReducedPrecisionTF32
+            ? ConvMainloopTf32 : ConvMainloopFma);
         set => _convEngineMainloopOverride = value;
     }
 
