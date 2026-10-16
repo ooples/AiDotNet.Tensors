@@ -25909,8 +25909,12 @@ public partial class CpuEngine : ITensorLevelEngine
         LazyTensorScope scope, Tensor<T> batchNormOutput, Tensor<T> refreshedStatistic, string opName)
     {
         using var refreshedStatisticKeep1 = new KeepAliveScope(refreshedStatistic);
+        // Through the engine, as the other compiled ops copy a result into their output: on the GPU the statistic stays
+        // resident (the output borrows its buffer inside a resident step) instead of being downloaded every step, and
+        // the step stays capturable - the host copy here was a synchronous download that aborted CUDA-graph capture
+        // of every network with a training-mode BatchNorm (CUDA 900).
         var statistic = scope.RecordUnary(LazyNodeType.Custom, opName, batchNormOutput, refreshedStatistic._shape,
-            (eng, output) => refreshedStatistic.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked()));
+            (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, refreshedStatistic, output));
         using var refreshedStatisticKeep2 = new KeepAliveScope(refreshedStatistic);
         using var statisticKeep1 = new KeepAliveScope(statistic);
         refreshedStatistic.AsSpanUnmarked().CopyTo(statistic.AsWritableSpanUnmarked());

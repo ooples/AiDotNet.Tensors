@@ -501,13 +501,34 @@ public partial class CpuEngine
         int totalRows = batch * seqLen;
         var pool = ArrayPool<float>.Shared;
 
-        var wxBuf = pool.Rent(totalRows * gateRows);
+        // Decide batch-parallel fan-out. The recurrence is independent across
+        // batch rows, so split [0,batch) into `numChunks` CONTIGUOUS ranges and
+        // run the whole T-step loop per range. Only fan out when each chunk keeps
+        // a GEMM-healthy row count (>= _lstmParallelMinRowsPerChunk): small
+        // batches (b=1/8) collapse to one chunk and take the serial path they
+        // already win on. The parallel region launches ONCE for the sequence.
+        int numChunks = 1;
+        if (_lstmParallelEnabled)
+        {
+            int byRows = batch / Math.Max(1, _lstmParallelMinRowsPerChunk);
+            numChunks = Math.Max(1, Math.Min(byRows, CpuParallelSettings.MaxDegreeOfParallelism));
+        }
+
+        // #436: with a fan-out, each chunk projects its OWN rows (Wx for [rows*seq, in]) into chunk-local scratch
+        // inside the same dispatch, instead of one parallel GEMM over every row followed by the recurrence
+        // region. That removes a fork/join and the [B*seq, 4H] buffer every core wrote and every chunk then read
+        // across chiplets step by step (4 MB at the AIsEval shape); the chunk-local projection stays in L2.
+        bool perChunkProjection = numChunks > 1;
+
+        // The whole-batch Wx buffer exists only without a fan-out.
+        var wxBuf = perChunkProjection ? System.Array.Empty<float>() : pool.Rent(totalRows * gateRows);
         // #477: pool the transposed hidden weight too. It used to be `new float[]` per
         // call (64 KB at the AIsEval shape) because SgemmWithCachedB keyed its pre-pack
         // cache on the array identity. Now the recurrent GEMM is SgemmSequential (no
         // identity cache), so wHhT can come from the pool — removing the single biggest
         // per-call allocation (the main GC-churn / p95 source).
         var wHhTBuf = pool.Rent(hidden * gateRows);
+        float[]? wIhT = null;   // [in, gateRows], rented only for the per-chunk projection
 
         // Output buffer comes from AutoTensorCache so we don't pay an allocation.
         var output = returnSequences
@@ -527,9 +548,19 @@ public partial class CpuEngine
             // row-major order is not represented by one contiguous span.
             var inputData = input.GetFlattenedData();
             var wIhData = wIh.GetFlattenedData();
+            float[]? bIhFlat = perChunkProjection ? bIh?.GetFlattenedData() : null;
 
             // Wx = input @ wIh^T using SimdGemm with transB=true.
             // input rows = totalRows, K = inFeatures, wIh rows = gateRows, ldb = inFeatures.
+            if (perChunkProjection)
+            {
+                // [gateRows, in] -> [in, gateRows]: the [K, N] row-major layout SgemmSequential takes.
+                wIhT = pool.Rent(inFeatures * gateRows);
+                for (int g = 0; g < gateRows; g++)
+                    for (int f = 0; f < inFeatures; f++)
+                        wIhT[f * gateRows + g] = wIhData[g * inFeatures + f];
+            }
+            else
             SimdGemm.Sgemm(
                 inputData.AsSpan(), inFeatures, false,
                 wIhData.AsSpan(), inFeatures, true,
@@ -537,7 +568,7 @@ public partial class CpuEngine
                 totalRows, inFeatures, gateRows);
 
             // Fold bIh into Wx (broadcast add) — SIMD-friendly contiguous loop.
-            if (bIh is not null)
+            if (bIh is not null && !perChunkProjection)
             {
                 var bIhArr = bIh.GetFlattenedData().AsSpan();
                 for (int r = 0; r < totalRows; r++)
@@ -568,19 +599,6 @@ public partial class CpuEngine
             float[]? fhArr = wantState ? (float[])(object)finalHidden.GetDataArray() : null;
             float[]? fcArr = wantState ? (float[])(object)finalCell.GetDataArray() : null;
 
-            // Decide batch-parallel fan-out. The recurrence is independent across
-            // batch rows, so split [0,batch) into `numChunks` CONTIGUOUS ranges and
-            // run the whole T-step loop per range. Only fan out when each chunk keeps
-            // a GEMM-healthy row count (>= _lstmParallelMinRowsPerChunk): small
-            // batches (b=1/8) collapse to one chunk and take the serial path they
-            // already win on. The parallel region launches ONCE for the sequence.
-            int numChunks = 1;
-            if (_lstmParallelEnabled)
-            {
-                int byRows = batch / Math.Max(1, _lstmParallelMinRowsPerChunk);
-                numChunks = Math.Max(1, Math.Min(byRows, CpuParallelSettings.MaxDegreeOfParallelism));
-            }
-
             if (numChunks <= 1)
             {
                 // Serial: one chunk covering the full batch, reusing pooled scratch.
@@ -592,7 +610,7 @@ public partial class CpuEngine
                 try
                 {
                     RunLstmRecurrenceRange(
-                        wxBuf, wHhT, bHhArr, h0Arr, c0Arr,
+                        wxBuf, 0, wHhT, bHhArr, h0Arr, c0Arr,
                         hPrevBuf, hCurrBuf, cPrevBuf, cCurrBuf, hhBuf,
                         outArr, returnSequences, fhArr, fcArr,
                         r0: 0, rows: batch, seqLen, hidden, gateRows);
@@ -620,10 +638,24 @@ public partial class CpuEngine
                     var cPrevL = pool.Rent(rows * hidden);
                     var cCurrL = pool.Rent(rows * hidden);
                     var hhL = pool.Rent(rows * gateRows);
+                    var wxL = pool.Rent(rows * seqLen * gateRows);
                     try
                     {
+                        // This chunk's input projection: its [rows*seq, in] input rows @ wIhT, plus bIh.
+                        SimdGemm.SgemmSequential(
+                            inputData.AsSpan(r0 * seqLen * inFeatures, rows * seqLen * inFeatures),
+                            wIhT!.AsSpan(0, inFeatures * gateRows),
+                            wxL.AsSpan(0, rows * seqLen * gateRows),
+                            rows * seqLen, inFeatures, gateRows);
+                        if (bIhFlat is not null)
+                            for (int r = 0; r < rows * seqLen; r++)
+                            {
+                                int off = r * gateRows;
+                                for (int g = 0; g < gateRows; g++)
+                                    wxL[off + g] += bIhFlat[g];
+                            }
                         RunLstmRecurrenceRange(
-                            wxBuf, wHhT, bHhArr, h0Arr, c0Arr,
+                            wxL, r0, wHhT, bHhArr, h0Arr, c0Arr,
                             hPrevL, hCurrL, cPrevL, cCurrL, hhL,
                             outArr, returnSequences, fhArr, fcArr,
                             r0, rows, seqLen, hidden, gateRows);
@@ -632,6 +664,7 @@ public partial class CpuEngine
                     {
                         pool.Return(hPrevL); pool.Return(hCurrL);
                         pool.Return(cPrevL); pool.Return(cCurrL); pool.Return(hhL);
+                        pool.Return(wxL);
                     }
                 });
             }
@@ -640,8 +673,9 @@ public partial class CpuEngine
         }
         finally
         {
-            pool.Return(wxBuf);
+            if (!perChunkProjection) pool.Return(wxBuf);
             pool.Return(wHhTBuf);
+            if (wIhT is not null) pool.Return(wIhT);
         }
     }
 
@@ -653,14 +687,14 @@ public partial class CpuEngine
     /// <paramref name="hCurr"/> / <paramref name="cPrev"/> / <paramref name="cCurr"/>
     /// / <paramref name="hh"/> buffers are LOCAL scratch owned by the caller (sized
     /// for <paramref name="rows"/>, not the full batch) and are mutated/ping-ponged
-    /// here. Shared reads: <paramref name="wxBuf"/> (pre-computed input projection,
-    /// indexed by GLOBAL row), <paramref name="wHhT"/>, bias, h0/c0. Shared writes:
+    /// here. Shared reads: <paramref name="wxBuf"/> (pre-computed input projection; global batch row
+    /// <c>gb</c> is its row <c>gb - wxRowBase</c>, so 0 for the whole-batch buffer and r0 for a chunk-local one), <paramref name="wHhT"/>, bias, h0/c0. Shared writes:
     /// disjoint global row ranges of <paramref name="outArr"/> and the optional final
     /// state arrays — no two ranges overlap, so concurrent chunks need no locking.
     /// </summary>
     [MethodImpl(Hot)]
     private static unsafe void RunLstmRecurrenceRange(
-        float[] wxBuf, float[] wHhT, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
+        float[] wxBuf, int wxRowBase, float[] wHhT, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
         float[] hPrev, float[] hCurr, float[] cPrev, float[] cCurr, float[] hh,
         float[] outArr, bool returnSequences, float[]? fhArr, float[]? fcArr,
         int r0, int rows, int seqLen, int hidden, int gateRows)
@@ -721,7 +755,7 @@ public partial class CpuEngine
                     for (int lr = 0; lr < rows; lr++)
                     {
                         int gb = r0 + lr;
-                        int wxRow = (gb * seqLen + t) * gateRows;
+                        int wxRow = ((gb - wxRowBase) * seqLen + t) * gateRows;
                         int hhRow = lr * gateRows;
                         int cRow = lr * hidden;
                         int outRow = (gb * seqLen + t) * hidden;
@@ -770,7 +804,7 @@ public partial class CpuEngine
                     for (int lr = 0; lr < rows; lr++)
                     {
                         int gb = r0 + lr;
-                        int wxRow = (gb * seqLen + t) * gateRows;
+                        int wxRow = ((gb - wxRowBase) * seqLen + t) * gateRows;
                         int hhRow = lr * gateRows;
                         int cRow = lr * hidden;
                         int outRow = (gb * seqLen + t) * hidden;
