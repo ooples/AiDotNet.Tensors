@@ -2592,7 +2592,7 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
     if (row < M && col < N)
     {
         int outIdx = row * N + col;
-        Cbatch[outIdx] = alpha * sum + beta * Cbatch[outIdx];
+        Cbatch[outIdx] = beta == 0.0f ? alpha * sum : alpha * sum + beta * Cbatch[outIdx];
     }
 }
 

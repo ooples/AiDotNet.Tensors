@@ -57,6 +57,7 @@ internal static class HipMfmaKernel
 
 // ===========================================================================
 // MFMA GEMM: C = alpha * A * B + beta * C
+// beta == 0 never reads C (BLAS semantics): a fresh output buffer can hold NaN, and 0 * NaN is NaN.
 // Uses 4 MFMA tiles per warp for 32x32 output coverage
 // ===========================================================================
 extern ""C"" __global__ void mfma_gemm_f32(
@@ -223,7 +224,7 @@ extern ""C"" __global__ void mfma_gemm_f32(
 
         if (globalRow < M && globalCol < N) {
             const int idx = globalRow * N + globalCol;
-            C[idx] = alpha * acc[i] + beta * C[idx];
+            C[idx] = beta == 0.0f ? alpha * acc[i] : alpha * acc[i] + beta * C[idx];
         }
     }
 }
@@ -364,7 +365,7 @@ extern ""C"" __global__ void mfma_gemm_f16(
         const int globalCol = blockCol + warpCol + localCol;
 
         if (globalRow < M && globalCol < N) {
-            C[globalRow * N + globalCol] = alpha * acc[i] + beta * C[globalRow * N + globalCol];
+            C[globalRow * N + globalCol] = beta == 0.0f ? alpha * acc[i] : alpha * acc[i] + beta * C[globalRow * N + globalCol];
         }
     }
 }
@@ -440,7 +441,7 @@ extern ""C"" __global__ void scalar_gemm_f32(
     // Write result
     if (row < M && col < N) {
         const int idx = row * N + col;
-        C[idx] = alpha * acc + beta * C[idx];
+        C[idx] = beta == 0.0f ? alpha * acc : alpha * acc + beta * C[idx];
     }
 }
 
@@ -532,13 +533,13 @@ extern ""C"" __global__ void rdna_gemm_wave32(
 
     // Write 2x2 results
     if (row0 < M && col0 < N)
-        C[row0 * N + col0] = alpha * acc00 + beta * C[row0 * N + col0];
+        C[row0 * N + col0] = beta == 0.0f ? alpha * acc00 : alpha * acc00 + beta * C[row0 * N + col0];
     if (row0 < M && col0 + 1 < N)
-        C[row0 * N + col0 + 1] = alpha * acc01 + beta * C[row0 * N + col0 + 1];
+        C[row0 * N + col0 + 1] = beta == 0.0f ? alpha * acc01 : alpha * acc01 + beta * C[row0 * N + col0 + 1];
     if (row0 + 1 < M && col0 < N)
-        C[(row0 + 1) * N + col0] = alpha * acc10 + beta * C[(row0 + 1) * N + col0];
+        C[(row0 + 1) * N + col0] = beta == 0.0f ? alpha * acc10 : alpha * acc10 + beta * C[(row0 + 1) * N + col0];
     if (row0 + 1 < M && col0 + 1 < N)
-        C[(row0 + 1) * N + col0 + 1] = alpha * acc11 + beta * C[(row0 + 1) * N + col0 + 1];
+        C[(row0 + 1) * N + col0 + 1] = beta == 0.0f ? alpha * acc11 : alpha * acc11 + beta * C[(row0 + 1) * N + col0 + 1];
 }
 ";
     }
