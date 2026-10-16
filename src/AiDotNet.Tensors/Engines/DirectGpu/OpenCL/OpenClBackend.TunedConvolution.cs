@@ -34,6 +34,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 (in TunedConv2DArgs a) => Conv2DTiled(a)),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.direct", TunedKernelOrigin.Builtin, true,
                                 _ => HasTunedKernel("conv2d_direct"), (in TunedConv2DArgs a) => Conv2DDirect(a)),
+                            // #1370: Winograd as transforms around one batched GEMM, where the generic route's Winograd
+                            // kernel computes each output tile's whole channel sum in one work item.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
+                                shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                                (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) Conv2DGeneric(a); }),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
