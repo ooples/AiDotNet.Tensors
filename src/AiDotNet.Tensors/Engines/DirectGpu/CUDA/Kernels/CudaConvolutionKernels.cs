@@ -2083,7 +2083,7 @@ __device__ __forceinline__ void ce_run_mainloop(float* smem, int tiles, Load loa
 }
 
 // Forward: Y[Cout, B*oH*oW] = W[Cout, K] * X_gathered[K, B*oH*oW], K = Cin*kH*kW. TAPU (Cin % 8 == 0) orders K as
-// (kh, kw, ci), so a K tile shares one tap: each lane's input position and bounds check are computed once per tile and
+// (ci / 8, kh, kw, ci % 8), so a K tile shares one tap: each lane's input position and bounds check are computed once per tile and
 // the tap advances by addition. Otherwise K is W's natural (ci, kh, kw) order with per-element index math. Split-K
 // slices go to out + z * B*Cout*oH*oW and are summed in order by conv2d_wgrad_splitk_reduce.
 // Fusion hooks (no-ops here): Pro(b, ci, ih * W + iw, x) transforms each in-bounds input element as it is loaded (padding
@@ -2116,7 +2116,15 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
 
     int kc = kBegin;
     int tap = 0, ci0 = 0, kh = 0, kw = 0;
-    if (TAPU) { tap = kBegin / inC; ci0 = kBegin - tap * inC; kh = tap / kW; kw = tap - kh * kW; }
+    // TAPU K order: (ci group of CE_BK, tap, ci within the group). A K tile is one (group, tap), and the kH*kW tiles of
+    // a group read the weights w[co][ci0 .. ci0+7][0 .. kH*kW-1], one contiguous run per output channel, back to back,
+    // so that run stays in L1 across its taps. In (tap, ci) order every tap re-fetched it from L2 or DRAM 32 bytes per
+    // lane (measured: the weight loads were 18-19 us of the 256@8 and 512@4 layers).
+    if (TAPU)
+    {
+        int g = kBegin / (CE_BK * khw);
+        tap = (kBegin - g * CE_BK * khw) / CE_BK; ci0 = g * CE_BK; kh = tap / kW; kw = tap - kh * kW;
+    }
 
     float ra[RA], rb[RB];
     auto load = [&]()
@@ -2171,7 +2179,7 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
     auto advance = [&]()
     {
         kc += CE_BK;
-        if (TAPU) { ci0 += CE_BK; if (ci0 == inC) { ci0 = 0; tap++; if (++kw == kW) { kw = 0; kh++; } } }
+        if (TAPU) { tap++; if (++kw == kW) { kw = 0; kh++; } if (tap == khw) { tap = 0; kh = 0; ci0 += CE_BK; } }
     };
 
     float acc[TM][TN];
