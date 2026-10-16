@@ -144,6 +144,37 @@ public sealed class HipVendorGemmComparisonTests
         new[] { 1024, 4096, 1024 }, new[] { 1024, 1024, 4096 }, new[] { 200, 500, 300 }, new[] { 32, 1024, 1024 }
     };
 
+    /// <summary>Times every row-major SGEMM tile (#377) against hipBLAS on the comparison shapes.</summary>
+    [SkippableFact]
+    [Trait("Category", "HardwareProof")]
+    public void RowMajorSgemm_VersusHipBlas_Measured()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable(ProofEnvironmentVariable), "1", StringComparison.Ordinal),
+            $"Set {ProofEnvironmentVariable}=1 to run the hipBLAS comparison.");
+        using var backend = new HipBackend();
+        Skip.IfNot(backend.IsAvailable && backend.IsHipBlasAvailable && backend.EnsureRowMajorGemm(),
+            "A HIP device with a working hipBLAS/rocBLAS is required.");
+        _output.WriteLine("M x N x K | hipBLAS ms | best row-major ms | ratio | best tile");
+        foreach (var s in ComparisonShapes)
+        {
+            int m = s[0], n = s[1], k = s[2];
+            float[] a = Values(m * k, 11), b = Values(k * n, 23);
+            float[] reference = CpuGemm(a, b, m, n, k);
+            using var ga = backend.AllocateBuffer(a);
+            using var gb = backend.AllocateBuffer(b);
+            using var gc = backend.AllocateBuffer(new float[m * n]);
+            double vendorMs = Time(() => Assert.True(backend.TryExecuteHipBlasGemm(ga, gb, gc, m, n, k, 1f, 0f)));
+            double best = double.MaxValue; string bestName = string.Empty;
+            foreach (var tile in AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels.HipRowMajorSgemmKernels.Tiles)
+            {
+                double ms = Time(() => Assert.True(backend.TryExecuteRowMajorGemm(tile, ga, gb, gc, m, n, k, 1f, 0f)));
+                AssertClose(reference, backend.DownloadBuffer(gc), k, $"{tile.KernelName} {m}x{n}x{k}");
+                if (ms < best) { best = ms; bestName = tile.KernelName; }
+            }
+            _output.WriteLine($"{m} x {n} x {k} | {vendorMs:F3} | {best:F3} | {best / vendorMs:F2} | {bestName}");
+        }
+    }
+
     private static double Time(Action gemm)
     {
         for (int i = 0; i < 3; i++) gemm();

@@ -11468,6 +11468,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _fftModule = IntPtr.Zero;
         }
         DisposeClBlastGemm();
+        DisposeRowMajorGemm();
         if (_spectralPerfModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_spectralPerfModule);

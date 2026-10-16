@@ -1,0 +1,109 @@
+#if NET6_0_OR_GREATER
+using System;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
+using AiDotNet.Tensors.Helpers;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
+
+/// <summary>#377: the row-major HIP SGEMM against a CPU reference, every tile, on shapes that leave partial tiles in M,
+/// N and K, plus the beta contract.</summary>
+[Collection("DirectGpuSerial")]
+public sealed class HipRowMajorSgemmTests
+{
+    private static HipBackend? CreateBackend()
+    {
+        var backend = new HipBackend();
+        if (backend.IsAvailable && backend.EnsureRowMajorGemm()) return backend;
+        backend.Dispose();
+        return null;
+    }
+
+    [SkippableTheory]
+    [InlineData(1, 1, 1)]
+    [InlineData(37, 53, 29)]
+    [InlineData(129, 65, 17)]
+    [InlineData(4096, 64, 1024)]
+    [InlineData(32, 1024, 1024)]
+    [InlineData(64, 4096, 1024)]
+    [InlineData(200, 500, 300)]
+    public void EveryTile_MatchesCpu(int m, int n, int k)
+    {
+        using var backend = CreateBackend();
+        Skip.If(backend is null, "A HIP device is required.");
+        float[] a = Values(m * k, 3), b = Values(k * n, 5);
+        float[] expected = CpuGemm(a, b, m, n, k);
+        using var gA = backend.AllocateBuffer(a);
+        using var gB = backend.AllocateBuffer(b);
+        using var gC = backend.AllocateBuffer(new float[m * n]);
+        double tolerance = 2e-6 * k + 1e-5;
+        foreach (var tile in HipRowMajorSgemmKernels.Tiles)
+        {
+            Assert.True(backend.TryExecuteRowMajorGemm(tile, gA, gB, gC, m, n, k, 1f, 0f), tile.KernelName);
+            double error = MaxError(expected, backend.DownloadBuffer(gC));
+            Assert.True(error <= tolerance, $"{tile.KernelName} {m}x{n}x{k}: max error {error:E2} > {tolerance:E2}");
+        }
+    }
+
+    [SkippableFact]
+    public void BetaZeroIgnoresNaNInC_BetaOneAccumulates_AlphaScales()
+    {
+        using var backend = CreateBackend();
+        Skip.If(backend is null, "A HIP device is required.");
+        const int m = 70, n = 90, k = 33;
+        float[] a = Values(m * k, 7), b = Values(k * n, 9);
+        float[] expected = CpuGemm(a, b, m, n, k);
+        using var gA = backend.AllocateBuffer(a);
+        using var gB = backend.AllocateBuffer(b);
+        var nan = new float[m * n];
+        for (int i = 0; i < nan.Length; i++) nan[i] = float.NaN;
+        using var gC = backend.AllocateBuffer(nan);
+        var tile = HipRowMajorSgemmKernels.Tiles[0];
+        Assert.True(backend.TryExecuteRowMajorGemm(tile, gA, gB, gC, m, n, k, 1f, 0f));
+        Assert.True(MaxError(expected, backend.DownloadBuffer(gC)) <= 1e-4);
+        Assert.True(backend.TryExecuteRowMajorGemm(tile, gA, gB, gC, m, n, k, 2f, 1f));
+        var tripled = new float[expected.Length];
+        for (int i = 0; i < tripled.Length; i++) tripled[i] = 3 * expected[i];
+        Assert.True(MaxError(tripled, backend.DownloadBuffer(gC)) <= 3e-4);
+    }
+
+    private static float[] Values(int count, int seed)
+    {
+        var random = RandomHelper.CreateSeededRandom(seed);
+        var values = new float[count];
+        for (int i = 0; i < count; i++) values[i] = (float)(random.NextDouble() * 2.0 - 1.0);
+        return values;
+    }
+
+    private static float[] CpuGemm(float[] a, float[] b, int m, int n, int k)
+    {
+        var c = new float[m * n];
+        var row = new double[n];
+        for (int i = 0; i < m; i++)
+        {
+            Array.Clear(row, 0, n);
+            for (int p = 0; p < k; p++)
+            {
+                double av = a[i * k + p];
+                int bo = p * n;
+                for (int j = 0; j < n; j++) row[j] += av * b[bo + j];
+            }
+            for (int j = 0; j < n; j++) c[i * n + j] = (float)row[j];
+        }
+        return c;
+    }
+
+    private static double MaxError(float[] expected, float[] actual)
+    {
+        double max = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            double d = Math.Abs(expected[i] - actual[i]);
+            if (double.IsNaN(d)) return double.PositiveInfinity;
+            max = Math.Max(max, d);
+        }
+        return max;
+    }
+}
+#endif
