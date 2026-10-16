@@ -3,15 +3,15 @@ using System;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 /// <summary>
-/// Fused Winograd F(2x2, 3x3) (<see cref="Kernels.CudaConvWinogradFusedKernels"/>): a filter transform, then one kernel
-/// that transforms its input patches in shared memory, runs the sixteen tile GEMMs and applies the output transform.
-/// Same admission and the same fp32 arithmetic as the unfused F(2x2) path. The module compiles on first use.
+/// Fused Winograd F(2x2, 3x3) (<see cref="Kernels.CudaConvWinogradFusedKernels"/>): one kernel per convolution that
+/// transforms its filters and its input patches in shared memory, runs the sixteen tile GEMMs and applies the output
+/// transform. Same admission and the same fp32 arithmetic as the unfused F(2x2) path. The module compiles on first use.
 /// </summary>
 public sealed partial class CudaBackend
 {
     private readonly object _winogradFusedModuleLock = new();
     private bool _winogradFusedModuleTried, _winogradFusedModuleReady;
-    private IGpuBuffer? _winogradFusedU, _winogradFusedPartials;
+    private IGpuBuffer? _winogradFusedPartials;
 
     internal bool EnsureWinogradFusedModule()
     {
@@ -42,8 +42,9 @@ public sealed partial class CudaBackend
     internal bool TryConv2DForwardWinogradF23Fused(in CudaConv2DArgs a)
     {
         if (!WinogradF23Admits(a) || !EnsureWinogradFusedModule()) return false;
-        return RunWinogradF23Fused(a.Input, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.PadH, "wfz_filter", a.Kernel,
-            a.OutChannels, a.InChannels, a.Output, a.OutChannels, a.OutHeight, a.OutWidth);
+        // Reduction over the input channels, outputs the output channels, filters w[outC][inC][3][3].
+        return RunWinogradF23Fused(a.Input, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.PadH, a.Kernel, flipped: false,
+            a.Output, a.OutChannels, a.OutHeight, a.OutWidth);
     }
 
     /// <summary>
@@ -53,32 +54,23 @@ public sealed partial class CudaBackend
     internal bool TryConv2DBackwardDataWinogradF23Fused(in CudaConv2DBackwardArgs a)
     {
         if (!WinogradF23AdmitsData(a) || !EnsureWinogradFusedModule()) return false;
-        return RunWinogradF23Fused(a.First, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth, 2 - a.PadH, "wfz_filter_flip",
-            a.Second, a.OutChannels, a.InChannels, a.Output, a.InChannels, a.InHeight, a.InWidth);
+        // Reduction over dY's channels (the forward's outC), outputs dX's channels, filters read rotated.
+        return RunWinogradF23Fused(a.First, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth, 2 - a.PadH, a.Second, flipped: true,
+            a.Output, a.InChannels, a.InHeight, a.InWidth);
     }
 
-    // y[n][outC][outH][outW] = conv3x3_s1(x[n][inC][h][w], padding pad): the named filter transform of the forward-layout
-    // weights [fwdK][fwdC][3][3] into U[16][inC][outC], then the fused kernel (512 threads, one block per SM) over 32
-    // output channels x 32 tiles per block. On deep layers the tiles alone give few blocks (512@4x4 at batch 8: 16
-    // blocks of 64 eight-channel steps each), so the channel reduction is split across blockIdx.z: the split count
-    // minimizes waves x steps per block (the critical path), smallest count on ties; the partial outputs are summed in
-    // split order (conv2d_wgrad_splitk_reduce), so the result stays deterministic.
-    private unsafe bool RunWinogradF23Fused(IGpuBuffer x, int n, int inC, int h, int w, int pad, string filterKernel,
-        IGpuBuffer weights, int fwdK, int fwdC, IGpuBuffer y, int outC, int outH, int outW)
+    // y[n][outC][outH][outW] = conv3x3_s1(x[n][inC][h][w], padding pad) through the fused kernel (512 threads, one block
+    // per SM) over 32 output channels x 32 tiles per block, with weights w[outC][inC][3][3] (flipped: false) or the
+    // input gradient's w[inC][outC][3][3] read rotated (flipped: true). On deep layers the tiles alone give few blocks
+    // (512@4x4 at batch 8: 16 blocks of 64 eight-channel steps each), so the channel reduction is split across
+    // blockIdx.z; each split applies the (linear) output transform to its partial products and writes its own slice,
+    // summed in split order (conv2d_wgrad_splitk_reduce), so the result stays deterministic.
+    private unsafe bool RunWinogradF23Fused(IGpuBuffer x, int n, int inC, int h, int w, int pad, IGpuBuffer weights,
+        bool flipped, IGpuBuffer y, int outC, int outH, int outW)
     {
         int tilesH = (outH + 1) / 2, tilesW = (outW + 1) / 2;
         long p = (long)n * tilesH * tilesW;
-        if (p > int.MaxValue || 16L * inC * outC > int.MaxValue || (long)n * inC * h * w > int.MaxValue) return false;
-        var u = TryConvScratch(ref _winogradFusedU, 16L * inC * outC);
-        if (u is null) return false;
-
-        using var _ = PushContext();
-        IntPtr wPtr = weights.Handle, uPtr = u.Handle, xPtr = x.Handle;
-        uint block = (uint)DefaultBlockSize;
-
-        void** fa = stackalloc void*[4];
-        fa[0] = &wPtr; fa[1] = &uPtr; fa[2] = &fwdK; fa[3] = &fwdC;
-        LaunchKernel(_kernelCache[filterKernel], (uint)(((long)fwdK * fwdC + block - 1) / block), block, fa);
+        if (p > int.MaxValue || 9L * inC * outC > int.MaxValue || (long)n * inC * h * w > int.MaxValue) return false;
 
         long blocks = ((p + 31) / 32) * ((outC + 31) / 32);
         int sms = Math.Max(1, _multiProcessorCount), totalSteps = (inC + 7) / 8;
@@ -88,7 +80,7 @@ public sealed partial class CudaBackend
         {
             // In half-step units: each wave costs its blocks' steps plus ~3 steps of per-block prologue and epilogue
             // (measured: 16 splits of 128@16 ran 15 one-step waves in 95 us), and each extra split one half step of
-            // partial traffic and reduce.
+            // partial traffic and reduce. Smallest count on ties.
             long cost = (blocks * s + sms - 1) / sms * 2 * ((totalSteps + s - 1) / s + 3) + (s - 1);
             if (cost < bestCost) { bestCost = cost; splits = s; }
         }
@@ -104,12 +96,14 @@ public sealed partial class CudaBackend
             if (partials is null) return false;
             target = partials;
         }
-        IntPtr tPtr = target.Handle;
 
+        using var _ = PushContext();
+        IntPtr xPtr = x.Handle, wPtr = weights.Handle, tPtr = target.Handle;
         void** ca = stackalloc void*[14];
-        ca[0] = &xPtr; ca[1] = &uPtr; ca[2] = &tPtr; ca[3] = &n; ca[4] = &inC; ca[5] = &h; ca[6] = &w; ca[7] = &outC;
+        ca[0] = &xPtr; ca[1] = &wPtr; ca[2] = &tPtr; ca[3] = &n; ca[4] = &inC; ca[5] = &h; ca[6] = &w; ca[7] = &outC;
         ca[8] = &outH; ca[9] = &outW; ca[10] = &pad; ca[11] = &tilesH; ca[12] = &tilesW; ca[13] = &rPerSplit;
-        LaunchKernel3D(_kernelCache["wfz_conv"], (uint)((p + 31) / 32), (uint)((outC + 31) / 32), (uint)splits, 512, 1, 1, ca, 0);
+        LaunchKernel3D(_kernelCache[flipped ? "wfz_conv_wf" : "wfz_conv_w"], (uint)((p + 31) / 32), (uint)((outC + 31) / 32),
+            (uint)splits, 512, 1, 1, ca, 0);
         if (splits > 1) LaunchSplitKReduce(reduce, target, y, (int)outputs, splits);
         return true;
     }
