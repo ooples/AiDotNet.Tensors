@@ -44,7 +44,15 @@ public sealed class ConvImplicitGemmBackwardTests
     /// pick, so the candidate it measures fastest is checked too).
     /// </summary>
     public static System.Collections.Generic.IEnumerable<object[]> ShapesAllRoutes() =>
-        Shapes().SelectMany(s => new[] { "engine", "implicit", "public" }.Select(r => s.Concat(new object[] { r }).ToArray()));
+        Shapes().SelectMany(s => new[] { "engine_fma", "engine_x3", "engine_tf32", "implicit", "public" }
+            .Select(r => s.Concat(new object[] { r }).ToArray()));
+
+    private static int MainloopOf(string route) => route switch
+    {
+        "engine_x3" => CudaBackend.ConvMainloop3xTf32,
+        "engine_tf32" => CudaBackend.ConvMainloopTf32,
+        _ => CudaBackend.ConvMainloopFma,
+    };
 
     [SkippableTheory]
     [MemberData(nameof(ShapesAllRoutes))]
@@ -53,6 +61,8 @@ public sealed class ConvImplicitGemmBackwardTests
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
+        Skip.If(route is "engine_x3" or "engine_tf32" && !backend.ConvTensorCoresAvailable, "TF32 mma needs sm_80+.");
+        double tolerance = route == "engine_tf32" ? 2e-3 : 1e-5;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (w + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
         Assert.True(outH > 0 && outW > 0, "invalid test shape");
@@ -74,7 +84,7 @@ public sealed class ConvImplicitGemmBackwardTests
             if (route == "public")
                 backend.Conv2DBackwardKernel(dX, dDy, target, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
             else
-                Assert.True(route == "engine" ? backend.Conv2DBackwardKernelViaEngine(a) : backend.Conv2DBackwardKernelViaImplicit(a),
+                Assert.True(route.StartsWith("engine") ? backend.Conv2DBackwardKernelViaEngine(a, MainloopOf(route)) : backend.Conv2DBackwardKernelViaImplicit(a),
                     $"the {route} route declined the shape");
         }
         backend.Synchronize();
@@ -105,7 +115,7 @@ public sealed class ConvImplicitGemmBackwardTests
                         int idx = ((co * inC + ci) * kH + kh) * kW + kw;
                         // fp32 accumulation over K terms: error bounded relative to the sum of magnitudes.
                         double error = Math.Abs(got[idx] - sum);
-                        double bound = 1e-5 * Math.Max(1.0, magnitude);
+                        double bound = tolerance * Math.Max(1.0, magnitude);
                         maxRel = Math.Max(maxRel, error / Math.Max(1.0, magnitude));
                         Assert.True(error <= bound, $"dW[{co},{ci},{kh},{kw}] = {got[idx]} vs {sum} (|terms| {magnitude})");
                         Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(got[idx]), 0) ==
@@ -122,6 +132,8 @@ public sealed class ConvImplicitGemmBackwardTests
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
+        Skip.If(route is "engine_x3" or "engine_tf32" && !backend.ConvTensorCoresAvailable, "TF32 mma needs sm_80+.");
+        double tolerance = route == "engine_tf32" ? 2e-3 : 1e-5;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (w + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
         Assert.True(outH > 0 && outW > 0, "invalid test shape");
@@ -166,14 +178,14 @@ public sealed class ConvImplicitGemmBackwardTests
         using var dX1 = backend.AllocateBuffer(poison);
         using var dX2 = backend.AllocateBuffer(poison);
         // The engine's input gradient takes Cout % 8 == 0 only; #1323's kernels cover the rest.
-        Skip.If(route == "engine" && outC % 8 != 0, "the engine input gradient needs Cout % 8 == 0");
+        Skip.If(route.StartsWith("engine") && outC % 8 != 0, "the engine input gradient needs Cout % 8 == 0");
         foreach (var target in new[] { dX1, dX2 })
         {
             var a = new CudaConv2DBackwardArgs(dDy, dWt, target, false, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
             if (route == "public")
                 backend.Conv2DBackwardInput(dDy, dWt, target, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
             else
-                Assert.True(route == "engine" ? backend.Conv2DBackwardInputViaEngine(a) : backend.Conv2DBackwardInputViaImplicit(a),
+                Assert.True(route.StartsWith("engine") ? backend.Conv2DBackwardInputViaEngine(a, MainloopOf(route)) : backend.Conv2DBackwardInputViaImplicit(a),
                     $"the {route} route declined the shape");
         }
         backend.Synchronize();
@@ -184,7 +196,7 @@ public sealed class ConvImplicitGemmBackwardTests
         {
             double error = Math.Abs(got[i] - sum[i]);
             maxRel = Math.Max(maxRel, error / Math.Max(1.0, magnitude[i]));
-            Assert.True(error <= 1e-5 * Math.Max(1.0, magnitude[i]), $"dX[{i}] = {got[i]} vs {sum[i]} (|terms| {magnitude[i]})");
+            Assert.True(error <= tolerance * Math.Max(1.0, magnitude[i]), $"dX[{i}] = {got[i]} vs {sum[i]} (|terms| {magnitude[i]})");
             Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(got[i]), 0) ==
                         BitConverter.ToInt32(BitConverter.GetBytes(again[i]), 0),
                 $"dX[{i}] differs between two identical runs: {got[i]:R} vs {again[i]:R}");
@@ -228,9 +240,11 @@ public sealed class ConvImplicitGemmBackwardTests
         float[] Fill(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1); return a; }
         double Median(List<double> v) { var o = v.OrderBy(x => x).ToList(); return o[o.Count / 2]; }
 
-        // Arms: dW via the #1325 engine / #1323 implicit / im2col, then dX via the same three.
-        string[] arms = { "dW engine", "dW #1323", "dW im2col", "dX engine", "dX #1323", "dX col2im" };
-        double[] totMin = new double[6], totMed = new double[6];
+        // Arms: dW via the engine (FMA / 3xTF32 / TF32), #1323 implicit, im2col; then dX via the same five.
+        string[] arms = { "dW eng fma", "dW eng 3xtf32", "dW eng tf32", "dW #1323", "dW im2col",
+                          "dX eng fma", "dX eng 3xtf32", "dX eng tf32", "dX #1323", "dX col2im" };
+        double[] totMin = new double[arms.Length], totMed = new double[arms.Length];
+        bool tc = backend.ConvTensorCoresAvailable;
         _out.WriteLine("layer                    x  | " + string.Join(" | ", arms.Select(a => $"{a,19}")) + "  (us per call, min / median)");
         foreach (var l in layers)
         {
@@ -245,8 +259,9 @@ public sealed class ConvImplicitGemmBackwardTests
             {
                 for (int arm = 0; arm < arms.Length; arm++)
                 {
-                    int path = arm % 3;
-                    bool input = arm >= 3;
+                    int path = arm % 5;
+                    bool input = arm >= 5;
+                    if ((path == 1 || path == 2) && !tc) continue;
                     if (input && !l.NeedsDx) continue;
                     var da = new CudaConv2DBackwardArgs(dy, w, dx, false, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
                     var wa = new CudaConv2DBackwardArgs(x, dy, dw, true, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
@@ -254,11 +269,15 @@ public sealed class ConvImplicitGemmBackwardTests
                     {
                         bool ran = (input, path) switch
                         {
-                            (false, 0) => backend.Conv2DBackwardKernelViaEngine(wa),
-                            (false, 1) => backend.Conv2DBackwardKernelViaImplicit(wa),
+                            (false, 0) => backend.Conv2DBackwardKernelViaEngine(wa, CudaBackend.ConvMainloopFma),
+                            (false, 1) => backend.Conv2DBackwardKernelViaEngine(wa, CudaBackend.ConvMainloop3xTf32),
+                            (false, 2) => backend.Conv2DBackwardKernelViaEngine(wa, CudaBackend.ConvMainloopTf32),
+                            (false, 3) => backend.Conv2DBackwardKernelViaImplicit(wa),
                             (false, _) => backend.Conv2DBackwardKernelViaIm2col(wa),
-                            (true, 0) => backend.Conv2DBackwardInputViaEngine(da),
-                            (true, 1) => backend.Conv2DBackwardInputViaImplicit(da),
+                            (true, 0) => backend.Conv2DBackwardInputViaEngine(da, CudaBackend.ConvMainloopFma),
+                            (true, 1) => backend.Conv2DBackwardInputViaEngine(da, CudaBackend.ConvMainloop3xTf32),
+                            (true, 2) => backend.Conv2DBackwardInputViaEngine(da, CudaBackend.ConvMainloopTf32),
+                            (true, 3) => backend.Conv2DBackwardInputViaImplicit(da),
                             _ => backend.Conv2DBackwardInputViaCol2im(da),
                         };
                         Assert.True(ran, $"{arms[arm]} declined {l.Name}");
@@ -281,7 +300,7 @@ public sealed class ConvImplicitGemmBackwardTests
             _out.WriteLine($"{l.Name,-22} {l.Count,2}  | " + string.Join(" | ", Enumerable.Range(0, arms.Length).Select(Cell)));
         }
         _out.WriteLine("step total (weighted)       | " + string.Join(" | ", Enumerable.Range(0, arms.Length).Select(a => $"{totMin[a],8:F1} / {totMed[a],8:F1}")));
-        _out.WriteLine($"conv backward per step (min): engine {(totMin[0] + totMin[3]) / 1000:F3} ms, #1323 {(totMin[1] + totMin[4]) / 1000:F3} ms, " +
-                       $"im2col {(totMin[2] + totMin[5]) / 1000:F3} ms");
+        _out.WriteLine($"conv backward per step (min): engine fma {(totMin[0] + totMin[5]) / 1000:F3} ms, engine 3xtf32 {(totMin[1] + totMin[6]) / 1000:F3} ms, " +
+                       $"engine tf32 {(totMin[2] + totMin[7]) / 1000:F3} ms, #1323 {(totMin[3] + totMin[8]) / 1000:F3} ms, im2col {(totMin[4] + totMin[9]) / 1000:F3} ms");
     }
 }

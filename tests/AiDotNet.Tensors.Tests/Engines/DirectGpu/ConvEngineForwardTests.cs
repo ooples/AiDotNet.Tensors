@@ -37,13 +37,20 @@ public sealed class ConvEngineForwardTests
         new object[] { 4, 16, 15, 15, 200, 3, 3, 2, 2, 1, 1, 1, 1 },    // Cout spans two 128 tiles, partial
     };
 
+    /// <summary>Every shape through each engine mainloop: 0 = FP32 FMA, 1 = 3xTF32, 2 = plain TF32 (#1335).</summary>
+    public static IEnumerable<object[]> ShapesAllMainloops() =>
+        Shapes().SelectMany(s => new[] { 0, 1, 2 }.Select(m => s.Concat(new object[] { m }).ToArray()));
+
     [SkippableTheory]
-    [MemberData(nameof(Shapes))]
+    [MemberData(nameof(ShapesAllMainloops))]
     public void Forward_MatchesFloat64ReferenceAndIsBitReproducible(
-        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW)
+        int batch, int inC, int h, int w, int outC, int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int mainloop)
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
+        Skip.If(mainloop != CudaBackend.ConvMainloopFma && !backend.ConvTensorCoresAvailable, "TF32 mma needs sm_80+.");
+        // FMA and 3xTF32 must hold the fp32 bound; plain TF32 rounds each product's operands to a 10-bit mantissa.
+        double tolerance = mainloop == CudaBackend.ConvMainloopTf32 ? 2e-3 : 1e-5;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (w + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
         Assert.True(outH > 0 && outW > 0, "invalid test shape");
@@ -62,8 +69,8 @@ public sealed class ConvEngineForwardTests
         using var y2 = backend.AllocateBuffer(poison);
         var a1 = new CudaConv2DArgs(xBuf, wBuf, y1, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
         var a2 = new CudaConv2DArgs(xBuf, wBuf, y2, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
-        Assert.True(backend.Conv2DForwardViaEngine(a1), "the engine declined the shape");
-        Assert.True(backend.Conv2DForwardViaEngine(a2), "the engine declined the shape");
+        Assert.True(backend.Conv2DForwardViaEngine(a1, mainloop), "the engine declined the shape");
+        Assert.True(backend.Conv2DForwardViaEngine(a2, mainloop), "the engine declined the shape");
         backend.Synchronize();
         float[] got = backend.DownloadBuffer(y1), again = backend.DownloadBuffer(y2);
 
@@ -92,7 +99,7 @@ public sealed class ConvEngineForwardTests
                         int idx = ((b * outC + co) * outH + oh) * outW + ow;
                         double error = Math.Abs(got[idx] - sum);
                         maxRel = Math.Max(maxRel, error / Math.Max(1.0, magnitude));
-                        Assert.True(error <= 1e-5 * Math.Max(1.0, magnitude), $"y[{b},{co},{oh},{ow}] = {got[idx]} vs {sum} (|terms| {magnitude})");
+                        Assert.True(error <= tolerance * Math.Max(1.0, magnitude), $"y[{b},{co},{oh},{ow}] = {got[idx]} vs {sum} (|terms| {magnitude})");
                         Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(got[idx]), 0) ==
                                     BitConverter.ToInt32(BitConverter.GetBytes(again[idx]), 0),
                             $"y[{b},{co},{oh},{ow}] differs between two identical runs: {got[idx]:R} vs {again[idx]:R}");
@@ -127,7 +134,7 @@ public sealed class ConvEngineForwardTests
             ("256-512 1x1 s2 @8", 1, 256, 8, 512, 1, 2, 0),
             ("512-512 3x3 @4", 3, 512, 4, 512, 3, 1, 1),
         };
-        string[] routes = { "engine", "narrow(#1274)", "im2col+gemm", "generic" };
+        string[] routes = { "engine fma", "engine 3xtf32", "engine tf32", "narrow(#1274)", "im2col+gemm", "generic" };
         var rng = new Random(1325);
         float[] Fill(int n) { var v = new float[n]; for (int i = 0; i < n; i++) v[i] = (float)(rng.NextDouble() * 2 - 1); return v; }
         double Median(List<double> v) { var o = v.OrderBy(t => t).ToList(); return o[o.Count / 2]; }
@@ -144,7 +151,9 @@ public sealed class ConvEngineForwardTests
             var a = new CudaConv2DArgs(x, wt, y, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
             Func<bool>[] run =
             {
-                () => backend.Conv2DForwardViaEngine(a),
+                () => backend.Conv2DForwardViaEngine(a, CudaBackend.ConvMainloopFma),
+                () => backend.ConvTensorCoresAvailable && backend.Conv2DForwardViaEngine(a, CudaBackend.ConvMainloop3xTf32),
+                () => backend.ConvTensorCoresAvailable && backend.Conv2DForwardViaEngine(a, CudaBackend.ConvMainloopTf32),
                 () => backend.Conv2DForwardViaNarrowImplicit(a),
                 () => backend.Conv2DForwardViaIm2colGemm(a),
                 () => backend.Conv2DForwardViaGeneric(a),

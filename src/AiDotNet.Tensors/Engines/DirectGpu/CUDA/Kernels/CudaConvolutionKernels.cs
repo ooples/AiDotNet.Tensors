@@ -1494,31 +1494,39 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
 }
 
 " + ConvEngineCore + @"
-#define CE_FPROP_KERNEL(NAME, BM, TAPU) \
+#define CE_FPROP_KERNEL(NAME, BM, TAPU, MAIN) \
 extern ""C"" __global__ __launch_bounds__(256) void NAME( \
     const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ out, \
     int batch, int inC, int H, int W, int outC, int outH, int outW, \
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
 { \
-    conv2d_fprop_ig_body<BM, BM, TAPU>(input, kernel, out, batch, inC, H, W, outC, outH, outW, \
-        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+    conv2d_fprop_ig_body<BM, BM, TAPU, CeIdentityPro, CeIdentityEpi, MAIN>(input, kernel, out, batch, inC, H, W, \
+        outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
 }
-CE_FPROP_KERNEL(conv2d_fprop_ig128_tap, 128, true)
-CE_FPROP_KERNEL(conv2d_fprop_ig128_gen, 128, false)
-CE_FPROP_KERNEL(conv2d_fprop_ig64_tap, 64, true)
-CE_FPROP_KERNEL(conv2d_fprop_ig64_gen, 64, false)
+CE_FPROP_KERNEL(conv2d_fprop_ig128_tap, 128, true, 0)
+CE_FPROP_KERNEL(conv2d_fprop_ig128_gen, 128, false, 0)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_tap, 64, true, 0)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_gen, 64, false, 0)
+CE_FPROP_KERNEL(conv2d_fprop_ig128_tap_x3, 128, true, 1)
+CE_FPROP_KERNEL(conv2d_fprop_ig128_gen_x3, 128, false, 1)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_tap_x3, 64, true, 1)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_gen_x3, 64, false, 1)
+CE_FPROP_KERNEL(conv2d_fprop_ig128_tap_tf32, 128, true, 2)
+CE_FPROP_KERNEL(conv2d_fprop_ig128_gen_tf32, 128, false, 2)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_tap_tf32, 64, true, 2)
+CE_FPROP_KERNEL(conv2d_fprop_ig64_gen_tf32, 64, false, 2)
 
 // Weight gradient on the engine core: dW[Cout, P] = dY[Cout, K] * X_gathered[K, P], P = Cin*kH*kW, K = B*oH*oW.
 // Both loaders put one K element per lane (8 lanes along K, rows 32 apart), so each lane decomposes its k = (b, oh, ow)
 // once per tile, dY reads coalesce along the output row, and every column's (ci, kh, kw) is fixed for the whole loop.
 // Split-K slices go to out + z * Cout*P, summed in order by conv2d_wgrad_splitk_reduce.
-template <int BM, int BN>
+template <int BM, int BN, int MAIN>
 __device__ __forceinline__ void conv2d_wgrad_ce_body(
     const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out,
     int batch, int inC, int H, int W, int outC, int outH, int outW,
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
 {
-    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
+    __shared__ __align__(16) float smem[2 * CE_BK * (BM + CePad<MAIN>::value) + 2 * CE_BK * (BN + CePad<MAIN>::value)];
     constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256;
     const int L = outH * outW, khw = kH * kW, P = inC * khw, K = batch * L, HW = H * W;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
@@ -1570,7 +1578,7 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
             rb[r] = v;
         }
     };
-    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
+    auto store = [&](auto as, auto bs)
     {
         #pragma unroll
         for (int r = 0; r < RA; r++) as[lk][lr + 32 * r] = ra[r];
@@ -1580,29 +1588,33 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
     auto advance = [&]() { kc += CE_BK; };
 
     float acc[TM][TN];
-    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+    ce_run_mainloop<BM, BN, MAIN>(smem, tiles, load, store, advance, acc);
 
+    using Map = CeMap<BM, BN, MAIN>;
+    constexpr int VEC = Map::VEC;
     float* slice = out + (long long)blockIdx.z * outC * P;
-    const int tx = tid & 15, ty = tid >> 4;
-    const bool vec = (P & 3) == 0;
+    const bool vec = (P % VEC) == 0;
     #pragma unroll
-    for (int g = 0; g < TN / 4; g++)
+    for (int jg = 0; jg < TN; jg += VEC)
     {
-        int nn = n0 + g * 64 + tx * 4;
+        int nn = n0 + Map::col(jg);
         if (nn >= P) continue;
         #pragma unroll
         for (int i = 0; i < TM; i++)
         {
-            int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
+            int m = m0 + Map::row(i);
             if (m >= outC) continue;
-            float* row = slice + (long long)m * P + nn;
+            float* rowp = slice + (long long)m * P + nn;
+            float v[VEC];
+            #pragma unroll
+            for (int j = 0; j < VEC; j++) v[j] = acc[i][jg + j];
             if (vec)
-                *reinterpret_cast<float4*>(row) = make_float4(acc[i][g * 4], acc[i][g * 4 + 1], acc[i][g * 4 + 2], acc[i][g * 4 + 3]);
+                ce_store_vec<VEC>(rowp, v);
             else
             {
                 #pragma unroll
-                for (int j = 0; j < 4; j++)
-                    if (nn + j < P) row[j] = acc[i][g * 4 + j];
+                for (int j = 0; j < VEC; j++)
+                    if (nn + j < P) rowp[j] = v[j];
             }
         }
     }
@@ -1613,13 +1625,13 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
 // split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation, kernel >= stride): blockIdx.z is the
 // sub-pixel phase (rh, rw); the block's columns are that phase's pixels and only the taps kh = rh (mod sH),
 // kw = rw (mod sW) are visited, every one of which hits; phases write disjoint pixels, no split.
-template <int BM, int BN, bool PHASE>
+template <int BM, int BN, bool PHASE, int MAIN>
 __device__ __forceinline__ void conv2d_dgrad_ce_body(
     const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
     int batch, int inC, int H, int W, int outC, int outH, int outW,
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
 {
-    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
+    __shared__ __align__(16) float smem[2 * CE_BK * (BM + CePad<MAIN>::value) + 2 * CE_BK * (BN + CePad<MAIN>::value)];
     constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256, BSTEP = 256 / BN;
     const int HW = H * W, khw = kH * kW, P = inC * khw, L = outH * outW;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
@@ -1683,7 +1695,7 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         for (int r = 0; r < RB; r++)
             rb[r] = valid ? src[(long long)(BSTEP * r) * L] : 0.0f;
     };
-    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
+    auto store = [&](auto as, auto bs)
     {
         #pragma unroll
         for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];
@@ -1702,73 +1714,88 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     };
 
     float acc[TM][TN];
-    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+    ce_run_mainloop<BM, BN, MAIN>(smem, tiles, load, store, advance, acc);
 
+    using Map = CeMap<BM, BN, MAIN>;
+    constexpr int VEC = Map::VEC;
     float* slice = out + (PHASE ? 0LL : (long long)blockIdx.z * batch * inC * HW);
-    const int tx = tid & 15, ty = tid >> 4;
-    const bool vec = !PHASE && (HW & 3) == 0;
+    const bool vec = !PHASE && (HW % VEC) == 0;
     #pragma unroll
-    for (int g = 0; g < TN / 4; g++)
+    for (int jg = 0; jg < TN; jg += VEC)
     {
-        int nn = n0 + g * 64 + tx * 4;
+        int nn = n0 + Map::col(jg);
         if (nn >= N) continue;
         if (vec)
         {
             int b = nn / plane, q = nn - b * plane;
-            float* col = slice + (long long)b * inC * HW + q;
+            float* colp = slice + (long long)b * inC * HW + q;
             #pragma unroll
             for (int i = 0; i < TM; i++)
             {
-                int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
-                if (m < inC)
-                    *reinterpret_cast<float4*>(col + (long long)m * HW) =
-                        make_float4(acc[i][g * 4], acc[i][g * 4 + 1], acc[i][g * 4 + 2], acc[i][g * 4 + 3]);
+                int m = m0 + Map::row(i);
+                if (m >= inC) continue;
+                float v[VEC];
+                #pragma unroll
+                for (int j = 0; j < VEC; j++) v[j] = acc[i][jg + j];
+                ce_store_vec<VEC>(colp + (long long)m * HW, v);
             }
             continue;
         }
         #pragma unroll
-        for (int j = 0; j < 4; j++)
+        for (int j = 0; j < VEC; j++)
         {
             int nj = nn + j;
             if (nj >= N) break;
             int b = nj / plane, q = nj - b * plane, i2 = q / Wp;
             int pix = PHASE ? (ih0 + i2 * sH) * W + iw0 + (q - i2 * Wp) * sW : q;
-            float* col = slice + (long long)b * inC * HW + pix;
+            float* colp = slice + (long long)b * inC * HW + pix;
             #pragma unroll
             for (int i = 0; i < TM; i++)
             {
-                int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
-                if (m < inC) col[(long long)m * HW] = acc[i][g * 4 + j];
+                int m = m0 + Map::row(i);
+                if (m < inC) colp[(long long)m * HW] = acc[i][jg + j];
             }
         }
     }
 }
 
-#define CE_WGRAD_KERNEL(NAME, BM) \
+#define CE_WGRAD_KERNEL(NAME, BM, MAIN) \
 extern ""C"" __global__ __launch_bounds__(256) void NAME( \
     const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out, \
     int batch, int inC, int H, int W, int outC, int outH, int outW, \
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
 { \
-    conv2d_wgrad_ce_body<BM, BM>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
+    conv2d_wgrad_ce_body<BM, BM, MAIN>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
         kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
 }
-CE_WGRAD_KERNEL(conv2d_wgrad_ce128, 128)
-CE_WGRAD_KERNEL(conv2d_wgrad_ce64, 64)
+CE_WGRAD_KERNEL(conv2d_wgrad_ce128, 128, 0)
+CE_WGRAD_KERNEL(conv2d_wgrad_ce64, 64, 0)
+CE_WGRAD_KERNEL(conv2d_wgrad_ce128_x3, 128, 1)
+CE_WGRAD_KERNEL(conv2d_wgrad_ce64_x3, 64, 1)
+CE_WGRAD_KERNEL(conv2d_wgrad_ce128_tf32, 128, 2)
+CE_WGRAD_KERNEL(conv2d_wgrad_ce64_tf32, 64, 2)
 
-#define CE_DGRAD_KERNEL(NAME, BM, PHASE) \
+#define CE_DGRAD_KERNEL(NAME, BM, PHASE, MAIN) \
 extern ""C"" __global__ __launch_bounds__(256) void NAME( \
     const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out, \
     int batch, int inC, int H, int W, int outC, int outH, int outW, \
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
 { \
-    conv2d_dgrad_ce_body<BM, BM, PHASE>(gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW, \
+    conv2d_dgrad_ce_body<BM, BM, PHASE, MAIN>(gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW, \
         kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
 }
-CE_DGRAD_KERNEL(conv2d_dgrad_ce128, 128, false)
-CE_DGRAD_KERNEL(conv2d_dgrad_ce64, 64, false)
-CE_DGRAD_KERNEL(conv2d_dgrad_ce128_phase, 128, true)
-CE_DGRAD_KERNEL(conv2d_dgrad_ce64_phase, 64, true)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128, 128, false, 0)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64, 64, false, 0)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128_phase, 128, true, 0)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64_phase, 64, true, 0)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128_x3, 128, false, 1)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64_x3, 64, false, 1)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128_phase_x3, 128, true, 1)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64_phase_x3, 64, true, 1)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128_tf32, 128, false, 2)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64_tf32, 64, false, 2)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce128_phase_tf32, 128, true, 2)
+CE_DGRAD_KERNEL(conv2d_dgrad_ce64_phase_tf32, 64, true, 2)
 ";
         }
 
@@ -1838,6 +1865,147 @@ __device__ __forceinline__ void ce_mainloop(float* smem, int tiles, Load load, S
     }
 }
 
+// #1335: the tensor-core mainloop. MAIN selects the inner product of every engine body: 0 = FP32 FMA (ce_mainloop),
+// 1 = 3xTF32 (each fp32 operand split into TF32 hi + lo, three mma.sync m16n8k8 per product: lo*hi + hi*lo + hi*hi,
+// fp32-level accuracy), 2 = plain TF32 (hi*hi only; explicit reduced-precision opt-in). The tensor-core variants need
+// sm_80+; the host dispatches them only there, and below that the helpers compile to a no-op.
+template <int MAIN> struct CePad { static constexpr int value = MAIN == 0 ? 4 : 8; };
+
+// Output coordinates of accumulator acc[i][j] within the block tile, and how many consecutive columns a thread owns
+// (4 for the FMA layout, 2 for the mma C fragment). Both layouts are separable: the row depends on i only, the column
+// on j only, and columns jg .. jg + VEC - 1 (jg a multiple of VEC) are consecutive.
+template <int BM, int BN, int MAIN>
+struct CeMap
+{
+    static constexpr int VEC = MAIN == 0 ? 4 : 2;
+    __device__ __forceinline__ static int row(int i)
+    {
+        if (MAIN == 0) return (i >> 2) * 64 + (threadIdx.x >> 4) * 4 + (i & 3);
+        int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        return (warp >> 2) * (BM / 2) + (i >> 1) * 16 + (lane >> 2) + 8 * (i & 1);
+    }
+    __device__ __forceinline__ static int col(int j)
+    {
+        if (MAIN == 0) return (j >> 2) * 64 + (threadIdx.x & 15) * 4 + (j & 3);
+        int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        return (warp & 3) * (BN / 4) + (j >> 1) * 8 + 2 * (lane & 3) + (j & 1);
+    }
+};
+
+template <int VEC> __device__ __forceinline__ void ce_store_vec(float* p, const float* v);
+template <> __device__ __forceinline__ void ce_store_vec<4>(float* p, const float* v)
+{
+    *reinterpret_cast<float4*>(p) = make_float4(v[0], v[1], v[2], v[3]);
+}
+template <> __device__ __forceinline__ void ce_store_vec<2>(float* p, const float* v)
+{
+    *reinterpret_cast<float2*>(p) = make_float2(v[0], v[1]);
+}
+
+__device__ __forceinline__ unsigned int ce_tf32(float x)
+{
+    unsigned int r;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm(""cvt.rna.tf32.f32 %0, %1;"" : ""=r""(r) : ""f""(x));
+#else
+    r = __float_as_uint(x) & 0xffffe000u;
+#endif
+    return r;
+}
+
+// d (4 floats, the C fragment) += A (m16 x k8, 4 TF32 regs) * B (k8 x n8, 2 TF32 regs).
+__device__ __forceinline__ void ce_mma_tf32(float* d, const unsigned int* a, const unsigned int* b)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(""mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+        : ""+f""(d[0]), ""+f""(d[1]), ""+f""(d[2]), ""+f""(d[3])
+        : ""r""(a[0]), ""r""(a[1]), ""r""(a[2]), ""r""(a[3]), ""r""(b[0]), ""r""(b[1]));
+#endif
+}
+
+// Same pipeline as ce_mainloop (register prefetch, two shared buffers, one barrier per K tile; CE_BK = 8 is one mma k
+// step). The 8 warps tile the block 2 x 4; a warp owns (BM/2) x (BN/4) of C as MI x NI m16n8 tiles, its accumulators
+// laid out as CeMap<BM, BN, 1> describes. Rows are padded by 8 so the fragment reads (lane = 4 g + t reading
+// [t][base + g]) hit 32 distinct banks.
+template <int BM, int BN, bool X3, typename Load, typename Store, typename Advance>
+__device__ __forceinline__ void ce_mainloop_tc(float* smem, int tiles, Load load, Store store, Advance advance,
+    float (&acc)[BM / 16][BN / 16])
+{
+    constexpr int TM = BM / 16, TN = BN / 16, MI = BM / 32, NI = BN / 32;
+    float (*As)[CE_BK][BM + 8] = reinterpret_cast<float (*)[CE_BK][BM + 8]>(smem);
+    float (*Bs)[CE_BK][BN + 8] = reinterpret_cast<float (*)[CE_BK][BN + 8]>(smem + 2 * CE_BK * (BM + 8));
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int wm = (warp >> 2) * (BM / 2), wn = (warp & 3) * (BN / 4);
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j++) acc[i][j] = 0.0f;
+    if (tiles <= 0) return;
+    int buf = 0;
+    load();
+    store(As[0], Bs[0]);
+    __syncthreads();
+    for (int tile = 0; tile < tiles; tile++)
+    {
+        bool more = tile + 1 < tiles;
+        if (more) { advance(); load(); }
+        unsigned int ahi[MI][4], alo[MI][4];
+        #pragma unroll
+        for (int mi = 0; mi < MI; mi++)
+        {
+            int r = wm + mi * 16 + g;
+            float a[4] = { As[buf][t][r], As[buf][t][r + 8], As[buf][t + 4][r], As[buf][t + 4][r + 8] };
+            #pragma unroll
+            for (int q = 0; q < 4; q++)
+            {
+                ahi[mi][q] = ce_tf32(a[q]);
+                alo[mi][q] = X3 ? ce_tf32(a[q] - __uint_as_float(ahi[mi][q])) : 0u;
+            }
+        }
+        #pragma unroll
+        for (int ni = 0; ni < NI; ni++)
+        {
+            int c = wn + ni * 8 + g;
+            float bv[2] = { Bs[buf][t][c], Bs[buf][t + 4][c] };
+            unsigned int bhi[2], blo[2];
+            #pragma unroll
+            for (int q = 0; q < 2; q++)
+            {
+                bhi[q] = ce_tf32(bv[q]);
+                blo[q] = X3 ? ce_tf32(bv[q] - __uint_as_float(bhi[q])) : 0u;
+            }
+            #pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+            {
+                float d[4] = { acc[mi * 2][ni * 2], acc[mi * 2][ni * 2 + 1], acc[mi * 2 + 1][ni * 2], acc[mi * 2 + 1][ni * 2 + 1] };
+                if (X3)
+                {
+                    // Small terms first, then the dominant hi * hi.
+                    ce_mma_tf32(d, alo[mi], bhi);
+                    ce_mma_tf32(d, ahi[mi], blo);
+                }
+                ce_mma_tf32(d, ahi[mi], bhi);
+                acc[mi * 2][ni * 2] = d[0]; acc[mi * 2][ni * 2 + 1] = d[1];
+                acc[mi * 2 + 1][ni * 2] = d[2]; acc[mi * 2 + 1][ni * 2 + 1] = d[3];
+            }
+        }
+        if (more)
+        {
+            store(As[buf ^ 1], Bs[buf ^ 1]);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+}
+
+template <int BM, int BN, int MAIN, typename Load, typename Store, typename Advance>
+__device__ __forceinline__ void ce_run_mainloop(float* smem, int tiles, Load load, Store store, Advance advance,
+    float (&acc)[BM / 16][BN / 16])
+{
+    if constexpr (MAIN == 0) ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+    else ce_mainloop_tc<BM, BN, MAIN == 1>(smem, tiles, load, store, advance, acc);
+}
+
 // Forward: Y[Cout, B*oH*oW] = W[Cout, K] * X_gathered[K, B*oH*oW], K = Cin*kH*kW. TAPU (Cin % 8 == 0) orders K as
 // (kh, kw, ci), so a K tile shares one tap: each lane's input position and bounds check are computed once per tile and
 // the tap advances by addition. Otherwise K is W's natural (ci, kh, kw) order with per-element index math. Split-K
@@ -1848,14 +2016,14 @@ __device__ __forceinline__ void ce_mainloop(float* smem, int tiles, Load load, S
 struct CeIdentityPro { __device__ __forceinline__ float operator()(int, int, int, float x) const { return x; } };
 struct CeIdentityEpi { __device__ __forceinline__ float operator()(int, int, int, float y) const { return y; } };
 
-template <int BM, int BN, bool TAPU, typename Pro = CeIdentityPro, typename Epi = CeIdentityEpi>
+template <int BM, int BN, bool TAPU, typename Pro = CeIdentityPro, typename Epi = CeIdentityEpi, int MAIN = 0>
 __device__ __forceinline__ void conv2d_fprop_ig_body(
     const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ out,
     int batch, int inC, int H, int W, int outC, int outH, int outW,
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit,
     Pro pro = Pro(), Epi epi = Epi())
 {
-    __shared__ __align__(16) float smem[2 * CE_BK * (BM + 4) + 2 * CE_BK * (BN + 4)];
+    __shared__ __align__(16) float smem[2 * CE_BK * (BM + CePad<MAIN>::value) + 2 * CE_BK * (BN + CePad<MAIN>::value)];
     constexpr int TM = BM / 16, TN = BN / 16, RA = BM * CE_BK / 256, RB = BN * CE_BK / 256, BSTEP = 256 / BN;
     const int L = outH * outW, N = batch * L, khw = kH * kW, K = inC * khw, HW = H * W;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
@@ -1917,7 +2085,7 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
             }
         }
     };
-    auto store = [&](float (*as)[BM + 4], float (*bs)[BN + 4])
+    auto store = [&](auto as, auto bs)
     {
         #pragma unroll
         for (int r = 0; r < RA; r++) as[ak][am + 32 * r] = ra[r];
@@ -1931,35 +2099,41 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
     };
 
     float acc[TM][TN];
-    ce_mainloop<BM, BN>(smem, tiles, load, store, advance, acc);
+    ce_run_mainloop<BM, BN, MAIN>(smem, tiles, load, store, advance, acc);
 
+    using Map = CeMap<BM, BN, MAIN>;
+    constexpr int VEC = Map::VEC;
     float* slice = out + (long long)blockIdx.z * batch * outC * L;
-    const int tx = tid & 15, ty = tid >> 4;
-    const bool vec = (L & 3) == 0;   // then a thread's 4 columns are 4 consecutive pixels of one image, 16-byte aligned
+    const bool vec = (L % VEC) == 0;   // then a column group is VEC consecutive pixels of one image, aligned
     #pragma unroll
-    for (int g = 0; g < TN / 4; g++)
+    for (int jg = 0; jg < TN; jg += VEC)
     {
-        int nn = n0 + g * 64 + tx * 4;
+        int nn = n0 + Map::col(jg);
         if (nn >= N) continue;
         int b = nn / L, l = nn - b * L;
         #pragma unroll
         for (int i = 0; i < TM; i++)
         {
-            int m = m0 + (i >> 2) * 64 + ty * 4 + (i & 3);
+            int m = m0 + Map::row(i);
             if (m >= outC) continue;
+            float v[VEC];
+            #pragma unroll
+            for (int j = 0; j < VEC; j++) v[j] = acc[i][jg + j];
             if (vec)
-                *reinterpret_cast<float4*>(slice + ((long long)b * outC + m) * L + l) =
-                    make_float4(epi(b, m, l, acc[i][g * 4]), epi(b, m, l + 1, acc[i][g * 4 + 1]),
-                                epi(b, m, l + 2, acc[i][g * 4 + 2]), epi(b, m, l + 3, acc[i][g * 4 + 3]));
+            {
+                #pragma unroll
+                for (int j = 0; j < VEC; j++) v[j] = epi(b, m, l + j, v[j]);
+                ce_store_vec<VEC>(slice + ((long long)b * outC + m) * L + l, v);
+            }
             else
             {
                 #pragma unroll
-                for (int j = 0; j < 4; j++)
+                for (int j = 0; j < VEC; j++)
                 {
                     int nj = nn + j;
                     if (nj >= N) break;
                     int bj = nj / L, lj = nj - bj * L;
-                    slice[((long long)bj * outC + m) * L + lj] = epi(bj, m, lj, acc[i][g * 4 + j]);
+                    slice[((long long)bj * outC + m) * L + lj] = epi(bj, m, lj, v[j]);
                 }
             }
         }
@@ -2008,7 +2182,27 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
                 "conv2d_dgrad_ce128",
                 "conv2d_dgrad_ce64",
                 "conv2d_dgrad_ce128_phase",
-                "conv2d_dgrad_ce64_phase"
+                "conv2d_dgrad_ce64_phase",
+                "conv2d_fprop_ig128_tap_x3",
+                "conv2d_fprop_ig128_gen_x3",
+                "conv2d_fprop_ig64_tap_x3",
+                "conv2d_fprop_ig64_gen_x3",
+                "conv2d_wgrad_ce128_x3",
+                "conv2d_wgrad_ce64_x3",
+                "conv2d_dgrad_ce128_x3",
+                "conv2d_dgrad_ce128_phase_x3",
+                "conv2d_dgrad_ce64_x3",
+                "conv2d_dgrad_ce64_phase_x3",
+                "conv2d_fprop_ig128_tap_tf32",
+                "conv2d_fprop_ig128_gen_tf32",
+                "conv2d_fprop_ig64_tap_tf32",
+                "conv2d_fprop_ig64_gen_tf32",
+                "conv2d_wgrad_ce128_tf32",
+                "conv2d_wgrad_ce64_tf32",
+                "conv2d_dgrad_ce128_tf32",
+                "conv2d_dgrad_ce128_phase_tf32",
+                "conv2d_dgrad_ce64_tf32",
+                "conv2d_dgrad_ce64_phase_tf32"
             };
         }
     }
