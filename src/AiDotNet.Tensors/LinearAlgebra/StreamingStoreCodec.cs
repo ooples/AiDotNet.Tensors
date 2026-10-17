@@ -1047,12 +1047,18 @@ internal static class StreamingStoreCodec
     // about three quarters of a ParaformerLarge step (#2322). The output is ordinary Deflate,
     // so stored payloads from either setting decode the same way. Before .NET 9 the strategy
     // can't be chosen and the level stays at Optimal.
+#if NET9_0_OR_GREATER
+    // zlib's level under the RLE strategy. RLE has no match search for the level to tune, so the
+    // fastest level costs nothing in ratio (level 6 RLE measured the same 1.196x).
+    private const int RleCompressionLevel = 1;
+#endif
+
     private static DeflateStream CreateLosslessCompressor(Stream destination)
     {
 #if NET9_0_OR_GREATER
         return new DeflateStream(destination, new ZLibCompressionOptions
         {
-            CompressionLevel = 1,
+            CompressionLevel = RleCompressionLevel,
             CompressionStrategy = ZLibCompressionStrategy.RunLengthEncoding,
         }, leaveOpen: true);
 #else
@@ -1097,8 +1103,9 @@ internal static class StreamingStoreCodec
 
     // The inverse of WriteShuffledPlanes: reads the plane-major stream a tile at a time through a
     // small pooled buffer and scatters each tile into its byte plane of dst. Returns the number of
-    // bytes read, which falls short of dst.Length only when the stream ends early. Like
-    // BytePlaneUnshuffle, it leaves a partial trailing element of dst untouched.
+    // bytes read, which differs from dst.Length when the stream ends early or holds more than dst
+    // (it probes for one byte past the end, so a payload for a larger weight is rejected rather
+    // than truncated). Like BytePlaneUnshuffle, it leaves a partial trailing element of dst untouched.
     private static int ReadShuffledPlanes(Stream src, Span<byte> dst, int elem)
     {
         int count = dst.Length / elem;
@@ -1121,6 +1128,7 @@ internal static class StreamingStoreCodec
 
             int tail = dst.Length - count * elem;
             if (tail > 0) total += ReadUpTo(src, buffer, tail);
+            total += ReadUpTo(src, buffer, 1);
             return total;
         }
         finally

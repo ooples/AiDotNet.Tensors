@@ -52,5 +52,6 @@ public class PooledChunkWriteStreamTests
         Assert.False(stream.CanWrite);
         Assert.Throws<ObjectDisposedException>(() => stream.WriteByte(2));
         Assert.Throws<ObjectDisposedException>(() => stream.ToArray());
+        Assert.Throws<ObjectDisposedException>(() => stream.Flush());
     }
 }

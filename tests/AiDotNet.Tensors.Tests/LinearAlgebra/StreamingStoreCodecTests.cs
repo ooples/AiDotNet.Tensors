@@ -551,6 +551,20 @@ public class StreamingStoreCodecTests
         Assert.ThrowsAny<Exception>(() => StreamingStoreCodec.DecodeLosslessFloat(truncated, new float[n]));
     }
 
+    // A payload for a larger weight inflates to more bytes than the destination holds; the decode
+    // rejects it rather than silently keeping a prefix.
+    [Fact]
+    public void Lossless_PayloadForALargerWeight_Throws()
+    {
+        var rng = new Rng(6);
+        int n = 20_000;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        Assert.True(enc.Length < n * sizeof(float));
+        Assert.Throws<InvalidOperationException>(() => StreamingStoreCodec.DecodeLosslessFloat(enc, new float[n - 1]));
+    }
+
 #if NET5_0_OR_GREATER
     // #2322: a streamed training weight is decoded on every re-materialization and re-encoded on
     // every write-back, several times a step. Decoding used to allocate a copy of the compressed

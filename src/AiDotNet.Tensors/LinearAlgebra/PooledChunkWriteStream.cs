@@ -74,9 +74,8 @@ internal sealed class PooledChunkWriteStream : Stream
         return result;
     }
 
-    public override void Flush()
-    {
-    }
+    // Writes land in the chunks directly, so there is nothing to flush.
+    public override void Flush() => ThrowIfDisposed();
 
     public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 

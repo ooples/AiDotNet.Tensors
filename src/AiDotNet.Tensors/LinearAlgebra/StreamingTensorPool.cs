@@ -626,8 +626,11 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
-    /// <summary>Returns an array from <see cref="RehydrateIntoRented"/>.</summary>
-    internal static void ReturnRented(byte[] rented) => RentedSnapshots.Return(rented);
+    /// <summary>
+    /// Returns an array from <see cref="RehydrateIntoRented"/>, cleared so a weight's bytes don't
+    /// outlive the pool that owned them in the static scratch pool.
+    /// </summary>
+    internal static void ReturnRented(byte[] rented) => RentedSnapshots.Return(rented, clearArray: true);
 
     /// <summary>Frees a weight + its backing-store file. Called at model
     /// dispose.</summary>
