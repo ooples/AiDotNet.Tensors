@@ -1035,10 +1035,14 @@ internal static class StreamingStoreCodec
         return rawOut;
     }
 
-    // Huffman coding alone, without LZ77 match search. What compresses in a shuffled weight is
-    // the skewed sign/exponent plane, which is entropy, not repeats, so the match search costs
-    // the time without finding anything. On 64 MiB of shuffled Gaussian fp32 (std 0.02):
-    // level 6 encodes 32 MB/s at 1.175x; Huffman-only 142 MB/s at 1.197x, and decodes faster.
+    // Run-length matches only (distance 1), no general LZ77 match search. What compresses in a
+    // shuffled trained weight is the skewed sign/exponent plane, which is entropy, not repeats,
+    // so the full match search costs the time without finding anything; a constant weight (a
+    // zero-initialized projection, a LayerNorm gain) is one long run, which RLE still takes.
+    // On 64 MiB of fp32, shuffled:
+    //   Gaussian (std 0.02): level 6 encodes 32 MB/s at 1.175x; RLE 117 MB/s at 1.196x.
+    //   all zeros / all ones: level 6 and RLE both ~1029x at over 3 GB/s. Huffman-only, which
+    //   is a little faster on the Gaussian weight, manages only 7.95x here and decodes slower.
     // A training step re-encodes every updated weight it sheds, so at level 6 this encode was
     // about three quarters of a ParaformerLarge step (#2322). The output is ordinary Deflate,
     // so stored payloads from either setting decode the same way. Before .NET 9 the strategy
@@ -1049,7 +1053,7 @@ internal static class StreamingStoreCodec
         return new DeflateStream(destination, new ZLibCompressionOptions
         {
             CompressionLevel = 1,
-            CompressionStrategy = ZLibCompressionStrategy.HuffmanOnly,
+            CompressionStrategy = ZLibCompressionStrategy.RunLengthEncoding,
         }, leaveOpen: true);
 #else
         return new DeflateStream(destination, CompressionLevel.Optimal, leaveOpen: true);

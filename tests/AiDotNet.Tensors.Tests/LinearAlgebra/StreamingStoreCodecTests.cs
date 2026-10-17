@@ -518,6 +518,25 @@ public class StreamingStoreCodecTests
         for (int i = 0; i < n; i++) Assert.Equal(srcBits[i], decBits[i]);
     }
 
+    // A constant weight (a zero-initialized projection, a LayerNorm gain of ones) is one long run
+    // per byte plane. The encoder must still collapse it: an entropy-only coder stops near 8x.
+    [Theory]
+    [InlineData(0f)]
+    [InlineData(1f)]
+    public void Lossless_ConstantTensor_CompressesToARunNotJustEntropy(float value)
+    {
+        int n = 1 << 20;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = value;
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        Assert.True(enc.Length * 100L < n * sizeof(float),
+            $"a constant {n * 4} B weight encoded to {enc.Length} B");
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeLosslessFloat(enc, dec);
+        for (int i = 0; i < n; i++)
+            Assert.Equal(BitExactHelpers.SingleBits(src[i]), BitExactHelpers.SingleBits(dec[i]));
+    }
+
     [Fact]
     public void Lossless_TruncatedCompressedPayload_Throws()
     {
