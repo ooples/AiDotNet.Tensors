@@ -40,14 +40,14 @@ public sealed partial class CudaBackend : IFusedMseLossBackend
     unsafe bool IFusedMseLossBackend.TryMseLoss(IGpuBuffer predictions, IGpuBuffer targets, IGpuBuffer loss, int length)
     {
         if (length <= 0 || length > MseLossMaxLength || predictions.Size < length || targets.Size < length || loss.Size < 1
-            || !EnsureMseLossModule() || !_kernelCache.TryGetValue("mse_loss_mean", out var kernel))
+            || !EnsureMseLossModule() || !_kernelCache.TryGetValue("mse_loss_mean", out var meanKernel))
             return false;
         using var _ = PushContext();
         IntPtr p = predictions.Handle, y = targets.Handle, l = loss.Handle;
         int n = length;
         void** args = stackalloc void*[4];
         args[0] = &p; args[1] = &y; args[2] = &l; args[3] = &n;
-        LaunchKernel(kernel, 1, 1024, args);
+        LaunchKernel(meanKernel, 1, 1024, args);
         return true;
     }
 
@@ -56,7 +56,7 @@ public sealed partial class CudaBackend : IFusedMseLossBackend
     {
         if (length <= 0 || predictions.Size < length || targets.Size < length || gradLoss.Size < 1
             || gradPredictions.Size < length || (gradTargets is not null && gradTargets.Size < length)
-            || !EnsureMseLossModule() || !_kernelCache.TryGetValue("mse_loss_backward", out var kernel))
+            || !EnsureMseLossModule() || !_kernelCache.TryGetValue("mse_loss_backward", out var backwardKernel))
             return false;
         using var _ = PushContext();
         IntPtr p = predictions.Handle, y = targets.Handle, g = gradLoss.Handle, dp = gradPredictions.Handle;
@@ -64,7 +64,7 @@ public sealed partial class CudaBackend : IFusedMseLossBackend
         int n = length;
         void** args = stackalloc void*[6];
         args[0] = &p; args[1] = &y; args[2] = &g; args[3] = &dp; args[4] = &dy; args[5] = &n;
-        LaunchKernel(kernel, (uint)Math.Min(4096, (length + 255) / 256), 256, args);
+        LaunchKernel(backwardKernel, (uint)Math.Min(4096, (length + 255) / 256), 256, args);
         return true;
     }
 }
