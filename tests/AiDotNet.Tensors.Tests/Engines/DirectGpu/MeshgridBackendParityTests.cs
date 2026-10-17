@@ -82,6 +82,15 @@ public sealed class MeshgridBackendParityTests
         Check(backend);
     }
 
+    [SkippableFact]
+    public void Metal_Meshgrid2DPair_MatchesTorch()
+    {
+        Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal is only available on macOS/iOS.");
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend();
+        Skip.IfNot(backend.IsAvailable, "Metal is not available.");
+        Check(backend);
+    }
+
     /// <summary>
     /// WebGPU's WGSL ports on Dawn, driven through the dispatch WebGPU ships (<see cref="DawnWebGpuBatchBackend"/>).
     /// Needs AIDOTNET_WEBGPU_NODE_DIR and an OpenCL host for the buffers.
