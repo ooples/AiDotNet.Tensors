@@ -5,13 +5,52 @@ public sealed partial class MetalBackend
     // All methods use Metal GPU dispatch via GetPipeline + DispatchThreadgroups.
     // CPU fallback only for ops where MSL kernel source doesn't exist yet.
 
-    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { SimpleUnary("Reduction", _reductionLibrary, "mean_axis", i, o, sz); }
-    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) { SimpleUnary("Activation", _activationLibrary, "clamp", i, o, sz); }
-    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) { SimpleUnary("ElementWise", _elementWiseLibrary, "pow_scalar", i, o, sz); }
+    // These bind each kernel's own argument layout. They were one-line Simple* calls that asked libraries for kernels
+    // they did not define, and dropped the scalars (clip bounds, exponent, fill value) or passed one size where the
+    // kernel reads two; MetalShaderCompilationTests.EveryKernelLookup_NamesAKernelDefinedInThatLibrary now gates the
+    // names, MetalFusedOpsParityTests the results.
+    public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz)
+    {
+        ThrowIfDisposed();
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "reduce_mean_full");
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(AsMetal(i), 0);
+        encoder.SetBuffer(AsMetal(o), 1);
+        encoder.SetBytes((uint)Math.Max(0, sz), 2);
+        encoder.DispatchThreadgroups(new MetalNativeBindings.MTLSize(1, 1, 1), new MetalNativeBindings.MTLSize(256, 1, 1));
+    }
+    public void ClipKernel(IGpuBuffer i, IGpuBuffer o, float mn, float mx, int sz) => ScalarPair("clamp_kernel", i, o, mn, mx, sz);
+    public void PowScalar(IGpuBuffer i, IGpuBuffer o, float ex, int sz) => ScalarUnary("pow_scalar", i, o, ex, sz);
     public void FracKernel(IGpuBuffer i, IGpuBuffer o, int sz) { SimpleUnary("ElementWise", _elementWiseLibrary, "frac_kernel", i, o, sz); }
-    public void EyeKernel(IGpuBuffer o, int n) { SimpleGenerate("Reduction", _reductionLibrary, "eye_kernel", o, n*n); }
-    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) { SimpleUnary("Reduction", _reductionLibrary, "one_hot_kernel", idx, o, bs*nc); }
-    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) { SimpleBinary("ElementWise", _elementWiseLibrary, "masked_fill_kernel", i, m, o, sz); }
+    public void EyeKernel(IGpuBuffer o, int n)
+    {
+        ThrowIfDisposed();
+        if (n <= 0) return;
+        var pipeline = GetPipeline("ExtendedReduction", _extendedReductionLibrary, "eye_kernel");
+        var (groups, threads) = pipeline.Calculate1DDispatch(checked(n * n));
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(AsMetal(o), 0);
+        encoder.SetBytes((uint)n, 1);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+    public void OneHotKernel(IGpuBuffer idx, IGpuBuffer o, int bs, int nc) => RowsByColumns("ExtendedReduction", _extendedReductionLibrary, "one_hot_kernel", idx, null, o, bs, nc, checked(bs * nc));
+    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz)
+    {
+        ThrowIfDisposed();
+        if (sz <= 0) return;
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "masked_fill_kernel");
+        var (groups, threads) = pipeline.Calculate1DDispatch(sz);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(AsMetal(i), 0);
+        encoder.SetBuffer(AsMetal(m), 1);
+        encoder.SetBuffer(AsMetal(o), 2);
+        encoder.SetBytes(fv, 3);
+        encoder.SetBytes((uint)sz, 4);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
     public void EqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { SimpleBinary("ElementWise", _elementWiseLibrary, "equals_kernel", a, b, o, sz); }
     public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int sz) { SimpleBinary("ElementWise", _elementWiseLibrary, "not_equals_kernel", a, b, o, sz); }
     // IEEE classify (isnan/isinf/isfinite): a real Metal MSL kernel is a HW-validation follow-up; the
@@ -603,18 +642,90 @@ public sealed partial class MetalBackend
         encoder.SetBytes(step, 7);
         encoder.DispatchThreadgroups(tgr, tpg);
     }
-    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) { SimpleBinary("Reduction", _reductionLibrary, "outer_product", a, b, o, M*N); }
-    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) { SimpleBinary("Reduction", _reductionLibrary, "batch_dot_product", a, b, o, bs); }
-    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "glu_forward", i, o, os*hd); }
-    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "geglu_forward", i, o, os*hd); }
-    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "reglu_forward", i, o, os*hd); }
-    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) { SimpleUnary("Activation", _activationLibrary, "swiglu_forward", i, o, os*hd); }
+    public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) => RowsByColumns("ExtendedReduction", _extendedReductionLibrary, "outer_product", a, b, o, M, N, checked(M * N));
+    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => RowsByColumns("DotProduct", _dotProductLibrary, "batched_dot_product", a, b, o, bs, dim, bs);
+    public void GluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => RowsByColumns("GatedActivation", _gatedActivationLibrary, "glu_forward", i, null, o, os, hd, checked(os * hd));
+    public void GeGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => RowsByColumns("GatedActivation", _gatedActivationLibrary, "geglu_forward", i, null, o, os, hd, checked(os * hd));
+    public void ReGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => RowsByColumns("GatedActivation", _gatedActivationLibrary, "reglu_forward", i, null, o, os, hd, checked(os * hd));
+    public void SwiGluForward(IGpuBuffer i, IGpuBuffer o, int os, int hd) => RowsByColumns("GatedActivation", _gatedActivationLibrary, "swiglu_forward", i, null, o, os, hd, checked(os * hd));
     public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) { SimpleBinary("Loss", _lossLibrary, "bce_loss", p, t, l, sz); }
-    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) { SimpleUnary("ElementWise", _elementWiseLibrary, "sub_scalar", i, o, sz); }
-    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { SimpleBinary("ElementWise", _elementWiseLibrary, "broadcast_add_last", a, b, o, os*isz); }
-    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { SimpleBinary("ElementWise", _elementWiseLibrary, "broadcast_sub_last", a, b, o, os*isz); }
-    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { SimpleBinary("ElementWise", _elementWiseLibrary, "broadcast_mul_last", a, b, o, os*isz); }
-    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) { SimpleBinary("ElementWise", _elementWiseLibrary, "broadcast_div_last", a, b, o, os*isz); }
+    public void SubScalar(IGpuBuffer i, IGpuBuffer o, float sc, int sz) => ScalarUnary("sub_scalar", i, o, sc, sz);
+    public void BroadcastAddLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => BroadcastLast("broadcast_add_last", a, b, o, os, isz);
+    public void BroadcastSubLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => BroadcastLast("broadcast_sub_last", a, b, o, os, isz);
+    public void BroadcastMulLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => BroadcastLast("broadcast_mul_last", a, b, o, os, isz);
+    public void BroadcastDivLast(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int os, int isz) => BroadcastLast("broadcast_div_last", a, b, o, os, isz);
+
+    /// <summary>ElementWise kernel (input, output, float, size).</summary>
+    private void ScalarUnary(string kernel, IGpuBuffer i, IGpuBuffer o, float scalar, int sz)
+    {
+        ThrowIfDisposed();
+        if (sz <= 0) return;
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, kernel);
+        var (groups, threads) = pipeline.Calculate1DDispatch(sz);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(AsMetal(i), 0);
+        encoder.SetBuffer(AsMetal(o), 1);
+        encoder.SetBytes(scalar, 2);
+        encoder.SetBytes((uint)sz, 3);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <summary>ElementWise kernel (input, output, float, float, size).</summary>
+    private void ScalarPair(string kernel, IGpuBuffer i, IGpuBuffer o, float first, float second, int sz)
+    {
+        ThrowIfDisposed();
+        if (sz <= 0) return;
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, kernel);
+        var (groups, threads) = pipeline.Calculate1DDispatch(sz);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(AsMetal(i), 0);
+        encoder.SetBuffer(AsMetal(o), 1);
+        encoder.SetBytes(first, 2);
+        encoder.SetBytes(second, 3);
+        encoder.SetBytes((uint)sz, 4);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
+
+    /// <summary>
+    /// A kernel of one or two inputs, an output, then two extents (rows, columns), over <paramref name="threads"/>
+    /// threads: (input[, second], output, rows, columns).
+    /// </summary>
+    private void RowsByColumns(string lib, System.IntPtr library, string kernel, IGpuBuffer input, IGpuBuffer? second,
+        IGpuBuffer output, int rows, int columns, int threads)
+    {
+        ThrowIfDisposed();
+        if (threads <= 0) return;
+        var pipeline = GetPipeline(lib, library, kernel);
+        var (groups, perGroup) = pipeline.Calculate1DDispatch(threads);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        int slot = 0;
+        encoder.SetBuffer(AsMetal(input), slot++);
+        if (second is not null) encoder.SetBuffer(AsMetal(second), slot++);
+        encoder.SetBuffer(AsMetal(output), slot++);
+        encoder.SetBytes((uint)rows, (ulong)slot++);
+        encoder.SetBytes((uint)columns, (ulong)slot);
+        encoder.DispatchThreadgroups(groups, perGroup);
+    }
+
+    /// <summary>The 2D last-axis broadcast kernels (A, B, C, outer, inner), x over inner and y over outer.</summary>
+    private void BroadcastLast(string kernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int outer, int inner)
+    {
+        ThrowIfDisposed();
+        if (outer <= 0 || inner <= 0) return;
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, kernel);
+        var (groups, threads) = pipeline.Calculate2DDispatch(inner, outer);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(AsMetal(a), 0);
+        encoder.SetBuffer(AsMetal(b), 1);
+        encoder.SetBuffer(AsMetal(o), 2);
+        encoder.SetBytes((uint)outer, 3);
+        encoder.SetBytes((uint)inner, 4);
+        encoder.DispatchThreadgroups(groups, threads);
+    }
 
     private void SimpleUnary(string lib, System.IntPtr library, string kernel, IGpuBuffer i, IGpuBuffer o, int sz)
     {
