@@ -1256,6 +1256,66 @@ internal static class FusedOptimizer
         });
     }
 
+    /// <summary>Elements per segment of <see cref="AdamWUpdateMultiParallel"/> (a multiple of <see cref="FloatSimdWidth"/>).</summary>
+    private const int MultiTensorSegmentElements = 1 << 13;
+
+    /// <summary>
+    /// Fused AdamW over every parameter tensor in ONE pool dispatch: each tensor's [0, length) is cut into
+    /// <see cref="FloatSimdWidth"/>-aligned segments of at most <see cref="MultiTensorSegmentElements"/> (its scalar tail
+    /// in its last segment), and the segments of all tensors run across the pool. Per tensor the result is bit-identical
+    /// to <see cref="AdamWUpdateSimd(float*, float*, float*, float*, int, float, float, float, float, float, float, float)"/>:
+    /// that call dispatched only a tensor of at least <see cref="ParallelThreshold"/> elements, so a model of many small
+    /// tensors (the parity Transformer: 30 tensors, 69K elements) updated them one after another on one thread: its
+    /// optimizer step went from ~93 to ~63 us (Ryzen 7 4800H, steps 100-200). A tensor whose gradient or parameter backing is empty is skipped, as the
+    /// per-parameter loop does. <paramref name="units"/> is caller-owned scratch for the segment list (reused while the
+    /// shapes do not change).
+    /// </summary>
+    internal static unsafe void AdamWUpdateMultiParallel(
+        float[][] paramArrays, int[] paramOffsets, float[][] gradArrays, int[] gradOffsets, float[][] mArrays, float[][] vArrays,
+        int[] lengths, int count, float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2,
+        ref int[]? units)
+    {
+        long total = 0;
+        int unitCount = 0;
+        for (int t = 0; t < count; t++)
+        {
+            if (lengths[t] == 0 || gradArrays[t].Length == 0 || paramArrays[t].Length == 0) continue;
+            total += lengths[t];
+            unitCount += (lengths[t] + MultiTensorSegmentElements - 1) / MultiTensorSegmentElements;
+        }
+        if (ParallelMaxDop <= 1 || total < ParallelThreshold || unitCount <= 1)
+        {
+            for (int t = 0; t < count; t++)
+            {
+                if (lengths[t] == 0 || gradArrays[t].Length == 0 || paramArrays[t].Length == 0) continue;
+                fixed (float* p = &paramArrays[t][paramOffsets[t]], g = &gradArrays[t][gradOffsets[t]], m = mArrays[t], v = vArrays[t])
+                    AdamWUpdateRangeF(p, g, m, v, 0, lengths[t], lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            }
+            return;
+        }
+        // (tensor, start, end) triples.
+        var list = units is { } owned && owned.Length >= 3 * unitCount ? owned : (units = new int[3 * unitCount]);
+        int u = 0;
+        for (int t = 0; t < count; t++)
+        {
+            int len = lengths[t];
+            if (len == 0 || gradArrays[t].Length == 0 || paramArrays[t].Length == 0) continue;
+            for (int s = 0; s < len; s += MultiTensorSegmentElements)
+            {
+                list[u++] = t; list[u++] = s; list[u++] = System.Math.Min(len, s + MultiTensorSegmentElements);
+            }
+        }
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(unitCount, k =>
+        {
+            int t = list[3 * k], s = list[3 * k + 1], e = list[3 * k + 2];
+            unsafe
+            {
+                fixed (float* p = &paramArrays[t][paramOffsets[t]], g = &gradArrays[t][gradOffsets[t]], m = mArrays[t], v = vArrays[t])
+                    AdamWUpdateRangeF(p, g, m, v, s, e, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            }
+        });
+    }
+
     /// <summary>Single-pass fused AdamW (float) over the element range [start,end).
     /// Folds decoupled weight decay into the Adam update so `param` is read+written
     /// once. SIMD head runs from `start` (8-aligned for every non-final chunk) + a

@@ -276,11 +276,7 @@ internal static partial class SimdGemm
             var bt = System.Buffers.ArrayPool<float>.Shared.Rent(k * n);
             try
             {
-                for (int j = 0; j < n; j++)
-                {
-                    int src = j * k;
-                    for (int i = 0; i < k; i++) bt[i * n + j] = b[src + i];
-                }
+                Transpose(b, 0, k, bt, 0, n, n, k);   // bt[i * n + j] = b[j * k + i]
                 JitGemmAvx2.RunJit(a.AsSpan(0, m * k), bt.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
             }
             finally { System.Buffers.ArrayPool<float>.Shared.Return(bt); }
@@ -311,11 +307,7 @@ internal static partial class SimdGemm
                     var at = t_splitKScratch is { } cached && cached.Length >= mPad * rows
                         ? cached : (t_splitKScratch = new float[mPad * rows]);
                     {
-                        for (int r = 0; r < rows; r++)
-                        {
-                            int src = (r0 + r) * lda;
-                            for (int f = 0; f < m; f++) at[f * rows + r] = a[src + f];
-                        }
+                        Transpose(a, r0 * lda, lda, at, 0, rows, rows, m);   // at[f * rows + r] = a[(r0 + r) * lda + f]
                         if (mPad > m) Array.Clear(at, m * rows, (mPad - m) * rows);
                         JitGemmAvx2.RunJit(at.AsSpan(0, mPad * rows), b.AsSpan(r0 * n, rows * n),
                             partial.AsSpan(chunk * mPad * n, mPad * n), mPad, n, rows, forceParallel: false);

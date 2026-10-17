@@ -4535,6 +4535,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
     }
 
+    /// <summary>True when no parameter takes the device update path (a resident buffer on a GPU backend).</summary>
+    private static bool AllParametersOnHost(
+        Engines.DirectGpu.IGpuBuffer?[] gpuParam, Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends)
+    {
+        for (int p = 0; p < gpuParam.Length; p++)
+            if (gpuParam[p] is not null && gpuBackends[p] is not null) return false;
+        return true;
+    }
+
     private unsafe void ConfigureOptimizerFloat(
         OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay,
         FusedOptimizerExtras extras)
@@ -4935,6 +4944,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             lbfgsState.LbfgsHasPrev = false;
         }
 
+        int[]? adamWSegments = null;   // AdamWUpdateMultiParallel's segment list, reused across steps
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -5401,6 +5411,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
                         CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
                     }
+                }
+                return;
+            }
+
+            // Host AdamW with fp32 moments over host parameters only: one pool dispatch across every tensor's segments
+            // (FusedOptimizer.AdamWUpdateMultiParallel), bit-identical to the per-parameter loop below, which updated a
+            // model of many small tensors one tensor at a time on this thread.
+            if (optType == OptimizerType.AdamW && !useBf16Moments && !useInt8Moments && AllParametersOnHost(gpuParam, gpuBackends))
+            {
+                FusedOptimizer.AdamWUpdateMultiParallel(paramArrays, paramOffsets, gradArrays, gradOffsets, m, v, lengths,
+                    paramCount, lr, b1, b2, epsVal, wd, stepBc1, stepBc2, ref adamWSegments);
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                    MarkHostWeightMutated(p);
                 }
                 return;
             }
@@ -10058,6 +10083,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var numOps = MathHelper.GetNumericOperations<T>();
         double totalNormSq = 0.0;
         _hostClipCovered.Clear();
+        // Every dense float gradient's sum of squares first, all of them in one pool dispatch (SumSquaresMany); the
+        // loop below then adds the per-tensor sums in tensor order, so the total is bit-identical to summing each
+        // tensor where it falls.
+        _clipFloatItems.Clear();
+        for (int p = 0; p < gradients.Length; p++)
+        {
+            var tensor = gradients[p];
+            if (tensor == null || SkipUnexercised(p)) continue;
+            if (tensor.IsContiguous && tensor.GetCpuBackingForStridedRead(out int floatOffset) is float[] fItem && floatOffset == 0)
+                _clipFloatItems.Add((fItem, tensor.Length));
+        }
+        if (_clipFloatSums.Length < _clipFloatItems.Count) _clipFloatSums = new double[_clipFloatItems.Count];
+        SumSquaresMany(_clipFloatItems, _clipFloatSums, ref _clipPartials, ref _clipUnits);
+        int floatItem = 0;
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
@@ -10073,7 +10112,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 totalNormSq += SumSquaresVectorized(dNorm, len);
             else if (tensor.IsContiguous && offset == 0 && arr is float[] fNorm)
             {
-                totalNormSq += SumSquaresChunked(fNorm, len);
+                if (floatItem >= _clipFloatItems.Count || !ReferenceEquals(_clipFloatItems[floatItem].Array, fNorm))
+                    throw new InvalidOperationException("Gradient clip: a float gradient's backing changed between the norm passes.");
+                totalNormSq += _clipFloatSums[floatItem++];
                 _hostClipCovered.Add((fNorm, len));
             }
             else if (tensor.IsContiguous && arr is not null)
@@ -10094,8 +10135,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         double totalNorm = Math.Sqrt(totalNormSq);
         if (totalNorm <= maxNorm) return;
 
-        // Step 2: scale every gradient by maxNorm / (totalNorm + 1e-6).
+        // Step 2: scale every gradient by maxNorm / (totalNorm + 1e-6). The dense float gradients are gathered and scaled
+        // in one pool dispatch (ScaleInPlaceMany), the rest in place as before.
         T scale = numOps.FromDouble(maxNorm / (totalNorm + 1e-6));
+        _clipFloatItems.Clear();
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
@@ -10109,13 +10152,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             else if (offset == 0 && arr is float[] fScale)
             {
-                ScaleInPlaceChunked(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
-                tensor.IncrementVersion();
+                _clipFloatItems.Add((fScale, len));
+                _clipScaledTensors.Add(tensor);
             }
             else
                 tensor.ScaleLogicalInPlace(scale);
         }
+        ScaleInPlaceMany(_clipFloatItems, (float)(maxNorm / (totalNorm + 1e-6)), ref _clipUnits);
+        foreach (var scaled in _clipScaledTensors) scaled.IncrementVersion();
+        _clipScaledTensors.Clear();
+        _clipFloatItems.Clear();
     }
+
+    private readonly List<Tensor<T>> _clipScaledTensors = new();
+
+    // Scratch of the host gradient clip's multi-tensor passes (SumSquaresMany / ScaleInPlaceMany), reused across steps.
+    private readonly List<(float[] Array, int Length)> _clipFloatItems = new();
+    private double[] _clipFloatSums = Array.Empty<double>();
+    private double[] _clipPartials = Array.Empty<double>();
+    private int[] _clipUnits = Array.Empty<int>();
 
     // Below this many FMAs a linear-backward GEMM stays on the direct managed kernel: BlasManaged's thin-M kernels
     // start at 1M FMAs and its general strategy path loses to SimdGemm on small shapes (measured on the parity MLP's
@@ -10477,6 +10532,92 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             System.Buffers.ArrayPool<double>.Shared.Return(partials);
         }
     }
+
+    /// <summary>
+    /// <see cref="SumSquaresChunked"/> of every item, all items' chunks in ONE pool dispatch: sums[i] is bit-identical to
+    /// SumSquaresChunked(items[i]) (each chunk is the same SumSquaresRange; a multi-chunk item adds its partials in chunk
+    /// order from 0.0, a single-chunk item is its one partial). Per-tensor calls ran every gradient under the chunk size
+    /// on the calling thread in turn: on the parity Transformer (30 tensors, 69K elements) the clip went from ~92 to ~67 us
+    /// per step with this and <see cref="ScaleInPlaceMany"/> (Ryzen 7 4800H, steps 100-200). <paramref name="partials"/>
+    /// and <paramref name="units"/> are caller-owned scratch.
+    /// </summary>
+    internal static void SumSquaresMany(
+        List<(float[] Array, int Length)> items, double[] sums, ref double[] partials, ref int[] units)
+    {
+        int unitCount = 0;
+        long total = 0;
+        foreach (var (_, len) in items)
+        {
+            unitCount += Math.Max(1, (len + ClipChunkElements - 1) / ClipChunkElements);
+            total += len;
+        }
+        if (partials.Length < unitCount) partials = new double[unitCount];
+        if (units.Length < 3 * unitCount) units = new int[3 * unitCount];
+        int u = 0;
+        for (int i = 0; i < items.Count; i++)
+        {
+            int len = items[i].Length;
+            for (int s = 0; s == 0 || s < len; s += ClipChunkElements)
+            {
+                units[u++] = i; units[u++] = s; units[u++] = Math.Min(len, s + ClipChunkElements);
+            }
+        }
+        var p = partials;
+        var list = units;
+        if (unitCount > 1 && total >= ClipParallelMinElements)
+            Helpers.PersistentParallelExecutor.Instance.Execute(unitCount, k =>
+                p[k] = SumSquaresRange(items[list[3 * k]].Array, list[3 * k + 1], list[3 * k + 2]));
+        else
+            for (int k = 0; k < unitCount; k++)
+                p[k] = SumSquaresRange(items[list[3 * k]].Array, list[3 * k + 1], list[3 * k + 2]);
+        int next = 0;
+        for (int i = 0; i < items.Count; i++)
+        {
+            int chunks = Math.Max(1, (items[i].Length + ClipChunkElements - 1) / ClipChunkElements);
+            if (chunks == 1) { sums[i] = p[next++]; continue; }
+            double s = 0.0;
+            for (int c = 0; c < chunks; c++) s += p[next++];
+            sums[i] = s;
+        }
+    }
+
+    /// <summary>Each item's [0, Length) times <paramref name="scale"/>, every item's chunks in one pool dispatch (one
+    /// multiply per element, so identical to <see cref="ScaleInPlaceChunked"/> per item).</summary>
+    internal static void ScaleInPlaceMany(List<(float[] Array, int Length)> items, float scale, ref int[] units)
+    {
+        int unitCount = 0;
+        long total = 0;
+        foreach (var (_, len) in items)
+        {
+            unitCount += (len + ClipChunkElements - 1) / ClipChunkElements;
+            total += len;
+        }
+        if (units.Length < 3 * unitCount) units = new int[3 * unitCount];
+        int u = 0;
+        for (int i = 0; i < items.Count; i++)
+            for (int s = 0; s < items[i].Length; s += ClipChunkElements)
+            {
+                units[u++] = i; units[u++] = s; units[u++] = Math.Min(items[i].Length, s + ClipChunkElements);
+            }
+        var list = units;
+        void Run(int k)
+        {
+            var a = items[list[3 * k]].Array;
+            int start = list[3 * k + 1], end = list[3 * k + 2];
+            int w = System.Numerics.Vector<float>.Count;
+            var vs = new System.Numerics.Vector<float>(scale);
+            int i = start;
+            for (; i <= end - w; i += w) (new System.Numerics.Vector<float>(a, i) * vs).CopyTo(a, i);
+            for (; i < end; i++) a[i] *= scale;
+        }
+        if (unitCount > 1 && total >= ClipParallelMinElements)
+            Helpers.PersistentParallelExecutor.Instance.Execute(unitCount, Run);
+        else
+            for (int k = 0; k < unitCount; k++) Run(k);
+    }
+
+    /// <summary>Below this many gradient elements in all, the multi-tensor norm and scale stay on the calling thread.</summary>
+    private const int ClipParallelMinElements = 1 << 14;
 
     /// <summary><see cref="ScaleInPlaceVectorized(float[], int, float)"/> over the same chunks, in parallel. Each element
     /// is one multiply whichever chunk or lane computes it, so the result is identical to the serial pass.</summary>

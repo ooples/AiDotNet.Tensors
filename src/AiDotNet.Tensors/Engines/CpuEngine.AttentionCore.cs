@@ -651,14 +651,8 @@ public partial class CpuEngine
 #endif
 
     /// <summary>block[d * stride + c] = src[srcOff + c * rowStride + d] for d &lt; depth, c &lt; cols.</summary>
-    private static void TransposeKeyBlock(float[] src, int srcOff, int rowStride, float[] block, int depth, int cols, int stride)
-    {
-        for (int c = 0; c < cols; c++)
-        {
-            int s = srcOff + c * rowStride;
-            for (int d = 0; d < depth; d++) block[d * stride + c] = src[s + d];
-        }
-    }
+    private static void TransposeKeyBlock(float[] src, int srcOff, int rowStride, float[] block, int depth, int cols, int stride) =>
+        Simd.SimdGemm.Transpose(src, srcOff, rowStride, block, 0, stride, cols, depth);
 
     /// <summary>max of x[off..+n] (NegativeInfinity when n is 0); max is order-independent, so for finite scores this
     /// equals the scalar scan exactly. A NaN score makes its row's output NaN whichever NaN rule the max follows.</summary>
