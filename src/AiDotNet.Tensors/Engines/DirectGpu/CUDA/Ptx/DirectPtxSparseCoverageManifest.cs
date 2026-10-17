@@ -31,6 +31,7 @@ internal static class DirectPtxSparseCoverageManifest
     private const string Csr = "CSR: int32 row pointers [M+1], int32 column indices [nnz], values [nnz]; dense row-major [K,N] and [M,N]";
     private const string Edges = "edge list: int32 source/target [E]; node features row-major [V,F]";
     private const string Segments = "CSR segments: int32 row pointers [M+1]; values or rows in segment order";
+    private const string CsrFloatIndex = "CSR: fp32 row pointers [M+1] and column indices [nnz] holding integral values; dense row-major input [K,N] and output [M,N]";
 
     internal static IReadOnlyList<DirectPtxSparseCoverageCell> All { get; } =
     [
@@ -60,10 +61,12 @@ internal static class DirectPtxSparseCoverageManifest
             "blocked: needs a backend entry point, then segmented-row-reduction families"),
         Planned("SegmentMax", "NVRTC segment_max (kernel only)", "out[s,:] = max of rows in segment s", Segments, "FP32",
             "blocked: needs a backend entry point, then segmented-row-reduction families"),
-        Planned("CudaBackend.CsrSegmentedMax", "NVRTC csr_segmented_max", "max of each CSR row's values", Segments, "FP32",
-            "segmented-value-reduction families"),
-        Planned("CudaBackend.CsrSegmentedMin", "NVRTC csr_segmented_min", "min of each CSR row's values", Segments, "FP32",
-            "segmented-value-reduction families"),
+        Experimental("CudaBackend.CsrSegmentedMax", "NVRTC csr_segmented_max",
+            "output[i,j] = max over the row's nonzeros p of input[col_idx[p], j]; 0 for an empty row", CsrFloatIndex, "FP32",
+            "v1 SM86 lanes-per-row exact (M,K,N) cells, the CSR SpMM family's: (2708,2708,64) (19717,500,128) (10000,10000,32) (512,512,64)"),
+        Experimental("CudaBackend.CsrSegmentedMin", "NVRTC csr_segmented_min",
+            "output[i,j] = min over the row's nonzeros p of input[col_idx[p], j]; 0 for an empty row", CsrFloatIndex, "FP32",
+            "v1 SM86 lanes-per-row exact (M,K,N) cells, the CSR SpMM family's: (2708,2708,64) (19717,500,128) (10000,10000,32) (512,512,64)"),
         Planned("CudaBackend.CsrSegmentedStdDev", "NVRTC csr_segmented_stddev", "standard deviation of each CSR row's values", Segments, "FP32",
             "segmented-value-reduction families (two-pass or Welford, fixed order)"),
         Planned("CsrSpMMBackwardB", "NVRTC csr_spmm_backward_b / csr_spmm_backward_b_deterministic (kernel only)", "dB = A_csr^T * dOut", Csr, "FP32",
