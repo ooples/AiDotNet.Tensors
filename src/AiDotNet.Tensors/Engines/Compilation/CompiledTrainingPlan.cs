@@ -10158,18 +10158,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var da = TryGetLiveFloatBacking(gradA);
             var db = TryGetLiveFloatBacking(gradB);
             if (dc is null || a is null || b is null || da is null || db is null) return null;
+            float[]? productScratch = null;
             return _ =>
             {
                 // dA[M,K] = dC[M,N] · B[K,N]ᵀ
                 if (needA)
                 {
-                    SharedOperandGemm(dc, n, false, b, n, true, da, m, n, k, accumulateA);
+                    SharedOperandGemm(dc, n, false, b, n, true, da, m, n, k, accumulateA, ref productScratch);
                     inputA.Grad = gradA;
                 }
                 // dB[K,N] = A[M,K]ᵀ · dC[M,N]
                 if (needB)
                 {
-                    SharedOperandGemm(a, k, true, dc, n, false, db, k, m, n, accumulateB);
+                    SharedOperandGemm(a, k, true, dc, n, false, db, k, m, n, accumulateB, ref productScratch);
                     inputB.Grad = gradB;
                 }
             };
@@ -10208,11 +10209,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// </summary>
     private static void SharedOperandGemm(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c,
-        int rows, int inner, int cols, bool accumulate)
+        int rows, int inner, int cols, bool accumulate, ref float[]? scratch)
     {
         if (!accumulate)
         {
             LinearBackwardGemm(a, lda, transA, b, ldb, transB, c, rows, inner, cols);
+            return;
+        }
+        // The small-K panel routes overwrite, so an accumulating product lands in scratch and is added: a Transformer's
+        // shared Q/K/V input gradient dY[2048,64]·W[64,64]ᵀ took 31 us there plus the add, against ~80 us accumulating
+        // through SgemmAdd (3950X).
+        int length = rows * cols;
+        var product = scratch is { } owned && owned.Length >= length ? owned : (scratch = new float[length]);
+        if (SimdGemm.TryGemmSmallJit(a, lda, transA, b, ldb, transB, product, rows, inner, cols))
+        {
+            int width = System.Numerics.Vector<float>.Count, i = 0;
+            for (; i + width <= length; i += width)
+                (new System.Numerics.Vector<float>(c, i) + new System.Numerics.Vector<float>(product, i)).CopyTo(c, i);
+            for (; i < length; i++) c[i] += product[i];
             return;
         }
         if (!BlasProvider.ShouldRouteManaged(rows, cols, inner, transA, transB, typeof(float))
