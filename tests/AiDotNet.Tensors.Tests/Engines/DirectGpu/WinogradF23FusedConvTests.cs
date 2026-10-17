@@ -103,13 +103,15 @@ public sealed class WinogradF23FusedConvTests
     }
 
     [SkippableTheory]
-    [InlineData(8, 64, 64, 32, 1)]
-    [InlineData(8, 512, 512, 4, 1)]  // deep layer: the channel reduction is split across blocks
-    [InlineData(8, 256, 256, 8, 1)]
-    [InlineData(3, 5, 7, 9, 1)]
-    [InlineData(2, 16, 40, 11, 0)]
-    [InlineData(1, 33, 70, 7, 2)]
-    public void Forward_MatchesFloat64ReferenceAndIsBitReproducible(int batch, int inC, int outC, int size, int pad)
+    [InlineData(8, 64, 64, 32, 1, 0)]
+    [InlineData(8, 512, 512, 4, 1, 0)]  // deep layer: the heuristic's split count, which depends on the device's SMs
+    [InlineData(8, 512, 512, 4, 1, 4)]  // the same layer forced to 4 splits: the split reducer runs on every device
+    [InlineData(8, 256, 256, 8, 1, 0)]
+    [InlineData(3, 5, 7, 9, 1, 0)]
+    [InlineData(3, 5, 7, 9, 1, 3)]      // more splits forced than the one eight-channel step: capped, still correct
+    [InlineData(2, 16, 40, 11, 0, 0)]
+    [InlineData(1, 33, 70, 7, 2, 0)]
+    public void Forward_MatchesFloat64ReferenceAndIsBitReproducible(int batch, int inC, int outC, int size, int pad, int forcedSplits)
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
@@ -155,14 +157,28 @@ public sealed class WinogradF23FusedConvTests
             foreach (var target in new[] { y1, y2 })
             {
                 var a = new CudaConv2DArgs(dx, dw, target, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
-                Assert.True(backend.TryConv2DForwardWinogradF23Fused(a), "fused Winograd refused an admitted shape");
+                Assert.True(backend.TryConv2DForwardWinogradF23Fused(a, forcedSplits), "fused Winograd refused an admitted shape");
             }
             backend.Synchronize();
             CheckAgainst(sum, magnitude, backend.DownloadBuffer(y1), backend.DownloadBuffer(y2),
-                $"y N{batch} C{inC} K{outC} {size}x{size} pad{pad}");
+                $"y N{batch} C{inC} K{outC} {size}x{size} pad{pad} splits{forcedSplits}");
         }
     }
 
+    // The split choice the forced-split case stands in for: ResNet's 512@4x4 layer at batch 8 is 16 tile blocks of 64
+    // eight-channel steps. A device with many SMs splits it (5 on 80 SMs); a 16-SM device keeps it whole, which is why
+    // the theory above forces splits rather than relying on the device it runs on. Needs no GPU.
+    [Fact]
+    public void Deep_layer_split_choice_follows_the_SM_count()
+    {
+        Assert.Equal(5, CudaBackend.ChooseWinogradF23FusedSplits(blocks: 16, inC: 512, sms: 80));
+        Assert.Equal(1, CudaBackend.ChooseWinogradF23FusedSplits(blocks: 16, inC: 512, sms: 16));
+        Assert.Equal(4, CudaBackend.SplitWinogradF23FusedReduction(512, 4, out int rPerSplit));
+        Assert.Equal(128, rPerSplit);
+        // 5 requested splits of 64 steps round to 13-step (104-channel) slices: 5 non-empty splits.
+        Assert.Equal(5, CudaBackend.SplitWinogradF23FusedReduction(512, 5, out rPerSplit));
+        Assert.Equal(104, rPerSplit);
+    }
     // The wiring: the forward and input-gradient slots register the fused route as its own candidate, never the reference.
     [SkippableFact]
     public void The_conv_slots_register_the_fused_candidates()
