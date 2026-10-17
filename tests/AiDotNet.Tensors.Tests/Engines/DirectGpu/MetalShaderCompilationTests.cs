@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using Xunit;
 
@@ -70,6 +71,7 @@ public sealed class MetalShaderCompilationTests
         yield return ("Categorical", () => MetalCategoricalKernels.Source, true);
         yield return ("BatchExecution",() => MetalBatchExecutionKernels.Source, true);
         yield return ("TorchParityF32", () => MetalBatchExecutionKernels.TorchParitySource, true);
+        yield return ("Winograd", () => WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), true);
     }
 
     internal static string? FindCompiler()

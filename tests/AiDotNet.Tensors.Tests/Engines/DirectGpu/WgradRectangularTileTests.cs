@@ -59,8 +59,8 @@ public sealed class WgradRectangularTileTests : IClassFixture<DirectGpuTensorEng
         using var dy = cuda.AllocateBuffer(Rand(batch * outC * outSize * outSize, 2, 1f));
         using var reference = cuda.AllocateBuffer(outC * inC * k * k);
         using var dw = cuda.AllocateBuffer(outC * inC * k * k);
-        var refArgs = new CudaConv2DBackwardArgs(x, dy, reference, true, batch, inC, size, size, outC, outSize, outSize, k, k, s, s, p, p, 1, 1);
-        var args = new CudaConv2DBackwardArgs(x, dy, dw, true, batch, inC, size, size, outC, outSize, outSize, k, k, s, s, p, p, 1, 1);
+        var refArgs = new TunedConv2DBackwardArgs(x, dy, reference, true, batch, inC, size, size, outC, outSize, outSize, k, k, s, s, p, p, 1, 1);
+        var args = new TunedConv2DBackwardArgs(x, dy, dw, true, batch, inC, size, size, outC, outSize, outSize, k, k, s, s, p, p, 1, 1);
         Assert.True(cuda.Conv2DBackwardKernelViaImplicit(refArgs), "implicit route refused");
         var expected = cuda.DownloadBuffer(reference);
         double scale = Math.Max(1.0, expected.Max(v => Math.Abs((double)v)));

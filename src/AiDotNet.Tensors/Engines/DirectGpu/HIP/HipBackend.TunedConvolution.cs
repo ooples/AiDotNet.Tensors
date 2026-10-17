@@ -35,6 +35,11 @@ public sealed partial class HipBackend
                             _ => HasTunedKernel("conv2d_tiled"), (in TunedConv2DArgs a) => Conv2DTiledOrDirect(a, tiled: true)),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.direct", TunedKernelOrigin.Builtin, true,
                             _ => HasTunedKernel("conv2d_direct"), (in TunedConv2DArgs a) => Conv2DTiledOrDirect(a, tiled: false)),
+                        // #1368: Winograd as transforms around one batched GEMM, where conv2d_winograd_f2x2_3x3 computes
+                        // each output tile's whole channel sum in one thread.
+                        new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
+                            shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) Conv2DGeneric(a); }),
                     };
                     _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                         new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,

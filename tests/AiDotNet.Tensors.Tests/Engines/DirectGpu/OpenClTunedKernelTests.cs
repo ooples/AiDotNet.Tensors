@@ -409,9 +409,10 @@ public sealed class OpenClTunedKernelTests
                 backend.Synchronize();
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
-            // Every candidate applies to these small shapes, so a variant that silently dropped out fails here.
+            // Every candidate applies to these small shapes, so a variant that silently dropped out fails here --
+            // except the Winograd route, which admits only 3x3 stride-1 undilated shapes (WinogradF23Pipeline).
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (k > 7 ? 1 : 0));
+                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 1));
         }
     }
 }

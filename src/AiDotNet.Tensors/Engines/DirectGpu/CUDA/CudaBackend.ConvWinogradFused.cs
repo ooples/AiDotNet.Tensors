@@ -50,7 +50,7 @@ public sealed partial class CudaBackend
     /// Input gradient dX = conv(dY, w') (w' the 180-degree-rotated, channel-transposed filter, padding 2 - pad) through
     /// the fused F(2x2) kernel. Overwrites dX. Same admission as <see cref="TryConv2DBackwardDataWinogradF23"/>.
     /// </summary>
-    internal bool TryConv2DBackwardDataWinogradF23Fused(in CudaConv2DBackwardArgs a)
+    internal bool TryConv2DBackwardDataWinogradF23Fused(in TunedConv2DBackwardArgs a)
     {
         if (!WinogradF23AdmitsData(a) || !EnsureWinogradFusedModule()) return false;
         return RunWinogradF23Fused(a.First, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth, 2 - a.PadH, "wfz_filter_flip",

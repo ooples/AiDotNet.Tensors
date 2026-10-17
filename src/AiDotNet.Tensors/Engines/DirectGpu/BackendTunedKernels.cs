@@ -157,6 +157,59 @@ internal readonly struct TunedNormBackwardArgs
     /// </summary>
     internal float Epsilon { get; }
 }
+/// <summary>
+/// Conv2D backward arguments. Weight gradient: First = input, Second = gradOutput, Output = gradKernel. Input gradient:
+/// First = gradOutput, Second = kernel, Output = gradInput. Sizes as in <see cref="TunedConv2DArgs"/>. Shared by every
+/// backend's backward slots.
+/// </summary>
+internal readonly struct TunedConv2DBackwardArgs
+{
+    internal TunedConv2DBackwardArgs(IGpuBuffer first, IGpuBuffer second, IGpuBuffer output, bool weightGradient,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    {
+        First = first; Second = second; Output = output; WeightGradient = weightGradient;
+        Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
+        OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
+        KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW;
+        PadH = padH; PadW = padW; DilationH = dilationH; DilationW = dilationW;
+    }
+
+    internal IGpuBuffer First { get; }
+    internal IGpuBuffer Second { get; }
+    internal IGpuBuffer Output { get; }
+    internal bool WeightGradient { get; }
+    internal int Batch { get; }
+    internal int InChannels { get; }
+    internal int InHeight { get; }
+    internal int InWidth { get; }
+    internal int OutChannels { get; }
+    internal int OutHeight { get; }
+    internal int OutWidth { get; }
+    internal int KernelH { get; }
+    internal int KernelW { get; }
+    internal int StrideH { get; }
+    internal int StrideW { get; }
+    internal int PadH { get; }
+    internal int PadW { get; }
+    internal int DilationH { get; }
+    internal int DilationW { get; }
+
+    internal int OutputCount => WeightGradient
+        ? OutChannels * InChannels * KernelH * KernelW
+        : Batch * InChannels * InHeight * InWidth;
+
+    /// <summary>Shape class: every geometric parameter, laid out as <see cref="TunedConv2DArgs.Shape"/>.</summary>
+    internal unsafe TunedShape Shape()
+    {
+        int* d = stackalloc int[15];
+        d[0] = Batch; d[1] = InChannels; d[2] = InHeight; d[3] = InWidth; d[4] = OutChannels;
+        d[5] = KernelH; d[6] = KernelW; d[7] = StrideH; d[8] = StrideW; d[9] = PadH; d[10] = PadW;
+        d[11] = DilationH; d[12] = DilationW; d[13] = OutHeight; d[14] = OutWidth;
+        return TunedShape.Create(TunedKernelDType.Float32, new ReadOnlySpan<int>(d, 15));
+    }
+}
+
 /// <summary>2-D convolution arguments (any backend): NCHW input, [Cout, Cin, kH, kW] filter.</summary>
 internal readonly struct TunedConv2DArgs
 {

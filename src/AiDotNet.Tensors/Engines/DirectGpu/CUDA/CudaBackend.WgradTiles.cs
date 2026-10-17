@@ -10,7 +10,7 @@ public sealed partial class CudaBackend
     /// 128x128, 64x128 or 128x64) and split-K count (0: enough splits for about two blocks per SM). Overwrites dW.
     /// False: nothing launched.
     /// </summary>
-    internal bool TryConv2DBackwardKernelEngineTiled(in CudaConv2DBackwardArgs a, int tileM, int tileN, int splits)
+    internal bool TryConv2DBackwardKernelEngineTiled(in TunedConv2DBackwardArgs a, int tileM, int tileN, int splits)
     {
         if (!a.WeightGradient || a.Batch <= 0 || a.OutChannels <= 0) return false;
         string? name = (tileM, tileN) switch

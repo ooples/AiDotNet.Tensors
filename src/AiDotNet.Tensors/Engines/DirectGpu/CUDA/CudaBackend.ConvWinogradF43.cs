@@ -43,7 +43,7 @@ public sealed partial class CudaBackend
     /// 2 - pad (the same admission as the F(2x2) input gradient). Overwrites dX. False (nothing launched) when the shape
     /// is not admitted, the module is unavailable or scratch cannot be sized.
     /// </summary>
-    internal bool TryConv2DBackwardDataWinogradF43(in CudaConv2DBackwardArgs a)
+    internal bool TryConv2DBackwardDataWinogradF43(in TunedConv2DBackwardArgs a)
     {
         if (!WinogradF23AdmitsData(a) || !EnsureWinogradF43Module()) return false;
         return RunWinogradF43(a.First, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth, 2 - a.PadH,
@@ -57,7 +57,7 @@ public sealed partial class CudaBackend
     /// thirty-six GEMMs over the P tiles (split along P when the K x C grid alone would leave SMs idle), and the output
     /// transform that sums the splits into dW[K][C][3][3]. Overwrites the gradient. Same admission as the F(3,2) path.
     /// </summary>
-    internal unsafe bool TryConv2DBackwardFilterWinogradF34(in CudaConv2DBackwardArgs a)
+    internal unsafe bool TryConv2DBackwardFilterWinogradF34(in TunedConv2DBackwardArgs a)
     {
         if (!WinogradF32AdmitsFilter(a) || !EnsureWinogradF43Module()) return false;
         int n = a.Batch, c = a.InChannels, k = a.OutChannels, h = a.InHeight, w = a.InWidth, pad = a.PadH;
