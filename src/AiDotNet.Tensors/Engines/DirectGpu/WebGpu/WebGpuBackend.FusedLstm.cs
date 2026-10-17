@@ -8,5 +8,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 public sealed partial class WebGpuBackend : IFusedLstmSequenceTraining
 {
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => int.MaxValue;
+    bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 }
 #endif
