@@ -155,6 +155,43 @@ public class SimdGemmDirectParallel2DTests
         }
     }
 
+    [Theory]
+    [InlineData(64, 784, 512)]
+    [InlineData(67, 100, 37)]    // ragged rows (67 = 11*6 + 1) and columns (37 = 2*16 + 5)
+    [InlineData(6, 9, 16)]
+    public void OverwritesEveryElementOfC_WithoutAClearedOutput(int m, int k, int n)
+    {
+        // Sgemm and BlasManaged hand the 2D kernel an uncleared C: every element must be stored, edges included.
+        var a = Rand(m * k, 5);
+        var b = Rand(k * n, 6);
+        var c = new float[m * n];
+        Array.Fill(c, float.NaN);
+        Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, c, m, k, n, allowParallel: true));
+        AssertMatchesReference(Reference(a, b, m, k, n), c, k, "C over a NaN-filled destination");
+    }
+
+    [Fact]
+    public void BlasManagedThinM_RoutesABatchSizedNoTransposeGemmToTheDirect2DPath()
+    {
+        // BlasManaged's thin-M kernel split rows, so every worker streamed all of B; in a training step B (the weights)
+        // arrives cold from the optimizer and that ran 2-3x slower than the column-first 2D split. The training
+        // forward routes through BlasManaged, so its batch-sized no-transpose GEMMs must land on the 2D kernel.
+        const int m = 64, k = 784, n = 512;
+        var a = Rand(m * k, 3);
+        var b = Rand(k * n, 4);
+        var direct = new float[m * n];
+        Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, direct, m, k, n, allowParallel: true));
+
+        var routed = new float[m * n];
+        int runsBefore = SimdGemm.t_directParallel2DRuns;
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, routed, n, m, n, k,
+            new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune });
+        Assert.Equal(runsBefore + 1, SimdGemm.t_directParallel2DRuns);
+        for (int i = 0; i < routed.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(direct[i]) == BitConverter.SingleToInt32Bits(routed[i]),
+                $"routed C[{i}] = {routed[i]:G9}, direct path {direct[i]:G9}");
+    }
+
     [Fact]
     public void TooNarrowForTheKernel_ReturnsFalseAndLeavesOutputUntouched()
     {

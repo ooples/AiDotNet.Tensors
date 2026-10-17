@@ -127,6 +127,67 @@ public class SmallJitGemmTests
         }
     }
 
+#if NETCOREAPP
+    /// <summary>
+    /// The rows below the last full 6-row panel and the columns right of the last full 16-column panel come from the
+    /// managed edge pass, which sums a[i,k]·b[k,j] for k in order from zero, a multiply then an add -- the scalar loop it
+    /// replaced, bit for bit. Widths cover a full 8-lane vector plus a scalar tail (n = 16·q + 11) and edge rows of
+    /// 1 to 5 (m = 6·p + r).
+    /// </summary>
+    [Theory]
+    [InlineData(64, 128, 512)]   // 4 edge rows, no edge columns
+    [InlineData(67, 40, 539)]    // 1 edge row; an 11-wide right strip (one vector, three scalars)
+    [InlineData(23, 9, 27)]      // 5 edge rows; tiny k
+    public async Task EdgeRowsAndColumns_EqualTheOrderedScalarSum(int m, int k, int n)
+    {
+        await Task.Yield();
+        if (!JitGemmAvx2.Available) return;
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(m * 131 + k * 17 + n);
+        var a = new float[m * k];
+        var b = new float[k * n];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        var c = new float[m * n];
+        for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
+
+        JitGemmAvx2.RunJit(a, b, c, m, n, k);
+
+        int mFull = m - m % 6, nFull = n - n % 16;
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                if (i < mFull && j < nFull) continue;   // panel kernel output (FMA): covered by MatchesDoubleProduct
+                float acc = 0f;
+                for (int p = 0; p < k; p++) acc += a[i * k + p] * b[p * n + j];
+                float got = c[i * n + j];
+                if (BitConverter.SingleToInt32Bits(got) != BitConverter.SingleToInt32Bits(acc))
+                    Assert.Fail($"c[{i},{j}] = {got:R}, the ordered scalar sum is {acc:R}");
+            }
+    }
+
+    /// <summary>
+    /// Inside the thin-M box BlasManaged's direct-parallel kernel serves, the small-K routes stand aside: a 64-row
+    /// batch is ~11 of the panel's 6-row blocks, and the transposed-B route adds a serial transpose of B, so they ran
+    /// 2-8x slower there ([64,128]x[128,512]: 72 vs 36 µs; dY[64,128]·W[512,128]ᵀ: 204 vs 34 µs). A decline writes nothing.
+    /// </summary>
+    [Theory]
+    [InlineData(64, 128, 512, false)]   // a linear layer's forward at batch 64
+    [InlineData(64, 128, 512, true)]    // its input gradient dY·Wᵀ
+    [InlineData(512, 128, 128, false)]
+    public async Task DeclinesTheThinMBoxBlasManagedServes(int m, int k, int n, bool transB)
+    {
+        await Task.Yield();
+        Assert.True(AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.ThinMDirectServesShape(m, n, k, false, transB)
+            || !System.Runtime.Intrinsics.X86.Fma.IsSupported, "the shape is meant to be inside the thin-M box");
+        var a = new float[m * k];
+        var b = new float[k * n];
+        var c = new float[m * n];
+        Array.Fill(c, float.NaN);
+        Assert.False(SimdGemm.TryGemmSmallJit(a, k, false, b, transB ? k : n, transB, c, m, k, n));
+        Assert.All(c, v => Assert.True(float.IsNaN(v)));
+    }
+#endif
+
     private static void AssertClose(double[] expected, float[] actual, string what)
     {
         Assert.Equal(expected.Length, actual.Length);
