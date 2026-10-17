@@ -283,7 +283,7 @@ public sealed partial class CudaBackend
 
         public void CapturePrologue()
         {
-            if (!_backend._kernelCache.TryGetValue("step_io_prologue", out var kernel))
+            if (!_backend._kernelCache.TryGetValue("step_io_prologue", out var prologueKernel))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: step_io_prologue");
             var args = default(StepIoArgs);
             bool vector = true;
@@ -312,12 +312,12 @@ public sealed partial class CudaBackend
             void** launchArgs = stackalloc void*[1];
             launchArgs[0] = &args;
             uint blocks = (uint)Math.Max(1, Math.Min(1024, (total + 255) / 256));
-            _backend.LaunchKernel(kernel, blocks, 256, launchArgs);
+            _backend.LaunchKernel(prologueKernel, blocks, 256, launchArgs);
         }
 
         public void CaptureEpilogue(IGpuBuffer? loss, int lossCount)
         {
-            if (!_backend._kernelCache.TryGetValue("step_io_epilogue", out var kernel))
+            if (!_backend._kernelCache.TryGetValue("step_io_epilogue", out var epilogueKernel))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: step_io_epilogue");
             if (lossCount < 0 || lossCount > StepIoLossCapacity) throw new ArgumentOutOfRangeException(nameof(lossCount));
             ulong stateAddress = (ulong)_state!.Handle.ToInt64(), resultsAddress = (ulong)_resultsDevice.ToInt64();
@@ -326,7 +326,7 @@ public sealed partial class CudaBackend
             void** launchArgs = stackalloc void*[5];
             launchArgs[0] = &stateAddress; launchArgs[1] = &resultsAddress; launchArgs[2] = &guard;
             launchArgs[3] = &lossPtr; launchArgs[4] = &count;
-            _backend.LaunchKernel(kernel, 1, 32, launchArgs);
+            _backend.LaunchKernel(epilogueKernel, 1, 32, launchArgs);
         }
 
         public ReadOnlySpan<float> Loss(uint replay, int count)
