@@ -87,56 +87,204 @@ __device__ __forceinline__ void sg_store(float* __restrict__ C, int M, int N, in
 
 // C[M,N] = act(alpha * A[M,K] * op(B) + beta * C + bias), row-major; op(B) is B[K,N], or B[N,K] transposed when
 // transB; bias[N] is optional (null) and act is ReLU when relu, else identity.
-// One 32x64 output tile per 64-thread block, K swept in SG_BK-deep chunks. Requires N and K multiples of four and
-// 16-byte-aligned operands (the host checks).
-extern ""C"" __global__ __launch_bounds__(SG_THREADS) void skinny_gemm(
+// One 32x64 output tile per block of four 64-thread groups. K is swept in SG_BK-deep chunks staged in shared memory;
+// each group accumulates the whole tile (4x8 per thread) over its quarter of every chunk, and the four partial tiles
+// are added in group order at the end (deterministic). The next chunk's operands are loaded into registers before the
+// current chunk's FMAs. One 64-thread block per tile (two warps, the chunk's load then its FMAs in sequence) left a
+// d_model-64 Transformer's projections latency-bound: the in-projection [256,64]x[64,192] took 5.9 us on 24 blocks.
+// Requires N and K multiples of four and 16-byte-aligned operands (the host checks).
+#define SG_GROUPS 4
+#define SG_BLOCK (SG_GROUPS * SG_THREADS)
+// BM: the tile's rows (32, 16 or 8; each thread holds BM / 8 rows x 8 columns). The host takes the smallest that still
+// gives the grid enough blocks: a 256-row product with N = 64 has 8 tiles of 32 rows, 8 SMs' worth.
+template <int BM>
+__device__ __forceinline__ void skinny_gemm_body(
     const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
     int M, int N, int K, int transB, float alpha, float beta, const float* __restrict__ bias, int relu)
 {
-    __shared__ __align__(16) float As[SG_BK][SG_BM + 4];
-    __shared__ __align__(16) float Bs[SG_BK][SG_BN + 4];
-    int tx = threadIdx.x & 7, ty = threadIdx.x >> 3;
-    int row0 = blockIdx.y * SG_BM, col0 = blockIdx.x * SG_BN;
-    float acc[4][8];
-    _Pragma(""unroll"") for (int i = 0; i < 4; i++)
+    constexpr int R = BM / 8;
+    constexpr int STAGE = SG_BK * (BM + 4) + SG_BK * (SG_BN + 4);
+    constexpr int PART = SG_GROUPS * BM * SG_BN;
+    // As / Bs for one chunk; reused for the four groups' partial tiles (SG_GROUPS x BM x 64) at the end.
+    __shared__ __align__(16) float smem[STAGE > PART ? STAGE : PART];
+    float (*As)[BM + 4] = reinterpret_cast<float (*)[BM + 4]>(smem);
+    float (*Bs)[SG_BN + 4] = reinterpret_cast<float (*)[SG_BN + 4]>(smem + SG_BK * (BM + 4));
+    const int tid = threadIdx.x, g = tid >> 6, lt = tid & 63;
+    const int tx = lt & 7, ty = lt >> 3;
+    const int row0 = blockIdx.y * BM, col0 = blockIdx.x * SG_BN;
+    float acc[R][8];
+    _Pragma(""unroll"") for (int i = 0; i < R; i++)
         _Pragma(""unroll"") for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
-    for (int k0 = 0; k0 < K; k0 += SG_BK)
-    {
-        // As[k][m] = A[row0 + m][k0 + k]: a float4 along k, stored transposed.
-        for (int idx = threadIdx.x; idx < SG_BM * SG_BK / 4; idx += SG_THREADS)
+
+    // Per chunk: A is BM x 32 floats (one float4 for each of the first BM * 8 threads), B is 32 x 64 (two per thread).
+    float4 pa = make_float4(0.0f, 0.0f, 0.0f, 0.0f), pb[2];
+    auto fetch = [&](int k0) {
+        if (tid < BM * 8)
         {
-            int r = idx / (SG_BK / 4), c = (idx % (SG_BK / 4)) * 4;
-            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            if (row0 + r < M && k0 + c < K)
-                v = __ldg(reinterpret_cast<const float4*>(A + (long long)(row0 + r) * K + k0 + c));
-            As[c][r] = v.x; As[c + 1][r] = v.y; As[c + 2][r] = v.z; As[c + 3][r] = v.w;
+            int r = tid >> 3, c = (tid & 7) * 4;   // A[row0 + r][k0 + c .. +3]
+            pa = (row0 + r < M && k0 + c < K)
+                ? __ldg(reinterpret_cast<const float4*>(A + (long long)(row0 + r) * K + k0 + c))
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
-        if (transB)
+        _Pragma(""unroll"")
+        for (int u = 0; u < 2; u++)
         {
-            // Bs[k][n] = B[col0 + n][k0 + k] for B stored [N, K].
-            for (int idx = threadIdx.x; idx < SG_BK * SG_BN / 4; idx += SG_THREADS)
+            int idx = tid + u * SG_BLOCK;
+            if (transB)
             {
-                int n = idx / (SG_BK / 4), c = (idx % (SG_BK / 4)) * 4;
-                float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                if (col0 + n < N && k0 + c < K)
-                    v = __ldg(reinterpret_cast<const float4*>(B + (long long)(col0 + n) * K + k0 + c));
-                Bs[c][n] = v.x; Bs[c + 1][n] = v.y; Bs[c + 2][n] = v.z; Bs[c + 3][n] = v.w;
+                int n = idx >> 3, c = (idx & 7) * 4;   // B[col0 + n][k0 + c .. +3], B stored [N, K]
+                pb[u] = (col0 + n < N && k0 + c < K)
+                    ? __ldg(reinterpret_cast<const float4*>(B + (long long)(col0 + n) * K + k0 + c))
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            else
+            {
+                int k = idx >> 4, c = (idx & 15) * 4;   // B[k0 + k][col0 + c .. +3]
+                pb[u] = (k0 + k < K && col0 + c < N)
+                    ? __ldg(reinterpret_cast<const float4*>(B + (long long)(k0 + k) * N + col0 + c))
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
-        else
+    };
+    fetch(0);
+    for (int k0 = 0; k0 < K; k0 += SG_BK)
+    {
+        if (tid < BM * 8)
         {
-            sg_load_b_rows(B, Bs, k0, K, col0, N);
+            int r = tid >> 3, c = (tid & 7) * 4;
+            As[c][r] = pa.x; As[c + 1][r] = pa.y; As[c + 2][r] = pa.z; As[c + 3][r] = pa.w;
+        }
+        _Pragma(""unroll"")
+        for (int u = 0; u < 2; u++)
+        {
+            int idx = tid + u * SG_BLOCK;
+            if (transB)
+            {
+                int n = idx >> 3, c = (idx & 7) * 4;
+                Bs[c][n] = pb[u].x; Bs[c + 1][n] = pb[u].y; Bs[c + 2][n] = pb[u].z; Bs[c + 3][n] = pb[u].w;
+            }
+            else
+            {
+                int k = idx >> 4, c = (idx & 15) * 4;
+                *reinterpret_cast<float4*>(&Bs[k][c]) = pb[u];
+            }
         }
         __syncthreads();
-        SG_ACCUMULATE(SG_BK)
+        if (k0 + SG_BK < K) fetch(k0 + SG_BK);
+        _Pragma(""unroll"")
+        for (int q = 0; q < SG_BK / SG_GROUPS; q++)
+        {
+            int kk = g * (SG_BK / SG_GROUPS) + q;
+            float av[R];
+            _Pragma(""unroll"") for (int i = 0; i < R; i++) av[i] = As[kk][ty * R + i];
+            float4 b0 = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float4 b1 = *reinterpret_cast<const float4*>(&Bs[kk][32 + tx * 4]);
+            _Pragma(""unroll"")
+            for (int i = 0; i < R; i++)
+            {
+                acc[i][0] += av[i] * b0.x; acc[i][1] += av[i] * b0.y; acc[i][2] += av[i] * b0.z;
+                acc[i][3] += av[i] * b0.w; acc[i][4] += av[i] * b1.x; acc[i][5] += av[i] * b1.y;
+                acc[i][6] += av[i] * b1.z; acc[i][7] += av[i] * b1.w;
+            }
+        }
         __syncthreads();
     }
-    for (int i = 0; i < 4; i++)
+
+    // Partial tiles: group g writes part[g][BM][64]; then the block finishes the tile a float4 at a time.
+    float* part = smem;
+    _Pragma(""unroll"")
+    for (int i = 0; i < R; i++)
     {
-        int row = row0 + ty * 4 + i;
-        sg_store(C, M, N, row, col0 + tx * 4, make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]), alpha, beta, bias, relu);
-        sg_store(C, M, N, row, col0 + 32 + tx * 4, make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]), alpha, beta, bias, relu);
+        float* row = part + (g * BM + ty * R + i) * SG_BN;
+        *reinterpret_cast<float4*>(row + tx * 4) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        *reinterpret_cast<float4*>(row + 32 + tx * 4) = make_float4(acc[i][4], acc[i][5], acc[i][6], acc[i][7]);
     }
+    __syncthreads();
+    for (int e4 = tid; e4 < BM * SG_BN / 4; e4 += SG_BLOCK)
+    {
+        int e = e4 * 4, rowL = e / SG_BN, colL = e % SG_BN;
+        float4 v = *reinterpret_cast<const float4*>(part + rowL * SG_BN + colL);
+        _Pragma(""unroll"")
+        for (int gg = 1; gg < SG_GROUPS; gg++)
+        {
+            float4 w = *reinterpret_cast<const float4*>(part + (gg * BM + rowL) * SG_BN + colL);
+            v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w;
+        }
+        sg_store(C, M, N, row0 + rowL, col0 + colL, v, alpha, beta, bias, relu);
+    }
+}
+
+#define SG_KERNEL(NAME, BM)                                                                                 \
+extern ""C"" __global__ __launch_bounds__(SG_BLOCK) void NAME(                                              \
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,                        \
+    int M, int N, int K, int transB, float alpha, float beta, const float* __restrict__ bias, int relu)     \
+{                                                                                                           \
+    skinny_gemm_body<BM>(A, B, C, M, N, K, transB, alpha, beta, bias, relu);                                \
+}
+SG_KERNEL(skinny_gemm, 32)
+SG_KERNEL(skinny_gemm_m16, 16)
+SG_KERNEL(skinny_gemm_m8, 8)
+
+// Small products cuBLAS runs as one long-latency kernel each: a classifier head over a flattened sequence
+// ([16,1024]x[1024,10], ~9 us as gemmSN) and its gradients ([16,10]x[10,1024] and [1024,16]x[16,10], ~3 us each).
+// A(m, k) = A[m * aRow + k * aCol] and B(k, n) = B[k * bRow + n * bCol], so one kernel serves A or B transposed.
+
+// Few outputs, long reduction: block (column group, row) computes C[row][16 * group .. +15] with its threads striding
+// over k, then reduces each column's partial sums through warp shuffles and one shared-memory step (fixed order).
+extern ""C"" __global__ __launch_bounds__(256) void small_gemm_rowreduce(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    int M, int N, int K, long long aRow, long long aCol, long long bRow, long long bCol,
+    float alpha, float beta, const float* __restrict__ bias, int relu)
+{
+    __shared__ float warpSums[8][16];
+    int row = blockIdx.y, col0 = blockIdx.x * 16;
+    float acc[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) acc[j] = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        float a = A[row * aRow + k * aCol];
+        #pragma unroll
+        for (int j = 0; j < 16; j++)
+            if (col0 + j < N) acc[j] = fmaf(a, B[k * bRow + (col0 + j) * bCol], acc[j]);
+    }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        float v = acc[j];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0) warpSums[warp][j] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 16) {
+        int j = threadIdx.x, col = col0 + j;
+        if (col < N) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) v += warpSums[w][j];
+            float r = alpha * v;
+            if (beta != 0.0f) r += beta * C[(long long)row * N + col];
+            if (bias) r += bias[col];
+            C[(long long)row * N + col] = relu ? sg_relu(r) : r;
+        }
+    }
+}
+
+// Short reduction (K <= 32): one thread per output, its K products summed in order.
+extern ""C"" __global__ __launch_bounds__(256) void small_gemm_tinyk(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    int M, int N, int K, long long aRow, long long aCol, long long bRow, long long bCol,
+    float alpha, float beta, const float* __restrict__ bias, int relu)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)M * N) return;
+    int row = (int)(idx / N), col = (int)(idx - (long long)row * N);
+    float v = 0.0f;
+    for (int k = 0; k < K; k++) v = fmaf(A[row * aRow + k * aCol], B[k * bRow + col * bCol], v);
+    float r = alpha * v;
+    if (beta != 0.0f) r += beta * C[idx];
+    if (bias) r += bias[col];
+    C[idx] = relu ? sg_relu(r) : r;
 }
 
 // C[M,N] = alpha * A[K,M]^T * B[K,N] + beta * C, row-major, for a long reduction K (a weight gradient, K = rows of
@@ -271,6 +419,10 @@ extern ""C"" __global__ __launch_bounds__(SG_TN_GROUPS * SG_THREADS) void skinny
             return new[]
             {
                 "skinny_gemm",
+                "skinny_gemm_m16",
+                "skinny_gemm_m8",
+                "small_gemm_rowreduce",
+                "small_gemm_tinyk",
                 "skinny_gemm_tn"
             };
         }
