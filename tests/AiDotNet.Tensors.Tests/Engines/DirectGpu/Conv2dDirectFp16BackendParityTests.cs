@@ -1,5 +1,6 @@
 #if NET6_0_OR_GREATER
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
@@ -115,8 +116,11 @@ public sealed class Conv2dDirectFp16BackendParityTests
             den += (double)expected[i] * expected[i];
         }
         double relL2 = den > 0 ? Math.Sqrt(num / den) : Math.Sqrt(num);
-        // The reference rounds the same operands the kernel does, so only FP32 accumulation is left.
-        Assert.True(relL2 < 1e-5, $"[{what}] direct FP16 conv relL2 {relL2:E3} against the FP16-rounded CPU reference");
+        // The reference rounds the same operands the kernel does, so only FP32 accumulation is left. On failure, the
+        // worst elements (index, got, expected) say whether the error is spread thin or concentrated in a few outputs.
+        Assert.True(relL2 < 1e-5, $"[{what}] direct FP16 conv relL2 {relL2:E3} against the FP16-rounded CPU reference; worst: "
+            + string.Join("; ", Enumerable.Range(0, expected.Length).OrderByDescending(i => Math.Abs(got[i] - expected[i])).Take(6)
+                .Select(i => $"[{i}] {got[i]:R} vs {expected[i]:R}")));
     }
 
     // A 1x1 convolution with one unit weight returns each input after the kernel's FP16 rounding, so the output must

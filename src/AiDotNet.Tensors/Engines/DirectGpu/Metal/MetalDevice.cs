@@ -417,6 +417,12 @@ public sealed class MetalDevice : IDisposable
         if (MetalNativeBindings.SendMessageBool(options, Selectors.RespondsToSelector, Selectors.SetMathMode))
         {
             MetalNativeBindings.SendMessage(options, Selectors.SetMathMode, IntPtr.Zero);
+            // On the runtimes with mathMode, the precision of the builtins (sin, cos, exp, ...) is a separate setting,
+            // mathFloatingPointFunctions, which defaults to fast (MTLMathFloatingPointFunctionsFast = 0). Safe math alone
+            // left a strict library's trigonometry on the fast variants: the generic FFT's twiddles missed the DFT at
+            // n = 257 by ~1e-4 relative on an Apple GPU. Precise = 1.
+            if (MetalNativeBindings.SendMessageBool(options, Selectors.RespondsToSelector, Selectors.SetMathFloatingPointFunctions))
+                MetalNativeBindings.SendMessage(options, Selectors.SetMathFloatingPointFunctions, new IntPtr(1));
             return options;
         }
 

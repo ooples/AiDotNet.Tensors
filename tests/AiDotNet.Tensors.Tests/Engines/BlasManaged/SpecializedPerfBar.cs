@@ -42,6 +42,9 @@ public static class SpecializedPerfBar
     // Frozen 2026-10-14 from GpuSpMMResidentBench (device-resident, both arms cross-checked) on an RTX 3080:
     // the managed kernels won all 5 catalog shapes in each of three runs, 1.10x to 2.88x. GpuSpMMResidentBench
     // gates on these. cuSPARSE is no longer a library dependency; the bench keeps a test-only binding to it.
+    // Re-checked 2026-10-17 on a GTX 1660 Ti (Turing) against cuSPARSE 12.6: the vec4 kernel lost PubMed (0.80x) and
+    // RecSys (0.88x) there, one 256-lane block per row leaving most lanes idle at N = 128 and 32. With rows packed per
+    // block it wins all 5 in each of three runs, 1.37x to 2.51x, so the bar holds on both devices.
     public const int    GpuSpMMMinWinRatePercent = 100;
     public const double GpuSpMMMaxLossMultiple    = 1.0;
 

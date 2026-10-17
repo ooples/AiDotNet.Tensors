@@ -361,7 +361,7 @@ public sealed partial class CudaBackend
                             (in CudaLayerNormArgs a) => LaunchTunedLayerNorm(name, l, a)));
                     }
                     candidates.Add(new CudaTunedKernelCandidate<CudaLayerNormArgs>(
-                        "directptx.layernorm_forward.d64", TunedKernelOrigin.Generated, true, IsDirectPtxD64Shape,
+                        "directptx.layernorm_forward.d64", TunedKernelOrigin.Generated, true, IsDirectPtxRowNormalizationCandidate,
                         (in CudaLayerNormArgs a) => RequireDirectPtx(TryDirectPtxRowNormalizationCandidate(
                             DirectPtxRowNormalizationOperation.LayerNormForward, a.Rows, a.Epsilon,
                             a.Input, a.Gamma, a.Beta, a.Output, a.SaveMean, a.SaveInvVar))));
@@ -434,7 +434,7 @@ public sealed partial class CudaBackend
                             (in CudaNormBackwardArgs a) => LaunchTunedLayerNormBackward(name, l, a)));
                     }
                     candidates.Add(new CudaTunedKernelCandidate<CudaNormBackwardArgs>(
-                        "directptx.layernorm_backward.d64", TunedKernelOrigin.Generated, true, IsDirectPtxD64Shape,
+                        "directptx.layernorm_backward.d64", TunedKernelOrigin.Generated, true, IsDirectPtxRowNormalizationCandidate,
                         (in CudaNormBackwardArgs a) => RequireDirectPtx(TryDirectPtxRowNormalizationCandidate(
                             DirectPtxRowNormalizationOperation.LayerNormBackwardInput, a.Rows, BackwardEpsilonPlaceholder,
                             a.GradOutput, a.Input, Required(a.Gamma), a.Stat0, Required(a.Stat1), a.Out0))));
@@ -537,7 +537,7 @@ public sealed partial class CudaBackend
         }
         candidates.Add(new CudaTunedKernelCandidate<CudaNormBackwardArgs>(
             rms ? "directptx.rmsnorm_grad_gamma.d64" : "directptx.layernorm_grad_params.d64",
-            TunedKernelOrigin.Generated, true, IsDirectPtxD64Shape,
+            TunedKernelOrigin.Generated, true, IsDirectPtxRowNormalizationCandidate,
             rms
                 ? new TunedKernelInvoker<CudaNormBackwardArgs>((in CudaNormBackwardArgs a) => RequireDirectPtx(TryDirectPtxRowNormalizationCandidate(
                     DirectPtxRowNormalizationOperation.RmsNormGradGamma, a.Rows, BackwardEpsilonPlaceholder,
@@ -603,6 +603,12 @@ public sealed partial class CudaBackend
     // The Direct-PTX row-normalization kernels exist for d = 64 and a fixed set of row counts. As registry
     // candidates they are admitted on any architecture: the gate's correctness and timing replace the
     // validated-architecture list and the environment flag.
+    // The direct-PTX row-normalization family is checked in only for GA10x/SM86 (PtxRowNormalizationD64Kernel throws
+    // PlatformNotSupportedException elsewhere), so the candidate applies only there. Gating on the shape alone made it
+    // "applicable" on every GPU, where running it threw (CudaTunedKernelTests on a GTX 1660 Ti, SM75).
+    private bool IsDirectPtxRowNormalizationCandidate(TunedShape shape) =>
+        IsDirectPtxD64Shape(shape) && Ptx.DirectPtxArchitecture.HasValidatedResidualLayerNormGelu(_ccMajor, _ccMinor);
+
     private static bool IsDirectPtxD64Shape(TunedShape shape) =>
         shape.Count == 2 && shape[1] == PtxRowNormalizationD64Kernel.Dimension &&
         PtxRowNormalizationD64Kernel.IsSupportedRows(shape[0]);

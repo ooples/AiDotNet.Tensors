@@ -548,6 +548,126 @@ kernel void add_scaled(
         C[gid] = fma(scaleA, A[gid], scaleB * B[gid]);
     }
 }
+
+// The IDirectGpuBackend fused-op surface (MetalBackend.FusedKernels) the host bound by name with no kernel behind it;
+// semantics are the CUDA/OpenCL kernels' (CudaBroadcastKernels, BroadcastKernels).
+kernel void pow_scalar(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant float& exponent [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) output[gid] = pow(input[gid], exponent);
+}
+
+kernel void sub_scalar(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant float& scalar [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) output[gid] = input[gid] - scalar;
+}
+
+kernel void frac_kernel(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& size [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) output[gid] = input[gid] - floor(input[gid]);
+}
+
+kernel void masked_fill_kernel(
+    device const float* input [[buffer(0)]],
+    device const float* mask [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant float& fillValue [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) output[gid] = mask[gid] != 0.0f ? fillValue : input[gid];
+}
+
+// IEEE equality on the bit patterns, as the OpenCL kernel: NaN equals nothing and +0 equals -0. Comparing bits keeps
+// fast math from folding NaN comparisons.
+static inline bool ieee_equal(float a, float b)
+{
+    uint ab = as_type<uint>(a), bb = as_type<uint>(b);
+    uint aa = ab & 0x7FFFFFFFu, ba = bb & 0x7FFFFFFFu;
+    return aa <= 0x7F800000u && ba <= 0x7F800000u && (ab == bb || (aa | ba) == 0u);
+}
+
+kernel void equals_kernel(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) output[gid] = ieee_equal(a[gid], b[gid]) ? 1.0f : 0.0f;
+}
+
+kernel void not_equals_kernel(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) output[gid] = ieee_equal(a[gid], b[gid]) ? 0.0f : 1.0f;
+}
+
+// Last-axis broadcasts in the 2D layout of broadcast_add_last / broadcast_mul_last (x = inner, y = outer).
+kernel void broadcast_sub_last(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& outer_size [[buffer(3)]],
+    constant uint& inner_size [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.y < outer_size && gid.x < inner_size) {
+        uint idx = gid.y * inner_size + gid.x;
+        C[idx] = A[idx] - B[gid.x];
+    }
+}
+
+kernel void broadcast_div_last(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& outer_size [[buffer(3)]],
+    constant uint& inner_size [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.y < outer_size && gid.x < inner_size) {
+        uint idx = gid.y * inner_size + gid.x;
+        C[idx] = A[idx] / (B[gid.x] + 1e-12f);
+    }
+}
+
+// Mean of a whole buffer into output[0], one 256-thread group: strided partial sums, then a fixed-order tree, so the
+// result does not depend on scheduling.
+kernel void reduce_mean_full(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& size [[buffer(2)]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    threadgroup float partial[256];
+    float sum = 0.0f;
+    for (uint i = lid; i < size; i += 256u) sum += input[i];
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (lid < stride) partial[lid] += partial[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) output[0] = size == 0u ? 0.0f : partial[0] / (float)size;
+}
 ";
 
     #endregion
@@ -1338,6 +1458,63 @@ kernel void bce_with_logits_backward(
         float sig = 1.0f / (1.0f + exp(-logits[gid]));
         gradInput[gid] = gradOutput[0] * (sig - targets[gid]) * invN;
     }
+}
+
+// Activation backwards the host bound by name but no library defined (MetalBackend.Activations); the math is the
+// OpenCL kernels' (NeuralNetKernels.cs, ActivationKernels.cs).
+kernel void elu_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* output [[buffer(2)]],
+    constant float& alpha [[buffer(3)]],
+    device float* gradInput [[buffer(4)]],
+    constant uint& size [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= size) return;
+    gradInput[gid] = input[gid] > 0.0f ? gradOutput[gid] : gradOutput[gid] * (output[gid] + alpha);
+}
+
+kernel void swish_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= size) return;
+    float x = input[gid];
+    float sig = 1.0f / (1.0f + exp(-x));
+    float swishVal = x * sig;
+    gradInput[gid] = gradOutput[gid] * (swishVal + sig * (1.0f - swishVal));
+}
+
+kernel void mish_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= size) return;
+    float x = input[gid];
+    float sp = x > 20.0f ? x : (x < -20.0f ? exp(x) : log(1.0f + exp(x)));
+    float tanh_sp = tanh(sp);
+    float sig = 1.0f / (1.0f + exp(-x));
+    gradInput[gid] = gradOutput[gid] * (tanh_sp + x * (1.0f - tanh_sp * tanh_sp) * sig);
+}
+
+kernel void hardswish_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= size) return;
+    float x = input[gid];
+    float grad = x <= -3.0f ? 0.0f : (x >= 3.0f ? 1.0f : (2.0f * x + 3.0f) / 6.0f);
+    gradInput[gid] = gradOutput[gid] * grad;
 }
 ";
 
@@ -2442,6 +2619,27 @@ kernel void softmax_row(
         for (uint i = 0; i < features; i++) {
             output[offset + i] *= inv_sum;
         }
+    }
+}
+
+// Softmax backward, one thread per row: gradInput = y * (g - sum_j g_j * y_j). The tuned slot's reference candidate
+// (MetalBackend.SoftmaxBackwardReference) and the fallback when no generated row kernel is taken.
+kernel void softmax_backward(
+    device const float* gradOutput [[buffer(0)]],
+    device const float* output [[buffer(1)]],
+    device float* gradInput [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& features [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= rows) return;
+    uint offset = gid * features;
+    float dot = 0.0f;
+    for (uint i = 0; i < features; i++) {
+        dot += gradOutput[offset + i] * output[offset + i];
+    }
+    for (uint i = 0; i < features; i++) {
+        gradInput[offset + i] = output[offset + i] * (gradOutput[offset + i] - dot);
     }
 }
 

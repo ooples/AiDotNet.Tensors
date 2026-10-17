@@ -60,6 +60,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     private IntPtr _comparisonLibrary;
     private IntPtr _randomLibrary;
     private IntPtr _dotProductLibrary;
+    private IntPtr _gatedActivationLibrary;
+    private IntPtr _extendedReductionLibrary;
     private IntPtr _fusedLinearLibrary;
     private IntPtr _quantGemmLibrary; // P0: weight-only fused dequant-GEMM (int8/int4/fp8)
     private IntPtr _pagedAttnLibrary; // P1: paged-attention decode
@@ -243,6 +245,19 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"Metal SpectralPerf pre-compilation warning: {ex.Message}");
+        }
+
+        // The gated activations (GLU family) and the extended reductions / shape ops (eye, one-hot, outer product) the
+        // IDirectGpuBackend fused surface dispatches. Their sources existed but no library compiled them, so every one of
+        // those ops failed with "function not found" on a Mac.
+        try
+        {
+            _gatedActivationLibrary = _shaderLibrary.CompileLibrary("GatedActivation", MetalKernels.GatedActivationKernels);
+            _extendedReductionLibrary = _shaderLibrary.CompileLibrary("ExtendedReduction", MetalKernels.ExtendedReductionKernels);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Metal GatedActivation/ExtendedReduction pre-compilation warning: {ex.Message}");
         }
 
         try
@@ -791,18 +806,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         // Custom tiled kernel that reads B with the [N, K] → Bᵀ index pattern.
         // Skips the materialized transpose copy that the generic Gemm + a
         // separate transpose dispatch would do.
-        var pipeline = GetPipeline("Matrix", _matrixLibrary, "matmul_tiled_transposed");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate2DDispatch(N, M);
-
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(aBuffer, 0);
-        encoder.SetBuffer(bBuffer, 1);
-        encoder.SetBuffer(cBuffer, 2);
-        encoder.SetBytes((uint)M, 3);
-        encoder.SetBytes((uint)N, 4);
-        encoder.SetBytes((uint)K, 5);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        DispatchTiledMatmul("matmul_tiled_transposed", aBuffer, bBuffer, cBuffer, M, N, K);
 
         if (Math.Abs(alpha - 1.0f) > 1e-7f)
             Scale(cBuffer, cBuffer, alpha, M * N);
@@ -821,20 +825,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        // For optimized GEMM, we would use MPS
-        // For now, use tiled matrix multiplication kernel
-        var pipeline = GetPipeline("Matrix", _matrixLibrary, "matmul_tiled");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate2DDispatch(N, M);
-
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(aBuffer, 0);
-        encoder.SetBuffer(bBuffer, 1);
-        encoder.SetBuffer(cBuffer, 2);
-        encoder.SetBytes((uint)M, 3);
-        encoder.SetBytes((uint)N, 4);
-        encoder.SetBytes((uint)K, 5);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        DispatchTiledMatmul("matmul_tiled", aBuffer, bBuffer, cBuffer, M, N, K);
 
         // Handle alpha/beta if not default
         if (Math.Abs(alpha - 1.0f) > 1e-7f || Math.Abs(beta) > 1e-7f)
@@ -846,6 +837,40 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
                 Scale(cBuffer, cBuffer, alpha, M * N);
             }
         }
+    }
+
+    /// <summary>Edge of the square tile <c>matmul_tiled</c> and <c>matmul_tiled_transposed</c> use (TILE_SIZE in the MSL).</summary>
+    private const int MatmulTile = 16;
+
+    /// <summary>
+    /// Launches one of the tiled matmul kernels. Both take their A and B tiles as <c>[[threadgroup(0)]]</c> /
+    /// <c>[[threadgroup(1)]]</c> arguments, which Metal sizes only through setThreadgroupMemoryLength: without it the
+    /// tiles have no storage and every output read back as 0 (first run on an Apple GPU, the macOS CI lane). The kernels
+    /// index their tiles by TILE_SIZE, so the threadgroup is exactly TILE_SIZE x TILE_SIZE, never the shrunken shape a
+    /// generic 2D dispatch could pick.
+    /// </summary>
+    private void DispatchTiledMatmul(string kernel, MetalGpuBuffer a, MetalGpuBuffer b, MetalGpuBuffer c, int M, int N, int K)
+    {
+        if (M <= 0 || N <= 0) return;
+        var pipeline = GetPipeline("Matrix", _matrixLibrary, kernel);
+        if (pipeline.MaxTotalThreadsPerThreadgroup < MatmulTile * MatmulTile)
+            throw new GpuCapabilityUnavailableException(
+                $"Metal {kernel} needs {MatmulTile * MatmulTile} threads per threadgroup; this pipeline allows {pipeline.MaxTotalThreadsPerThreadgroup}.");
+        const uint tileBytes = MatmulTile * MatmulTile * sizeof(float);
+
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(a, 0);
+        encoder.SetBuffer(b, 1);
+        encoder.SetBuffer(c, 2);
+        encoder.SetBytes((uint)M, 3);
+        encoder.SetBytes((uint)N, 4);
+        encoder.SetBytes((uint)K, 5);
+        encoder.SetThreadgroupMemoryLength(tileBytes, 0);
+        encoder.SetThreadgroupMemoryLength(tileBytes, 1);
+        encoder.DispatchThreadgroups(
+            new MTLSize((ulong)((N + MatmulTile - 1) / MatmulTile), (ulong)((M + MatmulTile - 1) / MatmulTile), 1),
+            new MTLSize(MatmulTile, MatmulTile, 1));
     }
 
     /// <summary>

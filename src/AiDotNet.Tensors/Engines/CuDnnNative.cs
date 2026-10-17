@@ -1092,6 +1092,8 @@ public sealed class CuDnnContext : IDisposable
     {
         try
         {
+            if (!CudnnSublibrariesResolvable())
+                return false;
             // Try to get version to check if library is loaded
             var version = CuDnnNative.cudnnGetVersion();
             return version > 0;
@@ -1109,6 +1111,82 @@ public sealed class CuDnnContext : IDisposable
             return false;
         }
     }
+
+    // cuDNN 9's cudnn64_9.dll is a shim: every call, cudnnGetVersion included, loads cudnn_graph64_9.dll and the other
+    // sub-libraries with a bare-name LoadLibrary, which searches the application directory and PATH, not the directory
+    // the shim came from. When the shim is resolved from runtimes/<rid>/native (a NuGet layout) and the sub-libraries
+    // are not on that search path, cuDNN prints "Could not locate cudnn_graph64_9.dll" and terminates the process
+    // (exit code 9) -- no exception reaches a catch. So before the first call, on Windows: find the shim's directory and
+    // load the sub-libraries from it by full path (a bare-name LoadLibrary then returns the module already loaded); if
+    // a required one is in neither that directory nor on the search path, report cuDNN unavailable.
+    private static readonly string[] Cudnn9RequiredSublibraries =
+        { "cudnn_graph64_9.dll", "cudnn_ops64_9.dll", "cudnn_cnn64_9.dll", "cudnn_heuristic64_9.dll", "cudnn_engines_precompiled64_9.dll" };
+    private static readonly string[] Cudnn9OptionalSublibraries =
+        { "cudnn_adv64_9.dll", "cudnn_engines_runtime_compiled64_9.dll" };
+
+    [System.Runtime.InteropServices.DllImport("kernel32", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetModuleFileNameW(IntPtr module, System.Text.StringBuilder fileName, uint size);
+
+    private static bool CudnnSublibrariesResolvable()
+    {
+#if NET5_0_OR_GREATER
+        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+            return true;
+        var assembly = typeof(CuDnnNative).Assembly;
+        if (!System.Runtime.InteropServices.NativeLibrary.TryLoad("cudnn64_9.dll", assembly, null, out IntPtr shim))
+            return true;   // no cuDNN 9: the version probe reports it (DllNotFoundException)
+        var path = new System.Text.StringBuilder(1024);
+        string? dir = GetModuleFileNameW(shim, path, (uint)path.Capacity) > 0
+            ? System.IO.Path.GetDirectoryName(path.ToString())
+            : null;
+        foreach (string name in Cudnn9RequiredSublibraries)
+            if (!LoadBeside(dir, name, assembly))
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"cuDNN 9 at {dir ?? "(unknown directory)"} is missing {name}; cuDNN is reported unavailable instead of letting it terminate the process.");
+                return false;
+            }
+        // The optional ones are large and loaded by cuDNN only when an API needs them; preload them only where cuDNN's own
+        // bare-name load would miss them, i.e. when the shim's directory is neither the application's nor on PATH.
+        if (dir is not null && !OnLoaderSearchPath(dir))
+            foreach (string name in Cudnn9OptionalSublibraries)
+            {
+                string full = System.IO.Path.Combine(dir, name);
+                if (System.IO.File.Exists(full)) System.Runtime.InteropServices.NativeLibrary.TryLoad(full, out _);
+            }
+        return true;
+#else
+        return true;
+#endif
+    }
+
+#if NET5_0_OR_GREATER
+    private static bool OnLoaderSearchPath(string dir)
+    {
+        static string Norm(string p) => System.IO.Path.GetFullPath(p).TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+        string target = Norm(dir);
+        if (string.Equals(target, Norm(AppContext.BaseDirectory), StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (string entry in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(System.IO.Path.PathSeparator))
+        {
+            if (string.IsNullOrWhiteSpace(entry)) continue;
+            try { if (string.Equals(target, Norm(entry.Trim()), StringComparison.OrdinalIgnoreCase)) return true; }
+            catch (ArgumentException) { }
+            catch (NotSupportedException) { }
+        }
+        return false;
+    }
+
+    private static bool LoadBeside(string? dir, string name, System.Reflection.Assembly assembly)
+    {
+        if (dir is not null)
+        {
+            string full = System.IO.Path.Combine(dir, name);
+            if (System.IO.File.Exists(full) && System.Runtime.InteropServices.NativeLibrary.TryLoad(full, out _))
+                return true;
+        }
+        return System.Runtime.InteropServices.NativeLibrary.TryLoad(name, assembly, null, out _);
+    }
+#endif
 
     /// <summary>Gets error message for cuDNN status.</summary>
     public static string GetErrorString(CuDnnNative.CudnnStatus status)
