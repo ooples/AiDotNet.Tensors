@@ -7,4 +7,5 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 public sealed partial class MetalBackend : IFusedLstmSequenceTraining
 {
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => int.MaxValue;
+    bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 }
