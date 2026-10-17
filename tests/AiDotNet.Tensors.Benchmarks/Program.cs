@@ -1437,6 +1437,12 @@ class Program
             return;
         }
 
+        // #1353 persistent fused ResNet basic block against the unfused engine route (CUDA)
+        if (args[0] == "--fused-basic-block")
+        {
+            Environment.ExitCode = FusedBasicBlockExperiment.Run();
+            return;
+        }
         // Metal fused Meshgrid2D against the composed route (#921)
         if (args[0] == "--metal-meshgrid2d")
         {
@@ -2227,6 +2233,7 @@ class Program
         Console.WriteLine("  --webgpu-tuned-profile [out.json] [rounds] : Tune the WebGPU kernel registry on Dawn and export a profile");
         Console.WriteLine("  --vulkan-meshgrid2d : Time the Vulkan fused Meshgrid2D route against the composed route");
         Console.WriteLine("  --metal-meshgrid2d : Time the Metal fused Meshgrid2D route against the composed route (macOS)");
+        Console.WriteLine("  --fused-basic-block : Time the #1353 persistent fused ResNet basic block against the unfused route (CUDA)");
         Console.WriteLine("  --webgpu-meshgrid2d-dawn : Time WebGPU's fused Meshgrid2D against the composed route on Dawn");
         Console.WriteLine("  --metal    : Run Metal backend diagnostics (macOS/Apple Silicon)");
         Console.WriteLine("  --webgpu   : Run WebGPU backend diagnostics (browser GPU compute)");
