@@ -17853,10 +17853,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         // Input projection as one GEMM, then the recurrence alone (see lstm_forward_recurrence).
+        bool finalStateWritten = false;
         if (_kernelCache.TryGetValue("lstm_forward_recurrence", out var forwardRecurrence))
         {
-            LstmForwardViaGemm(forwardRecurrence, input, hInit, cInit, weightsIh, weightsHh, biasIh, biasHh,
-                output, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
+            finalStateWritten = LstmForwardViaGemm(forwardRecurrence, input, hInit, cInit, weightsIh, weightsHh, biasIh,
+                biasHh, output, allH, allC, cacheGates, hFinal, cFinal, seqLen, batch, inputSize, hiddenSize);
         }
         else
         {
@@ -17864,6 +17865,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 output, allH, allC, cacheGates, seqLen, batch, inputSize, hiddenSize);
         }
 
+        if (finalStateWritten) return;
         using var _ = PushContext();
         CopyLstmFinalState(allH, allC, hFinal, cFinal, seqLen, batch, hiddenSize);
     }
@@ -17974,6 +17976,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (!_kernelCache.TryGetValue("lstm_backward_sequence", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_sequence");
+
+        // This kernel accumulates with atomics; zero its outputs so the backward writes them either way
+        // (IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients).
+        IDeviceZeroFill zero = this;
+        zero.ZeroBuffer(gradInput, batch * seqLen * inputSize);
+        zero.ZeroBuffer(gradHInit, batch * hiddenSize);
+        zero.ZeroBuffer(gradCInit, batch * hiddenSize);
+        zero.ZeroBuffer(gradWeightsIh, 4 * hiddenSize * inputSize);
+        zero.ZeroBuffer(gradWeightsHh, 4 * hiddenSize * hiddenSize);
+        zero.ZeroBuffer(gradBiasIh, 4 * hiddenSize);
+        zero.ZeroBuffer(gradBiasHh, 4 * hiddenSize);
 
         using var _ = PushContext();
 

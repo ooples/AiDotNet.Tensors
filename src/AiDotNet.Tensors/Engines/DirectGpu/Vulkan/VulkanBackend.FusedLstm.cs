@@ -5,4 +5,5 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 public sealed partial class VulkanBackend : IFusedLstmSequenceTraining
 {
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => 1024;
+    bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 }
