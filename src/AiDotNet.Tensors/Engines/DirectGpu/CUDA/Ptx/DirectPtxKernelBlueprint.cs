@@ -85,6 +85,14 @@ internal static class DirectPtxArchitecture
         (major, minor) == (8, 6);
 
     /// <summary>
+    /// The FP32 CSR segmented max / min specialization (issue #852) targets GA102/SM86, the CSR SpMM family's
+    /// architecture. It is assembled and resource-checked offline for sm_86 but has not run on a device yet, so it is
+    /// admitted for driver tests only and never dispatched; other architectures fail closed to the NVRTC kernels.
+    /// </summary>
+    internal static bool HasTargetedCsrSegmentedReduce(int major, int minor) =>
+        (major, minor) == (8, 6);
+
+    /// <summary>
     /// The index-select specialization is measured only on GA102/SM86. It is a
     /// separate predicate from the gather one because the two ops have
     /// different index dtypes and are promoted independently.

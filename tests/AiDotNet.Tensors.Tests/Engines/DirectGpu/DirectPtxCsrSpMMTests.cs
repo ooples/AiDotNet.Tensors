@@ -75,8 +75,9 @@ public class DirectPtxCsrSpMMTests
             Assert.False(string.IsNullOrWhiteSpace(c.DirectPtxAssignment));
             Assert.NotEqual(DirectPtxSparseCoverageStatus.PromotedDirectPtx, c.Status);
         });
-        Assert.Equal(new[] { "CudaBackend.CsrSpMMVec4" },
-            all.Where(c => c.Status == DirectPtxSparseCoverageStatus.ExperimentalDirectPtx).Select(c => c.Api).ToArray());
+        Assert.Equal(new[] { "CudaBackend.CsrSegmentedMax", "CudaBackend.CsrSegmentedMin", "CudaBackend.CsrSpMMVec4" },
+            all.Where(c => c.Status == DirectPtxSparseCoverageStatus.ExperimentalDirectPtx).Select(c => c.Api)
+                .OrderBy(api => api, StringComparer.Ordinal).ToArray());
         // Every NVRTC sparse kernel has a cell.
         foreach (string kernel in AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaSparseKernels.GetKernelNames())
             Assert.Contains(all, c => c.ExistingImplementation.Contains(kernel, StringComparison.Ordinal));

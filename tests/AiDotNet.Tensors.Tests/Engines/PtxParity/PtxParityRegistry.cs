@@ -94,6 +94,14 @@ public static class PtxParityRegistry
             "bit-identical to NVRTC csr_spmm_vec4 and within 1.3e-6 of an fp64 oracle on every cell. Converts " +
             "to ThreeWayParity once a backend route exists: the per-output accumulation order matches the NVRTC " +
             "kernel, so CUDA, PTX and the CPU CSR reference can be compared bit-exactly against each other."),
+        new PtxParitySpec("PtxCsrSegmentedReduceF32Kernel", PtxParityStatus.Deferred,
+            "CSR segmented max / min, fp32 (#852) - no public route yet (CudaBackend.CsrSegmentedMax / CsrSegmentedMin " +
+            "are its NVRTC counterparts)",
+            "experimental, not dispatched, and not yet run on a device: DirectPtxCsrSegmentedReduceTests checks the " +
+            "emitter, that its reduction and conversion instructions and starting constants are the ones NVRTC emits " +
+            "for csr_segmented_max / min under --use_fast_math, and, on an SM86 device, bit-identity with those NVRTC " +
+            "kernels on data with empty rows, NaN, signed zeros, subnormals and non-integral index values. Converts " +
+            "to ThreeWayParity once a backend route exists."),
         new PtxParitySpec("PtxFusedGatherF32Kernel", PtxParityStatus.Deferred,
             "embedding gather, fp32 (#844) — CudaBackend.Gather",
             "has a public route, but its tests cover the emitter and the PTX-vs-CPU result only, so the " +
