@@ -503,6 +503,7 @@ public static class MetalNativeBindings
         // must check respondsToSelector: before using either.
         public static readonly IntPtr SetFastMathEnabled = RegisterSelector("setFastMathEnabled:");
         public static readonly IntPtr SetMathMode = RegisterSelector("setMathMode:");
+        public static readonly IntPtr SetMathFloatingPointFunctions = RegisterSelector("setMathFloatingPointFunctions:");
         public static readonly IntPtr Release = RegisterSelector("release");
         public static readonly IntPtr Retain = RegisterSelector("retain");
         public static readonly IntPtr Autorelease = RegisterSelector("autorelease");
