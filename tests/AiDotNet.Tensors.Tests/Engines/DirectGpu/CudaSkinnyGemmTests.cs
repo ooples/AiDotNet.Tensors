@@ -196,6 +196,63 @@ public class CudaSkinnyGemmTests
     }
 
     // Relative to the sum of |terms|: fp32 accumulation error grows with it, not with the (possibly cancelling) result.
+    /// <summary>
+    /// The small products (TrySmallGemm): few outputs over a long reduction (a classifier head over a flattened
+    /// sequence, small_gemm_rowreduce) and a reduction of at most 32 (its gradients, small_gemm_tinyk), with A or B
+    /// transposed, the beta term and the bias/ReLU epilogue.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(16, 10, 1024, false, false)]   // the head's forward
+    [InlineData(16, 10, 1024, true, false)]
+    [InlineData(16, 10, 1024, false, true)]
+    [InlineData(3, 37, 300, false, false)]     // ragged column groups
+    [InlineData(16, 1024, 10, false, true)]    // the head's input gradient, dY · Wᵀ
+    [InlineData(1024, 10, 16, true, false)]    // its weight gradient, Xᵀ · dY
+    [InlineData(5, 7, 1, false, false)]
+    public void SmallGemm_EqualsTheReference(int m, int n, int k, bool transA, bool transB)
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        float[] a = Fill(m * k, 11), b = Fill(k * n, 12), c0 = Fill(m * n, 13), bias = Fill(n, 14);
+        using var aBuf = backend.AllocateBuffer(a);
+        using var bBuf = backend.AllocateBuffer(b);
+        using var biasBuf = backend.AllocateBuffer(bias);
+        foreach (var (alpha, beta, withBias, relu) in new[] { (1f, 0f, false, false), (0.5f, 0.25f, false, false), (1f, 0f, true, true) })
+        {
+            using var cBuf = backend.AllocateBuffer(beta == 0f ? Enumerable.Repeat(float.NaN, m * n).ToArray() : c0);
+            Assert.True(backend.TrySmallGemm(aBuf, bBuf, cBuf, m, n, k, transA, transB, alpha, beta, withBias ? biasBuf : null, relu),
+                $"small GEMM declined {m}x{n}x{k}");
+            AssertClose(backend.DownloadBuffer(cBuf), i =>
+            {
+                int row = i / n, col = i % n;
+                double s = 0, bound = 0;
+                for (int t = 0; t < k; t++)
+                {
+                    double av = transA ? a[t * m + row] : a[row * k + t];
+                    double bv = transB ? b[col * k + t] : b[t * n + col];
+                    s += av * bv; bound += Math.Abs(av * bv);
+                }
+                double r = alpha * s + beta * c0[i] + (withBias ? bias[col] : 0);
+                if (relu && r < 0) r = 0;
+                return (r, Math.Abs(alpha) * bound + Math.Abs(beta * c0[i]) + (withBias ? Math.Abs(bias[col]) : 0));
+            }, $"{m}x{n}x{k} transA={transA} transB={transB} alpha={alpha} beta={beta} bias={withBias} relu={relu}");
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(128, 64, 64)]     // neither few outputs nor a short reduction: cuBLAS's
+    [InlineData(65, 10, 1024)]    // more rows than the row-reduction takes
+    [InlineData(64, 64, 256)]     // too many outputs for the row-reduction (a 64x64 weight gradient)
+    public void SmallGemm_DeclinesShapesItDoesNotServe(int m, int n, int k)
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        using var aBuf = backend.AllocateBuffer(new float[m * k]);
+        using var bBuf = backend.AllocateBuffer(new float[k * n]);
+        using var cBuf = backend.AllocateBuffer(new float[m * n]);
+        Assert.False(backend.TrySmallGemm(aBuf, bBuf, cBuf, m, n, k, false, false, 1f, 0f));
+    }
+
     private static void AssertClose(float[] got, Func<int, (double Expected, double Bound)> reference, string what)
     {
         for (int i = 0; i < got.Length; i++)

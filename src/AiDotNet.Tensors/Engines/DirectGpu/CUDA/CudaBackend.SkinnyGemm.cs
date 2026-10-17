@@ -40,7 +40,7 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
         int tilesN = (N + SkinnyTileColumns - 1) / SkinnyTileColumns;
         int tileRows = SkinnyTileRows;
         while (tileRows > 8 && (long)((M + tileRows - 1) / tileRows) * tilesN < Math.Max(1, ComputeUnits) / 2) tileRows /= 2;
-        if (tileRows != SkinnyTileRows && _kernelCache.TryGetValue("skinny_gemm_m" + tileRows, out var shorter)) kernel = shorter;
+        if (tileRows != SkinnyTileRows && _kernelCache.TryGetValue(tileRows == 16 ? "skinny_gemm_m16" : "skinny_gemm_m8", out var shorter)) kernel = shorter;
         else tileRows = SkinnyTileRows;
         using var _ = PushContext();
         IntPtr a = A.Handle, b = B.Handle, c = C.Handle;
@@ -97,7 +97,48 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
     bool IGemmBiasActivationBackend.TryGemmBiasActivation(IGpuBuffer A, IGpuBuffer W, IGpuBuffer bias, IGpuBuffer C,
         int M, int N, int K, FusedActivationType activation)
         => (activation == FusedActivationType.None || activation == FusedActivationType.ReLU)
-            && TrySkinnyGemm(A, W, C, M, N, K, transB: false, 1f, 0f, bias, activation == FusedActivationType.ReLU);
+            && (TrySkinnyGemm(A, W, C, M, N, K, transB: false, 1f, 0f, bias, activation == FusedActivationType.ReLU)
+                || TrySmallGemm(A, W, C, M, N, K, transA: false, transB: false, 1f, 0f, bias, activation == FusedActivationType.ReLU));
+
+    // small_gemm_rowreduce takes at most this many output rows, columns and outputs, and at least this long a
+    // reduction. A 64x64 weight gradient over 256 rows measured 13.2 us there against ~6 us on cuBLASLt: the kernel is
+    // for a handful of outputs (a classifier head's 16x10), where one block per row and column group is the whole grid.
+    private const int SmallGemmMaxRows = 64, SmallGemmMaxColumns = 64, SmallGemmMaxOutputs = 1024, SmallGemmMinReduce = 256;
+    // small_gemm_tinyk: reductions at most this long, at most this many outputs.
+    private const int SmallGemmMaxTinyReduce = 32, SmallGemmMaxTinyOutputs = 1 << 20;
+
+    /// <summary>
+    /// <c>C[M,N] = act(alpha * op(A) * op(B) + beta * C + bias)</c> for the small shapes cuBLAS serves with one
+    /// long-latency kernel: few outputs over a long reduction (small_gemm_rowreduce: M, N &lt;= 64, K &gt;= 256 - a
+    /// classifier head over a flattened sequence) or a reduction of at most 32 (small_gemm_tinyk - that head's
+    /// gradients). op(A) is A[M,K], or A[K,M] transposed when <paramref name="transA"/>; op(B) is B[K,N], or B[N,K]
+    /// transposed when <paramref name="transB"/>. False - nothing launched - for any other shape.
+    /// </summary>
+    internal unsafe bool TrySmallGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, bool transA, bool transB,
+        float alpha, float beta, IGpuBuffer? bias = null, bool relu = false)
+    {
+        if (!SkinnyGemmEnabled || M <= 0 || N <= 0 || K <= 0 || (bias is not null && bias.Size < N)) return false;
+        bool rowReduce = M <= SmallGemmMaxRows && N <= SmallGemmMaxColumns && (long)M * N <= SmallGemmMaxOutputs
+            && K >= SmallGemmMinReduce;
+        bool tinyK = !rowReduce && K <= SmallGemmMaxTinyReduce && (long)M * N <= SmallGemmMaxTinyOutputs;
+        if (!rowReduce && !tinyK) return false;
+        if (!_kernelCache.TryGetValue(rowReduce ? "small_gemm_rowreduce" : "small_gemm_tinyk", out var kernel)) return false;
+        using var _ = PushContext();
+        IntPtr a = A.Handle, b = B.Handle, c = C.Handle, bi = bias?.Handle ?? IntPtr.Zero;
+        int m = M, n = N, k = K, re = relu ? 1 : 0;
+        long aRow = transA ? 1 : K, aCol = transA ? M : 1;   // A(m, k)
+        long bRow = transB ? 1 : N, bCol = transB ? K : 1;   // B(k, n)
+        float al = alpha, be = beta;
+        void** args = stackalloc void*[14];
+        args[0] = &a; args[1] = &b; args[2] = &c; args[3] = &m; args[4] = &n; args[5] = &k;
+        args[6] = &aRow; args[7] = &aCol; args[8] = &bRow; args[9] = &bCol;
+        args[10] = &al; args[11] = &be; args[12] = &bi; args[13] = &re;
+        if (rowReduce)
+            LaunchKernel2D(kernel, (uint)((N + 15) / 16), (uint)M, 1, 256, 1, args);
+        else
+            LaunchKernel(kernel, (uint)(((long)M * N + 255) / 256), 256, args);
+        return true;
+    }
 
     // Rows each split of skinny_gemm_tn reduces: ~256 (four passes per group) and at most 64 blocks in all, a whole
     // number of the block's 64-row passes. Measured on a GTX 1660 Ti at K = 2048 for 64x64, 64x128 and 128x64 outputs,

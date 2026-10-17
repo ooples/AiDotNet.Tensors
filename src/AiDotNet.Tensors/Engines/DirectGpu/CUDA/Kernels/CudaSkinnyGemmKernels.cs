@@ -225,6 +225,68 @@ SG_KERNEL(skinny_gemm, 32)
 SG_KERNEL(skinny_gemm_m16, 16)
 SG_KERNEL(skinny_gemm_m8, 8)
 
+// Small products cuBLAS runs as one long-latency kernel each: a classifier head over a flattened sequence
+// ([16,1024]x[1024,10], ~9 us as gemmSN) and its gradients ([16,10]x[10,1024] and [1024,16]x[16,10], ~3 us each).
+// A(m, k) = A[m * aRow + k * aCol] and B(k, n) = B[k * bRow + n * bCol], so one kernel serves A or B transposed.
+
+// Few outputs, long reduction: block (column group, row) computes C[row][16 * group .. +15] with its threads striding
+// over k, then reduces each column's partial sums through warp shuffles and one shared-memory step (fixed order).
+extern ""C"" __global__ __launch_bounds__(256) void small_gemm_rowreduce(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    int M, int N, int K, long long aRow, long long aCol, long long bRow, long long bCol,
+    float alpha, float beta, const float* __restrict__ bias, int relu)
+{
+    __shared__ float warpSums[8][16];
+    int row = blockIdx.y, col0 = blockIdx.x * 16;
+    float acc[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) acc[j] = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        float a = A[row * aRow + k * aCol];
+        #pragma unroll
+        for (int j = 0; j < 16; j++)
+            if (col0 + j < N) acc[j] = fmaf(a, B[k * bRow + (col0 + j) * bCol], acc[j]);
+    }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        float v = acc[j];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0) warpSums[warp][j] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 16) {
+        int j = threadIdx.x, col = col0 + j;
+        if (col < N) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) v += warpSums[w][j];
+            float r = alpha * v;
+            if (beta != 0.0f) r += beta * C[(long long)row * N + col];
+            if (bias) r += bias[col];
+            C[(long long)row * N + col] = relu ? sg_relu(r) : r;
+        }
+    }
+}
+
+// Short reduction (K <= 32): one thread per output, its K products summed in order.
+extern ""C"" __global__ __launch_bounds__(256) void small_gemm_tinyk(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    int M, int N, int K, long long aRow, long long aCol, long long bRow, long long bCol,
+    float alpha, float beta, const float* __restrict__ bias, int relu)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)M * N) return;
+    int row = (int)(idx / N), col = (int)(idx - (long long)row * N);
+    float v = 0.0f;
+    for (int k = 0; k < K; k++) v = fmaf(A[row * aRow + k * aCol], B[k * bRow + col * bCol], v);
+    float r = alpha * v;
+    if (beta != 0.0f) r += beta * C[idx];
+    if (bias) r += bias[col];
+    C[idx] = relu ? sg_relu(r) : r;
+}
+
 // C[M,N] = alpha * A[K,M]^T * B[K,N] + beta * C, row-major, for a long reduction K (a weight gradient, K = rows of
 // the batch). Grid (tilesN, tilesM, splits), 256 threads: block z reduces rows [z * rowsPerSplit, +rowsPerSplit) of its
 // 32x64 tile, its four 64-thread groups taking interleaved 16-row chunks; the groups' sums are added in group order in
@@ -359,6 +421,8 @@ extern ""C"" __global__ __launch_bounds__(SG_TN_GROUPS * SG_THREADS) void skinny
                 "skinny_gemm",
                 "skinny_gemm_m16",
                 "skinny_gemm_m8",
+                "small_gemm_rowreduce",
+                "small_gemm_tinyk",
                 "skinny_gemm_tn"
             };
         }
