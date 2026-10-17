@@ -535,9 +535,215 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         cb.EnqueueCapturedGraph(exec);
     }
 
+    // Page-locked step I/O of the captured graph (IGraphStepIo): the graph copies its inputs out of a staging slot the
+    // host fills, and publishes its loss and progress to memory the host reads, so a replay costs the host one graph
+    // launch. Null when the backend has none or the plan's inputs do not qualify; the replay then refreshes inputs and
+    // reads the loss through copies.
+    private Engines.DirectGpu.IGraphStepIo? _stepIo;
+    private Tensor<T>[]? _stepIoLeaves;
+    private Engines.DirectGpu.IGpuBuffer[]? _stepIoBuffers;
+    private uint _stepIoLaunched;   // replays launched (the device counts the same replays)
+    private bool _stepIoLossCaptured;   // the epilogue publishes the loss
+
+    /// <summary>
+    /// The optimizer update recorded into the step graph after the backward. It reads its learning rate (and Adam's step
+    /// number) from device scalars the graph's prologue picks out of a table the host writes, by the device's own count
+    /// of applied steps; the finiteness verdict and that count are published back. So a replay neither waits for the
+    /// previous step's verdict nor issues any optimizer launch from the host, and the schedule and bias correction stay
+    /// exactly those of the eager update (a discarded step does not advance the count).
+    /// </summary>
+    private sealed class CapturedOptimizer
+    {
+        public CapturedOptimizer(LrSchedule schedule, Action<Engines.DirectGpu.IGraphStepIo> capture)
+        {
+            Schedule = schedule;
+            Capture = capture;
+        }
+
+        public LrSchedule Schedule { get; }
+        public Action<Engines.DirectGpu.IGraphStepIo> Capture { get; }
+        public Action? AfterReplay { get; set; }
+        public Action<Engines.DirectGpu.IGraphStepIo>? Prepare { get; set; }
+        public uint InitialApplied { get; set; }
+        public uint LaunchedAtCapture { get; set; }
+        public int SkipsRecorded { get; set; }
+    }
+
+    // Set by ConfigureOptimizerFloat: the captured form of its update, or null when it has none.
+    private Func<CapturedOptimizer?>? _capturedOptimizerFactory;
+    private CapturedOptimizer? _capturedOptimizer;
+
+    /// <summary>
+    /// Builds the step I/O for exactly the inputs <see cref="RefreshGraphInputInPlace"/> refreshes, bound to the
+    /// buffers the capture pre-pass left them on. Null (refresh by copies) when anything does not qualify.
+    /// </summary>
+    private Engines.DirectGpu.IGraphStepIo? TryCreateStepIo(Engines.DirectGpu.IGpuGraphCapture cb)
+    {
+        if (typeof(T) != typeof(float) || _graphHasEmbedding) return null;
+        var leaves = new List<Tensor<T>>();
+        var buffers = new List<Engines.DirectGpu.IGpuBuffer>();
+        var lengths = new List<int>();
+        foreach (var leaf in GraphExternalLeaves())
+        {
+            if (ReferenceEquals(leaf, _compiledInputTensor)) continue;
+            if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var buffer)) return null;
+            if (buffer is null) continue;
+            if (buffer.Size < leaf.Length) return null;
+            leaves.Add(leaf); buffers.Add(buffer); lengths.Add(leaf.Length);
+        }
+        if (_compiledInputTensor is { } input && !CompiledInputIsParameter)
+        {
+            Engines.DirectGpu.IGpuBuffer? buffer;
+            if (GraphExternalLeaves().Contains(input))
+            {
+                if (!LeafStillBoundToCapturedBuffer(input, cb, out buffer)) return null;
+            }
+            else
+            {
+                buffer = input._gpuBuffer is { } bound && ReferenceEquals(input._gpuBackend, cb) ? bound : null;
+                if (buffer is not null && buffer.Handle == IntPtr.Zero) return null;
+            }
+            if (buffer is not null)
+            {
+                if (!input.IsContiguous || buffer.Size < input.Length) return null;
+                leaves.Add(input); buffers.Add(buffer); lengths.Add(input.Length);
+            }
+        }
+        var io = cb.CreateStepIo(buffers, lengths);
+        if (io is null) return null;
+        _stepIoLeaves = leaves.ToArray();
+        _stepIoBuffers = buffers.ToArray();
+        _stepIoLaunched = 0;
+        return io;
+    }
+
+    /// <summary>Whether every step-I/O input is still bound to the buffer the graph copies it into.</summary>
+    private bool StepIoInputsStillBound(Engines.DirectGpu.IGpuGraphCapture cb)
+    {
+        var leaves = _stepIoLeaves!; var buffers = _stepIoBuffers!;
+        for (int i = 0; i < leaves.Length; i++)
+            if (!ReferenceEquals(leaves[i]._gpuBuffer, buffers[i]) || !ReferenceEquals(leaves[i]._gpuBackend, cb)
+                || buffers[i].Handle == IntPtr.Zero)
+                return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Launches the next replay through the step I/O: fills its staging slot (once the replay that last read it has
+    /// completed) with each input's current host contents, then launches the graph.
+    /// </summary>
+    private unsafe void LaunchStepGraphWithStepIo(Engines.DirectGpu.IGpuGraphCapture cb, IntPtr exec)
+    {
+        var io = _stepIo!;
+        uint replay = _stepIoLaunched;
+        if (replay >= 2) io.WaitForReplays(replay - 1);   // slot replay % 2 was last read by replay - 2
+        var leaves = _stepIoLeaves!;
+        for (int i = 0; i < leaves.Length; i++)
+        {
+            var leaf = leaves[i];
+            using var lease = leaf.LeaseArray();
+            var data = (float[])(object)lease.Array;
+            int count = io.InputLength(i);
+            fixed (float* src = data)
+                Buffer.MemoryCopy(src, (void*)io.InputStaging(i, (int)(replay & 1)), (long)count * sizeof(float), (long)count * sizeof(float));
+            leaf._gpuBufferVersion = leaf.GpuCacheVersion;
+        }
+        if (_capturedOptimizer is { } optimizer)
+        {
+            // The device's applied count when this replay runs is between what the last completed replay published
+            // and that plus every replay still in flight; cover each possible step number.
+            int capacity = io.LearningRateCapacity;
+            if (replay >= (uint)capacity) io.WaitForReplays(replay - (uint)capacity + 1);
+            uint completed = io.CompletedReplays;
+            uint applied = io.AppliedSteps;
+            int window = (int)(replay - Math.Min(completed, replay)) + 1;
+            Span<float> rates = stackalloc float[window];
+            int first = (int)applied + 1;
+            for (int k = 0; k < window; k++) rates[k] = (float)optimizer.Schedule.GetLr(first + k);
+            io.WriteLearningRates(replay, first, rates);
+        }
+        LaunchStepGraph(cb, exec);
+        io.Flush();
+        _stepIoLaunched = replay + 1;
+    }
+
+    /// <summary>
+    /// Makes the step I/O's published loss of the replay just launched the loss tensor's pending host value. False
+    /// when the loss does not fit the published slot; the caller then reads it back by copy.
+    /// </summary>
+    private bool TryArmStepIoLoss()
+    {
+        if (_stepIo is not { } io || !_stepIoLossCaptured || _stepIoLaunched == 0) return false;
+        int count = _lossOutput.Length;
+        if (count <= 0 || count > 64 || _lossOutput.GetBackingArrayForCacheLookupUnsafe() is not float[] host || host.Length < count)
+            return false;
+        uint replay = _stepIoLaunched - 1;
+        Helpers.HostSync.Register(host, array =>
+        {
+            io.WaitForReplays(replay + 1);
+            io.Loss(replay, count).CopyTo(new Span<float>((float[])array, 0, count));
+        });
+        return true;
+    }
+
+    /// <summary>
+    /// Brings the step counter and skip bookkeeping up to date with a captured optimizer: waits for every launched
+    /// replay, then takes the device's applied count. Runs before anything reads them, as the deferred finiteness does.
+    /// </summary>
+    private void ResolveCapturedOptimizer()
+    {
+        if (_capturedOptimizer is not { } optimizer || _stepIo is not { } io) return;
+        uint launched = _stepIoLaunched;
+        io.WaitForReplays(launched);
+        uint applied = io.AppliedSteps;
+        int replays = (int)(launched - optimizer.LaunchedAtCapture);
+        int skipped = replays - (int)(applied - optimizer.InitialApplied);
+        for (int s = optimizer.SkipsRecorded; s < skipped; s++) _nonFiniteStepsSkipped++;
+        optimizer.SkipsRecorded = Math.Max(optimizer.SkipsRecorded, skipped);
+        _optimizerStep = (int)applied;
+        if (launched > 0)
+        {
+            double last = io.SumOfSquares(launched - 1);
+            _lastStepSkippedNonFiniteGradients = double.IsNaN(last) || double.IsInfinity(last);
+        }
+    }
+
+    /// <summary>
+    /// Re-seeds a captured optimizer's device step count after <see cref="_optimizerStep"/> was replaced from outside
+    /// the graph (another plan's moments taken over). The caller resolved every launched replay first.
+    /// </summary>
+    private void SyncCapturedOptimizerStep()
+    {
+        if (_capturedOptimizer is not { } optimizer || _stepIo is not { } io) return;
+        optimizer.InitialApplied = (uint)Math.Max(0, _optimizerStep);
+        optimizer.LaunchedAtCapture = _stepIoLaunched;
+        optimizer.SkipsRecorded = 0;
+        io.InitializeAppliedSteps(optimizer.InitialApplied);
+    }
+
+    private void DisposeStepIo()
+    {
+        if (_capturedOptimizer is not null && _stepIo is not null)
+        {
+            // Land the counter before the published state goes; later steps run the eager update from it.
+            ResolveCapturedOptimizer();
+            _capturedOptimizer = null;
+        }
+        // A loss armed from the step I/O reads its page-locked results: land it before they go.
+        if (_stepIo is not null && _lossOutput.GetBackingArrayForCacheLookupUnsafe() is { } lossKey)
+            Helpers.HostSync.TryMaterialize(lossKey);
+        _stepIo?.Dispose();
+        _stepIo = null;
+        _stepIoLeaves = null;
+        _stepIoBuffers = null;
+        _stepIoLaunched = 0;
+        _stepIoLossCaptured = false;
+    }
+
     private void RefreshLossFromCapturedGraph(Engines.DirectGpuTensorEngine gte)
     {
         if (typeof(T) != typeof(float)) return;
+        if (TryArmStepIoLoss()) return;
         if (TryDeferLossReadback(gte)) return;
         var fresh = gte.DownloadResidentBuffer(_lossOutput);
         if (fresh is null) return;
@@ -625,6 +831,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
         _graphStepCalls = 0;
+        DisposeStepIo();   // before the rollback below, which may read the loss
         // The eager step accumulates into HOST gradient arrays; leaving the accumulators bound to the capture's
         // device buffers made its in-place adds land on never-zeroed device memory (gradients piled up across steps).
         if (hadGraph && _engine is Engines.DirectGpuTensorEngine gRoll)
@@ -1873,6 +2080,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// </summary>
     private void ResolveDeferredFiniteness()
     {
+        ResolveCapturedOptimizer();
         if (!_finitenessDeferred) return;
         _finitenessDeferred = false;
         if (_finitenessReadback is not { } readback) return;
@@ -2246,6 +2454,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (double.IsNaN(strength) || double.IsInfinity(strength) || strength < 0)
             throw new ArgumentOutOfRangeException(nameof(strength), strength, "L2 strength must be finite and >= 0.");
         _l2Regularization = (float)strength;
+        RetireCapturedOptimizerIfIneligible();
+    }
+
+    /// <summary>
+    /// A captured optimizer runs the plain update inside the step graph; once gradient clipping or L2 regularization
+    /// is switched on, that graph would skip them, so it is retired and the next capture keeps the eager update.
+    /// </summary>
+    private void RetireCapturedOptimizerIfIneligible()
+    {
+        if (_capturedOptimizer is not null && (_maxGradNorm > 0.0 || _l2Regularization != 0f))
+            InvalidateCapturedStepGraph();
     }
 
     /// <inheritdoc/>
@@ -2274,6 +2493,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             RestoreFusedOptimizerCheckpoint(checkpoint, sourceState.Schedules);
         }
         _l2Regularization = source._l2Regularization;
+        RetireCapturedOptimizerIfIneligible();
     }
 
     /// <summary>
@@ -2344,7 +2564,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
         var target = _optimizerRuntimeState!;
         source.ResolveDeferredFiniteness();
+        ResolveDeferredFiniteness();   // this plan's in-flight replays land before its count is replaced
         _optimizerStep = source._optimizerStep;
+        SyncCapturedOptimizerStep();
         _maxGradNorm = source._maxGradNorm;
         target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
         target.Scalars.DAdaptationEstimate = src.Scalars.DAdaptationEstimate;
@@ -2485,6 +2707,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 "Gradient norm threshold must be finite and non-negative.");
         }
         _maxGradNorm = maxNorm;
+        RetireCapturedOptimizerIfIneligible();
     }
 
     // Gradient checkpointing (Phase 5.3)
@@ -2966,11 +3189,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         RefreshGraphInputInPlace(cb);
                         RunGpuStepBodyForCapture(cb);
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = true;
+                        _stepIo = TryCreateStepIo(cb);
+                        if (_stepIo is not null && _capturedOptimizerFactory?.Invoke() is { } capturedOptimizer)
+                        {
+                            // The eager warmup steps' verdicts first: the device's applied count starts from the host's.
+                            ResolveDeferredFiniteness();
+                            capturedOptimizer.InitialApplied = (uint)Math.Max(0, _optimizerStep);
+                            _stepIo.InitializeAppliedSteps(capturedOptimizer.InitialApplied);
+                            capturedOptimizer.Prepare?.Invoke(_stepIo);
+                            capturedOptimizer.LaunchedAtCapture = 0;
+                            _capturedOptimizer = capturedOptimizer;
+                        }
                         // Trace every device allocation that fires INSIDE the capture (AIDOTNET_GPU_CAPTURE_TRACE=1):
                         // those are the graph-purity violations that abort/spoil whole-step capture and keep the
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
-                            exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
+                            exec = cb.CaptureGraph(() =>
+                            {
+                                _stepIo?.CapturePrologue();
+                                RunGpuStepBodyForCapture(cb);
+                                if (_capturedOptimizer is { } optimizer && _stepIo is { } io) optimizer.Capture(io);
+                                var lossBuffer = _lossOutput._gpuBuffer;
+                                _stepIoLossCaptured = lossBuffer is not null && _lossOutput.Length <= 64;
+                                _stepIo?.CaptureEpilogue(_stepIoLossCaptured ? lossBuffer : null, _lossOutput.Length);
+                            });
                     }
                     catch (Exception captureFailure)
                     {
@@ -2983,6 +3225,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         // back NOW rather than aborting this step (PR #581 review: a one-off capture hiccup
                         // shouldn't kill a training run when every later step would succeed eagerly anyway).
                         _graphStepDisabled = true;
+                        DisposeStepIo();
                         DetachCapturePathBindings();
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         gte.EndGraphLifetime();
@@ -3004,6 +3247,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         // buffer non-evictable, silently defeating AIDOTNET_GPU_OFFLOAD and risking OOM. The
                         // _graphEvictionSuspended flag also gates Dispose, so clearing it prevents a double-resume.
                         _graphStepDisabled = true;
+                        DisposeStepIo();
                         DetachCapturePathBindings();
                         gte.EndGraphLifetime();
                         _graphEvictionSuspended = false;
@@ -3011,8 +3255,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         return StepResidentOrEager();
                     }
                     _stepGraphExec = exec;
-                    LaunchStepGraph(cb, exec);   // executes THIS step on the just-uploaded indices
+                    // Executes THIS step on the just-uploaded indices (through the step I/O's staging when it has one).
+                    if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, exec);
+                    else LaunchStepGraph(cb, exec);
                     RefreshLossFromCapturedGraph(gte);
+                    if (_capturedOptimizer is { } capturedFirst)
+                    {
+                        capturedFirst.AfterReplay?.Invoke();   // the graph ran the update
+                        return _lossOutput;
+                    }
                     // The optimizer update is run eagerly (NOT captured): its closure
                     // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
                     // Adam/AdamW bias-correction each step, and bakes those scalars into
@@ -3034,7 +3285,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 // Upload THIS step's token indices into the stable buffer (OUTSIDE capture) so the captured
                 // embedding gather replays on fresh indices; then replay the whole step as one graph launch.
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
-                if (!RefreshGraphInputInPlace(cb))
+                if (_stepIo is not null ? !StepIoInputsStillBound(cb) : !RefreshGraphInputInPlace(cb))
                 {
                     // An input the graph reads through a baked pointer was released: replaying would read freed
                     // memory. Drop the graph and train this plan eagerly from here on.
@@ -3042,9 +3293,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     _graphStepDisabled = true;
                     return StepEager();
                 }
-                LaunchStepGraph(cb, _stepGraphExec);
+                if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, _stepGraphExec);
+                else LaunchStepGraph(cb, _stepGraphExec);
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
                 RefreshLossFromCapturedGraph(gte);
+                if (_capturedOptimizer is { } capturedReplay)
+                {
+                    capturedReplay.AfterReplay?.Invoke();   // the graph ran the update
+                    return _lossOutput;
+                }
                 ApplyL2Regularization();
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
@@ -4954,6 +5211,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
 
         int[]? adamWSegments = null;   // AdamWUpdateMultiParallel's segment list, reused across steps
+        _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -5831,6 +6089,56 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 CommitOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             }
         };
+
+        // The same update captured into the step graph (see CapturedOptimizer): plain SGD or fp32-moment Adam/AdamW on one
+        // CUDA backend, with every parameter and gradient resident -- the multi-tensor path above, minus its per-step
+        // host work. Anything else keeps the update above, run after each replay.
+        _capturedOptimizerFactory = () =>
+        {
+            if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
+                || paramCount == 0 || _l2Regularization != 0f || _maxGradNorm > 0.0)
+                return null;
+            ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
+            var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+            var capGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+            var capM = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+            var capV = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
+            var capSizes = new List<int>(paramCount);
+            var owner = gpuBackends[0];
+            if (owner is not Engines.DirectGpu.IGpuGraphCapture) return null;
+            bool adam = optType != OptimizerType.SGD;
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (!ReferenceEquals(gpuBackends[p], owner) || gpuParam[p] is not { } gp || gpuGrad[p] is not { } gg
+                    || lengths[p] <= 0)
+                    return null;
+                if (adam && (gpuMomentStorage[p] != FusedMomentStorageMode.Float32 || gpuM[p] is null || gpuV[p] is null))
+                    return null;
+                capParams.Add(gp); capGrads.Add(gg); capSizes.Add(lengths[p]);
+                if (adam) { capM.Add(gpuM[p]!); capV.Add(gpuV[p]!); }
+            }
+            var captured = new CapturedOptimizer(lrSchedule, io =>
+            {
+                if (adam) io.CaptureAdamUpdate(optType == OptimizerType.AdamW, capParams, capGrads, capM, capV, capSizes, b1, b2, epsVal, wd);
+                else io.CaptureSgdUpdate(capParams, capGrads, capSizes, (float)wd);
+            });
+            captured.Prepare = io => io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes);
+            captured.AfterReplay = () =>
+            {
+                // The device updated every parameter in place: keep the host's view of them in step, as the
+                // multi-tensor path above does after its launch.
+                for (int p = 0; p < paramCount; p++)
+                {
+                    _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+                    if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                    {
+                        rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                        CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
+                    }
+                }
+            };
+            return captured;
+        };
     }
 
     private unsafe void ConfigureOptimizerFloatGrouped(
@@ -6140,6 +6448,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             GpuMomentStorage = gpuMomentStorage,
         };
 
+        _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -6601,6 +6910,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             VMaxDouble = vMax,
         };
 
+        _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -6805,6 +7115,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             VMaxDouble = vMax,
         };
 
+        _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -7012,6 +7323,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _gpuOptimizerBuffers.Clear();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
+        _capturedOptimizerFactory = null;
         _optimizerUpdate = null;
         _optimizerStep = 0;
         InvalidateCapturedStepGraph();

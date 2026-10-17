@@ -13456,11 +13456,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Mean, A, B, outerSize, reduceSize))
             return;
-        if (!_kernelCache.TryGetValue("mean_axis", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: mean_axis");
+        // Long rows: one block per row (mean_axis_rows), as SumAxis does; mean_axis's one thread per row walks a row
+        // serially (a full reduction is one row) and uncoalesced.
+        bool blockPerRow = reduceSize >= SumAxisRowsMinReduce;
+        if (!_kernelCache.TryGetValue(blockPerRow ? "mean_axis_rows" : "mean_axis", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: " + (blockPerRow ? "mean_axis_rows" : "mean_axis"));
 
         using var _ = PushContext();
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = blockPerRow ? (uint)outerSize : (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
         void** args = stackalloc void*[4];
@@ -13764,7 +13767,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step)
         => MultiTensorAdamImpl("adam_multi_tensor_update", parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard: null);
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard: null, IntPtr.Zero);
 
     public void AdamWMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -13772,7 +13775,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
         float weightDecay, int step)
         => MultiTensorAdamImpl("adamw_multi_tensor_update", parameters, gradients, firstMoments,
-            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard: null);
+            secondMoments, sizes, learningRate, beta1, beta2, epsilon, weightDecay, step, finiteGuard: null, IntPtr.Zero);
 
     /// <summary>
     /// <see cref="AdamMultiTensorUpdate"/> / <see cref="AdamWMultiTensorUpdate"/> that discard the step ON THE DEVICE
@@ -13791,7 +13794,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (finiteGuard.Size < 2) throw new ArgumentException("The double guard needs two float slots.", nameof(finiteGuard));
         MultiTensorAdamImpl(decoupledWeightDecay ? "adamw_multi_tensor_update" : "adam_multi_tensor_update",
             parameters, gradients, firstMoments, secondMoments, sizes, learningRate, beta1, beta2, epsilon,
-            weightDecay, step, finiteGuard);
+            weightDecay, step, finiteGuard, IntPtr.Zero);
     }
 
     // Must match SGD_MT_MAX / SGD_MT_CHUNK in CudaOptimizerKernels and SgdMultiTensorArgs' layout there.
@@ -13815,7 +13818,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public void SgdMultiTensorUpdate(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
         float learningRate, float weightDecay)
-        => SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, IntPtr.Zero);
+        => SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, IntPtr.Zero, IntPtr.Zero);
 
     /// <summary>
     /// <see cref="SgdMultiTensorUpdate"/> whose kernel reads <paramref name="finiteGuard"/> (a double) on the device and
@@ -13827,12 +13830,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (finiteGuard is null) throw new ArgumentNullException(nameof(finiteGuard));
         if (finiteGuard.Size < 2) throw new ArgumentException("The double guard needs two float slots.", nameof(finiteGuard));
-        SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, finiteGuard.Handle);
+        SgdMultiTensorImpl(parameters, gradients, sizes, learningRate, weightDecay, finiteGuard.Handle, IntPtr.Zero);
     }
 
-    private unsafe void SgdMultiTensorImpl(
+    // dynamicScalars: a device float[2] the kernel reads the learning rate from instead (a captured step's, see
+    // CudaBackend.StepIo); zero for the learningRate argument.
+    internal unsafe void SgdMultiTensorImpl(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes,
-        float learningRate, float weightDecay, IntPtr finiteGuard)
+        float learningRate, float weightDecay, IntPtr finiteGuard, IntPtr dynamicScalars)
     {
         PerTensorMultiTensorOptimizer.ValidateSgd(parameters, gradients, sizes);
         int n = parameters.Count;
@@ -13842,7 +13847,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         using var _ = PushContext();
         var args = default(SgdMultiTensorArgs);
-        void** launchArgs = stackalloc void*[4];
+        void** launchArgs = stackalloc void*[5];
         for (int first = 0; first < n; first += SgdMultiTensorMax)
         {
             int count = Math.Min(SgdMultiTensorMax, n - first);
@@ -13858,16 +13863,29 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             args.BlockStart[count] = blocks;
             args.Count = count;
             launchArgs[0] = &args; launchArgs[1] = &learningRate; launchArgs[2] = &weightDecay; launchArgs[3] = &finiteGuard;
+            launchArgs[4] = &dynamicScalars;
             LaunchKernel(kernel, (uint)blocks, DefaultBlockSize, launchArgs);
         }
     }
 
+    // dynamicScalars: a device float[2] (learning rate, step) the kernel reads instead of those arguments (a captured
+    // step's, see CudaBackend.StepIo); zero to use the arguments.
+    internal unsafe void MultiTensorAdamImpl(
+        string kernelName,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
+        float weightDecay, int step, IGpuBuffer? finiteGuard, IntPtr dynamicScalars)
+        => MultiTensorAdamImpl(kernelName, parameters, gradients, firstMoments, secondMoments, sizes, learningRate, beta1,
+            beta2, epsilon, weightDecay, step, finiteGuard, dynamicScalars, ownTable: null);
+
+    // ownTable: a table the caller built and owns (a captured step's); null uses the shared cached one.
     private unsafe void MultiTensorAdamImpl(
         string kernelName,
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
-        float weightDecay, int step, IGpuBuffer? finiteGuard)
+        float weightDecay, int step, IGpuBuffer? finiteGuard, IntPtr dynamicScalars, MultiTensorTable? ownTable)
     {
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
@@ -13885,11 +13903,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
-        void** args = stackalloc void*[15];
+        void** args = stackalloc void*[16];
         IntPtr guardH = finiteGuard?.Handle ?? IntPtr.Zero;
         lock (_adamTableSync)
         {
-            var table = GetAdamTable(parameters, gradients, firstMoments, secondMoments, sizes);
+            var table = ownTable ?? GetAdamTable(parameters, gradients, firstMoments, secondMoments, sizes);
             IntPtr pH = table.Pointers?.Handle ?? IntPtr.Zero;
             IntPtr gH = (IntPtr)((long)pH + n * sizeof(ulong));
             IntPtr mH = (IntPtr)((long)pH + 2L * n * sizeof(ulong));
@@ -13902,6 +13920,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             args[4] = &szH; args[5] = &ctH; args[6] = &csH;
             args[7] = &learningRate; args[8] = &beta1; args[9] = &beta2; args[10] = &epsilon;
             args[11] = &weightDecay; args[12] = &step; args[13] = &chunkSize; args[14] = &guardH;
+            args[15] = &dynamicScalars;
             LaunchKernel(kernel, (uint)table.TotalChunks, DefaultBlockSize, args);
         }
     }
@@ -13939,7 +13958,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (IsStreamCapturing())
             throw new InvalidOperationException(
                 "The multi-tensor Adam table must be built before stream capture; run an eager step first.");
+        var built = BuildAdamTable(parameters, gradients, firstMoments, secondMoments, sizes);
+        _adamTable?.Dispose();
+        _adamTable = built;
+        return built;
+    }
 
+    /// <summary>A new multi-tensor Adam table the caller owns (see <see cref="BuildGradientTable"/>).</summary>
+    private MultiTensorTable BuildAdamTable(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes)
+    {
+        int n = parameters.Count;
         var handles = new IntPtr[4 * n];
         var addresses = new byte[4 * n * sizeof(ulong)];
         var sizeArray = new int[n];
@@ -13981,8 +14012,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             table.Dispose();
             throw;
         }
-        _adamTable?.Dispose();
-        _adamTable = table;
         return table;
     }
 
@@ -14056,7 +14085,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (IsStreamCapturing())
             throw new InvalidOperationException(
                 "The multi-tensor gradient table must be built before stream capture; run an eager step first.");
+        var table = BuildGradientTable(tensors, sizes);
+        _gradientTable?.Dispose();
+        _gradientTable = table;
+        return table;
+    }
 
+    /// <summary>
+    /// A new gradient table (address, size and chunk arrays on the device) the caller owns. A captured graph that keeps
+    /// its own table is unaffected when another tensor list replaces the shared cached one.
+    /// </summary>
+    private MultiTensorTable BuildGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
+    {
         int n = tensors.Count;
         var addresses = new byte[n * sizeof(ulong)];
         var handles = new IntPtr[n];
@@ -14100,8 +14140,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             table.Dispose();
             throw;
         }
-        _gradientTable?.Dispose();
-        _gradientTable = table;
         return table;
     }
 
@@ -14110,6 +14148,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// <paramref name="sumOfSquares"/> (at least two float slots). Accumulated in double, so it is finite exactly when
     /// every element is: one reduction serves the global-norm clip and the non-finite-gradient check.
     /// </summary>
+    /// <summary>
+    /// <see cref="MultiTensorSumOfSquares"/> over a table the caller built and owns (captured step graphs). With
+    /// <paramref name="zeroFirst"/> false the sum accumulates onto <paramref name="sumOfSquares"/>, which the caller keeps
+    /// at zero between uses (a captured step's epilogue resets it), saving the graph a memset node.
+    /// </summary>
+    private unsafe void MultiTensorSumOfSquares(MultiTensorTable table, IGpuBuffer sumOfSquares, bool zeroFirst)
+    {
+        if (zeroFirst) Fill(sumOfSquares, 0f, 2);
+        if (table.Handles.Length == 0) return;
+        if (!_kernelCache.TryGetValue("multi_tensor_sum_squares", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: multi_tensor_sum_squares");
+        void** args = stackalloc void*[6];
+        using var _ = PushContext();
+        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+        IntPtr outH = sumOfSquares.Handle;
+        int totalChunks = table.TotalChunks;
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &outH;
+        LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorReductionMaxBlocks), MultiTensorChunk, args);
+    }
+
     public unsafe void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
     {
         if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));

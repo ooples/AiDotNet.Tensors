@@ -26,4 +26,7 @@ public sealed partial class OpenClBackend : IGpuGraphCapture
 
     void IGpuGraphCapture.DestroyCapturedGraph(System.IntPtr graphExec)
         => throw new System.ArgumentException("This backend never returns a graph handle.", nameof(graphExec));
+
+    IGraphStepIo? IGpuGraphCapture.CreateStepIo(System.Collections.Generic.IReadOnlyList<IGpuBuffer> inputs,
+        System.Collections.Generic.IReadOnlyList<int> lengths) => null;
 }

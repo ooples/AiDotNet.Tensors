@@ -85,9 +85,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public bool SkipReportedAfterNonFiniteStep;
         public int NonFiniteStepsSkipped;
         public int OptimizerStep;
+        public bool UpdateCapturedInGraph;   // the optimizer update ran inside the step graph (step I/O)
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -123,7 +124,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             if (!capture) concrete.DisableGraphStep();
             concrete.FailNextCaptureForTesting = failCapture;
             concrete.FailInsideNextCaptureForTesting = failInsideCapture;
-            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            if (schedule is null) plan.ConfigureOptimizer(optimizer, learningRate: 1e-2f);
+            else plan.ConfigureOptimizer(optimizer, schedule);
             plan.SetMaxGradNorm(maxGradNorm);
             var losses = new double[Steps];
             float[][] lastGradients = Array.Empty<float[]>();
@@ -133,6 +135,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             {
                 FeedBatch(x, y, s);
                 if (s == clipOffFromStep) plan.SetMaxGradNorm(0);
+                if (s == clipOnFromStep) plan.SetMaxGradNorm(0.5);
                 if (s == nonFiniteStep)
                 {
                     // One non-finite input makes every gradient non-finite: the whole step must be discarded.
@@ -190,6 +193,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             run.StepStates = states;
             run.NonFiniteStepsSkipped = plan.NonFiniteStepsSkipped;
             run.OptimizerStep = concrete.OptimizerStep;
+            run.UpdateCapturedInGraph = typeof(CompiledTrainingPlan<float>)
+                .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete) is not null;
             return run;
         }
     }
@@ -208,6 +213,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
             var eager = Train(gpu, capture: false);
             var captured = Train(gpu, capture: true);
+            Assert.True(captured.UpdateCapturedInGraph, "the replayed graph does not run the optimizer update (step I/O)");
             _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
             _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
 
@@ -254,6 +260,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             var eager = Train(gpu, capture: false, nonFiniteStep: nonFiniteStep, maxGradNorm: maxGradNorm, clipOffFromStep: clipOffFromStep);
             var captured = Train(gpu, capture: true, nonFiniteStep: nonFiniteStep, maxGradNorm: maxGradNorm, clipOffFromStep: clipOffFromStep);
             Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+            if (maxGradNorm == 0)
+                Assert.True(captured.UpdateCapturedInGraph, "the discard was not made by the graph's own update (step I/O)");
 
             foreach (var (name, run) in new[] { ("eager", eager), ("captured", captured) })
             {
@@ -270,6 +278,79 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
             }
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// The optimizer update inside the step graph reads each step's learning rate (and Adam's step number) from the
+    /// device, picked by the device's own count of applied steps out of a table the host writes ahead. A schedule that
+    /// changes the rate every step, and a non-finite step that must not advance the count, are where a stale or
+    /// off-by-one choice would show: the replayed plan must train exactly like the eager plan.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(OptimizerType.Adam, -1)]
+    [InlineData(OptimizerType.Adam, 6)]
+    [InlineData(OptimizerType.AdamW, 7)]
+    [InlineData(OptimizerType.SGD, 6)]
+    public void A_scheduled_update_inside_the_graph_trains_like_the_eager_step(OptimizerType optimizer, int nonFiniteStep)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var schedule = LrSchedule.Cosine(optimizer == OptimizerType.SGD ? 0.1 : 2e-2, Steps, 1e-3);
+            var eager = Train(gpu, capture: false, schedule: schedule, optimizer: optimizer, nonFiniteStep: nonFiniteStep);
+            var captured = Train(gpu, capture: true, schedule: schedule, optimizer: optimizer, nonFiniteStep: nonFiniteStep);
+            _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+            Assert.True(captured.UpdateCapturedInGraph, "the replayed graph does not run the optimizer update (step I/O)");
+            Assert.Equal(eager.OptimizerStep, captured.OptimizerStep);
+            Assert.Equal(eager.NonFiniteStepsSkipped, captured.NonFiniteStepsSkipped);
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s == nonFiniteStep) continue;
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            }
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// Gradient clipping switched on after the update was captured into the graph: the graph's update knows nothing of
+    /// clipping, so the plan must retire it and clip as the eager step does.
+    /// </summary>
+    [SkippableFact]
+    public void Clipping_switched_on_after_capture_is_applied_like_the_eager_step()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false, clipOnFromStep: 6);
+            var captured = Train(gpu, capture: true, clipOnFromStep: 6);
+            Assert.False(captured.UpdateCapturedInGraph, "a graph whose update skips clipping kept replaying after clipping was switched on");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
             for (int p = 0; p < eager.FinalWeights.Length; p++)
                 for (int i = 0; i < eager.FinalWeights[p].Length; i++)
                     Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,

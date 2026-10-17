@@ -478,6 +478,10 @@ internal static class CudaNativeBindings
     /// <summary>cuMemAllocManaged flag: attach to host stream only.</summary>
     public const uint CU_MEM_ATTACH_HOST = 2;
 
+    /// <summary>The device address of page-locked host memory from <see cref="cuMemAllocHost"/> (flags 0).</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemHostGetDevicePointer_v2")]
+    public static extern CudaResult cuMemHostGetDevicePointer(out IntPtr dptr, IntPtr p, uint flags);
+
     [DllImport(CudaLibrary, EntryPoint = "cuMemFreeHost")]
     public static extern CudaResult cuMemFreeHost(IntPtr p);
 
