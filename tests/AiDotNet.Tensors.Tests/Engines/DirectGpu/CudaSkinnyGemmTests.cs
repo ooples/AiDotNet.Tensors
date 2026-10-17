@@ -21,6 +21,8 @@ public class CudaSkinnyGemmTests
     [InlineData(300, 4, 8, false)]         // rows not a multiple of the 32-row tile, one partial column tile
     [InlineData(257, 256, 256, true)]      // the widest shape taken, K swept in eight chunks
     [InlineData(333, 68, 36, false)]       // N and K past a tile edge
+    [InlineData(256, 64, 128, false)]      // few tiles: the 8-row tile (a 256-row FFN down-projection)
+    [InlineData(256, 192, 64, true)]       // the 16-row tile with B transposed
     public void SkinnyGemm_EqualsTheReference(int m, int n, int k, bool transB)
     {
         using var backend = new CudaBackend();
@@ -154,7 +156,7 @@ public class CudaSkinnyGemmTests
     }
 
     [SkippableTheory]
-    [InlineData("skinny_gemm", 64)]
+    [InlineData("skinny_gemm", 256)]
     [InlineData("skinny_gemm_tn", 256)]
     public void SkinnyGemmKernels_KeepTheirAccumulatorsInRegisters(string kernel, int blockThreads)
     {

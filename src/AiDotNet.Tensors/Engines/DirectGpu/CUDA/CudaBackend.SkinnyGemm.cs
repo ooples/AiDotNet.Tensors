@@ -12,6 +12,8 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
         Environment.GetEnvironmentVariable("AIDOTNET_SKINNY_GEMM") != "0";
 
     private const int SkinnyTileRows = 32, SkinnyTileColumns = 64, SkinnyBlockThreads = 64;
+    // skinny_gemm: four 64-thread groups per block (SG_GROUPS * SG_THREADS).
+    private const int SkinnyGemmBlockThreads = 4 * SkinnyBlockThreads;
     // skinny_gemm_tn: four 64-thread groups per block, each reducing 16-row chunks of the block's split.
     private const int SkinnyTransposedABlockThreads = 256, SkinnyTransposedAPassRows = 64;
 
@@ -34,6 +36,12 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
             || (N & 3) != 0 || (K & 3) != 0 || !SkinnyAligned(A, B, C)
             || !_kernelCache.TryGetValue("skinny_gemm", out var kernel))
             return false;
+        // The tallest row tile that still gives about half the SMs a block (32, then 16, then 8 rows).
+        int tilesN = (N + SkinnyTileColumns - 1) / SkinnyTileColumns;
+        int tileRows = SkinnyTileRows;
+        while (tileRows > 8 && (long)((M + tileRows - 1) / tileRows) * tilesN < Math.Max(1, ComputeUnits) / 2) tileRows /= 2;
+        if (tileRows != SkinnyTileRows && _kernelCache.TryGetValue("skinny_gemm_m" + tileRows, out var shorter)) kernel = shorter;
+        else tileRows = SkinnyTileRows;
         using var _ = PushContext();
         IntPtr a = A.Handle, b = B.Handle, c = C.Handle;
         int m = M, n = N, k = K, tb = transB ? 1 : 0, re = relu ? 1 : 0;
@@ -42,8 +50,7 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
         void** args = stackalloc void*[11];
         args[0] = &a; args[1] = &b; args[2] = &c; args[3] = &m; args[4] = &n; args[5] = &k; args[6] = &tb;
         args[7] = &al; args[8] = &be; args[9] = &bi; args[10] = &re;
-        LaunchKernel2D(kernel, (uint)((N + SkinnyTileColumns - 1) / SkinnyTileColumns),
-            (uint)((M + SkinnyTileRows - 1) / SkinnyTileRows), 1, SkinnyBlockThreads, 1, args);
+        LaunchKernel2D(kernel, (uint)tilesN, (uint)((M + tileRows - 1) / tileRows), 1, SkinnyGemmBlockThreads, 1, args);
         return true;
     }
 
