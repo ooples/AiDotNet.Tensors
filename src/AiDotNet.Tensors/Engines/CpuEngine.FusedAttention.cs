@@ -441,7 +441,6 @@ public partial class CpuEngine
         float[] qs = ws.Get(0, br * hd), kt = ws.Get(1, hd * bc), vt = ws.Get(2, vd * bc);
         float[] pr = ws.Get(3, br * bc), ds = ws.Get(4, br * bc);
         float[] dk = ws.Get(7, bc * hd), dv = ws.Get(8, bc * vd);
-        float[] pt = ws.Get(9, bc * br), dst = ws.Get(10, bc * br);
         Array.Clear(dk, 0, cols * hd);
         Array.Clear(dv, 0, cols * vd);
         TransposeKeyBlock(k.Data, kBase + j0 * k.RowStride, k.RowStride, kt, hd, cols, bc);
@@ -454,10 +453,9 @@ public partial class CpuEngine
             if (!TileHasAllowed(p, b, h, i0, rows, j0, cols)) continue;
             for (int r = 0; r < rows; r++) ScaleCopy(q.Data, qBase + (i0 + r) * q.RowStride, qs, r * hd, hd, p.ScaleF);
             FusedAttentionGradientTile(qs, kt, vt, dO, dOBase, lse, delta, p, b, h, bh, i0, rows, j0, cols, pr, ds);
-            TransposeTile(pr, bc, pt, rows, rows, cols);
-            TransposeTile(ds, bc, dst, rows, rows, cols);
-            TileGemm(pt, 0, rows, dO, dOBase + i0 * vd, vd, dv, 0, vd, cols, vd, rows, accumulate: true);
-            TileGemm(dst, 0, rows, qs, 0, hd, dk, 0, hd, cols, hd, rows, accumulate: true);
+            // P^T and dS^T are read in place (row stride 1, column stride bc): no transposed copies.
+            TileGemm(pr, 0, 1, dO, dOBase + i0 * vd, vd, dv, 0, vd, cols, vd, rows, accumulate: true, aStep: bc);
+            TileGemm(ds, 0, 1, qs, 0, hd, dk, 0, hd, cols, hd, rows, accumulate: true, aStep: bc);
         }
         if (dK.Array is not null)
             for (int c = 0; c < cols; c++)

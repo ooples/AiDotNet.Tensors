@@ -160,6 +160,35 @@ public class JitGemmGeneratorTests
         Assert.Contains((byte)0x62, code);     // EVEX prefix — vdpbf16ps is raw EVEX (no .NET intrinsic)
     }
 
+    /// <summary>
+    /// The generator runs on one thread, so inside the thin-M box (a batch-64 linear layer) Gemm leaves the shape to
+    /// the parallel direct kernel: [64,512]x[512,128] ran 90 us on the generator against 42 us there. Outside the box
+    /// (32 rows) the generator still takes it. The strides are unusual so no other test's kernels match them.
+    /// </summary>
+    [Fact]
+    public void Gemm_LeavesAThinMBatchShapeToTheParallelKernel()
+    {
+        const int k = 520, n = 120; // n inside the generator's n <= 128 bound
+        if (!HardwareSupportsJit)
+        {
+            Assert.False(JitGemmGenerator.IsSupported);
+            return;
+        }
+        Assert.True(AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism >= 2,
+            "the stand-aside applies only with a second thread to run the parallel kernel on");
+        var b = Rand(k * n, 7);
+
+        var aBatch = Rand(64 * k, 6); var cBatch = new float[64 * n];
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(aBatch, k, false, b, n, false, cBatch, n, 64, n, k);
+        Assert.True(MaxAbsErr(cBatch, ScalarRef(aBatch, b, 64, n, k, null, false)) < 1e-3, "batch-64 result must match scalar ref");
+        Assert.False(JitGemmGenerator.HasKernelForStrides(k, n, n), "the generator ran a shape the parallel kernel serves");
+
+        var aThin = Rand(32 * k, 8); var cThin = new float[32 * n];
+        AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(aThin, k, false, b, n, false, cThin, n, 32, n, k);
+        Assert.True(MaxAbsErr(cThin, ScalarRef(aThin, b, 32, n, k, null, false)) < 1e-3, "32-row result must match scalar ref");
+        Assert.True(JitGemmGenerator.HasKernelForStrides(k, n, n), "the generator must still take a 32-row GEMM");
+    }
+
     [Fact]
     public void Bf16_StaysOffUntilExplicitlyEnabled()
     {

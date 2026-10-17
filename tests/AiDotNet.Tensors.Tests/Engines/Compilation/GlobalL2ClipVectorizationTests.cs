@@ -91,6 +91,70 @@ public class GlobalL2ClipVectorizationTests
                 $"len={len} [{i}]: {chunked[i]:R} != {serial[i]:R}");
     }
 
+    // A model's gradient list: biases, norms and weights below one chunk (the parity Transformer's 30 tensors are all
+    // under 64K), an empty one, and two spanning several chunks.
+    private static readonly int[] ManyLengths = { 64, 0, 4096, 8192, 10, 65_537, 3, 131_079, 1000, 65_536 };
+
+    [Fact]
+    public void SumSquaresMany_IsBitIdenticalToSumSquaresChunkedPerItem_AtEveryThreadCount()
+    {
+        var items = new System.Collections.Generic.List<(float[] Array, int Length)>();
+        for (int i = 0; i < ManyLengths.Length; i++) items.Add((MakeFloat(ManyLengths[i], seed: 700 + i), ManyLengths[i]));
+        // Plus chunks of very different magnitude, so adding the partials in any other order shows in the low bits.
+        int chunk = CompiledTrainingPlan<float>.ClipChunkElements;
+        int graded = 5 * chunk + 3;
+        var rng = new Random(17);   // the SumSquaresChunked_AddsPartialsInChunkOrder fixture, known to discriminate
+        var a = new float[graded];
+        for (int i = 0; i < graded; i++) a[i] = (float)((rng.NextDouble() + 0.1) * Math.Pow(37.0, i / chunk));
+        items.Add((a, graded));
+        double inOrder = 0.0, reversed = 0.0;
+        for (int c = 0; c < 6; c++) inOrder += CompiledTrainingPlan<float>.SumSquaresRange(a, c * chunk, Math.Min(graded, (c + 1) * chunk));
+        for (int c = 5; c >= 0; c--) reversed += CompiledTrainingPlan<float>.SumSquaresRange(a, c * chunk, Math.Min(graded, (c + 1) * chunk));
+        Assert.NotEqual(BitConverter.DoubleToInt64Bits(inOrder), BitConverter.DoubleToInt64Bits(reversed));   // the fixture discriminates
+        var expected = new double[items.Count];
+        for (int i = 0; i < items.Count; i++) expected[i] = CompiledTrainingPlan<float>.SumSquaresChunked(items[i].Array, items[i].Length);
+
+        int before = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            foreach (int threads in new[] { 1, 3, 16 })
+            {
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                var sums = new double[items.Count];
+                double[] partials = Array.Empty<double>();
+                int[] units = Array.Empty<int>();
+                CompiledTrainingPlan<float>.SumSquaresMany(items, sums, ref partials, ref units);
+                for (int i = 0; i < items.Count; i++)
+                    Assert.True(BitConverter.DoubleToInt64Bits(expected[i]) == BitConverter.DoubleToInt64Bits(sums[i]),
+                        $"threads={threads} item {i} (len {items[i].Length}): {sums[i]:R} != {expected[i]:R}");
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism = before;
+        }
+    }
+
+    [Fact]
+    public void ScaleInPlaceMany_IsBitIdenticalToScaleInPlaceChunkedPerItem()
+    {
+        var expected = new float[ManyLengths.Length][];
+        var items = new System.Collections.Generic.List<(float[] Array, int Length)>();
+        for (int i = 0; i < ManyLengths.Length; i++)
+        {
+            var a = MakeFloat(ManyLengths[i], seed: 900 + i);
+            expected[i] = (float[])a.Clone();
+            CompiledTrainingPlan<float>.ScaleInPlaceChunked(expected[i], ManyLengths[i], 0.3711f);
+            items.Add((a, ManyLengths[i]));
+        }
+        int[] units = Array.Empty<int>();
+        CompiledTrainingPlan<float>.ScaleInPlaceMany(items, 0.3711f, ref units);
+        for (int i = 0; i < items.Count; i++)
+            for (int j = 0; j < items[i].Array.Length; j++)   // includes the 5-element pad, which neither may touch
+                Assert.True(SingleBits(expected[i][j]) == SingleBits(items[i].Array[j]),
+                    $"item {i} (len {ManyLengths[i]}) [{j}]: {items[i].Array[j]:R} != {expected[i][j]:R}");
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(65_535)]

@@ -754,6 +754,74 @@ public class TensorLevelOpsTests
     }
 
     /// <summary>
+    /// Every permutation of rank 2-5 shapes that mix long runs (taking the
+    /// contiguous-run copy), short runs and size-1 axes (taking the element
+    /// walk), checked against independently computed source indices.
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { 2, 32, 4, 16 })]
+    [InlineData(new[] { 3, 1, 5, 8 })]
+    [InlineData(new[] { 1, 6, 1, 3 })]
+    [InlineData(new[] { 4, 9, 2 })]
+    [InlineData(new[] { 7, 5 })]
+    [InlineData(new[] { 2, 3, 1, 4, 6 })]
+    public void TensorPermuteInto_AllPermutations_MatchIndexReference(int[] inShape)
+    {
+        var engine = new CpuEngine();
+        var src = new Tensor<float>(inShape);
+        for (int i = 0; i < src.Length; i++) src[i] = i + 1;
+        int rank = inShape.Length;
+        var srcStrides = new int[rank];
+        srcStrides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--) srcStrides[d] = srcStrides[d + 1] * inShape[d + 1];
+
+        int checkedPerms = 0;
+        foreach (var axes in Permutations(rank))
+        {
+            var outShape = new int[rank];
+            for (int i = 0; i < rank; i++) outShape[i] = inShape[axes[i]];
+            var dst = new Tensor<float>(outShape);
+            engine.TensorPermuteInto(dst, src, axes);
+
+            var idx = new int[rank];
+            for (int lin = 0; lin < dst.Length; lin++)
+            {
+                int srcIdx = 0;
+                for (int d = 0; d < rank; d++) srcIdx += idx[d] * srcStrides[axes[d]];
+                Assert.True(srcIdx + 1 == dst[lin],
+                    $"axes [{string.Join(",", axes)}] at {lin}: expected {srcIdx + 1}, got {dst[lin]}");
+                for (int d = rank - 1; d >= 0; d--)
+                {
+                    if (++idx[d] < outShape[d]) break;
+                    idx[d] = 0;
+                }
+            }
+            checkedPerms++;
+        }
+
+        int expectedPerms = 1;
+        for (int k = 2; k <= rank; k++) expectedPerms *= k;
+        Assert.Equal(expectedPerms, checkedPerms);
+    }
+
+    private static System.Collections.Generic.IEnumerable<int[]> Permutations(int rank)
+    {
+        var a = new int[rank];
+        for (int i = 0; i < rank; i++) a[i] = i;
+        while (true)
+        {
+            yield return (int[])a.Clone();
+            int k = rank - 2;
+            while (k >= 0 && a[k] >= a[k + 1]) k--;
+            if (k < 0) yield break;
+            int l = rank - 1;
+            while (a[l] <= a[k]) l--;
+            (a[k], a[l]) = (a[l], a[k]);
+            Array.Reverse(a, k + 1, rank - k - 1);
+        }
+    }
+
+    /// <summary>
     /// Invalid permutations must surface as ArgumentException, not
     /// IndexOutOfRangeException — callers depend on the same exception
     /// surface as TensorPermute.

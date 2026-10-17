@@ -91,21 +91,19 @@ public partial class CpuEngine
         public LayerNormRowShape(int rows, int features, float epsilon)
         {
             Rows = rows; Features = features; Epsilon = epsilon;
-            // Fixed row chunking (a function of the shape only), so the dGamma/dBeta partial sums are combined in the
-            // same order whatever the thread count: results are bit-reproducible.
-            Chunks = Math.Max(1, Math.Min(64, rows / 32));
         }
 
         public int Rows { get; }
         public int Features { get; }
         public float Epsilon { get; }
-        public int Chunks { get; }
     }
 
     /// <summary>
     /// dX = invStd * (g - mean(g) - xhat * mean(g * xhat)) with g = gamma * dY and xhat = (x - mean) * invStd;
-    /// dGamma = sum over rows of dY * xhat; dBeta = sum over rows of dY. One parallel pass over fixed row chunks: each
-    /// writes its dX rows and its own dGamma/dBeta partial, and the partials are added in chunk order.
+    /// dGamma = sum over rows of dY * xhat; dBeta = sum over rows of dY. Runs the eager backward's kernel
+    /// (<see cref="LayerNormBackwardFloatFused"/>): one parallel pass over fixed row blocks, vectorized, partials added in
+    /// block order, so the compiled and eager gradients agree bit for bit at any thread count. Its own scalar loop,
+    /// which updated the dGamma/dBeta partials element by element, took ~170 us per [2048,64] norm on the parity Transformer (Ryzen 7 4800H).
     /// </summary>
     private static void LayerNormBackwardCompiledFloat(
         Tensor<float> gradOutput, Tensor<float>[] inputs, Tensor<float> output, object[] savedState, IEngine engine,
@@ -128,72 +126,22 @@ public partial class CpuEngine
         var dG = GradTarget(needG, gamma, grads, engine, distinct);
         var dB = GradTarget(needB, beta, grads, engine, distinct);
 
-        int fs = s.Features, chunks = s.Chunks;
-        float[]? partial = needG || needB ? System.Buffers.ArrayPool<float>.Shared.Rent(chunks * 2 * fs) : null;
+        // The eager backward's SIMD kernel (one pass over row blocks), writing each gradient where GradTarget points.
+        int fs = s.Features;
+        var partial = System.Buffers.ArrayPool<float>.Shared.Rent(LayerNormBackwardFloatScratchLength(s.Rows, fs));
         try
         {
-            CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)s.Rows * fs * 4, chunk =>
-            {
-                int r0 = (int)((long)chunk * s.Rows / chunks), r1 = (int)((long)(chunk + 1) * s.Rows / chunks);
-                int pg = chunk * 2 * fs, pb = pg + fs;
-                if (partial is not null) Array.Clear(partial, pg, 2 * fs);
-                float invFs = 1f / fs;
-                for (int r = r0; r < r1; r++)
-                {
-                    int xr = xOff + r * fs, dyr = dyOff + r * fs;
-                    float m = meanArr[r];
-                    float invStd = 1f / (float)Math.Sqrt(varArr[r] + s.Epsilon);
-                    float sumG = 0f, sumGX = 0f;
-                    for (int f = 0; f < fs; f++)
-                    {
-                        float go = dy[dyr + f];
-                        float xc = x[xr + f] - m;
-                        float g = gm[gmOff + f] * go;
-                        sumG += g;
-                        sumGX += g * xc;
-                        if (partial is not null)
-                        {
-                            partial[pg + f] += go * xc * invStd;
-                            partial[pb + f] += go;
-                        }
-                    }
-                    if (dX.Array is not null)
-                    {
-                        float meanG = sumG * invFs, meanGX = sumGX * invStd * invFs;
-                        int dr = dX.Offset + r * fs;
-                        for (int f = 0; f < fs; f++)
-                        {
-                            float xhat = (x[xr + f] - m) * invStd;
-                            float v = invStd * (gm[gmOff + f] * dy[dyr + f] - meanG - xhat * meanGX);
-                            if (dX.Overwrite) dX.Array[dr + f] = v; else dX.Array[dr + f] += v;
-                        }
-                    }
-                }
-            }, deterministicSafe: true);
-
-            if (partial is not null)
-            {
-                if (dG.Array is not null) ReducePartials(partial, 0, chunks, fs, dG);
-                if (dB.Array is not null) ReducePartials(partial, fs, chunks, fs, dB);
-            }
+            LayerNormBackwardFloatFused(dy, dyOff, x, xOff, gm, gmOff, meanArr, varArr, s.Rows, fs, s.Epsilon,
+                dX.Array, dX.Offset, !dX.Overwrite, dG.Array, dG.Offset, !dG.Overwrite, dB.Array, dB.Offset, !dB.Overwrite,
+                partial);
         }
         finally
         {
-            if (partial is not null) System.Buffers.ArrayPool<float>.Shared.Return(partial);
+            System.Buffers.ArrayPool<float>.Shared.Return(partial);
         }
 
         dX.Commit(grads, input, engine);
         dG.Commit(grads, gamma, engine);
         dB.Commit(grads, beta, engine);
-    }
-
-    /// <summary>target (=|+=) sum over chunks c of partial[c * 2 * fs + slot .. + fs], in chunk order.</summary>
-    private static void ReducePartials(float[] partial, int slot, int chunks, int fs, FusedGradTarget target)
-    {
-        var dst = target.Array!;
-        int off = target.Offset;
-        if (target.Overwrite) Array.Clear(dst, off, fs);
-        for (int c = 0; c < chunks; c++)
-            Axpy(1f, partial, c * 2 * fs + slot, dst, off, fs);
     }
 }
