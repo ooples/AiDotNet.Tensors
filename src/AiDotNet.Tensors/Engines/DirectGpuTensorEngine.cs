@@ -15375,6 +15375,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int rows = input.Length / cols;
         int scratchFloats = parts.LayerNormAffineGradientScratchFloats(rows, cols);
         if (rows <= 0 || scratchFloats <= 0) return false;
+        int rowScratchFloats = parts.LayerNormRowBackwardScratchFloats(rows, cols);
 
         var gR = ResolveResidentBufferNoUpload(backend, gradOutput, input.Length);
         var iR = ResolveResidentBufferNoUpload(backend, input, input.Length);
@@ -15390,8 +15391,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         bool pooled = ScratchPoolingActive;
         IGpuBuffer Scratch(int length) => pooled ? RentActionScratch(backend, length, fullyWritten: true) : backend.AllocateBuffer(length);
-        var invStd = Scratch(rows);
-        var partials = Scratch(scratchFloats);
+        IGpuBuffer? invStd = null;
+        var partials = Scratch(Math.Max(scratchFloats, rowScratchFloats));
         try
         {
             var giT = inputTarget is null ? new Tensor<T>(new T[input.Length], input.Shape.ToArray()) : intoInput;
@@ -15406,13 +15407,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Order matters for the false return: nothing is added anywhere until the last launch -- so an input
             // gradient added into its accumulator goes last (its availability was settled above).
             bool addingInput = addInput && inputTarget is not null;
-            if (!parts.TryLayerNormInverseStd(varR, invStd, rows, (float)epsilon)) return false;
-            if (!addingInput && !parts.TryLayerNormInputGradient(gR, iR, gamR, meanR, invStd, giBuf, rows, cols)) return false;
-            if (!parts.TryLayerNormAffineGradients(gR, iR, meanR, invStd, partials, ggBuf, gbBuf, rows, cols,
-                    gammaTarget is not null && addGamma, betaTarget is not null && addBeta))
-                return false;
-            if (addingInput && !parts.TryLayerNormInputGradientAdd(gR, iR, gamR, meanR, invStd, giBuf, rows, cols))
-                throw new InvalidOperationException("LayerNorm's input-gradient add was refused after its affine gradients landed.");
+            // One pass (plus the affine reduce) where the backend serves the shape; else the separate pieces.
+            if (rowScratchFloats <= 0 || !parts.TryLayerNormRowBackward(gR, iR, gamR, meanR, varR, partials, giBuf, ggBuf,
+                    gbBuf, rows, cols, (float)epsilon, addingInput, gammaTarget is not null && addGamma,
+                    betaTarget is not null && addBeta))
+            {
+                invStd = Scratch(rows);
+                if (!parts.TryLayerNormInverseStd(varR, invStd, rows, (float)epsilon)) return false;
+                if (!addingInput && !parts.TryLayerNormInputGradient(gR, iR, gamR, meanR, invStd, giBuf, rows, cols)) return false;
+                if (!parts.TryLayerNormAffineGradients(gR, iR, meanR, invStd, partials, ggBuf, gbBuf, rows, cols,
+                        gammaTarget is not null && addGamma, betaTarget is not null && addBeta))
+                    return false;
+                if (addingInput && !parts.TryLayerNormInputGradientAdd(gR, iR, gamR, meanR, invStd, giBuf, rows, cols))
+                    throw new InvalidOperationException("LayerNorm's input-gradient add was refused after its affine gradients landed.");
+            }
             ResidentSyncCheck("LayerNormBackwardParts");
             if (inputTarget is not null) giT.IncrementVersion();
             if (gammaTarget is not null) ggT.IncrementVersion();
@@ -15430,7 +15438,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            if (!pooled) { invStd.Dispose(); partials.Dispose(); }
+            if (!pooled) { invStd?.Dispose(); partials.Dispose(); }
         }
     }
 

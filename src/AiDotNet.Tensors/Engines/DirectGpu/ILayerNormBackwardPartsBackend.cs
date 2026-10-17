@@ -35,6 +35,21 @@ internal interface ILayerNormBackwardPartsBackend
     bool TryLayerNormInputGradientAdd(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean,
         IGpuBuffer inverseStd, IGpuBuffer gradInput, int rows, int cols);
 
+    /// <summary>Floats of scratch <see cref="TryLayerNormRowBackward"/> needs for [rows, cols]; 0 when it does not
+    /// serve that shape.</summary>
+    int LayerNormRowBackwardScratchFloats(int rows, int cols);
+
+    /// <summary>
+    /// The whole LayerNorm backward from the saved mean and VARIANCE (the inverse std formed in-kernel as
+    /// <see cref="TryLayerNormInverseStd"/> forms it): the input gradient overwriting <paramref name="gradInput"/> or,
+    /// when <paramref name="addInput"/>, added to it, and the affine gradients as <see cref="TryLayerNormAffineGradients"/>
+    /// places them. Deterministic. False -- nothing launched -- when unavailable, the shape is not served or the scratch
+    /// is smaller than <see cref="LayerNormRowBackwardScratchFloats"/>.
+    /// </summary>
+    bool TryLayerNormRowBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer mean,
+        IGpuBuffer variance, IGpuBuffer scratch, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int rows, int cols, float epsilon, bool addInput, bool addGamma, bool addBeta);
+
     /// <summary>Floats of scratch <see cref="TryLayerNormAffineGradients"/> needs for [rows, cols].</summary>
     int LayerNormAffineGradientScratchFloats(int rows, int cols);
 
