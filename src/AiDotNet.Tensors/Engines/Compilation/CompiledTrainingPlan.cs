@@ -7793,37 +7793,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue);
         }
 
-        // Phase G.12: layer-level dW batching. Detect MatMul backward
-        // steps with identical (M, N, K) shapes, peel out their dW
-        // computation, and dispatch all same-shape dW GEMMs in a
-        // single cblas_sgemm_batch call (group_size = N).
-        //
-        // Empirically REGRESSES on AMD Zen 2 + MKL 2026.0.0.901 (median
-        // 88 → 131 ms). Two suspected causes:
-        //   1. MKL's cblas_sgemm_batch internally serializes same-shape
-        //      group elements at small/medium N — no parallelism win.
-        //   2. Batched access pattern (4 layers' dW computed back-to-back)
-        //      walks through 4 disjoint memory regions, hurting L3 reuse
-        //      vs the interleaved (dA, dW, dA, dW, ...) sequential pattern
-        //      where each layer's dY and A stay hot in cache across the
-        //      dA + dW pair.
-        //
-        // Gated as OPT-IN via AIDOTNET_DW_BATCHING=1. The infrastructure
-        // is ready for workloads/hardware where the batched API delivers
-        // real parallelism (Sapphire Rapids+ with AMX, e.g.).
-        var peeledDwSpecs = new List<DwBatchSpec>();
-        var dWPeeledIndices = new HashSet<int>();
-        bool enableDwBatching = typeof(T) == typeof(float)
-            && !useGradPool
-            && BlasProvider.IsMklBatchedAvailable
-            && Environment.GetEnvironmentVariable("AIDOTNET_DW_BATCHING") == "1";
-        if (enableDwBatching)
-        {
-            DetectDwBatchingCandidates(forwardSteps, consumerCount, gradMap,
-                fusedStepIndices, consumedBySlicePrefix, analyticBackwardSpecs,
-                dWPeeledIndices, peeledDwSpecs);
-        }
-
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
@@ -8006,16 +7975,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 continue;
             }
 
-            // Phase G.12: tell the spec'd MatMul backward to skip its dW
-            // GEMM when this step's dW has been peeled out for batched
-            // dispatch via AppendBatchedDwActions. Without this flag, the
-            // dW GEMM would run twice (once in the per-step backward,
-            // once in the batched-dW append), defeating the optimization
-            // and doubling the dominant backward cost.
             // On a GPU engine, skip the host BLAS specialization (preferGenericForGpu) so the backward
             // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
             var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
-                dWPeeled: dWPeeledIndices.Contains(i), requiresGrad: requiresGradTensors);
+                requiresGrad: requiresGradTensors);
             if (action != null)
             {
                 backwardActions.Add(action);
@@ -8068,14 +8031,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // to shrink the actions list, and publishing here would leave
         // names indexed against the un-pruned position while Step()
         // walks the pruned array.
-
-        // Phase G.12: append batched dW actions. Group peeled dW specs
-        // by (M, N, K) shape; each shape group with size ≥ 2 emits one
-        // cblas_sgemm_batch call.
-        if (enableDwBatching && peeledDwSpecs.Count > 0)
-        {
-            AppendBatchedDwActions(peeledDwSpecs, backwardActions);
-        }
 
         // Loss gradient seed
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -8542,11 +8497,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     return null;
         }
 
-        // MatMul forward (double): direct BLAS into output buffer.
-        // Mirrors the float branch below but with double[] arrays and
-        // BlasProvider's double Dgemm overload (cblas_dgemm_ptr → OpenBLAS
-        // when AIDOTNET_USE_BLAS != 0). Falls through to SimdGemm.Dgemm
-        // when BLAS isn't loadable.
+        // MatMul forward (double): GEMM straight into the output buffer.
+        // Mirrors the float branch below with double[] arrays.
         if (typeof(T) == typeof(double)
             && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
@@ -8614,129 +8566,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 return eng => TensorMatMulGemvFloat(cA, cB, cOut, M, K);
             }
 
-            // Issue #338 Phase G.5: BF16 mixed-precision forward MatMul.
-            // When AIDOTNET_BLAS_PROVIDER=mkl-bf16 is opted in AND the MKL
-            // BF16 kernel is available, pre-convert weight B to BF16 at
-            // compile time (one-shot, weight is constant across replays in
-            // frozen-weights mode and converted-fresh each step in training
-            // mode via the closure). Activations A are converted on the
-            // fly into a pooled BF16 buffer. C remains FP32.
-            //
-            // Shape gate: skip BF16 when N > 1024 (LM head case where
-            // dC conversion cost in backward dominates the per-call kernel
-            // savings on CPUs without AVX-512-BF16 hardware).
-            if (BlasProvider.UseMklBf16 && N <= 1024)
-            {
-                // B is converted to BF16 lazily and refreshed whenever B's
-                // version counter (incremented by every in-place mutator)
-                // changes — covers the training loop where the optimizer
-                // mutates weights between Step()s. Frozen-weights callers
-                // get the one-shot conversion they expect; training callers
-                // get correctness at the cost of one BF16 conversion per
-                // step (K*N elements, microseconds).
-                var bBf16 = new ushort[K * N];
-                int cachedBVersion = -1;
-                var capInputB = inputB;
-                // Reusable BF16 scratch for A. Sized once; reused per call.
-                var aBf16 = new ushort[M * K];
-                return eng =>
-                {
-                    int bVersion = capInputB.StorageMutationVersion;
-                    if (bVersion != cachedBVersion)
-                    {
-                        unsafe
-                        {
-                            fixed (float* bSrc = cB)
-                            fixed (ushort* bDst = bBf16)
-                                BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
-                        }
-                        cachedBVersion = bVersion;
-                    }
-                    unsafe
-                    {
-                        fixed (float* aSrc = cA)
-                        fixed (ushort* aDst = aBf16)
-                            BlasProvider.Fp32ToBf16Bulk(aSrc, aDst, M * K);
-                    }
-                    if (!BlasProvider.TryGemmBf16(M, N, K, aBf16, 0, K, false, bBf16, 0, N, false, cOut, 0, N))
-                    {
-                        // Probe succeeded but call failed (transient) — fall back to FP32.
-                        if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
-                            SimdGemm.Sgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
-                    }
-                };
-            }
-
             if (allowCachedB)
             {
                 // Sub-E (#373): pre-pack B at plan-compile time so the replay
                 // closure routes through BlasManaged.Gemm with the cached handle.
                 // B is constant across inference calls (allowCachedB=true).
-                //
-                // Sources for the handle, in priority order:
-                //   1. Caller pre-registered inputB via FrozenWeightRegistry AND
-                //      managed wins for this shape — use the registry handle.
-                //   2. Caller didn't register but managed wins anyway — pre-pack
-                //      here at compile time.
-                //   3. Otherwise no pre-pack — legacy TryGemm/SgemmWithCachedB
-                //      stays intact (native BLAS is faster than managed at this
-                //      shape; routing managed despite the pre-pack regresses
-                //      end-to-end perf — see the regression test
-                //      Registered_FFN_128x768x768_Inference_Loop_Faster_Than_Unregistered).
-                bool willRouteManaged =
-                    Engines.BlasManaged.BlasManaged.PreferManaged
-                    || !Helpers.BlasProvider.IsAvailable
-                    || (Engines.BlasManaged.BlasManaged.AutotuneRouting
-                        && Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
-                            M, N, K, transA: false, transB: false, dtype: typeof(float)));
-
-                Engines.BlasManaged.WeightPackHandle? prePackedB = null;
-                if (willRouteManaged)
-                {
-                    // Prefer the caller's registered handle so we don't double-allocate.
-                    prePackedB = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB);
-                    if (prePackedB == null)
-                    {
-                        prePackedB = Engines.BlasManaged.BlasManaged.PrePackB<float>(
-                            new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);
-                    }
-                }
-
-                if (prePackedB != null)
-                {
-                    var capturedB = prePackedB;
-                    return eng =>
-                    {
-                        // Bypass autotune routing inside BlasProvider — we've
-                        // already decided managed wins and are passing the
-                        // pre-packed handle directly.
-                        bool prevBypass = Engines.BlasManaged.PrefersManagedCache.BypassAutotune;
-                        Engines.BlasManaged.PrefersManagedCache.BypassAutotune = true;
-                        try
-                        {
-                            Engines.BlasManaged.BlasManaged.Gemm<float>(
-                                new ReadOnlySpan<float>(cA), K, false,
-                                new ReadOnlySpan<float>(cB), N, false,
-                                new Span<float>(cOut), N,
-                                M, N, K,
-                                new Engines.BlasManaged.BlasOptions<float> { PackedB = capturedB });
-                        }
-                        finally
-                        {
-                            Engines.BlasManaged.PrefersManagedCache.BypassAutotune = prevBypass;
-                        }
-                    };
-                }
-
-                return eng =>
-                {
-                    if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
-                        // Path A pre-pack cache — B (weight) is constant across
-                        // inference calls, so SgemmWithCachedB amortises PackB
-                        // cost. Falls through to standard Sgemm for non-cache-
-                        // eligible shapes (n > Nc=4096).
-                        SimdGemm.SgemmWithCachedB(cA.AsSpan(0, M * K), cB, cOut.AsSpan(0, M * N), M, K, N);
-                };
+                // Prefer the caller's FrozenWeightRegistry handle so we don't
+                // double-allocate; otherwise pre-pack here.
+                var capturedB = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB)
+                    ?? Engines.BlasManaged.BlasManaged.PrePackB<float>(
+                        new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);
+                return eng => Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    new ReadOnlySpan<float>(cA), K, false,
+                    new ReadOnlySpan<float>(cB), N, false,
+                    new Span<float>(cOut), N,
+                    M, N, K,
+                    new Engines.BlasManaged.BlasOptions<float> { PackedB = capturedB });
             }
 
             // Training plan path: parameters (B) are updated in-place between
@@ -9025,9 +8870,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     float* pIn = (float*)inH.AddrOfPinnedObject();
                     float* pOut = (float*)outH.AddrOfPinnedObject();
-                    // Try MKL VML vsTanh first (SVML, ~3x faster than polynomial)
-                    if (!Helpers.VmlProvider.TryTanh(pIn, pOut, len))
-                        SimdKernels.TanhUnsafe(pIn, pOut, len);
+                    SimdKernels.TanhUnsafe(pIn, pOut, len);
                 }
             };
         }
@@ -9308,8 +9151,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     float* pIn = (float*)inH.AddrOfPinnedObject();
                     float* pOut = (float*)outH.AddrOfPinnedObject();
-                    if (!Helpers.VmlProvider.TryExp(pIn, pOut, len))
-                        SimdKernels.ExpUnsafe(pIn, pOut, len);
+                    SimdKernels.ExpUnsafe(pIn, pOut, len);
                 }
             };
         }
@@ -10175,9 +10017,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     /// <summary>
     /// <c>C[rows, cols] (+)= op(A) · op(B)</c> with inner dimension <paramref name="inner"/>, C dense with leading
-    /// dimension <paramref name="cols"/>. Overwrites when <paramref name="accumulate"/> is false, else adds into C:
-    /// native BLAS with beta = 1 unless BLAS routing prefers the managed kernels (deterministic mode, autotune), in
-    /// which case <see cref="SimdGemm.SgemmAdd(ReadOnlySpan{float}, int, bool, ReadOnlySpan{float}, int, bool, Span{float}, int, int, int)"/> accumulates.
+    /// dimension <paramref name="cols"/>. Overwrites when <paramref name="accumulate"/> is false, else
+    /// <see cref="SimdGemm.SgemmAdd(ReadOnlySpan{float}, int, bool, ReadOnlySpan{float}, int, bool, Span{float}, int, int, int)"/> accumulates.
     /// </summary>
     private static void SharedOperandGemm(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c,
@@ -10188,15 +10029,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             LinearBackwardGemm(a, lda, transA, b, ldb, transB, c, rows, inner, cols);
             return;
         }
-        if (!BlasProvider.ShouldRouteManaged(rows, cols, inner, transA, transB, typeof(float))
-            && BlasProvider.TryGemmExBeta(rows, cols, inner, a, 0, lda, transA, b, 0, ldb, transB, c, 0, cols, 1f, 1f))
-            return;
         SimdGemm.SgemmAdd(a.AsSpan(0, rows * inner), lda, transA, b.AsSpan(0, inner * cols), ldb, transB,
             c.AsSpan(0, rows * cols), rows, inner, cols);
     }
 
-    /// <summary>Double counterpart of the float <c>SharedOperandGemm</c>. Without native BLAS, or when routing prefers
-    /// the managed kernel, an accumulating product is computed into <paramref name="scratch"/> and then added.</summary>
+    /// <summary>Double counterpart of the float <c>SharedOperandGemm</c>. An accumulating product is computed into
+    /// <paramref name="scratch"/> and then added.</summary>
     private static void SharedOperandGemm(
         double[] a, int lda, bool transA, double[] b, int ldb, bool transB, double[] c,
         int rows, int inner, int cols, bool accumulate, ref double[]? scratch, int scratchLength)
@@ -10210,9 +10048,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
             return;
         }
-        if (!BlasProvider.ShouldRouteManaged(rows, cols, inner, transA, transB, typeof(double))
-            && BlasProvider.TryGemmExBeta(rows, cols, inner, a, 0, lda, transA, b, 0, ldb, transB, c, 0, cols, 1.0, 1.0))
-            return;
         var product = scratch ??= new double[scratchLength];
         int length = rows * cols;
         Engines.BlasManaged.BlasManaged.Gemm<double>(
@@ -10845,7 +10680,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
         List<GCHandle>? handleTracker = null,
-        bool dWPeeled = false,
         HashSet<Tensor<T>>? requiresGrad = null)
     {
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
@@ -10904,8 +10738,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // buffer set in the compile), so the contributions sum in it. These steps used to take the generic backward:
         // on N-BEATS (30 blocks, hidden 512, batch 1024) that was 90 of the 240 matmul backwards, each renting fresh
         // gradients and then copying or adding them into the plan buffers -- 36 MB allocated and 59 separate add
-        // passes per CPU step. A step whose dW is peeled into the batched-dW phase keeps the generic backward.
-        if (matMulOperandShared && !dWPeeled
+        // passes per CPU step.
+        if (matMulOperandShared
             && (typeof(T) == typeof(float) || typeof(T) == typeof(double))
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.OutputBuffer.IsContiguous)
@@ -11043,14 +10877,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // offset.
             float[]? cachedDC = null, cachedA = null, cachedB = null, cachedDestA = null, cachedDestB = null;
             int dcOff = 0, aOff = 0, bOff = 0, destAOff = 0, destBOff = 0;
-            // Phase G.5: BF16 scratch buffers. Allocated lazily on first
-            // call only when MKL-BF16 is active. cachedBBf16 is refreshed
-            // whenever inputB's Version changes (training loops mutate
-            // weights between Step()s); cachedABf16 and cachedDCBf16 are
-            // overwritten every call.
-            ushort[]? cachedABf16 = null, cachedBBf16 = null, cachedDCBf16 = null;
-            int cachedBBf16Version = -1;
-            var capInputBForBf16 = inputB;
 
             return eng =>
             {
@@ -11068,98 +10894,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     destBOff = gradB._storageOffset;
                 }
 
-                // Issue #338 Phase G.5: BF16 mixed-precision backward.
-                // Same trust contract as the forward BF16 path: weights are
-                // assumed frozen, BF16-converted once at lazy first call,
-                // reused across replays. Activation A and gradOut dC are
-                // converted on the fly into pooled BF16 scratches.
-                //
-                // Shape gate: BF16 backward only pays off when M*N (per-call
-                // dC conversion cost) is small relative to M*N*K (GEMM
-                // work). For the consumer Transformer LM head (M=2048,
-                // K=128, N=8192) the dC buffer is 16M elements — converting
-                // it per call costs ~8 ms via SIMD which dwarfs the BF16
-                // GEMM speedup on CPUs without AVX-512-BF16 hardware. Cap
-                // on N: skip BF16 when N > 1024.
-                if (BlasProvider.UseMklBf16 && N <= 1024)
-                {
-                    // Lazy initialise BF16 scratch + (re-)convert B whenever
-                    // inputB's version changes. The version counter is
-                    // incremented by every in-place mutator (e.g.
-                    // optimizer.step), so the BF16 weight image stays in
-                    // sync with the fp32 source even under training.
-                    if (cachedABf16 is null)
-                    {
-                        cachedABf16 = new ushort[M * K];
-                        cachedBBf16 = new ushort[K * N];
-                        cachedDCBf16 = new ushort[M * N];
-                    }
-                    int bVersion = capInputBForBf16.StorageMutationVersion;
-                    if (bVersion != cachedBBf16Version)
-                    {
-                        unsafe
-                        {
-                            fixed (float* bSrc = &cachedB![bOff])
-                            fixed (ushort* bDst = cachedBBf16)
-                                BlasProvider.Fp32ToBf16Bulk(bSrc, bDst, K * N);
-                        }
-                        cachedBBf16Version = bVersion;
-                    }
-                    unsafe
-                    {
-                        fixed (float* dcSrc = &cachedDC![dcOff])
-                        fixed (ushort* dcDst = cachedDCBf16)
-                            BlasProvider.Fp32ToBf16Bulk(dcSrc, dcDst, M * N);
-                        fixed (float* aSrc = &cachedA![aOff])
-                        fixed (ushort* aDst = cachedABf16)
-                            BlasProvider.Fp32ToBf16Bulk(aSrc, aDst, M * K);
-                    }
-                    // dA = dC @ B^T (M, K, N), dB = A^T @ dC (K, N, M)
-                    bool okA = BlasProvider.TryGemmBf16(M, K, N,
-                        cachedDCBf16!, 0, N, false, cachedBBf16!, 0, N, true,
-                        cachedDestA!, destAOff, K);
-                    bool okB = BlasProvider.TryGemmBf16(K, N, M,
-                        cachedABf16!, 0, K, true, cachedDCBf16!, 0, N, false,
-                        cachedDestB!, destBOff, N);
-                    if (okA && okB)
-                    {
-                        inputA.Grad = gradA;
-                        inputB.Grad = gradB;
-                        return;
-                    }
-                    // Either call failed — fall through to FP32 path.
-                }
-
                 // Small-K panel routes first (SimdGemm.TryGemmSmallJit): dA = dC·Bᵀ as a no-transpose product over a
                 // transposed copy of the small B, dB = Aᵀ·dC as a split-k reduction. Each falls back on its own.
                 bool dAJit = dcOff == 0 && bOff == 0 && destAOff == 0
                     && SimdGemm.TryGemmSmallJit(cachedDC, N, false, cachedB!, N, true, cachedDestA!, M, N, K);
-                bool dBJit = !dWPeeled && aOff == 0 && dcOff == 0 && destBOff == 0
+                bool dBJit = aOff == 0 && dcOff == 0 && destBOff == 0
                     && SimdGemm.TryGemmSmallJit(cachedA!, K, true, cachedDC, N, false, cachedDestB!, K, M, N);
-                if (dAJit && (dBJit || dWPeeled))
-                {
-                    inputA.Grad = gradA;
-                    if (!dWPeeled) inputB.Grad = gradB;
-                    return;
-                }
-
-                // Phase G.10: batch the two backward GEMMs (dA + dW) into a
-                // single MKL cblas_sgemm_batch call. Skipped when dW
-                // peeling is active for this step (Phase G.12) — the
-                // dW computation is deferred to a layer-batched call.
-                if (!dWPeeled && !dAJit && !dBJit
-                    && BlasProvider.IsMklBatchedAvailable
-                    && BlasProvider.TryGemmExBatch2(
-                        // dA = dC @ B^T  → [M, K]
-                        M, K, N,
-                        cachedDC, dcOff, N, false,
-                        cachedB!, bOff, N, true,
-                        cachedDestA!, destAOff, K,
-                        // dB = A^T @ dC  → [K, N]
-                        K, N, M,
-                        cachedA!, aOff, K, true,
-                        cachedDC, dcOff, N, false,
-                        cachedDestB!, destBOff, N))
+                if (dAJit && dBJit)
                 {
                     inputA.Grad = gradA;
                     inputB.Grad = gradB;
@@ -11174,11 +10915,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     using var gradAKeep1 = new KeepAliveScope(gradA);
                     dA.AsSpanUnmarked().CopyTo(gradA.AsWritableSpanUnmarked());
                 }
-                // dB = A^T @ dC — when dW peeling is active for this
-                // step (Phase G.12), skip this GEMM entirely; the dW
-                // computation is deferred to the batched-dW phase
-                // appended after the main backward loop.
-                if (!dWPeeled && !dBJit)
+                // dB = A^T @ dC
+                if (!dBJit)
                 {
                     if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
                     {
@@ -11190,7 +10928,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 }
 
                 inputA.Grad = gradA;
-                if (!dWPeeled) inputB.Grad = gradB;
+                inputB.Grad = gradB;
             };
         }
 
@@ -12506,23 +12244,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // where the activation's input is MatMul[i]'s output, and
             // MatMul[i+2]'s input is the activation's output.
             // Issue #338 Phase G.2: also accepts GELU (the Transformer FFN
-            // activation), but only engages the GELU fusion path when MKL
-            // is NOT preferred — the L1-tile strip approach (Mr=6 rows ×
-            // 342 strips per layer) issues hundreds of tiny BLAS calls
-            // that fight MKL's call-once-then-parallelize design.
-            // Empirically: with MKL active, fused MatMul→GELU→MatMul
-            // regresses 2.4× vs the unfused 3-step path. Without MKL
-            // (SimdGemm only), L1-tile fusion wins. So this branch is
-            // active only when neither MKL nor — for the GELU variant —
-            // is providing the big-GEMM win already.
+            // activation).
             bool isReluPattern = step1.OpName == "ReLU";
             bool isGeluPattern = step1.OpName == "GELU";
-            bool mklPreferred = string.Equals(
-                Environment.GetEnvironmentVariable("AIDOTNET_BLAS_PROVIDER"),
-                "mkl",
-                StringComparison.OrdinalIgnoreCase);
-            // GELU fusion only when MKL is NOT preferred (see comment above).
-            if (isGeluPattern && mklPreferred) continue;
             if (step0.OpName != "TensorMatMul" || step2.OpName != "TensorMatMul"
                 || (!isReluPattern && !isGeluPattern))
                 continue;
@@ -12587,128 +12311,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // Pre-allocate activated intermediate buffer
             var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
 
-            // ── Double-precision branch — BLAS-Dgemm × scalar ReLU × BLAS-Dgemm.
-            // Skips the L1-resident fused kernel (float-only) but still avoids
-            // the eager tape recording/dispatch pipeline. The two matmuls
-            // dispatch through OpenBLAS Dgemm directly (~75 GFLOPS) instead of
-            // going through eager TensorMatMul → tape recording → AutoTracer.
-            // Gated on BlasProvider.HasNativeDgemm at compile-build time — if
-            // the user has explicitly opted out of BLAS (AIDOTNET_USE_BLAS=0),
-            // we don't fuse this triple; the eager path will run and remain
-            // correct (just slower for that user). Industry standard: if you
-            // disable the BLAS that matmul depends on, you've also disabled
-            // the kernels that depend on it.
+            // FP64 is not fused: the triple runs through the ordinary compiled steps.
             if (typeof(T) == typeof(double))
             {
-                // The FP64 fusion below implements ReLU. GELU requires its
-                // pre-activation for the exact backward derivative, so retain
-                // the ordinary compiled GELU steps instead of silently applying
-                // ReLU semantics to a GELU graph.
-                if (!isReluPattern || !BlasProvider.HasNativeDgemm)
-                {
-                    TensorAllocator.Return(activatedBuffer);
-                    continue;
-                }
-
-                var capturedInputD = inputTensor;
-                var capturedW1D = w1Tensor;
-                var capturedW2D = w2Tensor;
-                var capturedOutputD = outputTensor;
-                var capturedActivatedD = activatedBuffer;
-                int cmD = m, ckD = k, chD = h, cnD = n;
-                var capturedGradMapD = gradMap;
-
-                capturedGradMapD.TryGetValue(capturedOutputD, out var gradOutD);
-                capturedGradMapD.TryGetValue(capturedW1D, out var gW1TensorD);
-                capturedGradMapD.TryGetValue(capturedW2D, out var gW2TensorD);
-                capturedGradMapD.TryGetValue(capturedInputD, out var gInTensorD);
-
-                var inArrayD = TryGetLiveDoubleBacking(capturedInputD);
-                var w1ArrayD = TryGetLiveDoubleBacking(capturedW1D);
-                var w2ArrayD = TryGetLiveDoubleBacking(capturedW2D);
-                var outArrayD = TryGetLiveDoubleBacking(capturedOutputD);
-                var activatedArrayD = TryGetLiveDoubleBacking(capturedActivatedD);
-                var gradOutArrayD = gradOutD is null ? null : TryGetLiveDoubleBacking(gradOutD);
-                var gW1ArrayD = gW1TensorD is null ? null : TryGetLiveDoubleBacking(gW1TensorD);
-                var gW2ArrayD = gW2TensorD is null ? null : TryGetLiveDoubleBacking(gW2TensorD);
-                var gInArrayD = gInTensorD is null ? null : TryGetLiveDoubleBacking(gInTensorD);
-
-                if (inArrayD is null || w1ArrayD is null || w2ArrayD is null
-                    || outArrayD is null || activatedArrayD is null || gradOutArrayD is null
-                    || (gW1TensorD is not null && gW1ArrayD is null)
-                    || (gW2TensorD is not null && gW2ArrayD is null)
-                    || (gInTensorD is not null && gInArrayD is null))
-                {
-                    TensorAllocator.Return(activatedBuffer);
-                    continue;
-                }
-
-                fusedForward.Add(eng =>
-                {
-                    BlasProvider.TryGemm(cmD, chD, ckD,
-                        inArrayD, 0, ckD, w1ArrayD, 0, chD, activatedArrayD, 0, chD);
-
-                    int activatedLen = cmD * chD;
-                    for (int idx = 0; idx < activatedLen; idx++)
-                        if (activatedArrayD[idx] < 0.0) activatedArrayD[idx] = 0.0;
-
-                    BlasProvider.TryGemm(cmD, cnD, chD,
-                        activatedArrayD, 0, chD, w2ArrayD, 0, cnD, outArrayD, 0, cnD);
-                });
-
-                fusedBackward.Add(eng =>
-                {
-                    // dW2 = activated^T @ gradOut → [h, n]
-                    if (gW2ArrayD is not null)
-                    {
-                        BlasProvider.TryGemmEx(chD, cnD, cmD,
-                            activatedArrayD, 0, chD, transA: true,
-                            gradOutArrayD, 0, cnD, transB: false,
-                            gW2ArrayD, 0, cnD);
-                    }
-
-                    // gradH = gradOut @ w2^T → [m, h]
-                    var gradH = ArrayPool<double>.Shared.Rent(cmD * chD);
-                    Array.Clear(gradH, 0, cmD * chD);
-                    BlasProvider.TryGemmEx(cmD, chD, cnD,
-                        gradOutArrayD, 0, cnD, transA: false,
-                        w2ArrayD, 0, cnD, transB: true,
-                        gradH, 0, chD);
-
-                    // ReLU backward: gradH *= (activated > 0 ? 1 : 0)
-                    int gradHLen = cmD * chD;
-                    for (int idx = 0; idx < gradHLen; idx++)
-                        if (activatedArrayD[idx] <= 0.0) gradH[idx] = 0.0;
-
-                    // dW1 = input^T @ gradH → [k, h]
-                    if (gW1ArrayD is not null)
-                    {
-                        BlasProvider.TryGemmEx(ckD, chD, cmD,
-                            inArrayD, 0, ckD, transA: true,
-                            gradH, 0, chD, transB: false,
-                            gW1ArrayD, 0, chD);
-                    }
-
-                    // dInput = gradH @ w1^T → [m, k]
-                    if (gInArrayD is not null)
-                    {
-                        BlasProvider.TryGemmEx(cmD, ckD, chD,
-                            gradH, 0, chD, transA: false,
-                            w1ArrayD, 0, chD, transB: true,
-                            gInArrayD, 0, ckD);
-                    }
-
-                    ArrayPool<double>.Shared.Return(gradH);
-
-                    capturedW1D.Grad = gW1TensorD;
-                    capturedW2D.Grad = gW2TensorD;
-                    capturedInputD.Grad = gInTensorD;
-                });
-
-                consumedIndices.Add(i);
-                consumedIndices.Add(i + 1);
-                consumedIndices.Add(i + 2);
-                i += 2;
+                TensorAllocator.Return(activatedBuffer);
                 continue;
             }
 
@@ -13504,201 +13110,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             consumedBySlicePrefix.Add(i + 1);  // Slice step is consumed by the fused MatMul
 
             next: ;
-        }
-    }
-
-    /// <summary>
-    /// Issue #338 Phase G.12: layer-level dW batching info. Each entry
-    /// describes one MatMul-backward step's dW GEMM (dW = A^T @ dY)
-    /// in enough detail for later grouping by shape and batched dispatch.
-    /// </summary>
-    private struct DwBatchSpec
-    {
-        public int M;
-        public int N;
-        public int K;
-        public int LdaPlain;  // == K (A is [M, K] row-major contiguous)
-        public int LdaDy;     // == N (dY is [M, N] row-major contiguous)
-        public int LdcDw;     // == N (dW dest is [K, N])
-        public int AOffset;
-        public int DyOffset;
-        public int DwOffset;
-        public float[] AArray;       // live source for A^T
-        public float[] DyArray;      // live source for dY
-        public float[] DwArray;      // live dW destination
-        public Tensor<T> DwTensor;   // dW destination (whose Grad we set)
-        public Tensor<T> WTensor;    // the weight tensor (for .Grad assignment)
-    }
-
-    /// <summary>
-    /// Issue #338 Phase G.12: walk forward steps, identify MatMul-backward
-    /// candidates whose shapes are identical to ≥ 1 other MatMul-backward
-    /// step in the plan, mark them for dW peeling and record the spec.
-    /// </summary>
-    private static void DetectDwBatchingCandidates(
-        List<CompiledStep<T>> forwardSteps,
-        Dictionary<Tensor<T>, int> consumerCount,
-        Dictionary<Tensor<T>, Tensor<T>> gradMap,
-        HashSet<int> fusedStepIndices,
-        HashSet<int> consumedBySlicePrefix,
-        Dictionary<int, Action<IEngine>> analyticBackwardSpecs,
-        HashSet<int> dWPeeledIndices,
-        List<DwBatchSpec> peeledDwSpecs)
-    {
-        if (typeof(T) != typeof(float)) return;
-
-        // First pass: collect every candidate MatMul-backward step's
-        // (M, N, K) signature.
-        var candidates = new List<(int idx, int M, int N, int K)>();
-        for (int i = 0; i < forwardSteps.Count; i++)
-        {
-            if (fusedStepIndices.Contains(i)) continue;
-            if (consumedBySlicePrefix.Contains(i)) continue;
-            if (analyticBackwardSpecs.ContainsKey(i)) continue;
-
-            var step = forwardSteps[i];
-            if (step.OpName != "TensorMatMul") continue;
-            if (step.Inputs.Length != 2) continue;
-
-            var inputA = step.Inputs[0];
-            var inputW = step.Inputs[1];
-            var output = step.OutputBuffer;
-
-            // Same gating as the existing ND×2D float MatMul-backward spec.
-            if (inputA.Rank < 2 || inputW.Rank != 2) continue;
-            if (!inputA.IsContiguous || !inputW.IsContiguous) continue;
-            if (!output.IsContiguous) continue;
-            if (!gradMap.ContainsKey(inputA) || !gradMap.ContainsKey(inputW) || !gradMap.ContainsKey(output))
-                continue;
-
-            int aRank = inputA.Rank;
-            int M = 1;
-            for (int d = 0; d < aRank - 1; d++) M *= inputA._shape[d];
-            int K = inputA._shape[aRank - 1];
-            int N = inputW._shape[1];
-            if (inputW._shape[0] != K) continue;
-
-            candidates.Add((i, M, N, K));
-        }
-
-        // Second pass: group by (M, N, K). Groups of size ≥ 2 get peeled
-        // for batching; single-occurrence shapes stay in the unpeeled
-        // (dA+dW combined) path.
-        var groupSizes = new Dictionary<(int, int, int), int>();
-        foreach (var (_, m, n, k) in candidates)
-        {
-            var key = (m, n, k);
-            groupSizes.TryGetValue(key, out int count);
-            groupSizes[key] = count + 1;
-        }
-
-        foreach (var (idx, M, N, K) in candidates)
-        {
-            if (groupSizes[(M, N, K)] < 2) continue;  // No batching benefit
-
-            var step = forwardSteps[idx];
-            var inputA = step.Inputs[0];
-            var inputW = step.Inputs[1];
-            var output = step.OutputBuffer;
-            var gradOut = gradMap[output];
-            var gradW = gradMap[inputW];
-
-            var aBacking = inputA.GetCpuBackingForStridedRead(out int aOffset);
-            var dyBacking = gradOut.GetCpuBackingForStridedRead(out int dyOffset);
-            var dwBacking = gradW.GetCpuBackingForContiguousWrite(out int dwOffset);
-            if (aBacking is null || dyBacking is null || dwBacking is null)
-                continue;
-
-            // dW = A^T @ dY → C[K, N].
-            // lda_plain=K (A in [M, K] row-major), ldb_dy=N (dY in [M, N]),
-            // ldc_dw=N (dW dest [K, N]).
-            peeledDwSpecs.Add(new DwBatchSpec
-            {
-                M = M, N = N, K = K,
-                LdaPlain = K, LdaDy = N, LdcDw = N,
-                AOffset = aOffset,
-                DyOffset = dyOffset,
-                DwOffset = dwOffset,
-                AArray = (float[])(object)aBacking,
-                DyArray = (float[])(object)dyBacking,
-                DwArray = (float[])(object)dwBacking,
-                DwTensor = gradW,
-                WTensor = inputW,
-            });
-            dWPeeledIndices.Add(idx);
-        }
-    }
-
-    /// <summary>
-    /// Issue #338 Phase G.12: append batched dW actions to the backward
-    /// action list. Groups specs by (M, N, K) shape, emits one
-    /// cblas_sgemm_batch call per group.
-    /// </summary>
-    private static unsafe void AppendBatchedDwActions(
-        List<DwBatchSpec> specs,
-        List<Action<IEngine>> backwardActions)
-    {
-        // Group by shape
-        var groups = new Dictionary<(int, int, int), List<DwBatchSpec>>();
-        foreach (var spec in specs)
-        {
-            var key = (spec.M, spec.N, spec.K);
-            if (!groups.TryGetValue(key, out var list))
-            {
-                list = new List<DwBatchSpec>();
-                groups[key] = list;
-            }
-            list.Add(spec);
-        }
-
-        foreach (var kv in groups)
-        {
-            var group = kv.Value;
-            var captured = group.ToArray();  // immutable snapshot for the closure
-            int batchSize = captured.Length;
-            int K = captured[0].K, N = captured[0].N, M = captured[0].M;
-
-            // Pre-allocate offset arrays at compile time so the hot
-            // closure doesn't ToArray() per call.
-            var aOffs = new int[batchSize];
-            var bOffs = new int[batchSize];
-            var cOffs = new int[batchSize];
-            var aArrs = new float[batchSize][];
-            var bArrs = new float[batchSize][];
-            var cArrs = new float[batchSize][];
-            for (int i = 0; i < batchSize; i++)
-            {
-                aOffs[i] = captured[i].AOffset;
-                bOffs[i] = captured[i].DyOffset;
-                cOffs[i] = captured[i].DwOffset;
-                aArrs[i] = captured[i].AArray;
-                bArrs[i] = captured[i].DyArray;
-                cArrs[i] = captured[i].DwArray;
-            }
-
-            backwardActions.Add(eng =>
-            {
-                if (!BlasProvider.TryGemmBatchSameShapeArrays(
-                    K, N, M,
-                    transA: true, transB: false,
-                    aArrs, aOffs, K,
-                    bArrs, bOffs, N,
-                    cArrs, cOffs, N,
-                    batchSize))
-                {
-                    // Fallback: individual TryGemmEx calls
-                    for (int i = 0; i < batchSize; i++)
-                    {
-                        BlasProvider.TryGemmEx(K, N, M,
-                            aArrs[i], aOffs[i], K, true,
-                            bArrs[i], bOffs[i], N, false,
-                            cArrs[i], cOffs[i], N);
-                    }
-                }
-
-                for (int i = 0; i < batchSize; i++)
-                    captured[i].WTensor.Grad = captured[i].DwTensor;
-            });
         }
     }
 

@@ -62,24 +62,6 @@ public class NativeLibraryNotFoundException : InvalidOperationException
 }
 
 /// <summary>
-/// Exception thrown when OpenBLAS is required but not available.
-/// </summary>
-public class OpenBlasNotFoundException : NativeLibraryNotFoundException
-{
-    private const string LibName = "OpenBLAS";
-    private const string Package = "AiDotNet.Native.OpenBLAS";
-
-    /// <summary>
-    /// Creates a new OpenBlasNotFoundException for the specified feature.
-    /// </summary>
-    /// <param name="feature">The feature that requires OpenBLAS.</param>
-    public OpenBlasNotFoundException(string feature = "CPU-accelerated BLAS operations")
-        : base(LibName, Package, feature)
-    {
-    }
-}
-
-/// <summary>
 /// Exception thrown when CLBlast is required but not available.
 /// </summary>
 public class ClBlastNotFoundException : NativeLibraryNotFoundException
@@ -232,7 +214,7 @@ public class CudaNotFoundException : InvalidOperationException
 
                 ALTERNATIVES:
                   - Use OpenCL for AMD/Intel GPUs: dotnet add package AiDotNet.Native.CLBlast
-                  - Use CPU acceleration: dotnet add package AiDotNet.Native.OpenBLAS
+                  - CPU: no package needed; the CPU engine runs without native libraries
                 """,
 
             CudaUnavailableReason.NoCudaDriver => $"""
@@ -300,7 +282,7 @@ public class CudaNotFoundException : InvalidOperationException
 
                 ALTERNATIVES if you don't have an NVIDIA GPU:
                   - OpenCL (AMD/Intel): dotnet add package AiDotNet.Native.CLBlast
-                  - CPU only: dotnet add package AiDotNet.Native.OpenBLAS
+                  - CPU only: no package needed; the CPU engine runs without native libraries
 
                 For more help: https://github.com/ooples/AiDotNet.Tensors/issues
                 """

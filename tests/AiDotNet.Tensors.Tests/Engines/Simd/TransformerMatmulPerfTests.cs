@@ -178,39 +178,6 @@ public class TransformerMatmulPerfTests
     //   - the backend name is the expected sentinel
     //   - matmul still works regardless of which path fires
 
-    [Fact]
-    public void BlasProvider_OptOut_ReportsUnavailable()
-    {
-        // BlasProvider default flipped to opt-OUT (AIDOTNET_USE_BLAS=0|false|no)
-        // in the post-MKL.NET removal work — `AiDotNet.Native.OpenBLAS` ships
-        // as a transitive NuGet dependency, so libopenblas is loadable on
-        // every consumer install and the default contract is now
-        // BLAS-on-when-loadable. This test only validates the opt-OUT path;
-        // when the env var is unset (or set to 1/true/yes), `IsAvailable`
-        // reflects whether the native probe succeeded, which is host-
-        // dependent and not contractually false.
-        var envVar = Environment.GetEnvironmentVariable("AIDOTNET_USE_BLAS");
-        bool isOptOut = string.Equals(envVar, "0", StringComparison.OrdinalIgnoreCase)
-                     || string.Equals(envVar, "false", StringComparison.OrdinalIgnoreCase)
-                     || string.Equals(envVar, "no", StringComparison.OrdinalIgnoreCase)
-                     || string.Equals(envVar, "off", StringComparison.OrdinalIgnoreCase);
-        if (!isOptOut) return;
-
-        Assert.False(BlasProvider.IsAvailable);
-        Assert.False(BlasProvider.HasNativeSgemm);
-        Assert.False(BlasProvider.HasNativeDgemm);
-        Assert.Contains("SimdGemm", BlasProvider.BackendName);
-    }
-
-    [Fact]
-    public void BlasProvider_BackendName_AlwaysReturnsValue()
-    {
-        // Never null/empty — diagnostic strings must always be present
-        // so downstream logging doesn't NRE.
-        var name = BlasProvider.BackendName;
-        Assert.False(string.IsNullOrWhiteSpace(name));
-    }
-
     // --- End-to-end: transformer FFN backward produces correct gradient ---
     //
     // The fix path is exercised by every matmul; this test picks a realistic

@@ -164,10 +164,6 @@ public class CompiledStepStallProbe
         }
         finally { CompiledTrainingPlan<float>.StepProbe = null; }
 
-        // The specialized (allocation-free) MatMul backward is gated on native BLAS. If that is
-        // false here, every matmul backward falls to the generic dictionary path that rents.
-        _out.WriteLine($"  BlasProvider.IsAvailable = {AiDotNet.Tensors.Helpers.BlasProvider.IsAvailable}");
-
         var bwdNames = CompiledTrainingPlan<float>.ProfBackwardStepNames;
         _out.WriteLine($"  --- backward step names ({bwdNames.Length}) ---");
         for (int i = 0; i < bwdNames.Length; i++) _out.WriteLine($"    BWD-{i}: {bwdNames[i]}");

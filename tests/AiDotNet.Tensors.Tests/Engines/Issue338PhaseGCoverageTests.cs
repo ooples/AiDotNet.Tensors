@@ -108,66 +108,6 @@ public class Issue338PhaseGCoverageTests
     }
 
     /// <summary>
-    /// Phase G.1 — BlasProvider exposes IsAvailable; when MKL/OpenBLAS
-    /// is loadable it should be true, and the BackendName surfaces
-    /// the active provider.
-    /// </summary>
-    [Fact]
-    public void BlasProvider_BackendName_NonEmpty()
-    {
-        var name = BlasProvider.BackendName;
-        Assert.False(string.IsNullOrEmpty(name));
-        // IsAvailable should match the BackendName's "loaded" form.
-        // Both OpenBLAS and MKL (Phase G.1 routing) are valid backends;
-        // accept either rather than hard-coding to OpenBLAS, which would
-        // fail in MKL-enabled CI matrices.
-        bool available = BlasProvider.IsAvailable;
-        if (available)
-        {
-            bool isKnownBackend =
-                name.Contains("OpenBLAS", StringComparison.OrdinalIgnoreCase) ||
-                name.Contains("MKL", StringComparison.OrdinalIgnoreCase);
-            Assert.True(isKnownBackend,
-                $"Unexpected available BLAS backend name: '{name}'.");
-        }
-    }
-
-    /// <summary>
-    /// Phase G.5 — Fp32ToBf16 round-trip preserves values within
-    /// BF16 precision (~3 decimal digits / 7-bit mantissa).
-    /// </summary>
-    [Fact]
-    public unsafe void BlasProvider_Fp32ToBf16_RoundTripPrecision()
-    {
-        // Scalar API.
-        float[] testValues = { 1.0f, -1.0f, 2.5f, 100.0f, 0.001f, 1234.5f };
-        foreach (var v in testValues)
-        {
-            ushort bf16 = BlasProvider.Fp32ToBf16(v);
-            // Reconstruct: shift up 16 bits → re-interpret as float.
-            uint upper = (uint)bf16 << 16;
-            float reconstructed = *(float*)&upper;
-            float relErr = MathF.Abs(reconstructed - v) / MathF.Max(MathF.Abs(v), 1e-6f);
-            Assert.True(relErr < 0.01f,
-                $"Fp32ToBf16({v}) = {bf16:X4}, reconstructed = {reconstructed}, relErr = {relErr:E3}");
-        }
-
-        // Bulk API.
-        var src = new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f, 9f };
-        var dst = new ushort[src.Length];
-        fixed (float* pSrc = src)
-        fixed (ushort* pDst = dst)
-        {
-            BlasProvider.Fp32ToBf16Bulk(pSrc, pDst, src.Length);
-        }
-        for (int i = 0; i < src.Length; i++)
-        {
-            ushort expected = BlasProvider.Fp32ToBf16(src[i]);
-            Assert.Equal(expected, dst[i]);
-        }
-    }
-
-    /// <summary>
     /// Phase G.4 — EnableFrozenWeightOptimizations is idempotent and
     /// produces equivalent gradients (the test cache pattern doesn't
     /// mutate weights, so the contract is preserved).

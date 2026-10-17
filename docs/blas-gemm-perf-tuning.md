@@ -4,26 +4,11 @@ AiDotNet.Tensors ships a **portable, deterministic, managed** FP32 GEMM (the Got
 `GotoGemmFp32` + JIT microkernels). It needs no native dependency and is bit-reproducible across
 machines and thread counts. For most workloads it is the right default.
 
-On large multi-core x86 it does **not** fully match hand-tuned native BLAS (OpenBLAS / Intel MKL)
-on the medium/large "diffusion" shapes — measured ~50–72% of OpenBLAS on a 16-core Zen2 for those
-shapes (it matches or wins on tiny GEMM and large squares). The remaining gap is the native
-libraries' assembly-tuned multithreaded packed-GEMM scheduling. Two opt-in environment switches let
-you trade portability/precision for that performance when you need it.
-
-## `AIDOTNET_USE_BLAS=1` — native OpenBLAS fast path (opt-in)
-
-Set `AIDOTNET_USE_BLAS=1` (also accepts `true` / `yes` / `on`) **at process start** to route FP32/FP64
-GEMM through native OpenBLAS when a compatible binary is present.
-
-- **When to use:** you need maximum CPU throughput on the diffusion/medium GEMM shapes today and can
-  accept a native dependency. ~1.4–2× the managed path on those shapes.
-- **Cost:** adds a native dependency; native BLAS is **not bit-deterministic** across thread counts,
-  so combine with the determinism settings only if your build's native provider guarantees it.
-- **Opt back out:** `AIDOTNET_USE_BLAS=0` forces the managed path even if a native binary is present.
-- Provider selection: `AIDOTNET_BLAS_PROVIDER` (advanced; see `BlasProvider`).
-
-The managed path remains the default precisely because it is portable and deterministic — native BLAS
-is the explicit performance opt-in, not the baseline.
+It is the only CPU GEMM: the library ships no native BLAS (OpenBLAS and Intel MKL were removed under #368).
+Measured against OpenBLAS on a 16-core Zen 2 (79 catalog shapes, alternating arms, two runs), the managed
+GEMM's median time was 0.90-0.93x OpenBLAS's: FP32 median 0.96x, FP64 0.59x, faster on about 65% of shapes,
+with the worst remaining shapes around 1.1-1.35x. One opt-in switch trades precision for bandwidth on large
+shapes.
 
 ## `AIDOTNET_GEMM_BF16=1` — bf16-B large-GEMM bandwidth path (opt-in, precision-changing)
 
@@ -40,13 +25,11 @@ bandwidth headroom) on large bandwidth-bound shapes; A stays fp32 and accumulati
   default. Appropriate for inference where bf16 precision is acceptable (common in diffusion);
   do not use it where exact fp32 GEMM is required.
 
-`AIDOTNET_GEMM_BF16` only affects the managed `GotoGemmFp32` path (it is ignored when
-`AIDOTNET_USE_BLAS=1` routes to native BLAS, and on the smaller shapes that don't meet the gate).
+`AIDOTNET_GEMM_BF16` only affects the `GotoGemmFp32` path, and only on shapes that meet the gate.
 
 ## Summary
 
 | Setting                  | Default | Effect                                              | Trade-off                          |
 |--------------------------|---------|-----------------------------------------------------|------------------------------------|
-| (none)                   | ✅      | Portable, deterministic managed FP32/FP64 GEMM      | ~50–72% of native BLAS on big shapes |
-| `AIDOTNET_USE_BLAS=1`    |         | Native OpenBLAS GEMM (~1.4–2× on diffusion shapes)  | native dependency, non-deterministic |
+| (none)                   | ✅      | Portable, deterministic managed FP32/FP64 GEMM      | —                                  |
 | `AIDOTNET_GEMM_BF16=1`   |         | bf16-B on large GEMMs (beats MKL on big squares)    | lossy (~3 sig figs), large shapes only |

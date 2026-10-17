@@ -46,58 +46,19 @@ internal sealed class BackwardCSEPass<T>
     }
 
     /// <summary>
-    /// Computes dC @ B^T using cached transpose. If BLAS supports TryGemmEx,
-    /// uses transposed GEMM directly (zero allocation for the transpose).
+    /// Computes dC @ B^T using cached transpose.
     /// </summary>
     internal Tensor<T> MatMulTransposeRight(Tensor<T> a, Tensor<T> b)
     {
-        if (typeof(T) == typeof(float) && a.Rank == 2 && b.Rank == 2 && BlasProvider.IsAvailable)
-        {
-            int m = a._shape[0], n = b._shape[0], k = a._shape[1];
-            var result = TensorAllocator.RentUninitialized<T>(new[] { m, n });
-            using var aArrLease = a.LeaseArray();
-            var aArr = (float[])(object)aArrLease.Array;
-            using var bArrLease = b.LeaseArray();
-            var bArr = (float[])(object)bArrLease.Array;
-            using var rArrLease = result.LeaseArray();
-            var rArr = (float[])(object)rArrLease.Array;
-
-            if (BlasProvider.TryGemmEx(m, n, k, aArr, 0, k, false, bArr, 0, k, true, rArr, 0, n))
-                return result;
-
-            // BLAS failed — return the unused rented buffer before falling through
-            AutoTensorCache.Return(result);
-        }
-
-        // Fallback: use cached transpose
         var bT = GetTranspose(b);
         return _engine.TensorMatMul(a, bT);
     }
 
     /// <summary>
-    /// Computes A^T @ dC using cached transpose. If BLAS supports TryGemmEx,
-    /// uses transposed GEMM directly (zero allocation for the transpose).
+    /// Computes A^T @ dC using cached transpose.
     /// </summary>
     internal Tensor<T> MatMulTransposeLeft(Tensor<T> a, Tensor<T> b)
     {
-        if (typeof(T) == typeof(float) && a.Rank == 2 && b.Rank == 2 && BlasProvider.IsAvailable)
-        {
-            int m = a._shape[1], n = b._shape[1], k = a._shape[0];
-            var result = TensorAllocator.RentUninitialized<T>(new[] { m, n });
-            using var aArrLease = a.LeaseArray();
-            var aArr = (float[])(object)aArrLease.Array;
-            using var bArrLease = b.LeaseArray();
-            var bArr = (float[])(object)bArrLease.Array;
-            using var rArrLease = result.LeaseArray();
-            var rArr = (float[])(object)rArrLease.Array;
-
-            if (BlasProvider.TryGemmEx(m, n, k, aArr, 0, m, true, bArr, 0, n, false, rArr, 0, n))
-                return result;
-
-            // BLAS failed — return the unused rented buffer before falling through
-            AutoTensorCache.Return(result);
-        }
-
         var aT = GetTranspose(a);
         return _engine.TensorMatMul(aT, b);
     }

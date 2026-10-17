@@ -27,7 +27,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// The probe times the real managed GEMM with the candidate blocking injected
 /// via <see cref="AutotuneDispatcher.BlockOverride"/> (a ThreadStatic that also
 /// guards against recursive re-measurement). It follows the
-/// <see cref="PrefersManagedCache"/> probe pattern: ArrayPool buffers, a warmup
+/// former PrefersManagedCache probe pattern: ArrayPool buffers, a warmup
 /// call, then a median of several timed runs to damp noise.
 /// </para>
 /// </summary>

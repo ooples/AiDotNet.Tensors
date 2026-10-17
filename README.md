@@ -9,14 +9,9 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 > **Note on dependencies.** The .nupkg ships with the following PackageReferences:
 > `Microsoft.Extensions.Logging.Abstractions`, `System.Text.Json`,
 > `System.Threading.Channels`, `K4os.Compression.LZ4` (LZ4 compression for
-> serialized tensor blobs), `AiDotNet.Native.OpenBLAS` (transitive native
-> OpenBLAS for fallback paths only — the hot paths run SimdGemm), and **MKL via Microsoft.ML.Mkl.Redist (~66 MB on
-> win-x64) + `intelmkl.redist.win-x64` (~500 MB on win-x64)** for the FP64
-> kernels that haven't yet been ported to pure-managed AVX2 (Phase 0 remediation
-> work tracks the port). For air-gapped / federal deployments we ship a custom
-> build with MKL/OpenBLAS removed and the entire telemetry namespace compiled
-> out — see [aidotnet.dev/enterprise](https://aidotnet.dev/enterprise) for
-> the Enterprise tier including air-gapped builds.
+> serialized tensor blobs) and `BouncyCastle.Cryptography`. It ships no native
+> CPU math library: OpenBLAS and Intel MKL were removed under #368, and every CPU
+> GEMM runs the managed kernels.
 >
 > **Performance numbers above assume net8.0+.** On net471 the SIMD/intrinsics
 > helpers are excluded (System.Runtime.Intrinsics is unavailable pre-net6); a
@@ -40,8 +35,6 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 # Core package (CPU SIMD acceleration)
 dotnet add package AiDotNet.Tensors
 
-# Optional: OpenBLAS for optimized CPU BLAS operations
-dotnet add package AiDotNet.Native.OpenBLAS
 
 # Optional: CLBlast for OpenCL GPU acceleration (AMD/Intel/NVIDIA)
 dotnet add package AiDotNet.Native.CLBlast
@@ -299,7 +292,6 @@ Console.WriteLine($"CUDA: {caps.HasCudaSupport}");
 Console.WriteLine($"OpenCL: {caps.HasOpenCLSupport}");
 
 // Native library availability
-Console.WriteLine($"OpenBLAS: {caps.HasOpenBlas}");
 Console.WriteLine($"CLBlast: {caps.HasClBlast}");
 
 // Or get a full status summary
@@ -307,16 +299,6 @@ Console.WriteLine(NativeLibraryDetector.GetStatusSummary());
 ```
 
 ## Optional Acceleration Packages
-
-### AiDotNet.Native.OpenBLAS
-
-Provides optimized CPU BLAS operations using OpenBLAS:
-
-```bash
-dotnet add package AiDotNet.Native.OpenBLAS
-```
-
-**Performance**: Accelerated BLAS operations for matrix multiply and decompositions.
 
 ### AiDotNet.Native.CLBlast
 

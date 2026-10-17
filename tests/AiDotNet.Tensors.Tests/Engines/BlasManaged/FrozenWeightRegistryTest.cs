@@ -50,12 +50,8 @@ public class FrozenWeightRegistryTest
 
         // Adoption is automatic — no engine API change. Register once, every
         // future TensorMatMul with bT as B operand consumes the pre-pack.
-        // Force managed routing for this test — by default native BLAS wins
-        // on most shapes, in which case the registry consult is bypassed.
         BlasManagedLib.ClearCaches();
         FrozenWeightRegistry.Register(bT);
-        bool prevPreferManaged = BlasManagedLib.PreferManaged;
-        BlasManagedLib.PreferManaged = true;
         try
         {
             var statsBefore = BlasManagedLib.GetStats();
@@ -79,7 +75,6 @@ public class FrozenWeightRegistryTest
         }
         finally
         {
-            BlasManagedLib.PreferManaged = prevPreferManaged;
             FrozenWeightRegistry.Unregister(bT);
         }
     }
@@ -143,8 +138,6 @@ public class FrozenWeightRegistryTest
 
         BlasManagedLib.ClearCaches();
         FrozenWeightRegistry.Register(bT);
-        bool prevPreferManaged = BlasManagedLib.PreferManaged;
-        BlasManagedLib.PreferManaged = true;
         try
         {
             var statsBefore = BlasManagedLib.GetStats();
@@ -164,7 +157,6 @@ public class FrozenWeightRegistryTest
         }
         finally
         {
-            BlasManagedLib.PreferManaged = prevPreferManaged;
             FrozenWeightRegistry.Unregister(bT);
         }
     }
@@ -244,8 +236,6 @@ public class FrozenWeightRegistryTest
 
         BlasManagedLib.ClearCaches();
         FrozenWeightRegistry.Register(bT);
-        bool prevPreferManaged = BlasManagedLib.PreferManaged;
-        BlasManagedLib.PreferManaged = true;
         try
         {
             // Warm: first TensorMatMul ticks the hit counter.
@@ -269,7 +259,6 @@ public class FrozenWeightRegistryTest
         }
         finally
         {
-            BlasManagedLib.PreferManaged = prevPreferManaged;
             FrozenWeightRegistry.Unregister(bT);
         }
     }

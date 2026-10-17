@@ -5855,7 +5855,7 @@ public partial class CpuEngine : ITensorLevelEngine
         numOps.Abs(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
-    /// <summary>Sin into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
+    /// <summary>Sin into pre-allocated destination.</summary>
     public unsafe void TensorSinInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
@@ -5864,19 +5864,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             using var inputDataKeep21 = new KeepAliveScope(input);
-            var srcMem = AsFloatMemory(input.DataUnmarked);
             using var destinationDataKeep33 = new KeepAliveScope(destination);
-            var dstMem = AsFloatMemory(destination.DataUnmarked);
-            using var pinSrc = srcMem.Pin();
-            using var pinDst = dstMem.Pin();
-            if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
-            {
-                using var fSrcLease = input.LeaseArray();
-                var fSrc = (float[])(object)fSrcLease.Array;
-                using var fDstLease = destination.LeaseArray();
-                var fDst = (float[])(object)fDstLease.Array;
-                for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
-            }
+            using var fSrcLease = input.LeaseArray();
+            var fSrc = (float[])(object)fSrcLease.Array;
+            using var fDstLease = destination.LeaseArray();
+            var fDst = (float[])(object)fDstLease.Array;
+            for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -5894,7 +5887,7 @@ public partial class CpuEngine : ITensorLevelEngine
         numOps.Sin(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
-    /// <summary>Cos into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
+    /// <summary>Cos into pre-allocated destination.</summary>
     public unsafe void TensorCosInto<T>(Tensor<T> destination, Tensor<T> input)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
@@ -5903,19 +5896,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             using var inputDataKeep23 = new KeepAliveScope(input);
-            var srcMem = AsFloatMemory(input.DataUnmarked);
             using var destinationDataKeep35 = new KeepAliveScope(destination);
-            var dstMem = AsFloatMemory(destination.DataUnmarked);
-            using var pinSrc = srcMem.Pin();
-            using var pinDst = dstMem.Pin();
-            if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
-            {
-                using var fSrcLease = input.LeaseArray();
-                var fSrc = (float[])(object)fSrcLease.Array;
-                using var fDstLease = destination.LeaseArray();
-                var fDst = (float[])(object)fDstLease.Array;
-                for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
-            }
+            using var fSrcLease = input.LeaseArray();
+            var fSrc = (float[])(object)fSrcLease.Array;
+            using var fDstLease = destination.LeaseArray();
+            var fDst = (float[])(object)fDstLease.Array;
+            for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -7897,19 +7883,12 @@ public partial class CpuEngine : ITensorLevelEngine
             unsafe
             {
                 using var tensorDataKeep14 = new KeepAliveScope(tensor);
-                var srcMem = AsFloatMemory(tensor.DataUnmarked);
                 using var resultDataKeep30 = new KeepAliveScope(result);
-                var dstMem = AsFloatMemory(result.DataUnmarked);
-                using var pinSrc = srcMem.Pin();
-                using var pinDst = dstMem.Pin();
-                if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
-                {
-                    using var fSrcLease = tensor.LeaseArray();
-                    var fSrc = (float[])(object)fSrcLease.Array;
-                    using var fDstLease = result.LeaseArray();
-                    var fDst = (float[])(object)fDstLease.Array;
-                    for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
-                }
+                using var fSrcLease = tensor.LeaseArray();
+                var fSrc = (float[])(object)fSrcLease.Array;
+                using var fDstLease = result.LeaseArray();
+                var fDst = (float[])(object)fDstLease.Array;
+                for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
             }
         }
         else
@@ -7958,19 +7937,12 @@ public partial class CpuEngine : ITensorLevelEngine
             unsafe
             {
                 using var tensorDataKeep15 = new KeepAliveScope(tensor);
-                var srcMem = AsFloatMemory(tensor.DataUnmarked);
                 using var resultDataKeep31 = new KeepAliveScope(result);
-                var dstMem = AsFloatMemory(result.DataUnmarked);
-                using var pinSrc = srcMem.Pin();
-                using var pinDst = dstMem.Pin();
-                if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
-                {
-                    using var fSrcLease = tensor.LeaseArray();
-                    var fSrc = (float[])(object)fSrcLease.Array;
-                    using var fDstLease = result.LeaseArray();
-                    var fDst = (float[])(object)fDstLease.Array;
-                    for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
-                }
+                using var fSrcLease = tensor.LeaseArray();
+                var fSrc = (float[])(object)fSrcLease.Array;
+                using var fDstLease = result.LeaseArray();
+                var fDst = (float[])(object)fDstLease.Array;
+                for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
             }
         }
         else
@@ -14454,18 +14426,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Sub-E (#373): auto-adopt pre-packed weight when B is registered in
-        // FrozenWeightRegistry AND the autotune routing decision says managed
-        // wins for this shape. The second check matters because at many shapes
-        // (M*N*K compute-bound) native BLAS is 4-6× faster than BlasManaged
-        // even with a pre-pack — routing managed unconditionally there makes
-        // adoption ANTI-helpful. The gate is the same one BlasProvider.TryGemmEx
-        // uses, so behavior is consistent with the rest of the dispatcher.
+        // FrozenWeightRegistry.
         if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
         {
             var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
             if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle)
-                && a.IsContiguous && b.IsContiguous
-                && ShouldRouteManagedForPrePackedB<T>(m, p, n))
+                && a.IsContiguous && b.IsContiguous)
             {
                 if (typeof(T) == typeof(float))
                 {
@@ -14713,39 +14679,6 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorMatMul(a, b);
     }
 
-    /// <summary>
-    /// Sub-E (#373): decide whether a pre-packed-B fast path should route the
-    /// call to <see cref="Engines.BlasManaged.BlasManaged.Gemm{T}"/> (managed)
-    /// or fall through to <see cref="Helpers.MatrixMultiplyHelper.TryGemm"/>
-    /// (native BLAS). Mirrors the routing decision made by
-    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> so the pre-pack adoption
-    /// only fires when managed is actually competitive — otherwise routing
-    /// managed for a faster native shape regresses end-to-end perf even
-    /// after pre-pack savings (see the regression caught by
-    /// <c>Registered_FFN_128x768x768_Inference_Loop_Faster_Than_Unregistered</c>
-    /// where managed was 5.7× slower than native).
-    /// </summary>
-    private static bool ShouldRouteManagedForPrePackedB<T>(int m, int n, int k)
-    {
-        // Force-managed mode (supply-chain) — always route managed.
-        if (Engines.BlasManaged.BlasManaged.PreferManaged) return true;
-
-        // Native BLAS unavailable — managed is the only option.
-        if (!Helpers.BlasProvider.IsAvailable) return true;
-
-        // Autotune-based per-shape routing — only when the cache says managed wins.
-        if (Engines.BlasManaged.BlasManaged.AutotuneRouting)
-        {
-            Type dtype = typeof(T) == typeof(float) ? typeof(float) : typeof(double);
-            return Engines.BlasManaged.PrefersManagedCache.PrefersManaged(
-                m, n, k, transA: false, transB: false, dtype: dtype);
-        }
-
-        // No routing flag set: prefer native — pre-pack savings don't outweigh
-        // the BlasManaged-vs-native compute gap at most production shapes.
-        return false;
-    }
-
     private static bool TryTensorMatMulGemv<T>(Tensor<T> a, Tensor<T> b, Tensor<T> result, int m, int k)
     {
         if (typeof(T) == typeof(float))
@@ -14906,17 +14839,13 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.IsContiguous && b.IsContiguous)
         {
             // Sub-E (#373): collapsed ND × 2D path — when B is registered in
-            // FrozenWeightRegistry AND managed wins for this shape, route the
-            // single big GEMM through BlasManaged with the pre-pack handle.
-            // Gate is identical to the 2D path's ShouldRouteManagedForPrePackedB
-            // to keep behavior consistent (and avoid the 5.7× regression that
-            // unconditional managed routing produced at FFN_128×768×768).
+            // FrozenWeightRegistry, route the single big GEMM through BlasManaged
+            // with the pre-pack handle.
             if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
             {
                 int bigM = batchSize * m;
                 var handle = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(b);
-                if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle)
-                    && ShouldRouteManagedForPrePackedB<T>(bigM, p, n))
+                if (handle != null && Engines.BlasManaged.WeightPackCache.IsCacheCurrent(handle))
                 {
                     if (typeof(T) == typeof(float))
                     {
@@ -16091,40 +16020,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     int gradOutOff = b * gradSliceSize1x1;
                     int destSliceOff = b * inputSliceSize1x1;
-                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
-                        inChannels, N1x1, outChannels,
-                        kernelD1x1, 0, inChannels, true,    // A = kernel [outC × inC]^T
-                        gradOutputD1x1, gradOutOff, N1x1, false,
-                        gradInputD1x1, destSliceOff, N1x1,
-                        alpha: 1.0,
-                        beta: 0.0);
-                    if (!usedBlas)
+                    // Cold path — build transposed kernel once per batch (rare).
+                    var poolKt = System.Buffers.ArrayPool<double>.Shared;
+                    var kT = poolKt.Rent(inChannels * outChannels);
+                    try
                     {
-                        // Cold path — build transposed kernel once per batch (rare).
-                        var poolKt = System.Buffers.ArrayPool<double>.Shared;
-                        var kT = poolKt.Rent(inChannels * outChannels);
-                        try
+                        for (int r = 0; r < outChannels; r++)
+                            for (int c = 0; c < inChannels; c++)
+                                kT[c * outChannels + r] = kernelD1x1[r * inChannels + c];
+                        var dstSpan = new Span<double>(gradInputD1x1, destSliceOff, inputSliceSize1x1);
+                        dstSpan.Clear();
+                        for (int ic = 0; ic < inChannels; ic++)
                         {
-                            for (int r = 0; r < outChannels; r++)
-                                for (int c = 0; c < inChannels; c++)
-                                    kT[c * outChannels + r] = kernelD1x1[r * inChannels + c];
-                            var dstSpan = new Span<double>(gradInputD1x1, destSliceOff, inputSliceSize1x1);
-                            dstSpan.Clear();
-                            for (int ic = 0; ic < inChannels; ic++)
+                            int kRowBase = ic * outChannels;
+                            int dRowBase = ic * N1x1;
+                            for (int n = 0; n < N1x1; n++)
                             {
-                                int kRowBase = ic * outChannels;
-                                int dRowBase = ic * N1x1;
-                                for (int n = 0; n < N1x1; n++)
-                                {
-                                    double sum = 0.0;
-                                    for (int oc = 0; oc < outChannels; oc++)
-                                        sum += kT[kRowBase + oc] * gradOutputD1x1[gradOutOff + oc * N1x1 + n];
-                                    dstSpan[dRowBase + n] += sum;
-                                }
+                                double sum = 0.0;
+                                for (int oc = 0; oc < outChannels; oc++)
+                                    sum += kT[kRowBase + oc] * gradOutputD1x1[gradOutOff + oc * N1x1 + n];
+                                dstSpan[dRowBase + n] += sum;
                             }
                         }
-                        finally { poolKt.Return(kT); }
                     }
+                    finally { poolKt.Return(kT); }
                 });
                 return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputD1x1));
             }
@@ -16712,42 +16631,32 @@ public partial class CpuEngine : ITensorLevelEngine
                     // gradInput_b = kernel^T (inC × outC) @ gradOut_b (outC × N)
                     // Use TryGemmEx with TransA=true so kernel is consumed
                     // in its natural [outC, inC] row-major layout.
-                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
-                        inChannels, N, outChannels,
-                        kernelD, 0, inChannels, true,        // A = kernel [outC × inC] transposed
-                        gradOutputD, gradOutOff, N, false,   // B = gradOut_b [outC × N]
-                        destD, destSliceOff, N,              // C := α A @ B + β C
-                        alpha: 1.0,
-                        beta: accumulate ? 1.0 : 0.0);
-                    if (!usedBlas)
+                    // Fallback: build transposed kernel once on demand
+                    // (rare path — only when BLAS is unavailable). Per-batch
+                    // alloc is fine here since this is the cold path.
+                    var kT = System.Buffers.ArrayPool<double>.Shared.Rent(inChannels * outChannels);
+                    try
                     {
-                        // Fallback: build transposed kernel once on demand
-                        // (rare path — only when BLAS is unavailable). Per-batch
-                        // alloc is fine here since this is the cold path.
-                        var kT = System.Buffers.ArrayPool<double>.Shared.Rent(inChannels * outChannels);
-                        try
+                        for (int r = 0; r < outChannels; r++)
+                            for (int c = 0; c < inChannels; c++)
+                                kT[c * outChannels + r] = kernelD[r * inChannels + c];
+                        var dstSpan = new Span<double>(destD, destSliceOff, inputSliceSize);
+                        if (!accumulate) dstSpan.Clear();
+                        // dstSpan += kT[inC, outC] @ gradOut_b[outC, N]
+                        for (int ic = 0; ic < inChannels; ic++)
                         {
-                            for (int r = 0; r < outChannels; r++)
-                                for (int c = 0; c < inChannels; c++)
-                                    kT[c * outChannels + r] = kernelD[r * inChannels + c];
-                            var dstSpan = new Span<double>(destD, destSliceOff, inputSliceSize);
-                            if (!accumulate) dstSpan.Clear();
-                            // dstSpan += kT[inC, outC] @ gradOut_b[outC, N]
-                            for (int ic = 0; ic < inChannels; ic++)
+                            int kRowBase = ic * outChannels;
+                            int dRowBase = ic * N;
+                            for (int n = 0; n < N; n++)
                             {
-                                int kRowBase = ic * outChannels;
-                                int dRowBase = ic * N;
-                                for (int n = 0; n < N; n++)
-                                {
-                                    double sum = 0.0;
-                                    for (int oc = 0; oc < outChannels; oc++)
-                                        sum += kT[kRowBase + oc] * gradOutputD[gradOutOff + oc * N + n];
-                                    dstSpan[dRowBase + n] += sum;
-                                }
+                                double sum = 0.0;
+                                for (int oc = 0; oc < outChannels; oc++)
+                                    sum += kT[kRowBase + oc] * gradOutputD[gradOutOff + oc * N + n];
+                                dstSpan[dRowBase + n] += sum;
                             }
                         }
-                        finally { System.Buffers.ArrayPool<double>.Shared.Return(kT); }
                     }
+                    finally { System.Buffers.ArrayPool<double>.Shared.Return(kT); }
                 });
                 return;
             }
@@ -17380,26 +17289,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     double betaThis = (b == 0) ? 0.0 : 1.0;
                     int gradOutOff = b * outChannels * N1x1;
                     int inOff = b * inChannels * N1x1;
-                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
-                        outChannels, inChannels, N1x1,
-                        gradOutputD, gradOutOff, N1x1, false,
-                        inputD, inOff, N1x1, true,
-                        gradKernelD, 0, inChannels,
-                        alpha: 1.0, beta: betaThis);
-                    if (!usedBlas)
+                    if (b == 0) Array.Clear(gradKernelD, 0, totalLen1x1);
+                    for (int oc = 0; oc < outChannels; oc++)
                     {
-                        if (b == 0) Array.Clear(gradKernelD, 0, totalLen1x1);
-                        for (int oc = 0; oc < outChannels; oc++)
+                        int goRowBase = gradOutOff + oc * N1x1;
+                        for (int ic = 0; ic < inChannels; ic++)
                         {
-                            int goRowBase = gradOutOff + oc * N1x1;
-                            for (int ic = 0; ic < inChannels; ic++)
-                            {
-                                double sum = 0.0;
-                                int inRowBase = inOff + ic * N1x1;
-                                for (int n = 0; n < N1x1; n++)
-                                    sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
-                                gradKernelD[oc * inChannels + ic] += sum;
-                            }
+                            double sum = 0.0;
+                            int inRowBase = inOff + ic * N1x1;
+                            for (int n = 0; n < N1x1; n++)
+                                sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
+                            gradKernelD[oc * inChannels + ic] += sum;
                         }
                     }
                 }
@@ -17889,28 +17789,19 @@ public partial class CpuEngine : ITensorLevelEngine
                     double betaThis = (b == 0) ? (accumulate ? 1.0 : 0.0) : 1.0;
                     int gradOutOff = b * outChannels * N;
                     int inOff = b * inChannels * N;
-                    bool usedBlas = Helpers.BlasProvider.TryGemmExBeta(
-                        outChannels, inChannels, N,
-                        gradOutputD, gradOutOff, N, false,   // A = gradOut_b [outC × N]
-                        inputD, inOff, N, true,              // B = input_b^T [N × inC] (logical), via TransB
-                        destD, destOff, inChannels,
-                        alpha: 1.0, beta: betaThis);
-                    if (!usedBlas)
+                    // No-BLAS scalar fallback (very cold path).
+                    if (b == 0 && !accumulate)
+                        Array.Clear(destD, destOff, totalLen);
+                    for (int oc = 0; oc < outChannels; oc++)
                     {
-                        // No-BLAS scalar fallback (very cold path).
-                        if (b == 0 && !accumulate)
-                            Array.Clear(destD, destOff, totalLen);
-                        for (int oc = 0; oc < outChannels; oc++)
+                        for (int ic = 0; ic < inChannels; ic++)
                         {
-                            for (int ic = 0; ic < inChannels; ic++)
-                            {
-                                double sum = 0.0;
-                                int goRowBase = gradOutOff + oc * N;
-                                int inRowBase = inOff + ic * N;
-                                for (int n = 0; n < N; n++)
-                                    sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
-                                destD[destOff + oc * inChannels + ic] += sum;
-                            }
+                            double sum = 0.0;
+                            int goRowBase = gradOutOff + oc * N;
+                            int inRowBase = inOff + ic * N;
+                            for (int n = 0; n < N; n++)
+                                sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
+                            destD[destOff + oc * inChannels + ic] += sum;
                         }
                     }
                 }
@@ -17947,15 +17838,6 @@ public partial class CpuEngine : ITensorLevelEngine
                             c, c + 1, height, width, kernelHeight, kernelWidth,
                             strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
                     }, deterministicSafe: true);
-                    if (Helpers.BlasProvider.TryGemmExBeta(
-                        outChannels, colH, colW,
-                        gradOutputD, 0, colW, false,
-                        im2colBuf, 0, colW, true,
-                        destD, destOff, colH,
-                        alpha: 1.0, beta: accumulate ? 1.0 : 0.0))
-                    {
-                        return;
-                    }
                     // No-BLAS cold fallback (BLAS is normally present): transpose +
                     // blocked multiply into a bounded temp, then merge per accumulate.
                     var localGradCold = kPoolD.Rent(totalLen);
@@ -32322,25 +32204,6 @@ public partial class CpuEngine : ITensorLevelEngine
         var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
         try
         {
-            // #1305: avoid OpenBLAS thread oversubscription against our outer
-            // batch*heads parallel-for. Each per-head GEMM is tiny
-            // (M=seqQ, K=headDim≤128, N=seqK) — multi-threaded OpenBLAS gives no
-            // wall-time benefit over a sequential kernel at this size, and on a
-            // 32-core host an 8-head outer parallel-for × 32-thread inner DGEMM
-            // produces ~256-thread oversubscription that takes the call from
-            // ~30 ms to >600 s (>20,000× slower). Scope OpenBLAS to 1 thread for
-            // the duration of the parallel-for and restore the prior count.
-            //
-            // PR #410 CodeRabbit fix: use the lock-protected scope token so
-            // overlapping/nested callers from concurrent threads don't restore
-            // stale values. Only the outermost scope hits OpenBLAS on dispose.
-            //
-            // PR #410 CodeRabbit follow-up: ScopeOpenBlasThreads is created
-            // INSIDE the try so if its constructor throws (lazy _nativeAvailable
-            // init, lock contention, etc.) the rented scoresData still gets
-            // returned via the finally below. Previously the scope acquisition
-            // happened before the try, leaking the array pool on that path.
-            using var blasScope = Helpers.BlasProvider.ScopeOpenBlasThreads(1);
             var weightsData = new double[scoresLen];
             var outputData = new double[bhCount * seqQ * d_v];
             var statsData = new double[bhCount * seqQ];
@@ -43608,66 +43471,15 @@ public partial class CpuEngine : ITensorLevelEngine
                         inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                     blasDone = true;
                 }
-#if NET5_0_OR_GREATER
-                // Tier -1: NativeInferencePool — pre-pinned weights, zero GC per call
-                var inferPool = NativeInferencePool.Current;
-                if (!blasDone && inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                if (!blasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
-                    unsafe
-                    {
-                        float* pW = inferPool.GetOrPin(wArr);
-                        float* pOut = inferPool.GetActivationBuffer(M * N);
-                        fixed (float* pIn = inArr)
-                        {
-                            if (BlasProvider.HasRawSgemm)
-                                BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
-                            else
-                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
-                        }
-                        // Copy result to managed output (needed for Tensor wrapping)
-                        new System.Span<float>(pOut, M * N).CopyTo(outArr.AsSpan());
-                    }
-                    blasDone = true;
-                }
-
-                // Tier 0: Raw function pointer — zero overhead calli (no delegate, no P/Invoke)
-                if (!blasDone && BlasProvider.HasRawSgemm)
-                {
-                    unsafe
-                    {
-                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
-                            BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
-                    }
-                    blasDone = true;
-                }
-#endif
-                if (!blasDone)
-                {
-                    // Tier 1: Native delegate dispatch
-                    if (BlasProvider.HasNativeSgemm)
-                    {
-                        unsafe
-                        {
-                            fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
-                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
-                        }
-                    }
-                    // Tier 2: MKL verified
-                    else if (BlasProvider.IsMklVerified)
-                    {
-                        BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
-                    }
-                    // Tier 3: Any BLAS with validation
-                    else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                    {
-                        // Path B step 1: route through Path A's cached-B
-                        // SGEMM. For inference with stable weight arrays,
-                        // this amortises PackB across every forward call.
-                        // Falls through to standard Sgemm when the shape
-                        // exceeds Nc (single-jc-pass assumption).
-                        Simd.SimdGemm.SgemmWithCachedB(
-                            inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
-                    }
+                    // Path B step 1: route through Path A's cached-B
+                    // SGEMM. For inference with stable weight arrays,
+                    // this amortises PackB across every forward call.
+                    // Falls through to standard Sgemm when the shape
+                    // exceeds Nc (single-jc-pass assumption).
+                    Simd.SimdGemm.SgemmWithCachedB(
+                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                 }
 
                 _ffnGemmScope.Dispose();
@@ -43692,33 +43504,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var outArrLease = result.LeaseArray();
                 var outArr = (double[])(object)outArrLease.Array;
 
-                bool dBlasDone = false;
-#if NET5_0_OR_GREATER
-                if (BlasProvider.HasRawDgemm)
-                {
-                    unsafe
-                    {
-                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
-                            BlasProvider.DgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
-                    }
-                    dBlasDone = true;
-                }
-#endif
-                if (!dBlasDone && BlasProvider.HasNativeDgemm)
-                {
-                    unsafe
-                    {
-                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
-                            BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
-                    }
-                    dBlasDone = true;
-                }
-                if (!dBlasDone && BlasProvider.IsMklVerified)
-                {
-                    BlasProvider.MklDgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
-                    dBlasDone = true;
-                }
-                if (!dBlasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
                     CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
                         bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null,
@@ -43890,55 +43676,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                     blasDone = true;
                 }
-#if NET5_0_OR_GREATER
-                var inferPool = NativeInferencePool.Current;
-                if (!blasDone && inferPool is not null && (BlasProvider.HasRawSgemm || BlasProvider.HasNativeSgemm))
+                if (!blasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
-                    unsafe
-                    {
-                        float* pW = inferPool.GetOrPin(wArr);
-                        float* pOut = inferPool.GetActivationBuffer(M * N);
-                        fixed (float* pIn = inArr)
-                        {
-                            if (BlasProvider.HasRawSgemm)
-                                BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
-                            else
-                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
-                        }
-                        new System.Span<float>(pOut, M * N).CopyTo(outArr.AsSpan());
-                    }
-                    blasDone = true;
-                }
-
-                if (!blasDone && BlasProvider.HasRawSgemm)
-                {
-                    unsafe
-                    {
-                        fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
-                            BlasProvider.SgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
-                    }
-                    blasDone = true;
-                }
-#endif
-                if (!blasDone)
-                {
-                    if (BlasProvider.HasNativeSgemm)
-                    {
-                        unsafe
-                        {
-                            fixed (float* pIn = inArr, pW = wArr, pOut = outArr)
-                                BlasProvider.SgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
-                        }
-                    }
-                    else if (BlasProvider.IsMklVerified)
-                    {
-                        BlasProvider.MklSgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
-                    }
-                    else if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                    {
-                        Simd.SimdGemm.SgemmWithCachedB(
-                            inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
-                    }
+                    Simd.SimdGemm.SgemmWithCachedB(
+                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                 }
 
                 _ffnGemmScope.Dispose();
@@ -43960,33 +43701,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var outArrLease = destination.LeaseArray();
                 var outArr = (double[])(object)outArrLease.Array;
 
-                bool dBlasDone = false;
-#if NET5_0_OR_GREATER
-                if (BlasProvider.HasRawDgemm)
-                {
-                    unsafe
-                    {
-                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
-                            BlasProvider.DgemmRaw(M, N, K, pIn, K, pW, N, pOut, N);
-                    }
-                    dBlasDone = true;
-                }
-#endif
-                if (!dBlasDone && BlasProvider.HasNativeDgemm)
-                {
-                    unsafe
-                    {
-                        fixed (double* pIn = inArr, pW = wArr, pOut = outArr)
-                            BlasProvider.DgemmDirect(M, N, K, pIn, K, pW, N, pOut, N);
-                    }
-                    dBlasDone = true;
-                }
-                if (!dBlasDone && BlasProvider.IsMklVerified)
-                {
-                    BlasProvider.MklDgemmZeroOffset(M, N, K, inArr, K, wArr, N, outArr, N);
-                    dBlasDone = true;
-                }
-                if (!dBlasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
+                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
                 {
                     CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
                         bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null,

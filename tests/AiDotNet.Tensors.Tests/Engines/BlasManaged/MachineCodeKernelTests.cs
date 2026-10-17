@@ -593,16 +593,11 @@ public class MachineCodeKernelTests
         try { packBothSt = Bench(() => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(a, k, false, b, n, false, c, n, m, n, k)); }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = prevMax; }
 
-        double openblas = 0;
-        if (BlasProvider.HasRawSgemm)
-            fixed (float* pa = a, pb = b, pc = c)
-            { float* xa = pa, xb = pb, xc = pc; openblas = Bench(() => BlasProvider.SgemmRaw(m, n, k, xa, k, xb, n, xc, n)); }
 
         int physical = Math.Max(1, Environment.ProcessorCount / 2);
         _output.WriteLine($"PackBoth-sweep {m}³ MC={Environment.GetEnvironmentVariable("AIDOTNET_GEMM_MC")} " +
             $"NC={Environment.GetEnvironmentVariable("AIDOTNET_GEMM_NC")} KC={Environment.GetEnvironmentVariable("AIDOTNET_GEMM_KC")}: " +
-            $"PackBoth {packBoth:F0} GF/s (st {packBothSt:F0}/core, scaling {packBoth / packBothSt:F1}× / {physical} phys), " +
-            $"OpenBLAS {openblas:F0} ({(packBoth / openblas - 1) * 100:+0.0;-0.0}%)");
+            $"PackBoth {packBoth:F0} GF/s (st {packBothSt:F0}/core, scaling {packBoth / packBothSt:F1}× / {physical} phys)");
     }
 
     [Fact]
@@ -681,27 +676,7 @@ public class MachineCodeKernelTests
                 packBoth = 2.0 * m * n * k * iters / best / 1e9;
             }
 
-            // Native OpenBLAS reference (shipped libopenblas.dll) — the bar to beat.
-            double openblas = 0;
-            if (BlasProvider.HasRawSgemm)
-            {
-                fixed (float* pa = a, pb = b, pc = c)
-                {
-                    for (int i = 0; i < 5; i++) BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
-                    double best = double.MaxValue;
-                    for (int w = 0; w < 7; w++)
-                    {
-                        var sw = Stopwatch.StartNew();
-                        for (int i = 0; i < iters; i++) BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
-                        sw.Stop();
-                        best = Math.Min(best, sw.Elapsed.TotalSeconds);
-                    }
-                    openblas = 2.0 * m * n * k * iters / best / 1e9;
-                }
-            }
-
-            _output.WriteLine($"GEMM {m}x{n}x{k}: OpenBLAS {openblas:F0}, PackBoth(ours) {packBoth:F0} " +
-                $"({(packBoth / openblas - 1) * 100:+0.0;-0.0}% vs OpenBLAS), machine-kernel {panelG:F0} GF/s | " +
+            _output.WriteLine($"GEMM {m}x{n}x{k}: PackBoth(ours) {packBoth:F0}, machine-kernel {panelG:F0} GF/s | " +
                 $"per-tile {perTile:F0}, single-thread/core {st1:F0} (raw ceiling ~115)");
         }
     }

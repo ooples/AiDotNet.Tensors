@@ -87,18 +87,11 @@ public partial class CpuEngine
 
             // dW[outC, colH] = G[outC, batch*colW] . cols[colH, batch*colW]^T
             Array.Clear(result, resultOff, totalLen);
-            if (!BlasProvider.IsAvailable || !BlasProvider.TryGemmEx(
-                    outChannels, colH, colWAll,
-                    packedGrad, 0, colWAll, false,
-                    cols, 0, colWAll, true,
-                    result, resultOff, colH))
-            {
-                Simd.SimdGemm.Sgemm(
-                    new ReadOnlySpan<float>(packedGrad, 0, outChannels * colWAll), colWAll, false,
-                    new ReadOnlySpan<float>(cols, 0, colH * colWAll), colWAll, true,
-                    new Span<float>(result, resultOff, totalLen),
-                    outChannels, colWAll, colH);
-            }
+            Simd.SimdGemm.Sgemm(
+                new ReadOnlySpan<float>(packedGrad, 0, outChannels * colWAll), colWAll, false,
+                new ReadOnlySpan<float>(cols, 0, colH * colWAll), colWAll, true,
+                new Span<float>(result, resultOff, totalLen),
+                outChannels, colWAll, colH);
             if (accumulate)
                 for (int i = 0; i < totalLen; i++) destF[destOff + i] += result[i];
         }
@@ -132,18 +125,11 @@ public partial class CpuEngine
 
             // cols[colH, batch*colW] = W[outC, colH]^T . G[outC, batch*colW]
             Array.Clear(cols, 0, colH * colWAll);
-            if (!BlasProvider.IsAvailable || !BlasProvider.TryGemmEx(
-                    colH, colWAll, outChannels,
-                    kernelF, 0, colH, true,
-                    packedGrad, 0, colWAll, false,
-                    cols, 0, colWAll))
-            {
-                Simd.SimdGemm.Sgemm(
-                    new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, true,
-                    new ReadOnlySpan<float>(packedGrad, 0, outChannels * colWAll), colWAll, false,
-                    new Span<float>(cols, 0, colH * colWAll),
-                    colH, outChannels, colWAll);
-            }
+            Simd.SimdGemm.Sgemm(
+                new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, true,
+                new ReadOnlySpan<float>(packedGrad, 0, outChannels * colWAll), colWAll, false,
+                new Span<float>(cols, 0, colH * colWAll),
+                colH, outChannels, colWAll);
 
             // Each (image, channel) plane is written by exactly one worker.
             CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, (long)colH * colWAll, bc =>
@@ -200,11 +186,7 @@ public partial class CpuEngine
                     new ReadOnlySpan<float>(cols, 0, colH * colWAll), colWAll, false,
                     new Span<float>(packedOut, 0, outChannels * colWAll), colWAll,
                     outChannels, colWAll, colH);
-            else if (!BlasProvider.IsAvailable || !BlasProvider.TryGemmEx(
-                    outChannels, colWAll, colH,
-                    kernelF, 0, colH, false,
-                    cols, 0, colWAll, false,
-                    packedOut, 0, colWAll))
+            else
             {
                 Simd.SimdGemm.Sgemm(
                     new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, false,

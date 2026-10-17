@@ -75,8 +75,4 @@ The Vulkan backend has no vendor math libraries; every kernel is its own GLSL / 
 
 ## CPU libraries
 
-These are listed for completeness; none is GPU-related.
-
-| Library | Needed? | Loaded | Without it |
-|---|---|---|---|
-| `libopenblas` | Optional, opt-in with `AIDOTNET_USE_BLAS=1` | On first BLAS use | The managed GEMM (`BlasManaged`) runs |
+None. CPU GEMM runs the managed `BlasManaged` kernels; OpenBLAS and Intel MKL are no longer shipped or loaded (#368).

@@ -64,7 +64,6 @@ public class SigmoidABTest
         _output.WriteLine($"  SIMD kernel:    {simdMs:F3}ms");
         _output.WriteLine($"  Raw multiply:   {rawMs:F3}ms (memory throughput baseline)");
         _output.WriteLine($"  Compiled plan:  {compiledMs:F3}ms");
-        _output.WriteLine($"  VML available:  {AiDotNet.Tensors.Helpers.VmlProvider.IsInitialized}");
         _output.WriteLine($"");
         _output.WriteLine($"  Sigmoid overhead vs raw: {simdMs / rawMs:F1}x (exp cost)");
         _output.WriteLine($"  PyTorch BDN: 0.488ms");

@@ -38,7 +38,6 @@ public class CompiledTrainingPlanGemmPerfBench
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
         double gflop = 2.0 * M * K * N / 1e9;
-        _o.WriteLine($"native BLAS IsAvailable = {AiDotNet.Tensors.Helpers.BlasProvider.IsAvailable}");
 
         Action simd = () => AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
             a.AsSpan(0, M * K), K, false, b.AsSpan(0, K * N), N, false, c.AsSpan(0, M * N), M, K, N);

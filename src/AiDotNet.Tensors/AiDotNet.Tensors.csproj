@@ -57,15 +57,10 @@
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
     <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
-    <!-- NU1603: intelmkl.redist transitive deps reference exact versions
-         that get bumped to next patch (e.g. intelopenmp 2026.0.0 →
-         2026.0.0.944). Higher within the same major is fine. -->
-    <NoWarn>$(NoWarn);NU1603</NoWarn>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
     <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
-    <NoWarn>$(NoWarn);NU1603</NoWarn>
   </PropertyGroup>
 
   <!-- Define WINDOWS for correct DLL names on Windows -->
@@ -140,21 +135,11 @@
 
   <ItemGroup>
     <!--
-      External CPU math libraries REMOVED per the feat/finish-mkl-replacement
-      branch (Issue #131 completion + supply-chain-independence directive):
-        - MKL.NET + MKL.NET.win-x64 (110 MB Intel binary previously bundled)
-        - Native BLAS loader (cblas_sgemm via BlasProvider / CpuNativeBlas)
-        - MKL VML (VmlProvider)
-        - Intel oneDNN (OneDnnProvider — dnnl.dll)
-      All of the above are now stub classes that return false at every
-      entry point. The engine routes all matmul through SimdGemm's AVX2
-      blocked kernel + JIT micro-kernels; all element-wise transcendentals
-      through SimdKernels (Herumi exp, Pade sigmoid, vectorized tanh/log/...);
-      all Conv2D through FusedConv + SimdGemm / Winograd / SIMD-direct.
-
-      Per iter 18c benchmarks (docs/mkl-replacement/baseline/iter18c-results.md),
-      the in-house kernels are at 0.99-1.04× of MKL on every tracked DiT-XL
-      shape — 5 shapes beat MKL, 5 at parity, 0 meaningfully trailing.
+      No native CPU math libraries ship with this package. GEMM runs the managed
+      BlasManaged kernels; element-wise transcendentals run SimdKernels; Conv2D runs
+      FusedConv + SimdGemm / Winograd / SIMD-direct. MKL.NET was removed under #131, and
+      OpenBLAS (AiDotNet.Native.OpenBLAS), Microsoft.ML.Mkl.Redist and intelmkl.redist
+      under #368, once the managed GEMM reached rough parity with OpenBLAS.
     -->
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
@@ -248,116 +233,6 @@
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
   </ItemGroup>
 
-  <!--
-    CPU BLAS native (#327): industry-standard pattern matching PyTorch / NumPy
-    / TensorFlow — ship libopenblas alongside the managed package so consumers
-    get MKL-class GEMM throughput out of the box. Without this reference,
-    BlasProvider.ProbeNativeLibrary fails (libopenblas.dll not on the runtime
-    load path), every TensorMatMul falls to SimdGemm's AVX2 managed kernel,
-    and Transformer training pays a 6-10× wall-time gap to PyTorch. The
-    BlasProvider doc-comment already claims this is the default ("AiDotNet
-    ships AiDotNet.Native.OpenBLAS as a transitive NuGet dependency, so
-    libopenblas is loadable on every consumer install") — this reference
-    makes the claim true.
-
-    Unconditional on TFM: the package payload is pure native binaries
-    deployed via runtimes/<rid>/native, which both net10.0 and net471
-    consume identically (SDK-style projects auto-copy native assets from
-    runtime.* packages on both frameworks). BlasProvider.ProbeNativeLibrary
-    is a vanilla DllImport P/Invoke + DllNotFoundException catch — those
-    APIs are net471-compatible. Including the package on net471 means the
-    "transitive dependency for every consumer" claim holds for net471
-    consumers too instead of silently dropping them to the managed
-    SimdGemm fallback.
-  -->
-  <ItemGroup>
-    <PackageReference Include="AiDotNet.Native.OpenBLAS" Version="0.75.6" />
-  </ItemGroup>
-
-  <!--
-    Issue #338 Phase G.1 — MKL via Microsoft.ML.Mkl.Redist (~66MB win-x64).
-    The supply-chain-independence directive (Issue #131, csproj lines 60-77)
-    removed MKL.NET (110MB Intel binary). Phase F.2 measured that the
-    in-house SimdGemm CAN beat OpenBLAS per-call at d=128 transformer
-    backward shapes (2× faster in isolation) but regresses 2.4× end-to-end
-    due to .NET Parallel.For thread-pool contention between the forward
-    and backward calls. Closing the gap to ≤100ms PyTorch parity for
-    Issue #338 requires either fixing that contention (significant kernel
-    refactor) or routing through a native BLAS that uses its own thread
-    pool — exactly what MKL provides.
-    `Microsoft.ML.Mkl.Redist` is the MS-blessed MKL redist used by ML.NET
-    (`Microsoft.ML.Mkl.Components`, `Microsoft.ML.CpuMath`). Selected over
-    `Intel.MKL` (third-party, larger payload) and `Microsoft.ML.OnnxRuntime`
-    (uses MKL/oneDNN internally for graph execution but does not expose
-    cblas_sgemm at the public API surface — wrong tool for low-level GEMM).
-    Opt-in via env var `AIDOTNET_BLAS_PROVIDER=mkl`; default remains
-    OpenBLAS until MKL is verified faster on the consumer's hardware.
-  -->
-  <ItemGroup>
-    <PackageReference Include="Microsoft.ML.Mkl.Redist" Version="5.0.0" />
-  </ItemGroup>
-
-  <!--
-    Issue #338 Phase G.5 — full Intel MKL redist for BF16 mixed-precision
-    GEMM. `Microsoft.ML.Mkl.Redist` (above) strips MKL to a small set of
-    FP32/FP64 GEMM exports for ML.NET; `intelmkl.redist.win-x64` ships
-    the full `mkl_rt.3.dll` (28MB) which exports `cblas_gemm_bf16bf16f32`,
-    the mixed-precision GEMM that closes the f32 GEMM throughput gap on
-    AVX-512-BF16 capable Intel CPUs (Cooper Lake, Sapphire Rapids, etc.).
-    Win-x64 only — the equivalent linux-x64/osx-x64 packages exist
-    (`intelmkl.redist.linux-x64`, `intelmkl.redist.osx-x64`) but are gated
-    on consumer demand; add them when needed.
-    Total native payload on win-x64: ~500MB. Gated entirely behind
-    `AIDOTNET_BLAS_PROVIDER=mkl-bf16`; users who don't opt in pay nothing
-    at runtime beyond the native asset deployment.
-  -->
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
-    <!-- NU1603: Intel's transitive deps occasionally reference exact
-         versions that get bumped to next patch (e.g. intelopenmp 2026.0.0
-         → 2026.0.0.944). Higher within the same major is fine. -->
-    <PackageReference Include="intelmkl.redist.win-x64" Version="2026.0.0.901" NoWarn="NU1603" />
-  </ItemGroup>
-
-  <!-- intelmkl.redist's MSBuild targets gate Content-item generation on
-       legacy `packages.config` detection, so SDK-style projects don't get
-       the native DLLs auto-copied to bin. Replicate the deployment
-       manually using NuGetPackageRoot. EnsureTrailingSlash because a
-       NUGET_PACKAGES set without one (F:\nuget-packages) yields a root with
-       no separator, and the glob then matched nothing, silently.
-
-       Version wildcard (`*`) on the package-version folder: NU1603 (above)
-       allows restore to pick newer patch versions of Intel transitive
-       packages than this csproj pins. If we hardcoded patch versions in
-       the Include path, those copies would silently miss when restore
-       picked a different patch (e.g. intelopenmp 2026.0.0.944 → .950) and
-       the runtime DLLs would disappear from bin. With `*`, whichever
-       patch restore actually resolved is what gets copied. The NuGet
-       global cache normally holds one resolved version per project at
-       a time; if multiple are present from other projects, MSBuild
-       last-write-wins via the Link metadata (`%(Filename)%(Extension)`)
-       is acceptable since all patch versions of these MKL/OpenMP/TBB
-       redist packages share the same DLL names with binary-compatible
-       contents. -->
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
-    <None Include="$([MSBuild]::EnsureTrailingSlash($(NuGetPackageRoot)))intelmkl.redist.win-x64\*\runtimes\win-x64\native\*.dll">
-      <Link>%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-      <Pack>false</Pack>
-    </None>
-    <None Include="$([MSBuild]::EnsureTrailingSlash($(NuGetPackageRoot)))intelopenmp.redist.win\*\runtimes\win-x64\native\*.dll">
-      <Link>%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-      <Pack>false</Pack>
-    </None>
-    <None Include="$([MSBuild]::EnsureTrailingSlash($(NuGetPackageRoot)))inteltbb.redist.win\*\runtimes\win-x64\native\*.dll">
-      <Link>%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Visible>false</Visible>
-      <Pack>false</Pack>
-    </None>
-  </ItemGroup>
 
   <!--
     GPU-side optional packages — separate supply-chain surface (users opt in

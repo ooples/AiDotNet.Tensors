@@ -181,53 +181,13 @@ public partial class CpuEngine
             && TryMlpRowStripes(input, weights, biases, hiddenActivation, outputActivation, out var striped))
             return striped!;
 
-        // Issue #436: small-batch inference GEMMs are oversubscribed by the
-        // default all-cores native-BLAS thread count. On a 16-core box the
-        // AIsEval MLP (bs=128) measured ~1.74 ms at 16 threads vs ~1.20 ms at
-        // 8 — the per-GEMM thread-fan-out/sync cost dominates the tiny actual
-        // compute (the 128×10×128 head is almost pure overhead). Cap the native
-        // BLAS thread count to roughly one thread per 16 output rows (so each
-        // thread keeps a cache-resident M-stripe of useful work), clamped to the
-        // core count, for the span of the forward. The scope restores the prior
-        // count on exit and is reference-counted for nested/concurrent callers.
-        // Effective GEMM M is the product of every leading dimension ([..., inFeatures]);
-        // using only _shape[0] would collapse a shape like [batch, time, features] to
-        // near single-thread and skew the cap badly. Accumulate in a long and stop early
-        // once the cap is already saturated (rows/16 >= ProcessorCount) to avoid overflow.
-        long rows = 1;
-        for (int d = 0; d < Math.Max(0, input.Rank - 1); d++)
-        {
-            rows *= input._shape[d];
-            if (rows >= (long)Environment.ProcessorCount * 16) break;
-        }
-        // Math.Clamp isn't available on net471 — use Max/Min (see the same
-        // pattern in CpuEngine.Geometry.cs / FusedPointwise.cs).
-        int blasThreads = Math.Max(1, Math.Min((int)(rows / 16), Environment.ProcessorCount));
-        // ScopeOpenBlasThreads is NOT free: it marshals an openblas_set_num_threads
-        // onto a dedicated BLAS thread (a semaphore round-trip) on BOTH entry and
-        // restore — ~0.1 ms of the measured ~0.29 ms batch-1 MlpForward (issue #475 /
-        // small-batch inference loss vs PyTorch). At small effective M the per-layer
-        // GEMMs are GEMV-tiny (e.g. 1×784×512) and OpenBLAS runs them single-threaded
-        // by its own size heuristic, so forcing the global pool to 1 thread changes
-        // nothing — the reconfiguration is pure overhead. Only enter the scope once
-        // there are enough output rows that native BLAS would actually multithread and
-        // oversubscribe (the #436 case was bs=128; blasThreads only drops below the
-        // core count from bs≈32 up). default(OpenBlasThreadScope) is an inert token
-        // whose Dispose is a no-op, so the small-batch path pays nothing.
-        const long BlasThreadScopeMinRows = 32;
-        using var _blasScope = rows >= BlasThreadScopeMinRows
-            ? Helpers.BlasProvider.ScopeOpenBlasThreads(blasThreads)
-            : default;
-
         int last = weights.Count - 1;
 
         // Phase 3 (compiled-inference): whole-MLP ping-pong fast path for float.
         // Chains every layer through two reused scratch buffers — no per-layer
         // Tensor allocation, no per-layer FusedLinear preamble, intermediates stay
         // cache-resident — with the LAST layer writing straight into the result
-        // (no final copy). Each layer's GEMM follows the Phase-1 routing gate
-        // (managed cached-B prepack vs native BLAS); bias+activation is applied in
-        // place. Output is numerically identical to the per-layer FusedLinear chain.
+        // (no final copy). Bias+activation is applied in place. Output is numerically identical to the per-layer FusedLinear chain.
         if (typeof(T) == typeof(float) && input.Rank == 2 && input.IsContiguous && !input.IsSparse)
         {
             int M = input._shape[0];
@@ -282,40 +242,23 @@ public partial class CpuEngine
                         // Last layer writes directly into the result buffer (no copy).
                         float[] dst = i == last ? outArr : (pingToggle == 0 ? bufA : bufB);
 
-                        // Per-layer kernel choice: a WIDE layer (large K·N) goes to native
-                        // BLAS at EVERY batch — including the small-M latency regime.
-                        // The shared PreferManagedInferenceGemm gate keeps wide layers on
-                        // managed cached-B at M<16, but measurement (Phase5/Phase7 probes)
-                        // shows native BLAS wins the wide classifier-head layer
-                        // (e.g. 784→512) even at M=1; routing it to managed made MlpForward
-                        // ~6.7× slower than the self-tuned CompiledMlp at M=1. Managed
-                        // cached-B still wins the small layers (low K·N), where native
-                        // BLAS dispatch overhead dominates. Mirror that split here without
-                        // changing PreferManagedInferenceGemm (which FusedLinear also uses).
                         // #475 AsSpan contract (see the comment above the loop): read the weight
-                        // as the live CPU span — no GPU-tagged snapshot copy. The JIT and native
-                        // paths use this span directly; the managed cached-B path additionally
-                        // needs the STABLE backing float[] (GetFlattenedData) for its
-                        // identity-keyed pre-pack. AsSpan also materializes lazy data once.
+                        // as the live CPU span — no GPU-tagged snapshot copy. The JIT and managed
+                        // paths use this span directly. AsSpan also materializes lazy data once.
                         var wT = (Tensor<float>)(object)w;
                         using var wSpanLease = wT.Lease();
                         ReadOnlySpan<float> wSpan = wSpanLease.Span;
 
                         bool gemmDone = false;
 #if NETCOREAPP
-                        // JIT'd AVX2 kernel first (opt-in) — beats both managed cached-B
-                        // and native BLAS on the MLP shapes; this is the path the MLP
+                        // JIT'd AVX2 kernel first (opt-in) — beats managed cached-B
+                        // on the MLP shapes; this is the path the MLP
                         // actually takes (so without it the JIT never reached the MLP).
                         if (_jitGemm && Simd.JitGemmAvx2.TryMultiply(
                                 srcSpan.Slice(0, M * curK), wSpan.Slice(0, curK * n), dst.AsSpan(0, M * n), M, n, curK))
                             gemmDone = true;
 #endif
-                        bool preferManaged = (long)curK * n <= 200_000 || !BlasProvider.HasRawSgemm;
-                        if (gemmDone)
-                        {
-                            // done by JIT
-                        }
-                        else if (preferManaged)
+                        if (!gemmDone)
                         {
                             // #475: at these small managed shapes (curK*n <= 200K) the direct
                             // serial AVX2 microkernel beats the BlasManaged cached-B dispatch.
@@ -329,8 +272,7 @@ public partial class CpuEngine
                             // parallelism, is concurrency-safe (no shared pack-cache state),
                             // and reads wSpan directly (no GetFlattenedData() float[] copy, no
                             // pack-cache identity concerns). (wT/wSpan hoisted above.)
-                            // #475 (2026-10): with native BLAS off -- the default -- every layer lands here,
-                            // including the wide head. SgemmSequential is single-threaded, so the AIsEval
+                            // #475 (2026-10): every layer lands here, including the wide head. SgemmSequential is single-threaded, so the AIsEval
                             // layer 0 (128x784x512) took ~1.45 ms at any thread budget on a 64-core Threadripper,
                             // while the parallel Sgemm dispatch took 0.17 ms; layer 1 (128x512x128) 160 -> 40 us.
                             // Below MlpParallelGemmMinWork the sequential kernel still wins (layer 2, 128x128x10:
@@ -347,25 +289,6 @@ public partial class CpuEngine
                                     srcSpan.Slice(0, M * curK), wSpan.Slice(0, curK * n),
                                     dst.AsSpan(0, M * n), M, curK, n);
                         }
-                        else
-                        {
-                            unsafe
-                            {
-                                fixed (float* ps = srcSpan, pw = wSpan, pd = dst)
-                                {
-                                    if (BlasProvider.HasRawSgemm)
-                                        BlasProvider.SgemmRaw(M, n, curK, ps, curK, pw, n, pd, n);
-                                    else
-                                        // Unreachable in practice (preferManaged already captures
-                                        // !HasRawSgemm); kept as a defensive fallback, on the same
-                                        // stable-array contract as the preferManaged branch above.
-                                        Simd.SimdGemm.SgemmWithCachedB(
-                                            srcSpan.Slice(0, M * curK), wT.GetFlattenedData(),
-                                            dst.AsSpan(0, M * n), M, curK, n);
-                                }
-                            }
-                        }
-
                         var act = i == last ? outputActivation : hiddenActivation;
                         var ap = i == last ? outputActivationParams : hiddenActivationParams;
                         var bi = biases[i];

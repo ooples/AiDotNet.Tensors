@@ -108,8 +108,6 @@ public static class Issue327TransformerTrainBatchedBenchmark
         Console.WriteLine($"  AVX2                   : {Avx2.IsSupported}");
         Console.WriteLine($"  FMA                    : {Fma.IsSupported}");
         Console.WriteLine($"  AVX-512F               : {Avx512F.IsSupported}");
-        Console.WriteLine($"  BLAS backend           : {BlasProvider.BackendName}");
-        Console.WriteLine($"  BLAS available         : {BlasProvider.IsAvailable}");
         Console.WriteLine($"  Deterministic mode     : {BlasProvider.IsDeterministicMode}");
         Console.WriteLine($"  SerialGrainSize        : {PersistentParallelExecutor.DefaultSerialGrainSize:N0}");
         Console.WriteLine($"  MaxDegreeOfParallelism : {CpuParallelSettings.MaxDegreeOfParallelism}");
