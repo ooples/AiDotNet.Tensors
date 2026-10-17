@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.139.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.2...v0.139.3) (2026-10-17)
+
+
+### Performance
+
+* **cuda-lstm:** register-resident recurrence + one fused backward-GEMM kernel; LSTM step 309 -&gt; 155 us ([#1403](https://github.com/ooples/AiDotNet.Tensors/issues/1403)) ([12b5393](https://github.com/ooples/AiDotNet.Tensors/commit/12b5393c0970cede78ca1b2ffc92c510a10fdc73))
+
 ## [0.139.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.1...v0.139.2) (2026-10-17)
 
 
