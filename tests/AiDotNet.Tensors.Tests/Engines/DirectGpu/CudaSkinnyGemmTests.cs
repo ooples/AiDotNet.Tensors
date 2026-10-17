@@ -90,6 +90,12 @@ public class CudaSkinnyGemmTests
     [InlineData(256, 256, 4096)]   // 32 tiles, the most the per-thread counters hold
     [InlineData(4, 8, 513)]        // a partial tile and a reduction that is not a multiple of the 32-row chunk
     [InlineData(36, 68, 1000)]
+    [InlineData(64, 192, 256)]     // a 256-row batch's weight gradients: wgrad_tile_tn, one launch
+    [InlineData(64, 64, 256)]
+    [InlineData(128, 64, 256)]
+    [InlineData(256, 256, 511)]    // the longest reduction it takes, a partial last chunk
+    [InlineData(4, 8, 64)]         // the shortest, one partial tile
+    [InlineData(36, 68, 100)]      // partial tiles both ways
     public void SkinnyGemmTransposedA_EqualsTheReference(int m, int n, int k)
     {
         using var backend = new CudaBackend();
@@ -156,6 +162,7 @@ public class CudaSkinnyGemmTests
     [SkippableTheory]
     [InlineData("skinny_gemm", 64)]
     [InlineData("skinny_gemm_tn", 256)]
+    [InlineData("wgrad_tile_tn", 256)]
     public void SkinnyGemmKernels_KeepTheirAccumulatorsInRegisters(string kernel, int blockThreads)
     {
         using var backend = new CudaBackend();

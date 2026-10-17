@@ -53,9 +53,34 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
     /// workspace, which cuBLAS and cuBLASLt use only in this stream's order. False -- nothing launched -- when the
     /// shape, alignment, workspace or kernel does not qualify; the caller then runs cuBLAS.
     /// </summary>
+    // wgrad_tile_tn takes reductions from this many rows up to skinny_gemm_tn's (512).
+    private const int WgradTileMinReduce = 64;
+
+    /// <summary>
+    /// <c>C[M,N] = alpha * A[K,M]ᵀ * B[K,N] + beta * C</c> through wgrad_tile_tn for a reduction of 64..511 rows with
+    /// M, N &lt;= 256 (multiples of 4, 16-byte aligned): one launch where cuBLASLt ran a GEMM and a split-K reduce.
+    /// False -- nothing launched -- for any other shape.
+    /// </summary>
+    internal unsafe bool TryWgradTile(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    {
+        if (!SkinnyGemmEnabled || K < WgradTileMinReduce || K >= 512 || M <= 0 || N <= 0
+            || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
+            || !_kernelCache.TryGetValue("wgrad_tile_tn", out var wgradKernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr a = A.Handle, b = B.Handle, c = C.Handle;
+        int m = M, n = N, k = K;
+        float al = alpha, be = beta;
+        void** args = stackalloc void*[8];
+        args[0] = &a; args[1] = &b; args[2] = &c; args[3] = &m; args[4] = &n; args[5] = &k; args[6] = &al; args[7] = &be;
+        LaunchKernel2D(wgradKernel, (uint)((N + 15) / 16), (uint)((M + 15) / 16), 1, 256, 1, args);
+        return true;
+    }
+
     internal unsafe bool TrySkinnyGemmTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
         float alpha, float beta)
     {
+        if (K < 512) return TryWgradTile(A, B, C, M, N, K, alpha, beta);
         if (!SkinnyGemmEnabled || K < 512 || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow
             || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
             || !_kernelCache.TryGetValue("skinny_gemm_tn", out var kernel))
