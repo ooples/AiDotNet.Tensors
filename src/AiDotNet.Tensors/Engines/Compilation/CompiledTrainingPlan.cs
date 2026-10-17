@@ -2567,6 +2567,53 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static readonly bool s_zeroAccumulatingOnly =
         Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_ZERO_ACCUMULATING_ONLY") != "0";
 
+    // Gradient buffers this step's zeroing pass clears, gathered so the clear runs across the worker pool.
+    private readonly List<(T[] Array, int Length)> _pendingGradClears = new();
+    private const int GradClearChunk = 1 << 15;
+
+    /// <summary>
+    /// Zeroes the buffers gathered in <see cref="_pendingGradClears"/>, split into 32K-element pieces across the
+    /// worker pool. On the parity CPU Transformer they are the seven multi-consumer gradients (the residual streams and
+    /// the norm outputs Q/K/V share): 787K floats a step, ~300 us as one thread's Array.Clear (Ryzen 7 4800H).
+    /// </summary>
+    private void ClearPendingGradBuffers()
+    {
+        var pending = _pendingGradClears;
+        try
+        {
+            long total = 0;
+            int pieces = 0;
+            foreach (var (_, length) in pending)
+            {
+                total += length;
+                pieces += (length + GradClearChunk - 1) / GradClearChunk;
+            }
+            if (pieces <= 1)
+            {
+                foreach (var (array, length) in pending) Array.Clear(array, 0, length);
+                return;
+            }
+            CpuParallelSettings.ParallelForOrSerial(0, pieces, total, piece =>
+            {
+                foreach (var (array, length) in pending)
+                {
+                    int owned = (length + GradClearChunk - 1) / GradClearChunk;
+                    if (piece < owned)
+                    {
+                        int start = piece * GradClearChunk;
+                        Array.Clear(array, start, Math.Min(GradClearChunk, length - start));
+                        return;
+                    }
+                    piece -= owned;
+                }
+            });
+        }
+        finally
+        {
+            pending.Clear();
+        }
+    }
+
     /// <summary><see cref="_genericGradIndices"/> as a per-buffer mask (built once).</summary>
     private bool[] AccumulatingGradMask(int count)
     {
@@ -3753,13 +3800,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 if (verified && eagerCandidates[i]) continue;   // its first contribution this step copies in
                 if (accumulating is not null && !accumulating[i]) continue;   // overwritten whole by its writer
-                Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+                _pendingGradClears.Add((gradArrays[i], _preAllocatedGrads[i].Length));
                 InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);   // see the note on the full clear below
                 // The zeros ARE this buffer's first write, so every contribution adds onto them (a specialized
                 // delegate that accumulates in place does not claim a first write). A candidate on the verification
                 // run stays unmarked so its first contribution claims it, which is how coverage is recorded.
                 if (!eagerCandidates[i]) _preAllocatedGrads[i]._gradWriteGeneration = eagerGradWriteGeneration;
             }
+            ClearPendingGradBuffers();
         }
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
@@ -3771,9 +3819,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             for (int i = 0; i < _genericGradIndices.Length; i++)
             {
                 int idx = _genericGradIndices[i];
-                Array.Clear(gradArrays[idx], 0, _preAllocatedGrads[idx].Length);
+                _pendingGradClears.Add((gradArrays[idx], _preAllocatedGrads[idx].Length));
                 InvalidateStaleDeviceCopy(_preAllocatedGrads[idx]);   // see the note on the full clear below
             }
+            ClearPendingGradBuffers();
         }
         else
         {
