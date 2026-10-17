@@ -1018,7 +1018,7 @@ internal static class StreamingStoreCodec
         // of the garbage the write-back produced (#2322).
         using var ms = new PooledChunkWriteStream();
         ms.WriteByte(DeflateCompressedTag);
-        using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true))
+        using (var ds = CreateLosslessCompressor(ms))
             WriteShuffledPlanes(raw, elem, ds);
 
         // ms.Length counts the tag byte, so the compressed payload is ms.Length - LosslessTagLength.
@@ -1033,6 +1033,27 @@ internal static class StreamingStoreCodec
         rawOut[0] = RawShuffledTag;
         BytePlaneShuffle(raw, rawOut.AsSpan(LosslessTagLength), elem);
         return rawOut;
+    }
+
+    // Huffman coding alone, without LZ77 match search. What compresses in a shuffled weight is
+    // the skewed sign/exponent plane, which is entropy, not repeats, so the match search costs
+    // the time without finding anything. On 64 MiB of shuffled Gaussian fp32 (std 0.02):
+    // level 6 encodes 32 MB/s at 1.175x; Huffman-only 142 MB/s at 1.197x, and decodes faster.
+    // A training step re-encodes every updated weight it sheds, so at level 6 this encode was
+    // about three quarters of a ParaformerLarge step (#2322). The output is ordinary Deflate,
+    // so stored payloads from either setting decode the same way. Before .NET 9 the strategy
+    // can't be chosen and the level stays at Optimal.
+    private static DeflateStream CreateLosslessCompressor(Stream destination)
+    {
+#if NET9_0_OR_GREATER
+        return new DeflateStream(destination, new ZLibCompressionOptions
+        {
+            CompressionLevel = 1,
+            CompressionStrategy = ZLibCompressionStrategy.HuffmanOnly,
+        }, leaveOpen: true);
+#else
+        return new DeflateStream(destination, CompressionLevel.Optimal, leaveOpen: true);
+#endif
     }
 
     private static void DecodeLosslessBytes(ReadOnlySpan<byte> src, Span<byte> dstRaw, int elem)
