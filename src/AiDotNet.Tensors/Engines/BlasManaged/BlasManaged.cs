@@ -222,6 +222,16 @@ public static partial class BlasManaged
 #endif
 
     /// <summary>
+    /// Whether the JIT small-GEMM generator should stand aside for the thin-M direct-parallel kernel: a dense no-trans
+    /// GEMM inside that kernel's box, with more than one thread to run it on. The generator runs on one thread, so a
+    /// batch-64 linear layer's [64,512]x[512,128] took 90 us there against 42 us on the parallel kernel (3950X).
+    /// </summary>
+    private static bool ThinMDirectTakesDenseShape(int m, int n, int k, int lda, int ldb, int ldc) =>
+        CpuParallelSettings.MaxDegreeOfParallelism > 1
+        && lda == k && ldb == n && ldc == n
+        && ThinMDirectServesShape(m, n, k, transA: false, transB: false);
+
+    /// <summary>
     /// Whether <see cref="Gemm{T}"/> runs a dense, unpacked GEMM of this shape (row-major, ldc = n) through the thin-M
     /// direct-parallel kernel. Other kernels consult it to stand aside where that kernel wins.
     /// </summary>
@@ -611,6 +621,7 @@ public static partial class BlasManaged
             && HasRowMajorTile(a, m, k, lda)
             && HasRowMajorTile(b, k, n, ldb)
             && HasRowMajorTile(c, m, n, ldc)
+            && !ThinMDirectTakesDenseShape(m, n, k, lda, ldb, ldc)
             && JitGemmGenerator.IsSupported)
         {
             var jitEpi = options.Epilogue;
