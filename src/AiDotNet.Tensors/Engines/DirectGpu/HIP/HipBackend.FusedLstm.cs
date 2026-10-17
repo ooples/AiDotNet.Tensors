@@ -4,4 +4,5 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 public sealed partial class HipBackend : IFusedLstmSequenceTraining
 {
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => MaxRnnBlockSize;
+    bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 }

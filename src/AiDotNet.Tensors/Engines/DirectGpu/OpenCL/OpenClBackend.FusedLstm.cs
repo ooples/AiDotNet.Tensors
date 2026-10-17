@@ -7,6 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     public sealed partial class OpenClBackend : IFusedLstmSequenceTraining
     {
         int IFusedLstmSequenceTraining.MaxFusedLstmHidden => MaxLstmSequenceHidden();
+        bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => false;
 
         private int MaxLstmSequenceHidden()
         {

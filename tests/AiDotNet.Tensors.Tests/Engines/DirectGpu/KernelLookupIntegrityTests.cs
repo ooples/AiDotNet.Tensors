@@ -34,8 +34,12 @@ internal static class KernelLookupIntegrity
 
     private static readonly Regex LiteralPattern = new(@"""([a-z][a-z0-9_]*)""", RegexOptions.None, Timeout);
 
+    // A read of the cache: TryGetValue, ContainsKey or the indexer. An indexer assignment (_kernelCache["x"] = ...) is a
+    // registration, not a lookup; counting it made a module compiled only on some devices (OpenCL's mixed-precision
+    // kernels, built only where the device reports FP16) fail this test everywhere else.
     private static readonly Regex DirectCachePattern = new(
-        @"_kernelCache\s*(?:(?:\.TryGetValue|\.ContainsKey)\s*\(\s*|\[\s*)(\w+|""[a-z][a-z0-9_]*"")", RegexOptions.None, Timeout);
+        @"_kernelCache\s*(?:(?:\.TryGetValue|\.ContainsKey)\s*\(\s*|\[\s*)((?>\w+)|""[a-z][a-z0-9_]*"")(?!\s*\]\s*=(?!=))",
+        RegexOptions.None, Timeout);
 
     private sealed class Method
     {

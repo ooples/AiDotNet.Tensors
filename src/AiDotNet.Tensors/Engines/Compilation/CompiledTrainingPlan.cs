@@ -3076,6 +3076,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private readonly Dictionary<Tensor<T>, Engines.DirectGpu.IGpuBuffer> _ownedLeafBuffers =
         new(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
+    private bool? _compiledInputIsParameter;
+
+    private bool CompiledInputIsParameter => _compiledInputIsParameter ??=
+        _compiledInputTensor is { } input && Array.Exists(_parameters, p => ReferenceEquals(p, input));
+
     private bool IsOwnedLeafBinding(Tensor<T> leaf)
         => leaf._gpuBuffer is { } bound && _ownedLeafBuffers.TryGetValue(leaf, out var owned)
            && ReferenceEquals(owned, bound);
@@ -3148,6 +3153,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // compatibility (it's the embeddings matrix there), so gate on the flag, not on null.
         if (_graphHasEmbedding) return allLive;
         if (_compiledInputTensor is not { } inT) return allLive;
+        // The compiled input is the first step's first input, which is a parameter when the step reads one first (the
+        // fused LSTM's bias add). Like every parameter it is read by the graph and updated by the optimizer on the
+        // device, so refreshing it from the host downloaded and re-uploaded it, stalling the stream every replay.
+        if (CompiledInputIsParameter) return allLive;
         Engines.DirectGpu.IGpuBuffer? buf;
         if (GraphExternalLeaves().Contains(inT))
         {
