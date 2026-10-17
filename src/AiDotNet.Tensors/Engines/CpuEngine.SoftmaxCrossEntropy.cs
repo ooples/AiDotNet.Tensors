@@ -25,7 +25,7 @@ public partial class CpuEngine
 
         int cols = logits._shape[logits.Rank - 1];
         int rows = logits.Length / cols;
-        var node = new SoftmaxCrossEntropyState(rows);
+        var node = new SoftmaxCrossEntropyState(rows, cols);
         var savedState = new object[] { node };
         if (GraphMode.IsActive)
         {
@@ -46,16 +46,16 @@ public partial class CpuEngine
         return loss;
     }
 
-    // Per-row log-sum-exp and target mass from the forward, read by the backward; reused by every replay of a node.
+    // The forward's softmax and per-row target sum, read by the backward (so it needs no exp); reused by every replay.
     private sealed class SoftmaxCrossEntropyState
     {
-        internal SoftmaxCrossEntropyState(int rows)
+        internal SoftmaxCrossEntropyState(int rows, int cols)
         {
-            LogSumExp = new float[rows];
+            Probabilities = new float[rows * cols];
             TargetSum = new float[rows];
         }
 
-        internal float[] LogSumExp { get; }
+        internal float[] Probabilities { get; }
         internal float[] TargetSum { get; }
         internal float Count { get; set; } = 1f;
     }
@@ -83,7 +83,8 @@ public partial class CpuEngine
     {
         var z = HostFloats(logits, "logits");
         var t = HostFloats(target, "target");
-        int rows = node.LogSumExp.Length;
+        var p = node.Probabilities;
+        int rows = node.TargetSum.Length;
         int cols = logits.Length / rows;
         double total = 0.0, supervised = 0.0;
         for (int r = 0; r < rows; r++)
@@ -92,8 +93,15 @@ public partial class CpuEngine
             float max = z[o];
             for (int c = 1; c < cols; c++) max = Math.Max(max, z[o + c]);
             double sumExp = 0.0;
-            for (int c = 0; c < cols; c++) sumExp += Math.Exp(z[o + c] - max);
+            for (int c = 0; c < cols; c++)
+            {
+                double e = Math.Exp(z[o + c] - max);
+                p[o + c] = (float)e;
+                sumExp += e;
+            }
             double lse = max + Math.Log(sumExp);
+            float invSum = (float)(1.0 / sumExp);
+            for (int c = 0; c < cols; c++) p[o + c] *= invSum;
             double dot = 0.0, targetSum = 0.0, mass = 0.0;
             for (int c = 0; c < cols; c++)
             {
@@ -105,7 +113,6 @@ public partial class CpuEngine
             total += dot - targetSum * lse;
             // Sign of the mass, as the composed count: NaN propagates, zero mass counts zero.
             supervised += double.IsNaN(mass) ? double.NaN : mass > 0.0 ? 1.0 : 0.0;
-            node.LogSumExp[r] = (float)lse;
             node.TargetSum[r] = (float)targetSum;
         }
         double count = double.IsNaN(supervised) ? double.NaN : Math.Max(supervised, 1.0);
@@ -120,11 +127,11 @@ public partial class CpuEngine
         var node = savedState[0] as SoftmaxCrossEntropyState
             ?? throw new InvalidOperationException("Softmax cross-entropy backward: the forward's row statistics are missing.");
         var logits = inputs[0];
-        var z = HostFloats(logits, "logits");
+        var p = node.Probabilities;
         var t = HostFloats(inputs[1], "target");
         float g = HostFloats(gradOutput, "loss gradient")[0];
         float scale = g / node.Count;
-        int rows = node.LogSumExp.Length;
+        int rows = node.TargetSum.Length;
         int cols = logits.Length / rows;
         var grad = TensorAllocator.RentUninitialized<T>(logits._shape);
         var dz = grad.GetCpuBackingForContiguousWrite(out int dzOffset) as float[]
@@ -132,10 +139,9 @@ public partial class CpuEngine
         for (int r = 0; r < rows; r++)
         {
             int o = r * cols;
-            float lse = node.LogSumExp[r];
             float rowScale = scale * node.TargetSum[r];
             for (int c = 0; c < cols; c++)
-                dz[dzOffset + o + c] = rowScale * (float)Math.Exp(z[o + c] - lse) - scale * t[o + c];
+                dz[dzOffset + o + c] = rowScale * p[o + c] - scale * t[o + c];
         }
         grad.IncrementVersion();
         DifferentiableOps.AccumulateGrad(grads, logits, grad, engine);
