@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.139.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.0...v0.139.1) (2026-10-17)
+
+
+### Bug Fixes
+
+* **autotune:** an inconclusive tuning measurement is retried and never persisted ([#1382](https://github.com/ooples/AiDotNet.Tensors/issues/1382)) ([5ca97e2](https://github.com/ooples/AiDotNet.Tensors/commit/5ca97e23ac99f99d717ac140e04a964d35b60e71))
+* **autotune:** the tuned-slot gate forgives one stalled timing pair ([#1358](https://github.com/ooples/AiDotNet.Tensors/issues/1358)) ([011fdea](https://github.com/ooples/AiDotNet.Tensors/commit/011fdea64e6ed47f07a940f1042c4e4d7ab0ae1e))
+* **cuda:** fan-out gemms run each slice on its leased stream ([#1364](https://github.com/ooples/AiDotNet.Tensors/issues/1364)) ([ac9def1](https://github.com/ooples/AiDotNet.Tensors/commit/ac9def1ccff54e0fa9a3ea0b3ef34d469053c98b)), closes [#1315](https://github.com/ooples/AiDotNet.Tensors/issues/1315)
+* **cuda:** per-thread cuBLAS setup zero-fills its skinny-GEMM counters on the device ([#1348](https://github.com/ooples/AiDotNet.Tensors/issues/1348)) ([4ef9c46](https://github.com/ooples/AiDotNet.Tensors/commit/4ef9c46e028667bd2d9be2ea99301477154f26b8))
+* **memory:** disposing a large result returns its array to the thread cache ([#1363](https://github.com/ooples/AiDotNet.Tensors/issues/1363)) ([7c3247b](https://github.com/ooples/AiDotNet.Tensors/commit/7c3247ba9baacc59608a4f26471e3273f279bbf9)), closes [#1331](https://github.com/ooples/AiDotNet.Tensors/issues/1331)
+
+
+### Performance
+
+* **compiled-gpu:** register-resident BatchNorm + fused BN-&gt;ReLU and BN-&gt;add-&gt;ReLU (ResNet-18 step -20%) ([#1376](https://github.com/ooples/AiDotNet.Tensors/issues/1376)) ([78e9e46](https://github.com/ooples/AiDotNet.Tensors/commit/78e9e46d33df5d663a7323430ce415c6e54bcfbf))
+* **compiled-gpu:** remove the captured training step's dead memsets and first-write gradient copies ([#1361](https://github.com/ooples/AiDotNet.Tensors/issues/1361)) ([f3dd5c0](https://github.com/ooples/AiDotNet.Tensors/commit/f3dd5c021f922213ca04ec25fd038a969832768d))
+* **cpu:** single-thread gemm/conv routes and a staged direct conv for large planes ([#1380](https://github.com/ooples/AiDotNet.Tensors/issues/1380)) ([e8fb163](https://github.com/ooples/AiDotNet.Tensors/commit/e8fb16388df6485d6ab4e4350ecfbda055a237fd))
+* **cuda-conv:** 8x8-micro-tile weight-gradient kernel (r8) replaces the engine rectangular tiles ([#1392](https://github.com/ooples/AiDotNet.Tensors/issues/1392)) ([491e84c](https://github.com/ooples/AiDotNet.Tensors/commit/491e84ceb726e34e844d9712ab8cc431c723f7f9))
+* **cuda-conv:** engine forward/input-gradient K order keeps each weight run in L1 ([#1387](https://github.com/ooples/AiDotNet.Tensors/issues/1387)) ([3bab9bf](https://github.com/ooples/AiDotNet.Tensors/commit/3bab9bfb9cf9cd53c5d1f89ebf7110a2cd30cb63))
+* **cuda-conv:** faster engine input gradient: balanced phase split-K, coalesced epilogue, tap-major weights ([#1374](https://github.com/ooples/AiDotNet.Tensors/issues/1374)) ([6290563](https://github.com/ooples/AiDotNet.Tensors/commit/6290563895c2808d822d143797ba9913e87caddb))
+* **cuda-conv:** fused single-kernel Winograd F(2x2,3x3) for the input gradient and forward ([#1377](https://github.com/ooples/AiDotNet.Tensors/issues/1377)) ([84811af](https://github.com/ooples/AiDotNet.Tensors/commit/84811af535bb145f48cb5eda764265c9e6efa575))
+* **cuda-conv:** fused Winograd transforms its filters in-kernel and splits the reduction on deep layers ([#1390](https://github.com/ooples/AiDotNet.Tensors/issues/1390)) ([11485f7](https://github.com/ooples/AiDotNet.Tensors/commit/11485f74098784b4934b1d9418dd1932a0317b57))
+* **cuda-conv:** opt-in Winograd F(4x4,3x3) input gradient and F(3x3,4x4) weight gradient ([#1378](https://github.com/ooples/AiDotNet.Tensors/issues/1378)) ([22e1b68](https://github.com/ooples/AiDotNet.Tensors/commit/22e1b68d1da698bd5e004ee8ed69b95793d9ed9c))
+* **cuda-conv:** rectangular engine weight-gradient tiles as dW candidates ([#1385](https://github.com/ooples/AiDotNet.Tensors/issues/1385)) ([93675af](https://github.com/ooples/AiDotNet.Tensors/commit/93675af404c5805e37fe2f489b911dd0c4b07f6d))
+* **cuda-conv:** split-K for the sub-pixel phase input gradient on small grids ([#1356](https://github.com/ooples/AiDotNet.Tensors/issues/1356)) ([c083f50](https://github.com/ooples/AiDotNet.Tensors/commit/c083f5059c14bf0834cef75016e8871aad2d04a5))
+* **cuda:** multi-tensor sum of squares sums each float4 in float ([#1367](https://github.com/ooples/AiDotNet.Tensors/issues/1367)) ([4fdf82a](https://github.com/ooples/AiDotNet.Tensors/commit/4fdf82a261382987e14851e7218b8838787368df))
+* **cuda:** Winograd conv candidates: F(2x2,3x3) forward + input gradient, F(3x3,2x2) weight gradient ([#1350](https://github.com/ooples/AiDotNet.Tensors/issues/1350)) ([835da67](https://github.com/ooples/AiDotNet.Tensors/commit/835da67faaa91c397344243d1816cc5ddec6a774))
+* **gpu:** Winograd conv routes on HIP, OpenCL, Vulkan, WebGPU and Metal; CUDA 13 startup, OpenCL BatchedGemm and tuning-attribution fixes ([#1379](https://github.com/ooples/AiDotNet.Tensors/issues/1379)) ([c3a6d70](https://github.com/ooples/AiDotNet.Tensors/commit/c3a6d70e086be0645d3ba31440fff1da09575795))
+* **opencl:** choose clblast's direct or indirect gemm by problem volume ([#1383](https://github.com/ooples/AiDotNet.Tensors/issues/1383)) ([fe74992](https://github.com/ooples/AiDotNet.Tensors/commit/fe74992275e07b1255ad503352331dcef5d3fcf6)), closes [#377](https://github.com/ooples/AiDotNet.Tensors/issues/377)
+* **ptx:** direct-PTX FP32 CSR segmented max and min (experimental) ([#1393](https://github.com/ooples/AiDotNet.Tensors/issues/1393)) ([78c093d](https://github.com/ooples/AiDotNet.Tensors/commit/78c093d5d7c010c3d4df3975c741da8aeac381a6)), closes [#852](https://github.com/ooples/AiDotNet.Tensors/issues/852)
+
 ## [0.139.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.138.1...v0.139.0) (2026-10-16)
 
 
