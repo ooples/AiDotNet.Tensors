@@ -197,7 +197,7 @@ public partial class CpuEngine
         int br = Math.Min(AttentionCoreQueryBlock, s.SeqQ), bc = Math.Min(AttentionCoreKeyBlock, s.SeqK);
 
         var ws = AttentionScratch.ForThread();
-        float[] qs = ws.Get(0, br * hd), kt = ws.Get(1, hd * bc), sc = ws.Get(2, br * bc);
+        float[] kt = ws.Get(1, hd * bc), sc = ws.Get(2, br * bc);
         float[] acc = ws.Get(3, br * vd), rowMax = ws.Get(4, br), rowSum = ws.Get(5, br);
         {
             for (int i0 = 0; i0 < s.SeqQ; i0 += br)
@@ -205,7 +205,6 @@ public partial class CpuEngine
                 int rows = Math.Min(br, s.SeqQ - i0);
                 for (int r = 0; r < rows; r++)
                 {
-                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.ScaleF);
                     rowMax[r] = float.NegativeInfinity;
                     rowSum[r] = 0f;
                 }
@@ -214,24 +213,33 @@ public partial class CpuEngine
                 for (int j0 = 0; j0 < keyEnd; j0 += bc)
                 {
                     int cols = Math.Min(bc, keyEnd - j0);
-                    TransposeKeyBlock(k, kBase + j0 * qw, qw, kt, hd, cols, bc);
-                    // S = (scale * Q_block) . K_block^T for the whole [rows, cols] tile.
-                    TileGemm(qs, 0, hd, kt, 0, bc, sc, 0, bc, rows, cols, hd, accumulate: false);
+                    // The softmax scale rides on the key tile's transpose (a copy either way), so the query rows are
+                    // read in place: a scaled copy of them was ~20% of the serial forward at head dim 16 (4800H).
+                    TransposeKeyBlockScaled(k, kBase + j0 * qw, qw, kt, hd, cols, bc, s.ScaleF);
+                    // S = Q_block . (scale * K_block)^T for the whole [rows, cols] tile.
+                    TileGemm(q, qBase + i0 * qw, qw, kt, 0, bc, sc, 0, bc, rows, cols, hd, accumulate: false);
                     for (int r = 0; r < rows; r++)
                     {
                         int valid = Math.Min(cols, s.KeyLimit(i0 + r) - j0);
                         int srow = r * bc;
                         if (valid <= 0) { Array.Clear(sc, srow, cols); continue; }   // contributes nothing below
                         float blockMax = RowMax(sc, srow, valid);
+                        bool first = rowMax[r] == float.NegativeInfinity;
                         float newMax = Math.Max(rowMax[r], blockMax);
-                        float rescale = rowMax[r] == float.NegativeInfinity ? 0f : (float)Math.Exp(rowMax[r] - newMax);
-                        ExpShifted(sc, srow, valid, newMax);
-                        float blockSum = 0f;
-                        for (int c = 0; c < valid; c++) blockSum += sc[srow + c];
-                        rowSum[r] = rowSum[r] * rescale + blockSum;
+                        float blockSum = ExpShiftedSum(sc, srow, valid, newMax);
+                        if (first)
+                        {
+                            // Nothing accumulated yet: the running sum and acc are zero, so no rescale.
+                            rowSum[r] = blockSum;
+                        }
+                        else
+                        {
+                            float rescale = (float)Math.Exp(rowMax[r] - newMax);
+                            rowSum[r] = rowSum[r] * rescale + blockSum;
+                            if (rescale != 1f) Scale(acc, r * vd, vd, rescale);
+                        }
                         rowMax[r] = newMax;
                         if (valid < cols) Array.Clear(sc, srow + valid, cols - valid);
-                        if (rescale != 1f) Scale(acc, r * vd, vd, rescale);
                     }
                     // acc += P . V_block
                     TileGemm(sc, 0, bc, v, vBase + j0 * vw, vw, acc, 0, vd, rows, vd, cols, accumulate: true);
@@ -370,7 +378,7 @@ public partial class CpuEngine
         int br = Math.Min(AttentionCoreQueryBlock, s.SeqQ), bc = Math.Min(AttentionCoreKeyBlock, s.SeqK);
 
         var ws = AttentionScratch.ForThread();
-        float[] qs = ws.Get(0, br * hd), kt = ws.Get(1, hd * bc), vt = ws.Get(2, vd * bc);
+        float[] kt = ws.Get(1, hd * bc), vt = ws.Get(2, vd * bc);
         float[] p = ws.Get(3, br * bc), ds = ws.Get(4, br * bc), dq = ws.Get(5, br * hd), delta = ws.Get(6, br);
         float[] dk = ws.Get(7, s.SeqK * hd), dv = ws.Get(8, s.SeqK * vd);
         {
@@ -380,20 +388,18 @@ public partial class CpuEngine
             {
                 int rows = Math.Min(br, s.SeqQ - i0);
                 for (int r = 0; r < rows; r++)
-                {
-                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.ScaleF);
                     delta[r] = Dot(dO, dOBase + (i0 + r) * vw, o, oBase + (i0 + r) * vw, vd);
-                }
                 Array.Clear(dq, 0, rows * hd);
                 int keyEnd = s.KeyLimit(i0 + rows - 1);
                 for (int j0 = 0; j0 < keyEnd; j0 += bc)
                 {
                     int cols = Math.Min(bc, keyEnd - j0);
-                    TransposeKeyBlock(k, kBase + j0 * qw, qw, kt, hd, cols, bc);
+                    // The same scaled key tile as the forward, so P is rebuilt from exactly the forward's scores.
+                    TransposeKeyBlockScaled(k, kBase + j0 * qw, qw, kt, hd, cols, bc, s.ScaleF);
                     TransposeKeyBlock(v, vBase + j0 * vw, vw, vt, vd, cols, bc);
-                    // P = exp(scale * Q.K^T - lse) and dP = dO.V^T for the whole tile, then dS = P * (dP - delta).
+                    // P = exp(Q.(scale * K)^T - lse) and dP = dO.V^T for the whole tile, then dS = P * (dP - delta).
                     // Masked entries are zeroed rather than skipped: the dV and dK products read the tile by column.
-                    TileGemm(qs, 0, hd, kt, 0, bc, p, 0, bc, rows, cols, hd, accumulate: false);
+                    TileGemm(q, qBase + i0 * qw, qw, kt, 0, bc, p, 0, bc, rows, cols, hd, accumulate: false);
                     TileGemm(dO, dOBase + i0 * vw, vw, vt, 0, bc, ds, 0, bc, rows, cols, vd, accumulate: false);
                     for (int r = 0; r < rows; r++)
                     {
@@ -414,10 +420,10 @@ public partial class CpuEngine
                             Array.Clear(ds, prow + valid, cols - valid);
                         }
                     }
-                    // dV[j0..] += P^T . dO_block;  dK[j0..] += dS^T . (scale * Q_block);  dQ_block += dS . K_block
-                    // P^T and dS^T are read in place (row stride 1, column stride bc): no transposed copies.
+                    // dV[j0..] += P^T . dO_block;  dK[j0..] += dS^T . Q_block (scaled when stored);  dQ_block += dS . K_block
+                    // P^T and dS^T are read in place (row stride 1, column stride bc), Q in place: no copies.
                     TileGemm(p, 0, 1, dO, dOBase + i0 * vw, vw, dv, j0 * vd, vd, cols, vd, rows, accumulate: true, aStep: bc);
-                    TileGemm(ds, 0, 1, qs, 0, hd, dk, j0 * hd, hd, cols, hd, rows, accumulate: true, aStep: bc);
+                    TileGemm(ds, 0, 1, q, qBase + i0 * qw, qw, dk, j0 * hd, hd, cols, hd, rows, accumulate: true, aStep: bc);
                     TileGemm(ds, 0, bc, k, kBase + j0 * qw, qw, dq, 0, hd, rows, hd, cols, accumulate: true);
                 }
                 if (dQ.Array is not null)
@@ -427,7 +433,7 @@ public partial class CpuEngine
             }
             if (dK.Array is not null)
                 for (int j = 0; j < s.SeqK; j++)
-                    StoreRow(dk, j * hd, dK.Array, dK.Offset + b * s.SeqK * qw + j * qw + h * hd, hd, 1f, dK.Overwrite);
+                    StoreRow(dk, j * hd, dK.Array, dK.Offset + b * s.SeqK * qw + j * qw + h * hd, hd, s.ScaleF, dK.Overwrite);
             if (dV.Array is not null)
                 for (int j = 0; j < s.SeqK; j++)
                     StoreRow(dv, j * vd, dV.Array, dV.Offset + b * s.SeqK * vw + j * vw + h * vd, vd, 1f, dV.Overwrite);
@@ -653,6 +659,53 @@ public partial class CpuEngine
     /// <summary>block[d * stride + c] = src[srcOff + c * rowStride + d] for d &lt; depth, c &lt; cols.</summary>
     private static void TransposeKeyBlock(float[] src, int srcOff, int rowStride, float[] block, int depth, int cols, int stride) =>
         Simd.SimdGemm.Transpose(src, srcOff, rowStride, block, 0, stride, cols, depth);
+
+    /// <summary><see cref="TransposeKeyBlock"/> with every element multiplied by <paramref name="scale"/>.</summary>
+    private static void TransposeKeyBlockScaled(
+        float[] src, int srcOff, int rowStride, float[] block, int depth, int cols, int stride, float scale) =>
+        Simd.SimdGemm.TransposeScaled(src, srcOff, rowStride, block, 0, stride, cols, depth, scale);
+
+    /// <summary>
+    /// x[off..+n] = exp(x - shift), returning the sum of the results. The exponentials are those of
+    /// <see cref="ExpShifted"/> (the same vector kernel on full 8-lane groups, MathF.Exp on the tail); the sum runs in
+    /// eight lanes, then the lanes in order, then the tail -- one pass instead of the exp pass plus a scalar sum whose
+    /// dependent adds were most of the forward's per-row cost at seqK 32.
+    /// </summary>
+    private static unsafe float ExpShiftedSum(float[] x, int off, int n, float shift)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported && n >= 8)
+        {
+            int n8 = n & ~7;
+            var vs = System.Runtime.Intrinsics.Vector256.Create(shift);
+            var acc = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            fixed (float* px = &x[off])
+            {
+                for (int i = 0; i < n8; i += 8)
+                {
+                    var e = Simd.SimdKernels.FastExp256(Avx.Subtract(Avx.LoadVector256(px + i), vs));
+                    Avx.Store(px + i, e);
+                    acc = Avx.Add(acc, e);
+                }
+                float* lanes = stackalloc float[8];
+                Avx.Store(lanes, acc);
+                float sum = 0f;
+                for (int l = 0; l < 8; l++) sum += lanes[l];
+                for (int i = n8; i < n; i++)
+                {
+                    float e = MathF.Exp(px[i] - shift);
+                    px[i] = e;
+                    sum += e;
+                }
+                return sum;
+            }
+        }
+#endif
+        ExpShifted(x, off, n, shift);
+        float total = 0f;
+        for (int c = 0; c < n; c++) total += x[off + c];
+        return total;
+    }
 
     /// <summary>max of x[off..+n] (NegativeInfinity when n is 0); max is order-independent, so for finite scores this
     /// equals the scalar scan exactly. A NaN score makes its row's output NaN whichever NaN rule the max follows.</summary>

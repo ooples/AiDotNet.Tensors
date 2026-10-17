@@ -42,6 +42,19 @@ public sealed class SimdGemmTransposeTests
         for (int i = 0; i < dst.Length; i++)
             Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(expected[i]), 0) == BitConverter.ToInt32(BitConverter.GetBytes(dst[i]), 0),
                 $"rows={rows} cols={cols} [{i}]: {dst[i]:R} != {expected[i]:R}");
+
+        // The scaled variant: the same placement, each element times the scale (one float multiply), the rest untouched.
+        const float Scale = 0.25f * 1.0371f;
+        var scaledDst = new float[dst.Length];
+        for (int i = 0; i < scaledDst.Length; i++) scaledDst[i] = Sentinel;
+        var scaledExpected = (float[])scaledDst.Clone();
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                scaledExpected[dOff + c * dstStride + r] = src[sOff + r * srcStride + c] * Scale;
+        SimdGemm.TransposeScaled(src, sOff, srcStride, scaledDst, dOff, dstStride, rows, cols, Scale);
+        for (int i = 0; i < scaledDst.Length; i++)
+            Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(scaledExpected[i]), 0) == BitConverter.ToInt32(BitConverter.GetBytes(scaledDst[i]), 0),
+                $"scaled rows={rows} cols={cols} [{i}]: {scaledDst[i]:R} != {scaledExpected[i]:R}");
     }
 
     [Fact]
