@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -9,10 +11,134 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <inheritdoc/>
+    /// <remarks>Dense host float logits take ONE recorded node: a forward that computes the loss in a single pass over
+    /// the logits and a backward that writes their gradient in one more. The composed primitives were about ten recorded
+    /// ops, each with its own dispatch, output and gradient buffer; on a batch-64, 10-class MLP training step they cost
+    /// ~190 us against ~5 us for this node. Everything else (other element types, strided or device tensors) keeps the
+    /// composed primitives.</remarks>
     public virtual Tensor<T> TensorSoftmaxCrossEntropy<T>(Tensor<T> logits, Tensor<T> target)
     {
         ValidateSoftmaxCrossEntropy(logits, target);
-        return SoftmaxCrossEntropyDecomposed(logits, target);
+        if (typeof(T) != typeof(float) || this is DirectGpuTensorEngine
+            || !IsDenseHost(logits) || !IsDenseHost(target) || logits.Length == 0)
+            return SoftmaxCrossEntropyDecomposed(logits, target);
+
+        int cols = logits._shape[logits.Rank - 1];
+        int rows = logits.Length / cols;
+        var node = new SoftmaxCrossEntropyState(rows);
+        var savedState = new object[] { node };
+        if (GraphMode.IsActive)
+        {
+            if (GraphMode.Current is not { } scope || !scope.BindEngine(this))
+                return SoftmaxCrossEntropyDecomposed(logits, target);
+            var capturedLogits = logits;
+            var capturedTarget = target;
+            return scope.RecordVariadic(LazyNodeType.Custom, "SoftmaxCrossEntropy", new[] { logits, target },
+                Array.Empty<int>(),
+                (eng, output) => WriteScalar(output, SoftmaxCrossEntropyForward(capturedLogits, capturedTarget, node)),
+                SoftmaxCrossEntropyBackward<T>, savedState);
+        }
+
+        var loss = new Tensor<T>(Array.Empty<int>());
+        WriteScalar(loss, SoftmaxCrossEntropyForward(logits, target, node));
+        DifferentiableOps.RecordIfActive("SoftmaxCrossEntropy", loss, new[] { logits, target },
+            SoftmaxCrossEntropyBackward<T>, savedState);
+        return loss;
+    }
+
+    // Per-row log-sum-exp and target mass from the forward, read by the backward; reused by every replay of a node.
+    private sealed class SoftmaxCrossEntropyState
+    {
+        internal SoftmaxCrossEntropyState(int rows)
+        {
+            LogSumExp = new float[rows];
+            TargetSum = new float[rows];
+        }
+
+        internal float[] LogSumExp { get; }
+        internal float[] TargetSum { get; }
+        internal float Count { get; set; } = 1f;
+    }
+
+    private static bool IsDenseHost<T>(Tensor<T> tensor) =>
+        tensor.IsContiguous && tensor._storageOffset == 0 && !tensor.HasPendingGpuData && tensor.TryGetGpuBuffer() is null;
+
+    private static float[] HostFloats<T>(Tensor<T> tensor, string role) =>
+        tensor.GetCpuBackingForStridedRead(out _) as float[]
+        ?? throw new InvalidOperationException($"Softmax cross-entropy: the {role} has no host float buffer.");
+
+    private static void WriteScalar<T>(Tensor<T> output, float value)
+    {
+        var dst = output.GetCpuBackingForContiguousWrite(out int offset) as float[]
+            ?? throw new InvalidOperationException("Softmax cross-entropy: the loss has no host float buffer.");
+        dst[offset] = value;
+        output.IncrementVersion();
+    }
+
+    /// <summary>
+    /// loss = -(sum over rows of sum_c t*log_softmax(z)) / max(supervised rows, 1), where a row is supervised when its
+    /// target has mass -- the composed objective exactly, accumulated in double.
+    /// </summary>
+    private static float SoftmaxCrossEntropyForward<T>(Tensor<T> logits, Tensor<T> target, SoftmaxCrossEntropyState node)
+    {
+        var z = HostFloats(logits, "logits");
+        var t = HostFloats(target, "target");
+        int rows = node.LogSumExp.Length;
+        int cols = logits.Length / rows;
+        double total = 0.0, supervised = 0.0;
+        for (int r = 0; r < rows; r++)
+        {
+            int o = r * cols;
+            float max = z[o];
+            for (int c = 1; c < cols; c++) max = Math.Max(max, z[o + c]);
+            double sumExp = 0.0;
+            for (int c = 0; c < cols; c++) sumExp += Math.Exp(z[o + c] - max);
+            double lse = max + Math.Log(sumExp);
+            double dot = 0.0, targetSum = 0.0, mass = 0.0;
+            for (int c = 0; c < cols; c++)
+            {
+                float tc = t[o + c];
+                dot += (double)tc * z[o + c];
+                targetSum += tc;
+                mass += Math.Abs(tc);
+            }
+            total += dot - targetSum * lse;
+            // Sign of the mass, as the composed count: NaN propagates, zero mass counts zero.
+            supervised += double.IsNaN(mass) ? double.NaN : mass > 0.0 ? 1.0 : 0.0;
+            node.LogSumExp[r] = (float)lse;
+            node.TargetSum[r] = (float)targetSum;
+        }
+        double count = double.IsNaN(supervised) ? double.NaN : Math.Max(supervised, 1.0);
+        node.Count = (float)count;
+        return (float)(-total / count);
+    }
+
+    /// <summary>d loss / d z = (g / count) * (target_sum_row * softmax(z) - t). The target is supervision: no gradient.</summary>
+    private static void SoftmaxCrossEntropyBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var node = savedState[0] as SoftmaxCrossEntropyState
+            ?? throw new InvalidOperationException("Softmax cross-entropy backward: the forward's row statistics are missing.");
+        var logits = inputs[0];
+        var z = HostFloats(logits, "logits");
+        var t = HostFloats(inputs[1], "target");
+        float g = HostFloats(gradOutput, "loss gradient")[0];
+        float scale = g / node.Count;
+        int rows = node.LogSumExp.Length;
+        int cols = logits.Length / rows;
+        var grad = TensorAllocator.RentUninitialized<T>(logits._shape);
+        var dz = grad.GetCpuBackingForContiguousWrite(out int dzOffset) as float[]
+            ?? throw new InvalidOperationException("Softmax cross-entropy backward: the gradient has no host float buffer.");
+        for (int r = 0; r < rows; r++)
+        {
+            int o = r * cols;
+            float lse = node.LogSumExp[r];
+            float rowScale = scale * node.TargetSum[r];
+            for (int c = 0; c < cols; c++)
+                dz[dzOffset + o + c] = rowScale * (float)Math.Exp(z[o + c] - lse) - scale * t[o + c];
+        }
+        grad.IncrementVersion();
+        DifferentiableOps.AccumulateGrad(grads, logits, grad, engine);
     }
 
     private protected static void ValidateSoftmaxCrossEntropy<T>(Tensor<T> logits, Tensor<T> target)
