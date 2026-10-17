@@ -949,6 +949,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL tuned row kernels compilation failed: {ex.Message}");
                 }
 
+                // Winograd F(2x2,3x3) / F(3x3,2x2) tile transforms for the convolution slots (#1370). Optional like the
+                // module above, but a failure is logged: it silently drops three tuned candidates for every 3x3 conv.
+                try
+                {
+                    var winogradProgram = CompileOrLoadCached(WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.OpenCl),
+                        OpenClBuildOptions.SafeMathFlags, "Winograd kernels");
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in WinogradF23KernelTemplate.GetKernelNames())
+                        built.Add((name, new DirectOpenClKernel(_context, winogradProgram, name)));
+                    _programs.Add(winogradProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL Winograd kernels unavailable: {ex.Message}");
+                }
+
                 // Compile Parity-210 kernels (hot-path subset of #210 op surface).
                 // Optional — on drivers that reject any op the whole module we
                 // swallow the exception and fall back to the CpuEngine path.
@@ -2974,37 +2991,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (batchCount <= 0)
                 throw new ArgumentException("Batch count must be positive", nameof(batchCount));
 
+            if (M <= 0 || N <= 0) return;
+
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
             var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
 
-            // Allocate atomic counter buffer and initialize to 0
-            var counterData = new int[] { 0 };
-            using var counterBuffer = new DirectOpenClIntBuffer(_context, counterData);
-
-            var kernel = _kernelCache["gemm_batched_persistent"];
-
+            // One 16x16 output tile per work group, the batch in z (see gemm_batched_tiled).
+            var kernel = _kernelCache["gemm_batched_tiled"];
             kernel.SetArg(0, bufferA.Handle);
             kernel.SetArg(1, bufferB.Handle);
             kernel.SetArg(2, bufferC.Handle);
             kernel.SetArg(3, M);
             kernel.SetArg(4, N);
             kernel.SetArg(5, K);
-            kernel.SetArg(6, batchCount);
-            kernel.SetArg(7, counterBuffer.Handle);
-            kernel.SetArg(8, alpha);
-            kernel.SetArg(9, beta);
-
-            // Calculate optimal work group size based on GPU capabilities
-            var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
-
-            // Launch enough workgroups to saturate the GPU
-            // Each workgroup processes batches via work-stealing until all are done
-            int numWorkgroups = Math.Max(batchCount, ComputeUnits * 2);
-            int globalSizeX = numWorkgroups * localSizeX;
-            int globalSizeY = localSizeY;
-
-            kernel.Execute2D(globalSizeX, globalSizeY, localSizeX, localSizeY);
+            kernel.SetArg(6, alpha);
+            kernel.SetArg(7, beta);
+            kernel.Execute3D(RoundUpToMultiple(N, 16), RoundUpToMultiple(M, 16), batchCount, 16, 16, 1);
             _context?.Finish();  // Sync for batched - ensures all batches complete
         }
 
@@ -6986,30 +6989,11 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW,
             int dilationH, int dilationW)
         {
-            var k = _kernelCache["conv2d_backward_input"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradInput).Buffer.Handle);
-            k.SetArg(arg++, batch);
-            k.SetArg(arg++, inChannels);
-            k.SetArg(arg++, inHeight);
-            k.SetArg(arg++, inWidth);
-            k.SetArg(arg++, outChannels);
-            k.SetArg(arg++, outHeight);
-            k.SetArg(arg++, outWidth);
-            k.SetArg(arg++, kernelH);
-            k.SetArg(arg++, kernelW);
-            k.SetArg(arg++, strideH);
-            k.SetArg(arg++, strideW);
-            k.SetArg(arg++, padH);
-            k.SetArg(arg++, padW);
-            k.SetArg(arg++, dilationH);
-            k.SetArg(arg++, dilationW);
-
-            // Work distribution: (inWidth, inHeight, batch * inChannels)
-            int localX = 8, localY = 8, localZ = 1;
-            k.Execute3D(inWidth, inHeight, batch * inChannels, localX, localY, localZ);
+            // Registry dispatch (#1370): the direct kernel or Winograd F(2x2,3x3), chosen per shape class.
+            var args = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardDataSlot.TryExecute(args.Shape(), args)) return;
+            LaunchDxDirect(args);
         }
 
         public void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -7019,34 +7003,51 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW,
             int dilationH, int dilationW)
         {
-            var k = _kernelCache["conv2d_backward_weights"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradKernel).Buffer.Handle);
-            k.SetArg(arg++, batch);
-            k.SetArg(arg++, inChannels);
-            k.SetArg(arg++, inHeight);
-            k.SetArg(arg++, inWidth);
-            k.SetArg(arg++, outChannels);
-            k.SetArg(arg++, outHeight);
-            k.SetArg(arg++, outWidth);
-            k.SetArg(arg++, kernelH);
-            k.SetArg(arg++, kernelW);
-            k.SetArg(arg++, strideH);
-            k.SetArg(arg++, strideW);
-            k.SetArg(arg++, padH);
-            k.SetArg(arg++, padW);
-            k.SetArg(arg++, dilationH);
-            k.SetArg(arg++, dilationW);
-
-            // Work distribution: (kernelW, kernelH, outChannels * inChannels)
-            int localX = Math.Min(8, kernelW);
-            int localY = Math.Min(8, kernelH);
-            int localZ = 1;
-            k.Execute3D(kernelW, kernelH, outChannels * inChannels, localX, localY, localZ);
+            // Registry dispatch (#1370): the direct kernel or Winograd F(3x3,2x2), chosen per shape class.
+            var args = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardFilterSlot.TryExecute(args.Shape(), args)) return;
+            LaunchDwDirect(args);
         }
 
+        private static void BackwardConvArgs(DirectOpenClKernel k, in TunedConv2DBackwardArgs a)
+        {
+            uint arg = 0;
+            k.SetArg(arg++, BufferHandle(a.First));
+            k.SetArg(arg++, BufferHandle(a.Second));
+            k.SetArg(arg++, BufferHandle(a.Output));
+            k.SetArg(arg++, a.Batch);
+            k.SetArg(arg++, a.InChannels);
+            k.SetArg(arg++, a.InHeight);
+            k.SetArg(arg++, a.InWidth);
+            k.SetArg(arg++, a.OutChannels);
+            k.SetArg(arg++, a.OutHeight);
+            k.SetArg(arg++, a.OutWidth);
+            k.SetArg(arg++, a.KernelH);
+            k.SetArg(arg++, a.KernelW);
+            k.SetArg(arg++, a.StrideH);
+            k.SetArg(arg++, a.StrideW);
+            k.SetArg(arg++, a.PadH);
+            k.SetArg(arg++, a.PadW);
+            k.SetArg(arg++, a.DilationH);
+            k.SetArg(arg++, a.DilationW);
+        }
+
+        // The input gradient's direct kernel: one work item per input element, (inWidth, inHeight, batch * inChannels).
+        private void LaunchDxDirect(in TunedConv2DBackwardArgs a)
+        {
+            var k = _kernelCache["conv2d_backward_input"];
+            BackwardConvArgs(k, a);
+            k.Execute3D(a.InWidth, a.InHeight, a.Batch * a.InChannels, 8, 8, 1);
+        }
+
+        // The weight gradient's direct kernel: one work item per weight, (kernelW, kernelH, outChannels * inChannels).
+        private void LaunchDwDirect(in TunedConv2DBackwardArgs a)
+        {
+            var k = _kernelCache["conv2d_backward_weights"];
+            BackwardConvArgs(k, a);
+            k.Execute3D(a.KernelW, a.KernelH, a.OutChannels * a.InChannels, Math.Min(8, a.KernelW), Math.Min(8, a.KernelH), 1);
+        }
         public void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
             int batch, int inChannels, int inLength,
             int outChannels, int outLength, int kernelLength,

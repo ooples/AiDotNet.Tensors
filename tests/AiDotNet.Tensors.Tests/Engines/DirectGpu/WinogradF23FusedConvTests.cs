@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
 using Xunit.Abstractions;
@@ -93,7 +94,7 @@ public sealed class WinogradF23FusedConvTests
             using var dX2 = backend.AllocateBuffer(poison);
             foreach (var target in new[] { dX1, dX2 })
             {
-                var a = new CudaConv2DBackwardArgs(dDy, dW, target, false, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
+                var a = new TunedConv2DBackwardArgs(dDy, dW, target, false, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
                 Assert.True(backend.TryConv2DBackwardDataWinogradF23Fused(a), "fused Winograd refused an admitted shape");
             }
             backend.Synchronize();
@@ -194,7 +195,7 @@ public sealed class WinogradF23FusedConvTests
         using var wt = backend.AllocateBuffer(Rand(c * c * 9, rng));
         using var o = backend.AllocateBuffer(batch * c * s * s);
         var fwd = new CudaConv2DArgs(a0, wt, o, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
-        var dx = new CudaConv2DBackwardArgs(a0, wt, o, false, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
+        var dx = new TunedConv2DBackwardArgs(a0, wt, o, false, batch, c, s, s, c, s, s, 3, 3, 1, 1, 1, 1, 1, 1);
 
         double budget = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds;
         AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.BudgetMilliseconds =
@@ -256,7 +257,7 @@ public sealed class WinogradF23FusedConvTests
             using var a0 = backend.AllocateBuffer(Rand(batch * c * hw * hw, rng));
             using var wt = backend.AllocateBuffer(Rand(c * c * 9, rng));
             using var o = backend.AllocateBuffer(batch * c * hw * hw);
-            var b = new CudaConv2DBackwardArgs(a0, wt, o, false, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
+            var b = new TunedConv2DBackwardArgs(a0, wt, o, false, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
             var f = new CudaConv2DArgs(a0, wt, o, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
             Func<bool>[] dxRuns =
             {

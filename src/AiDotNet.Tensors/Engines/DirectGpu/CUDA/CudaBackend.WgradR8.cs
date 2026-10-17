@@ -47,7 +47,7 @@ public sealed partial class CudaBackend
     /// The weight gradient through conv2d_wgrad_r8_{tileM}x{tileN} (8x8 micro-tile per thread) with a split-K count
     /// (0: enough splits for about two blocks per SM). Overwrites dW. False: nothing launched.
     /// </summary>
-    internal unsafe bool TryConv2DBackwardKernelR8(in CudaConv2DBackwardArgs a, int tileM, int tileN, int splits)
+    internal unsafe bool TryConv2DBackwardKernelR8(in TunedConv2DBackwardArgs a, int tileM, int tileN, int splits)
     {
         if (!a.WeightGradient || a.Batch <= 0 || a.OutChannels <= 0 || !EnsureWgradR8Module()) return false;
         long p = (long)a.InChannels * a.KernelH * a.KernelW;

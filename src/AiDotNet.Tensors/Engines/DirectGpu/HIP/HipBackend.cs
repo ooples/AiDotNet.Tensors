@@ -825,6 +825,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(Kernels.HipLossForwardKernels.GetSource(), "loss_forward", ref _lossModule, Kernels.HipLossForwardKernels.GetKernelNames());
             CompileKernelModule(Kernels.HipSoftmaxVariantKernels.GetSource(), "softmax_variant", ref _softmaxVarModule, Kernels.HipSoftmaxVariantKernels.GetKernelNames());
             CompileTunedRowKernels();
+            CompileWinogradKernels();
 
             // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
             CompileKernelModule(Kernels.HipComplexKernels.GetSource(), "complex", ref _complexModule, Kernels.HipComplexKernels.GetKernelNames());
@@ -4403,91 +4404,35 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Synchronize();
     }
 
-    public unsafe void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
+    public void Conv2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        if (!_kernelCache.TryGetValue("conv2d_backward_input", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv2d_backward_input");
-
-            {
-            var pGradOut = gradOutput.Handle;
-            var pKernel = kernel.Handle;
-            var pGradIn = gradInput.Handle;
-            void** args = stackalloc void*[18];
-            args[0] = &pGradOut;
-            args[1] = &pKernel;
-            args[2] = &pGradIn;
-            args[3] = &batch;
-            args[4] = &inChannels;
-            args[5] = &inHeight;
-            args[6] = &inWidth;
-            args[7] = &outChannels;
-            args[8] = &outHeight;
-            args[9] = &outWidth;
-            args[10] = &kernelH;
-            args[11] = &kernelW;
-            args[12] = &strideH;
-            args[13] = &strideW;
-            args[14] = &padH;
-            args[15] = &padW;
-            args[16] = &dilationH;
-            args[17] = &dilationW;
-
-
-            uint gridX = (uint)((inWidth + 15) / 16);
-            uint gridY = (uint)((inHeight + 15) / 16);
-            uint gridZ = (uint)(batch * inChannels);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
-            Synchronize();
-            }
+        // Registry dispatch (#1368): the direct kernel or Winograd F(2x2,3x3), chosen per shape class.
+        var args = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (!(batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardDataSlot.TryExecute(args.Shape(), args)))
+            LaunchDxDirect(args);
+        Synchronize();
     }
 
-    public unsafe void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
+    public void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
         int batch, int inChannels, int inHeight, int inWidth,
         int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        if (!_kernelCache.TryGetValue("conv2d_backward_kernel", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: conv2d_backward_kernel");
-
-            {
-            var pInput = input.Handle;
-            var pGradOut = gradOutput.Handle;
-            var pGradKernel = gradKernel.Handle;
-            void** args = stackalloc void*[18];
-            args[0] = &pInput;
-            args[1] = &pGradOut;
-            args[2] = &pGradKernel;
-            args[3] = &batch;
-            args[4] = &inChannels;
-            args[5] = &inHeight;
-            args[6] = &inWidth;
-            args[7] = &outChannels;
-            args[8] = &outHeight;
-            args[9] = &outWidth;
-            args[10] = &kernelH;
-            args[11] = &kernelW;
-            args[12] = &strideH;
-            args[13] = &strideW;
-            args[14] = &padH;
-            args[15] = &padW;
-            args[16] = &dilationH;
-            args[17] = &dilationW;
-
-
-            // One thread per gradKernel element (see the kernel): a flat 1D grid has no 65,535 limit.
-            long total = (long)outChannels * inChannels * kernelH * kernelW;
-            LaunchKernel(krnl, (uint)((total + 255) / 256), 256, args);
-            Synchronize();
-            }
+        // Registry dispatch (#1368): the direct kernel or Winograd F(3x3,2x2), chosen per shape class.
+        var args = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (!(batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardFilterSlot.TryExecute(args.Shape(), args)))
+            LaunchDwDirect(args);
+        Synchronize();
     }
-
     public unsafe void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inLength,
         int outChannels, int outLength, int kernelLength,
@@ -11609,12 +11554,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _winogradModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _winogradModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = IntPtr.Zero;
 
         // Settle first (ruling the load out if it never ran, or waiting out one in flight), so no handle appears after this.
         SettleHipBlas(load: false);

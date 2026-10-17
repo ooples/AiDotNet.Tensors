@@ -142,68 +142,16 @@ public static class PerfHarness
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
 
-        for (int i = 0; i < Warmup; i++)
-            BlasManagedLib.Gemm<float>(a, aCols, s.TransA, b, bCols, s.TransB, c, s.N, s.M, s.N, s.K);
-
-        // Drain GC before the measurement so a Gen2 collect mid-window
-        // doesn't contaminate the alloc-bytes delta or the timing tail.
-        SettleHeap();
-        long bmAllocStart = AllocatedBytes();
-        var bmTimes = new double[iters];
-        var sw = new Stopwatch();
-        for (int i = 0; i < iters; i++)
-        {
-            sw.Restart();
-            BlasManagedLib.Gemm<float>(a, aCols, s.TransA, b, bCols, s.TransB, c, s.N, s.M, s.N, s.K);
-            sw.Stop();
-            bmTimes[i] = sw.Elapsed.TotalMilliseconds;
-        }
-        double bmAllocPerCall = (AllocatedBytes() - bmAllocStart) / (double)iters;
-        Array.Sort(bmTimes);
-        double bmMedian = bmTimes[iters / 2];
-        double bmP95 = bmTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
-        double bmP99 = bmTimes[Math.Min(iters - 1, (int)(iters * 0.99))];
-        double bmGflops = Gflops(s.M, s.N, s.K, bmMedian);
-
-        double nativeMedian = -1, nativeP95 = -1, nativeP99 = -1;
-        double nativeGflops = 0, nativeAlloc = 0;
+        void Managed() => BlasManagedLib.Gemm<float>(a, aCols, s.TransA, b, bCols, s.TransB, c, s.N, s.M, s.N, s.K);
         bool nativeOk = BlasProvider.IsAvailable;
+        Action? native = null;
         if (nativeOk)
         {
-            try
-            {
-                for (int i = 0; i < Warmup; i++)
-                    BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
-
-                SettleHeap();
-                long nAllocStart = AllocatedBytes();
-                var nTimes = new double[iters];
-                for (int i = 0; i < iters; i++)
-                {
-                    sw.Restart();
-                    BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
-                    sw.Stop();
-                    nTimes[i] = sw.Elapsed.TotalMilliseconds;
-                }
-                nativeAlloc = (AllocatedBytes() - nAllocStart) / (double)iters;
-                Array.Sort(nTimes);
-                nativeMedian = nTimes[iters / 2];
-                nativeP95 = nTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
-                nativeP99 = nTimes[Math.Min(iters - 1, (int)(iters * 0.99))];
-                nativeGflops = Gflops(s.M, s.N, s.K, nativeMedian);
-            }
-            catch
-            {
-                nativeOk = false;
-            }
+            native = () => BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
+            try { native(); }
+            catch { nativeOk = false; native = null; }
         }
-
-        double ratio = (nativeOk && nativeMedian > 0) ? bmMedian / nativeMedian : 0.0;
-        return new ShapeResult(
-            s.Name, s.M, s.N, s.K, s.TransA, s.TransB, "Single",
-            bmMedian, bmP95, bmP99, bmGflops, bmAllocPerCall,
-            nativeMedian, nativeP95, nativeP99, nativeGflops, nativeAlloc,
-            nativeOk, ratio);
+        return Measure(s, "Single", iters, Managed, native);
     }
 
     private static ShapeResult MeasureDouble(Shape s, int iters)
@@ -216,75 +164,108 @@ public static class PerfHarness
         var a = new double[aRows * aCols];
         var b = new double[bRows * bCols];
         var c = new double[s.M * s.N];
-        for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() * 2 - 1;
-        for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() * 2 - 1;
+        for (int i = 0; i < a.Length; i++) a[i] = (double)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < b.Length; i++) b[i] = (double)(rng.NextDouble() * 2 - 1);
 
-        for (int i = 0; i < Warmup; i++)
-            BlasManagedLib.Gemm<double>(a, aCols, s.TransA, b, bCols, s.TransB, c, s.N, s.M, s.N, s.K);
-
-        SettleHeap();
-        long bmAllocStart = AllocatedBytes();
-        var bmTimes = new double[iters];
-        var sw = new Stopwatch();
-        for (int i = 0; i < iters; i++)
-        {
-            sw.Restart();
-            BlasManagedLib.Gemm<double>(a, aCols, s.TransA, b, bCols, s.TransB, c, s.N, s.M, s.N, s.K);
-            sw.Stop();
-            bmTimes[i] = sw.Elapsed.TotalMilliseconds;
-        }
-        double bmAllocPerCall = (AllocatedBytes() - bmAllocStart) / (double)iters;
-        Array.Sort(bmTimes);
-        double bmMedian = bmTimes[iters / 2];
-        double bmP95 = bmTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
-        double bmP99 = bmTimes[Math.Min(iters - 1, (int)(iters * 0.99))];
-        double bmGflops = Gflops(s.M, s.N, s.K, bmMedian);
-
-        double nativeMedian = -1, nativeP95 = -1, nativeP99 = -1;
-        double nativeGflops = 0, nativeAlloc = 0;
+        void Managed() => BlasManagedLib.Gemm<double>(a, aCols, s.TransA, b, bCols, s.TransB, c, s.N, s.M, s.N, s.K);
         bool nativeOk = BlasProvider.IsAvailable;
+        Action? native = null;
         if (nativeOk)
         {
-            try
-            {
-                for (int i = 0; i < Warmup; i++)
-                    BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
-
-                SettleHeap();
-                long nAllocStart = AllocatedBytes();
-                var nTimes = new double[iters];
-                for (int i = 0; i < iters; i++)
-                {
-                    sw.Restart();
-                    BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
-                    sw.Stop();
-                    nTimes[i] = sw.Elapsed.TotalMilliseconds;
-                }
-                nativeAlloc = (AllocatedBytes() - nAllocStart) / (double)iters;
-                Array.Sort(nTimes);
-                nativeMedian = nTimes[iters / 2];
-                nativeP95 = nTimes[Math.Min(iters - 1, (int)(iters * 0.95))];
-                nativeP99 = nTimes[Math.Min(iters - 1, (int)(iters * 0.99))];
-                nativeGflops = Gflops(s.M, s.N, s.K, nativeMedian);
-            }
-            catch
-            {
-                nativeOk = false;
-            }
+            native = () => BlasProvider.TryGemmEx(s.M, s.N, s.K, a, 0, aCols, s.TransA, b, 0, bCols, s.TransB, c, 0, s.N);
+            try { native(); }
+            catch { nativeOk = false; native = null; }
         }
-
-        double ratio = (nativeOk && nativeMedian > 0) ? bmMedian / nativeMedian : 0.0;
-        return new ShapeResult(
-            s.Name, s.M, s.N, s.K, s.TransA, s.TransB, "Double",
-            bmMedian, bmP95, bmP99, bmGflops, bmAllocPerCall,
-            nativeMedian, nativeP95, nativeP99, nativeGflops, nativeAlloc,
-            nativeOk, ratio);
+        return Measure(s, "Double", iters, Managed, native);
     }
 
     /// <summary>
-    /// Achieved GFLOPS at the given median latency: 2*M*N*K FMAs / seconds / 1e9.
-    /// Returns 0 when latency is zero/negative (e.g., native unavailable).
+    /// Times BlasManaged and (when available) native OpenBLAS on one shape, alternating the two arms round by round.
     /// </summary>
+    /// <remarks>
+    /// The arms used to be timed one after the other: every BlasManaged call, then every native call. On a shared
+    /// machine the load moves between the two windows, so the ratio measured the load as much as the kernels. The same
+    /// shape (MobileNetV2_pw_196x96x96) took 1.84x and then 0.84x native's time in two runs a few minutes apart. Alternating puts
+    /// both arms under the same load, and the ratio is the median of the per-round ratios. A sample batches enough calls
+    /// to last at least <see cref="MinSampleMs"/>, so sub-microsecond shapes are not timer resolution. Allocation is
+    /// counted in separate untimed loops.
+    /// </remarks>
+    internal static ShapeResult Measure(Shape s, string dtype, int iters, Action managed, Action? native)
+    {
+        for (int i = 0; i < Warmup; i++) { managed(); native?.Invoke(); }
+
+        int calls = CallsPerSample(managed);
+        if (native is not null) calls = Math.Max(calls, CallsPerSample(native));
+
+        SettleHeap();
+        var bmTimes = new double[iters];
+        var nTimes = native is null ? null : new double[iters];
+        var ratios = native is null ? null : new double[iters];
+        var sw = new Stopwatch();
+        for (int i = 0; i < iters; i++)
+        {
+            // Alternate which arm goes first, so neither always runs on the warmer cache.
+            bool managedFirst = (i & 1) == 0;
+            if (!managedFirst && native is not null) nTimes![i] = TimeCalls(native, calls, sw);
+            bmTimes[i] = TimeCalls(managed, calls, sw);
+            if (managedFirst && native is not null) nTimes![i] = TimeCalls(native, calls, sw);
+            if (ratios is not null) ratios[i] = nTimes![i] > 0 ? bmTimes[i] / nTimes[i] : 0;
+        }
+
+        double bmAlloc = AllocPerCall(managed, iters);
+        var (bmMedian, bmP95, bmP99) = Percentiles(bmTimes);
+        double nativeMedian = -1, nativeP95 = -1, nativeP99 = -1, nativeGflops = 0, nativeAlloc = 0, ratio = 0;
+        if (native is not null)
+        {
+            (nativeMedian, nativeP95, nativeP99) = Percentiles(nTimes!);
+            nativeGflops = Gflops(s.M, s.N, s.K, nativeMedian);
+            nativeAlloc = AllocPerCall(native, iters);
+            Array.Sort(ratios!);
+            ratio = ratios![iters / 2];
+        }
+        return new ShapeResult(
+            s.Name, s.M, s.N, s.K, s.TransA, s.TransB, dtype,
+            bmMedian, bmP95, bmP99, Gflops(s.M, s.N, s.K, bmMedian), bmAlloc,
+            nativeMedian, nativeP95, nativeP99, nativeGflops, nativeAlloc,
+            native is not null, ratio);
+    }
+
+    /// <summary>Shortest sample a timing round takes, in milliseconds.</summary>
+    private const double MinSampleMs = 0.05;
+
+    private static int CallsPerSample(Action run)
+    {
+        var sw = Stopwatch.StartNew();
+        int calls = 0;
+        do { run(); calls++; } while (sw.Elapsed.TotalMilliseconds < MinSampleMs && calls < 1_000_000);
+        return calls;
+    }
+
+    // Milliseconds per call over one sample of `calls` calls.
+    private static double TimeCalls(Action run, int calls, Stopwatch sw)
+    {
+        sw.Restart();
+        for (int i = 0; i < calls; i++) run();
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds / calls;
+    }
+
+    private static double AllocPerCall(Action run, int calls)
+    {
+        SettleHeap();
+        long start = AllocatedBytes();
+        for (int i = 0; i < calls; i++) run();
+        return (AllocatedBytes() - start) / (double)calls;
+    }
+
+    private static (double Median, double P95, double P99) Percentiles(double[] times)
+    {
+        var sorted = (double[])times.Clone();
+        Array.Sort(sorted);
+        int n = sorted.Length;
+        return (sorted[n / 2], sorted[Math.Min(n - 1, (int)(n * 0.95))], sorted[Math.Min(n - 1, (int)(n * 0.99))]);
+    }
+
     private static double Gflops(int m, int n, int k, double medianMs)
     {
         if (medianMs <= 0) return 0;

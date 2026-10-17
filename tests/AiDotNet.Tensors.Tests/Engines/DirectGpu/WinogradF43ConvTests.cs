@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
 using Xunit.Abstractions;
@@ -71,7 +72,7 @@ public sealed class WinogradF43ConvTests
         using var dX2 = backend.AllocateBuffer(poison);
         foreach (var target in new[] { dX1, dX2 })
         {
-            var a = new CudaConv2DBackwardArgs(dDy, dW, target, false, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
+            var a = new TunedConv2DBackwardArgs(dDy, dW, target, false, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
             Assert.True(backend.TryConv2DBackwardDataWinogradF43(a), "Winograd F(4x4) refused an admitted shape");
         }
         backend.Synchronize();
@@ -120,7 +121,7 @@ public sealed class WinogradF43ConvTests
         using var dW2 = backend.AllocateBuffer(outC * inC * 9);
         foreach (var target in new[] { dW1, dW2 })
         {
-            var a = new CudaConv2DBackwardArgs(dX, dDy, target, true, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
+            var a = new TunedConv2DBackwardArgs(dX, dDy, target, true, batch, inC, h, w, outC, outH, outW, 3, 3, 1, 1, pad, pad, 1, 1);
             Assert.True(backend.TryConv2DBackwardFilterWinogradF34(a), "Winograd F(3x3,4x4) refused an admitted shape");
         }
         backend.Synchronize();
@@ -182,7 +183,7 @@ public sealed class WinogradF43ConvTests
             using var xb = backend.AllocateBuffer(Fill(batch * c * hw * hw));
             using var dy = backend.AllocateBuffer(Fill(batch * c * hw * hw));
             using var dw = backend.AllocateBuffer(c * c * 9);
-            var a = new CudaConv2DBackwardArgs(xb, dy, dw, true, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
+            var a = new TunedConv2DBackwardArgs(xb, dy, dw, true, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
             Func<bool>[] run =
             {
                 () => backend.TryConv2DBackwardFilterWinogradF34(a),
@@ -229,7 +230,7 @@ public sealed class WinogradF43ConvTests
             using var dy = backend.AllocateBuffer(Fill(batch * c * hw * hw));
             using var wt = backend.AllocateBuffer(Fill(c * c * 9));
             using var dx = backend.AllocateBuffer(batch * c * hw * hw);
-            var a = new CudaConv2DBackwardArgs(dy, wt, dx, false, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
+            var a = new TunedConv2DBackwardArgs(dy, wt, dx, false, batch, c, hw, hw, c, hw, hw, 3, 3, 1, 1, 1, 1, 1, 1);
             Func<bool>[] run =
             {
                 () => backend.TryConv2DBackwardDataWinogradF43(a),
