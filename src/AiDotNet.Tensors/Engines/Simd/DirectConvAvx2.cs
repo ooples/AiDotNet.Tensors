@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Helpers;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #endif
 
 namespace AiDotNet.Tensors.Engines.Simd;
@@ -171,6 +172,7 @@ internal static class DirectConvAvx2
     }
 #if NET5_0_OR_GREATER
     /// <summary>output[n, oc, oh, ow] (=, or += when <paramref name="accumulate"/>) conv(input, kernel), NCHW / OIHW.</summary>
+    [MethodImpl(Hot)]
     public static void Forward(
         float[] input, int inputOffset, float[] kernel, int kernelOffset, float[] output, int outputOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
@@ -201,6 +203,7 @@ internal static class DirectConvAvx2
     /// dX (=, or +=) for a stride-1, dilation-1 conv: the forward conv of the output gradient with
     /// W'[i, o, y, x] = W[o, i, kH-1-y, kW-1-x] and padding k-1-p.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void BackwardInput(
         float[] gradOutput, int gradOutputOffset, float[] kernel, int kernelOffset, float[] dest, int destOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
@@ -240,6 +243,7 @@ internal static class DirectConvAvx2
     /// and over its own grid of rows ry + strideH*j it is a stride-1 correlation of the output gradient with that
     /// flipped sub-kernel, so the forward tile runs it unchanged. No column matrix, no scatter.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void BackwardInputStrided(
         float[] gradOutput, int gradOutputOffset, float[] kernel, int kernelOffset, float[] dest, int destOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
@@ -293,7 +297,7 @@ internal static class DirectConvAvx2
         {
             PackInput(gradOutput, gradOutputOffset, packedGrad, batch, outChannels, outputHeight, outputWidth, borderH, borderW, paddedH, paddedW);
             int inBlocks = inChannels / Block;
-            CpuParallelSettings.ParallelForOrSerial(0, phases.Count * inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, task =>
+            CpuParallelSettings.ParallelForOrSerial(0, phases.Count * inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, [MethodImpl(Hot)] (task) =>
             {
                 var phase = phases[task / inBlocks];
                 PackKernelPhase(kernel, kernelOffset, packedKernel, phase.KernelOffset, task % inBlocks, outChannels, inChannels,
@@ -305,7 +309,7 @@ internal static class DirectConvAvx2
             for (int p = 0; p < phases.Count; p++) taskStart[p + 1] = taskStart[p] + phases[p].Tasks;
             CpuParallelSettings.ParallelForOrSerial(0, totalTasks,
                 (long)batch * height * width * inChannels * outChannels * kernelHeight * kernelWidth / (strideH * strideW),
-                task =>
+                [MethodImpl(Hot)] (task) =>
                 {
                     int p = 0;
                     while (taskStart[p + 1] <= task) p++;
@@ -326,9 +330,10 @@ internal static class DirectConvAvx2
         }
     }
     /// <summary>Zeroes phase (ry, rx) of every plane: the input positions no kernel tap reaches (a 1x1 stride-2 conv's odd rows).</summary>
+    [MethodImpl(Hot)]
     private static void ClearPhase(float[] dest, int destOffset, int planes, int height, int width, int ry, int rx, int strideH, int strideW)
     {
-        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * height * width / (strideH * strideW), plane =>
+        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * height * width / (strideH * strideW), [MethodImpl(Hot)] (plane) =>
         {
             int baseIndex = destOffset + plane * height * width;
             for (int y = ry; y < height; y += strideH)
@@ -342,6 +347,7 @@ internal static class DirectConvAvx2
     /// [I/8][O/8][tapsH][tapsW][8 out][8 in] with sub-kernel tap (y, x)
     /// = W[o, i, firstH + strideH*(tapsH-1-y), firstW + strideW*(tapsW-1-x)].
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackKernelPhase(float[] source, int sourceOffset, float[] packed, int packedOffset, int ib,
         int outChannels, int inChannels, int kernelHeight, int kernelWidth,
         int firstH, int strideH, int tapsH, int firstW, int strideW, int tapsW)
@@ -370,6 +376,7 @@ internal static class DirectConvAvx2
         }
     }
     /// <summary>dW[oc, ic, kh, kw] (=, or += when <paramref name="accumulate"/>) for the conv of input with kernel.</summary>
+    [MethodImpl(Hot)]
     public static void BackwardKernel(
         float[] input, int inputOffset, float[] gradOutput, int gradOutputOffset, float[] dest, int destOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
@@ -406,14 +413,14 @@ internal static class DirectConvAvx2
             if (partials is null)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, pairs, (long)kernelSize * batch * positions,
-                    task => BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate,
+                    [MethodImpl(Hot)] (task) => BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate,
                         task / inBlocks, task % inBlocks, 0, batch, inChannels, outBlocks, paddedW, planeIn,
                         kernelHeight, kernelWidth, dilationH, dilationW, positions),
                     deterministicSafe: true);
             }
             else
             {
-                CpuParallelSettings.ParallelForOrSerial(0, pairs * splits, (long)kernelSize * batch * positions, task =>
+                CpuParallelSettings.ParallelForOrSerial(0, pairs * splits, (long)kernelSize * batch * positions, [MethodImpl(Hot)] (task) =>
                 {
                     int split = task / pairs, pair = task % pairs;
                     int b0 = split * imagesPerSplit;
@@ -433,11 +440,12 @@ internal static class DirectConvAvx2
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void ReducePartials(float[] partials, int splits, int length, float[] dest, int destOffset, bool accumulate)
     {
         const int Chunk = 2048;
         int chunks = (length + Chunk - 1) / Chunk;
-        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)splits * length, chunk =>
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)splits * length, [MethodImpl(Hot)] (chunk) =>
         {
             int begin = chunk * Chunk, end = Math.Min(length, begin + Chunk);
             fixed (float* pp = partials)
@@ -462,12 +470,13 @@ internal static class DirectConvAvx2
     }
 
     /// <summary>NCHW -> zero-padded [N][ceil(C/8)][H+2pH][W+2pW][8]; channels past C are zero.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackInput(float[] source, int sourceOffset, float[] packed,
         int batch, int channels, int height, int width, int padH, int padW, int paddedH, int paddedW)
     {
         int blocks = (channels + Block - 1) / Block;
         int plane = paddedH * paddedW * Block;
-        CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * blocks * plane, task =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * blocks * plane, [MethodImpl(Hot)] (task) =>
         {
             int b = task / blocks, blk = task % blocks;
             fixed (float* ps = source)
@@ -491,10 +500,11 @@ internal static class DirectConvAvx2
     }
 
     /// <summary>NCHW gradient -> [N][C/8][P][8].</summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackGradByBlock(float[] source, int sourceOffset, float[] packed, int batch, int channels, int positions)
     {
         int blocks = channels / Block;
-        CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * channels * positions, task =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * channels * positions, [MethodImpl(Hot)] (task) =>
         {
             fixed (float* ps = source)
             fixed (float* pd = packed)
@@ -514,6 +524,7 @@ internal static class DirectConvAvx2
     /// OIHW -> [O/8][I/8][kH][kW][8 in][8 out]. With <paramref name="transposeAndFlip"/> the result is the packed
     /// kernel of the transposed conv: its outputs are the original inputs, and the taps are reversed.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackKernel(float[] source, int sourceOffset, float[] packed,
         int outChannels, int inChannels, int kernelHeight, int kernelWidth, bool transposeAndFlip)
     {
@@ -525,7 +536,7 @@ internal static class DirectConvAvx2
         // order: [tap][input lane][output lane]. The source reads stay within Block rows of
         // Block*taps contiguous floats, so both sides stream instead of striding a cache line per
         // store (the old lane-outer order touched every destination line Block times).
-        CpuParallelSettings.ParallelForOrSerial(0, (packedOut / Block) * packedInBlocks, (long)outChannels * inChannels * taps, task =>
+        CpuParallelSettings.ParallelForOrSerial(0, (packedOut / Block) * packedInBlocks, (long)outChannels * inChannels * taps, [MethodImpl(Hot)] (task) =>
         {
             int ob = task / packedInBlocks, ib = task % packedInBlocks;
             fixed (float* ps = source)
@@ -559,6 +570,7 @@ internal static class DirectConvAvx2
     // A/B switch for the staged output store (on by default).
     internal static bool s_stagedStore = true;
 
+    [MethodImpl(Hot)]
     private static void ForwardPacked(float[] packedInput, float[] packedKernel, float[] output, int outputOffset, bool accumulate,
         ForwardGeometry geometry, int targetTasks)
     {
@@ -570,7 +582,7 @@ internal static class DirectConvAvx2
         int tasksPerTile = (chunks + chunksPerTask - 1) / chunksPerTask;
         CpuParallelSettings.ParallelForOrSerial(0, tiles * tasksPerTile,
             (long)totalPositions * geometry.OutChannels * geometry.InBlocks * Block * geometry.KernelHeight * geometry.KernelWidth,
-            task =>
+            [MethodImpl(Hot)] (task) =>
             {
                 int tile = task / tasksPerTile, part = task % tasksPerTile;
                 int first = part * chunksPerTask * PositionUnroll;
@@ -647,6 +659,7 @@ internal static class DirectConvAvx2
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void ForwardTile(float[] packedInput, float[] packedKernel, int kernelOffset, float[] output, int outputOffset,
         bool accumulate, in ForwardGeometry g, int tile, int first, int last)
     {
@@ -745,6 +758,7 @@ internal static class DirectConvAvx2
 
     // Writes `run` consecutive positions x 32 channels from the stage ([position][channel]) as one contiguous run per
     // channel. Only for the plain grid, where position q's output index is q's offset in the plane.
+    [MethodImpl(Hot)]
     private static unsafe void FlushStage(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q0, int run, float* stage)
     {
         int index = g.OutputIndex(q0, out int b);
@@ -757,7 +771,7 @@ internal static class DirectConvAvx2
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void StorePosition(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q,
         Vector256<float> v0, Vector256<float> v1, Vector256<float> v2, Vector256<float> v3)
     {
@@ -768,7 +782,7 @@ internal static class DirectConvAvx2
         StoreLanes(d + (long)2 * Block * g.OutPlane, g.OutPlane, accumulate, v2);
         StoreLanes(d + (long)3 * Block * g.OutPlane, g.OutPlane, accumulate, v3);
     }
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(HotInline)]
     private static unsafe void StoreLanes(float* d, int stride, bool accumulate, Vector256<float> v)
     {
         if (accumulate)
@@ -790,6 +804,7 @@ internal static class DirectConvAvx2
     /// column group x output-channel half) running over a chunk before the next, with each pass's accumulators parked
     /// in a small stack buffer between chunks: a whole-plane sweep per pass re-streamed the operands from L2.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void BackwardKernelTile(float[] packedInput, float[] packedGrad, int[] offsets, float[] dest, int destOffset,
         bool accumulate, int ob, int ib, int batchBegin, int batchEnd, int inChannels, int outBlocks, int paddedW, int planeIn,
         int kernelHeight, int kernelWidth, int dilationH, int dilationW, int positions)

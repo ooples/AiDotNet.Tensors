@@ -146,6 +146,15 @@ internal static class JitGemmGenerator
         }
     }
 
+    /// <summary>True when a kernel specialized for these strides has been emitted: the evidence that a GEMM ran
+    /// here rather than on another route.</summary>
+    internal static bool HasKernelForStrides(int lda, int ldb, int ldc)
+    {
+        foreach (var key in s_cache.Keys)
+            if (key.Lda == lda && key.Ldb == ldb && key.Ldc == ldc) return true;
+        return false;
+    }
+
     /// <summary>
     /// Release every retained executable kernel and reset the cache. Wired into
     /// <see cref="BlasManaged.ClearCaches"/>. NOTE: this disposes the executable pages, so it is
@@ -293,5 +302,6 @@ internal static class JitGemmGenerator
     internal static unsafe bool TryRunFp64(double* a, int lda, double* b, int ldb, double* c, int ldc, int m, int n, int k) => false;
     internal static bool TryRunBf16(System.ReadOnlySpan<ushort> a, System.ReadOnlySpan<ushort> b, System.Span<float> c, int m, int k, int n) => false;
     internal static void ClearCache() { /* no JIT cache on net471 — IsSupported is always false */ }
+    internal static bool HasKernelForStrides(int lda, int ldb, int ldc) => false;
 }
 #endif

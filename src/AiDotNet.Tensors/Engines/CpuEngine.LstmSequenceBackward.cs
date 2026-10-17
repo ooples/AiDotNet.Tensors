@@ -74,6 +74,7 @@ public partial class CpuEngine
     }
 
     /// <summary>buf[off..off+len) *= s, vectorized (one IEEE multiply per element, as the scalar loop).</summary>
+    [MethodImpl(Hot)]
     private static void ScaleInPlace(float[] buf, int off, int len, float s)
     {
         int i = 0;
@@ -314,6 +315,7 @@ public partial class CpuEngine
     /// (every position of it). Allocation-free apart from the dispatch closure: the eager tape path hands it a fresh
     /// workspace per call, a compiled-plan node one workspace it reuses every step. Requires seqLen &gt; 0.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void LstmTrainForwardCoreFloat(
         float[] inArr, float[] wIhArr, float[] wHhArr,
         float[]? bIhArr, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
@@ -367,6 +369,7 @@ public partial class CpuEngine
     /// then per timestep accumulates h_{t-1}·WHhᵀ onto those rows IN the time-major saved gates, applies the exact
     /// activations and the cell, and writes c_t, tanh(c_t), h_t and the output rows.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void LstmForwardChunk(int c, float[] inArr, float[]? h0Arr, float[]? c0Arr,
         bool returnSequences, LstmTrainWorkspace ws, IntPtr outPtr, int outLen)
     {
@@ -459,6 +462,7 @@ public partial class CpuEngine
     //    so results do not depend on the vector width. ──────────────────────────────────────────────────────────────
 
     /// <summary>c = f·c_prev + i·g into cells[cCurRow..] and cbuf[cb..] (gate rows of act at iOff/fOff/gOff).</summary>
+    [MethodImpl(Hot)]
     private static void CellUpdateRow(float[] act, int iOff, int fOff, int gOff, float[] cells, int cPrevRow, int cCurRow,
         float[] cbuf, int cb, int len)
     {
@@ -483,6 +487,7 @@ public partial class CpuEngine
     }
 
     /// <summary>h = o·tanh(c) into hiddens[hRow..] (o at act[oOff..], tanh(c) at tanhC[tc..]).</summary>
+    [MethodImpl(Hot)]
     private static void HiddenOutRow(float[] act, int oOff, float[] tanhC, int tc, float[] hiddens, int hRow, int len)
     {
         int h = 0;
@@ -501,6 +506,7 @@ public partial class CpuEngine
     /// dh/dc (plus this step's upstream gradient when <paramref name="gradOut"/> is non-null), writes the four
     /// pre-activation gate gradients to dgatesT[dgtRow..] and dgatesAll[dgaRow..] and carries dc to t-1.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void BpttCellRow(float[] gates, int gateRow, float[] cells, int cPrevRow, float[] tanhC, int tcRow,
         float[] dhNext, float[] dcNext, int carryRow, float[]? gradOut, int goRow,
         float[] dgatesT, int dgtRow, float[] dgatesAll, int dgaRow, int hidden)
@@ -571,6 +577,7 @@ public partial class CpuEngine
     }
 
     /// <summary>sum[0..len) += part[0..len), vectorized; per element the same single add as the scalar loop.</summary>
+    [MethodImpl(Hot)]
     private static void LstmAddInto(float[] sum, float[] part, int len)
     {
         int i = 0;
@@ -894,6 +901,7 @@ public partial class CpuEngine
     /// forms the chunk's input-gradient rows (dgates·WIh) and its partial weight/bias gradients
     /// (xᵀ·dgates, h_{t-1}ᵀ·dgates, Σ dgates). Leaves dh/dc after t = 0 in the chunk's carries for gradH0/gradC0.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void LstmBackwardChunk(int c, LstmTrainWorkspace ws, LstmBackwardScratch scratch, float[] gradOutArr, bool returnSequences,
         float[] wHhArr, float[]? wIhArr, float[]? inputArr, IntPtr gradInputPtr, bool needWHh, bool needBias, bool needH0)
     {

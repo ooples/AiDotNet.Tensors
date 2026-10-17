@@ -634,7 +634,7 @@ internal static class DifferentiableOps
     /// </summary>
     /// <summary>True, and marks the buffer written, when this is its first contribution in the current
     /// <see cref="GradWriteGeneration"/>; false outside a generation or for later contributions.</summary>
-    private static bool ClaimFirstWrite<T>(Tensor<T> buffer)
+    internal static bool ClaimFirstWrite<T>(Tensor<T> buffer)
     {
         int generation = GradWriteGeneration;
         if (generation == 0 || buffer._gradWriteGeneration == generation) return false;

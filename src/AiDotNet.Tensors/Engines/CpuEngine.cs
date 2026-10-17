@@ -28433,91 +28433,18 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradBeta = (float[])(object)gradBetaData;
             var fGradInput = (float[])(object)gradInputData;
             float fEps = (float)epsilon;
-            int fs = featureSize;
-            float featureSizeF = fs;
-            float invFeatureSizeF = 1f / featureSizeF;
-
-            // gradGamma / gradBeta: sum across batches, split into feature-column ranges (each accumulated over the
-            // rows in order, so bit-identical to the whole-width loop at any thread count). One core cannot pull the
-            // memory bandwidth this pass needs; the serial loop left the rest of the machine idle.
-            LayerNormBackwardFloatAccumGammaBeta(fGradOut, fInput, fMean, fVar, fGradGamma, fGradBeta, batchSize, fs, fEps);
-
-            // gradInput: per-batch two-pass (sum reductions, then per-element).
-            // Safe to parallelize over batches since each batch writes to a
-            // disjoint [b*fs, (b+1)*fs) slice of gradInput.
-            [MethodImpl(Hot)]
-            void ProcessBatch(int b)
+            // gradInput and the gradGamma / gradBeta partials in one pass over row blocks (see
+            // LayerNormBackwardFloatFused); the partials are summed in block order, so the result does not depend on
+            // the thread count.
+            var lnPartial = System.Buffers.ArrayPool<float>.Shared.Rent(LayerNormBackwardFloatScratchLength(batchSize, featureSize));
+            try
             {
-                int off = b * fs;
-                float invStd = 1f / MathF.Sqrt(fVar[b] + fEps);
-                float m = fMean[b];
-
-                float sumGrad = 0f;
-                float sumGradX = 0f;
-                int f = 0;
-#if NET5_0_OR_GREATER
-                if (Vector256.IsHardwareAccelerated && fs >= 8)
-                {
-                    var vM = Vector256.Create(m);
-                    var accGrad = Vector256<float>.Zero;
-                    var accGradX = Vector256<float>.Zero;
-                    for (; f + 8 <= fs; f += 8)
-                    {
-                        var scaledGrad = Vector256.LoadUnsafe(ref fGamma[f]) * Vector256.LoadUnsafe(ref fGradOut[off + f]);
-                        accGrad += scaledGrad;
-                        accGradX += scaledGrad * (Vector256.LoadUnsafe(ref fInput[off + f]) - vM);
-                    }
-                    sumGrad = Vector256.Sum(accGrad);
-                    sumGradX = Vector256.Sum(accGradX);
-                }
-#endif
-                for (; f < fs; f++)
-                {
-                    float scaledGrad = fGamma[f] * fGradOut[off + f];
-                    sumGrad += scaledGrad;
-                    sumGradX += scaledGrad * (fInput[off + f] - m);
-                }
-
-                float scale = invStd * invFeatureSizeF;
-                int fw = 0;
-#if NET5_0_OR_GREATER
-                if (Vector256.IsHardwareAccelerated && fs >= 8)
-                {
-                    var vM = Vector256.Create(m);
-                    var vInvStd = Vector256.Create(invStd);
-                    var vFeat = Vector256.Create(featureSizeF);
-                    var vSumGrad = Vector256.Create(sumGrad);
-                    var vSumGradX = Vector256.Create(sumGradX);
-                    var vScale = Vector256.Create(scale);
-                    for (; fw + 8 <= fs; fw += 8)
-                    {
-                        var norm = (Vector256.LoadUnsafe(ref fInput[off + fw]) - vM) * vInvStd;
-                        var gradNorm = Vector256.LoadUnsafe(ref fGamma[fw]) * Vector256.LoadUnsafe(ref fGradOut[off + fw]);
-                        var term3 = norm * vInvStd * vSumGradX;
-                        var res = vScale * (vFeat * gradNorm - vSumGrad - term3);
-                        res.StoreUnsafe(ref fGradInput[off + fw]);
-                    }
-                }
-#endif
-                for (; fw < fs; fw++)
-                {
-                    float normalized = (fInput[off + fw] - m) * invStd;
-                    float gradNorm = fGamma[fw] * fGradOut[off + fw];
-                    float term1 = featureSizeF * gradNorm;
-                    float term3 = normalized * invStd * sumGradX;
-                    fGradInput[off + fw] = scale * (term1 - sumGrad - term3);
-                }
+                LayerNormBackwardFloatFused(fGradOut, 0, fInput, 0, fGamma, 0, fMean, fVar, batchSize, featureSize, fEps,
+                    fGradInput, 0, false, fGradGamma, 0, false, fGradBeta, 0, false, lnPartial);
             }
-
-            // Same threshold used by the forward: below ~50K total elements the
-            // Parallel.For dispatch cost exceeds the work.
-            if (batchSize * fs < 50_000)
+            finally
             {
-                for (int b = 0; b < batchSize; b++) ProcessBatch(b);
-            }
-            else
-            {
-                CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, ProcessBatch);
+                System.Buffers.ArrayPool<float>.Shared.Return(lnPartial);
             }
         }
         else if (typeof(T) == typeof(double))
@@ -28758,46 +28685,140 @@ public partial class CpuEngine : ITensorLevelEngine
     // block it is the plain serial loop.
     private const int NormRowBlock = 128;
 
-    private static void LayerNormBackwardFloatAccumGammaBeta(
-        float[] gradOut, float[] input, float[] mean, float[] variance,
-        float[] gradGamma, float[] gradBeta,
-        int rows, int fs, float eps)
+    /// <summary>Floats <see cref="LayerNormBackwardFloatFused"/> needs as its <c>partial</c> scratch.</summary>
+    internal static int LayerNormBackwardFloatScratchLength(int rows, int fs)
+        => 2 * ((rows + NormRowBlock - 1) / NormRowBlock) * fs + 2 * fs;
+
+    /// <summary>
+    /// Float LayerNorm backward over [rows, fs] in ONE parallel pass over <see cref="NormRowBlock"/>-row blocks: each
+    /// block writes its rows' input gradient and its gamma/beta partial sums, then the partials are summed in block
+    /// order. The blocks and the summation order do not depend on the thread count, so neither does the result. Each
+    /// gradient that is given is written, or added onto when its accumulate flag is set (a tensor with several
+    /// consumers). The eager backward and the compiled LayerNorm node both run this, so they agree bit for bit.
+    /// Offsets locate each operand's first element; mean and variance start at 0.
+    /// </summary>
+    internal static void LayerNormBackwardFloatFused(
+        float[] gradOut, int dyOff, float[] input, int xOff, float[] gamma, int gammaOff,
+        float[] mean, float[] variance, int rows, int fs, float eps,
+        float[]? dX, int dXOff, bool accumulateX,
+        float[]? dGamma, int dGammaOff, bool accumulateGamma,
+        float[]? dBeta, int dBetaOff, bool accumulateBeta,
+        float[] partial)
     {
         int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
-        if (blocks <= 1)
+        bool needGammaBeta = dGamma is not null || dBeta is not null;
+        CpuParallelSettings.ParallelForOrSerial(0, blocks, 3L * rows * fs, blk =>
         {
-            LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, gradGamma, 0, gradBeta, 0, 0, rows, fs, eps);
-            return;
-        }
-        var partial = System.Buffers.ArrayPool<float>.Shared.Rent(2 * blocks * fs);
-        try
-        {
-            CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * fs, blk =>
+            int r0 = blk * NormRowBlock, r1 = Math.Min(rows, r0 + NormRowBlock);
+            if (needGammaBeta)
             {
                 int gOff = blk * fs, bOff = (blocks + blk) * fs;
                 Array.Clear(partial, gOff, fs);
                 Array.Clear(partial, bOff, fs);
-                LayerNormBackwardFloatAccumGammaBetaRows(gradOut, input, mean, variance, partial, gOff, partial, bOff,
-                    blk * NormRowBlock, Math.Min(rows, (blk + 1) * NormRowBlock), fs, eps);
-            }, deterministicSafe: true);
-            AccumulateAxisRows(partial, 0, fs, blocks, gradGamma, 0, fs);
-            AccumulateAxisRows(partial, blocks * fs, fs, blocks, gradBeta, 0, fs);
-        }
-        finally
+                LayerNormBackwardFloatAccumGammaBetaRows(gradOut, dyOff, input, xOff, mean, variance,
+                    partial, gOff, partial, bOff, r0, r1, fs, eps);
+            }
+            if (dX is not null)
+                for (int b = r0; b < r1; b++)
+                    LayerNormBackwardFloatInputRow(gradOut, dyOff + b * fs, input, xOff + b * fs, gamma, gammaOff,
+                        mean[b], variance[b], dX, dXOff + b * fs, fs, eps, accumulateX);
+        }, deterministicSafe: true);
+        if (!needGammaBeta) return;
+        int sumGamma = 2 * blocks * fs, sumBeta = sumGamma + fs;
+        AccumulateAxisRows(partial, 0, fs, blocks, partial, sumGamma, fs);
+        AccumulateAxisRows(partial, blocks * fs, fs, blocks, partial, sumBeta, fs);
+        if (dGamma is not null) StoreOrAddFloats(partial, sumGamma, dGamma, dGammaOff, fs, accumulateGamma);
+        if (dBeta is not null) StoreOrAddFloats(partial, sumBeta, dBeta, dBetaOff, fs, accumulateBeta);
+    }
+
+    private static void StoreOrAddFloats(float[] src, int srcOffset, float[] dst, int dstOffset, int length, bool accumulate)
+    {
+        if (!accumulate)
         {
-            System.Buffers.ArrayPool<float>.Shared.Return(partial);
+            Array.Copy(src, srcOffset, dst, dstOffset, length);
+            return;
+        }
+        var acc = new Span<float>(dst, dstOffset, length);
+        Simd.SimdKernels.VectorAdd(acc, new ReadOnlySpan<float>(src, srcOffset, length), acc);
+    }
+
+    /// <summary>dX for one row: invStd/fs * (fs * g*dy - sum(g*dy) - xhat * invStd * sum(g*dy*(x - mean))).</summary>
+    [MethodImpl(Hot)]
+    private static void LayerNormBackwardFloatInputRow(
+        float[] gradOut, int yo, float[] input, int xo, float[] gamma, int go, float m, float var,
+        float[] dX, int dxo, int fs, float eps, bool accumulate)
+    {
+        float featureSizeF = fs;
+        float invStd = 1f / MathF.Sqrt(var + eps);
+
+        float sumGrad = 0f;
+        float sumGradX = 0f;
+        int f = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && fs >= 8)
+        {
+            var vM = Vector256.Create(m);
+            var accGrad = Vector256<float>.Zero;
+            var accGradX = Vector256<float>.Zero;
+            for (; f + 8 <= fs; f += 8)
+            {
+                var scaledGrad = Vector256.LoadUnsafe(ref gamma[go + f]) * Vector256.LoadUnsafe(ref gradOut[yo + f]);
+                accGrad += scaledGrad;
+                accGradX += scaledGrad * (Vector256.LoadUnsafe(ref input[xo + f]) - vM);
+            }
+            sumGrad = Vector256.Sum(accGrad);
+            sumGradX = Vector256.Sum(accGradX);
+        }
+#endif
+        for (; f < fs; f++)
+        {
+            float scaledGrad = gamma[go + f] * gradOut[yo + f];
+            sumGrad += scaledGrad;
+            sumGradX += scaledGrad * (input[xo + f] - m);
+        }
+
+        float scale = invStd * (1f / featureSizeF);
+        int fw = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && fs >= 8)
+        {
+            var vM = Vector256.Create(m);
+            var vInvStd = Vector256.Create(invStd);
+            var vFeat = Vector256.Create(featureSizeF);
+            var vSumGrad = Vector256.Create(sumGrad);
+            var vSumGradX = Vector256.Create(sumGradX);
+            var vScale = Vector256.Create(scale);
+            for (; fw + 8 <= fs; fw += 8)
+            {
+                var norm = (Vector256.LoadUnsafe(ref input[xo + fw]) - vM) * vInvStd;
+                var gradNorm = Vector256.LoadUnsafe(ref gamma[go + fw]) * Vector256.LoadUnsafe(ref gradOut[yo + fw]);
+                var term3 = norm * vInvStd * vSumGradX;
+                var res = vScale * (vFeat * gradNorm - vSumGrad - term3);
+                if (accumulate) res += Vector256.LoadUnsafe(ref dX[dxo + fw]);
+                res.StoreUnsafe(ref dX[dxo + fw]);
+            }
+        }
+#endif
+        for (; fw < fs; fw++)
+        {
+            float normalized = (input[xo + fw] - m) * invStd;
+            float gradNorm = gamma[go + fw] * gradOut[yo + fw];
+            float term1 = featureSizeF * gradNorm;
+            float term3 = normalized * invStd * sumGradX;
+            float res = scale * (term1 - sumGrad - term3);
+            dX[dxo + fw] = accumulate ? dX[dxo + fw] + res : res;
         }
     }
 
     [MethodImpl(Hot)]
     private static void LayerNormBackwardFloatAccumGammaBetaRows(
-        float[] gradOut, float[] input, float[] mean, float[] variance,
+        float[] gradOut, int dyOff, float[] input, int xOff, float[] mean, float[] variance,
         float[] gAcc, int gOff, float[] bAcc, int bOff,
         int r0, int r1, int fs, float eps)
     {
         for (int b = r0; b < r1; b++)
         {
-            int off = b * fs;
+            int yo = dyOff + b * fs, xo = xOff + b * fs;
             float invStd = 1f / MathF.Sqrt(variance[b] + eps);
             float m = mean[b];
             int f = 0;
@@ -28808,8 +28829,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var vInvStd = Vector256.Create(invStd);
                 for (; f + 8 <= fs; f += 8)
                 {
-                    var go = Vector256.LoadUnsafe(ref gradOut[off + f]);
-                    var norm = (Vector256.LoadUnsafe(ref input[off + f]) - vM) * vInvStd;
+                    var go = Vector256.LoadUnsafe(ref gradOut[yo + f]);
+                    var norm = (Vector256.LoadUnsafe(ref input[xo + f]) - vM) * vInvStd;
                     (Vector256.LoadUnsafe(ref gAcc[gOff + f]) + go * norm).StoreUnsafe(ref gAcc[gOff + f]);
                     (Vector256.LoadUnsafe(ref bAcc[bOff + f]) + go).StoreUnsafe(ref bAcc[bOff + f]);
                 }
@@ -28817,8 +28838,8 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
             for (; f < fs; f++)
             {
-                float go = gradOut[off + f];
-                float normalized = (input[off + f] - m) * invStd;
+                float go = gradOut[yo + f];
+                float normalized = (input[xo + f] - m) * invStd;
                 gAcc[gOff + f] += go * normalized;
                 bAcc[bOff + f] += go;
             }
@@ -38996,6 +39017,14 @@ public partial class CpuEngine : ITensorLevelEngine
         using var outputDataKeep4 = new KeepAliveScope(output);
         var dstSpan = output.DataUnmarked.Span;
 
+        // Merge adjacent output axes that the source also keeps adjacent
+        // (stride[i] == stride[i+1] * dim[i+1]); when the merged innermost
+        // axis is stride-1 in the source, every innermost row is one
+        // contiguous run, so the walk becomes a block copy per run. The
+        // attention head split/merge ([0,2,1,3]) is this case: runs of head_dim.
+        if (rank >= 2 && output.Length > 0 && TryPermuteContiguousRuns(srcSpan, dstSpan, dstShape, permutedSrcStrides))
+            return;
+
         // For rank ≤ 4 (the diffusion / transformer hot path), unroll the
         // index walk into nested loops; for higher ranks, fall back to a
         // generic odometer loop.
@@ -39070,6 +39099,65 @@ public partial class CpuEngine : ITensorLevelEngine
                 idx[d] = 0;
             }
         }
+    }
+
+    /// <summary>
+    /// Dense permute as a block copy per contiguous source run. Returns false
+    /// (caller falls back to the element walk) when the merged innermost axis
+    /// is not stride-1 in the source or its runs are too short to amortise a copy.
+    /// </summary>
+    private static bool TryPermuteContiguousRuns<T>(ReadOnlySpan<T> src, Span<T> dst, int[] dstShape, int[] srcStrides)
+    {
+        const int MinRun = 4;
+        int rank = dstShape.Length;
+        if (rank > 16) return false;
+        Span<int> dims = stackalloc int[rank];
+        Span<int> st = stackalloc int[rank];
+        int m = 0;
+        for (int i = 0; i < rank; i++)
+        {
+            int d = dstShape[i];
+            if (d == 1) continue;
+            if (m > 0 && st[m - 1] == srcStrides[i] * d)
+            {
+                dims[m - 1] *= d;
+                st[m - 1] = srcStrides[i];
+            }
+            else
+            {
+                dims[m] = d;
+                st[m] = srcStrides[i];
+                m++;
+            }
+        }
+
+        if (m == 0)
+        {
+            dst[0] = src[0];
+            return true;
+        }
+        if (st[m - 1] != 1) return false;
+        int run = dims[m - 1];
+        if (m > 1 && run < MinRun) return false;
+
+        int outer = 1;
+        for (int k = 0; k < m - 1; k++) outer *= dims[k];
+        Span<int> idx = stackalloc int[rank];
+        idx.Clear();
+        int srcBase = 0, off = 0;
+        for (int o = 0; o < outer; o++)
+        {
+            src.Slice(srcBase, run).CopyTo(dst.Slice(off, run));
+            off += run;
+            for (int k = m - 2; k >= 0; k--)
+            {
+                srcBase += st[k];
+                if (++idx[k] < dims[k]) break;
+                srcBase -= st[k] * dims[k];
+                idx[k] = 0;
+            }
+        }
+        return true;
     }
 
     [MethodImpl(Hot)]
