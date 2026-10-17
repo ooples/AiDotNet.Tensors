@@ -154,6 +154,39 @@ public sealed class MetalFusedOpsParityTests
     }
 
     [SkippableFact]
+    public void Metal_ConvertToFp16_RoundsToNearestEven_LikeHalf()
+    {
+        Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal is only available on macOS/iOS.");
+        using var b = new MetalBackend();
+        Skip.IfNot(b.IsAvailable, "Metal is not available.");
+
+        // Ties and near-ties in the normal and subnormal range, the largest finite half and its overflow, zeros, inf,
+        // and random values. The conversion truncated before, which a tie or any value just under one exposes.
+        var values = new System.Collections.Generic.List<float>
+        {
+            0f, -0f, 1f, -1f, 65504f, 65519.99f, 65520f, 1e9f, float.PositiveInfinity, float.NegativeInfinity,
+            5.9604645e-8f, 2.9802322e-8f, 2.9802326e-8f, 8.940697e-8f, 6.1035156e-5f, 6.097555e-5f,
+        };
+        foreach (uint low in new uint[] { 0xfff, 0x1000, 0x1001, 0x1fff })
+            foreach (uint top in new uint[] { 0, 1, 2, 3, 0x2aa, 0x3ff })
+                foreach (uint e in new uint[] { 100, 112, 113, 127, 140, 142 })
+                    values.Add(BitConverter.Int32BitsToSingle((int)((e << 23) | (top << 13) | low)));
+        values.AddRange(Values(501, 31, 70000f));
+        float[] input = values.ToArray();
+        using var din = b.AllocateBuffer(input);
+        using var dout = b.AllocateBuffer((input.Length + 1) / 2);
+        b.ConvertToFp16(din, dout, input.Length);
+        float[] packed = b.DownloadBuffer(dout);
+        for (int i = 0; i < input.Length; i++)
+        {
+            uint word = (uint)BitConverter.SingleToInt32Bits(packed[i / 2]);
+            ushort got = (ushort)((i & 1) == 0 ? word & 0xffff : word >> 16);
+            ushort expected = BitConverter.HalfToUInt16Bits((Half)input[i]);
+            Assert.True(got == expected, $"ConvertToFp16({input[i]:R}): got 0x{got:X4}, expected 0x{expected:X4}");
+        }
+    }
+
+    [SkippableFact]
     public void Metal_SoftmaxBackwardAndTiledGemm_MatchCpu()
     {
         Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal is only available on macOS/iOS.");

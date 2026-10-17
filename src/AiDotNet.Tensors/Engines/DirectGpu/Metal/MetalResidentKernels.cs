@@ -450,17 +450,27 @@ inline ushort resident_float_to_half(float value)
     uint sign = (bits >> 16) & 0x8000u;
     int exponent = int((bits >> 23) & 0xffu) - 112;
     uint mantissa = bits & 0x7fffffu;
+    // Round to nearest, ties to even, as __float2half and (Half)x do. This truncated (mantissa >> 13), so every
+    // ConvertToFp16 on Metal rounded toward zero: the direct FP16 convolution's weights came out up to one half ulp
+    // smaller than the FP16-rounded reference (relL2 4.5e-4, first run on an Apple GPU).
     if (exponent <= 0) {
         if (exponent < -10) return ushort(sign);
         mantissa |= 0x800000u;
-        mantissa >>= uint(14 - exponent);
-        return ushort(sign | mantissa);
+        uint shift = uint(14 - exponent);           // 14 .. 24
+        uint q = mantissa >> shift;
+        uint rem = mantissa & ((1u << shift) - 1u);
+        uint halfway = 1u << (shift - 1u);
+        if (rem > halfway || (rem == halfway && (q & 1u) != 0u)) q += 1u;   // may carry into the smallest normal
+        return ushort(sign | q);
     }
     if (exponent >= 31) {
         if ((bits & 0x7fffffffu) > 0x7f800000u) return ushort(0x7fffu);
         return ushort(sign | 0x7c00u);
     }
-    return ushort(sign | (uint(exponent) << 10) | (mantissa >> 13));
+    uint h = (uint(exponent) << 10) | (mantissa >> 13);
+    uint r = mantissa & 0x1fffu;
+    if (r > 0x1000u || (r == 0x1000u && (h & 1u) != 0u)) h += 1u;           // a carry into the exponent, up to infinity, is right
+    return ushort(sign | h);
 }
 
 inline float resident_half_to_float(ushort value)
