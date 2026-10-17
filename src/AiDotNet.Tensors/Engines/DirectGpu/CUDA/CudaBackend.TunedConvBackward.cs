@@ -24,6 +24,9 @@ public sealed partial class CudaBackend
         Environment.GetEnvironmentVariable("AIDOTNET_CONV_IMPLICIT_DGRAD") != "0";
     private static readonly bool s_convEngineBackwardEnv =
         Environment.GetEnvironmentVariable("AIDOTNET_CONV_ENGINE_BACKWARD") != "0";
+    // Operator opt-out for the r8 weight-gradient candidates alone, leaving the other GEMM backward routes registered.
+    private static readonly bool s_convR8WgradEnv =
+        Environment.GetEnvironmentVariable("AIDOTNET_CONV_R8_WGRAD") != "0";
 
     internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardFilterSlot
     {
@@ -64,8 +67,8 @@ public sealed partial class CudaBackend
                     // instructions on per-element index arithmetic (Nsight Compute). Per call on an RTX 3080 (batch 8) vs the
                     // implicit kernel: 64@32 81.0 -> 59.1 us (64x128), 64->128 s2 48.2 -> 36.9, 128->256 s2 45.8 -> 37.9,
                     // 256->512 s2 42.7 -> 32.7, 512@4 69.3 -> 58.2 us; 1x1 and stem layers stay on the existing kernels.
-                    if (s_convGemmBackward && candidates.Count > 0)
-                        foreach (var (tileM, tileN) in new[] { (64, 128), (128, 64) })
+                    if (s_convGemmBackward && s_convR8WgradEnv)
+                        foreach (var (tileM, tileN) in Kernels.CudaConvWgradKernels.TileShapes)
                         {
                             int tm = tileM, tn = tileN;
                             candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>(

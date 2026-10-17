@@ -56,9 +56,9 @@ public sealed partial class CudaBackend
         if (p <= 0 || kTotal <= 0 || kTotal > int.MaxValue || outputs > int.MaxValue
             || (long)a.Batch * a.InChannels * a.InHeight * a.InWidth > int.MaxValue
             || (long)a.Batch * a.OutChannels * a.OutHeight * a.OutWidth > int.MaxValue
-            || !_kernelCache.TryGetValue($"conv2d_wgrad_r8_{tileM}x{tileN}", out var gemm))
+            || !_kernelCache.TryGetValue(Kernels.CudaConvWgradKernels.KernelName(tileM, tileN), out var gemm))
             return false;
-        const int Bk = 16;   // the kernels' K tile (WR_KERNEL ..., 16)
+        const int Bk = Kernels.CudaConvWgradKernels.KTile;
         int threads = (tileM / 8) * (tileN / 8);
         int tilesN = (int)((p + tileN - 1) / tileN), tilesM = (a.OutChannels + tileM - 1) / tileM;
         long tiles = (long)tilesN * tilesM;

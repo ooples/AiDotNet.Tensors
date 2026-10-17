@@ -5,6 +5,7 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -82,7 +83,7 @@ public sealed class WgradR8KernelTests : IClassFixture<DirectGpuTensorEngineTest
 
         double implicitUs = Time(() => cuda.Conv2DBackwardKernelViaImplicit(refArgs));
         var line = new System.Text.StringBuilder($"[dW {inC}->{outC} {size}x{size} k{k} s{s}] implicit {implicitUs:F1}");
-        foreach (var (tm, tn) in new[] { (64, 128), (128, 64) })
+        foreach (var (tm, tn) in CudaConvWgradKernels.TileShapes)
             foreach (int splits in new[] { 0, 1 })
             {
                 cuda.Fill(dw, float.NaN, dw.Size);
@@ -95,5 +96,54 @@ public sealed class WgradR8KernelTests : IClassFixture<DirectGpuTensorEngineTest
                 line.Append($" | r8 {tm}x{tn}/{(splits == 0 ? "auto" : splits.ToString())} {us:F1}");
             }
         _output.WriteLine(line.ToString());
+    }
+
+    // (inC, h, w, outC, kernel, stride, pad, dilation): non-square inputs and outputs, dilation 2, and a 1x1 shortcut whose
+    // P = inC is odd -- the kernel takes H/W, outH/outW and dH/dW separately, and the ResNet shapes above are all square
+    // with dilation 1.
+    public static IEnumerable<object[]> IrregularShapes() => new[]
+    {
+        new object[] { 16, 20, 12, 48, 3, 1, 1, 1 },
+        new object[] { 24, 17, 23, 40, 3, 2, 1, 1 },
+        new object[] { 32, 18, 14, 64, 3, 1, 2, 2 },   // dilation 2, padding 2 keeps the size
+        new object[] { 33, 15, 9, 70, 1, 1, 0, 1 },    // 1x1 shortcut, odd P
+    };
+
+    /// <summary>
+    /// Correctness only (no timing) on irregular shapes, at the automatic split count and at fixed counts of 3 and 7: a
+    /// large GPU can pick one split for every shape, which would leave the split-K reduction and its per-slice offsets
+    /// untested.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(IrregularShapes))]
+    public void R8_wgrad_kernels_match_the_implicit_route_on_irregular_shapes_and_forced_splits(
+        int inC, int h, int w, int outC, int k, int s, int p, int d)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = (DirectGpuTensorEngine)_fixture.Engine!;
+        var cuda = gpu.GetBackend() as CudaBackend;
+        Skip.If(cuda is null, "CUDA only.");
+        const int batch = 4;
+        int outH = (h + 2 * p - d * (k - 1) - 1) / s + 1, outW = (w + 2 * p - d * (k - 1) - 1) / s + 1;
+        using var x = cuda!.AllocateBuffer(Rand(batch * inC * h * w, 3, 1f));
+        using var dy = cuda.AllocateBuffer(Rand(batch * outC * outH * outW, 4, 1f));
+        using var reference = cuda.AllocateBuffer(outC * inC * k * k);
+        using var dw = cuda.AllocateBuffer(outC * inC * k * k);
+        var refArgs = new TunedConv2DBackwardArgs(x, dy, reference, true, batch, inC, h, w, outC, outH, outW, k, k, s, s, p, p, d, d);
+        var args = new TunedConv2DBackwardArgs(x, dy, dw, true, batch, inC, h, w, outC, outH, outW, k, k, s, s, p, p, d, d);
+        Assert.True(cuda.Conv2DBackwardKernelViaImplicit(refArgs), "implicit route refused");
+        var expected = cuda.DownloadBuffer(reference);
+        double scale = Math.Max(1.0, expected.Max(v => Math.Abs((double)v)));
+
+        foreach (var (tm, tn) in CudaConvWgradKernels.TileShapes)
+            foreach (int splits in new[] { 0, 3, 7 })
+            {
+                cuda.Fill(dw, float.NaN, dw.Size);
+                Assert.True(cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits), $"r8 {tm}x{tn} refused");
+                var actual = cuda.DownloadBuffer(dw);
+                double maxErr = 0;
+                for (int i = 0; i < expected.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / scale);
+                Assert.True(maxErr < 1e-5, $"r8 {tm}x{tn} splits {splits} [{inC}->{outC} {h}x{w} k{k} s{s} p{p} d{d}]: max err {maxErr:E2}");
+            }
     }
 }

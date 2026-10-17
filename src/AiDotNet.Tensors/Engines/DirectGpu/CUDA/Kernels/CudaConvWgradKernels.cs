@@ -1,3 +1,4 @@
+using System.Linq;
 // Copyright (c) AiDotNet. All rights reserved.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
@@ -19,6 +20,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// </summary>
 internal static class CudaConvWgradKernels
 {
+    /// <summary>The K depth of every r8 tile (WR_KERNEL's BK); the host rounds split-K slices to it.</summary>
+    internal const int KTile = 16;
+
+    /// <summary>The (rows, columns) output tiles compiled and offered as dW candidates: 64 x 128 for the common short
+    /// Cout rows, 128 x 64 for few, long rows.</summary>
+    internal static readonly (int M, int N)[] TileShapes = { (64, 128), (128, 64) };
+
     public static string GetSource() => @"
 // Column table entry: x offset of column (ci, kh, kw) relative to the K position's window origin, and its shifts.
 struct WrCol { int off; int khd; int kwd; int valid; };
@@ -171,9 +179,9 @@ extern ""C"" __global__ __launch_bounds__((BM / 8) * (BN / 8)) void NAME( \
     conv2d_wgrad_r8_body<BM, BN, BK>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
         kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
 }
-WR_KERNEL(conv2d_wgrad_r8_64x128, 64, 128, 16)
-WR_KERNEL(conv2d_wgrad_r8_128x64, 128, 64, 16)
-";
+" + string.Concat(TileShapes.Select(t => $"WR_KERNEL({KernelName(t.M, t.N)}, {t.M}, {t.N}, {KTile})\n"));
 
-    public static string[] GetKernelNames() => new[] { "conv2d_wgrad_r8_64x128", "conv2d_wgrad_r8_128x64" };
+    public static string[] GetKernelNames() => TileShapes.Select(t => KernelName(t.M, t.N)).ToArray();
+
+    internal static string KernelName(int tileM, int tileN) => $"conv2d_wgrad_r8_{tileM}x{tileN}";
 }
