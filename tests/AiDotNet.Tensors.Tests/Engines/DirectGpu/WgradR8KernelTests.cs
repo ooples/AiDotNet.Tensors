@@ -11,17 +11,17 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// The rectangular engine weight-gradient tiles (64x128, 128x64; the dW slot's engine_64x128 / engine_128x64 candidates)
-/// on every ResNet-18 (batch 8, 32x32) layer shape, with automatic and single split-K, against the implicit-GEMM route.
-/// Each configuration's time is reported next to the implicit kernel's.
+/// The 8x8-micro-tile weight-gradient kernels (conv2d_wgrad_r8_64x128 / _128x64; the dW slot's r8 candidates) on every
+/// ResNet-18 (batch 8, 32x32) layer shape, with automatic and single split-K, against the implicit-GEMM route. Each
+/// configuration's time is reported next to the implicit kernel's.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public sealed class WgradRectangularTileTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+public sealed class WgradR8KernelTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
     private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly ITestOutputHelper _output;
 
-    public WgradRectangularTileTests(DirectGpuTensorEngineTestFixture fixture, ITestOutputHelper output)
+    public WgradR8KernelTests(DirectGpuTensorEngineTestFixture fixture, ITestOutputHelper output)
     {
         _fixture = fixture;
         _output = output;
@@ -47,7 +47,7 @@ public sealed class WgradRectangularTileTests : IClassFixture<DirectGpuTensorEng
 
     [SkippableTheory]
     [MemberData(nameof(Shapes))]
-    public void Rectangular_wgrad_tiles_match_the_implicit_route(int inC, int size, int outC, int k, int s, int p)
+    public void R8_wgrad_kernels_match_the_implicit_route(int inC, int size, int outC, int k, int s, int p)
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var gpu = (DirectGpuTensorEngine)_fixture.Engine!;
@@ -86,13 +86,13 @@ public sealed class WgradRectangularTileTests : IClassFixture<DirectGpuTensorEng
             foreach (int splits in new[] { 0, 1 })
             {
                 cuda.Fill(dw, float.NaN, dw.Size);
-                if (!cuda.TryConv2DBackwardKernelEngineTiled(args, tm, tn, splits)) continue;
+                Assert.True(cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits), $"r8 {tm}x{tn} refused");
                 var actual = cuda.DownloadBuffer(dw);
                 double maxErr = 0;
                 for (int i = 0; i < expected.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / scale);
-                Assert.True(maxErr < 1e-5, $"{tm}x{tn} splits {splits}: max err {maxErr:E2}");
-                double us = Time(() => cuda.TryConv2DBackwardKernelEngineTiled(args, tm, tn, splits));
-                line.Append($" | {tm}x{tn}/{(splits == 0 ? "auto" : splits.ToString())} {us:F1}");
+                Assert.True(maxErr < 1e-5, $"r8 {tm}x{tn} splits {splits}: max err {maxErr:E2}");
+                double us = Time(() => cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits));
+                line.Append($" | r8 {tm}x{tn}/{(splits == 0 ? "auto" : splits.ToString())} {us:F1}");
             }
         _output.WriteLine(line.ToString());
     }

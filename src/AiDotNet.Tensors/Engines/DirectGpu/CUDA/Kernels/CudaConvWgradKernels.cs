@@ -1,0 +1,179 @@
+// Copyright (c) AiDotNet. All rights reserved.
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
+
+/// <summary>
+/// Convolution weight gradient as an implicit GEMM built to keep the FMA pipe busy:
+/// dW[co, p] = sum over k = (b, oh, ow) of dY[b, co, oh, ow] * X[b, ci, oh*sH - pH + kh*dH, ow*sW - pW + kw*dW], with
+/// p = (ci, kh, kw). Nsight Compute on the earlier kernels (RTX 3080, ResNet-18 layers) found them instruction-overhead
+/// bound: only 40-46% of executed instructions were FMAs, the rest per-element index arithmetic and bounds checks. Here
+/// <list type="bullet">
+/// <item>each thread owns an 8 x 8 block of the output tile (64 FMAs per K step against four 16-byte shared loads, in the
+/// split-quad layout that keeps those loads conflict-free);</item>
+/// <item>a block computes every column's input offset and kernel shifts once, into shared memory, and each thread decodes
+/// its K position (b, oh, ow) incrementally per tile instead of dividing, so a gathered input element costs a table
+/// read, an add, two unsigned range checks and a load;</item>
+/// <item>split-K partial rows are written as 16-byte stores and summed in split order by conv2d_wgrad_splitk_reduce
+/// (deterministic).</item>
+/// </list>
+/// </summary>
+internal static class CudaConvWgradKernels
+{
+    public static string GetSource() => @"
+// Column table entry: x offset of column (ci, kh, kw) relative to the K position's window origin, and its shifts.
+struct WrCol { int off; int khd; int kwd; int valid; };
+
+template <int BM, int BN, int WR_BK>
+__device__ __forceinline__ void conv2d_wgrad_r8_body(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    constexpr int THREADS = (BM / 8) * (BN / 8);
+    constexpr int GROUPS = THREADS / WR_BK;          // loader lanes per K position
+    constexpr int RA = BM / GROUPS, RB = BN / GROUPS; // elements each thread loads per tile
+    __shared__ __align__(16) float As[2][WR_BK][BM + 4];
+    __shared__ __align__(16) float Bs[2][WR_BK][BN + 4];
+    __shared__ WrCol cols[BN];
+
+    const int L = outH * outW, khw = kH * kW, P = inC * khw, K = batch * L, HW = H * W;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int kBegin = blockIdx.z * kPerSplit, kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x;
+
+    for (int c = tid; c < BN; c += THREADS)
+    {
+        int p = n0 + c;
+        WrCol e;
+        e.valid = p < P;
+        int pp = e.valid ? p : 0;
+        int ci = pp / khw, t = pp - ci * khw, kh = t / kW, kw = t - kh * kW;
+        e.khd = kh * dH;
+        e.kwd = kw * dW;
+        e.off = ci * HW + e.khd * W + e.kwd;
+        cols[c] = e;
+    }
+
+    // This thread's K lane and its incrementally maintained (b, oh, ow).
+    const int klane = tid % WR_BK, group = tid / WR_BK;
+    int kAbs = kBegin + klane;
+    int kb = 0, koh = 0, kow = 0;
+    if (kAbs < K) { kb = kAbs / L; int l = kAbs - kb * L; koh = l / outW; kow = l - koh * outW; }
+
+    float ra[RA], rb[RB];
+    auto load = [&]()
+    {
+        bool kIn = kAbs < kEnd;
+        const float* dyK = gradOutput + ((long long)kb * outC + m0 + group) * L + koh * outW + kow;
+        #pragma unroll
+        for (int i = 0; i < RA; i++)
+        {
+            int m = m0 + group + GROUPS * i;
+            ra[i] = (kIn && m < outC) ? dyK[(long long)(GROUPS * i) * L] : 0.0f;
+        }
+        int ihBase = koh * sH - pH, iwBase = kow * sW - pW;
+        const float* xK = input + (long long)kb * inC * HW + (long long)ihBase * W + iwBase;
+        #pragma unroll
+        for (int j = 0; j < RB; j++)
+        {
+            WrCol e = cols[group + GROUPS * j];
+            bool ok = kIn && e.valid && (unsigned)(ihBase + e.khd) < (unsigned)H && (unsigned)(iwBase + e.kwd) < (unsigned)W;
+            rb[j] = ok ? xK[e.off] : 0.0f;
+        }
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int i = 0; i < RA; i++) As[buf][klane][group + GROUPS * i] = ra[i];
+        #pragma unroll
+        for (int j = 0; j < RB; j++) Bs[buf][klane][group + GROUPS * j] = rb[j];
+    };
+    auto advance = [&]()
+    {
+        kAbs += WR_BK;
+        kow += WR_BK;
+        while (kow >= outW) { kow -= outW; if (++koh == outH) { koh = 0; ++kb; } }
+    };
+
+    const int tx = tid % (BN / 8), ty = tid / (BN / 8);
+    float acc[8][8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc[i][j] = 0.0f;
+
+    __syncthreads();   // the column table
+    const int tiles = kBegin < kEnd ? (kEnd - kBegin + WR_BK - 1) / WR_BK : 0;
+    int buf = 0;
+    if (tiles > 0)
+    {
+        load();
+        store(0);
+        __syncthreads();
+    }
+    for (int tIdx = 0; tIdx < tiles; tIdx++)
+    {
+        bool more = tIdx + 1 < tiles;
+        if (more) { advance(); load(); }
+        #pragma unroll
+        for (int kk = 0; kk < WR_BK; kk++)
+        {
+            float4 a0 = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 a1 = *reinterpret_cast<const float4*>(&As[buf][kk][BM / 2 + ty * 4]);
+            float4 b0 = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
+            float4 b1 = *reinterpret_cast<const float4*>(&Bs[buf][kk][BN / 2 + tx * 4]);
+            float a[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+            float b[8] = { b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w };
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[i][j] += a[i] * b[j];
+        }
+        if (more)
+        {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    // Rows ty*4 + {0..3} and BM/2 + ty*4 + {0..3}; columns tx*4 + {0..3} and BN/2 + tx*4 + {0..3}.
+    float* slice = out + (long long)blockIdx.z * outC * P;
+    const bool vec = (P & 3) == 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+    {
+        int m = m0 + (i >> 2) * (BM / 2) + ty * 4 + (i & 3);
+        if (m >= outC) continue;
+        #pragma unroll
+        for (int h = 0; h < 2; h++)
+        {
+            int n = n0 + h * (BN / 2) + tx * 4;
+            float* row = slice + (long long)m * P + n;
+            if (vec && n + 3 < P)
+                *reinterpret_cast<float4*>(row) = make_float4(acc[i][4 * h], acc[i][4 * h + 1], acc[i][4 * h + 2], acc[i][4 * h + 3]);
+            else
+            {
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    if (n + j < P) row[j] = acc[i][4 * h + j];
+            }
+        }
+    }
+}
+
+#define WR_KERNEL(NAME, BM, BN, BK) \
+extern ""C"" __global__ __launch_bounds__((BM / 8) * (BN / 8)) void NAME( \
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out, \
+    int batch, int inC, int H, int W, int outC, int outH, int outW, \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+{ \
+    conv2d_wgrad_r8_body<BM, BN, BK>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
+        kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+}
+WR_KERNEL(conv2d_wgrad_r8_64x128, 64, 128, 16)
+WR_KERNEL(conv2d_wgrad_r8_128x64, 128, 64, 16)
+";
+
+    public static string[] GetKernelNames() => new[] { "conv2d_wgrad_r8_64x128", "conv2d_wgrad_r8_128x64" };
+}
