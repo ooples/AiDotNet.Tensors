@@ -2570,6 +2570,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // Gradient buffers this step's zeroing pass clears, gathered so the clear runs across the worker pool.
     private readonly List<(T[] Array, int Length)> _pendingGradClears = new();
     private const int GradClearChunk = 1 << 15;
+    private long _lastClearedGradElements = -1;
+
+    /// <summary>Gradient elements the last step's selective zeroing pass cleared (-1 before any such pass). Test hook.</summary>
+    internal long LastClearedGradElements => _lastClearedGradElements;
 
     /// <summary>
     /// Zeroes the buffers gathered in <see cref="_pendingGradClears"/>, split into 32K-element pieces across the
@@ -2588,6 +2592,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 total += length;
                 pieces += (length + GradClearChunk - 1) / GradClearChunk;
             }
+            _lastClearedGradElements = total;
             if (pieces <= 1)
             {
                 foreach (var (array, length) in pending) Array.Clear(array, 0, length);
@@ -8013,6 +8018,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int genericBackwardCount = 0;
         // Steps whose backward is the generic accumulator: AccumulateGrad ADDS into their inputs' gradient buffers.
         var genericBackwardSteps = new List<CompiledStep<T>>();
+        // Specialized steps whose delegates claim each multi-consumer input gradient's first write (AccumulatesInto).
+        var firstWriteClaimingSteps = new List<CompiledStep<T>>();
 
         // Gradient relevance: a tensor's gradient can reach a parameter only when the tensor was COMPUTED FROM one
         // (requiresGradTensors, above). The traced input batch, the labels, and everything derived from them alone
@@ -8085,12 +8092,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // and doubling the dominant backward cost.
             // On a GPU engine, skip the host BLAS specialization (preferGenericForGpu) so the backward
             // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
+            var claims = new System.Runtime.CompilerServices.StrongBox<bool>();
             var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
-                dWPeeled: dWPeeledIndices.Contains(i), requiresGrad: requiresGradTensors);
+                dWPeeled: dWPeeledIndices.Contains(i), requiresGrad: requiresGradTensors, claimsFirstWrite: claims);
             if (action != null)
             {
                 backwardActions.Add(action);
                 backwardStepNames.Add($"specialized:{step.OpName}");
+                if (claims.Value) firstWriteClaimingSteps.Add(step);
             }
             else
             {
@@ -8307,11 +8316,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // (a specialized/fused/analytic delegate, which neither claims nor respects first-write marks) is excluded
         // and stays zeroed. consumerCount counts every consuming step, so equality with the generic-only count
         // means no other consumer exists. Pooled buffers keep their own re-zero schedule.
+        // A specialized delegate that claims the first write the same way (firstWriteClaimingSteps: the residual add, the
+        // shared Q/K/V matmul) counts with the generic writers. On the parity CPU Transformer that leaves the residual
+        // streams and the norm outputs unzeroed: they were all seven buffers the step still cleared (787K floats).
         bool[]? eagerFirstWriteCandidates = null;
         if (!useGradPool && genericBackwardCount > 0 && genericBackwardSteps.Count > 0)
         {
             var genericConsumers = new Dictionary<Tensor<T>, int>();
-            foreach (var genericStep in genericBackwardSteps)
+            foreach (var genericStep in genericBackwardSteps.Concat(firstWriteClaimingSteps))
             {
                 foreach (var inp in genericStep.Inputs)
                     genericConsumers[inp] = genericConsumers.TryGetValue(inp, out int seen) ? seen + 1 : 1;
@@ -10147,6 +10159,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>dst[start..+count] += src (accumulate) or = src.</summary>
+    /// <summary>
+    /// Whether a backward delegate must ADD its contribution into a multi-consumer input's gradient buffer. Under the
+    /// host step's GradWriteGeneration the first writer of the step claims the buffer and overwrites it, exactly as the
+    /// generic AccumulateGrad copies its first contribution in, so a buffer whose every writer claims needs no zeroing
+    /// (see the first-write candidates in the compile). Outside a generation nothing is claimed and the buffer was
+    /// zeroed, so a shared operand accumulates. A single-consumer operand always overwrites; its write is still claimed,
+    /// so the step's first-write coverage check (RecordEagerFirstWriteCoverage) sees the buffer written.
+    /// </summary>
+    private static bool AccumulatesInto(Tensor<T> grad, bool shared)
+    {
+        bool first = Autodiff.DifferentiableOps.ClaimFirstWrite(grad);
+        return shared && !first;
+    }
+
     private static void AddOrCopy(float[] src, float[] dst, int start, int count, bool accumulate)
     {
         if (!accumulate) { Array.Copy(src, start, dst, start, count); return; }
@@ -10160,15 +10186,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// The backward of <c>C[M,N] = A[M,K] · B[K,N]</c> (A's leading dims collapsed into M) when at least one operand
     /// has several consumers: <c>dA = dC · Bᵀ</c> and <c>dB = Aᵀ · dC</c>, each one transposed GEMM into the plan's
     /// gradient buffer. A single-consumer operand's gradient overwrites its buffer (beta = 0); a shared operand's
-    /// accumulates into it (beta = 1), relying on the plan zeroing every multi-consumer tensor's gradient buffer at the
-    /// start of the step. A gradient no parameter reads (<paramref name="requiresGrad"/>) is not computed. Returns null
-    /// for any layout the raw-array GEMMs cannot address, so the step keeps the generic backward.
+    /// overwrites it when this is the buffer's first write of the step and accumulates into it (beta = 1) otherwise
+    /// (<see cref="AccumulatesInto"/>), so the plan need not zero it. A gradient no parameter reads
+    /// (<paramref name="requiresGrad"/>) is not computed. Returns null for any layout the raw-array GEMMs cannot
+    /// address, so the step keeps the generic backward; otherwise sets <paramref name="claimsFirstWrite"/>.
     /// </summary>
     private static Action<IEngine>? BuildSharedOperandMatMulBackward(
         CompiledStep<T> step,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         Dictionary<Tensor<T>, int> consumerCount,
-        HashSet<Tensor<T>>? requiresGrad)
+        HashSet<Tensor<T>>? requiresGrad,
+        System.Runtime.CompilerServices.StrongBox<bool>? claimsFirstWrite)
     {
         var inputA = step.Inputs[0];
         var inputB = step.Inputs[1];
@@ -10208,18 +10236,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var db = TryGetLiveFloatBacking(gradB);
             if (dc is null || a is null || b is null || da is null || db is null) return null;
             float[]? productScratch = null;
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return _ =>
             {
                 // dA[M,K] = dC[M,N] · B[K,N]ᵀ
                 if (needA)
                 {
-                    SharedOperandGemm(dc, n, false, b, n, true, da, m, n, k, accumulateA, ref productScratch);
+                    SharedOperandGemm(dc, n, false, b, n, true, da, m, n, k, AccumulatesInto(gradA, accumulateA), ref productScratch);
                     inputA.Grad = gradA;
                 }
                 // dB[K,N] = A[M,K]ᵀ · dC[M,N]
                 if (needB)
                 {
-                    SharedOperandGemm(a, k, true, dc, n, false, db, k, m, n, accumulateB, ref productScratch);
+                    SharedOperandGemm(a, k, true, dc, n, false, db, k, m, n, AccumulatesInto(gradB, accumulateB), ref productScratch);
                     inputB.Grad = gradB;
                 }
             };
@@ -10235,16 +10264,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // then added. Sized for the larger accumulated gradient, allocated on first use only.
         int scratchLength = Math.Max(accumulateA && needA ? m * k : 0, accumulateB && needB ? k * n : 0);
         double[]? scratch = null;
+        if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
         return _ =>
         {
             if (needA)
             {
-                SharedOperandGemm(dcD, n, false, bD, n, true, daD, m, n, k, accumulateA, ref scratch, scratchLength);
+                SharedOperandGemm(dcD, n, false, bD, n, true, daD, m, n, k, AccumulatesInto(gradA, accumulateA), ref scratch, scratchLength);
                 inputA.Grad = gradA;
             }
             if (needB)
             {
-                SharedOperandGemm(aD, k, true, dcD, n, false, dbD, k, m, n, accumulateB, ref scratch, scratchLength);
+                SharedOperandGemm(aD, k, true, dcD, n, false, dbD, k, m, n, AccumulatesInto(gradB, accumulateB), ref scratch, scratchLength);
                 inputB.Grad = gradB;
             }
         };
@@ -10936,8 +10966,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         IEngine engine,
         List<GCHandle>? handleTracker = null,
         bool dWPeeled = false,
-        HashSet<Tensor<T>>? requiresGrad = null)
+        HashSet<Tensor<T>>? requiresGrad = null,
+        System.Runtime.CompilerServices.StrongBox<bool>? claimsFirstWrite = null)
     {
+        // claimsFirstWrite is set when the returned delegate writes each multi-consumer input's gradient through
+        // AccumulatesInto (claiming the step's first write) rather than always adding into a zeroed buffer.
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
         // PR #319: extend the MatMul backward to cover double via
         // BlasProvider.TryGemmEx(double[], ...) so tape-trained
@@ -11000,7 +11033,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.OutputBuffer.IsContiguous)
         {
-            var sharedOperandBackward = BuildSharedOperandMatMulBackward(step, gradMap, consumerCount, requiresGrad);
+            var sharedOperandBackward = BuildSharedOperandMatMulBackward(step, gradMap, consumerCount, requiresGrad,
+                claimsFirstWrite);
             if (sharedOperandBackward is not null)
                 return sharedOperandBackward;
         }
@@ -11670,6 +11704,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             // Float host buffers of one shape: both gradients in one chunked pass across the pool. The engine add and
             // the single-threaded span copy took ~170 us per residual add of [64,32,64] (3990X).
+            // A multi-consumer operand's buffer is overwritten when this is its first write of the step (see
+            // AccumulatesInto), so the plan does not zero it.
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             if (typeof(T) == typeof(float) && !engine.SupportsGpu
                 && gradA.Length == gradOut.Length && gradB.Length == gradOut.Length
                 && TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
@@ -11684,12 +11721,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // An operand whose gradient views gradOut (AliasReshapeViewGradients) already holds it.
                     bool skipA = !accumA && ReferenceEquals(ga, g) && gradA._storageOffset == gradOut._storageOffset;
                     bool skipB = !accumB && ReferenceEquals(gb, g) && gradB._storageOffset == gradOut._storageOffset;
+                    bool addA = !skipA && AccumulatesInto(gradA, accumA);
+                    bool addB = !skipB && AccumulatesInto(gradB, accumB);
                     int chunks = Math.Max(1, (addLen + ReluChunkElements - 1) / ReluChunkElements);
                     CpuParallelSettings.ParallelForOrSerial(0, chunks, 2L * addLen, c =>
                     {
                         int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, addLen - start);
-                        if (!skipA) AddOrCopy(g, ga, start, count, accumA);
-                        if (!skipB) AddOrCopy(g, gb, start, count, accumB);
+                        if (!skipA) AddOrCopy(g, ga, start, count, addA);
+                        if (!skipB) AddOrCopy(g, gb, start, count, addB);
                     }, deterministicSafe: true);
                     inputA.Grad = gradA;
                     inputB.Grad = gradB;
@@ -11698,12 +11737,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             return eng =>
             {
-                if (accumA)
+                if (AccumulatesInto(gradA, accumA))
                     eng.TensorAddInto(gradA, gradA, gradOut);
                 else
                     gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
 
-                if (accumB)
+                if (AccumulatesInto(gradB, accumB))
                     eng.TensorAddInto(gradB, gradB, gradOut);
                 else
                     gradOut.AsSpan().CopyTo(gradB.AsWritableSpan());
@@ -11767,9 +11806,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
+            // A multi-consumer operand's buffer is overwritten on its first write of the step (AccumulatesInto).
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return eng =>
             {
-                if (accumA)
+                if (AccumulatesInto(gradA, accumA))
                 {
                     // gradA += gradOut * inputB
                     var temp = eng.TensorMultiply(gradOut, inputB);
@@ -11778,7 +11819,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else
                     eng.TensorMultiplyInto(gradA, gradOut, inputB);
 
-                if (accumB)
+                if (AccumulatesInto(gradB, accumB))
                 {
                     // gradB += gradOut * inputA
                     var temp = eng.TensorMultiply(gradOut, inputA);
