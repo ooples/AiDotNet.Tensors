@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.139.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.1...v0.139.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **compiled-gpu:** max-pool recompute backward keeps its winner indices on the device ([#1396](https://github.com/ooples/AiDotNet.Tensors/issues/1396)) ([06b8eac](https://github.com/ooples/AiDotNet.Tensors/commit/06b8eac8a2f0412212e9a82b82cc40fef9b73faa))
+
+
+### Performance
+
+* **cpu:** training-step fixes vs PyTorch - JIT edge rows, tiering, parked-pool stealing, deep-K weight gradients ([#1362](https://github.com/ooples/AiDotNet.Tensors/issues/1362)) ([3ac6a4d](https://github.com/ooples/AiDotNet.Tensors/commit/3ac6a4dc7ae4cd62b6c0fae1634c4c5c3f220e43))
+* **streaming:** fast lossless re-encode and no per-materialize weight-sized garbage ([#1394](https://github.com/ooples/AiDotNet.Tensors/issues/1394)) ([4ec7e92](https://github.com/ooples/AiDotNet.Tensors/commit/4ec7e926a34e31f4ce696f1e627cb58fc061ab9c))
+
 ## [0.139.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.0...v0.139.1) (2026-10-17)
 
 
