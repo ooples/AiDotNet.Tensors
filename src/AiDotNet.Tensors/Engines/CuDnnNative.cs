@@ -1146,8 +1146,14 @@ public sealed class CuDnnContext : IDisposable
                     $"cuDNN 9 at {dir ?? "(unknown directory)"} is missing {name}; cuDNN is reported unavailable instead of letting it terminate the process.");
                 return false;
             }
-        foreach (string name in Cudnn9OptionalSublibraries)
-            LoadBeside(dir, name, assembly);
+        // The optional ones are large and loaded by cuDNN only when an API needs them; preload them only where cuDNN's own
+        // bare-name load would miss them, i.e. when the shim's directory is neither the application's nor on PATH.
+        if (dir is not null && !OnLoaderSearchPath(dir))
+            foreach (string name in Cudnn9OptionalSublibraries)
+            {
+                string full = System.IO.Path.Combine(dir, name);
+                if (System.IO.File.Exists(full)) System.Runtime.InteropServices.NativeLibrary.TryLoad(full, out _);
+            }
         return true;
 #else
         return true;
@@ -1155,6 +1161,21 @@ public sealed class CuDnnContext : IDisposable
     }
 
 #if NET5_0_OR_GREATER
+    private static bool OnLoaderSearchPath(string dir)
+    {
+        static string Norm(string p) => System.IO.Path.GetFullPath(p).TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+        string target = Norm(dir);
+        if (string.Equals(target, Norm(AppContext.BaseDirectory), StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (string entry in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(System.IO.Path.PathSeparator))
+        {
+            if (string.IsNullOrWhiteSpace(entry)) continue;
+            try { if (string.Equals(target, Norm(entry.Trim()), StringComparison.OrdinalIgnoreCase)) return true; }
+            catch (ArgumentException) { }
+            catch (NotSupportedException) { }
+        }
+        return false;
+    }
+
     private static bool LoadBeside(string? dir, string name, System.Reflection.Assembly assembly)
     {
         if (dir is not null)
