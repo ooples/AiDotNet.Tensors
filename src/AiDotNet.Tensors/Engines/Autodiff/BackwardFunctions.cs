@@ -1691,10 +1691,14 @@ internal static class BackwardFunctions<T>
         }
         else
         {
-            int[,,,,] maxIndices;
+            // Winners as an index TENSOR, which a GPU engine keeps on the device: the int[,,,,] form is a host array, so
+            // recovering it downloaded the indices every step -- inside a captured compiled step that read aborted the
+            // capture (CUDA 900) and left the plan on the eager path (measured: the parity CNN's compiled step 27.2 ms
+            // against 0.46 ms for PyTorch's CUDA graph).
+            Tensor<int> maxIndices;
             using (new NoGradScope<T>())
-                engine.MaxPool2DWithIndices(inputs[0], poolSize, stride, out maxIndices);
-            grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+                engine.MaxPool2DWithTensorIndices(inputs[0], poolSize, stride, out maxIndices);
+            grad = engine.MaxPool2DBackwardWithTensorIndices(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
