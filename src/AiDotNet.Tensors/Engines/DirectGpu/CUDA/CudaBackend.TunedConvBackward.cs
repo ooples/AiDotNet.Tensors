@@ -24,6 +24,9 @@ public sealed partial class CudaBackend
         Environment.GetEnvironmentVariable("AIDOTNET_CONV_IMPLICIT_DGRAD") != "0";
     private static readonly bool s_convEngineBackwardEnv =
         Environment.GetEnvironmentVariable("AIDOTNET_CONV_ENGINE_BACKWARD") != "0";
+    // Operator opt-out for the r8 weight-gradient candidates alone, leaving the other GEMM backward routes registered.
+    private static readonly bool s_convR8WgradEnv =
+        Environment.GetEnvironmentVariable("AIDOTNET_CONV_R8_WGRAD") != "0";
 
     internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardFilterSlot
     {
@@ -60,18 +63,18 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("cublas.conv2d_dw.im2col_gemm",
                             TunedKernelOrigin.Vendor, true, _ => true,
                             (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaIm2col(a)) LaunchDwDirect(a); }));
-                    // Rectangular engine tiles: Cout is the GEMM's row count and is often 64 while Cin*kH*kW reaches the
-                    // thousands, so 64 x 128 keeps the 8-wide column micro-tile without padding a 128-row tile; 128 x 64
-                    // suits few, long rows. Measured per call on an RTX 3080 (batch 8) against the implicit kernel: 64@32
-                    // 78.8 -> 65.0 us (64x128), 64->128 s2 46.4 -> 38.5 us (64x128), 512@4 69.3 -> 61.9 us (128x64).
-                    if (s_convGemmBackward && s_convEngineBackwardEnv && candidates.Count > 0)
-                        foreach (var (tileM, tileN) in new[] { (64, 128), (128, 64) })
+                    // 8x8-micro-tile weight gradient (CudaConvWgradKernels): the engine tiles spent 54-60% of their issued
+                    // instructions on per-element index arithmetic (Nsight Compute). Per call on an RTX 3080 (batch 8) vs the
+                    // implicit kernel: 64@32 81.0 -> 59.1 us (64x128), 64->128 s2 48.2 -> 36.9, 128->256 s2 45.8 -> 37.9,
+                    // 256->512 s2 42.7 -> 32.7, 512@4 69.3 -> 58.2 us; 1x1 and stem layers stay on the existing kernels.
+                    if (s_convGemmBackward && s_convR8WgradEnv)
+                        foreach (var (tileM, tileN) in Kernels.CudaConvWgradKernels.TileShapes)
                         {
                             int tm = tileM, tn = tileN;
                             candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>(
-                                $"nvrtc.conv2d_dw.engine_{tm}x{tn}", TunedKernelOrigin.Builtin, true,
-                                _ => HasTunedKernel($"conv2d_wgrad_ce{tm}x{tn}"),
-                                (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardKernelEngineTiled(a, tm, tn, 0)) LaunchDwDirect(a); }));
+                                $"nvrtc.conv2d_dw.r8_{tm}x{tn}", TunedKernelOrigin.Builtin, true,
+                                _ => EnsureWgradR8Module(),
+                                (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardKernelR8(a, tm, tn, 0)) LaunchDwDirect(a); }));
                         }
                     // Winograd F(3x3,2x2) weight gradient (16 GEMMs over 2x2 dY tiles, split along the tiles when the
                     // K x C grid is small). Registered after the references: it wins ResNet's 128- and 256-channel
