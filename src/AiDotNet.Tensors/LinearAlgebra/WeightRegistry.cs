@@ -1221,27 +1221,35 @@ public static partial class WeightRegistry
             return;
         }
 
-        byte[] snapshot = pool.RehydrateInto(weight.StreamingPoolHandle);
+        bool floatingPoint = typeof(T) == typeof(float) || typeof(T) == typeof(double);
         // No-upcast int8 fast path: keep an int8-stored weight as int8 + per-row scales in
         // inference so the matmul fast path feeds the int8 GEMM directly (no dequant to fp32).
         // The fp32 view is produced lazily by EnsureMaterialized only if a non-matmul path
         // reads it. Training/unknown still decode to fp32 (the optimizer writes the weight).
-        if (inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Int8
-            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        if (inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Int8 && floatingPoint)
         {
-            weight.AttachStreamingInt8(snapshot);
+            weight.AttachStreamingInt8(pool.RehydrateInto(weight.StreamingPoolHandle));
         }
         // No-upcast int4 fast path: same as int8 but for the 8x int4 group-quant store — keep it
         // 4-bit + group scales so an int4-resident model holds its small footprint through the
         // matmul (the int4 weight-only GEMM consumes it directly).
-        else if (inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Int4
-            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        else if (inferenceMode && weight.StreamingStoreEncoding == StreamingEncoding.Int4 && floatingPoint)
         {
-            weight.AttachStreamingInt4(snapshot);
+            weight.AttachStreamingInt4(pool.RehydrateInto(weight.StreamingPoolHandle));
         }
         else
         {
-            weight.RestoreStorageFromBytes(snapshot);
+            // The quantized fast paths keep their snapshot; a restore decodes it into fresh storage
+            // and is done with it, so the snapshot is rented rather than allocated.
+            byte[] rented = pool.RehydrateIntoRented(weight.StreamingPoolHandle, out int length);
+            try
+            {
+                weight.RestoreStorageFromBytes(new ReadOnlySpan<byte>(rented, 0, length));
+            }
+            finally
+            {
+                StreamingTensorPool.ReturnRented(rented);
+            }
         }
 
         // RehydrateInto may have paged other weights out to stay under budget.

@@ -475,6 +475,129 @@ public class StreamingStoreCodecTests
             Assert.Equal(BitConverter.DoubleToInt64Bits(src[i]), BitConverter.DoubleToInt64Bits(dec[i]));
     }
 
+    // Large enough to span many inflate tiles and several 1 MiB encode chunks, and not a multiple
+    // of either, so the last tile and the last chunk are partial.
+    [Fact]
+    public void Lossless_LargeTensor_RoundTrip_IsBitExact()
+    {
+        var rng = new Rng(2322);
+        int n = 700_001;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        Assert.True(enc.Length < n * sizeof(float), "a Gaussian weight should take the compressed path");
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeLosslessFloat(enc, dec);
+        for (int i = 0; i < n; i++)
+            Assert.Equal(BitExactHelpers.SingleBits(src[i]), BitExactHelpers.SingleBits(dec[i]));
+
+        var srcD = new double[n / 2];
+        for (int i = 0; i < srcD.Length; i++) srcD[i] = rng.NextGaussian(0.05);
+        var encD = StreamingStoreCodec.EncodeLosslessDouble(srcD);
+        var decD = new double[srcD.Length];
+        StreamingStoreCodec.DecodeLosslessDouble(encD, decD);
+        for (int i = 0; i < srcD.Length; i++)
+            Assert.Equal(BitConverter.DoubleToInt64Bits(srcD[i]), BitConverter.DoubleToInt64Bits(decD[i]));
+    }
+
+    // Uniformly random bit patterns do not compress, so the encoder stores the raw shuffled bytes
+    // (one tag byte plus the payload) and the decoder unshuffles them in place.
+    [Fact]
+    public void Lossless_IncompressibleTensor_RoundTrip_IsBitExact()
+    {
+        var rng = new Rng(77);
+        int n = 50_003;
+        var src = new float[n];
+        var srcBits = System.Runtime.InteropServices.MemoryMarshal.Cast<float, uint>(src.AsSpan());
+        for (int i = 0; i < n; i++) srcBits[i] = (uint)(rng.NextUnit() * uint.MaxValue);
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        Assert.Equal(n * sizeof(float) + 1, enc.Length);
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeLosslessFloat(enc, dec);
+        var decBits = System.Runtime.InteropServices.MemoryMarshal.Cast<float, uint>(dec.AsSpan());
+        for (int i = 0; i < n; i++) Assert.Equal(srcBits[i], decBits[i]);
+    }
+
+    // A constant weight (a zero-initialized projection, a LayerNorm gain of ones) is one long run
+    // per byte plane. The encoder must still collapse it: an entropy-only coder stops near 8x.
+    [Theory]
+    [InlineData(0f)]
+    [InlineData(1f)]
+    public void Lossless_ConstantTensor_CompressesToARunNotJustEntropy(float value)
+    {
+        int n = 1 << 20;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = value;
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        Assert.True(enc.Length * 100L < n * sizeof(float),
+            $"a constant {n * 4} B weight encoded to {enc.Length} B");
+        var dec = new float[n];
+        StreamingStoreCodec.DecodeLosslessFloat(enc, dec);
+        for (int i = 0; i < n; i++)
+            Assert.Equal(BitExactHelpers.SingleBits(src[i]), BitExactHelpers.SingleBits(dec[i]));
+    }
+
+    [Fact]
+    public void Lossless_TruncatedCompressedPayload_Throws()
+    {
+        var rng = new Rng(5);
+        int n = 20_000;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        Assert.True(enc.Length < n * sizeof(float));
+        var truncated = new byte[enc.Length / 2];
+        Array.Copy(enc, truncated, truncated.Length);
+        Assert.ThrowsAny<Exception>(() => StreamingStoreCodec.DecodeLosslessFloat(truncated, new float[n]));
+    }
+
+    // A payload for a larger weight inflates to more bytes than the destination holds; the decode
+    // rejects it rather than silently keeping a prefix.
+    [Fact]
+    public void Lossless_PayloadForALargerWeight_Throws()
+    {
+        var rng = new Rng(6);
+        int n = 20_000;
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        Assert.True(enc.Length < n * sizeof(float));
+        Assert.Throws<InvalidOperationException>(() => StreamingStoreCodec.DecodeLosslessFloat(enc, new float[n - 1]));
+    }
+
+#if NET5_0_OR_GREATER
+    // #2322: a streamed training weight is decoded on every re-materialization and re-encoded on
+    // every write-back, several times a step. Decoding used to allocate a copy of the compressed
+    // payload plus a full-size shuffled intermediate, and encoding a buffer pre-sized to most of
+    // the raw size ahead of its exact-length result. Neither should allocate more than a small
+    // fixed overhead now (the encode's exact-length result aside).
+    [Fact]
+    public void Lossless_DecodeAndEncode_DoNotAllocateTheWeightsSize()
+    {
+        var rng = new Rng(9);
+        int n = 1 << 22; // 16 MiB of fp32
+        var src = new float[n];
+        for (int i = 0; i < n; i++) src[i] = rng.NextGaussian(0.05);
+        var dec = new float[n];
+        // Warm up: JIT, the shared pools and the Deflate stream types.
+        var enc = StreamingStoreCodec.EncodeLosslessFloat(src);
+        StreamingStoreCodec.DecodeLosslessFloat(enc, dec);
+
+        const long overhead = 1 << 20;
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        StreamingStoreCodec.DecodeLosslessFloat(enc, dec);
+        long decodeBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(decodeBytes < overhead, $"decoding a {n * 4L} B weight allocated {decodeBytes} B");
+
+        before = GC.GetAllocatedBytesForCurrentThread();
+        var again = StreamingStoreCodec.EncodeLosslessFloat(src);
+        long encodeBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(enc.Length, again.Length);
+        Assert.True(encodeBytes < again.Length + overhead,
+            $"encoding a {n * 4L} B weight to {again.Length} B allocated {encodeBytes} B");
+    }
+#endif
+
     [Fact]
     public void EncodeDecodeDouble_RoundTrip_WithinBf16Precision()
     {
