@@ -167,9 +167,12 @@ struct SgdMultiTensorArgs
     int count;
 };
 
+// dyn (optional): device float[2] whose [0] replaces learningRate -- a captured step reads the step's rate there.
 extern ""C"" __global__ __launch_bounds__(256) void sgd_multi_tensor_update(
-    SgdMultiTensorArgs a, float learningRate, float weightDecay, const double* __restrict__ finiteGuard)
+    SgdMultiTensorArgs a, float learningRate, float weightDecay, const double* __restrict__ finiteGuard,
+    const float* __restrict__ dyn)
 {
+    if (dyn != 0) learningRate = dyn[0];
     // Guarded launch: the gradients' double sum of squares, written earlier on this stream; not finite = skip the step.
     if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
     int b = blockIdx.x;
@@ -202,11 +205,14 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update(
     const int* __restrict__ chunkStart,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int chunkSize,
-    const double* __restrict__ finiteGuard)
+    const double* __restrict__ finiteGuard,
+    const float* __restrict__ dyn)
 {
     // A non-finite gradient sum of squares (written on the device before this launch) discards the whole
     // step: no moment or parameter is written, exactly as the host-side check skipped the launch.
     if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
+    // dyn (optional): device float[2] = this step's learning rate and step number, for a captured step.
+    if (dyn != 0) { learningRate = dyn[0]; step = (int)dyn[1]; }
     int t = chunkTensor[blockIdx.x];
     int base = chunkStart[blockIdx.x];
     int i = base + threadIdx.x;
@@ -241,11 +247,14 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
     const int* __restrict__ chunkStart,
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int chunkSize,
-    const double* __restrict__ finiteGuard)
+    const double* __restrict__ finiteGuard,
+    const float* __restrict__ dyn)
 {
     // A non-finite gradient sum of squares (written on the device before this launch) discards the whole
     // step: no moment or parameter is written, exactly as the host-side check skipped the launch.
     if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
+    // dyn (optional): device float[2] = this step's learning rate and step number, for a captured step.
+    if (dyn != 0) { learningRate = dyn[0]; step = (int)dyn[1]; }
     int t = chunkTensor[blockIdx.x];
     int base = chunkStart[blockIdx.x];
     int i = base + threadIdx.x;

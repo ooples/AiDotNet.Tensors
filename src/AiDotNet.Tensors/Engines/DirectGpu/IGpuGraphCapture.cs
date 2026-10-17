@@ -34,4 +34,12 @@ internal interface IGpuGraphCapture : IDirectGpuBackend
 
     /// <summary>Frees a graph <see cref="CaptureGraph"/> returned.</summary>
     void DestroyCapturedGraph(System.IntPtr graphExec);
+
+    /// <summary>
+    /// Page-locked step I/O for a graph that reads <paramref name="inputs"/> (the first <paramref name="lengths"/>
+    /// floats of each): see <see cref="IGraphStepIo"/>. Null where the backend has none (every backend without device
+    /// graphs); the caller then refreshes inputs and reads results through ordinary copies.
+    /// </summary>
+    IGraphStepIo? CreateStepIo(System.Collections.Generic.IReadOnlyList<IGpuBuffer> inputs,
+        System.Collections.Generic.IReadOnlyList<int> lengths);
 }
