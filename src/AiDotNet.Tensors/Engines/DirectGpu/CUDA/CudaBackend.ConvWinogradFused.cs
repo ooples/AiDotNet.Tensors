@@ -105,15 +105,19 @@ public sealed partial class CudaBackend
     /// eight-channel steps, <see cref="SplitWinogradF23FusedReduction"/>).</summary>
     internal static int ChooseWinogradF23FusedSplits(long blocks, int inC, int sms)
     {
+        // Measured per-block prologue + epilogue cost, in eight-channel steps (see the cost comment below).
+        const int PrologueEpilogueSteps = 3;
+        // Most splits the heuristic considers (the bound the measured cost model was taken under).
+        const int MaxSplits = 16;
         int totalSteps = (inC + 7) / 8;
         int splits = 1;
         long bestCost = long.MaxValue;
-        for (int s = 1; s <= Math.Min(16, totalSteps); s++)
+        for (int s = 1; s <= Math.Min(MaxSplits, totalSteps); s++)
         {
             // In half-step units: each wave costs its blocks' steps plus ~3 steps of per-block prologue and epilogue
             // (measured: 16 splits of 128@16 ran 15 one-step waves in 95 us), and each extra split one half step of
             // partial traffic and reduce. Smallest count on ties.
-            long cost = (blocks * s + sms - 1) / sms * 2 * ((totalSteps + s - 1) / s + 3) + (s - 1);
+            long cost = (blocks * s + sms - 1) / sms * 2 * ((totalSteps + s - 1) / s + PrologueEpilogueSteps) + (s - 1);
             if (cost < bestCost) { bestCost = cost; splits = s; }
         }
         return splits;
