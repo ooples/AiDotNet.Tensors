@@ -27,6 +27,7 @@ public sealed class LstmSequenceBackendParityTests
         (5, 3, 6, 64),    // B*H spans several work-groups
         (7, 4, 3, 33),    // CUDA: register-resident recurrence padded to 64, batch not a multiple of its rows per block
         (32, 16, 32, 64), // the parity LSTM
+        (8, 200, 16, 32), // CUDA: R = 1600 rows split three ways (with a short last split) in the backward GEMMs
         (5, 4, 6, 100),   // a generic 256-wide work-group would split a batch row
         (2, 3, 5, 300),   // H wider than a 256-wide work-group (the engine allows H <= 1024)
     };
