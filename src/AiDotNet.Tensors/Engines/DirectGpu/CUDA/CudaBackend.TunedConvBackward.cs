@@ -5,58 +5,6 @@ using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 /// <summary>
-/// Conv2D backward arguments. Weight gradient: First = input, Second = gradOutput, Output = gradKernel. Input gradient:
-/// First = gradOutput, Second = kernel, Output = gradInput. Sizes as in <see cref="CudaConv2DArgs"/>.
-/// </summary>
-internal readonly struct CudaConv2DBackwardArgs
-{
-    internal CudaConv2DBackwardArgs(IGpuBuffer first, IGpuBuffer second, IGpuBuffer output, bool weightGradient,
-        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
-    {
-        First = first; Second = second; Output = output; WeightGradient = weightGradient;
-        Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
-        OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
-        KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW;
-        PadH = padH; PadW = padW; DilationH = dilationH; DilationW = dilationW;
-    }
-
-    internal IGpuBuffer First { get; }
-    internal IGpuBuffer Second { get; }
-    internal IGpuBuffer Output { get; }
-    internal bool WeightGradient { get; }
-    internal int Batch { get; }
-    internal int InChannels { get; }
-    internal int InHeight { get; }
-    internal int InWidth { get; }
-    internal int OutChannels { get; }
-    internal int OutHeight { get; }
-    internal int OutWidth { get; }
-    internal int KernelH { get; }
-    internal int KernelW { get; }
-    internal int StrideH { get; }
-    internal int StrideW { get; }
-    internal int PadH { get; }
-    internal int PadW { get; }
-    internal int DilationH { get; }
-    internal int DilationW { get; }
-
-    internal int OutputCount => WeightGradient
-        ? OutChannels * InChannels * KernelH * KernelW
-        : Batch * InChannels * InHeight * InWidth;
-
-    /// <summary>Shape class: every geometric parameter, laid out as <see cref="CudaConv2DArgs.Shape"/>.</summary>
-    internal unsafe TunedShape Shape()
-    {
-        int* d = stackalloc int[15];
-        d[0] = Batch; d[1] = InChannels; d[2] = InHeight; d[3] = InWidth; d[4] = OutChannels;
-        d[5] = KernelH; d[6] = KernelW; d[7] = StrideH; d[8] = StrideW; d[9] = PadH; d[10] = PadW;
-        d[11] = DilationH; d[12] = DilationW; d[13] = OutHeight; d[14] = OutWidth;
-        return TunedShape.Create(TunedKernelDType.Float32, new ReadOnlySpan<int>(d, 15));
-    }
-}
-
-/// <summary>
 /// #1325: Conv2D backward (weight and input gradients) through the tuned-kernel registry, as the forward pass already is.
 /// No one route wins every shape: on ResNet-18 #1323's implicit GEMM has the fastest weight gradient on most layers,
 /// the #1325 engine the fastest stride-1 input gradient, and SGEMM + col2im the fastest strided 3x3 input gradient. Each
@@ -68,7 +16,7 @@ internal readonly struct CudaConv2DBackwardArgs
 /// </summary>
 public sealed partial class CudaBackend
 {
-    private TunedKernelSlot<CudaConv2DBackwardArgs>? _conv2DBackwardFilterSlot, _conv2DBackwardDataSlot;
+    private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardFilterSlot, _conv2DBackwardDataSlot;
 
     private static readonly bool s_convImplicitWgradEnv =
         Environment.GetEnvironmentVariable("AIDOTNET_CONV_IMPLICIT_WGRAD") != "0";
@@ -77,7 +25,7 @@ public sealed partial class CudaBackend
     private static readonly bool s_convEngineBackwardEnv =
         Environment.GetEnvironmentVariable("AIDOTNET_CONV_ENGINE_BACKWARD") != "0";
 
-    internal TunedKernelSlot<CudaConv2DBackwardArgs> Conv2DBackwardFilterSlot
+    internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardFilterSlot
     {
         get
         {
@@ -90,44 +38,57 @@ public sealed partial class CudaBackend
                     // process's online tuning budget is spent, and as the correctness baseline. So the strongest general
                     // route goes first (#1323's implicit GEMM: fastest weight gradient on most ResNet-18 layers), and the
                     // direct kernel, which never wins, is registered only when nothing else is.
-                    var candidates = new List<ITunedKernelCandidate<CudaConv2DBackwardArgs>>();
+                    var candidates = new List<ITunedKernelCandidate<TunedConv2DBackwardArgs>>();
                     if (s_convGemmBackward && s_convImplicitWgradEnv)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.implicit",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.implicit",
                             TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_wgrad_implicit_gemm"),
-                            (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaImplicit(a)) LaunchDwDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaImplicit(a)) LaunchDwDirect(a); }));
                     if (s_convGemmBackward && s_convEngineBackwardEnv)
                         foreach (int mainloop in ConvEngineMainloopsInOrder())
                         {
                             int ml = mainloop;
-                            candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>(
+                            candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>(
                                 "nvrtc.conv2d_dw.engine" + ConvMainloopSuffix(ml), TunedKernelOrigin.Builtin, true,
                                 _ => HasTunedKernel("conv2d_wgrad_ce128" + ConvMainloopSuffix(ml)),
-                                (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaEngine(a, ml)) LaunchDwDirect(a); }));
+                                (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaEngine(a, ml)) LaunchDwDirect(a); }));
                         }
                     if (s_convGemmBackward && ImplicitConvEnabled)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.implicit_narrow",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.implicit_narrow",
                             TunedKernelOrigin.Builtin, true, shape => HasTunedKernel("conv2d_weight_grad_implicit") && NarrowWgradAdmits(shape),
-                            (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaNarrow(a)) LaunchDwDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaNarrow(a)) LaunchDwDirect(a); }));
                     if (s_convGemmBackward)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("cublas.conv2d_dw.im2col_gemm",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("cublas.conv2d_dw.im2col_gemm",
                             TunedKernelOrigin.Vendor, true, _ => true,
-                            (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaIm2col(a)) LaunchDwDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardKernelViaIm2col(a)) LaunchDwDirect(a); }));
+                    // Rectangular engine tiles: Cout is the GEMM's row count and is often 64 while Cin*kH*kW reaches the
+                    // thousands, so 64 x 128 keeps the 8-wide column micro-tile without padding a 128-row tile; 128 x 64
+                    // suits few, long rows. Measured per call on an RTX 3080 (batch 8) against the implicit kernel: 64@32
+                    // 78.8 -> 65.0 us (64x128), 64->128 s2 46.4 -> 38.5 us (64x128), 512@4 69.3 -> 61.9 us (128x64).
+                    if (s_convGemmBackward && s_convEngineBackwardEnv && candidates.Count > 0)
+                        foreach (var (tileM, tileN) in new[] { (64, 128), (128, 64) })
+                        {
+                            int tm = tileM, tn = tileN;
+                            candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>(
+                                $"nvrtc.conv2d_dw.engine_{tm}x{tn}", TunedKernelOrigin.Builtin, true,
+                                _ => HasTunedKernel($"conv2d_wgrad_ce{tm}x{tn}"),
+                                (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardKernelEngineTiled(a, tm, tn, 0)) LaunchDwDirect(a); }));
+                        }
                     // Winograd F(3x3,2x2) weight gradient (16 GEMMs over 2x2 dY tiles, split along the tiles when the
                     // K x C grid is small). Registered after the references: it wins ResNet's 128- and 256-channel
                     // layers and loses where the tile count or the channel count is small.
                     if (candidates.Count > 0)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f32",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f32",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
-                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF32(a)) LaunchDwDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF32(a)) LaunchDwDirect(a); }));
                     // Winograd F(3x3,4x4): opt-in only (owner decision, #1335), like the F(4x4) input gradient.
                     if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f34",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f34",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradF43Module(),
-                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF34(a)) LaunchDwDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF34(a)) LaunchDwDirect(a); }));
                     if (candidates.Count == 0)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dw.direct", TunedKernelOrigin.Builtin,
-                            true, _ => HasTunedKernel("conv2d_backward_kernel"), (in CudaConv2DBackwardArgs a) => LaunchDwDirect(a)));
-                    _conv2DBackwardFilterSlot = new TunedKernelSlot<CudaConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardFilter,
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.direct", TunedKernelOrigin.Builtin,
+                            true, _ => HasTunedKernel("conv2d_backward_kernel"), (in TunedConv2DBackwardArgs a) => LaunchDwDirect(a)));
+                    _conv2DBackwardFilterSlot = new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardFilter,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
                 return Created(_conv2DBackwardFilterSlot);
@@ -135,7 +96,7 @@ public sealed partial class CudaBackend
         }
     }
 
-    internal TunedKernelSlot<CudaConv2DBackwardArgs> Conv2DBackwardDataSlot
+    internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardDataSlot
     {
         get
         {
@@ -146,41 +107,47 @@ public sealed partial class CudaBackend
                 {
                     // Reference first (see the weight-gradient slot): the engine (fastest stride-1 input gradient, but
                     // Cout % 8 == 0 only), then #1323's implicit GEMM, which takes every shape; direct only alone.
-                    var candidates = new List<ITunedKernelCandidate<CudaConv2DBackwardArgs>>();
+                    var candidates = new List<ITunedKernelCandidate<TunedConv2DBackwardArgs>>();
                     if (s_convGemmBackward && s_convEngineBackwardEnv)
                         foreach (int mainloop in ConvEngineMainloopsInOrder())
                         {
                             int ml = mainloop;
-                            candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>(
+                            candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>(
                                 "nvrtc.conv2d_dx.engine" + ConvMainloopSuffix(ml), TunedKernelOrigin.Builtin, true,
                                 shape => HasTunedKernel("conv2d_dgrad_ce128" + ConvMainloopSuffix(ml)) && shape[4] % ConvEngineTileK == 0,
-                                (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaEngine(a, ml)) LaunchDxDirect(a); }));
+                                (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaEngine(a, ml)) LaunchDxDirect(a); }));
                         }
                     if (s_convGemmBackward && s_convImplicitDgradEnv)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.implicit",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.implicit",
                             TunedKernelOrigin.Builtin, true, _ => HasTunedKernel("conv2d_dgrad_implicit_gemm"),
-                            (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaImplicit(a)) LaunchDxDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaImplicit(a)) LaunchDxDirect(a); }));
                     if (s_convGemmBackward)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("cublas.conv2d_dx.gemm_col2im",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("cublas.conv2d_dx.gemm_col2im",
                             TunedKernelOrigin.Vendor, true, _ => true,
-                            (in CudaConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaCol2im(a)) LaunchDxDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!Conv2DBackwardInputViaCol2im(a)) LaunchDxDirect(a); }));
                     // Winograd F(2x2,3x3) on the flipped, channel-transposed filter (cuDNN's input-gradient algorithm for
                     // ResNet's mid layers). Registered after the references: it loses where the tile count is small.
                     if (candidates.Count > 0)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
-                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23(a)) LaunchDxDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23(a)) LaunchDxDirect(a); }));
+                    // The same F(2x2) arithmetic fused into one kernel after the filter transform (cuDNN's input gradient for
+                    // ResNet's 32x32 and 16x16 layers): no V/M round trips through global memory.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f23_fused",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradFusedModule(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF23Fused(a)) LaunchDxDirect(a); }));
                     // Winograd F(4x4,3x3): registered ONLY under the explicit reduced-precision opt-in (owner decision,
                     // #1335): ~20x the fp32 rounding error of F(2x2). Unregistered otherwise, so the persisted-decision key
                     // differs between the two settings.
                     if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f43",
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.winograd_f43",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradF43Module(),
-                            (in CudaConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF43(a)) LaunchDxDirect(a); }));
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardDataWinogradF43(a)) LaunchDxDirect(a); }));
                     if (candidates.Count == 0)
-                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
-                            true, _ => HasTunedKernel("conv2d_backward_input"), (in CudaConv2DBackwardArgs a) => LaunchDxDirect(a)));
-                    _conv2DBackwardDataSlot = new TunedKernelSlot<CudaConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardData,
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dx.direct", TunedKernelOrigin.Builtin,
+                            true, _ => HasTunedKernel("conv2d_backward_input"), (in TunedConv2DBackwardArgs a) => LaunchDxDirect(a)));
+                    _conv2DBackwardDataSlot = new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardData,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
                 }
                 return Created(_conv2DBackwardDataSlot);
@@ -188,7 +155,7 @@ public sealed partial class CudaBackend
         }
     }
 
-    private CudaTunedKernelHarness<CudaConv2DBackwardArgs> BackwardHarness() =>
+    private CudaTunedKernelHarness<TunedConv2DBackwardArgs> BackwardHarness() =>
         new(this, ConvolutionTolerance,
             a => new[] { (a.Output, a.OutputCount) },
             a => a.Output.Handle == a.First.Handle || a.Output.Handle == a.Second.Handle);
@@ -205,51 +172,51 @@ public sealed partial class CudaBackend
 
     // Per-route entry points: the slot candidates above, and the tests and benchmark, which run one route regardless of
     // what the slot would pick. False when that route declines the shape; nothing is launched then.
-    internal bool Conv2DBackwardKernelViaEngine(in CudaConv2DBackwardArgs a) => Conv2DBackwardKernelViaEngine(a, ConvEngineMainloop);
+    internal bool Conv2DBackwardKernelViaEngine(in TunedConv2DBackwardArgs a) => Conv2DBackwardKernelViaEngine(a, ConvEngineMainloop);
 
-    internal bool Conv2DBackwardKernelViaEngine(in CudaConv2DBackwardArgs a, int mainloop) =>
+    internal bool Conv2DBackwardKernelViaEngine(in TunedConv2DBackwardArgs a, int mainloop) =>
         TryConv2DBackwardKernelEngine(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW, mainloop);
 
-    internal bool Conv2DBackwardKernelViaImplicit(in CudaConv2DBackwardArgs a) =>
+    internal bool Conv2DBackwardKernelViaImplicit(in TunedConv2DBackwardArgs a) =>
         TryConv2DBackwardKernelImplicitGemm(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW);
 
-    internal bool Conv2DBackwardKernelViaNarrow(in CudaConv2DBackwardArgs a) =>
+    internal bool Conv2DBackwardKernelViaNarrow(in TunedConv2DBackwardArgs a) =>
         TryConv2DBackwardKernelImplicitNarrow(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW);
 
-    internal bool Conv2DBackwardKernelViaIm2col(in CudaConv2DBackwardArgs a) =>
+    internal bool Conv2DBackwardKernelViaIm2col(in TunedConv2DBackwardArgs a) =>
         TryConv2DBackwardKernelIm2col(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW);
 
-    internal bool Conv2DBackwardInputViaEngine(in CudaConv2DBackwardArgs a) => Conv2DBackwardInputViaEngine(a, ConvEngineMainloop);
+    internal bool Conv2DBackwardInputViaEngine(in TunedConv2DBackwardArgs a) => Conv2DBackwardInputViaEngine(a, ConvEngineMainloop);
 
-    internal bool Conv2DBackwardInputViaEngine(in CudaConv2DBackwardArgs a, int mainloop) =>
+    internal bool Conv2DBackwardInputViaEngine(in TunedConv2DBackwardArgs a, int mainloop) =>
         TryConv2DBackwardInputEngine(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW, mainloop);
 
-    internal bool Conv2DBackwardInputViaImplicit(in CudaConv2DBackwardArgs a) =>
+    internal bool Conv2DBackwardInputViaImplicit(in TunedConv2DBackwardArgs a) =>
         TryConv2DBackwardInputImplicitGemm(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW);
 
-    internal bool Conv2DBackwardInputViaCol2im(in CudaConv2DBackwardArgs a) =>
+    internal bool Conv2DBackwardInputViaCol2im(in TunedConv2DBackwardArgs a) =>
         TryConv2DBackwardInputCol2im(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW);
 
-    private void LaunchDwDirect(in CudaConv2DBackwardArgs a) =>
+    private void LaunchDwDirect(in TunedConv2DBackwardArgs a) =>
         LaunchConv2DBackwardKernelDirect(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW);
 
-    private void LaunchDxDirect(in CudaConv2DBackwardArgs a) =>
+    private void LaunchDxDirect(in TunedConv2DBackwardArgs a) =>
         LaunchConv2DBackwardInputDirect(a.First, a.Second, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
             a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
             a.DilationH, a.DilationW);

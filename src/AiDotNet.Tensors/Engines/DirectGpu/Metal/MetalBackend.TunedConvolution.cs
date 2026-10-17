@@ -28,6 +28,10 @@ public sealed partial class MetalBackend
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("metal.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                             shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedKernel(TunedRowKernelTemplate.Im2ColName, 1),
                             (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
+                        // #1369: Winograd F(2x2,3x3) as transforms around one batched GEMM.
+                        new DelegateTunedKernelCandidate<TunedConv2DArgs>("metal.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
+                            shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) Conv2DDirect(a); }),
                     };
                     _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                         new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,

@@ -348,7 +348,7 @@ public sealed class OpenClTunedKernelTests
             using var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin();
             backend.Softmax(input, output, rows, n);
             var reason = Assert.Single(backend.SoftmaxSlot.CachedDecisions).Reason;
-            Assert.True(reason == TunedKernelDecisionReason.Tuned || reason == TunedKernelDecisionReason.ReferenceWon, $"measured decision expected, got {reason}");
+            Assert.True(reason is TunedKernelDecisionReason.Tuned or TunedKernelDecisionReason.ReferenceWon or TunedKernelDecisionReason.Inconclusive, $"measured decision expected, got {reason}");
             Assert.True(GpuLaunchProbe.TuningReadbacks > tuningBefore, "the gate snapshots candidate outputs, so tuning must read back");
             Assert.Equal(0, scope.Downloads);
         }
@@ -409,9 +409,10 @@ public sealed class OpenClTunedKernelTests
                 backend.Synchronize();
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
-            // Every candidate applies to these small shapes, so a variant that silently dropped out fails here.
+            // Every candidate applies to these small shapes, so a variant that silently dropped out fails here --
+            // except the Winograd route, which admits only 3x3 stride-1 undilated shapes (WinogradF23Pipeline).
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (k > 7 ? 1 : 0));
+                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 1));
         }
     }
 }

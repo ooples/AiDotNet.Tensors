@@ -32,12 +32,11 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
-            dilationH, dilationW);
-        var (wgX, wgY, wgZ) = CalcWorkgroups8x8(inWidth, inHeight, batch * inChannels);
-        Dispatch3Buffer3DAsync("Conv2DBackward", WebGpuKernels.Conv2DBackwardSource, "conv2d_backward_input",
-            gradOutput, kernel, gradInput, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
+        // Registry dispatch (#1372): the direct kernel or Winograd F(2x2,3x3), chosen per shape class.
+        var args = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardDataSlot.TryExecute(args.Shape(), args)) return;
+        LaunchDxDirect(args);
     }
 
     public void Conv2DBackwardKernel(IGpuBuffer input, IGpuBuffer gradOutput, IGpuBuffer gradKernel,
@@ -47,13 +46,11 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
-        // 1D dispatch: each thread computes one kernel weight gradient
-        int totalKernelElements = outChannels * inChannels * kernelH * kernelW;
-        var uniforms = MakeConvUniforms(batch, inChannels, outChannels,
-            inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
-            dilationH, dilationW);
-        Dispatch3BufferAsync("Conv2DBackwardKernel", WebGpuKernels.Conv2DBackwardKernelSource, "conv2d_backward_kernel",
-            input, gradOutput, gradKernel, uniforms, totalKernelElements).GetAwaiter().GetResult();
+        // Registry dispatch (#1372): the direct kernel or Winograd F(3x3,2x2), chosen per shape class.
+        var args = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (batch > 0 && outHeight > 0 && outWidth > 0 && Conv2DBackwardFilterSlot.TryExecute(args.Shape(), args)) return;
+        LaunchDwDirect(args);
     }
 
     public void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,

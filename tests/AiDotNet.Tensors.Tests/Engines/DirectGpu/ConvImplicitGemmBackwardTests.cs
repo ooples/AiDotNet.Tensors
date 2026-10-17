@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
 using Xunit.Abstractions;
@@ -80,7 +81,7 @@ public sealed class ConvImplicitGemmBackwardTests
         using var dW2 = backend.AllocateBuffer(outC * p);
         foreach (var target in new[] { dW1, dW2 })
         {
-            var a = new CudaConv2DBackwardArgs(dX, dDy, target, true, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+            var a = new TunedConv2DBackwardArgs(dX, dDy, target, true, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
             if (route == "public")
                 backend.Conv2DBackwardKernel(dX, dDy, target, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
             else
@@ -181,7 +182,7 @@ public sealed class ConvImplicitGemmBackwardTests
         Skip.If(route.StartsWith("engine") && outC % 8 != 0, "the engine input gradient needs Cout % 8 == 0");
         foreach (var target in new[] { dX1, dX2 })
         {
-            var a = new CudaConv2DBackwardArgs(dDy, dWt, target, false, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
+            var a = new TunedConv2DBackwardArgs(dDy, dWt, target, false, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
             if (route == "public")
                 backend.Conv2DBackwardInput(dDy, dWt, target, batch, inC, h, w, outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW);
             else
@@ -263,8 +264,8 @@ public sealed class ConvImplicitGemmBackwardTests
                     bool input = arm >= 5;
                     if ((path == 1 || path == 2) && !tc) continue;
                     if (input && !l.NeedsDx) continue;
-                    var da = new CudaConv2DBackwardArgs(dy, w, dx, false, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
-                    var wa = new CudaConv2DBackwardArgs(x, dy, dw, true, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
+                    var da = new TunedConv2DBackwardArgs(dy, w, dx, false, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
+                    var wa = new TunedConv2DBackwardArgs(x, dy, dw, true, batch, l.InC, l.Hw, l.Hw, l.OutC, outHw, outHw, l.K, l.K, l.S, l.S, l.P, l.P, 1, 1);
                     void Call()
                     {
                         bool ran = (input, path) switch

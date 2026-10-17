@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // NVRTC bindings for runtime CUDA kernel compilation.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -279,6 +280,38 @@ internal static class NvrtcNativeBindings
     {
         return Api.Version(out major, out minor);
     }
+
+    // Probed once, published safely: two first callers no longer race to assign different arrays.
+    private static readonly Lazy<(string Version, string[] Options)> s_jitCompatibility = new(ProbeJitCompatibility,
+        System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private static (string Version, string[] Options) ProbeJitCompatibility()
+    {
+        if (nvrtcVersion(out int major, out int minor) != NvrtcResult.Success) return ("nvrtc-unknown", Array.Empty<string>());
+        string version = "nvrtc-" + major.ToString(System.Globalization.CultureInfo.InvariantCulture) + "."
+            + minor.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return (version, major >= 13 ? new[] { "-default-device" } : Array.Empty<string>());
+    }
+
+    /// <summary>
+    /// The NVRTC version ("nvrtc-13.0"), part of the kernel cache key so a toolkit upgrade never loads cubins the previous
+    /// NVRTC produced.
+    /// </summary>
+    internal static string VersionTag => s_jitCompatibility.Value.Version;
+
+    /// <summary>
+    /// Options every runtime compile needs on this NVRTC, after the architecture: <c>-default-device</c> on NVRTC 13 and
+    /// later, nothing before.
+    /// </summary>
+    /// <remarks>
+    /// NVRTC 13 treats a function with no execution-space annotation as a host function, and refuses host functions in
+    /// JIT mode. Generic lambdas inside kernels (<c>auto store = [&amp;](auto as, auto bs)</c> in the conv engine, whose
+    /// shared-memory row stride differs between the FMA and tensor-core main loops) are such functions, so on a CUDA 13
+    /// toolkit the convolution module failed to compile and the whole CUDA backend came up unavailable -- silently, as a
+    /// device with no GPU. Runtime-compiled sources hold no host code at all, so making the device the default execution
+    /// space changes nothing else. Older NVRTCs keep exactly the options they had.
+    /// </remarks>
+    internal static IReadOnlyList<string> JitCompatibilityOptions => s_jitCompatibility.Value.Options;
 
     public static NvrtcResult nvrtcCreateProgram(
         ref IntPtr prog,

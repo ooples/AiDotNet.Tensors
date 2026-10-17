@@ -141,7 +141,7 @@ internal static class SparseSemiStructuredGpuDispatch
         try
         {
             string arch = $"--gpu-architecture=sm_{major}{minor}";
-            string[] options = new[] { arch };
+            string[] options = new[] { arch }.Concat(NvrtcNativeBindings.JitCompatibilityOptions).ToArray();
             var compileResult = NvrtcNativeBindings.nvrtcCompileProgram(program, options.Length, options);
             if (compileResult != NvrtcResult.Success)
                 throw new InvalidOperationException($"nvrtcCompileProgram failed: {compileResult}");

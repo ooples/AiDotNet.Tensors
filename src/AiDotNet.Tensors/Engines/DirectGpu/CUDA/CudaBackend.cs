@@ -958,10 +958,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// <summary>
     /// Computes a hash key for the kernel cache based on source code and compilation options.
     /// </summary>
-    private static string ComputeCacheKey(string source, string compileOptions)
+    private static string ComputeCacheKey(string source, string arch, bool useFastMath)
     {
         using var sha = System.Security.Cryptography.SHA256.Create();
-        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(source + "|" + compileOptions));
+        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(
+            source + "|" + arch + "|fastMath=" + useFastMath));
         return BitConverter.ToString(hash).Replace("-", "").Substring(0, 32);
     }
 
@@ -997,25 +998,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         var (major, minor) = GetComputeCapability(device);
         string arch = $"--gpu-architecture=sm_{major}{minor}";
+        IReadOnlyList<string> jitOptions = NvrtcNativeBindings.JitCompatibilityOptions;
 
-        // Kernel sources hold device code only, so an unannotated function is a device function: NVRTC 13 treats one
-        // as a host function and rejects it in JIT mode, which the generic lambdas the conv-engine mainloops take
-        // (`auto store = [&](auto as, auto bs)`) are -- the whole convolution module then failed to compile,
-        // CompileAllKernels threw, and the backend reported CUDA unavailable on a working GPU (CUDA 13.1, GTX 1660 Ti),
-        // every caller falling back to OpenCL.
-        var optionsList = new List<string> { arch, "--device-as-default-execution-space" };
-        if (useFastMath)
-            optionsList.Add("--use_fast_math");
-        var cudaInclude = GetCudaIncludePath();
-        if (cudaInclude != null)
-            optionsList.Add($"--include-path={cudaInclude}");
-        string[] options = optionsList.ToArray();
-
-        // Try loading from disk cache first. The key covers every compile option, not just the architecture: a cubin
-        // built under other options is a different binary (and one built while the module compiled can hide that it
-        // no longer does).
+        // Try loading from disk cache first. The key covers every option that changes the binary, and the NVRTC version,
+        // so cubins from a previous toolkit are never loaded after an upgrade.
         string? cacheDir = GetKernelCacheDirectory();
-        string cacheKey = ComputeCacheKey(source, string.Join(" ", options));
+        string cacheKey = ComputeCacheKey(source,
+            string.Join(" ", new[] { arch, NvrtcNativeBindings.VersionTag }.Concat(jitOptions)), useFastMath);
         string? cacheFile = cacheDir != null ? Path.Combine(cacheDir, $"{moduleName}_{cacheKey}.cubin") : null;
 
         if (cacheFile != null && File.Exists(cacheFile))
@@ -1055,6 +1044,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         // Compile with NVRTC
+        var optionsList = new List<string> { arch };
+        optionsList.AddRange(jitOptions);
+        if (useFastMath)
+            optionsList.Add("--use_fast_math");
+        var cudaInclude = GetCudaIncludePath();
+        if (cudaInclude != null)
+            optionsList.Add($"--include-path={cudaInclude}");
+
+        string[] options = optionsList.ToArray();
+
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(
             ref program, source, moduleName + ".cu", 0, IntPtr.Zero, IntPtr.Zero);
@@ -7061,7 +7060,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // #1325: per-shape route through the tuned-kernel slot; the fixed chain below when the slot has none.
         if (batch > 0 && outHeight > 0 && outWidth > 0)
         {
-            var tuned = new CudaConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
+            var tuned = new TunedConv2DBackwardArgs(gradOutput, kernel, gradInput, false, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
             if (Conv2DBackwardDataSlot.TryExecute(tuned.Shape(), tuned)) return;
         }
@@ -7120,7 +7119,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // #1325: per-shape route through the tuned-kernel slot; the fixed chain below when the slot has none.
         if (batch > 0 && outHeight > 0 && outWidth > 0)
         {
-            var tuned = new CudaConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
+            var tuned = new TunedConv2DBackwardArgs(input, gradOutput, gradKernel, true, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
             if (Conv2DBackwardFilterSlot.TryExecute(tuned.Shape(), tuned)) return;
         }
