@@ -38,21 +38,46 @@ internal static class GpuDriverCrossPlatformResolver
 
     private static IntPtr Resolve(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
     {
-        string[]? candidates = MapToPlatformCandidates(libraryName);
-        if (candidates is null)
-            return IntPtr.Zero;
-
-        foreach (var candidate in candidates)
+        foreach (var candidate in LoadOrder(libraryName))
         {
-            // Skip the name the loader is already trying — returning Zero lets the
-            // default search handle it; we only add the cross-OS aliases.
-            if (string.Equals(candidate, libraryName, StringComparison.Ordinal))
-                continue;
             if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out var handle))
                 return handle;
         }
         return IntPtr.Zero;
     }
+
+    /// <summary>
+    /// The names <see cref="Resolve"/> tries, in order, for a requested library; empty when the name is not one of ours.
+    /// </summary>
+    /// <remarks>
+    /// The requested name itself is normally left out: returning Zero lets the default search handle it, and the
+    /// resolver only adds the cross-OS aliases. NVRTC is the exception. Its bindings are one class per version
+    /// (NvrtcNativeBindings.ResolveApi probes them newest first), and the version the loaded library reports picks the
+    /// compile options (-default-device on 13+). A registered resolver runs BEFORE the default search, so offering the
+    /// 13 binding an older alias first meant a CUDA 12 NVRTC anywhere on PATH (PyTorch's torch/lib) answered for
+    /// "nvrtc64_130_0" with 13 installed: the probe read 12.6, dropped -default-device, NVRTC 13 never loaded, and
+    /// the CUDA backend came up unavailable. So for NVRTC the exact name is tried first.
+    /// </remarks>
+    internal static string[] LoadOrder(string libraryName)
+    {
+        string[]? candidates = MapToPlatformCandidates(libraryName);
+        if (candidates is null)
+            return Array.Empty<string>();
+
+        var order = new System.Collections.Generic.List<string>(candidates.Length);
+        bool exactFirst = IsNvrtc(libraryName) && Array.IndexOf(candidates, libraryName) >= 0;
+        if (exactFirst) order.Add(libraryName);
+        foreach (var candidate in candidates)
+        {
+            if (!string.Equals(candidate, libraryName, StringComparison.Ordinal))
+                order.Add(candidate);
+        }
+        return order.ToArray();
+    }
+
+    private static bool IsNvrtc(string libraryName) =>
+        libraryName.StartsWith("nvrtc64_", StringComparison.Ordinal) ||
+        libraryName.StartsWith("libnvrtc", StringComparison.Ordinal);
 
     /// <summary>
     /// Returns the current platform's candidate names for a known GPU library alias,
@@ -66,10 +91,9 @@ internal static class GpuDriverCrossPlatformResolver
         if (libraryName is "nvcuda" or "libcuda" or "libcuda.so.1" or "libcuda.so")
             return windows ? ["nvcuda"] : ["libcuda.so.1", "libcuda.so"];
 
-        // NVRTC (runtime compiler) — newest first; exact-version probing still happens
-        // upstream in NvrtcNativeBindings.ResolveApi, this is the cross-OS fallback.
-        if (libraryName.StartsWith("nvrtc64_", StringComparison.Ordinal) ||
-            libraryName.StartsWith("libnvrtc", StringComparison.Ordinal))
+        // NVRTC (runtime compiler) — newest first, tried only after the exact requested name (see Resolve);
+        // this is the cross-OS and missing-version fallback.
+        if (IsNvrtc(libraryName))
         {
             return windows
                 ? ["nvrtc64_130_0", "nvrtc64_120_0", "nvrtc64_12", "nvrtc64_118_0", "nvrtc64_112_0"]
