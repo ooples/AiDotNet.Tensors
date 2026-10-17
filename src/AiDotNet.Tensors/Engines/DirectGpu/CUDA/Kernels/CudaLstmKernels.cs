@@ -972,6 +972,7 @@ __device__ __forceinline__ void lstm_forward_recurrence_reg_body(
     const float bias = biasIh[k] + biasHh[k];
 
     const int cb = k / H, cj = k - cb * H;
+    const int gateBlock = cb;   // thread k's gate row is in block k / H: 0 i, 1 f, 2 g, 3 o
     const bool cell = cb < BB && b0 + cb < batch;
     const int cgid = (b0 + cb) * H + cj;
     float c = 0.0f;
@@ -986,7 +987,7 @@ __device__ __forceinline__ void lstm_forward_recurrence_reg_body(
 
     for (int t = 0; t < timeSteps; t++) {
         // Independent partial sums keep the FMA chain short when BB is small.
-        constexpr int P = BB >= 4 ? 1 : 4 / BB;
+        constexpr int P = BB >= 4 ? 2 : 8 / BB;
         float acc[BB][P];
 #pragma unroll
         for (int bb = 0; bb < BB; bb++) {
@@ -1016,15 +1017,17 @@ __device__ __forceinline__ void lstm_forward_recurrence_reg_body(
             float s = acc[bb][0];
 #pragma unroll
             for (int p = 1; p < P; p++) s += acc[bb][p];
-            pre[bb][k] = s;
+            // Each gate row applies its own activation here, on all 4H threads, rather than the H cell threads
+            // applying all four after the barrier: the serial part of a step keeps only the cell update and tanh(c).
+            pre[bb][k] = gateBlock == 2 ? lstm_tanh(s) : sigmoid(s);
         }
-        __syncthreads();   // every preactivation is in pre, and every thread has read hs for this step
+        __syncthreads();   // every activated gate is in pre, and every thread has read hs for this step
 
         if (cell) {
-            float f = sigmoid(pre[cb][H + cj]);
-            float i_gate = sigmoid(pre[cb][cj]);
-            float g = lstm_tanh(pre[cb][2 * H + cj]);
-            float o = sigmoid(pre[cb][3 * H + cj]);
+            float f = pre[cb][H + cj];
+            float i_gate = pre[cb][cj];
+            float g = pre[cb][2 * H + cj];
+            float o = pre[cb][3 * H + cj];
             c = f * c + i_gate * g;
             float h = o * lstm_tanh(c);
             hs[cb][cj] = h;
