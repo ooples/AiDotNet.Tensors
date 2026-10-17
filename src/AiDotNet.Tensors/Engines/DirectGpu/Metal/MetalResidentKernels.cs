@@ -801,24 +801,23 @@ kernel void split_fft_strided_serial(
             outputReal[b] = re; outputImag[b] = im;
         }
     }
+    // Each twiddle is evaluated directly. Building them by repeated multiplication by a per-stage step compounds
+    // the step's rounding over span/2 products: a one-ulp step error reached ~0.026 at length 1024, which is the
+    // transform Bluestein runs for n = 257.
     float sign = inverse != 0u ? 1.0f : -1.0f;
     for (uint span = 2u; span <= length; span <<= 1u) {
-        float angle = sign * 2.0f * 3.14159265358979323846f / float(span);
-        float stepReal = cos(angle), stepImag = sin(angle);
         for (uint start = 0u; start < length; start += span) {
-            float currentReal = 1.0f, currentImag = 0.0f;
             for (uint j = 0u; j < span / 2u; ++j) {
+                float angle = sign * 2.0f * 3.14159265358979323846f * (float(j) / float(span));
+                float twiddleReal = precise::cos(angle), twiddleImag = precise::sin(angle);
                 uint even = base + (start + j) * elementStride;
                 uint odd = base + (start + j + span / 2u) * elementStride;
                 float oddReal = outputReal[odd], oddImag = outputImag[odd];
-                float productReal = currentReal * oddReal - currentImag * oddImag;
-                float productImag = currentReal * oddImag + currentImag * oddReal;
+                float productReal = twiddleReal * oddReal - twiddleImag * oddImag;
+                float productImag = twiddleReal * oddImag + twiddleImag * oddReal;
                 float evenReal = outputReal[even], evenImag = outputImag[even];
                 outputReal[odd] = evenReal - productReal; outputImag[odd] = evenImag - productImag;
                 outputReal[even] = evenReal + productReal; outputImag[even] = evenImag + productImag;
-                float nextReal = currentReal * stepReal - currentImag * stepImag;
-                currentImag = currentReal * stepImag + currentImag * stepReal;
-                currentReal = nextReal;
             }
         }
     }
