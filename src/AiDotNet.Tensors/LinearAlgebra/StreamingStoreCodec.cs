@@ -995,15 +995,6 @@ internal static class StreamingStoreCodec
         }
     }
 
-    private static int DeflateDecompress(byte[] comp, byte[] dst, int dstLen)
-    {
-        using var ms = new MemoryStream(comp);
-        using var ds = new DeflateStream(ms, CompressionMode.Decompress);
-        int read = 0, r;
-        while (read < dstLen && (r = ds.Read(dst, read, dstLen - read)) > 0) read += r;
-        return read;
-    }
-
     // DEFLATE (zlib's raw deflate) is the entropy coder: unlike LZ4 (match-only, no entropy
     // stage → ~1.08x on shuffled fp weights), Deflate's Huffman stage compresses the highly
     // repetitive sign/exponent byte-plane that the shuffle exposes → ~1.18x, bit-exact, at
@@ -1022,7 +1013,10 @@ internal static class StreamingStoreCodec
         // MemoryStream..ctor, then, once a redundant copy was removed upstream in WeightRegistry,
         // one allocation later at MemoryStream.ToArray. Writing the tag into the stream ahead of the
         // compressed bytes removes the prepend copy too, leaving the stream buffer and one ToArray.
-        using var ms = new MemoryStream((raw.Length - (raw.Length >> 3)) + LosslessTagLength);
+        // The stream buffer is pooled chunks now, so ToArray is the only allocation: a streamed
+        // training weight is re-encoded every time it is shed, and that buffer was the larger half
+        // of the garbage the write-back produced (#2322).
+        using var ms = new PooledChunkWriteStream();
         ms.WriteByte(DeflateCompressedTag);
         using (var ds = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true))
             WriteShuffledPlanes(raw, elem, ds);
@@ -1048,21 +1042,73 @@ internal static class StreamingStoreCodec
         int shuffledLen = dstRaw.Length;
         byte flag = src[0];
         var payload = src.Slice(LosslessTagLength);
-        byte[] shuffled;
         if (flag == DeflateCompressedTag)
         {
-            shuffled = new byte[shuffledLen];
-            int dec = DeflateDecompress(payload.ToArray(), shuffled, shuffledLen);
+            // Inflate straight from the caller's bytes into the destination. This runs on every
+            // re-materialization of a streamed training weight, so the copy of the compressed
+            // payload and the full-size shuffled intermediate it used to make were most of the
+            // garbage a training step produced (#2322).
+            int dec = payload.IsEmpty ? 0 : InflateShuffledPlanes(payload, dstRaw, elem);
             if (dec != shuffledLen)
                 throw new InvalidOperationException($"Lossless decode: Deflate produced {dec} bytes, expected {shuffledLen}.");
         }
         else
         {
-            shuffled = payload.ToArray();
-            if (shuffled.Length != shuffledLen)
-                throw new InvalidOperationException($"Lossless decode: raw payload {shuffled.Length} bytes, expected {shuffledLen}.");
+            if (payload.Length != shuffledLen)
+                throw new InvalidOperationException($"Lossless decode: raw payload {payload.Length} bytes, expected {shuffledLen}.");
+            BytePlaneUnshuffle(payload, dstRaw, elem);
         }
-        BytePlaneUnshuffle(shuffled, dstRaw, elem);
+    }
+
+    private static unsafe int InflateShuffledPlanes(ReadOnlySpan<byte> payload, Span<byte> dst, int elem)
+    {
+        fixed (byte* p = payload)
+        {
+            using var ms = new UnmanagedMemoryStream(p, payload.Length);
+            using var ds = new DeflateStream(ms, CompressionMode.Decompress);
+            return ReadShuffledPlanes(ds, dst, elem);
+        }
+    }
+
+    // The inverse of WriteShuffledPlanes: reads the plane-major stream a tile at a time through a
+    // small pooled buffer and scatters each tile into its byte plane of dst. Returns the number of
+    // bytes read, which falls short of dst.Length only when the stream ends early. Like
+    // BytePlaneUnshuffle, it leaves a partial trailing element of dst untouched.
+    private static int ReadShuffledPlanes(Stream src, Span<byte> dst, int elem)
+    {
+        int count = dst.Length / elem;
+        int tile = Math.Max(elem, Math.Min(count, ShuffleTileElems));
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(tile);
+        int total = 0;
+        try
+        {
+            for (int k = 0; k < elem; k++)
+            {
+                for (int i0 = 0; i0 < count; i0 += tile)
+                {
+                    int n = Math.Min(tile, count - i0);
+                    int got = ReadUpTo(src, buffer, n);
+                    total += got;
+                    if (got < n) return total;
+                    for (int i = 0; i < n; i++) dst[(i0 + i) * elem + k] = buffer[i];
+                }
+            }
+
+            int tail = dst.Length - count * elem;
+            if (tail > 0) total += ReadUpTo(src, buffer, tail);
+            return total;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private static int ReadUpTo(Stream src, byte[] buffer, int count)
+    {
+        int read = 0, r;
+        while (read < count && (r = src.Read(buffer, read, count - read)) > 0) read += r;
+        return read;
     }
 
     // ── Test hooks (InternalsVisibleTo) — exercise the shuffle transform directly so tests
