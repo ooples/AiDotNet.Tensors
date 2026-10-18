@@ -17826,7 +17826,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (normalizedAxes.Length == input.Rank && input.IsContiguous && input.Length > 0)
             {
                 using var source = GetOrAllocateBuffer(backend, input);
-                var output = AllocateOutputBuffer(backend, 1);
+                var output = AllocateFullyWrittenOutputBuffer(backend, 1);   // MeanAxis writes it: no zero-fill node
                 bool handedOff = false;
                 try
                 {
