@@ -20974,8 +20974,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal bool TryMatMulWeightGradient2D<T>(Tensor<T> gradOutput, Tensor<T> a, int n, out Tensor<T>? gradB,
         Tensor<T>? intoB = null, bool addIntoB = false)
+        => TryMatMulWeightGradient2D(gradOutput, a, n, out gradB, intoB, addIntoB, null, false, out _);
+
+    /// <summary>As the overload above, with the bias gradient landed in <paramref name="intoBias"/> by the same launch
+    /// where the backend serves it (<paramref name="biasWritten"/>), as in the bias overload of
+    /// <see cref="TryMatMulBackward2D{T}(Tensor{T}, Tensor{T}, Tensor{T}, out Tensor{T}?, out Tensor{T}?, Tensor{T}?, bool, Tensor{T}?, bool, Tensor{T}?, bool, out bool)"/>.</summary>
+    internal bool TryMatMulWeightGradient2D<T>(Tensor<T> gradOutput, Tensor<T> a, int n, out Tensor<T>? gradB,
+        Tensor<T>? intoB, bool addIntoB, Tensor<T>? intoBias, bool addIntoBias, out bool biasWritten)
     {
         gradB = null;
+        biasWritten = false;
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
         if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA) return false;
         if (a.Rank != 2 || gradOutput.Rank != 2) return false;
@@ -20991,12 +20999,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var bufA = ResolveResidentBufferNoUpload(backend, a, M * K);
                 if (bufG is null || bufA is null) return false;
                 var targetBufB = ResolveDirectGradTarget(backend, intoB, K * n, bufG, bufA, null);
+                var targetBias = backend is DirectGpu.IWeightBiasGradientBackend
+                    ? ResolveDirectGradTarget(backend, intoBias, n, bufG, bufA, null) : null;
+                if (targetBias is not null && targetBias.Handle == targetBufB?.Handle) targetBias = null;
                 var outB = targetBufB is null ? new Tensor<T>(new T[(long)K * n], new[] { K, n }) : intoB;
                 if (outB is null) return false;
                 var outBufB = targetBufB ?? GetOrCreateResidentBuffer(backend, outB, K * n, fullyWritten: true);
                 if (outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * n) return false;
-                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, n, M, 1f, targetBufB is not null && addIntoB ? 1f : 0f);
+                float betaB = targetBufB is not null && addIntoB ? 1f : 0f;
+                biasWritten = targetBias is not null
+                    && ((DirectGpu.IWeightBiasGradientBackend)backend).TryWeightAndBiasGradient(bufA, bufG, outBufB, targetBias,
+                        K, n, M, betaB, addIntoBias ? 1f : 0f);
+                if (!biasWritten) transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, n, M, 1f, betaB);
                 ResidentSyncCheck("MatMulWeightGradient2D");
+                if (biasWritten)
+                {
+                    intoBias!.IncrementVersion();
+                    BindResidentBuffer(intoBias, targetBias!, backend);
+                }
                 if (targetBufB is not null) outB.IncrementVersion();
                 BindResidentBuffer(outB, outBufB, backend);
                 gradB = outB;

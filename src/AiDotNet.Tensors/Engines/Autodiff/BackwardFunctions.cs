@@ -7127,7 +7127,8 @@ internal static class BackwardFunctions<T>
                         gpuDone = true;
                     }
                     else if (!needsInputGradient && needsWeightGradient
-                        && gpuLinear.TryMatMulWeightGradient2D(gFlat, iFlat, N, out var gpuWeightOnly, intoWeight, addWeight)
+                        && gpuLinear.TryMatMulWeightGradient2D(gFlat, iFlat, N, out var gpuWeightOnly, intoWeight, addWeight,
+                            intoBiasFused, addBiasFused, out biasLanded)
                         && gpuWeightOnly is not null)
                     {
                         weightGradFast = gpuWeightOnly;
