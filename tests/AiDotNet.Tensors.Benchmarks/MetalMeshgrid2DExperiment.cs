@@ -73,11 +73,7 @@ internal static class MetalMeshgrid2DExperiment
                         grids[0].Dispose();
                         grids[1].Dispose();
                     }
-                    // The macOS runner's GPU is virtualized: at the default 5 ms batches its preemption swung the paired
-                    // ratio 11-42%. Longer batches and more brackets average that jitter out; the stability threshold
-                    // itself is unchanged.
-                    var pair = StableTimer.MeasureCalibratedHostPair(Composed, backend.Synchronize, Fused, backend.Synchronize,
-                        maxAttempts: 30, targetBatchMilliseconds: 50.0, bracketsPerAttempt: 9);
+                    var pair = StableTimer.MeasureCalibratedHostPair(Composed, backend.Synchronize, Fused, backend.Synchronize);
                     bool promoted = pair.Stable && pair.Ratio >= PromotionSpeedup;
                     allPromoted &= promoted;
                     Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0,-12} {1,-5} {2,-14} {3,-14} {4,-8} {5,-7} {6}",
