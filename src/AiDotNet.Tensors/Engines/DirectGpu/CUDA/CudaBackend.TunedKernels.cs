@@ -207,6 +207,7 @@ public sealed partial class CudaBackend
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _tuneStartEvent, 0), "cuEventCreate(tune)");
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _tuneEndEvent, 0), "cuEventCreate(tune)");
             }
+            if (TryMeasureCapturedMilliseconds(run, repetitions, out double captured)) return captured;
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneStartEvent, _stream), "cuEventRecord(tune)");
             for (int i = 0; i < repetitions; i++) run();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneEndEvent, _stream), "cuEventRecord(tune)");
@@ -214,6 +215,50 @@ public sealed partial class CudaBackend
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuEventElapsedTime(out float ms, _tuneStartEvent, _tuneEndEvent), "cuEventElapsedTime(tune)");
             return ms;
+        }
+    }
+
+    // Set false to time candidates as eager launches (the previous behaviour), e.g. to compare the two.
+    private static readonly bool s_tuneInCapturedGraph =
+        Environment.GetEnvironmentVariable("AIDOTNET_TUNE_CAPTURED") != "0";
+
+    /// <summary>
+    /// The candidate's repetitions captured into one CUDA graph and timed as a single replay (after one warm replay):
+    /// device time with no per-launch host cost between the candidate's kernels, as a compiled training step's captured
+    /// graph runs them. Eager timing charged a multi-kernel candidate the WDDM launch overhead of each of its kernels -
+    /// the four-kernel Winograd weight gradient measured 63.8 us per call there and runs 46.5 us inside the ResNet-18
+    /// step, so the slot preferred single-kernel candidates that are slower in the step. False (the caller times eagerly)
+    /// where capture is unavailable, the stream is already capturing, or the candidate cannot be captured.
+    /// </summary>
+    private bool TryMeasureCapturedMilliseconds(Action run, int repetitions, out double milliseconds)
+    {
+        milliseconds = 0;
+        if (!s_tuneInCapturedGraph || IsStreamCapturing()) return false;
+        IntPtr exec;
+        try
+        {
+            exec = CaptureGraph(() => { for (int i = 0; i < repetitions; i++) run(); });
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            return false;
+        }
+        if (exec == IntPtr.Zero) return false;
+        try
+        {
+            LaunchCapturedGraph(exec);   // warm: first replay uploads the graph
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneStartEvent, _stream), "cuEventRecord(tune)");
+            LaunchCapturedGraph(exec);
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneEndEvent, _stream), "cuEventRecord(tune)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventSynchronize(_tuneEndEvent), "cuEventSynchronize(tune)");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuEventElapsedTime(out float ms, _tuneStartEvent, _tuneEndEvent), "cuEventElapsedTime(tune)");
+            milliseconds = ms;
+            return true;
+        }
+        finally
+        {
+            DestroyCapturedGraph(exec);
         }
     }
 
