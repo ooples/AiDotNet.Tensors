@@ -76,7 +76,8 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
         void** args = stackalloc void*[10];
         args[0] = &a; args[1] = &b; args[2] = &c; args[3] = &m; args[4] = &n; args[5] = &k; args[6] = &al; args[7] = &be;
         args[8] = &bi; args[9] = &bb;
-        LaunchKernel2D(wgradKernel, (uint)((N + 15) / 16), (uint)((M + 15) / 16), 1, 256, 1, args);
+        // One more row of blocks for the bias sums.
+        LaunchKernel2D(wgradKernel, (uint)((N + 15) / 16), (uint)((M + 15) / 16 + (bias is null ? 0 : 1)), 1, 256, 1, args);
         return true;
     }
 

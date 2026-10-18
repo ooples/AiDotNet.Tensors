@@ -145,8 +145,8 @@ extern ""C"" __global__ __launch_bounds__(SG_THREADS) void skinny_gemm(
 // columns is staged in shared memory (one float4 of each per thread, the next chunk's loaded into registers while
 // this one is used); group g accumulates rows [16g, 16g + 16) of every chunk into its 2x2 outputs per thread, and the
 // four groups' partial tiles are added in group order at the end (deterministic). With bias (a linear layer's dY as B),
-// the first row of blocks also sums its staged B columns: bias[n] = sum_k B[k][n] (+ biasBeta * bias[n]), every thread
-// summing 4 rows of every chunk for one column, the 16 partials per column added in order.
+// one extra row of blocks, running beside the tiles, writes bias[n] = sum_k B[k][n] (+ biasBeta * bias[n]): each thread
+// sums one float4 column quad over every 64th row, and the 64 row lanes are added by a fixed shared-memory tree.
 extern ""C"" __global__ __launch_bounds__(256) void wgrad_tile_tn(
     const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
     int M, int N, int K, float alpha, float beta, float* __restrict__ bias, float biasBeta)
@@ -154,12 +154,42 @@ extern ""C"" __global__ __launch_bounds__(256) void wgrad_tile_tn(
     __shared__ float4 sA[64][4];
     __shared__ float4 sB[64][4];
     __shared__ float4 red[3][64];
-    __shared__ float biasPart[256];
     int tid = threadIdx.x;
     int m0 = blockIdx.y * 16, n0 = blockIdx.x * 16;
+    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (bias != 0 && blockIdx.y == gridDim.y - 1)
+    {
+        int lane = tid >> 2, q = tid & 3, col4 = n0 + q * 4;
+        float4 s = zero;
+        if (col4 < N)
+            #pragma unroll 4
+            for (int r = lane; r < K; r += 64)
+            {
+                float4 v = *reinterpret_cast<const float4*>(B + (long long)r * N + col4);
+                s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
+            }
+        sB[lane][q] = s;
+        __syncthreads();
+        for (int half = 32; half > 0; half >>= 1)
+        {
+            if (lane < half)
+            {
+                float4 o = sB[lane + half][q];
+                s.x += o.x; s.y += o.y; s.z += o.z; s.w += o.w;
+                sB[lane][q] = s;
+            }
+            __syncthreads();
+        }
+        int col = n0 + tid;
+        if (tid < 16 && col < N)
+        {
+            float v = reinterpret_cast<const float*>(&sB[0][0])[tid];
+            bias[col] = biasBeta != 0.0f ? v + biasBeta * bias[col] : v;
+        }
+        return;
+    }
     int loadRow = tid >> 2, loadQ = tid & 3;
     int am = m0 + loadQ * 4, bn = n0 + loadQ * 4;
-    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 pa = zero, pb = zero;
     if (loadRow < K)
     {
@@ -168,8 +198,6 @@ extern ""C"" __global__ __launch_bounds__(256) void wgrad_tile_tn(
     }
     int g = tid >> 6, t = tid & 63, ty = t >> 3, tx = t & 7;
     float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
-    const bool sumsBias = bias != 0 && blockIdx.y == 0;
-    float bsum = 0.0f;
     for (int r0 = 0; r0 < K; r0 += 64)
     {
         sA[loadRow][loadQ] = pa;
@@ -191,26 +219,7 @@ extern ""C"" __global__ __launch_bounds__(256) void wgrad_tile_tn(
             c00 = fmaf(a.x, b.x, c00); c01 = fmaf(a.x, b.y, c01);
             c10 = fmaf(a.y, b.x, c10); c11 = fmaf(a.y, b.y, c11);
         }
-        if (sumsBias)
-        {
-            // Column tid & 15 over rows [4 * (tid >> 4), +4) of this chunk (rows past K are staged as zero).
-            #pragma unroll
-            for (int i = 0; i < 4; i++) bsum += reinterpret_cast<const float*>(&sB[(tid >> 4) * 4 + i][0])[tid & 15];
-        }
         __syncthreads();
-    }
-    if (sumsBias)
-    {
-        biasPart[tid] = bsum;
-        __syncthreads();
-        int col = n0 + tid;
-        if (tid < 16 && col < N)
-        {
-            float v = 0.0f;
-            #pragma unroll
-            for (int q = 0; q < 16; q++) v += biasPart[q * 16 + tid];
-            bias[col] = biasBeta != 0.0f ? v + biasBeta * bias[col] : v;
-        }
     }
     if (g > 0) red[g - 1][t] = make_float4(c00, c01, c10, c11);
     __syncthreads();
