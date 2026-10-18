@@ -144,14 +144,17 @@ extern ""C"" __global__ __launch_bounds__(SG_THREADS) void skinny_gemm(
 // launches, ~5 us). Block = one 16x16 output tile, four 64-thread groups. Each 64-row chunk of the tile's A and B
 // columns is staged in shared memory (one float4 of each per thread, the next chunk's loaded into registers while
 // this one is used); group g accumulates rows [16g, 16g + 16) of every chunk into its 2x2 outputs per thread, and the
-// four groups' partial tiles are added in group order at the end (deterministic).
+// four groups' partial tiles are added in group order at the end (deterministic). With bias (a linear layer's dY as B),
+// the first row of blocks also sums its staged B columns: bias[n] = sum_k B[k][n] (+ biasBeta * bias[n]), 64 threads
+// each summing 16 rows of every chunk for one column, the four partials added in order.
 extern ""C"" __global__ __launch_bounds__(256) void wgrad_tile_tn(
     const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
-    int M, int N, int K, float alpha, float beta)
+    int M, int N, int K, float alpha, float beta, float* __restrict__ bias, float biasBeta)
 {
     __shared__ float4 sA[64][4];
     __shared__ float4 sB[64][4];
     __shared__ float4 red[3][64];
+    __shared__ float biasPart[64];
     int tid = threadIdx.x;
     int m0 = blockIdx.y * 16, n0 = blockIdx.x * 16;
     int loadRow = tid >> 2, loadQ = tid & 3;
@@ -165,6 +168,8 @@ extern ""C"" __global__ __launch_bounds__(256) void wgrad_tile_tn(
     }
     int g = tid >> 6, t = tid & 63, ty = t >> 3, tx = t & 7;
     float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
+    const bool sumsBias = bias != 0 && blockIdx.y == 0 && tid < 64;
+    float bsum = 0.0f;
     for (int r0 = 0; r0 < K; r0 += 64)
     {
         sA[loadRow][loadQ] = pa;
@@ -186,7 +191,24 @@ extern ""C"" __global__ __launch_bounds__(256) void wgrad_tile_tn(
             c00 = fmaf(a.x, b.x, c00); c01 = fmaf(a.x, b.y, c01);
             c10 = fmaf(a.y, b.x, c10); c11 = fmaf(a.y, b.y, c11);
         }
+        if (sumsBias)
+        {
+            // Column tid & 15 over rows [16 * (tid >> 4), +16) of this chunk (rows past K are staged as zero).
+            #pragma unroll
+            for (int i = 0; i < 16; i++) bsum += reinterpret_cast<const float*>(&sB[(tid >> 4) * 16 + i][0])[tid & 15];
+        }
         __syncthreads();
+    }
+    if (bias != 0 && blockIdx.y == 0)
+    {
+        if (tid < 64) biasPart[tid] = bsum;
+        __syncthreads();
+        int col = n0 + tid;
+        if (tid < 16 && col < N)
+        {
+            float v = biasPart[tid] + biasPart[16 + tid] + biasPart[32 + tid] + biasPart[48 + tid];
+            bias[col] = biasBeta != 0.0f ? v + biasBeta * bias[col] : v;
+        }
     }
     if (g > 0) red[g - 1][t] = make_float4(c00, c01, c10, c11);
     __syncthreads();

@@ -20821,9 +20821,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryMatMulBackward2D<T>(
         Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, out Tensor<T>? gradA, out Tensor<T>? gradB,
         Tensor<T>? intoA = null, bool addIntoA = false, Tensor<T>? intoB = null, bool addIntoB = false)
+        => TryMatMulBackward2D(gradOutput, a, b, out gradA, out gradB, intoA, addIntoA, intoB, addIntoB, null, false, out _);
+
+    /// <summary>
+    /// <see cref="TryMatMulBackward2D{T}(Tensor{T}, Tensor{T}, Tensor{T}, out Tensor{T}?, out Tensor{T}?, Tensor{T}?, bool, Tensor{T}?, bool)"/>
+    /// for a linear layer whose bias gradient accumulator is <paramref name="intoBias"/>: in a resident step, where the
+    /// backend forms the weight and bias gradients in one launch (<see cref="DirectGpu.IWeightBiasGradientBackend"/>), the
+    /// bias gradient (dY's column sums) lands in that accumulator too -- overwritten, or added to when
+    /// <paramref name="addIntoBias"/> -- and <paramref name="biasWritten"/> is true; otherwise the caller still owes it.
+    /// </summary>
+    internal bool TryMatMulBackward2D<T>(
+        Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, out Tensor<T>? gradA, out Tensor<T>? gradB,
+        Tensor<T>? intoA, bool addIntoA, Tensor<T>? intoB, bool addIntoB, Tensor<T>? intoBias, bool addIntoBias,
+        out bool biasWritten)
     {
         gradA = null;
         gradB = null;
+        biasWritten = false;
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
         if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA) return false;
         if (a.Rank != 2 || b.Rank != 2 || gradOutput.Rank != 2) return false;
@@ -20847,6 +20861,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var targetBufA = ResolveDirectGradTarget(backend, intoA, M * K, bufG, bufA, bufB);
                 var targetBufB = ResolveDirectGradTarget(backend, intoB, K * N, bufG, bufA, bufB);
                 if (targetBufA is not null && targetBufB is not null && targetBufA.Handle == targetBufB.Handle) targetBufB = null;
+                var targetBias = backend is DirectGpu.IWeightBiasGradientBackend
+                    ? ResolveDirectGradTarget(backend, intoBias, N, bufG, bufA, bufB) : null;
+                if (targetBias is not null && (targetBias.Handle == targetBufA?.Handle || targetBias.Handle == targetBufB?.Handle))
+                    targetBias = null;
                 var outA = targetBufA is null ? new Tensor<T>(new T[(long)M * K], new[] { M, K }) : intoA;
                 var outB = targetBufB is null ? new Tensor<T>(new T[(long)K * N], new[] { K, N }) : intoB;
                 if (outA is null || outB is null) return false;
@@ -20857,8 +20875,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 float betaA = targetBufA is not null && addIntoA ? 1f : 0f;
                 float betaB = targetBufB is not null && addIntoB ? 1f : 0f;
                 backend.MatMulTransposed(bufG, bufB, outBufA, M, K, N, 1f, betaA);  // dA[M,K] = dY[M,N] · B[K,N]ᵀ
-                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, N, M, 1f, betaB); // dB[K,N] = A[M,K]ᵀ · dY[M,N]
+                // dB[K,N] = A[M,K]ᵀ · dY[M,N], with the bias gradient Σ_m dY[m, :] in the same launch where served.
+                biasWritten = targetBias is not null
+                    && ((DirectGpu.IWeightBiasGradientBackend)backend).TryWeightAndBiasGradient(bufA, bufG, outBufB, targetBias,
+                        K, N, M, betaB, addIntoBias ? 1f : 0f);
+                if (!biasWritten) transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, N, M, 1f, betaB);
                 ResidentSyncCheck("MatMulBackward2D");
+                if (biasWritten)
+                {
+                    intoBias!.IncrementVersion();
+                    BindResidentBuffer(intoBias, targetBias!, backend);
+                }
                 if (targetBufA is not null) outA.IncrementVersion();
                 if (targetBufB is not null) outB.IncrementVersion();
                 BindResidentBuffer(outA, outBufA, backend);

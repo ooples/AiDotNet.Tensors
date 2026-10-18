@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // Row-major FP32 GEMMs for narrow products (see CudaSkinnyGemmKernels): Gemm, MatMulTransposed and MatMulTransposedA
 // try these before cuBLAS. Strict fp32 and deterministic (fixed summation order, no atomics on values), so they serve
 // GpuDeterminism as well as the default mode.
-public sealed partial class CudaBackend : IGemmBiasActivationBackend
+public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBiasGradientBackend
 {
     // AIDOTNET_SKINNY_GEMM=0: every GEMM goes to cuBLAS as before.
     private static readonly bool SkinnyGemmEnabled =
@@ -61,21 +61,29 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
     /// M, N &lt;= 256 (multiples of 4, 16-byte aligned): one launch where cuBLASLt ran a GEMM and a split-K reduce.
     /// False -- nothing launched -- for any other shape.
     /// </summary>
-    internal unsafe bool TryWgradTile(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+    internal unsafe bool TryWgradTile(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta,
+        IGpuBuffer? bias = null, float biasBeta = 0f)
     {
         if (!SkinnyGemmEnabled || K < WgradTileMinReduce || K >= 512 || M <= 0 || N <= 0
             || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
+            || (bias is not null && (bias.Size < N || bias.Handle == C.Handle || bias.Handle == B.Handle || bias.Handle == A.Handle))
             || !_kernelCache.TryGetValue("wgrad_tile_tn", out var wgradKernel))
             return false;
         using var _ = PushContext();
-        IntPtr a = A.Handle, b = B.Handle, c = C.Handle;
+        IntPtr a = A.Handle, b = B.Handle, c = C.Handle, bi = bias?.Handle ?? IntPtr.Zero;
         int m = M, n = N, k = K;
-        float al = alpha, be = beta;
-        void** args = stackalloc void*[8];
+        float al = alpha, be = beta, bb = biasBeta;
+        void** args = stackalloc void*[10];
         args[0] = &a; args[1] = &b; args[2] = &c; args[3] = &m; args[4] = &n; args[5] = &k; args[6] = &al; args[7] = &be;
+        args[8] = &bi; args[9] = &bb;
         LaunchKernel2D(wgradKernel, (uint)((N + 15) / 16), (uint)((M + 15) / 16), 1, 256, 1, args);
         return true;
     }
+
+    // A linear layer's dW = Aᵀ·dY with its bias gradient (dY's column sums) in the same wgrad_tile_tn launch.
+    bool IWeightBiasGradientBackend.TryWeightAndBiasGradient(IGpuBuffer a, IGpuBuffer gradOutput, IGpuBuffer gradWeight,
+        IGpuBuffer gradBias, int k, int n, int m, float betaW, float betaB)
+        => TryWgradTile(a, gradOutput, gradWeight, k, n, m, 1f, betaW, gradBias, betaB);
 
     internal unsafe bool TrySkinnyGemmTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
         float alpha, float beta)

@@ -7099,6 +7099,7 @@ internal static class BackwardFunctions<T>
                     : engine.Reshape(inputs[0], new[] { rowsI, K });
                 Tensor<T>? inputGradFlat = null;
                 Tensor<T>? weightGradFast = null;
+                bool biasLanded = false;
                 // GPU: the GEMMs read their operands transposed in place (cuBLAS op flags). Materializing Wᵀ and Xᵀ
                 // cost two transpose kernels per linear layer per step -- 16 of a Transformer step's 24 -- and a layer
                 // whose input gradient nothing reads (the first one) computed and discarded that GEMM as well.
@@ -7107,15 +7108,18 @@ internal static class BackwardFunctions<T>
                     && !DifferentiableOps.IsRecording<T>()
                     && !Compilation.GraphMode.IsActive)
                 {
-                    // In a resident step the GEMMs write into the gradient accumulators themselves.
-                    bool addInput = false, addWeight = false;
+                    // In a resident step the GEMMs write into the gradient accumulators themselves -- the bias's too,
+                    // where the backend forms it in the weight GEMM's launch.
+                    bool addInput = false, addWeight = false, addBiasFused = false;
                     var intoInput = needsInputGradient
                         ? DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out addInput) : null;
                     var intoWeight = needsWeightGradient
                         ? DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[1], engine, out addWeight) : null;
+                    var intoBiasFused = needsBiasGradient && inputs[2].Length == N
+                        ? DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[2], engine, out addBiasFused) : null;
                     if (needsInputGradient && needsWeightGradient
                         && gpuLinear.TryMatMulBackward2D(gFlat, iFlat, inputs[1], out var gpuInputGrad, out var gpuWeightGrad,
-                            intoInput, addInput, intoWeight, addWeight)
+                            intoInput, addInput, intoWeight, addWeight, intoBiasFused, addBiasFused, out biasLanded)
                         && gpuInputGrad is not null && gpuWeightGrad is not null)
                     {
                         inputGradFlat = gpuInputGrad;
@@ -7139,6 +7143,7 @@ internal static class BackwardFunctions<T>
                         DifferentiableOps.CommitDirectGradWrite(grads, inputs[1], intoWeight);
                         weightGradFast = null;
                     }
+                    if (biasLanded) DifferentiableOps.CommitDirectGradWrite(grads, inputs[2], intoBiasFused!);
                 }
                 if (!gpuDone)
                 {
@@ -7158,7 +7163,7 @@ internal static class BackwardFunctions<T>
                 if (weightGradFast is not null)
                     DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGradFast, engine);
 
-                if (inputs.Length > 2)
+                if (inputs.Length > 2 && !biasLanded)
                 {
                     // A bias of N elements (any rank) gets the column sums of [rowsG, N]; in a resident step they are
                     // summed straight into its accumulator.
