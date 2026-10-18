@@ -131,6 +131,11 @@ extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_double(
 // N % 4 == 0 (the caller's gate); cudaMalloc gives 256-byte base alignment and
 // colA*N + col4 is a multiple of 4, so the float4 load/store are aligned. Same
 // per-output reduction order as csr_spmm → deterministic + parity-checkable.
+// A row needs N / 4 lanes. When that is fewer than the block, the block packs
+// blockDim.x / (N / 4) rows (lanes of one row adjacent) and the grid's x covers
+// row groups; one block per row left 224 of 256 lanes idle at N = 128 and 248 at
+// N = 32, and lost to cuSPARSE on a GTX 1660 Ti. Wider rows keep one row per
+// block with grid y over column chunks. Each output's sum is unchanged.
 extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_vec4(
     const float* __restrict__ csrValues,
     const int* __restrict__ csrColIndices,
@@ -139,8 +144,21 @@ extern ""C"" __global__ __launch_bounds__(256) void csr_spmm_vec4(
     float* __restrict__ output,
     int M, int K, int N, int nnz)
 {
-    int row = blockIdx.x;
-    int col4 = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+    int lanes = N >> 2;
+    int row, col4;
+    if (lanes >= (int)blockDim.x)
+    {
+        row = blockIdx.x;
+        col4 = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+    }
+    else
+    {
+        int rowsPerBlock = blockDim.x / lanes;
+        int r = threadIdx.x / lanes;
+        if (r >= rowsPerBlock) return;
+        row = blockIdx.x * rowsPerBlock + r;
+        col4 = (threadIdx.x - r * lanes) * 4;
+    }
 
     if (row >= M || col4 >= N) return;
 

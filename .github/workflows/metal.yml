@@ -1,0 +1,80 @@
+name: Metal (macOS, Apple GPU)
+
+# Why this lane exists
+# --------------------
+# Every Metal test skips off macOS, and no other CI job runs on a Mac, so the Metal backend's kernels had never
+# executed in CI: the softmax variants (#915) and the fused Meshgrid2D (#921) were implemented and compile-checked
+# with Apple's compiler on Windows (MetalShaderCompilationTests, #1299) but never run. GitHub's Apple-silicon macOS
+# runners expose a Metal device, so this job runs the Metal tests there and times the Meshgrid2D promotion gate.
+#
+# The hosted runner's GPU is virtualized, so its timings are a check that the gate holds on Apple hardware, not a
+# tuned-profile measurement (#1254 still needs a physical Mac).
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  metal:
+    # Skip on the release-please Release PR and the release merge-commit push (mirrors build.yml).
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Metal device
+      run: |
+        system_profiler SPDisplaysDataType
+        # The Metal compiler ships with Xcode; MetalShaderCompilationTests finds it through this variable.
+        echo "AIDOTNET_METAL_COMPILER=$(xcrun -f metal)" >> "$GITHUB_ENV"
+
+    - name: Build tests and benchmarks (net10.0)
+      run: |
+        dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+        dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj --configuration Release
+
+    - name: Metal tests
+      run: |
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+          --configuration Release --no-build --framework net10.0 \
+          --filter "FullyQualifiedName~Metal&Category!=Benchmark&Category!=Performance" \
+          --logger "console;verbosity=normal" --logger "trx;LogFileName=metal.trx" --results-directory ./metal-results \
+          --blame-hang --blame-hang-timeout 600s --blame-crash
+
+    - name: Meshgrid2D promotion gate (#921)
+      if: always()
+      # Informational: the hosted runner's GPU is virtualized and its per-arm timings swing 25-70%, so the stability
+      # gate usually reports "no verdict". The medians are recorded here; correctness gates in the step above.
+      continue-on-error: true
+      run: |
+        dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj \
+          --configuration Release --no-build -- --metal-meshgrid2d
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: metal-results
+        path: ./metal-results/**
+        if-no-files-found: ignore

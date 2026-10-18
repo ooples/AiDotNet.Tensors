@@ -1,5 +1,6 @@
 #if NET6_0_OR_GREATER
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -67,9 +68,14 @@ public sealed class GenericFftBackendParityTests
                 var aRe = backend.DownloadBuffer(bRe);
                 var aIm = backend.DownloadBuffer(bIm);
                 double tol = 2e-5 * n * (inverse ? 1.0 / n : 1.0) * 2 + 1e-5;
-                for (int i = 0; i < Batch * n; i++)
-                    Assert.True(Math.Abs(aRe[i] - eRe[i]) <= tol && Math.Abs(aIm[i] - eIm[i]) <= tol,
-                        $"n={n} {(inverse ? "inverse" : "forward")} [{i}]: got ({aRe[i]}, {aIm[i]}), expected ({eRe[i]}, {eIm[i]})");
+                // On failure: how many bins miss, and the worst few, so a single outlier and a spread-out error read
+                // differently.
+                var misses = Enumerable.Range(0, Batch * n)
+                    .Select(i => (i, err: Math.Max(Math.Abs(aRe[i] - eRe[i]), Math.Abs(aIm[i] - eIm[i]))))
+                    .Where(e => e.err > tol).OrderByDescending(e => e.err).ToList();
+                Assert.True(misses.Count == 0,
+                    $"n={n} {(inverse ? "inverse" : "forward")}: {misses.Count} of {Batch * n} bins exceed {tol:G3}; worst: "
+                    + string.Join("; ", misses.Take(5).Select(e => $"[{e.i}] got ({aRe[e.i]}, {aIm[e.i]}), expected ({eRe[e.i]:G9}, {eIm[e.i]:G9}), err {e.err:G3}")));
             }
     }
 
