@@ -22,6 +22,9 @@ public enum CudaGemmDispatchPath
     DirectPtxSgemm = 2,
     /// <summary>A tuned, generated TF32 Tensor-Core GEMM (determinism off, TF32 allowed).</summary>
     DirectPtxTensorCore = 3,
+    /// <summary>One of the backend's hand-written narrow GEMMs (skinny_gemm*, small_gemm_*), for shapes with no tuned
+    /// route.</summary>
+    NarrowGemm = 4,
 }
 
 /// <summary>

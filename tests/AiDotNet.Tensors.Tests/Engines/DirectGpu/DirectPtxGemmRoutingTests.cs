@@ -135,20 +135,20 @@ public sealed class DirectPtxGemmRoutingTests
             Assert.True(decision.GraphCublasMicroseconds > 0 && decision.GraphDirectPtxMicroseconds > 0,
                 "the graph verdict was not measured: " + decision.GraphReason);
 
-            // The tuning run installs exactly what it decided.
+            // The tuning run installs exactly what it decided. Without a generated-kernel verdict the shape takes its
+            // untuned path: here (256^3) the narrow skinny_gemm, which comes after a tuned route and before cuBLAS.
+            var untuned = CudaGemmDispatchPath.NarrowGemm;
             using var a = backend.AllocateBuffer(Values(m * k, 1));
             using var b = backend.AllocateBuffer(Values(k * n, 2));
             using var c = backend.AllocateBuffer(m * n);
             backend.Gemm(a, b, c, m, n, k);
-            Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : CudaGemmDispatchPath.Cublas,
-                backend.LastGemmDispatchPath);
+            Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : untuned, backend.LastGemmDispatchPath);
 
             // A later activation (here: after clearing) follows the persisted verdict, in this math mode only.
             backend.ClearGemmRoutes();
             Assert.Equal(decision.UsesDirectPtx || decision.UsesDirectPtxInGraph, backend.TryActivatePersistedGemmRoute(m, n, k));
             backend.Gemm(a, b, c, m, n, k);
-            Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : CudaGemmDispatchPath.Cublas,
-                backend.LastGemmDispatchPath);
+            Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : untuned, backend.LastGemmDispatchPath);
 
             // A new backend (a later process) activates the verdict on the shape's first GEMM, with no explicit call.
             using (var fresh = new CudaBackend())
@@ -157,8 +157,7 @@ public sealed class DirectPtxGemmRoutingTests
                 using var fb = fresh.AllocateBuffer(Values(k * n, 2));
                 using var fc = fresh.AllocateBuffer(m * n);
                 fresh.Gemm(fa, fb, fc, m, n, k);
-                Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : CudaGemmDispatchPath.Cublas,
-                    fresh.LastGemmDispatchPath);
+                Assert.Equal(decision.UsesDirectPtx ? CudaGemmDispatchPath.DirectPtxSgemm : untuned, fresh.LastGemmDispatchPath);
             }
 
             AiDotNetEngine.SetDeterministicMode(false);
