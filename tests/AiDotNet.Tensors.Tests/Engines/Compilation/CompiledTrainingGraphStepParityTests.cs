@@ -88,9 +88,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public bool UpdateCapturedInGraph;   // the optimizer update ran inside the step graph (step I/O)
         public bool UpdateCapturedBeforeClip;   // ... at the step before clipOnFromStep
         public int CheckpointStep;   // the step count an optimizer checkpoint (export / save) records
+        public bool ReplayedParityGraphs;   // two step graphs alternated (the ping-pong SGD update)
+        public float[][] WeightsAfterDispose = Array.Empty<float[]>();
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -124,6 +126,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         {
             var concrete = (CompiledTrainingPlan<float>)plan;
             if (!capture) concrete.DisableGraphStep();
+            if (!pingPong) concrete.DisablePingPongForTesting();
             concrete.FailNextCaptureForTesting = failCapture;
             concrete.FailInsideNextCaptureForTesting = failInsideCapture;
             if (schedule is null) plan.ConfigureOptimizer(optimizer, learningRate: 1e-2f);
@@ -204,7 +207,56 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             run.OptimizerStep = concrete.OptimizerStep;
             run.UpdateCapturedInGraph = typeof(CompiledTrainingPlan<float>)
                 .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete) is not null;
+            run.ReplayedParityGraphs = concrete.ReplaysParityGraphs;
+            plan.Dispose();
+            run.WeightsAfterDispose = parameters.Select(p => p.ToArray()).ToArray();
             return run;
+        }
+    }
+
+    /// <summary>
+    /// The captured SGD update writes the new weights into a second buffer set and two step graphs alternate (one
+    /// reads set A and writes B, the other the reverse), so one pass over the gradients both updates and takes their
+    /// finiteness reduction. It must train bit for bit like the in-place update: the same arithmetic per element, a
+    /// non-finite step undone on either parity, the current weights readable between steps, and back in the plan's own
+    /// buffers once the graphs go (an odd replay count leaves them in the second set).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(-1)]
+    [InlineData(6)]
+    [InlineData(7)]
+    public void Ping_pong_sgd_trains_bit_for_bit_like_the_in_place_update(int nonFiniteStep)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_SGD_PINGPONG") == "0",
+                "The ping-pong update is disabled for this process.");
+
+            var schedule = LrSchedule.Cosine(0.1, Steps, 1e-3);
+            var inPlace = Train(gpu, capture: true, schedule: schedule, optimizer: OptimizerType.SGD, nonFiniteStep: nonFiniteStep, pingPong: false);
+            var pingPong = Train(gpu, capture: true, schedule: schedule, optimizer: OptimizerType.SGD, nonFiniteStep: nonFiniteStep);
+            Assert.True(inPlace.UpdateCapturedInGraph && pingPong.UpdateCapturedInGraph, "the update was not captured into the graph");
+            Assert.False(inPlace.ReplayedParityGraphs, "the in-place oracle alternated graphs");
+            Assert.True(pingPong.ReplayedParityGraphs, "the ping-pong plan did not alternate two step graphs");
+            Assert.Equal(inPlace.NonFiniteStepsSkipped, pingPong.NonFiniteStepsSkipped);
+            Assert.Equal(inPlace.OptimizerStep, pingPong.OptimizerStep);
+            for (int s = 0; s < Steps; s++)
+                if (s != nonFiniteStep)
+                    Assert.Equal(inPlace.Losses[s], pingPong.Losses[s]);
+            if (nonFiniteStep >= 0)
+                for (int p = 0; p < pingPong.WeightsBeforeNonFiniteStep.Length; p++)
+                    Assert.Equal(pingPong.WeightsBeforeNonFiniteStep[p], pingPong.WeightsAfterNonFiniteStep[p]);
+            for (int p = 0; p < inPlace.FinalWeights.Length; p++)
+            {
+                Assert.Equal(inPlace.FinalWeights[p], pingPong.FinalWeights[p]);
+                Assert.Equal(pingPong.FinalWeights[p], pingPong.WeightsAfterDispose[p]);
+            }
         }
     }
 

@@ -86,6 +86,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static readonly bool s_graphStepDiagnosticsEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPHSTEP_DIAG") == "1";
     private IntPtr _stepGraphExec;
+    // The step graph for odd replays, when the plan alternates two (NeedsParityGraphs): replay r runs
+    // _stepGraphExec when r is even, this one when r is odd. Zero: every replay runs _stepGraphExec.
+    private IntPtr _stepGraphExecOdd;
+    // Set when a ping-pong optimizer's parity graphs failed their capture or wiring check: later captures update in place.
+    private bool _pingPongRejected;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
     /// <summary>Set when <see cref="TryRunResidentBody"/> threw; later steps use StepEager.</summary>
@@ -287,6 +292,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     ~CompiledTrainingPlan()
     {
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExec);
+        Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExecOdd);
     }
 
     public void Dispose()
@@ -454,6 +460,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// </summary>
     public string? GraphCaptureFailureReason { get; private set; }
 
+    /// <summary>Why the ping-pong optimizer update was given up for the in-place one, or null.</summary>
+    internal string? PingPongRejectionReason { get; private set; }
+
+    private void RejectPingPong(string reason)
+    {
+        PingPongRejectionReason = reason;
+        PingPongDiagnostic("rejected: " + reason);
+        System.Diagnostics.Trace.TraceWarning(
+            "The compiled training step's ping-pong optimizer update was given up; the captured step updates the weights in place. " + reason);
+    }
+
+    // AIDOTNET_GRAPH_CAPTURE_DEBUG=1: whether the ping-pong update engaged, and why not, in the capture diagnostics file.
+    private static void PingPongDiagnostic(string message)
+    {
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") != "1") return;
+        try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+            "[PING-PONG] " + message + System.Environment.NewLine); } catch { }
+    }
+
     private void RecordGraphCaptureFailure(string reason)
     {
         GraphCaptureFailureReason = reason;
@@ -466,6 +491,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// environment switch is read once per process, so this is how a single test process compares a captured plan
     /// against an eager one (the parity oracle for capture).
     /// </summary>
+    /// <summary>Keeps THIS plan's captured SGD update in place (one step graph): the oracle for the ping-pong update.</summary>
+    internal void DisablePingPongForTesting() => _pingPongRejected = true;
+
+    /// <summary>True while the plan replays a graph per replay parity.</summary>
+    internal bool ReplaysParityGraphs => _stepGraphExecOdd != IntPtr.Zero;
+
     internal void DisableGraphStep()
     {
         InvalidateCapturedStepGraph();
@@ -567,7 +598,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         public uint InitialApplied { get; set; }
         public uint LaunchedAtCapture { get; set; }
         public int SkipsRecorded { get; set; }
+
+        // ---- ping-pong (null PingPong: the update runs in place in one graph) ----
+        /// <summary>Each parameter's second weight buffer; the parity-1 graph reads the weights from these.</summary>
+        public Engines.DirectGpu.IGpuBuffer[]? PingPong { get; set; }
+        /// <summary>Records the parity-1 graph's update (weights B -> A); <see cref="Capture"/> records parity 0's.</summary>
+        public Action<Engines.DirectGpu.IGraphStepIo>? CaptureOdd { get; set; }
+        /// <summary>Binds every parameter to the buffer set the graph of the given parity reads (0: A, 1: B).</summary>
+        public Action<int>? BindParity { get; set; }
+        /// <summary>The buffer set holding the current weights: 0 = A, 1 = B. Flips with every replay.</summary>
+        public int Latest { get; set; }
+        /// <summary>Before the graphs go: brings the current weights back to A, rebinds A and frees B.</summary>
+        public Action? Release { get; set; }
     }
+
+    /// <summary>
+    /// True when the step needs a graph per replay parity: something in it bakes a different address on even and odd
+    /// replays (a ping-pong optimizer's weight buffers).
+    /// </summary>
+    private bool NeedsParityGraphs => _capturedOptimizer?.PingPong is not null;
 
     // Set by ConfigureOptimizerFloat: the captured form of its update, or null when it has none.
     private Func<CapturedOptimizer?>? _capturedOptimizerFactory;
@@ -662,6 +711,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             for (int k = 0; k < window; k++) rates[k] = (float)optimizer.Schedule.GetLr(first + k);
             io.WriteLearningRates(replay, first, rates);
         }
+        if ((replay & 1) == 1 && _stepGraphExecOdd != IntPtr.Zero) exec = _stepGraphExecOdd;
         LaunchStepGraph(cb, exec);
         io.Flush();
         _stepIoLaunched = replay + 1;
@@ -721,8 +771,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         io.InitializeAppliedSteps(optimizer.InitialApplied);
     }
 
+    private void ReleasePingPong()
+    {
+        if (_capturedOptimizer is not { PingPong: not null } optimizer) return;
+        var release = optimizer.Release;
+        optimizer.Release = null;
+        optimizer.PingPong = null;
+        release?.Invoke();
+    }
+
     private void DisposeStepIo()
     {
+        ReleasePingPong();
         // A disposed engine's context took the page-locked results with it: nothing in them can be read any more.
         bool live = _engine is Engines.DirectGpuTensorEngine gte
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true };
@@ -828,14 +888,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private void InvalidateCapturedStepGraph()
     {
-        if (_stepGraphExec != IntPtr.Zero
-            && _engine is Engines.DirectGpuTensorEngine gte
+        // The current weights back in the buffers the plan's other paths update (stream-ordered after every replay),
+        // while the graphs that pin the second buffers still keep them alive.
+        ReleasePingPong();
+        if (_engine is Engines.DirectGpuTensorEngine gte
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
         {
-            cb.DestroyCapturedGraph(_stepGraphExec);
+            if (_stepGraphExec != IntPtr.Zero) cb.DestroyCapturedGraph(_stepGraphExec);
+            if (_stepGraphExecOdd != IntPtr.Zero) cb.DestroyCapturedGraph(_stepGraphExecOdd);
         }
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
+        _stepGraphExecOdd = IntPtr.Zero;
         _graphStepCalls = 0;
         DisposeStepIo();   // before the rollback below, which may read the loss
         // The eager step accumulates into HOST gradient arrays; leaving the accumulators bound to the capture's
@@ -3210,15 +3274,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         // those are the graph-purity violations that abort/spoil whole-step capture and keep the
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
-                            exec = cb.CaptureGraph(() =>
-                            {
-                                _stepIo?.CapturePrologue();
-                                RunGpuStepBodyForCapture(cb);
-                                if (_capturedOptimizer is { } optimizer && _stepIo is { } io) optimizer.Capture(io);
-                                var lossBuffer = _lossOutput._gpuBuffer;
-                                _stepIoLossCaptured = lossBuffer is not null && _lossOutput.Length <= 64;
-                                _stepIo?.CaptureEpilogue(_stepIoLossCaptured ? lossBuffer : null, _lossOutput.Length);
-                            });
+                            exec = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 0));
                     }
                     catch (Exception captureFailure)
                     {
@@ -3261,6 +3317,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         return StepResidentOrEager();
                     }
                     _stepGraphExec = exec;
+                    if (NeedsParityGraphs && !TryCaptureOddParityGraph(gte, cb))
+                    {
+                        // The second graph did not capture, or a graph reads the other parity's buffers: drop both and
+                        // let the next step capture the in-place update. This step runs eagerly.
+                        _pingPongRejected = true;
+                        InvalidateCapturedStepGraph();
+                        return StepResidentOrEager();
+                    }
                     // Executes THIS step on the just-uploaded indices (through the step I/O's staging when it has one).
                     if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, exec);
                     else LaunchStepGraph(cb, exec);
@@ -3617,6 +3681,62 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (backend is Engines.DirectGpu.IDeviceZeroFill zero) zero.ZeroBytes(buffer, (long)length * elementSize);
         else backend.Fill(buffer, 0f, length);
+    }
+
+    /// <summary>One step graph's capture body: the step I/O prologue, the step, the captured update, the epilogue.</summary>
+    private void CaptureStepGraphBody(Engines.DirectGpu.IGpuGraphCapture cb, int parity)
+    {
+        _stepIo?.CapturePrologue(parity);
+        RunGpuStepBodyForCapture((Engines.DirectGpu.IDirectGpuBackend)cb);
+        if (_capturedOptimizer is { } optimizer && _stepIo is { } io)
+        {
+            if (parity == 0) optimizer.Capture(io);
+            else optimizer.CaptureOdd!(io);
+        }
+        var lossBuffer = _lossOutput._gpuBuffer;
+        _stepIoLossCaptured = lossBuffer is not null && _lossOutput.Length <= 64;
+        _stepIo?.CaptureEpilogue(_stepIoLossCaptured ? lossBuffer : null, _lossOutput.Length);
+    }
+
+    /// <summary>
+    /// Captures the odd-replay step graph after the even one: the same body with every parameter bound to the second
+    /// weight buffers. False (the caller drops both graphs) when it does not capture, or when either graph hands the
+    /// other parity's weight buffers to captured work: some op resolved a parameter around its binding, and the
+    /// alternation would read stale weights.
+    /// </summary>
+    private bool TryCaptureOddParityGraph(Engines.DirectGpuTensorEngine gte, Engines.DirectGpu.IGpuGraphCapture cb)
+    {
+        if (_capturedOptimizer is not { PingPong: { } second, BindParity: { } bind } optimizer || _stepIo is not { } io) return false;
+        var first = new Engines.DirectGpu.IGpuBuffer[_parameters.Length];
+        for (int p = 0; p < first.Length; p++)
+            if (_parameters[p]._gpuBuffer is { } bound) first[p] = bound; else return false;
+        IntPtr odd = IntPtr.Zero;
+        try
+        {
+            using var _cap = gte.EnterCompiledCapturePath();
+            bind(1);
+            try
+            {
+                using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCaptureOdd"))
+                    odd = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 1));
+            }
+            finally { bind(0); }
+        }
+        catch (Exception oddFailure)
+        {
+            RejectPingPong("the odd-replay step graph did not capture: " + oddFailure.GetType().Name + ": " + oddFailure.Message);
+            if (odd != IntPtr.Zero) cb.DestroyCapturedGraph(odd);
+            return false;
+        }
+        if (odd == IntPtr.Zero) { RejectPingPong("the odd-replay step graph produced no graph"); return false; }
+        _stepGraphExecOdd = odd;
+        if (io.CapturedGraphReads(_stepGraphExec, second) || io.CapturedGraphReads(odd, first))
+        {
+            RejectPingPong("a step graph reads the other parity's weight buffers (an op resolved a parameter around its binding)");
+            return false;
+        }
+        PingPongDiagnostic("engaged: " + _parameters.Length + " parameters, two step graphs alternate");
+        return true;
     }
 
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.IDirectGpuBackend backend)
@@ -6123,28 +6243,113 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 capParams.Add(gp); capGrads.Add(gg); capSizes.Add(lengths[p]);
                 if (adam) { capM.Add(gpuM[p]!); capV.Add(gpuV[p]!); }
             }
+            var pingPong = !adam ? TryAllocatePingPongBuffers(capParams, capSizes, owner) : null;
             var captured = new CapturedOptimizer(lrSchedule, io =>
             {
                 if (adam) io.CaptureAdamUpdate(optType == OptimizerType.AdamW, capParams, capGrads, capM, capV, capSizes, b1, b2, epsVal, wd);
+                else if (pingPong is not null) io.CaptureSgdPingPongUpdate(0, (float)wd);
                 else io.CaptureSgdUpdate(capParams, capGrads, capSizes, (float)wd);
             });
-            captured.Prepare = io => io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes);
-            captured.AfterReplay = () =>
+            captured.Prepare = io =>
             {
-                // The device updated every parameter in place: keep the host's view of them in step, as the
-                // multi-tensor path above does after its launch.
+                if (pingPong is not null) io.PrepareSgdPingPong(capParams, pingPong, capGrads, capSizes);
+                else io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes);
+            };
+            // Binds every parameter to buffer set `set` (0: the plan's own, 1: the ping-pong second buffers) as the
+            // authoritative copy everywhere it is looked up; `from` is the set the persistent weight cache names now.
+            void BindSet(int set, int from)
+            {
+                if (_engine is not Engines.DirectGpuTensorEngine rebindEngine) return;
                 for (int p = 0; p < paramCount; p++)
                 {
-                    _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
-                    if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
-                    {
-                        rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
-                        CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
-                    }
+                    if (gpuParam[p] is not { } a || gpuBackends[p] is not { } beBind) continue;
+                    var target = set == 1 && pingPong is not null ? pingPong[p] : a;
+                    var source = from == 1 && pingPong is not null ? pingPong[p] : a;
+                    if (typeof(T) == typeof(float))
+                        rebindEngine.MovePersistentParameterBuffer((Tensor<float>)(object)_parameters[p], source, target);
+                    rebindEngine.BindResidentBuffer(_parameters[p], target, beBind);
+                    CommitDeviceParameterUpdate(rebindEngine, p, target, beBind);
                 }
+            }
+            captured.AfterReplay = () =>
+            {
+                // The device updated every parameter (in place, or into the other buffer set): keep the host's view of
+                // them in step, as the multi-tensor path above does after its launch.
+                for (int p = 0; p < paramCount; p++)
+                    _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+                int previous = captured.Latest;
+                if (captured.PingPong is not null) captured.Latest ^= 1;
+                BindSet(captured.Latest, previous);
             };
+            if (pingPong is not null)
+            {
+                captured.PingPong = pingPong;
+                captured.CaptureOdd = io => io.CaptureSgdPingPongUpdate(1, (float)wd);
+                // Capture-time binding only: the parity-1 graph is recorded against the second buffers, then the
+                // parameters go back to the first ones, where the current weights still are.
+                captured.BindParity = set => BindSet(set, set == 1 ? 0 : 1);
+                captured.Release = () =>
+                {
+                    if (captured.Latest == 1)
+                    {
+                        // Stream-ordered after every replay: the current weights back into the plan's own buffers.
+                        for (int p = 0; p < paramCount; p++) owner.Copy(pingPong[p], gpuParam[p]!, lengths[p]);
+                        BindSet(0, 1);
+                        captured.Latest = 0;
+                    }
+                    foreach (var b in pingPong) b.Dispose();
+                };
+            }
             return captured;
         };
+    }
+
+    // AIDOTNET_SGD_PINGPONG=0 keeps the captured SGD update in place (one step graph).
+    private static readonly bool s_sgdPingPongEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_SGD_PINGPONG") != "0";
+
+    /// <summary>
+    /// The second weight buffer of every parameter for a ping-pong captured SGD update, or null to update in place:
+    /// switched off, rejected earlier, a parameter that is a view into a flat ParameterBuffer (forwards resolve it from
+    /// the flat buffer, not its binding), weight buffers that overlap, or no device memory for the copy.
+    /// </summary>
+    private Engines.DirectGpu.IGpuBuffer[]? TryAllocatePingPongBuffers(IReadOnlyList<Engines.DirectGpu.IGpuBuffer> weights,
+        IReadOnlyList<int> sizes, Engines.DirectGpu.IDirectGpuBackend backend)
+    {
+        if (!s_sgdPingPongEnabled || _pingPongRejected || typeof(T) != typeof(float)) return null;
+        for (int p = 0; p < _parameters.Length; p++)
+            if (Engines.DirectGpuTensorEngine.IsFlatParameterView((Tensor<float>)(object)_parameters[p]))
+            {
+                PingPongDiagnostic("in place: parameter " + p + " is a view into a flat parameter buffer");
+                return null;
+            }
+        var ranges = new List<(long Start, long End)>(weights.Count);
+        foreach (var w in weights)
+        {
+            long start = w.Handle.ToInt64();
+            ranges.Add((start, start + w.SizeInBytes));
+        }
+        ranges.Sort((x, y) => x.Start.CompareTo(y.Start));
+        for (int i = 1; i < ranges.Count; i++)
+            if (ranges[i].Start < ranges[i - 1].End)
+            {
+                PingPongDiagnostic("in place: two parameters' weight buffers overlap");
+                return null;
+            }
+        var second = new Engines.DirectGpu.IGpuBuffer[weights.Count];
+        int allocated = 0;
+        try
+        {
+            for (; allocated < second.Length; allocated++) second[allocated] = backend.AllocateBuffer(sizes[allocated]);
+        }
+        catch (Exception oom)
+        {
+            // Out of device memory (or an allocator fault) costs only the faster update: train in place.
+            for (int i = 0; i < allocated; i++) second[i].Dispose();
+            RejectPingPong("no device memory for the second weight buffers: " + oom.Message);
+            return null;
+        }
+        return second;
     }
 
     private unsafe void ConfigureOptimizerFloatGrouped(

@@ -14048,6 +14048,100 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     /// <summary>
+    /// The table of one ping-pong SGD direction (sgd_pingpong_update): each tensor's source weights, destination
+    /// weights and gradient, in <see cref="GradientTableChunk"/>-element chunks. The caller owns it.
+    /// </summary>
+    private MultiTensorTable BuildPingPongTable(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations,
+        IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes)
+    {
+        int n = sources.Count;
+        if (destinations.Count != n || gradients.Count != n || sizes.Count != n)
+            throw new ArgumentException("Every list needs one entry per tensor.");
+        var handles = new IntPtr[3 * n];
+        var addresses = new byte[3 * n * sizeof(ulong)];
+        var sizeArray = new int[n];
+        int totalChunks = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int size = sizes[t];
+            if (size <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (sources[t].Size < size || destinations[t].Size < size || gradients[t].Size < size)
+                throw new ArgumentException("A tensor buffer is smaller than its size.");
+            handles[t] = sources[t].Handle;
+            handles[n + t] = destinations[t].Handle;
+            handles[2 * n + t] = gradients[t].Handle;
+            sizeArray[t] = size;
+            totalChunks += (size + GradientTableChunk - 1) / GradientTableChunk;
+        }
+        for (int i = 0; i < handles.Length; i++)
+            WriteAddress(addresses, i, handles[i]);
+        var chunkTensor = new int[totalChunks];
+        var chunkStart = new int[totalChunks];
+        int c = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int chunks = (sizeArray[t] + GradientTableChunk - 1) / GradientTableChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * GradientTableChunk; c++; }
+        }
+        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
+        try
+        {
+            using (PushContext())
+            {
+                table.Pointers = AllocateByteBuffer(addresses.Length);
+                UploadByteBuffer(table.Pointers, addresses);
+                table.SizesBuffer = AllocateIntBuffer(sizeArray);
+                table.ChunkTensor = AllocateIntBuffer(chunkTensor);
+                table.ChunkStart = AllocateIntBuffer(chunkStart);
+            }
+        }
+        catch
+        {
+            table.Dispose();
+            throw;
+        }
+        return table;
+    }
+
+    /// <summary>
+    /// One ping-pong SGD step over <paramref name="table"/> (see sgd_pingpong_update): the updated weights to the
+    /// destinations, the gradients' sum of squares onto <paramref name="guard"/> (a double). <paramref name="partials"/>
+    /// holds a double per chunk; <paramref name="done"/> is a zeroed counter the kernel leaves zeroed.
+    /// </summary>
+    private unsafe void SgdPingPongUpdate(MultiTensorTable table, float weightDecay, IntPtr dynamicScalars,
+        IGpuBuffer partials, IGpuBuffer done, IntPtr guard)
+    {
+        if (table.TotalChunks == 0) return;
+        if (partials.Size < 2 * table.TotalChunks) throw new ArgumentException("The partials need a double per chunk.", nameof(partials));
+        if (!_kernelCache.TryGetValue("sgd_pingpong_update", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_pingpong_update");
+        using var _ = PushContext();
+        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+        IntPtr partialsH = partials.Handle, doneH = done.Handle;
+        int n = table.Sizes.Length, totalChunks = table.TotalChunks;
+        void** args = stackalloc void*[11];
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &n; args[5] = &totalChunks;
+        args[6] = &weightDecay; args[7] = &dynamicScalars; args[8] = &partialsH; args[9] = &doneH; args[10] = &guard;
+        LaunchKernel(kernel, (uint)totalChunks, MultiTensorChunk, args);
+    }
+
+    /// <summary>Copies every source over its destination in <paramref name="table"/> when *<paramref name="guard"/> is not finite.</summary>
+    private unsafe void SgdPingPongRevert(MultiTensorTable table, IntPtr guard)
+    {
+        if (table.TotalChunks == 0) return;
+        if (!_kernelCache.TryGetValue("sgd_pingpong_revert", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_pingpong_revert");
+        using var _ = PushContext();
+        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+        int n = table.Sizes.Length, totalChunks = table.TotalChunks;
+        void** args = stackalloc void*[7];
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &n; args[5] = &totalChunks; args[6] = &guard;
+        // Every block returns at once on a finite step: a small grid keeps that cheap.
+        uint blocks = (uint)Math.Min(totalChunks, 2 * Math.Max(1, _multiProcessorCount));
+        LaunchKernel(kernel, blocks, MultiTensorChunk, args);
+    }
+
+    /// <summary>
     /// Pointer, size and chunk tables for the multi-tensor gradient kernels, kept across calls. A compiled training
     /// plan's gradient buffers are stable from step to step, so the tables are built and uploaded once and reused;
     /// rebuilding them per call would cost seven allocations and uploads, more than the kernels themselves.
