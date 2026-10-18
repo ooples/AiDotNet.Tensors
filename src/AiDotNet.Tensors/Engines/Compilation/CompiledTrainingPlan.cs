@@ -7834,7 +7834,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var sharedRowSumCache = new Dictionary<int, float[]>();
         // CUDA-graph eligibility + GPU utilization: on a GPU engine, prefer the GENERIC engine-dispatched
         // (GPU-stream) path over the CPU-BLAS/SIMD host specializations below. Those specializations are a
-        // CPU optimization (SimdGemm / BlasProvider.TryGemmEx on host .Data arrays); on a GPU engine they
+        // CPU optimization (SimdGemm / BlasProvider.GemmEx on host .Data arrays); on a GPU engine they
         // (1) run the heavy GEMMs + elementwise on the CPU, starving the device (cortex GPU util ~7%), and
         // (2) are host-only, so the fixed kernel sequence can't be CUDA-graph captured (AIDOTNET_CUDA_GRAPH_STEP).
         // Routing to generic moves the work onto the GPU AND makes the whole step graph-eligible. Default ON
@@ -8585,7 +8585,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // specialized path for the current numeric type. Branches without a
         // double specialization simply fall through to the generic engine
         // path at the bottom of the caller. PR #319: extend the MatMul
-        // branch to cover double via BlasProvider.TryGemm(double[], ...) +
+        // branch to cover double via BlasProvider.Gemm(double[], ...) +
         // SimdGemm.Dgemm fallback so tape-trained Tensor<double> models
         // (the consumer ViT-Base in PR #1224) hit the compiled-replay fast
         // path on their hottest op.
@@ -8639,8 +8639,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // SimdGemm.Dgemm. Pre-pack-B for double is a future enhancement.
             return eng =>
             {
-                if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
-                    SimdGemm.Dgemm(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, K, N);
+                BlasProvider.Gemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N);
             };
         }
 
@@ -8739,9 +8738,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else if (M <= TrainingSmallMCutover)
                     SimdGemm.Sgemm(cA.AsSpan(0, M * K), K, false, cB.AsSpan(0, K * N), N, false,
                                    cOut.AsSpan(0, M * N), M, K, N);
-                else if (!BlasProvider.TryGemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N))
-                    SimdGemm.Sgemm(cA.AsSpan(0, M * K), K, false, cB.AsSpan(0, K * N), N, false,
-                                   cOut.AsSpan(0, M * N), M, K, N);
+                else BlasProvider.Gemm(M, N, K, cA, 0, K, cB, 0, N, cOut, 0, N);
             };
         }
 
@@ -10014,7 +10011,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     /// <summary>
     /// C[m,n] := op(A)[m,k] · op(B)[k,n] (row-major, overwriting C) for the specialized linear backward. Routes like the
-    /// MatMul specialization -- BlasProvider.TryGemmEx, which honours deterministic mode (managed, reproducible across
+    /// MatMul specialization -- BlasProvider.GemmEx, which honours deterministic mode (managed, reproducible across
     /// thread counts) and native/autotune routing otherwise -- except for small GEMMs, which take the direct managed
     /// kernel (see <see cref="LinearBackwardBlasMinWork"/>).
     /// </summary>
@@ -10209,11 +10206,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!accumulate)
         {
-            if (!BlasProvider.TryGemmEx(rows, cols, inner, a, 0, lda, transA, b, 0, ldb, transB, c, 0, cols))
-                Engines.BlasManaged.BlasManaged.Gemm<double>(
-                    a.AsSpan(0, rows * inner), lda, transA, b.AsSpan(0, inner * cols), ldb, transB,
-                    c.AsSpan(0, rows * cols), cols, rows, cols, inner,
-                    new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
+            BlasProvider.GemmEx(rows, cols, inner, a, 0, lda, transA, b, 0, ldb, transB, c, 0, cols);
             return;
         }
         var product = scratch ??= new double[scratchLength];
@@ -10233,10 +10226,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (SimdGemm.TryGemmSmallJit(a, lda, transA, b, ldb, transB, c, m, k, n))
             return;
-        if ((long)m * k * n >= LinearBackwardBlasMinWork
-            && BlasProvider.TryGemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n))
-            return;
-        SimdGemm.Sgemm(a, lda, transA, b, ldb, transB, c.AsSpan(0, m * n), m, k, n);
+        if ((long)m * k * n >= LinearBackwardBlasMinWork)
+            BlasProvider.GemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n);
+        else
+            SimdGemm.Sgemm(a, lda, transA, b, ldb, transB, c.AsSpan(0, m * n), m, k, n);
     }
 
     /// <summary>
@@ -10941,7 +10934,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // AccumulatesInto (claiming the step's first write) rather than always adding into a zeroed buffer.
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
         // PR #319: extend the MatMul backward to cover double via
-        // BlasProvider.TryGemmEx(double[], ...) so tape-trained
+        // BlasProvider.GemmEx(double[], ...) so tape-trained
         // Tensor<double> models hit the compiled-replay fast path on the
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
@@ -11041,21 +11034,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 // dA = dC @ B^T — double-precision BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(Md, Kd, Nd, cdDC, 0, Nd, false, cdB, 0, Nd, true, cdDestA, 0, Kd))
-                {
-                    var dA = eng.TensorMatMul(gradOutD, inputBd.Transpose());
-                    using var dAKeep1 = new KeepAliveScope(dA);
-                    using var gradAdKeep1 = new KeepAliveScope(gradAd);
-                    dA.AsSpanUnmarked().CopyTo(gradAd.AsWritableSpanUnmarked());
-                }
+                BlasProvider.GemmEx(Md, Kd, Nd, cdDC, 0, Nd, false, cdB, 0, Nd, true, cdDestA, 0, Kd);
                 // dB = A^T @ dC — double-precision BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(Kd, Nd, Md, cdA, 0, Kd, true, cdDC, 0, Nd, false, cdDestB, 0, Nd))
-                {
-                    var dB = eng.TensorMatMul(inputAd.Transpose(), gradOutD);
-                    using var dBKeep1 = new KeepAliveScope(dB);
-                    using var gradBdKeep1 = new KeepAliveScope(gradBd);
-                    dB.AsSpanUnmarked().CopyTo(gradBd.AsWritableSpanUnmarked());
-                }
+                BlasProvider.GemmEx(Kd, Nd, Md, cdA, 0, Kd, true, cdDC, 0, Nd, false, cdDestB, 0, Nd);
 
                 inputAd.Grad = gradAd;
                 inputBd.Grad = gradBd;
@@ -11166,23 +11147,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 }
 
                 // dA = dC @ B^T — direct BLAS with engine fallback
-                if (!dAJit && !BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
-                {
-                    var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
-                    using var dAKeep2 = new KeepAliveScope(dA);
-                    using var gradAKeep1 = new KeepAliveScope(gradA);
-                    dA.AsSpanUnmarked().CopyTo(gradA.AsWritableSpanUnmarked());
-                }
+                if (!dAJit) BlasProvider.GemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K);
                 // dB = A^T @ dC
                 if (!dBJit)
                 {
-                    if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
-                    {
-                        var dB = eng.TensorMatMul(inputA.Transpose(), gradOut);
-                        using var dBKeep2 = new KeepAliveScope(dB);
-                        using var gradBKeep1 = new KeepAliveScope(gradB);
-                        dB.AsSpanUnmarked().CopyTo(gradB.AsWritableSpanUnmarked());
-                    }
+                    BlasProvider.GemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N);
                 }
 
                 inputA.Grad = gradA;
@@ -13296,14 +13265,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         cNused * sizeof(float));
 
                 // M, N_used, K; lda=K, ldb=N_used (CONTIGUOUS), ldc=N_used.
-                if (!BlasProvider.TryGemm(cM, cNused, cK,
+                BlasProvider.Gemm(cM, cNused, cK,
                         inputAArray, 0, cK,
                         wPacked, 0, cNused,
-                        sliceOutputArray, 0, cNused))
-                {
-                    SimdGemm.Sgemm(inputAArray.AsSpan(0, cM * cK), wPacked.AsSpan(0, cK * cNused),
-                        sliceOutputArray.AsSpan(0, cM * cNused), cM, cK, cNused);
-                }
+                        sliceOutputArray, 0, cNused);
             };
 
             // Phase G.11 BACKWARD: smaller GEMMs using the pre-packed W.
@@ -13314,27 +13279,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 // dA = dSliceOut [M, N_used] @ W_q^T [N_used, K]
                 // lda=N_used (compact), ldb=N_used (compact W_q), ldc=K
-                if (!BlasProvider.TryGemmEx(cM, cK, cNused,
+                BlasProvider.GemmEx(cM, cK, cNused,
                         gradSliceOutputArray, 0, cNused, false,
                         wPacked, 0, cNused, true,
-                        gradAArray, 0, cK))
-                {
-                    SimdGemm.Sgemm(gradSliceOutputArray.AsSpan(0, cM * cNused), cNused, false,
-                        wPacked.AsSpan(0, cK * cNused), cNused, true,
-                        gradAArray.AsSpan(0, cM * cK), cM, cNused, cK);
-                }
+                        gradAArray, 0, cK);
 
                 // dW_packed [K, N_used] = A^T [K, M] @ dSliceOut [M, N_used]
                 // Compute into the contiguous scratch, then scatter into full dW.
-                if (!BlasProvider.TryGemmEx(cK, cNused, cM,
+                BlasProvider.GemmEx(cK, cNused, cM,
                         inputAArray, 0, cK, true,
                         gradSliceOutputArray, 0, cNused, false,
-                        dWPackedScratch, 0, cNused))
-                {
-                    SimdGemm.Sgemm(inputAArray.AsSpan(0, cM * cK), cK, true,
-                        gradSliceOutputArray.AsSpan(0, cM * cNused), cNused, false,
-                        dWPackedScratch.AsSpan(0, cK * cNused), cK, cM, cNused);
-                }
+                        dWPackedScratch, 0, cNused);
 
                 // Scatter scratch into dW[:, 0:N_used], zero dW[:, N_used:N_full]
                 Array.Clear(gradWArray, 0, gradWArray.Length);
@@ -13442,17 +13397,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 int v2 = capturedW2.StorageMutationVersion;
                 if (v1 != wFusedW1Version || v2 != wFusedW2Version)
                 {
-                    if (!BlasProvider.TryGemm(cK, cN, cH, w1Data, 0, cH, w2Data, 0, cN, cWFused, 0, cN))
-                    {
-                        SimdGemm.Sgemm(w1Data.AsSpan(0, cK * cH), w2Data.AsSpan(0, cH * cN),
-                            cWFused.AsSpan(0, cK * cN), cK, cH, cN);
-                    }
+                    BlasProvider.Gemm(cK, cN, cH, w1Data, 0, cH, w2Data, 0, cN, cWFused, 0, cN);
                     wFusedW1Version = v1;
                     wFusedW2Version = v2;
                 }
-                if (!BlasProvider.TryGemm(cM, cN, cK, inputArray, 0, cK, cWFused, 0, cN, outputArray, 0, cN))
-                    SimdGemm.Sgemm(inputArray.AsSpan(0, cM * cK), cWFused.AsSpan(0, cK * cN),
-                        outputArray.AsSpan(0, cM * cN), cM, cK, cN);
+                BlasProvider.Gemm(cM, cN, cK, inputArray, 0, cK, cWFused, 0, cN, outputArray, 0, cN);
             });
 
             // Pre-allocate dW_fused scratch (compile-time, reused per call).
@@ -13463,58 +13412,38 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (gradOutArray is null) return;
 
                 // dW_fused = input^T @ gradOut  [K, N]
-                if (!BlasProvider.TryGemmEx(cK, cN, cM,
+                BlasProvider.GemmEx(cK, cN, cM,
                         inputArray, 0, cK, true,
                         gradOutArray, 0, cN, false,
-                        dWFused, 0, cN))
-                {
-                    SimdGemm.Sgemm(inputArray.AsSpan(0, cM * cK), cK, true,
-                        gradOutArray.AsSpan(0, cM * cN), cN, false,
-                        dWFused.AsSpan(0, cK * cN), cK, cM, cN);
-                }
+                        dWFused, 0, cN);
 
                 // dW1 = dW_fused @ W2^T  [K, H]  (chain rule on W_fused = W1 @ W2)
                 if (gradW1Array is not null)
                 {
-                    if (!BlasProvider.TryGemmEx(cK, cH, cN,
+                    BlasProvider.GemmEx(cK, cH, cN,
                             dWFused, 0, cN, false,
                             w2Data, 0, cN, true,
-                            gradW1Array, 0, cH))
-                    {
-                        SimdGemm.Sgemm(dWFused.AsSpan(0, cK * cN), cN, false,
-                            w2Data.AsSpan(0, cH * cN), cN, true,
-                            gradW1Array.AsSpan(0, cK * cH), cK, cN, cH);
-                    }
+                            gradW1Array, 0, cH);
                     capturedW1.Grad = gradW1Tensor;
                 }
 
                 // dW2 = W1^T @ dW_fused  [H, N]
                 if (gradW2Array is not null)
                 {
-                    if (!BlasProvider.TryGemmEx(cH, cN, cK,
+                    BlasProvider.GemmEx(cH, cN, cK,
                             w1Data, 0, cH, true,
                             dWFused, 0, cN, false,
-                            gradW2Array, 0, cN))
-                    {
-                        SimdGemm.Sgemm(w1Data.AsSpan(0, cK * cH), cH, true,
-                            dWFused.AsSpan(0, cK * cN), cN, false,
-                            gradW2Array.AsSpan(0, cH * cN), cH, cK, cN);
-                    }
+                            gradW2Array, 0, cN);
                     capturedW2.Grad = gradW2Tensor;
                 }
 
                 // dInput = gradOut @ W_fused^T  [M, K]
                 if (gradInputArray is not null)
                 {
-                    if (!BlasProvider.TryGemmEx(cM, cK, cN,
+                    BlasProvider.GemmEx(cM, cK, cN,
                             gradOutArray, 0, cN, false,
                             cWFused, 0, cN, true,
-                            gradInputArray, 0, cK))
-                    {
-                        SimdGemm.Sgemm(gradOutArray.AsSpan(0, cM * cN), cN, false,
-                            cWFused.AsSpan(0, cK * cN), cN, true,
-                            gradInputArray.AsSpan(0, cM * cK), cM, cN, cK);
-                    }
+                            gradInputArray, 0, cK);
                     capturedInput.Grad = gradInputTensor;
                 }
             });

@@ -17,7 +17,7 @@ public partial class CpuEngine
 {
     // The batch-wide column buffer is colH x (batch * colW) floats. 16M (64 MB) is also the largest operand SimdGemm
     // materializes a transpose of; larger problems keep the per-image path. Without native BLAS the GEMMs run on SimdGemm:
-    // BlasProvider.TryGemmEx would serve them from BlasManaged, measured ~5x slower on transposed operands.
+    // BlasProvider.GemmEx would serve them from BlasManaged, measured ~5x slower on transposed operands.
     private const long ConvBackwardBatchedMaxColumnElements = 16L * 1024 * 1024;
 
     // Stride-1 input gradients run as a transposed conv, which wins on large planes (1.4 ms against 8 ms batched at 64

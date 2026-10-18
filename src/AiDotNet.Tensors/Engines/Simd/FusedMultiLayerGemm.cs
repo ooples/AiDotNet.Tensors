@@ -66,22 +66,17 @@ internal static class FusedMultiLayerGemm
             // Fallback path: separate GEMM + SIMD GELU + GEMM. No L1 win,
             // but at least vectorized GELU.
             Array.Clear(activated, 0, m * h);
-            if (!BlasProvider.TryGemm(m, h, k, input, 0, k, w1, 0, h, activated, 0, h))
-                SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), activated.AsSpan(0, m * h), m, k, h);
+            BlasProvider.Gemm(m, h, k, input, 0, k, w1, 0, h, activated, 0, h);
             Buffer.BlockCopy(activated, 0, preActivation, 0, m * h * sizeof(float));
             fixed (float* pAct = activated)
                 SimdKernels.GELUUnsafe(pAct, pAct, m * h);
             Array.Clear(output, 0, m * n);
-            if (!BlasProvider.TryGemm(m, n, h, activated, 0, h, w2, 0, n, output, 0, n))
-                SimdGemm.Sgemm(activated.AsSpan(0, m * h), w2.AsSpan(0, h * n), output.AsSpan(0, m * n), m, h, n);
+            BlasProvider.Gemm(m, n, h, activated, 0, h, w2, 0, n, output, 0, n);
             return;
         }
 
         Array.Clear(output, 0, m * n);
         var gtile = ArrayPool<float>.Shared.Rent(Mr * h);
-        int gnrBlocks = (n + Nr - 1) / Nr;
-        float[] gpackedW2 = Array.Empty<float>();
-        bool gw2Packed = false;
 
         try
         {
@@ -91,8 +86,7 @@ internal static class FusedMultiLayerGemm
 
                 // GEMM1 strip → tile[mr, h]
                 Array.Clear(gtile, 0, mr * h);
-                if (!BlasProvider.TryGemm(mr, h, k, input, ic * k, k, w1, 0, h, gtile, 0, h))
-                    SimdGemm.Sgemm(input.AsSpan(ic * k, mr * k), w1.AsSpan(0, k * h), gtile.AsSpan(0, mr * h), mr, k, h);
+                BlasProvider.Gemm(mr, h, k, input, ic * k, k, w1, 0, h, gtile, 0, h);
 
                 // Save pre-activation rows to preActivation[ic..ic+mr, :]
                 Buffer.BlockCopy(gtile, 0, preActivation, ic * h * sizeof(float), mr * h * sizeof(float));
@@ -107,23 +101,12 @@ internal static class FusedMultiLayerGemm
                 Buffer.BlockCopy(gtile, 0, activated, ic * h * sizeof(float), mr * h * sizeof(float));
 
                 // GEMM2 strip: output[ic..ic+mr] += tile @ W2
-                if (!BlasProvider.TryGemm(mr, n, h, gtile, 0, h, w2, 0, n, output, ic * n, n))
-                {
-                    if (!gw2Packed)
-                    {
-                        gpackedW2 = ArrayPool<float>.Shared.Rent(h * ((gnrBlocks * Nr) + Nr));
-                        PackBRowMajor(w2, gpackedW2, h, n);
-                        gw2Packed = true;
-                    }
-                    ComputeGemm2FromTile(gtile, gpackedW2, output, ic, mr, h, n);
-                }
+                BlasProvider.Gemm(mr, n, h, gtile, 0, h, w2, 0, n, output, ic * n, n);
             }
         }
         finally
         {
             ArrayPool<float>.Shared.Return(gtile);
-            if (gw2Packed)
-                ArrayPool<float>.Shared.Return(gpackedW2);
         }
     }
 
@@ -173,11 +156,6 @@ internal static class FusedMultiLayerGemm
         // Allocate inter-layer tile buffer [Mr, H] — stays in L1
         var tile = ArrayPool<float>.Shared.Rent(Mr * h);
 
-        // Defer W2 packing until we know BLAS isn't available (avoids wasted work)
-        int nrBlocks = (n + Nr - 1) / Nr;
-        float[] packedW2 = Array.Empty<float>();
-        bool w2Packed = false;
-
         try
         {
             // Process Mr rows at a time
@@ -188,8 +166,7 @@ internal static class FusedMultiLayerGemm
                 // Step 1: Compute GEMM1 tile = input[ic:ic+mr, :] @ W1[:, :] → tile[mr, H]
                 // Use BLAS for maximum performance on the first GEMM
                 Array.Clear(tile, 0, mr * h);
-                if (!BlasProvider.TryGemm(mr, h, k, input, ic * k, k, w1, 0, h, tile, 0, h))
-                    SimdGemm.Sgemm(input.AsSpan(ic * k, mr * k), w1.AsSpan(0, k * h), tile.AsSpan(0, mr * h), mr, k, h);
+                BlasProvider.Gemm(mr, h, k, input, ic * k, k, w1, 0, h, tile, 0, h);
 
                 // Step 2: Apply activation in-place on tile AND save to activated buffer.
                 // When preActivation is provided (Phase G.2 for GELU), capture the
@@ -223,24 +200,12 @@ internal static class FusedMultiLayerGemm
 
                 // Step 3: Compute GEMM2: output[ic:ic+mr, :] += tile[mr, H] @ W2[H, N]
                 // Use BLAS with beta=0 (output was pre-cleared) for the strip
-                if (!BlasProvider.TryGemm(mr, n, h, tile, 0, h, w2, 0, n, output, ic * n, n))
-                {
-                    // Pack W2 on first BLAS miss (deferred to avoid wasted work when BLAS is available)
-                    if (!w2Packed)
-                    {
-                        packedW2 = ArrayPool<float>.Shared.Rent(h * ((nrBlocks * Nr) + Nr));
-                        PackBRowMajor(w2, packedW2, h, n);
-                        w2Packed = true;
-                    }
-                    ComputeGemm2FromTile(tile, packedW2, output, ic, mr, h, n);
-                }
+                BlasProvider.Gemm(mr, n, h, tile, 0, h, w2, 0, n, output, ic * n, n);
             }
         }
         finally
         {
             ArrayPool<float>.Shared.Return(tile);
-            if (w2Packed)
-                ArrayPool<float>.Shared.Return(packedW2);
         }
     }
 
@@ -298,92 +263,6 @@ internal static class FusedMultiLayerGemm
         }
     }
 
-    /// <summary>
-    /// Computes output[ic:ic+mr, :N] += tile[mr,H] @ W2[H,N] using packed B.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
-    private static unsafe void ComputeGemm2FromTile(
-        float[] tile, float[] packedW2, float[] output,
-        int ic, int mr, int h, int n)
-    {
-        fixed (float* pTile = tile, pW2 = packedW2, pOut = output)
-        {
-            int nrBlocks = (n + Nr - 1) / Nr;
-
-            for (int jr = 0; jr < nrBlocks; jr++)
-            {
-                int jLocal = jr * Nr;
-                int nc = Math.Min(Nr, n - jLocal);
-                int bOff = jr * h * Nr;
-
-                for (int row = 0; row < mr; row++)
-                {
-                    float* tileRow = pTile + row * h;
-                    float* outRow = pOut + (ic + row) * n + jLocal;
-
-#if NET5_0_OR_GREATER
-                    if (Fma.IsSupported && nc == Nr)
-                    {
-                        // Full Nr=16 tile: 2 Vector256 accumulators
-                        var acc0 = Avx.LoadVector256(outRow);
-                        var acc1 = Avx.LoadVector256(outRow + 8);
-
-                        for (int p = 0; p < h; p++)
-                        {
-                            var a = Vector256.Create(tileRow[p]);
-                            var b0 = Avx.LoadVector256(pW2 + bOff + p * Nr);
-                            var b1 = Avx.LoadVector256(pW2 + bOff + p * Nr + 8);
-                            acc0 = Fma.MultiplyAdd(a, b0, acc0);
-                            acc1 = Fma.MultiplyAdd(a, b1, acc1);
-                        }
-
-                        Avx.Store(outRow, acc0);
-                        Avx.Store(outRow + 8, acc1);
-                    }
-                    else
-#endif
-                    {
-                        // Scalar path for edge tiles
-                        for (int p = 0; p < h; p++)
-                        {
-                            float a = tileRow[p];
-                            for (int jj = 0; jj < nc; jj++)
-                                outRow[jj] += a * pW2[bOff + p * Nr + jj];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// <summary>Pack B[H,N] into column-panel layout for GEMM2 micro-kernel access.</summary>
-    [MethodImpl(Hot)]
-    private static unsafe void PackBRowMajor(float[] b, float[] packed, int h, int n)
-    {
-        int nrBlocks = (n + Nr - 1) / Nr;
-        fixed (float* pB = b, pPacked = packed)
-        {
-            for (int jr = 0; jr < nrBlocks; jr++)
-            {
-                int jLocal = jr * Nr;
-                int nc = Math.Min(Nr, n - jLocal);
-                int packOff = jr * h * Nr;
-
-                for (int p = 0; p < h; p++)
-                {
-                    int srcRowOff = p * n + jLocal;
-                    int dstOff = packOff + p * Nr;
-                    int j = 0;
-                    for (; j < nc; j++)
-                        pPacked[dstOff + j] = pB[srcRowOff + j];
-                    // Zero-pad partial tiles
-                    for (; j < Nr; j++)
-                        pPacked[dstOff + j] = 0f;
-                }
-            }
-        }
-    }
-
     /// <summary>Fallback: separate GEMM + activation + GEMM when H is too large for L1.</summary>
     [MethodImpl(Hot)]
     private static void FallbackSeparate(
@@ -426,9 +305,7 @@ internal static class FusedMultiLayerGemm
     /// collapses.</item>
     /// </list>
     /// <para>
-    /// Native <see cref="BlasProvider.TryGemm"/> is only a last-resort fallback for the
-    /// long-tail shapes neither managed kernel handles well yet (e.g. large-k moderate-m),
-    /// then SimdGemm if native is absent too.
+    /// Every other shape (e.g. large-k moderate-m) goes through <see cref="BlasProvider.Gemm"/>.
     /// </para>
     /// </summary>
     private static void FullGemm(
@@ -455,9 +332,7 @@ internal static class FusedMultiLayerGemm
             return;
         }
 
-        // Long-tail fallback: native if present, else SimdGemm.
-        if (!BlasProvider.TryGemm(mm, nn, kk, a, 0, lda, b, 0, ldb, c, 0, ldc))
-            SimdGemm.Sgemm(a.AsSpan(0, mm * kk), lda, false, b.AsSpan(0, kk * nn), ldb, false,
-                           c.AsSpan(0, mm * nn), mm, kk, nn);
+        // Long-tail shapes.
+        BlasProvider.Gemm(mm, nn, kk, a, 0, lda, b, 0, ldb, c, 0, ldc);
     }
 }

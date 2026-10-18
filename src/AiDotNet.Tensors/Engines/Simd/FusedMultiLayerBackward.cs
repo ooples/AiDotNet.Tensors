@@ -50,26 +50,11 @@ internal static class FusedMultiLayerBackward
         float[]? workspace = null) // [M, H] pre-allocated buffer for grad_h to avoid allocation
     {
         // Step 1: gradW2 = activated^T @ gradOutput  [H,M] @ [M,N] = [H,N]
-        // Uses TryGemmEx(transA=true) — no transpose allocation
-        if (!BlasProvider.TryGemmEx(h, n, m,
+        // Uses GemmEx(transA=true) — no transpose allocation
+        BlasProvider.GemmEx(h, n, m,
                 activated, 0, h, true,
                 gradOutput, 0, n, false,
-                gradW2, 0, n))
-        {
-            // Fallback: manual transposed matmul. Zero gradW2 first —
-            // SimdGemm.Sgemm uses beta=0 semantically but doesn't zero
-            // the destination internally for transposed-A paths; the
-            // caller's gradW2 may be reused across steps and carry stale
-            // values from a previous backward.
-            Array.Clear(gradW2, 0, h * n);
-            using var activatedKeep1 = new KeepAliveScope(activated);
-            using var gradOutputKeep1 = new KeepAliveScope(gradOutput);
-            using var gradW2Keep1 = new KeepAliveScope(gradW2);
-            SimdGemm.Sgemm(
-                activated.AsSpan(), h, true,
-                gradOutput.AsSpan(), n, false,
-                gradW2.AsSpan(), h, m, n);
-        }
+                gradW2, 0, n);
 
         // Step 2: gradB2 = sum(gradOutput, axis=0)  → [N]
         if (gradB2.Length >= n)
@@ -87,26 +72,15 @@ internal static class FusedMultiLayerBackward
         }
 
         // Step 3: grad_h = gradOutput @ W2^T  [M,N] @ [N,H] = [M,H]
-        // Uses TryGemmEx(transB=true) — no transpose allocation
+        // Uses GemmEx(transB=true) — no transpose allocation
         int requiredSize = m * h;
         var grad_h = workspace != null && workspace.Length >= requiredSize
             ? workspace
             : new float[requiredSize];
-        if (!BlasProvider.TryGemmEx(m, h, n,
+        BlasProvider.GemmEx(m, h, n,
                 gradOutput, 0, n, false,
                 w2, 0, n, true,
-                grad_h, 0, h))
-        {
-            // workspace may be reused across steps; clear before fallback.
-            Array.Clear(grad_h, 0, requiredSize);
-            using var gradOutputKeep2 = new KeepAliveScope(gradOutput);
-            using var w2Keep1 = new KeepAliveScope(w2);
-            using var grad_hKeep1 = new KeepAliveScope(grad_h);
-            SimdGemm.Sgemm(
-                gradOutput.AsSpan(), n, false,
-                w2.AsSpan(), n, true,
-                grad_h.AsSpan(), m, n, h);
-        }
+                grad_h, 0, h);
 
         // Step 4: Apply activation derivative in-place: grad_pre = grad_h * act'(activated)
         // This is a fused SIMD operation — no separate allocation
@@ -117,20 +91,10 @@ internal static class FusedMultiLayerBackward
         }
 
         // Step 5: gradW1 = input^T @ grad_pre  [K,M] @ [M,H] = [K,H]
-        if (!BlasProvider.TryGemmEx(k, h, m,
+        BlasProvider.GemmEx(k, h, m,
                 input, 0, k, true,
                 grad_h, 0, h, false,
-                gradW1, 0, h))
-        {
-            Array.Clear(gradW1, 0, k * h);
-            using var inputKeep1 = new KeepAliveScope(input);
-            using var grad_hKeep2 = new KeepAliveScope(grad_h);
-            using var gradW1Keep1 = new KeepAliveScope(gradW1);
-            SimdGemm.Sgemm(
-                input.AsSpan(), k, true,
-                grad_h.AsSpan(), h, false,
-                gradW1.AsSpan(), k, m, h);
-        }
+                gradW1, 0, h);
 
         // Step 6: gradB1 = sum(grad_pre, axis=0) → [H]
         if (gradB1.Length >= h)
@@ -150,20 +114,10 @@ internal static class FusedMultiLayerBackward
         // Step 7: gradInput = grad_pre @ W1^T  [M,H] @ [H,K] = [M,K]
         if (gradInput.Length >= m * k)
         {
-            if (!BlasProvider.TryGemmEx(m, k, h,
+            BlasProvider.GemmEx(m, k, h,
                     grad_h, 0, h, false,
                     w1, 0, h, true,
-                    gradInput, 0, k))
-            {
-                Array.Clear(gradInput, 0, m * k);
-                using var grad_hKeep3 = new KeepAliveScope(grad_h);
-                using var w1Keep1 = new KeepAliveScope(w1);
-                using var gradInputKeep1 = new KeepAliveScope(gradInput);
-                SimdGemm.Sgemm(
-                    grad_h.AsSpan(), h, false,
-                    w1.AsSpan(), h, true,
-                    gradInput.AsSpan(), m, h, k);
-            }
+                    gradInput, 0, k);
         }
     }
 
@@ -237,23 +191,10 @@ internal static class FusedMultiLayerBackward
         float[]? workspace = null)
     {
         // Step 1: gradW2 = activated^T @ gradOutput  [H,M] @ [M,N] = [H,N]
-        if (!BlasProvider.TryGemmEx(h, n, m,
+        BlasProvider.GemmEx(h, n, m,
                 activated, 0, h, true,
                 gradOutput, 0, n, false,
-                gradW2, 0, n))
-        {
-            // SimdGemm.Sgemm assumes beta=0 destination; gradW2 is caller-
-            // owned and may carry values from a previous backward. Clear
-            // before writing.
-            Array.Clear(gradW2, 0, h * n);
-            using var activatedKeep2 = new KeepAliveScope(activated);
-            using var gradOutputKeep3 = new KeepAliveScope(gradOutput);
-            using var gradW2Keep2 = new KeepAliveScope(gradW2);
-            SimdGemm.Sgemm(
-                activated.AsSpan(), h, true,
-                gradOutput.AsSpan(), n, false,
-                gradW2.AsSpan(), h, m, n);
-        }
+                gradW2, 0, n);
 
         // Step 2: gradB2 = sum(gradOutput, axis=0) → [N]
         if (gradB2.Length >= n)
@@ -275,21 +216,10 @@ internal static class FusedMultiLayerBackward
         var grad_h = workspace != null && workspace.Length >= requiredSize
             ? workspace
             : new float[requiredSize];
-        if (!BlasProvider.TryGemmEx(m, h, n,
+        BlasProvider.GemmEx(m, h, n,
                 gradOutput, 0, n, false,
                 w2, 0, n, true,
-                grad_h, 0, h))
-        {
-            // workspace may be reused across steps; clear before fallback.
-            Array.Clear(grad_h, 0, requiredSize);
-            using var gradOutputKeep4 = new KeepAliveScope(gradOutput);
-            using var w2Keep2 = new KeepAliveScope(w2);
-            using var grad_hKeep4 = new KeepAliveScope(grad_h);
-            SimdGemm.Sgemm(
-                gradOutput.AsSpan(), n, false,
-                w2.AsSpan(), n, true,
-                grad_h.AsSpan(), m, n, h);
-        }
+                grad_h, 0, h);
 
         // Step 4: Apply activation derivative against PRE-activation
         // (this is the only line that differs from the ReLU/post-activation
@@ -301,20 +231,10 @@ internal static class FusedMultiLayerBackward
         }
 
         // Step 5: gradW1 = input^T @ grad_pre  [K,M] @ [M,H] = [K,H]
-        if (!BlasProvider.TryGemmEx(k, h, m,
+        BlasProvider.GemmEx(k, h, m,
                 input, 0, k, true,
                 grad_h, 0, h, false,
-                gradW1, 0, h))
-        {
-            Array.Clear(gradW1, 0, k * h);
-            using var inputKeep2 = new KeepAliveScope(input);
-            using var grad_hKeep5 = new KeepAliveScope(grad_h);
-            using var gradW1Keep2 = new KeepAliveScope(gradW1);
-            SimdGemm.Sgemm(
-                input.AsSpan(), k, true,
-                grad_h.AsSpan(), h, false,
-                gradW1.AsSpan(), k, m, h);
-        }
+                gradW1, 0, h);
 
         // Step 6: gradB1 = sum(grad_pre, axis=0) → [H]
         if (gradB1.Length >= h)
@@ -334,20 +254,10 @@ internal static class FusedMultiLayerBackward
         // Step 7: gradInput = grad_pre @ W1^T  [M,H] @ [H,K] = [M,K]
         if (gradInput.Length >= m * k)
         {
-            if (!BlasProvider.TryGemmEx(m, k, h,
+            BlasProvider.GemmEx(m, k, h,
                     grad_h, 0, h, false,
                     w1, 0, h, true,
-                    gradInput, 0, k))
-            {
-                Array.Clear(gradInput, 0, m * k);
-                using var grad_hKeep6 = new KeepAliveScope(grad_h);
-                using var w1Keep2 = new KeepAliveScope(w1);
-                using var gradInputKeep2 = new KeepAliveScope(gradInput);
-                SimdGemm.Sgemm(
-                    grad_h.AsSpan(), h, false,
-                    w1.AsSpan(), h, true,
-                    gradInput.AsSpan(), m, h, k);
-            }
+                    gradInput, 0, k);
         }
     }
 }

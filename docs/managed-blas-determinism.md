@@ -1,10 +1,8 @@
 # ManagedBlas determinism & dispatch modes
 
 AiDotNet.Tensors runs CPU matrix multiplication (GEMM) through its own managed
-kernel, **ManagedBlas** (`BlasManaged.Gemm`), as the default path. Native OpenBLAS
-is kept as an **optional per-shape accelerator**: in non-deterministic mode the
-autotune router may dispatch to it for the (typically large, single-stream) shapes
-where it still edges the managed kernel. This document describes the two execution
+kernel, **ManagedBlas** (`BlasManaged.Gemm`). There is no native BLAS dependency
+(OpenBLAS and Intel MKL were removed). This document describes the two execution
 modes, the determinism guarantee, and how dispatch is routed.
 
 ## Two modes
@@ -18,7 +16,7 @@ AiDotNetEngine.SetDeterministicMode(false);  // maximum throughput
 
 | | Deterministic (default) | Non-deterministic |
 |---|---|---|
-| GEMM kernel | ManagedBlas, always | per-shape best of ManagedBlas / native OpenBLAS (autotuned) |
+| GEMM kernel | ManagedBlas | ManagedBlas, which may also split the K-reduction across threads |
 | Result reproducibility | **bit-identical** across runs and thread counts (same machine/ISA) | not guaranteed bit-identical (reduction order may vary) |
 | Parallelism | **full** (multi-threaded) | full |
 | Use when | training/inference that must reproduce exactly; debugging; regression baselines | latency/throughput is the only goal |
@@ -48,38 +46,19 @@ same GEMM at 1/2/4/16 threads and asserts the output is bit-identical.
 
 ## Dispatch routing
 
-All `BlasProvider.TryGemm*` entry points decide managed-vs-native via one helper,
-`BlasProvider.ShouldRouteManaged`, in this priority order:
-
-1. **`BlasManaged.PreferManaged`** (default `false`) — force managed everywhere; set
-   `true` for supply-chain-hardened deployments that want zero native attack surface.
-2. **Deterministic mode** — always managed (the reproducible-and-parallel kernel).
-   Deterministic mode never consults the timing-based autotune below, because a
-   measurement-chosen kernel would not be reproducible.
-3. **`BlasManaged.AutotuneRouting`** (default `true`) — in *non-deterministic* mode,
-   `PrefersManagedCache` measures both kernels once per `(shape, hardware)` tuple
-   (disk-persisted under `~/.aidotnet/autotune/`) and routes future calls to the
-   faster one. Managed where it wins, native where it wins — so the managed default
-   never costs throughput.
-4. Otherwise → native OpenBLAS.
+Every CPU GEMM, including the `BlasProvider.Gemm` and `BlasProvider.GemmEx` entry
+points, runs the managed `BlasManaged` kernel in both modes. The mode changes only
+which splits that kernel may use (the K-reduction split above) and whether the
+order-dependent reductions elsewhere run serially (`BlasProvider.SetDeterministicMode`).
 
 ## Quick reference
 
 ```csharp
 using AiDotNet.Tensors.Engines;
-using AiDotNet.Tensors.Engines.BlasManaged;
 
 // Reproducible + parallel (default).
 AiDotNetEngine.SetDeterministicMode(true);
 
-// Max throughput; per-shape best-of managed/native.
+// Max throughput: K-reduction splits allowed, results may vary with thread count.
 AiDotNetEngine.SetDeterministicMode(false);
-
-// Hardened: never touch native BLAS, in any mode.
-BlasManaged.PreferManaged = true;
-
-// Disable per-shape autotune. Deterministic mode still routes managed; in
-// non-deterministic mode dispatch then falls back to native (unless PreferManaged
-// is true).
-BlasManaged.AutotuneRouting = false;
 ```

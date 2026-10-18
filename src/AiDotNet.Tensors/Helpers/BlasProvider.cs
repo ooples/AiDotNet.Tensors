@@ -19,7 +19,7 @@ internal static class BlasProvider
     // ─────────────────────────────────────────────────────────────────────
     // Shape-instrumentation hook (issue #403 Phase A.1).
     //
-    // When subscribed, every TryGemm/TryGemmEx call invokes the hook with
+    // When subscribed, every Gemm/GemmEx call invokes the hook with
     // (m, n, k, transA, transB) so a higher-level profiler can build a
     // unique-shape catalog without modifying call sites. The hook is a single
     // volatile delegate read on the fast path — when unset, the per-call cost
@@ -116,50 +116,46 @@ internal static class BlasProvider
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // GEMM: C := A·B (row-major), optionally with transposed operands.
-    // Always served by the managed kernel, so these never return false. The
-    // bool return is kept so call sites written against the old native
-    // provider keep compiling; their fallbacks are unreachable.
+    // GEMM: C := A·B (row-major), optionally with transposed operands, always
+    // served by the managed kernel. C is overwritten, never read.
     // ────────────────────────────────────────────────────────────────────
 
-    internal static bool TryGemm(int m, int n, int k,
+    internal static void Gemm(int m, int n, int k,
         float[] a, int aOffset, int lda,
         float[] b, int bOffset, int ldb,
         float[] c, int cOffset, int ldc)
-        => TryGemm(m, n, k,
+        => Gemm(m, n, k,
             new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda,
             new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb,
             new Span<float>(c, cOffset, c.Length - cOffset), ldc);
 
-    internal static bool TryGemm(int m, int n, int k,
+    internal static void Gemm(int m, int n, int k,
         double[] a, int aOffset, int lda,
         double[] b, int bOffset, int ldb,
         double[] c, int cOffset, int ldc)
-        => TryGemm(m, n, k,
+        => Gemm(m, n, k,
             new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda,
             new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb,
             new Span<double>(c, cOffset, c.Length - cOffset), ldc);
 
-    internal static bool TryGemm(int m, int n, int k,
+    internal static void Gemm(int m, int n, int k,
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int ldc)
     {
         Engines.BlasManaged.BlasManaged.Gemm<float>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
         LogShape(m, n, k);
-        return true;
     }
 
-    internal static bool TryGemm(int m, int n, int k,
+    internal static void Gemm(int m, int n, int k,
         ReadOnlySpan<double> a, int lda, ReadOnlySpan<double> b, int ldb, Span<double> c, int ldc)
     {
         Engines.BlasManaged.BlasManaged.Gemm<double>(a, lda, false, b, ldb, false, c, ldc, m, n, k);
         LogShape(m, n, k);
-        return true;
     }
 
     /// <summary>
     /// GEMM with optional transposed operands, writing C without reading it (beta = 0).
     /// </summary>
-    internal static bool TryGemmEx(int m, int n, int k,
+    internal static void GemmEx(int m, int n, int k,
         float[] a, int aOffset, int lda, bool transA,
         float[] b, int bOffset, int ldb, bool transB,
         float[] c, int cOffset, int ldc)
@@ -170,13 +166,12 @@ internal static class BlasProvider
             new Span<float>(c, cOffset, c.Length - cOffset), ldc,
             m, n, k, new Engines.BlasManaged.BlasOptions<float> { BetaZero = true });
         LogShape(m, n, k, transA, transB);
-        return true;
     }
 
     /// <summary>
-    /// Double-precision counterpart of <see cref="TryGemmEx(int, int, int, float[], int, int, bool, float[], int, int, bool, float[], int, int)"/>.
+    /// Double-precision counterpart of <see cref="GemmEx(int, int, int, float[], int, int, bool, float[], int, int, bool, float[], int, int)"/>.
     /// </summary>
-    internal static bool TryGemmEx(int m, int n, int k,
+    internal static void GemmEx(int m, int n, int k,
         double[] a, int aOffset, int lda, bool transA,
         double[] b, int bOffset, int ldb, bool transB,
         double[] c, int cOffset, int ldc)
@@ -187,6 +182,5 @@ internal static class BlasProvider
             new Span<double>(c, cOffset, c.Length - cOffset), ldc,
             m, n, k, new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
         LogShape(m, n, k, transA, transB);
-        return true;
     }
 }

@@ -266,37 +266,12 @@ internal static class MatrixMultiplyHelper
     {
         if (typeof(T) == typeof(float) && a is float[] af && b is float[] bf && c is float[] cf)
         {
-            if (BlasProvider.TryGemm(m, n, k, af, aOffset, k, bf, bOffset, n, cf, cOffset, n))
-            {
-                return true;
-            }
-
-            // BLAS unavailable - fall back to our SIMD GEMM (BLIS-style tiled FMA kernel)
-            if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] BLAS unavailable, using SimdGemm.Sgemm fallback");
-            SimdGemm.Sgemm(
-                af.AsSpan(aOffset, m * k),
-                bf.AsSpan(bOffset, k * n),
-                cf.AsSpan(cOffset, m * n),
-                m, k, n);
+            BlasProvider.Gemm(m, n, k, af, aOffset, k, bf, bOffset, n, cf, cOffset, n);
             return true;
         }
         else if (typeof(T) == typeof(double) && a is double[] ad && b is double[] bd && c is double[] cd)
         {
-            if (BlasProvider.TryGemm(m, n, k, ad, aOffset, k, bd, bOffset, n, cd, cOffset, n))
-            {
-                return true;
-            }
-
-            // BLAS unavailable — route double through SimdGemm.Dgemm (issue
-            // #243). The scalar fallback in MultiplyBlocked handles the
-            // below-threshold path; this gives the mid-to-large shapes an
-            // AVX2 FMA kernel without needing OpenBLAS.
-            if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] BLAS unavailable, using SimdGemm.Dgemm fallback");
-            SimdGemm.Dgemm(
-                ad.AsSpan(aOffset, m * k),
-                bd.AsSpan(bOffset, k * n),
-                cd.AsSpan(cOffset, m * n),
-                m, k, n);
+            BlasProvider.Gemm(m, n, k, ad, aOffset, k, bd, bOffset, n, cd, cOffset, n);
             return true;
         }
 #if NET5_0_OR_GREATER

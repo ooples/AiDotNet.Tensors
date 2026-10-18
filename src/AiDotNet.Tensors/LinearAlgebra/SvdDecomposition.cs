@@ -248,19 +248,10 @@ internal static class SvdDecomposition
             ? workspace
             : new float[xRows * r];
         Array.Clear(temp, 0, xRows * r);
-        if (!BlasProvider.TryGemm(xRows, r, xCols, x, 0, xCols, factors.LeftFactor, 0, r, temp, 0, r))
-        {
-            using var tempKeep1 = new KeepAliveScope(temp);
-            SimdGemm.Sgemm(x.AsSpan(0, xRows * xCols), factors.LeftFactor.AsSpan(0, xCols * r),
-                temp.AsSpan(), xRows, xCols, r);
-        }
+        BlasProvider.Gemm(xRows, r, xCols, x, 0, xCols, factors.LeftFactor, 0, r, temp, 0, r);
 
         // Step 2: output = temp[xRows, r] @ rightFactor[r, N] → [xRows, N]
-        if (!BlasProvider.TryGemm(xRows, n, r, temp, 0, r, factors.RightFactor, 0, n, output, 0, n))
-        {
-            SimdGemm.Sgemm(temp.AsSpan(0, xRows * r), factors.RightFactor.AsSpan(0, r * n),
-                output.AsSpan(0, xRows * n), xRows, r, n);
-        }
+        BlasProvider.Gemm(xRows, n, r, temp, 0, r, factors.RightFactor, 0, n, output, 0, n);
     }
 }
 

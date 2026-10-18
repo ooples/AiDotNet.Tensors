@@ -58,7 +58,7 @@ public class DeepProfileTests
         sw.Restart();
         for (int i = 0; i < iters; i++)
             for (int s = 0; s < B; s++)
-                BlasProvider.TryGemm(M, N, K, af, s * M * K, K, bf, s * K * N, N, cf, s * M * N, N);
+                BlasProvider.Gemm(M, N, K, af, s * M * K, K, bf, s * K * N, N, cf, s * M * N, N);
         sw.Stop();
         _output.WriteLine($"D. 4x BLAS (pre-alloc): {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
 
@@ -69,7 +69,7 @@ public class DeepProfileTests
         Array.Copy(bf, b2d, K * N);
         sw.Restart();
         for (int i = 0; i < iters; i++)
-            BlasProvider.TryGemm(B * M, N, K, a2d, 0, K, b2d, 0, N, cf, 0, N);
+            BlasProvider.Gemm(B * M, N, K, a2d, 0, K, b2d, 0, N, cf, 0, N);
         sw.Stop();
         _output.WriteLine($"E. Single BLAS [{B * M},{K}]@[{K},{N}]: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
 
@@ -126,10 +126,10 @@ public class DeepProfileTests
         var af = (float[])(object)a.GetDataArray();
         var bf = (float[])(object)b.GetDataArray();
         var cf = new float[32 * 256];
-        BlasProvider.TryGemm(32, 256, 256, af, 0, 256, bf, 0, 256, cf, 0, 256);
+        BlasProvider.Gemm(32, 256, 256, af, 0, 256, bf, 0, 256, cf, 0, 256);
         sw.Restart();
         for (int i = 0; i < iters; i++)
-            BlasProvider.TryGemm(32, 256, 256, af, 0, 256, bf, 0, 256, cf, 0, 256);
+            BlasProvider.Gemm(32, 256, 256, af, 0, 256, bf, 0, 256, cf, 0, 256);
         sw.Stop();
         _output.WriteLine($"B. Raw BLAS: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
 

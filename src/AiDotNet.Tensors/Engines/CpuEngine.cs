@@ -11252,7 +11252,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
             if (!gemmHandled)
             {
-                gemmHandled = Helpers.BlasProvider.TryGemm(
+                Helpers.BlasProvider.Gemm(
                     outChannels, colW, colH,
                     kernelSpan.Slice(0, outChannels * colH),
                     colH,
@@ -11260,15 +11260,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     colW,
                     outputSpan.Slice(outputOffset, outChannels * colW),
                     colW);
-            }
-
-            if (!gemmHandled)
-            {
-                MultiplyMatrixBlockedFloat(
-                    kernelSpan,
-                    im2colSpan.Slice(0, sliceSize),
-                    outputSpan.Slice(outputOffset, outChannels * colW),
-                    outChannels, colH, colW);
             }
         }
 
@@ -11542,18 +11533,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     // C[oc, colOffset + j] = kernel[oc, :] · panel[:, j]  for j in [0, ncBlock), written with
                     // ldc = colW (the full row stride) from the block's first output element.
                     var cWindow = outputSpan.Slice(outBatchOffset + colOffset);
-                    bool usedBlas = Helpers.BlasProvider.TryGemm(
+                    Helpers.BlasProvider.Gemm(
                         outChannels, ncBlock, colH,
                         kernelSpan.Slice(0, outChannels * colH), colH, // A = kernel [outChannels x colH], lda=colH
                         panelSpan.Slice(0, colH * ncBlock), ncBlock,   // B = panel  [colH x ncBlock],     ldb=ncBlock
                         cWindow, colW);                                // C window, ldc=colW
-
-                    if (!usedBlas)
-                    {
-                        MultiplyMatrixBlockedFloatStrided(
-                            kernelSpan, panelSpan, cWindow,
-                            outChannels, colH, ncBlock, colW);
-                    }
                 }
             }
         }
@@ -11669,7 +11653,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int inputOffset = b * inputSliceSize;
                 int outputOffset = b * outChannels * colW;
 
-                bool usedBlas = Helpers.BlasProvider.TryGemm(
+                Helpers.BlasProvider.Gemm(
                     outChannels, colW, colH,
                     kernelSpan.Slice(0, outChannels * colH),
                     colH,
@@ -11677,15 +11661,6 @@ public partial class CpuEngine : ITensorLevelEngine
                     colW,
                     outputSpan.Slice(outputOffset, outChannels * colW),
                     colW);
-
-                if (!usedBlas)
-                {
-                    Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                        kernelSpan.Slice(0, outChannels * colH),
-                        inputSpan.Slice(inputOffset, inputSliceSize),
-                        outputSpan.Slice(outputOffset, outChannels * colW),
-                        outChannels, colH, colW);
-                }
             }
             return;
         }
@@ -11712,7 +11687,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // Step 2: GEMM for this batch
             int outputOffset = b * outChannels * colW;
 
-            bool usedBlas = Helpers.BlasProvider.TryGemm(
+            Helpers.BlasProvider.Gemm(
                 outChannels, colW, colH,
                 kernelSpan.Slice(0, outChannels * colH),
                 colH,
@@ -11720,15 +11695,6 @@ public partial class CpuEngine : ITensorLevelEngine
                 colW,
                 outputSpan.Slice(outputOffset, outChannels * colW),
                 colW);
-
-            if (!usedBlas)
-            {
-                Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                    kernelSpan.Slice(0, outChannels * colH),
-                    im2colSpan.Slice(0, sliceSize),
-                    outputSpan.Slice(outputOffset, outChannels * colW),
-                    outChannels, colH, colW);
-            }
         }
 
 #if !NETCOREAPP
@@ -13829,9 +13795,9 @@ public partial class CpuEngine : ITensorLevelEngine
             // treats it as Kᵀ-major and contracts over K).
             // Large products take the parallel packed BLAS first: a tied LM head's logits [1024,512]·[49152,512]ᵀ ran
             // 592 ms through SimdGemm vs PyTorch's 207 ms (3990X).
-            bool viaBlas = (long)M * N * K >= MatMulTransposedBlasMinWork
-                && BlasProvider.TryGemmEx(M, N, K, aRaw, aOff, K, false, bRaw, bOff, K, true, rRaw, rOff, N);
-            if (!viaBlas)
+            if ((long)M * N * K >= MatMulTransposedBlasMinWork)
+                BlasProvider.GemmEx(M, N, K, aRaw, aOff, K, false, bRaw, bOff, K, true, rRaw, rOff, N);
+            else
             AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
                 new ReadOnlySpan<float>(aRaw, aOff, M * K),
                 lda: K, transA: false,
@@ -13846,14 +13812,10 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        // Double fast path via BLAS cblas_dgemm with transB=true. Mirrors the
+        // Double fast path via the managed GEMM with transB=true. Mirrors the
         // float branch's "skip the transpose materialization" trick. Used by
         // every attention layer's QKᵀ on fp64 and by linear-layer backwards
-        // through MatMulTransposedBackward. Falls through to the materialize-
-        // transpose generic path below when BLAS isn't loaded (rare — the in-
-        // house SimdGemm.Dgemm doesn't carry a transB flag, so we don't have
-        // a non-BLAS fast path here; the existing TryGemmEx route gives us
-        // PyTorch-class throughput when libopenblas is available).
+        // through MatMulTransposedBackward.
         if (typeof(T) == typeof(double) && a.Rank == 2 && b.Rank == 2 && a.IsContiguous && b.IsContiguous)
         {
             var aRaw = (double[])(object)a._storage.GetDataArray();
@@ -13862,17 +13824,12 @@ public partial class CpuEngine : ITensorLevelEngine
             var rRaw = (double[])(object)result._storage.GetDataArray();
             int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
 
-            if (BlasProvider.TryGemmEx(M, N, K,
+            BlasProvider.GemmEx(M, N, K,
                 aRaw, aOff, K, false,
                 bRaw, bOff, K, true,
-                rRaw, rOff, N))
-            {
-                DifferentiableOps.RecordBinary("TensorMatMulTransposed", result, a, b, BackwardFunctions<T>.MatMulTransposedBackward);
-                return result;
-            }
-            // BLAS not loaded — fall through to the materialize-transpose path
-            // (still better than nothing; future work: add an in-house
-            // DgemmTransposeB so we keep the fast path even without libopenblas).
+                rRaw, rOff, N);
+            DifferentiableOps.RecordBinary("TensorMatMulTransposed", result, a, b, BackwardFunctions<T>.MatMulTransposedBackward);
+            return result;
         }
 
         // Generic fallback: materialize the transpose and call TensorMatMul.
@@ -14064,16 +14021,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Rank == 2 && b.Rank == 2)
         {
             int m = a._shape[0], k = a._shape[1], n = b._shape[1];
-            if (Helpers.BlasProvider.TryGemmEx(m, n, k,
+            Helpers.BlasProvider.GemmEx(m, n, k,
                 aArr, aOff, k, false,
                 bArr, bOff, n, false,
-                oArr, oOff, n))
-                return;
-            SimdGemm.Dgemm(
-                new ReadOnlySpan<double>(aArr, aOff, m * k),
-                new ReadOnlySpan<double>(bArr, bOff, k * n),
-                new Span<double>(oArr, oOff, m * n),
-                m, k, n);
+                oArr, oOff, n);
             return;
         }
 
@@ -14087,16 +14038,10 @@ public partial class CpuEngine : ITensorLevelEngine
             int batchSize = 1;
             for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
             int rows = batchSize * m;
-            if (BlasProvider.TryGemmEx(rows, n, k,
+            BlasProvider.GemmEx(rows, n, k,
                 aArr, aOff, k, false,
                 bArr, bOff, n, false,
-                oArr, oOff, n))
-                return;
-            SimdGemm.Dgemm(
-                new ReadOnlySpan<double>(aArr, aOff, rows * k),
-                new ReadOnlySpan<double>(bArr, bOff, k * n),
-                new Span<double>(oArr, oOff, rows * n),
-                rows, k, n);
+                oArr, oOff, n);
             return;
         }
 
@@ -14112,31 +14057,19 @@ public partial class CpuEngine : ITensorLevelEngine
             int sliceA = m * k, sliceB = k * n, sliceC = m * n;
             if (batchSize == 1)
             {
-                if (BlasProvider.TryGemmEx(m, n, k,
+                BlasProvider.GemmEx(m, n, k,
                     aArr, aOff, k, false,
                     bArr, bOff, n, false,
-                    oArr, oOff, n))
-                    return;
-                SimdGemm.Dgemm(
-                    new ReadOnlySpan<double>(aArr, aOff, sliceA),
-                    new ReadOnlySpan<double>(bArr, bOff, sliceB),
-                    new Span<double>(oArr, oOff, sliceC),
-                    m, k, n);
+                    oArr, oOff, n);
             }
             else
             {
                 CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
                 {
-                    if (BlasProvider.TryGemmEx(m, n, k,
+                    BlasProvider.GemmEx(m, n, k,
                         aArr, aOff + batch * sliceA, k, false,
                         bArr, bOff + batch * sliceB, n, false,
-                        oArr, oOff + batch * sliceC, n))
-                        return;
-                    SimdGemm.DgemmSequential(
-                        new ReadOnlySpan<double>(aArr, aOff + batch * sliceA, sliceA),
-                        new ReadOnlySpan<double>(bArr, bOff + batch * sliceB, sliceB),
-                        new Span<double>(oArr, oOff + batch * sliceC, sliceC),
-                        m, k, n);
+                        oArr, oOff + batch * sliceC, n);
                 });
             }
             return;
@@ -15679,7 +15612,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Double-precision parallel to <see cref="Conv2DIm2colGemm"/>: im2col +
-    /// dgemm using <see cref="Helpers.BlasProvider.TryGemm"/> (libopenblas
+    /// dgemm using <see cref="Helpers.BlasProvider.Gemm"/> (libopenblas
     /// dgemm). Mirrors the float fast path's lowering but uses the
     /// asymmetric-stride <see cref="Helpers.Im2ColHelper.Im2Col"/> overload
     /// so it works for the int[]-stride / int[]-padding / int[]-dilation
@@ -15723,20 +15656,11 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int inOff = b * inputSliceSize;
             int outOff = b * outC * N;
-            bool usedBlas = Helpers.BlasProvider.TryGemm(
+            Helpers.BlasProvider.Gemm(
                 outC, N, K,
                 kernel.AsSpan(0, outC * K), K,
                 input.AsSpan(inOff, inputSliceSize), N,
                 output.AsSpan(outOff, outC * N), N);
-
-            if (!usedBlas)
-            {
-                Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                    kernel.AsSpan(0, outC * K),
-                    input.AsSpan(inOff, inputSliceSize),
-                    output.AsSpan(outOff, outC * N),
-                    outC, K, N);
-            }
         }
 
         void ProcessImage(int b)
@@ -15750,20 +15674,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     1, inC, H, W, kH, kW, sH, sW, padH, padW, dH, dW);
 
                 int outOff = b * outC * N;
-                bool usedBlas = Helpers.BlasProvider.TryGemm(
+                Helpers.BlasProvider.Gemm(
                     outC, N, K,
                     kernel.AsSpan(0, outC * K), K,
                     col.AsSpan(0, K * N), N,
                     output.AsSpan(outOff, outC * N), N);
-
-                if (!usedBlas)
-                {
-                    Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                        kernel.AsSpan(0, outC * K),
-                        col.AsSpan(0, K * N),
-                        output.AsSpan(outOff, outC * N),
-                        outC, K, N);
-                }
             }
             finally
             {
@@ -15897,17 +15812,10 @@ public partial class CpuEngine : ITensorLevelEngine
                                        gradOutAll, oc * batchColW + b * colW, colW);
                     }
 
-                    if (!Helpers.BlasProvider.TryGemmEx(colH, batchColW, outChannels,
+                    Helpers.BlasProvider.GemmEx(colH, batchColW, outChannels,
                         kernelF, 0, colH, true,
                         gradOutAll, 0, batchColW, false,
-                        colAll, 0, batchColW))
-                    {
-                        Simd.SimdGemm.Sgemm(
-                            new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, true,
-                            new ReadOnlySpan<float>(gradOutAll, 0, outChannels * batchColW), batchColW, false,
-                            new Span<float>(colAll, 0, colH * batchColW),
-                            colH, outChannels, batchColW);
-                    }
+                        colAll, 0, batchColW);
 
                     CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
                     {
@@ -15941,18 +15849,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
                     // col[colH,colW] = kernel^T[colH,outC] @ gradOutput[outC,colW].
                     // A = kernel stored [outC,colH] (lda=colH), transposed via transA.
-                    if (!Helpers.BlasProvider.TryGemmEx(colH, colW, outChannels,
+                    Helpers.BlasProvider.GemmEx(colH, colW, outChannels,
                         kernelF, 0, colH, true,
                         gradOutputF, gradOutOff, colW, false,
-                        colBuf, 0, colW))
-                    {
-                        // SimdGemm fallback (transpose A in-place via the flag).
-                        Simd.SimdGemm.Sgemm(
-                            new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, true,
-                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
-                            new Span<float>(colBuf, 0, colH * colW),
-                            colH, outChannels, colW);
-                    }
+                        colBuf, 0, colW);
 
                     int imgOff = b * inChannels * height * width;
                     // Channel-parallel scatter: the serial Span col2im was the dominant
@@ -16012,7 +15912,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     int destSliceOff = b * inputSliceSize1x1;
                     // gradInput_b[inC, N] = kernel[outC, inC]ᵀ · gradOut_b[outC, N] through the managed GEMM, which
                     // reads the kernel transposed in place and overwrites the slice.
-                    Helpers.BlasProvider.TryGemmEx(
+                    Helpers.BlasProvider.GemmEx(
                         inChannels, N1x1, outChannels,
                         kernelD1x1, 0, inChannels, true,
                         gradOutputD1x1, gradOutOff, N1x1, false,
@@ -16195,26 +16095,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
 
                     // One full-width transA GEMM (kernel packed once).
-                    if (!Helpers.BlasProvider.TryGemmEx(colH, batchColW, outChannels,
+                    Helpers.BlasProvider.GemmEx(colH, batchColW, outChannels,
                         kernelD, 0, colH, true,
                         gradOutAll, 0, batchColW, false,
-                        colAll, 0, batchColW))
-                    {
-                        // Cold fallback: transpose kernel once, sequential GEMM.
-                        var ktScratch = poolD.Rent(colH * outChannels);
-                        try
-                        {
-                            for (int r = 0; r < outChannels; r++)
-                                for (int c = 0; c < colH; c++)
-                                    ktScratch[c * outChannels + r] = kernelD[r * colH + c];
-                            Simd.SimdGemm.DgemmSequential(
-                                new ReadOnlySpan<double>(ktScratch, 0, colH * outChannels),
-                                new ReadOnlySpan<double>(gradOutAll, 0, outChannels * batchColW),
-                                new Span<double>(colAll, 0, colH * batchColW),
-                                colH, outChannels, batchColW);
-                        }
-                        finally { poolD.Return(ktScratch); }
-                    }
+                        colAll, 0, batchColW);
 
                     // Batch-parallel col2im, reading each batch's strided slice.
                     CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
@@ -16247,30 +16131,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
                     // col[colH,colW] = kernel^T[colH,outC] @ gradOutput[outC,colW].
                     // A = kernel stored [outC,colH] (lda=colH), transposed via transA.
-                    if (!Helpers.BlasProvider.TryGemmEx(colH, colW, outChannels,
+                    Helpers.BlasProvider.GemmEx(colH, colW, outChannels,
                         kernelD, 0, colH, true,
                         gradOutputD, gradOutOff, colW, false,
-                        colBuf, 0, colW))
-                    {
-                        // Cold fallback (no managed/native GEMM): SimdGemm has no
-                        // transpose flag, so materialize kernel^T into a scratch
-                        // for this batch and run the sequential AVX2/FMA kernel
-                        // (we're inside the parallel-over-batch loop, so the
-                        // parallel SimdGemm.Dgemm would oversubscribe).
-                        var ktScratch = poolD.Rent(colH * outChannels);
-                        try
-                        {
-                            for (int r = 0; r < outChannels; r++)
-                                for (int c = 0; c < colH; c++)
-                                    ktScratch[c * outChannels + r] = kernelD[r * colH + c];
-                            Simd.SimdGemm.DgemmSequential(
-                                new ReadOnlySpan<double>(ktScratch, 0, colH * outChannels),
-                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                                new Span<double>(colBuf, 0, colH * colW),
-                                colH, outChannels, colW);
-                        }
-                        finally { poolD.Return(ktScratch); }
-                    }
+                        colBuf, 0, colW);
 
                     int imgOff = b * inChannels * height * width;
                     Helpers.Im2ColHelper.Col2ImAccumulate(
@@ -16521,17 +16385,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 try
                 {
                     int gradOutOff = b * outChannels * colW;
-                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                    Helpers.BlasProvider.Gemm(colH, colW, outChannels,
                         kernelT, 0, outChannels,
                         gradOutputF, gradOutOff, colW,
-                        colBuf, 0, colW))
-                    {
-                        Simd.SimdGemm.Sgemm(
-                            new ReadOnlySpan<float>(kernelT),
-                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW),
-                            new Span<float>(colBuf, 0, colH * colW),
-                            colH, outChannels, colW);
-                    }
+                        colBuf, 0, colW);
                     int imgOff = destOff + b * inChannels * height * width;
                     if (channelParallel)
                     {
@@ -16606,7 +16463,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // so an accumulating call lands the product in a pooled slice and adds it.
                     if (!accumulate)
                     {
-                        Helpers.BlasProvider.TryGemmEx(
+                        Helpers.BlasProvider.GemmEx(
                             inChannels, N, outChannels,
                             kernelD, 0, inChannels, true,
                             gradOutputD, gradOutOff, N, false,
@@ -16616,7 +16473,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var product = System.Buffers.ArrayPool<double>.Shared.Rent(inputSliceSize);
                     try
                     {
-                        Helpers.BlasProvider.TryGemmEx(
+                        Helpers.BlasProvider.GemmEx(
                             inChannels, N, outChannels,
                             kernelD, 0, inChannels, true,
                             gradOutputD, gradOutOff, N, false,
@@ -16641,17 +16498,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 try
                 {
                     int gradOutOff = b * outChannels * colW;
-                    if (!Helpers.BlasProvider.TryGemm(colH, colW, outChannels,
+                    Helpers.BlasProvider.Gemm(colH, colW, outChannels,
                         kernelTD, 0, outChannels,
                         gradOutputD, gradOutOff, colW,
-                        colBuf, 0, colW))
-                    {
-                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                            new ReadOnlySpan<double>(kernelTD),
-                            new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                            new Span<double>(colBuf, 0, colH * colW),
-                            colH, outChannels, colW);
-                    }
+                        colBuf, 0, colW);
                     int imgOff = destOff + b * inChannels * height * width;
                     if (channelParallel)
                     {
@@ -17143,16 +16993,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     // amortizes; the packed kernel scales — vs the no-pack dispatcher whose strided-A
                     // access only reached ~12 GF/s here). Bit-exact either way (disjoint C rows, fixed
                     // K order). Native BLAS (when present) still wins outright, so prefer it first.
-                    if (!Helpers.BlasProvider.TryGemmEx(
+                    Helpers.BlasProvider.GemmEx(
                         colH, outChannels, batchColW,
                         im2colAll, 0, batchColW, false,
                         gradOutAllT, 0, outChannels, false,
-                        gradKernelT, 0, outChannels))
-                    {
-                        ConvWeightGemmFloat(
-                            im2colAll, gradOutAllT, gradKernelT, colH, outChannels, batchColW,
-                            parallel: convParallel);
-                    }
+                        gradKernelT, 0, outChannels);
                     TransposeFloatRowMajor(gradKernelT, gradKernelF, colH, outChannels);
 
                     return RentFloatResult<T>(kernelShape, gradKernelF);
@@ -17186,19 +17031,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gradOutOff = b * outChannels * colW;
 
                     // BLAS GEMM with transpose: localGrad = gradOutput × im2col^T
-                    if (!Helpers.BlasProvider.TryGemmEx(
+                    Helpers.BlasProvider.GemmEx(
                         outChannels, colH, colW,
                         gradOutputF, gradOutOff, colW, false,
                         im2colBuf, 0, colW, true,
-                        localGrad, 0, colH))
-                    {
-                        // SimdGemm fallback with transpose
-                        Simd.SimdGemm.Sgemm(
-                            new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
-                            new ReadOnlySpan<float>(im2colBuf, 0, colH * colW), colW, true,
-                            new Span<float>(localGrad, 0, outChannels * colH),
-                            outChannels, colW, colH);
-                    }
+                        localGrad, 0, colH);
 
                     var gradCopy = new float[outChannels * colH];
                     Array.Copy(localGrad, gradCopy, outChannels * colH);
@@ -17261,7 +17098,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int gradOutOff = b * outChannels * N1x1;
                         int inOff = b * inChannels * N1x1;
                         var target = b == 0 || product1x1 is null ? gradKernelD : product1x1;
-                        Helpers.BlasProvider.TryGemmEx(
+                        Helpers.BlasProvider.GemmEx(
                             outChannels, inChannels, N1x1,
                             gradOutputD, gradOutOff, N1x1, false,
                             inputD, inOff, N1x1, true,
@@ -17355,18 +17192,12 @@ public partial class CpuEngine : ITensorLevelEngine
                         strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
 
                     // gradKernel = gradOutAll @ im2colAll^T — one full-width GEMM.
-                    if (Helpers.BlasProvider.TryGemmEx(
+                    Helpers.BlasProvider.GemmEx(
                         outChannels, colH, batchColW,
                         gradOutAll, 0, batchColW, false,
                         im2colAll, 0, batchColW, true,
-                        gradKernelD, 0, colH))
-                    {
-                        return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
-                    }
-                    // BLAS declined (non-deterministic + no native BLAS): clear
-                    // the partial destination and fall through to the per-batch
-                    // path below, which carries its own SimdGemm fallback.
-                    Array.Clear(gradKernelD, 0, gradKernelD.Length);
+                        gradKernelD, 0, colH);
+                    return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
                 }
                 finally
                 {
@@ -17402,38 +17233,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     int gradOutOff = b * outChannels * colW;
 
                     // BLAS GEMM with transpose: localGrad = gradOutput × im2col^T
-                    if (!Helpers.BlasProvider.TryGemmEx(
+                    Helpers.BlasProvider.GemmEx(
                         outChannels, colH, colW,
                         gradOutputD, gradOutOff, colW, false,
                         im2colBuf, 0, colW, true,
-                        localGrad, 0, colH))
-                    {
-                        // #415 Phase D: BLAS-unavailable fallback now
-                        // routes through SimdGemm.DgemmSequential (AVX2 +
-                        // FMA Vector256<double>, ~12 GFLOPS on the
-                        // SimdGemmDouble.cs perf baseline) instead of
-                        // the older MultiplyMatrixBlockedDouble (~3 GFLOPS
-                        // on the same shape). Sequential variant because
-                        // we're already inside the parallel-over-batch
-                        // dispatch — SimdGemm.Dgemm's nested Parallel.For
-                        // would oversubscribe the worker pool.
-                        // SimdGemm.Dgemm doesn't take a transpose flag,
-                        // so we transpose im2col first (same as the
-                        // pre-existing fallback did).
-                        var im2colT = kPoolD.Rent(colW * colH);
-                        try
-                        {
-                            for (int r = 0; r < colH; r++)
-                                for (int c = 0; c < colW; c++)
-                                    im2colT[c * colH + r] = im2colBuf[r * colW + c];
-                            Simd.SimdGemm.DgemmSequential(
-                                new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                                new ReadOnlySpan<double>(im2colT, 0, colW * colH),
-                                new Span<double>(localGrad, 0, outChannels * colH),
-                                outChannels, colW, colH);
-                        }
-                        finally { kPoolD.Return(im2colT); }
-                    }
+                        localGrad, 0, colH);
 
                     // Hand the rented buffer to the cross-batch merge
                     // step instead of copying. We mark localGradOwned=false
@@ -17657,18 +17461,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
                 }
                 int gradOutOff = b * outChannels * colW;
-                if (!Helpers.BlasProvider.TryGemmEx(
+                Helpers.BlasProvider.GemmEx(
                     outChannels, colH, colW,
                     gradOutputF, gradOutOff, colW, false,
                     im2colBuf, 0, colW, true,
-                    localGrad, 0, colH))
-                {
-                    Simd.SimdGemm.Sgemm(
-                        new ReadOnlySpan<float>(gradOutputF, gradOutOff, outChannels * colW), colW, false,
-                        new ReadOnlySpan<float>(im2colBuf, 0, colH * colW), colW, true,
-                        new Span<float>(localGrad, 0, totalLen),
-                        outChannels, colW, colH);
-                }
+                    localGrad, 0, colH);
             }
 
             long perImageGemmKF = (long)outChannels * colH * colW;
@@ -17767,7 +17564,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int inOff = b * inChannels * N;
                         bool direct = b == 0 && !accumulate;
                         var target = direct || product1x1 is null ? destD : product1x1;
-                        Helpers.BlasProvider.TryGemmEx(
+                        Helpers.BlasProvider.GemmEx(
                             outChannels, inChannels, N,
                             gradOutputD, gradOutOff, N, false,
                             inputD, inOff, N, true,
@@ -17866,26 +17663,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW);
                 }
                 int gradOutOff = b * outChannels * colW;
-                if (!Helpers.BlasProvider.TryGemmEx(
+                Helpers.BlasProvider.GemmEx(
                     outChannels, colH, colW,
                     gradOutputD, gradOutOff, colW, false,
                     im2colBuf, 0, colW, true,
-                    localGrad, 0, colH))
-                {
-                    var im2colT = kPoolD.Rent(colW * colH);
-                    try
-                    {
-                        for (int r = 0; r < colH; r++)
-                            for (int c = 0; c < colW; c++)
-                                im2colT[c * colH + r] = im2colBuf[r * colW + c];
-                        Helpers.Im2ColHelper.MultiplyMatrixBlockedDouble(
-                            new ReadOnlySpan<double>(gradOutputD, gradOutOff, outChannels * colW),
-                            new ReadOnlySpan<double>(im2colT, 0, colW * colH),
-                            new Span<double>(localGrad, 0, totalLen),
-                            outChannels, colW, colH);
-                    }
-                    finally { kPoolD.Return(im2colT); }
-                }
+                    localGrad, 0, colH);
             }
 
             long perImageGemmKD = (long)outChannels * colH * colW;
@@ -22334,10 +22116,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     padDepth, padHeight, padWidth,
                     dilationDepth, dilationHeight, dilationWidth);
 
-                bool multiplied;
                 if (typeof(T) == typeof(float))
                 {
-                    multiplied = Helpers.BlasProvider.TryGemmEx(
+                    Helpers.BlasProvider.GemmEx(
                         tileRows, outChannels, columnsPerRow,
                         (float[])(object)columns, 0, columnsPerRow, false,
                         (float[])(object)kernelData, 0, columnsPerRow, true,
@@ -22345,19 +22126,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    multiplied = Helpers.BlasProvider.TryGemmEx(
+                    Helpers.BlasProvider.GemmEx(
                         tileRows, outChannels, columnsPerRow,
                         (double[])(object)columns, 0, columnsPerRow, false,
                         (double[])(object)kernelData, 0, columnsPerRow, true,
                         (double[])(object)flatOutput, 0, outChannels);
-                }
-
-                if (!multiplied)
-                {
-                    allocatedResult.Dispose();
-                    allocatedResult = null;
-                    result = null!;
-                    return false;
                 }
 
                 // GEMM emits [tileRows, OC] in NDHWC row order. Scatter the tile directly into
@@ -22875,10 +22648,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var kernelData = kernel.GetReadOnlyDataArray();
             PackConv3DOutputRows(gradOutputData, flatGradOutput, batch, outChannels, spatial);
 
-            bool multiplied;
             if (typeof(T) == typeof(float))
             {
-                multiplied = Helpers.BlasProvider.TryGemmEx(
+                Helpers.BlasProvider.GemmEx(
                     rows, columnsPerRow, outChannels,
                     (float[])(object)flatGradOutput, 0, outChannels, false,
                     (float[])(object)kernelData, 0, columnsPerRow, false,
@@ -22886,13 +22658,12 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                multiplied = Helpers.BlasProvider.TryGemmEx(
+                Helpers.BlasProvider.GemmEx(
                     rows, columnsPerRow, outChannels,
                     (double[])(object)flatGradOutput, 0, outChannels, false,
                     (double[])(object)kernelData, 0, columnsPerRow, false,
                     (double[])(object)gradColumns, 0, columnsPerRow);
             }
-            if (!multiplied) return false;
 
             var gradInputData = new T[checked(batch * inChannels * depth * height * width)];
             ScatterConv3DColumnsToInput(
@@ -22987,10 +22758,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 dilationDepth, dilationHeight, dilationWidth);
             PackConv3DOutputRows(gradOutputData, flatGradOutput, batch, outChannels, spatial);
 
-            bool multiplied;
             if (typeof(T) == typeof(float))
             {
-                multiplied = Helpers.BlasProvider.TryGemmEx(
+                Helpers.BlasProvider.GemmEx(
                     columnsPerRow, outChannels, rows,
                     (float[])(object)columns, 0, columnsPerRow, true,
                     (float[])(object)flatGradOutput, 0, outChannels, false,
@@ -22998,13 +22768,12 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                multiplied = Helpers.BlasProvider.TryGemmEx(
+                Helpers.BlasProvider.GemmEx(
                     columnsPerRow, outChannels, rows,
                     (double[])(object)columns, 0, columnsPerRow, true,
                     (double[])(object)flatGradOutput, 0, outChannels, false,
                     (double[])(object)transposedGradKernel, 0, outChannels);
             }
-            if (!multiplied) return false;
 
             var gradKernelData = new T[checked(outChannels * columnsPerRow)];
             CpuParallelSettings.ParallelForOrSerial(0, outChannels,
@@ -31320,29 +31089,11 @@ public partial class CpuEngine : ITensorLevelEngine
             // [seqQ, seqK] with transA=true (so effectively [seqK, seqQ]).
             // lda is the *original* row stride of A (seqK, since weights is
             // stored row-major [seqQ, seqK]).
-            bool gemmedV = BlasProvider.TryGemmEx(
+            BlasProvider.GemmEx(
                 m: seqK, n: d_v, k: seqQ,
                 a: wF, aOffset: wOff, lda: seqK, transA: true,
                 b: gradOutF, bOffset: gOff, ldb: d_v, transB: false,
                 c: gradVData, cOffset: vOff, ldc: d_v);
-            if (!gemmedV)
-            {
-                // SimdGemm has no built-in transA support — transpose weights
-                // into scratch, then regular SGEMM.
-                var wT = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * seqQ);
-                try
-                {
-                    for (int i = 0; i < seqQ; i++)
-                        for (int j = 0; j < seqK; j++)
-                            wT[j * seqQ + i] = wF[wOff + i * seqK + j];
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        wT.AsSpan(0, seqK * seqQ),
-                        gradOutF.AsSpan(gOff, seqQ * d_v),
-                        gradVData.AsSpan(vOff, seqK * d_v),
-                        seqK, seqQ, d_v);
-                }
-                finally { System.Buffers.ArrayPool<float>.Shared.Return(wT); }
-            }
 
             // Step 2: gradWeights[seqQ, seqK] = gradOut[seqQ, d_v] @ V^T[d_v, seqK]
             // m=seqQ, n=seqK, k=d_v. B = value with transB=true; ldb is value's
@@ -31350,27 +31101,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var gradWeights = System.Buffers.ArrayPool<float>.Shared.Rent(scratchLen);
             try
             {
-                bool gemmedW = BlasProvider.TryGemmEx(
+                BlasProvider.GemmEx(
                     m: seqQ, n: seqK, k: d_v,
                     a: gradOutF, aOffset: gOff, lda: d_v, transA: false,
                     b: vF, bOffset: vOff, ldb: d_v, transB: true,
                     c: gradWeights, cOffset: 0, ldc: seqK);
-                if (!gemmedW)
-                {
-                    var vT = System.Buffers.ArrayPool<float>.Shared.Rent(d_v * seqK);
-                    try
-                    {
-                        for (int i = 0; i < seqK; i++)
-                            for (int j = 0; j < d_v; j++)
-                                vT[j * seqK + i] = vF[vOff + i * d_v + j];
-                        Engines.Simd.SimdGemm.SgemmSequential(
-                            gradOutF.AsSpan(gOff, seqQ * d_v),
-                            vT.AsSpan(0, d_v * seqK),
-                            gradWeights.AsSpan(0, seqQ * seqK),
-                            seqQ, d_v, seqK);
-                    }
-                    finally { System.Buffers.ArrayPool<float>.Shared.Return(vT); }
-                }
 
                 // Step 3: softmax backward — row-wise. gradScores = W * (gradW - dot),
                 // where dot = sum_j(W[i,j] * gradW[i,j]) is the per-row inner product.
@@ -31393,42 +31128,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 // Step 4: gradQ[seqQ, d_k] = gradScores[seqQ, seqK] @ K[seqK, d_k]
                 // (scale already folded into gradScores).
-                bool gemmedQ = BlasProvider.TryGemmEx(
+                BlasProvider.GemmEx(
                     m: seqQ, n: d_k, k: seqK,
                     a: gradWeights, aOffset: 0, lda: seqK, transA: false,
                     b: kF, bOffset: kOff, ldb: d_k, transB: false,
                     c: gradQData, cOffset: qOff, ldc: d_k);
-                if (!gemmedQ)
-                {
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        gradWeights.AsSpan(0, seqQ * seqK),
-                        kF.AsSpan(kOff, seqK * d_k),
-                        gradQData.AsSpan(qOff, seqQ * d_k),
-                        seqQ, seqK, d_k);
-                }
 
                 // Step 5: gradK[seqK, d_k] = gradScores^T[seqK, seqQ] @ Q[seqQ, d_k]
-                bool gemmedK = BlasProvider.TryGemmEx(
+                BlasProvider.GemmEx(
                     m: seqK, n: d_k, k: seqQ,
                     a: gradWeights, aOffset: 0, lda: seqK, transA: true,
                     b: qF, bOffset: qOff, ldb: d_k, transB: false,
                     c: gradKData, cOffset: kOff, ldc: d_k);
-                if (!gemmedK)
-                {
-                    var sT = System.Buffers.ArrayPool<float>.Shared.Rent(seqK * seqQ);
-                    try
-                    {
-                        for (int i = 0; i < seqQ; i++)
-                            for (int j = 0; j < seqK; j++)
-                                sT[j * seqQ + i] = gradWeights[i * seqK + j];
-                        Engines.Simd.SimdGemm.SgemmSequential(
-                            sT.AsSpan(0, seqK * seqQ),
-                            qF.AsSpan(qOff, seqQ * d_k),
-                            gradKData.AsSpan(kOff, seqK * d_k),
-                            seqK, seqQ, d_k);
-                    }
-                    finally { System.Buffers.ArrayPool<float>.Shared.Return(sT); }
-                }
             }
             finally { System.Buffers.ArrayPool<float>.Shared.Return(gradWeights, clearArray: false); }
         });
@@ -31453,7 +31164,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// via virtual dispatch. Now the dispatch cost is paid once per op
     /// and the inner arithmetic goes direct-double, which the JIT can
     /// auto-vectorize for the softmax-backward row sweep.</para>
-    /// <para>No double equivalent of <c>BlasProvider.TryGemmEx</c> exists,
+    /// <para>No double equivalent of <c>BlasProvider.GemmEx</c> exists,
     /// so the transposed GEMMs always pre-transpose into scratch and call
     /// the blocked kernel. That matches what the float path does when
     /// <c>TryGemmEx</c> returns false.</para>
@@ -32159,7 +31870,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// materialized-softmax structure (per-head pre-transpose of K, fused
     /// scale + causal/bias mask + numerically stable softmax, output = P · V).
     /// Routes scores=Q·K^T and out=P·V through cblas_dgemm via
-    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> when libopenblas is loaded;
+    /// <see cref="Helpers.BlasProvider.GemmEx"/> when libopenblas is loaded;
     /// falls back to the in-house <see cref="Simd.SimdGemm.DgemmSequential"/>
     /// tiled Vector256&lt;double&gt; FMA kernel when BLAS is absent. The outer
     /// <c>Parallel.For</c> across (batch * heads) demands the sequential GEMM
@@ -32219,7 +31930,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Step 1: scores = Q · K^T. Pre-transpose this head's K into a
                 // pooled scratch buffer so the GEMM doesn't need transB support.
                 //
-                // PR #426 Linux CI follow-up: bypass BlasProvider.TryGemmEx
+                // PR #426 Linux CI follow-up: bypass BlasProvider.GemmEx
                 // entirely and call SimdGemm.DgemmSequential directly — matches
                 // the float path's design (FlashAttentionFloat goes straight
                 // to SgemmSequential without trying OpenBLAS first). Pre-fix
@@ -43534,16 +43245,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                     blasDone = true;
                 }
-                if (!blasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                {
-                    // Path B step 1: route through Path A's cached-B
-                    // SGEMM. For inference with stable weight arrays,
-                    // this amortises PackB across every forward call.
-                    // Falls through to standard Sgemm when the shape
-                    // exceeds Nc (single-jc-pass assumption).
-                    Simd.SimdGemm.SgemmWithCachedB(
-                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
-                }
+                if (!blasDone) BlasProvider.Gemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N);
 
                 _ffnGemmScope.Dispose();
 
@@ -43567,13 +43269,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var outArrLease = result.LeaseArray();
                 var outArr = (double[])(object)outArrLease.Array;
 
-                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                {
-                    CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
-                        bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null,
-                        outArr, M, N, K, activation);
-                    return result;
-                }
+                BlasProvider.Gemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N);
 
                 if (bias != null || activation != FusedActivationType.None)
                 {
@@ -43739,11 +43435,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
                     blasDone = true;
                 }
-                if (!blasDone && !BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                {
-                    Simd.SimdGemm.SgemmWithCachedB(
-                        inArr.AsSpan(0, M * K), wArr, outArr.AsSpan(0, M * N), M, K, N);
-                }
+                if (!blasDone) BlasProvider.Gemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N);
 
                 _ffnGemmScope.Dispose();
 
@@ -43764,13 +43456,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 using var outArrLease = destination.LeaseArray();
                 var outArr = (double[])(object)outArrLease.Array;
 
-                if (!BlasProvider.TryGemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N))
-                {
-                    CpuFusedOperations.FusedGemmBiasActivation(inArr, wArr,
-                        bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null,
-                        outArr, M, N, K, activation);
-                    return;
-                }
+                BlasProvider.Gemm(M, N, K, inArr, 0, K, wArr, 0, N, outArr, 0, N);
 
                 if (bias != null || activation != FusedActivationType.None)
                 {

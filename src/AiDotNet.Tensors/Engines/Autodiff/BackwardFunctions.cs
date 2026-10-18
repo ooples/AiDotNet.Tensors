@@ -1151,11 +1151,9 @@ internal static class BackwardFunctions<T>
                 // Large: the parallel packed BLAS first. SimdGemm's transposed-A path ran the tied LM head's
                 // dTable = gradCᵀ[49152,1024] · A[1024,512] in 993 ms vs 87 ms through TryGemmEx (3990X).
                 // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
-                if (!BlasProvider.TryGemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, K, false, gradAData, 0, K))
-                    SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
+                BlasProvider.GemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, K, false, gradAData, 0, K);
                 // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
-                if (!BlasProvider.TryGemmEx(N, K, M, dCArr, 0, N, true, aArr, 0, K, false, gradBData, 0, K))
-                    SimdGemm.Sgemm(dCArr, N, true, aArr, K, false, gradBData.AsSpan(0, N * K), N, M, K);
+                BlasProvider.GemmEx(N, K, M, dCArr, 0, N, true, aArr, 0, K, false, gradBData, 0, K);
 
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
                 DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
@@ -6856,16 +6854,9 @@ internal static class BackwardFunctions<T>
                     "FusedLinear double weight-gradient buffer must be a contiguous CPU tensor."));
 
             // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W stored [K,N] (ldb=N), transB=true.
-            bool okInput = BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
+            BlasProvider.GemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K);
             // dWeight[K,N] = inputᵀ[K,M] · dY[M,N]; input stored [M,K] (lda=K), transA=true.
-            bool okWeight = BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
-
-            if (!(okInput && okWeight))
-            {
-                AutoTensorCache.Return(inputGrad);
-                AutoTensorCache.Return(weightGrad);
-                goto fusedFallback;
-            }
+            BlasProvider.GemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N);
 
             DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
             DifferentiableOps.AccumulateGrad(grads, inputs[1], weightGrad, engine);
@@ -6889,9 +6880,7 @@ internal static class BackwardFunctions<T>
             return;
         }
 
-        // Fallback: engine calls (non-float or non-2D, or BLAS refused).
-        //
-        // Fallback: engine calls (non-float or non-2D, or BLAS refused).
+        // Fallback: engine calls (non-float or non-2D).
         //
         // Transformer hot path: input is typically rank-3 [B, T, K], weight is
         // rank-2 [K, N]. Flatten leading dims of input/gradOutput to 2D so both
@@ -6901,7 +6890,6 @@ internal static class BackwardFunctions<T>
         // the 2D SIMD-blocked fast path. At paper-scale ChronosBolt this was
         // ~98% of Train wall-clock (30 s / 34 s per iteration; 27 calls ×
         // ~1.1 s each). Reshape is a zero-copy view on contiguous inputs.
-        fusedFallback:
         bool fastPath = inputs[1].Rank == 2
                      && gradOutput.Rank >= 2 && inputs[0].Rank >= 2
                      && inputs[0].IsContiguous && gradOutput.IsContiguous

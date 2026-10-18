@@ -44,7 +44,7 @@ public class CompiledTrainingPlanGemmPerfBench
         Action blas = () => AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
             a.AsSpan(0, M * K), K, false, b.AsSpan(0, K * N), N, false, c.AsSpan(0, M * N), N, M, N, K,
             new AiDotNet.Tensors.Engines.BlasManaged.BlasOptions<float> { PackingMode = AiDotNet.Tensors.Engines.BlasManaged.PackingMode.DisableAutotune });
-        Action nativeFull = () => AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(
+        Action nativeFull = () => AiDotNet.Tensors.Helpers.BlasProvider.Gemm(
             M, N, K, a, 0, K, b, 0, N, c, 0, N);
 
         foreach (var (nm, fn) in new[] { ("SimdGemm", simd), ("BlasManaged", blas), ("NativeFull", nativeFull) })
