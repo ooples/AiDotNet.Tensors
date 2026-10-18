@@ -342,6 +342,8 @@ public static unsafe class VulkanNativeBindings
     #region Feature and Extension Queries
 
     public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000;
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001;
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES = 1000197000;
     public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES = 1000180000;
     public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT = 1000260000;
 
@@ -370,6 +372,21 @@ public static unsafe class VulkanNativeBindings
             vkGetPhysicalDeviceFeatures2_Windows(physicalDevice, pFeatures);
         else
             vkGetPhysicalDeviceFeatures2_Linux(physicalDevice, pFeatures);
+    }
+
+    [DllImport(VulkanWindows, EntryPoint = "vkGetPhysicalDeviceProperties2")]
+    private static extern void vkGetPhysicalDeviceProperties2_Windows(IntPtr physicalDevice, VkPhysicalDeviceProperties2* pProperties);
+
+    [DllImport(VulkanLinux, EntryPoint = "vkGetPhysicalDeviceProperties2")]
+    private static extern void vkGetPhysicalDeviceProperties2_Linux(IntPtr physicalDevice, VkPhysicalDeviceProperties2* pProperties);
+
+    /// <summary>Vulkan 1.1: valid only on an instance created with apiVersion 1.1 or later.</summary>
+    public static void vkGetPhysicalDeviceProperties2(IntPtr physicalDevice, VkPhysicalDeviceProperties2* pProperties)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            vkGetPhysicalDeviceProperties2_Windows(physicalDevice, pProperties);
+        else
+            vkGetPhysicalDeviceProperties2_Linux(physicalDevice, pProperties);
     }
 
     [DllImport(VulkanWindows, EntryPoint = "vkEnumerateDeviceExtensionProperties")]

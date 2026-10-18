@@ -304,7 +304,9 @@ public sealed class VulkanTunedKernelTests
     public void TimingHarness_MeasuresMoreTimeForMoreWork()
     {
         var backend = RequireBackend();
-        const int rows = 4096, n = 256;
+        // Enough device work per run (32768 x 256) that one run is not dominated by the harness's fixed submit cost,
+        // ~1.4 ms on a WDDM Vulkan driver, which made 16 runs measure under 3x one run there.
+        const int rows = 32768, n = 256;
         float[] x = Values(rows * n, 5, 3f);
         using var input = backend.AllocateBuffer(x);
         using var output = backend.AllocateBuffer(x.Length);
@@ -528,9 +530,11 @@ public sealed class VulkanTunedKernelTests
                 backend.Synchronize();
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
-            // Every candidate applies to these small shapes, so a variant that silently dropped out fails here.
+            // Every candidate applies to these small shapes except Winograd F(2x2,3x3) (#1371), which takes only 3x3
+            // stride-1 undilated convolutions, so a variant that silently dropped out fails here.
+            int notAdmitted = (k > 7 ? 1 : 0) + (AiDotNet.Tensors.Engines.DirectGpu.WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 1);
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (k > 7 ? 1 : 0));
+                + notAdmitted);
         }
     }
 }
