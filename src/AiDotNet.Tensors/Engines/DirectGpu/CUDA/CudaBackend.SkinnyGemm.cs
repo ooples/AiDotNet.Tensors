@@ -114,6 +114,9 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
     private const int SmallGemmMaxRows = 64, SmallGemmMaxColumns = 64, SmallGemmMaxOutputs = 1024, SmallGemmMinReduce = 256;
     // small_gemm_tinyk: reductions at most this long, at most this many outputs.
     private const int SmallGemmMaxTinyReduce = 32, SmallGemmMaxTinyOutputs = 1 << 20;
+    // ... and reductions up to SmallGemmMaxShortReduce when there are at most SmallGemmMaxShortOutputs outputs (a small
+    // head over a hidden state, [32,64]x[64,10]: cuBLAS plus a bias kernel took ~4.8 us).
+    private const int SmallGemmMaxShortReduce = 128, SmallGemmMaxShortOutputs = 4096;
 
     /// <summary>
     /// <c>C[M,N] = act(alpha * op(A) * op(B) + beta * C + bias)</c> for the small shapes cuBLAS serves with one
@@ -128,7 +131,8 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
         if (!SkinnyGemmEnabled || M <= 0 || N <= 0 || K <= 0 || (bias is not null && bias.Size < N)) return false;
         bool rowReduce = M <= SmallGemmMaxRows && N <= SmallGemmMaxColumns && (long)M * N <= SmallGemmMaxOutputs
             && K >= SmallGemmMinReduce;
-        bool tinyK = !rowReduce && K <= SmallGemmMaxTinyReduce && (long)M * N <= SmallGemmMaxTinyOutputs;
+        bool tinyK = !rowReduce && ((K <= SmallGemmMaxTinyReduce && (long)M * N <= SmallGemmMaxTinyOutputs)
+            || (K <= SmallGemmMaxShortReduce && (long)M * N <= SmallGemmMaxShortOutputs));
         if (!rowReduce && !tinyK) return false;
         if (!_kernelCache.TryGetValue(rowReduce ? "small_gemm_rowreduce" : "small_gemm_tinyk", out var kernel)) return false;
         using var _ = PushContext();

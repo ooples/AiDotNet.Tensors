@@ -213,6 +213,8 @@ public class CudaSkinnyGemmTests
     [InlineData(16, 1024, 10, false, true)]    // the head's input gradient, dY · Wᵀ
     [InlineData(1024, 10, 16, true, false)]    // its weight gradient, Xᵀ · dY
     [InlineData(5, 7, 1, false, false)]
+    [InlineData(32, 10, 64, false, false)]    // an LSTM head over its last hidden state: a short reduction, few outputs
+    [InlineData(32, 64, 128, true, false)]
     public void SmallGemm_EqualsTheReference(int m, int n, int k, bool transA, bool transB)
     {
         using var backend = new CudaBackend();
@@ -247,6 +249,7 @@ public class CudaSkinnyGemmTests
     [InlineData(128, 64, 64)]     // neither few outputs nor a short reduction: cuBLAS's
     [InlineData(65, 10, 1024)]    // more rows than the row-reduction takes
     [InlineData(64, 64, 256)]     // too many outputs for the row-reduction (a 64x64 weight gradient)
+    [InlineData(64, 64, 129)]     // a reduction just past the short limit at its most outputs
     public void SmallGemm_DeclinesShapesItDoesNotServe(int m, int n, int k)
     {
         using var backend = new CudaBackend();
