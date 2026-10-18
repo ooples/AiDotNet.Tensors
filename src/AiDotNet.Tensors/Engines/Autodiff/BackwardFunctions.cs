@@ -3422,6 +3422,44 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, predictions, grad, engine);
     }
 
+    /// <summary>
+    /// Backward of the compiled plan's fused mean squared error (<c>ReduceMean(Square(Subtract(p, y)))</c>, see
+    /// MseLossFusionPattern): <c>dp = 2 (p - y) g / n</c>, and <c>dy = -dp</c> only when the target's gradient is
+    /// required. One launch on a backend with the fused kernels; composed otherwise.
+    /// </summary>
+    internal static void FusedMseLossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var predictions = inputs[0];
+        var targets = inputs[1];
+        bool needPredictions = DifferentiableOps.IsGradientRequired(predictions);
+        bool needTargets = DifferentiableOps.IsGradientRequired(targets);
+        if (!needPredictions && !needTargets) return;
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryFusedMseLossBackward(gradOutput, predictions, targets, needTargets, out var deviceTargetGrad) is { } devicePredGrad)
+        {
+            if (needPredictions) DifferentiableOps.AccumulateGrad(grads, predictions, devicePredGrad, engine);
+            if (needTargets && deviceTargetGrad is not null) DifferentiableOps.AccumulateGrad(grads, targets, deviceTargetGrad, engine);
+            return;
+        }
+
+        var diff = engine.TensorSubtract(predictions, targets);
+        Tensor<T> predGrad;
+        if (engine is DirectGpuTensorEngine scaleGpu
+            && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
+        {
+            predGrad = deviceScaled;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            predGrad = engine.TensorMultiplyScalar(diff, numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / predictions.Length));
+        }
+        if (needTargets) DifferentiableOps.AccumulateGrad(grads, targets, engine.TensorNegate(predGrad), engine);
+        if (needPredictions) DifferentiableOps.AccumulateGrad(grads, predictions, predGrad, engine);
+    }
+
     /// <summary>BCE with logits loss backward</summary>
     internal static void BCEWithLogitsLossBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
