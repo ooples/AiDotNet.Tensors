@@ -42,20 +42,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
         }                                                                                                   \
     }
 
-// Bs[k][n] = B[k0 + k][col0 + n] for a row-major B[rows, N], rows >= kEnd zero.
-__device__ __forceinline__ void sg_load_b_rows(const float* __restrict__ B, float (*Bs)[SG_BN + 4],
-    int k0, int kEnd, int col0, int N)
-{
-    for (int idx = threadIdx.x; idx < SG_BK * SG_BN / 4; idx += SG_THREADS)
-    {
-        int k = idx >> 4, c = (idx & 15) * 4;
-        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (k0 + k < kEnd && col0 + c < N)
-            v = __ldg(reinterpret_cast<const float4*>(B + (long long)(k0 + k) * N + col0 + c));
-        *reinterpret_cast<float4*>(&Bs[k][c]) = v;
-    }
-}
-
 // The ReLU kernel's operation (relu_nan_safe): NaN passes through, so the fused epilogue equals BiasAdd then Relu.
 __device__ __forceinline__ float sg_relu(float x)
 {

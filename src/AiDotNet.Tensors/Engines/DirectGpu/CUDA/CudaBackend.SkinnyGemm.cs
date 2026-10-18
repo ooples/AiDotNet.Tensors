@@ -27,10 +27,13 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
     /// <c>C[M,N] = alpha · A[M,K] · op(B) + beta · C</c> (op(B) = <c>B[K,N]</c>, or <c>B[N,K]ᵀ</c> when
     /// <paramref name="transB"/>) through skinny_gemm, for a tall A (M ≥ 256) and N, K ≤ 256. False -- nothing
     /// launched -- for any other shape, an unaligned operand or a missing kernel; the caller then runs cuBLAS.
+    /// <paramref name="forceTileRows"/> (32, 16 or 8; tests) fixes the row tile, which is otherwise chosen from the
+    /// device's SM count.
     /// </summary>
     internal unsafe bool TrySkinnyGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, bool transB,
-        float alpha, float beta, IGpuBuffer? bias = null, bool relu = false)
+        float alpha, float beta, IGpuBuffer? bias = null, bool relu = false, int forceTileRows = 0)
     {
+        if (forceTileRows != 0 && forceTileRows != 32 && forceTileRows != 16 && forceTileRows != 8) return false;
         if (bias is not null && (bias.Size < N || (bias.Handle.ToInt64() & 15) != 0)) return false;
         if (!SkinnyGemmEnabled || M < 256 || M > 65535 * SkinnyTileRows || N > SkinnyMaxNarrow || K > SkinnyMaxNarrow
             || (N & 3) != 0 || (K & 3) != 0 || !SkinnyAligned(A, B, C)
@@ -38,10 +41,15 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
             return false;
         // The tallest row tile that still gives about half the SMs a block (32, then 16, then 8 rows).
         int tilesN = (N + SkinnyTileColumns - 1) / SkinnyTileColumns;
-        int tileRows = SkinnyTileRows;
-        while (tileRows > 8 && (long)((M + tileRows - 1) / tileRows) * tilesN < Math.Max(1, ComputeUnits) / 2) tileRows /= 2;
-        if (tileRows != SkinnyTileRows && _kernelCache.TryGetValue(tileRows == 16 ? "skinny_gemm_m16" : "skinny_gemm_m8", out var shorter)) kernel = shorter;
-        else tileRows = SkinnyTileRows;
+        int tileRows = forceTileRows != 0 ? forceTileRows : SkinnyTileRows;
+        if (forceTileRows == 0)
+            while (tileRows > 8 && (long)((M + tileRows - 1) / tileRows) * tilesN < Math.Max(1, ComputeUnits) / 2) tileRows /= 2;
+        if (tileRows != SkinnyTileRows)
+        {
+            if (_kernelCache.TryGetValue(tileRows == 16 ? "skinny_gemm_m16" : "skinny_gemm_m8", out var shorter)) kernel = shorter;
+            else if (forceTileRows != 0) return false;
+            else tileRows = SkinnyTileRows;
+        }
         using var _ = PushContext();
         IntPtr a = A.Handle, b = B.Handle, c = C.Handle;
         int m = M, n = N, k = K, tb = transB ? 1 : 0, re = relu ? 1 : 0;

@@ -21,8 +21,8 @@ public class CudaSkinnyGemmTests
     [InlineData(300, 4, 8, false)]         // rows not a multiple of the 32-row tile, one partial column tile
     [InlineData(257, 256, 256, true)]      // the widest shape taken, K swept in eight chunks
     [InlineData(333, 68, 36, false)]       // N and K past a tile edge
-    [InlineData(256, 64, 128, false)]      // few tiles: the 8-row tile (a 256-row FFN down-projection)
-    [InlineData(256, 192, 64, true)]       // the 16-row tile with B transposed
+    [InlineData(256, 64, 128, false)]      // a 256-row FFN down-projection: few tiles
+    [InlineData(256, 192, 64, true)]       // a 256-row in-projection, B transposed
     public void SkinnyGemm_EqualsTheReference(int m, int n, int k, bool transB)
     {
         using var backend = new CudaBackend();
@@ -30,12 +30,14 @@ public class CudaSkinnyGemmTests
         float[] a = Fill(m * k, 1), b = Fill(k * n, 2), c0 = Fill(m * n, 3);
         using var aBuf = backend.AllocateBuffer(a);
         using var bBuf = backend.AllocateBuffer(b);
+        // Every row tile on every shape (0: the device's own choice, which depends on its SM count).
+        foreach (int tileRows in new[] { 0, 32, 16, 8 })
         foreach (var (alpha, beta) in new[] { (1f, 0f), (0.5f, 0.25f) })
         {
             // beta 0 must not read C: NaN there would poison every output.
             using var cBuf = backend.AllocateBuffer(beta == 0f ? Enumerable.Repeat(float.NaN, m * n).ToArray() : c0);
-            Assert.True(backend.TrySkinnyGemm(aBuf, bBuf, cBuf, m, n, k, transB, alpha, beta),
-                $"skinny_gemm declined {m}x{n}x{k}");
+            Assert.True(backend.TrySkinnyGemm(aBuf, bBuf, cBuf, m, n, k, transB, alpha, beta, forceTileRows: tileRows),
+                $"skinny_gemm declined {m}x{n}x{k} (tile rows {tileRows})");
             AssertClose(backend.DownloadBuffer(cBuf), i =>
             {
                 int row = i / n, col = i % n;
@@ -46,7 +48,7 @@ public class CudaSkinnyGemmTests
                     s += p; bound += Math.Abs(p);
                 }
                 return (alpha * s + beta * c0[i], Math.Abs(alpha) * bound + Math.Abs(beta * c0[i]));
-            }, $"{m}x{n}x{k} transB={transB} alpha={alpha} beta={beta}");
+            }, $"{m}x{n}x{k} transB={transB} tileRows={tileRows} alpha={alpha} beta={beta}");
         }
     }
 
@@ -157,6 +159,8 @@ public class CudaSkinnyGemmTests
 
     [SkippableTheory]
     [InlineData("skinny_gemm", 256)]
+    [InlineData("skinny_gemm_m16", 256)]
+    [InlineData("skinny_gemm_m8", 256)]
     [InlineData("skinny_gemm_tn", 256)]
     public void SkinnyGemmKernels_KeepTheirAccumulatorsInRegisters(string kernel, int blockThreads)
     {
