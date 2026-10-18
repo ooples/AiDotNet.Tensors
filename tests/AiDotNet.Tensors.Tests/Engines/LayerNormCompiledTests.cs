@@ -68,6 +68,59 @@ public class LayerNormCompiledTests
         }
     }
 
+    /// <summary>
+    /// A pre-LN block's input feeds both the norm and the residual add, so its gradient is the sum of two contributions:
+    /// the norm's backward must ADD its dX onto the residual's (and, the buffer being reused, start from
+    /// zero again on step 2). 300 rows span three row blocks with a partial last one; 20 features leave a scalar tail.
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { 300, 20 })]
+    [InlineData(new[] { 4, 32, 64 })]
+    public async Task CompiledPlan_ResidualInput_AddsTheNormGradientToTheResidualOne(int[] inputShape)
+    {
+        await Task.Yield();
+        var rng = new Random(23);
+        Tensor<float> Make(int[] shape, double offset)
+        {
+            int n = 1; foreach (var d in shape) n *= d;
+            var a = new float[n];
+            for (int i = 0; i < n; i++) a[i] = (float)(offset + rng.NextDouble() * 2 - 1);
+            return new Tensor<float>(a, shape);
+        }
+        int fs = inputShape[inputShape.Length - 1];
+        var input = Make(inputShape, 0.3);
+        var gamma = Make(new[] { fs }, 1.0);
+        var beta = Make(new[] { fs }, 0.0);
+        var upstream = Make(inputShape, 0.0);
+        const double eps = 1e-5;
+        var engine = new CpuEngine();
+
+        Reference(input.ToArray(), gamma.ToArray(), beta.ToArray(), upstream.ToArray(), eps,
+            out _, out var dxNorm, out var dg, out var db);
+        var dy = upstream.ToArray();
+        var dx = new double[dxNorm.Length];
+        for (int i = 0; i < dx.Length; i++) dx[i] = dxNorm[i] + dy[i];
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var normed = engine.LayerNorm(input, gamma, beta, eps, out _, out _);
+            engine.ReduceSum(engine.TensorMultiply(engine.TensorAdd(input, normed), upstream), null);
+            plan = scope.CompileTraining(new[] { input, gamma, beta });
+        }
+
+        using (plan)
+        {
+            for (int step = 0; step < 2; step++)
+            {
+                plan.Step();
+                AssertClose(dx, plan.Gradients[0].ToArray(), $"dX step {step}");
+                AssertClose(dg, plan.Gradients[1].ToArray(), $"dGamma step {step}");
+                AssertClose(db, plan.Gradients[2].ToArray(), $"dBeta step {step}");
+            }
+        }
+    }
+
     private static void Reference(float[] x, float[] g, float[] b, float[] dy, double eps,
         out double[] y, out double[] dx, out double[] dg, out double[] db)
     {

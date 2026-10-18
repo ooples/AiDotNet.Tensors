@@ -89,6 +89,45 @@ public sealed class PersistentExecutorClaimedChunksTests
     }
 
     [Fact]
+    public void ParkedWorkers_AWorkerDoneWithItsSetTakesALateWorkersChunk()
+    {
+        // Workers woken from a park (no warm window here) start only after an OS wake-up. Every participant done with
+        // its own set then takes the sets nobody has started: worker slot 0 is held 200 ms, the calling thread's own
+        // chunk takes 100 ms, and the late worker's chunk must run on another worker -- not wait for the caller to
+        // finish its chunk and take it then, as when only the caller stole.
+        int priorDop = CpuParallelSettings.MaxDegreeOfParallelism;
+        var priorWarm = PersistentParallelExecutor.WarmWindow;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = 4;
+            PersistentParallelExecutor.WarmWindow = TimeSpan.Zero;
+            PersistentParallelExecutor.TestWorkerStartDelay = slot => { if (slot == 0) Thread.Sleep(200); };
+            int caller = Environment.CurrentManagedThreadId;
+            var ranOn = new int[4];
+            var hits = new int[4];
+            var sw = Stopwatch.StartNew();
+            PersistentParallelExecutor.Instance.Execute(4, c =>
+            {
+                if (c == 0) Thread.Sleep(100);
+                ranOn[c] = Environment.CurrentManagedThreadId;
+                Interlocked.Increment(ref hits[c]);
+            });
+            sw.Stop();
+            Assert.All(hits, h => Assert.Equal(1, h));
+            Assert.NotEqual(caller, ranOn[1]);
+            Assert.True(sw.ElapsedMilliseconds < 190, $"dispatch took {sw.ElapsedMilliseconds} ms (waiting for the late worker: ~200 ms)");
+        }
+        finally
+        {
+            PersistentParallelExecutor.TestWorkerStartDelay = null;
+            PersistentParallelExecutor.WarmWindow = priorWarm;
+            CpuParallelSettings.MaxDegreeOfParallelism = priorDop;
+            // Let the delayed worker finish its sleep and find its set taken before other tests dispatch.
+            Thread.Sleep(250);
+        }
+    }
+
+    [Fact]
     public void ChunkException_ReachesTheCaller_AndTheNextDispatchIsClean()
     {
         int priorDop = CpuParallelSettings.MaxDegreeOfParallelism;

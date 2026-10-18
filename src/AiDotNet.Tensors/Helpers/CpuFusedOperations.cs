@@ -179,6 +179,11 @@ public static class CpuFusedOperations
         {
             if (allowCachedB)
                 SimdGemm.SgemmWithCachedB(A.AsSpan(0, M * K), B, output.AsSpan(0, M * N), M, K, N);
+            else if (Engines.BlasManaged.BlasManaged.ThinMDirectServesShape(M, N, K, transA: false, transB: false))
+                // Fresh weights each call, M-parallel: [64,784]x[784,512] 162 µs vs 198 for the pack-fresh kernel below.
+                Engines.BlasManaged.BlasManaged.Gemm<float>(A.AsSpan(0, M * K), K, false, B.AsSpan(0, K * N), N, false,
+                    output.AsSpan(0, M * N), N, M, N, K,
+                    new Engines.BlasManaged.BlasOptions<float> { PackingMode = Engines.BlasManaged.PackingMode.DisableAutotune });
             else
                 SimdGemm.Sgemm(A.AsSpan(0, M * K), K, false, B.AsSpan(0, K * N), N, false,
                                output.AsSpan(0, M * N), M, K, N);

@@ -66,10 +66,11 @@ public partial class DirectGpuTensorEngine
     private static void StampLstmForward(LstmTrainCache cache, LstmForwardStamp stamp)
         => stamp.Generation = ++cache.Generation;
 
-    // The backward kernel accumulates, so its outputs start at zero: a stream memset on CUDA (capturable), a fill on
-    // any other backend.
+    // A backward that accumulates needs its outputs at zero: a stream memset where the backend has one (capturable),
+    // a fill otherwise. One that writes them (IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients) needs nothing.
     private static void ZeroLstmGradient(IDirectGpuBackend backend, IGpuBuffer buffer, int length)
     {
+        if (backend is IFusedLstmSequenceTraining { LstmBackwardOverwritesGradients: true }) return;
         if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(buffer, length);
         else backend.Fill(buffer, 0f, length);
     }
@@ -144,8 +145,9 @@ public partial class DirectGpuTensorEngine
     /// captured CUDA graph replayed as ~2,000 kernels, ~750 copies and ~450 memsets per step for a 32-step LSTM.
     /// Returns null (the caller records its decomposed ops) wherever the eager fused path would also decline.
     /// </summary>
-    /// <remarks>Two biases are summed by a recorded add before the node, as the eager path does, so each receives
-    /// the bias gradient through that add.</remarks>
+    /// <remarks>Both biases are inputs of the node: the kernels sum them, and each receives the bias gradient from the
+    /// backward. A recorded add before the node (as the eager path sums them) cost the captured step an add kernel
+    /// and, in the backward, a gradient copy per bias.</remarks>
     private Tensor<T>? TryRecordLstmSequenceTrain<T>(Compilation.LazyTensorScope scope, Tensor<T> input,
         Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh)
     {
@@ -162,12 +164,13 @@ public partial class DirectGpuTensorEngine
             return null;
         if (!scope.BindEngine(this)) return null;
 
-        var bias = bIh is not null && bHh is not null ? TensorAdd(bIh, bHh)
-            : bIh ?? bHh ?? new Tensor<T>(new[] { gateRows });
+        var bias = bIh ?? bHh ?? new Tensor<T>(new[] { gateRows });
+        var secondBias = bIh is not null ? bHh : null;
         var node = new LstmRecordedNode();
 
         return scope.RecordVariadic(Compilation.LazyNodeType.Custom, "LstmSequenceTrain",
-            new[] { input, wIh, wHh, bias }, new[] { b, t, h },
+            secondBias is null ? new[] { input, wIh, wHh, bias } : new[] { input, wIh, wHh, bias, secondBias },
+            new[] { b, t, h },
             (eng, output) =>
             {
                 var gpu = (DirectGpuTensorEngine)eng;
@@ -176,7 +179,7 @@ public partial class DirectGpuTensorEngine
                 // weight tensor) and stable across steps, so a captured graph keeps valid pointers.
                 var cache = gpu.GetLstmTrainCache(backend, wIh, b, t, inSize, h);
                 node.Cache = cache;
-                var result = gpu.RunLstmForward(input, wIh, wHh, bias, cache);
+                var result = gpu.RunLstmForward(input, wIh, wHh, bias, cache, secondBias);
                 StampLstmForward(cache, node.Stamp);
                 CopyResultInto(eng, result, output);
             },
@@ -198,7 +201,9 @@ public partial class DirectGpuTensorEngine
         var cache = node.Cache ?? throw new InvalidOperationException("The fused GPU LSTM node's backward ran before its forward.");
         LstmSequenceTrainBackward(gradOutput, inputs, output, new object[] { cache, node.Stamp }, engine, grads);
     }
-    private Tensor<T> RunLstmForward<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias, LstmTrainCache c)
+    // secondBias: the hidden-hidden bias, summed with bias by the kernel; the cache's zero bias when there is one bias.
+    private Tensor<T> RunLstmForward<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias, LstmTrainCache c,
+        Tensor<T>? secondBias = null)
     {
         var backend = GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var inputC = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
@@ -206,11 +211,14 @@ public partial class DirectGpuTensorEngine
         using var bufWih = GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = GetOrAllocateBuffer(backend, wHh);
         using var bufBias = GetOrAllocateBuffer(backend, bias);
+        using var bufBias2 = secondBias is null ? default : GetOrAllocateBuffer(backend, secondBias);
         int n = c.B * c.T * c.H;
-        var output = AllocateOutputBuffer(backend, n);
+        // The forward writes every output element.
+        var output = AllocateFullyWrittenOutputBuffer(backend, n);
         try
         {
-            backend.LstmForwardSequence(bufInput.Buffer, c.H0, c.C0, bufWih.Buffer, bufWhh.Buffer, bufBias.Buffer, c.ZeroBias,
+            backend.LstmForwardSequence(bufInput.Buffer, c.H0, c.C0, bufWih.Buffer, bufWhh.Buffer, bufBias.Buffer,
+                secondBias is null ? c.ZeroBias : bufBias2.Buffer,
                 output.Buffer, c.FinalH, c.FinalC, c.AllH, c.AllC, c.Gates, c.T, c.B, c.In, c.H);
             var result = DeferTensorResult<T>(backend, output.Buffer, n, new[] { c.B, c.T, c.H });
             output.RelinquishOwnership();
@@ -244,20 +252,28 @@ public partial class DirectGpuTensorEngine
         using var bufWhh = gpu.GetOrAllocateBuffer(backend, wHh);
 
         int nIn = c.B * c.T * c.In, nWih = 4 * c.H * c.In, nWhh = 4 * c.H * c.H, nBias = 4 * c.H;
-        var gIn = AllocateOutputBuffer(backend, nIn);
-        var gWih = AllocateOutputBuffer(backend, nWih);
-        var gWhh = AllocateOutputBuffer(backend, nWhh);
-        var gBias = AllocateOutputBuffer(backend, nBias);
-        // The kernel accumulates every gradient with atomicAdd: zero them first (capturable memset).
+        // A backward that writes its gradients needs neither zero-filled buffers nor ZeroLstmGradient's memsets.
+        bool overwrites = backend is IFusedLstmSequenceTraining { LstmBackwardOverwritesGradients: true };
+        OwnedBuffer Gradient(int length) =>
+            overwrites ? AllocateFullyWrittenOutputBuffer(backend, length) : AllocateOutputBuffer(backend, length);
+        var gIn = Gradient(nIn);
+        var gWih = Gradient(nWih);
+        var gWhh = Gradient(nWhh);
+        var gBias = Gradient(nBias);
+        // A recorded node may carry the hidden-hidden bias as a fifth input; it receives the backend's gradBiasHh.
+        bool secondBias = inputs.Length > 4;
+        var gBiasHh = secondBias ? Gradient(nBias) : default;
+        var biasHhTarget = secondBias ? gBiasHh.Buffer : c.GradBiasHh;
+        // Zeroed first unless the backend's backward writes them (ZeroLstmGradient).
         ZeroLstmGradient(backend, gIn.Buffer, nIn);
         ZeroLstmGradient(backend, gWih.Buffer, nWih);
         ZeroLstmGradient(backend, gWhh.Buffer, nWhh);
         ZeroLstmGradient(backend, gBias.Buffer, nBias);
-        ZeroLstmGradient(backend, c.GradBiasHh, nBias);
+        ZeroLstmGradient(backend, biasHhTarget, nBias);
 
         backend.LstmBackwardSequence(bufGradOut.Buffer, c.AllH, c.AllC, c.Gates, c.H0, c.C0,
             bufWih.Buffer, bufWhh.Buffer, bufInput.Buffer,
-            gIn.Buffer, c.GradH0, c.GradC0, gWih.Buffer, gWhh.Buffer, gBias.Buffer, c.GradBiasHh,
+            gIn.Buffer, c.GradH0, c.GradC0, gWih.Buffer, gWhh.Buffer, gBias.Buffer, biasHhTarget,
             c.T, c.B, c.In, c.H);
 
         var gradInput = gpu.DeferTensorResult<T>(backend, gIn.Buffer, nIn, new[] { c.B, c.T, c.In }); gIn.RelinquishOwnership();
@@ -269,5 +285,11 @@ public partial class DirectGpuTensorEngine
         Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[1], gradWih, engine);
         Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[2], gradWhh, engine);
         Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[3], gradBias, engine);
+        if (secondBias)
+        {
+            var gradBiasHh = gpu.DeferTensorResult<T>(backend, gBiasHh.Buffer, nBias, new[] { 4 * c.H });
+            gBiasHh.RelinquishOwnership();
+            Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[4], gradBiasHh, engine);
+        }
     }
 }

@@ -151,14 +151,7 @@ public static partial class BlasManaged
         if (options.PackedA is not null || options.PackedB is not null) return false;
         // both-transposed is rare and would need strided A *and* strided B (no
         // contiguous vector dimension) — left on the strategy.
-        if (transA && transB) return false;
-        if (ldc != n || (n & 7) != 0) return false;
-        // B transposed runs the NT dot-product kernel, which reads Bᵀ rows contiguously and does not re-stream a
-        // [k, n] B per row chunk, so its N ceiling is wider: a linear layer's input gradient dY·W at 784 outputs
-        // fell to the streaming strategy at 2.2x the time (128x512x784: 0.38 ms vs 0.17 here).
-        int maxN = transB && !transA ? ThinMDirectTransBMaxN : ThinMDirectMaxN;
-        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > maxN || k > ThinMDirectMaxK) return false;
-        if ((long)m * n * k < ThinMDirectMinWork) return false; // tiny GEMMs stay on the strategy/autotune path
+        if (ldc != n || !ThinMDirectServesShape(m, n, k, transA, transB)) return false;
         // Each operand must be contiguous in its stored (possibly transposed) layout:
         // !transA → A is [m,k] (lda=k); transA → Aᵀ is [k,m] (lda=m). Likewise B.
         if (lda != (transA ? m : k)) return false;
@@ -189,6 +182,16 @@ public static partial class BlasManaged
                     MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
                     MemoryMarshal.Cast<T, double>(c), m, k, n);
         }
+        else if (isFloat && Simd.SimdGemm.UseDirectParallel2D
+            && m <= Simd.SimdGemm.DirectParallel2DMaxM && k <= Simd.SimdGemm.DirectParallel2DMaxK
+            && Simd.SimdGemm.TrySgemmDirectParallel2D(MemoryMarshal.Cast<T, float>(a), lda, MemoryMarshal.Cast<T, float>(b), ldb,
+                MemoryMarshal.Cast<T, float>(c), m, k, n, allowParallel: true))
+        {
+            // A batch-sized M splits the OUTPUT COLUMNS first: each worker reads its own slab of B once. The row split
+            // below has every worker stream all of B, which held while B was cache-resident but not in a training step,
+            // where the optimizer has just rewritten the weights and evicted them: [64,784]x[784,512] with the cache
+            // evicted ran 674-1160 us that way against 284-336 us here (Ryzen 4800H), and no slower with it hot.
+        }
         else if (isFloat)
         {
             // FP64 no-trans and both trans variants already OVERWRITE every C element
@@ -217,6 +220,39 @@ public static partial class BlasManaged
         return true;
     }
 #endif
+
+    /// <summary>
+    /// Whether the JIT small-GEMM generator should stand aside for the thin-M direct-parallel kernel: a dense no-trans
+    /// GEMM inside that kernel's box, with more than one thread to run it on. The generator runs on one thread, so a
+    /// batch-64 linear layer's [64,512]x[512,128] took 90 us there against 42 us on the parallel kernel (3950X).
+    /// </summary>
+    private static bool ThinMDirectTakesDenseShape(int m, int n, int k, int lda, int ldb, int ldc) =>
+        CpuParallelSettings.MaxDegreeOfParallelism > 1
+        && lda == k && ldb == n && ldc == n
+        && ThinMDirectServesShape(m, n, k, transA: false, transB: false);
+
+    /// <summary>
+    /// Whether <see cref="Gemm{T}"/> runs a dense, unpacked GEMM of this shape (row-major, ldc = n) through the thin-M
+    /// direct-parallel kernel. Other kernels consult it to stand aside where that kernel wins.
+    /// </summary>
+    internal static bool ThinMDirectServesShape(int m, int n, int k, bool transA, bool transB)
+    {
+#if NET5_0_OR_GREATER
+        if (!System.Runtime.Intrinsics.X86.Fma.IsSupported) return false;
+        // both-transposed is rare and would need strided A *and* strided B (no
+        // contiguous vector dimension) — left on the strategy.
+        if (transA && transB) return false;
+        if ((n & 7) != 0) return false;
+        // B transposed runs the NT dot-product kernel, which reads Bᵀ rows contiguously and does not re-stream a
+        // [k, n] B per row chunk, so its N ceiling is wider: a linear layer's input gradient dY·W at 784 outputs
+        // fell to the streaming strategy at 2.2x the time (128x512x784: 0.38 ms vs 0.17 here).
+        int maxN = transB && !transA ? ThinMDirectTransBMaxN : ThinMDirectMaxN;
+        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > maxN || k > ThinMDirectMaxK) return false;
+        return (long)m * n * k >= ThinMDirectMinWork; // tiny GEMMs stay on the strategy/autotune path
+#else
+        return false;
+#endif
+    }
 
     // #475 Phase 1: route small FP32 GEMMs to the libxsmm-style JIT generator, which exceeds OpenBLAS
     // 1.5-6x for n<=128 (measured --ab-jit). Gate to the win region (large-N unpacked streaming loses
@@ -550,6 +586,7 @@ public static partial class BlasManaged
             && HasRowMajorTile(a, m, k, lda)
             && HasRowMajorTile(b, k, n, ldb)
             && HasRowMajorTile(c, m, n, ldc)
+            && !ThinMDirectTakesDenseShape(m, n, k, lda, ldb, ldc)
             && JitGemmGenerator.IsSupported)
         {
             var jitEpi = options.Epilogue;

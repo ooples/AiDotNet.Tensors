@@ -25,6 +25,9 @@ public sealed class LstmSequenceBackendParityTests
         (2, 3, 4, 5),
         (3, 5, 7, 16),
         (5, 3, 6, 64),    // B*H spans several work-groups
+        (7, 4, 3, 33),    // CUDA: register-resident recurrence padded to 64, batch not a multiple of its rows per block
+        (32, 16, 32, 64), // the parity LSTM
+        (8, 200, 16, 32), // CUDA: R = 1600 rows split three ways (with a short last split) in the backward GEMMs
         (5, 4, 6, 100),   // a generic 256-wide work-group would split a batch row
         (2, 3, 5, 300),   // H wider than a 256-wide work-group (the engine allows H <= 1024)
     };
@@ -164,6 +167,12 @@ public sealed class LstmSequenceBackendParityTests
                 PortableLstmSequence.Forward(backend, portable, bx, h0, c0, bwih, bwhh, bbias, zeroBias, y, hFinal, cFinal,
                     allH, allC, gates, tN, bN, inN, hN);
             AssertClose(r.Y, backend.DownloadBuffer(y), $"{shape} output");
+            // The final hidden state is the output's last timestep (CUDA's register recurrence writes it directly).
+            var expectedFinal = new double[bN * hN];
+            for (int bb = 0; bb < bN; bb++)
+                for (int hh = 0; hh < hN; hh++)
+                    expectedFinal[bb * hN + hh] = r.Y[(bb * tN + tN - 1) * hN + hh];
+            AssertClose(expectedFinal, backend.DownloadBuffer(hFinal), $"{shape} hFinal");
 
             using var bgy = backend.AllocateBuffer(gy);
             using var gIn = backend.AllocateBuffer(new float[bN * tN * inN]);
@@ -173,13 +182,21 @@ public sealed class LstmSequenceBackendParityTests
             using var gWhh = backend.AllocateBuffer(new float[4 * hN * hN]);
             using var gBias = backend.AllocateBuffer(new float[4 * hN]);
             using var gBiasHh = backend.AllocateBuffer(new float[4 * hN]);
+            if (portable is null && backend is IFusedLstmSequenceTraining { LstmBackwardOverwritesGradients: true })
+            {
+                // A backend that declares it writes every gradient must not read them: start them all at NaN.
+                foreach (var (buf, n) in new[] { (gIn, bN * tN * inN), (gH0, bN * hN), (gC0, bN * hN), (gWih, 4 * hN * inN),
+                             (gWhh, 4 * hN * hN), (gBias, 4 * hN), (gBiasHh, 4 * hN) })
+                    backend.Fill(buf, float.NaN, n);
+            }
             if (portable is null)
                 backend.LstmBackwardSequence(bgy, allH, allC, gates, h0, c0, bwih, bwhh, bx,
                     gIn, gH0, gC0, gWih, gWhh, gBias, gBiasHh, tN, bN, inN, hN);
             else
                 PortableLstmSequence.Backward(backend, portable, bgy, allH, allC, gates, bwih, bwhh, bx,
                     gIn, gH0, gC0, gWih, gWhh, gBias, gBiasHh, tN, bN, inN, hN);
-            if (portable is not null) AssertClose(r.GBias, backend.DownloadBuffer(gBiasHh), $"{shape} gradBiasHh");
+            // The fused training path hands gradBiasHh to the hidden-hidden bias: every backend must write it in full.
+            AssertClose(r.GBias, backend.DownloadBuffer(gBiasHh), $"{shape} gradBiasHh");
             AssertClose(r.GIn, backend.DownloadBuffer(gIn), $"{shape} gradInput");
             AssertClose(r.GWih, backend.DownloadBuffer(gWih), $"{shape} gradWih");
             AssertClose(r.GWhh, backend.DownloadBuffer(gWhh), $"{shape} gradWhh");

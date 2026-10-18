@@ -96,11 +96,17 @@ internal sealed class PersistentParallelExecutor
         public readonly long Id;
         /// <summary>Plain mode: chunks not yet finished; the dispatch completes when this reaches zero.</summary>
         public int Pending;
+        /// <summary>
+        /// Plain mode: the workers this dispatch woke were parked, not spinning, so their chunks wait out an OS wake-up.
+        /// Every participant then takes the unstarted chunks of the others as soon as its own set is done, rather than
+        /// the dispatcher alone after the steal grace.
+        /// </summary>
+        public readonly bool StealEagerly;
 
         private static long s_ids;
 
         public Job(Action<int>? action, Func<object?>? localInit, Action<int, object?>? localBody,
-            Action<object?>? localFinally, int numChunks, int stride)
+            Action<object?>? localFinally, int numChunks, int stride, bool stealEagerly = false)
         {
             Action = action;
             LocalInit = localInit;
@@ -110,6 +116,7 @@ internal sealed class PersistentParallelExecutor
             Stride = stride;
             Id = Interlocked.Increment(ref s_ids);
             Pending = numChunks;
+            StealEagerly = stealEagerly;
         }
     }
 
@@ -447,9 +454,33 @@ internal sealed class PersistentParallelExecutor
     /// then run every chunk still unstarted (each owner's cursor, compare-exchanged like the owner does, so each chunk
     /// still runs once), then wait for the chunks still running elsewhere.
     /// </summary>
+    /// <summary>
+    /// A participant done with its own set runs every other participant's unstarted chunks, starting with the next
+    /// owner so concurrent stealers spread out. Each chunk is still claimed on its owner's cursor, so it runs once.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private void StealUnstarted(Job job, int self)
+    {
+        int stride = job.Stride;
+        for (int k = 1; k < stride && Volatile.Read(ref job.Pending) != 0; k++)
+            _ = RunSet(job, (self + k) % stride, publish: true);
+    }
+
     [MethodImpl(Hot)]
     private Exception? FinishPlainDispatch(Job job)
     {
+        if (job.StealEagerly)
+        {
+            // Parked workers: no grace -- the dispatcher takes unstarted chunks right after its own set.
+            Exception? eager = null;
+            for (int owner = 1; owner < job.Stride && Volatile.Read(ref job.Pending) != 0; owner++)
+            {
+                var ex = RunSet(job, owner, publish: false);
+                eager ??= ex;
+            }
+            WaitForZero(ref job.Pending);
+            return eager;
+        }
         if (Volatile.Read(ref job.Pending) != 0)
         {
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -704,6 +735,8 @@ internal sealed class PersistentParallelExecutor
                 // before the chunk counts as finished.
                 TestWorkerStartDelay?.Invoke(slot);
                 _ = RunSet(job, slot + 1, publish: true);
+                if (job.StealEagerly)
+                    StealUnstarted(job, slot + 1);
                 continue;
             }
             if (slot >= job.Stride - 1)
@@ -889,18 +922,30 @@ internal sealed class PersistentParallelExecutor
                 int workersNeeded = Math.Min(numChunks - 1, effWorkers);
                 int stride = workersNeeded + 1;   // participants = main + woken workers
 
+                // Were the workers this dispatch wakes still warm-spinning (WorkerLoop's gate on the previous
+                // dispatch), or parked? A parked worker starts its set only after an OS wake-up, so waiting for it to
+                // run its own chunks (keeping their cache residency) costs more than the residency saves: on 16
+                // hardware threads every full-width dispatch parks the pool, and owned chunks put that wake-up on
+                // each one -- 16 x 10 us chunks took 45-58 us against 38-41 us claimed from a shared counter
+                // (Ryzen 4800H). Parked: every participant takes unstarted chunks once its own set is done.
+                long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                int prevWorkers = System.Threading.Volatile.Read(ref _lastWorkersNeeded);
+                long warmTicks = System.Threading.Volatile.Read(ref _warmWindowTicks);
+                bool workersWarm = warmTicks > 0 && workersNeeded <= prevWorkers && prevWorkers + 1 < s_hardwareThreads
+                    && nowTicks - System.Threading.Volatile.Read(ref _lastDispatchTicks) < warmTicks;
+
                 // Publish dispatch time + worker count so warm-spinning workers know the
                 // pool is active and whether this dispatch left spare cores to spin on
                 // (adaptive keep-warm, gated on spare capacity).
                 System.Threading.Volatile.Write(ref _lastWorkersNeeded, workersNeeded);
-                System.Threading.Volatile.Write(ref _lastDispatchTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+                System.Threading.Volatile.Write(ref _lastDispatchTicks, nowTicks);
 
                 // Completion state, then publish the whole dispatch as ONE immutable Job. The
                 // _job volatile write (and the _workReady Set() release below) publishes _remaining
                 // too, so a woken worker reads a fully-consistent dispatch.
                 _workerException = null;
                 _allDone.Reset();
-                var job = new Job(action, null, null, null, numChunks, stride);
+                var job = new Job(action, null, null, null, numChunks, stride, stealEagerly: !workersWarm);
                 if (_cursors.Length < stride * CursorStride)
                     _cursors = new long[(_numWorkers + 1) * CursorStride];
                 _job = job; // publish BEFORE waking any worker (the volatile write also publishes the cursors)

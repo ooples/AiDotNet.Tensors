@@ -55,7 +55,9 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
     const bool patchLoader = tid < 256;
     const int lp = tid & 31, lc = (tid >> 5) & 7;
     const int gp = p0 + lp;
-    unsigned rowOk = 0, colOk = 0;
+    // pm bit i*4+j: element (i, j) of this thread's 4x4 patch lies inside the image (fixed for the whole reduction,
+    // so each step's loads test one bit instead of recomputing the bounds).
+    unsigned pm = 0;
     long long inOff = 0;
     if (patchLoader && gp < P)
     {
@@ -64,10 +66,9 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
         int h0 = th * 2 - pad, w0 = tw * 2 - pad;
         #pragma unroll
         for (int i = 0; i < 4; i++)
-        {
-            if (h0 + i >= 0 && h0 + i < IH) rowOk |= 1u << i;
-            if (w0 + i >= 0 && w0 + i < IW) colOk |= 1u << i;
-        }
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                if (h0 + i >= 0 && h0 + i < IH && w0 + j >= 0 && w0 + j < IW) pm |= 1u << (i * 4 + j);
         inOff = (long long)n * R * IH * IW + (long long)h0 * IW + w0;
     }
     const long long chanStride = (long long)IH * IW;
@@ -92,20 +93,34 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
         const bool rv = r < rEnd;
         if (patchLoader)
         {
+            // One row pointer per patch row; the four columns are immediate offsets from it.
+            const unsigned m = rv ? pm : 0u;
             const float* src = in + inOff + (long long)r * chanStride;
             #pragma unroll
             for (int i = 0; i < 4; i++)
+            {
+                const float* row = src + i * IW;
                 #pragma unroll
-                for (int j = 0; j < 4; j++)
-                    d[i * 4 + j] = (rv && ((rowOk >> i) & 1u) && ((colOk >> j) & 1u)) ? __ldg(src + i * IW + j) : 0.0f;
+                for (int j = 0; j < 4; j++) d[i * 4 + j] = ((m >> (i * 4 + j)) & 1u) ? __ldg(row + j) : 0.0f;
+            }
         }
         if (!patchLoader)
         {
             const int wr = r0 + fr, wo = o0 + fo;
             const bool wvOk = wr < rEnd && wo < O;
-            const float* src = wt + (WMODE == 1 ? (long long)wo * R + wr : (long long)wr * O + wo) * 9;
-            #pragma unroll
-            for (int q = 0; q < 9; q++) wv[q] = wvOk ? __ldg(src + q) : 0.0f;
+            // One address, one (per-thread uniform) branch: predicating each load on wvOk made the compiler
+            // rebuild the 64-bit address nine times.
+            if (wvOk)
+            {
+                const float* src = wt + (WMODE == 1 ? (long long)wo * R + wr : (long long)wr * O + wo) * 9;
+                #pragma unroll
+                for (int q = 0; q < 9; q++) wv[q] = __ldg(src + q);
+            }
+            else
+            {
+                #pragma unroll
+                for (int q = 0; q < 9; q++) wv[q] = 0.0f;
+            }
         }
     };
     auto store = [&]()

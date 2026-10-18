@@ -1598,10 +1598,14 @@ internal static class BackwardFunctions<T>
         }
         else
         {
-            int[,,,,] maxIndices;
+            // Winners as an index TENSOR, which a GPU engine keeps on the device: the int[,,,,] form is a host array, so
+            // recovering it downloaded the indices every step -- inside a captured compiled step that read aborted the
+            // capture (CUDA 900) and left the plan on the eager path (measured: the parity CNN's compiled step 27.2 ms
+            // against 0.46 ms for PyTorch's CUDA graph).
+            Tensor<int> maxIndices;
             using (new NoGradScope<T>())
-                engine.MaxPool2DWithIndices(inputs[0], poolSize, stride, out maxIndices);
-            grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+                engine.MaxPool2DWithTensorIndices(inputs[0], poolSize, stride, out maxIndices);
+            grad = engine.MaxPool2DBackwardWithTensorIndices(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -3323,6 +3327,44 @@ internal static class BackwardFunctions<T>
         T scale = numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / predictions.Length);
         var grad = engine.TensorMultiplyScalar(diff, scale);
         DifferentiableOps.AccumulateGrad(grads, predictions, grad, engine);
+    }
+
+    /// <summary>
+    /// Backward of the compiled plan's fused mean squared error (<c>ReduceMean(Square(Subtract(p, y)))</c>, see
+    /// MseLossFusionPattern): <c>dp = 2 (p - y) g / n</c>, and <c>dy = -dp</c> only when the target's gradient is
+    /// required. One launch on a backend with the fused kernels; composed otherwise.
+    /// </summary>
+    internal static void FusedMseLossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var predictions = inputs[0];
+        var targets = inputs[1];
+        bool needPredictions = DifferentiableOps.IsGradientRequired(predictions);
+        bool needTargets = DifferentiableOps.IsGradientRequired(targets);
+        if (!needPredictions && !needTargets) return;
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryFusedMseLossBackward(gradOutput, predictions, targets, needTargets, out var deviceTargetGrad) is { } devicePredGrad)
+        {
+            if (needPredictions) DifferentiableOps.AccumulateGrad(grads, predictions, devicePredGrad, engine);
+            if (needTargets && deviceTargetGrad is not null) DifferentiableOps.AccumulateGrad(grads, targets, deviceTargetGrad, engine);
+            return;
+        }
+
+        var diff = engine.TensorSubtract(predictions, targets);
+        Tensor<T> predGrad;
+        if (engine is DirectGpuTensorEngine scaleGpu
+            && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
+        {
+            predGrad = deviceScaled;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            predGrad = engine.TensorMultiplyScalar(diff, numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / predictions.Length));
+        }
+        if (needTargets) DifferentiableOps.AccumulateGrad(grads, targets, engine.TensorNegate(predGrad), engine);
+        if (needPredictions) DifferentiableOps.AccumulateGrad(grads, predictions, predGrad, engine);
     }
 
     /// <summary>BCE with logits loss backward</summary>

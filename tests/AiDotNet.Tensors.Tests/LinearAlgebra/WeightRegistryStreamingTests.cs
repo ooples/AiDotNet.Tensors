@@ -1186,6 +1186,34 @@ public class WeightRegistryStreamingTests : IDisposable
     }
 
     [Fact]
+    public void RehydrateIntoRented_ReturnsTheWeightsBytes_InAPooledArray()
+    {
+        // #2322: Materialize decodes from a rented snapshot. The rented array may be longer than
+        // the weight; its first `length` bytes are the weight's, and writing to it after the
+        // return leaves the pool's copy alone.
+        var pool = new StreamingTensorPool(new GpuOffloadOptions
+        {
+            StreamingPoolMaxResidentBytes = 1024,
+            StreamingBackingStorePath = _backingDir,
+        });
+        try
+        {
+            var data = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+            long h = pool.Register(data);
+
+            var rented = pool.RehydrateIntoRented(h, out int length);
+            Assert.Equal(data.Length, length);
+            Assert.True(rented.Length >= length);
+            Assert.Equal(data, rented.AsSpan(0, length).ToArray());
+            rented[0] = 99;
+            StreamingTensorPool.ReturnRented(rented);
+
+            Assert.Equal(data, pool.RehydrateInto(h));
+        }
+        finally { pool.Dispose(); }
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task PrefetchAsync_BringsBytesIntoResidentSet()
     {
         // Reviewer flagged the original wall-clock poll loop (1s budget)

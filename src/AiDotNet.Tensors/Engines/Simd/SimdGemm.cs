@@ -237,16 +237,12 @@ internal static partial class SimdGemm
         if (!transA && transB)
         {
             // B is stored [n, k]; Bᵀ [k, n] is the small operand.
-            if (lda != k || ldb != k || (long)k * n > SmallJitMaxTransposeElements || !InJitSmallKBand(m, n, k))
+            if (lda != k || ldb != k || (long)k * n > SmallJitMaxTransposeElements || !InJitSmallKBand(m, n, k, transB: true))
                 return false;
             var bt = System.Buffers.ArrayPool<float>.Shared.Rent(k * n);
             try
             {
-                for (int j = 0; j < n; j++)
-                {
-                    int src = j * k;
-                    for (int i = 0; i < k; i++) bt[i * n + j] = b[src + i];
-                }
+                Transpose(b, 0, k, bt, 0, n, n, k);   // bt[i * n + j] = b[j * k + i]
                 JitGemmAvx2.RunJit(a.AsSpan(0, m * k), bt.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
             }
             finally { System.Buffers.ArrayPool<float>.Shared.Return(bt); }
@@ -277,11 +273,7 @@ internal static partial class SimdGemm
                     var at = t_splitKScratch is { } cached && cached.Length >= mPad * rows
                         ? cached : (t_splitKScratch = new float[mPad * rows]);
                     {
-                        for (int r = 0; r < rows; r++)
-                        {
-                            int src = (r0 + r) * lda;
-                            for (int f = 0; f < m; f++) at[f * rows + r] = a[src + f];
-                        }
+                        Transpose(a, r0 * lda, lda, at, 0, rows, rows, m);   // at[f * rows + r] = a[(r0 + r) * lda + f]
                         if (mPad > m) Array.Clear(at, m * rows, (mPad - m) * rows);
                         JitGemmAvx2.RunJit(at.AsSpan(0, mPad * rows), b.AsSpan(r0 * n, rows * n),
                             partial.AsSpan(chunk * mPad * n, mPad * n), mPad, n, rows, forceParallel: false);
@@ -312,13 +304,18 @@ internal static partial class SimdGemm
 
 
     /// <summary>Shapes the small-K panel kernel wins at: shallow k, enough rows to parallelize, and either total work
-    /// under <see cref="JitSmallKMaxWork"/> or B re-read traffic under <see cref="JitSmallKMaxBTrafficBytes"/>.</summary>
-    private static bool InJitSmallKBand(int m, int n, int k)
+    /// under <see cref="JitSmallKMaxWork"/> or B re-read traffic under <see cref="JitSmallKMaxBTrafficBytes"/> -- less
+    /// the thin-M box BlasManaged's direct-parallel kernel serves. Inside that box the panel's 6-row blocks leave M
+    /// unsplit enough to idle most cores, and the transposed-B route adds a serial transpose of B: [64,128]x[128,512]
+    /// took 72 µs here vs 36 there, and dY[64,128]·Wᵀ (W [512,128]) 204 vs 34 (Ryzen 4800H). Past its bounds (M 2048)
+    /// the panel still wins, 62 vs 139 µs at [2048,64]x[64,64].</summary>
+    private static bool InJitSmallKBand(int m, int n, int k, bool transB)
     {
         long work = (long)m * n * k;
         long bTraffic = (long)(m / 6) * k * n * sizeof(float);
         return k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16 && work >= JitSmallKMinWork
-            && (work <= JitSmallKMaxWork || bTraffic <= JitSmallKMaxBTrafficBytes);
+            && (work <= JitSmallKMaxWork || bTraffic <= JitSmallKMaxBTrafficBytes)
+            && !BlasManaged.BlasManaged.ThinMDirectServesShape(m, n, k, transA: false, transB);
     }
 
     // B re-read traffic ceiling for the panel route (bytes): the giant-M regressions were at 22-33 MB.
@@ -358,7 +355,7 @@ internal static partial class SimdGemm
         // The work ceiling stands in for B re-read traffic, (m/6)*k*n*4 bytes, which is what regressed at giant M
         // (22-33 MB). A shape just over the ceiling with modest traffic -- the [2048,64]x[64,128] FFN GEMM, 16.8M MACs
         // and 11 MB -- is admitted on the traffic test.
-        if (_jitSmallK && JitGemmAvx2.Available && InJitSmallKBand(m, n, k))
+        if (_jitSmallK && JitGemmAvx2.Available && InJitSmallKBand(m, n, k, transB: false))
         {
             JitGemmAvx2.RunJit(a, b.Slice(0, k * n), c, m, n, k);
             return true;
@@ -1605,13 +1602,13 @@ internal static partial class SimdGemm
 #endif
 
         // Direct-2D first where it applies, as in SgemmAddInternal (measured faster than the column panel on every
-        // shape both take). It needs a zeroed C; any route below overwrites C if it declines.
+        // shape both take). Its store kernels write every element of C, so C is not cleared first (that pass was ~3%
+        // of a CPU MLP training step); any route below overwrites C if it declines.
         if (UseParallelGemm && UseDirectParallel2D && !transA && !transB && lda == k && ldb == n
             && Avx2.IsSupported && Fma.IsSupported && m >= Mr
             && m <= DirectParallel2DMaxM && k <= DirectParallel2DMaxK && n >= Nr
             && (long)m * k * n >= ParallelWorkThreshold)
         {
-            c.Slice(0, m * n).Clear();
             if (TrySgemmDirectParallel2D(a, lda, b, ldb, c, m, k, n, allowParallel: true))
                 return;
         }

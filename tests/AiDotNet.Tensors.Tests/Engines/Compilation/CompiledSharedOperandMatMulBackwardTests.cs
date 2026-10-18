@@ -166,6 +166,63 @@ public sealed class CompiledSharedOperandMatMulBackwardTests : IDisposable
     }
 
     /// <summary>
+    /// A Transformer's Q, K and V projections of one normalised activation, at its batch-64 x 32-token size:
+    /// x[2048,64] times three [64,64] weights. x's gradient is the sum of three dY·Wᵀ products, which the plan
+    /// accumulates; at this shape the small-K panel route computes each into scratch and adds it. Two steps, so a
+    /// gradient that did not restart from zero would show up doubled.
+    /// </summary>
+    [Fact]
+    public void QkvProjections_SharedInputGradient_MatchesEagerTape()
+    {
+        const int tokens = 2048, width = 64;
+        var rng = new Random(64);
+        var x = Make<float>([tokens, width], rng, 1.0, v => (float)v);
+        var weights = new[]
+        {
+            Make<float>([width, width], rng, 0.2, v => (float)v),
+            Make<float>([width, width], rng, 0.2, v => (float)v),
+            Make<float>([width, width], rng, 0.2, v => (float)v),
+        };
+        var parameters = new[] { x, weights[0], weights[1], weights[2] };
+        var engine = new CpuEngine();
+        Tensor<float> Loss(IEngine e)
+        {
+            var q = e.TensorMatMul(x, weights[0]);
+            var k = e.TensorMatMul(x, weights[1]);
+            var v = e.TensorMatMul(x, weights[2]);
+            var mix = e.TensorAdd(e.TensorMultiply(q, k), v);
+            return e.ReduceMean(e.TensorMultiply(mix, mix), new[] { 0, 1 }, keepDims: false);
+        }
+
+        Dictionary<Tensor<float>, Tensor<float>> expected;
+        using (var tape = new GradientTape<float>())
+            expected = tape.ComputeGradients(Loss(engine), parameters);
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+            plan = scope.CompileTraining(parameters, Loss(engine));
+
+        using (plan)
+        {
+            Assert.Equal(3, ((CompiledTrainingPlan<float>)plan).BackwardStepKinds.Count(k => k == "specialized:TensorMatMul"));
+            for (int step = 0; step < 2; step++)
+            {
+                plan.Step();
+                for (int p = 0; p < parameters.Length; p++)
+                {
+                    var want = expected[parameters[p]].ToArray();
+                    var got = plan.Gradients[p].ToArray();
+                    double scale = 1e-12;
+                    foreach (var w in want) scale = Math.Max(scale, Math.Abs(w));
+                    for (int i = 0; i < want.Length; i++)
+                        Assert.True(Math.Abs(got[i] - want[i]) <= 1e-4 * scale,
+                            $"step {step}, parameter {p}, element {i}: compiled {got[i]:G9}, eager {want[i]:G9}");
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// One [rows, 1] bias added to two [rows, cols] tensors: its gradient is the sum of both contributions' row sums,
     /// so the per-row reduction must ADD into the bias gradient for the second consumer, and the sum must restart
     /// from zero every step.

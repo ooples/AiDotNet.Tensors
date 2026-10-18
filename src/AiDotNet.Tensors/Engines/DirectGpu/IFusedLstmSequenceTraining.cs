@@ -15,4 +15,11 @@ internal interface IFusedLstmSequenceTraining
 {
     /// <summary>The largest hidden size the sequence kernels handle correctly on this device.</summary>
     int MaxFusedLstmHidden { get; }
+
+    /// <summary>
+    /// Whether <see cref="IDirectGpuBackend.LstmBackwardSequence"/> writes every gradient output rather than
+    /// accumulating into it, so the caller need not zero them first (on CUDA that zeroing was five memsets per LSTM
+    /// layer in every captured training step).
+    /// </summary>
+    bool LstmBackwardOverwritesGradients { get; }
 }

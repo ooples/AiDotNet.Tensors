@@ -600,6 +600,38 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
+    // Scratch for RehydrateIntoRented. A dedicated pool rather than ArrayPool.Shared: a streamed
+    // model's weights are megabytes each, and the shared pool would keep a stack of them per core.
+    // Two arrays per size class bound what it holds; a weight larger than the cap gets a plain array.
+    private const int RentedSnapshotMaxBytes = 64 * 1024 * 1024;
+    private static readonly ArrayPool<byte> RentedSnapshots = ArrayPool<byte>.Create(RentedSnapshotMaxBytes, 2);
+
+    /// <summary>
+    /// <see cref="RehydrateInto"/> for a caller that only decodes the bytes and lets them go: they
+    /// land in a rented array, of which the first <paramref name="length"/> bytes are the weight's.
+    /// The caller hands the array back through <see cref="ReturnRented"/> once it has decoded it.
+    /// Re-materializing a streamed training weight happens several times a step, so the fresh
+    /// array <see cref="RehydrateInto"/> makes each time was a large share of a step's garbage (#2322).
+    /// </summary>
+    internal byte[] RehydrateIntoRented(long handleId, out int length)
+    {
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            var span = Rehydrate(handleId);
+            var rented = RentedSnapshots.Rent(span.Length);
+            span.CopyTo(rented);
+            length = span.Length;
+            return rented;
+        }
+    }
+
+    /// <summary>
+    /// Returns an array from <see cref="RehydrateIntoRented"/>, cleared so a weight's bytes don't
+    /// outlive the pool that owned them in the static scratch pool.
+    /// </summary>
+    internal static void ReturnRented(byte[] rented) => RentedSnapshots.Return(rented, clearArray: true);
+
     /// <summary>Frees a weight + its backing-store file. Called at model
     /// dispose.</summary>
     public void Unregister(long handleId)

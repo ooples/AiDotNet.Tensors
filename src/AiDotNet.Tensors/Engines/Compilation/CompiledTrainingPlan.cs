@@ -1689,6 +1689,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 continue;
             }
 
+            // The clip's sum of squares already decided it (a ~2 MB re-read per step for the parity MLP).
+            if (HostClipCovers(gradients, gradOffsets[p], lengths[p]))
+            {
+                gradientsFinite = _hostClipSumFinite;
+                continue;
+            }
+
             fixed (float* pGrad = &gradients[gradOffsets[p]])
             {
                 gradientsFinite = FusedOptimizer.AllFiniteParallel(pGrad, lengths[p]);
@@ -1788,6 +1795,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
 
+    // The host float gradients (array, logical length) this step's global-norm clip summed, and whether that double sum
+    // of squares was finite -- it is exactly when every summed element is, and a finite clip scale keeps them so. The
+    // CPU finiteness check then skips re-reading them. Cleared after every optimizer update, like the device record.
+    private readonly List<(float[] Array, int Length)> _hostClipCovered = new List<(float[] Array, int Length)>();
+    private bool _hostClipSumFinite;
+
+    private bool HostClipCovers(float[] gradients, int offset, int length)
+    {
+        if (offset != 0) return false;
+        foreach (var (array, len) in _hostClipCovered)
+            if (ReferenceEquals(array, gradients) && len == length) return true;
+        return false;
+    }
+
     // The device double the multi-tensor Adam guard and the deferred finiteness readback read this step: the plan's own
     // sum of squares, or the clip's when it covered the same gradients.
     private Engines.DirectGpu.IGpuBuffer? _finitenessGuard;
@@ -1834,6 +1855,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             _clipSumCoveredBuffers.Clear();
             _clipSumCoveredSizes.Clear();
             _clipSumCoveredBackend = null;
+            _hostClipCovered.Clear();
         }
     }
 
@@ -2545,6 +2567,58 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static readonly bool s_zeroAccumulatingOnly =
         Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_ZERO_ACCUMULATING_ONLY") != "0";
 
+    // Gradient buffers this step's zeroing pass clears, gathered so the clear runs across the worker pool.
+    private readonly List<(T[] Array, int Length)> _pendingGradClears = new();
+    private const int GradClearChunk = 1 << 15;
+    private long _lastClearedGradElements = -1;
+
+    /// <summary>Gradient elements the last step's selective zeroing pass cleared (-1 before any such pass). Test hook.</summary>
+    internal long LastClearedGradElements => _lastClearedGradElements;
+
+    /// <summary>
+    /// Zeroes the buffers gathered in <see cref="_pendingGradClears"/>, split into 32K-element pieces across the
+    /// worker pool. On the parity CPU Transformer they are the seven multi-consumer gradients (the residual streams and
+    /// the norm outputs Q/K/V share): 787K floats a step, ~300 us as one thread's Array.Clear (Ryzen 7 4800H).
+    /// </summary>
+    private void ClearPendingGradBuffers()
+    {
+        var pending = _pendingGradClears;
+        try
+        {
+            long total = 0;
+            int pieces = 0;
+            foreach (var (_, length) in pending)
+            {
+                total += length;
+                pieces += (length + GradClearChunk - 1) / GradClearChunk;
+            }
+            _lastClearedGradElements = total;
+            if (pieces <= 1)
+            {
+                foreach (var (array, length) in pending) Array.Clear(array, 0, length);
+                return;
+            }
+            CpuParallelSettings.ParallelForOrSerial(0, pieces, total, piece =>
+            {
+                foreach (var (array, length) in pending)
+                {
+                    int owned = (length + GradClearChunk - 1) / GradClearChunk;
+                    if (piece < owned)
+                    {
+                        int start = piece * GradClearChunk;
+                        Array.Clear(array, start, Math.Min(GradClearChunk, length - start));
+                        return;
+                    }
+                    piece -= owned;
+                }
+            });
+        }
+        finally
+        {
+            pending.Clear();
+        }
+    }
+
     /// <summary><see cref="_genericGradIndices"/> as a per-buffer mask (built once).</summary>
     private bool[] AccumulatingGradMask(int count)
     {
@@ -3076,6 +3150,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private readonly Dictionary<Tensor<T>, Engines.DirectGpu.IGpuBuffer> _ownedLeafBuffers =
         new(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
+    private bool? _compiledInputIsParameter;
+
+    private bool CompiledInputIsParameter => _compiledInputIsParameter ??=
+        _compiledInputTensor is { } input && Array.Exists(_parameters, p => ReferenceEquals(p, input));
+
     private bool IsOwnedLeafBinding(Tensor<T> leaf)
         => leaf._gpuBuffer is { } bound && _ownedLeafBuffers.TryGetValue(leaf, out var owned)
            && ReferenceEquals(owned, bound);
@@ -3148,6 +3227,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // compatibility (it's the embeddings matrix there), so gate on the flag, not on null.
         if (_graphHasEmbedding) return allLive;
         if (_compiledInputTensor is not { } inT) return allLive;
+        // The compiled input is the first step's first input, which is a parameter when the step reads one first (the
+        // fused LSTM's bias add). Like every parameter it is read by the graph and updated by the optimizer on the
+        // device, so refreshing it from the host downloaded and re-uploaded it, stalling the stream every replay.
+        if (CompiledInputIsParameter) return allLive;
         Engines.DirectGpu.IGpuBuffer? buf;
         if (GraphExternalLeaves().Contains(inT))
         {
@@ -3731,13 +3814,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 if (verified && eagerCandidates[i]) continue;   // its first contribution this step copies in
                 if (accumulating is not null && !accumulating[i]) continue;   // overwritten whole by its writer
-                Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+                _pendingGradClears.Add((gradArrays[i], _preAllocatedGrads[i].Length));
                 InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);   // see the note on the full clear below
                 // The zeros ARE this buffer's first write, so every contribution adds onto them (a specialized
                 // delegate that accumulates in place does not claim a first write). A candidate on the verification
                 // run stays unmarked so its first contribution claims it, which is how coverage is recorded.
                 if (!eagerCandidates[i]) _preAllocatedGrads[i]._gradWriteGeneration = eagerGradWriteGeneration;
             }
+            ClearPendingGradBuffers();
         }
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
@@ -3749,9 +3833,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             for (int i = 0; i < _genericGradIndices.Length; i++)
             {
                 int idx = _genericGradIndices[i];
-                Array.Clear(gradArrays[idx], 0, _preAllocatedGrads[idx].Length);
+                _pendingGradClears.Add((gradArrays[idx], _preAllocatedGrads[idx].Length));
                 InvalidateStaleDeviceCopy(_preAllocatedGrads[idx]);   // see the note on the full clear below
             }
+            ClearPendingGradBuffers();
         }
         else
         {
@@ -4459,6 +4544,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
     }
 
+    /// <summary>True when no parameter takes the device update path (a resident buffer on a GPU backend).</summary>
+    private static bool AllParametersOnHost(
+        Engines.DirectGpu.IGpuBuffer?[] gpuParam, Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends)
+    {
+        for (int p = 0; p < gpuParam.Length; p++)
+            if (gpuParam[p] is not null && gpuBackends[p] is not null) return false;
+        return true;
+    }
+
     private unsafe void ConfigureOptimizerFloat(
         OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay,
         FusedOptimizerExtras extras)
@@ -4859,6 +4953,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             lbfgsState.LbfgsHasPrev = false;
         }
 
+        int[]? adamWSegments = null;   // AdamWUpdateMultiParallel's segment list, reused across steps
         _optimizerUpdate = () =>
         {
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
@@ -5325,6 +5420,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
                         CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
                     }
+                }
+                return;
+            }
+
+            // Host AdamW with fp32 moments over host parameters only: one pool dispatch across every tensor's segments
+            // (FusedOptimizer.AdamWUpdateMultiParallel), bit-identical to the per-parameter loop below, which updated a
+            // model of many small tensors one tensor at a time on this thread.
+            if (optType == OptimizerType.AdamW && !useBf16Moments && !useInt8Moments && AllParametersOnHost(gpuParam, gpuBackends))
+            {
+                FusedOptimizer.AdamWUpdateMultiParallel(paramArrays, paramOffsets, gradArrays, gradOffsets, m, v, lengths,
+                    paramCount, lr, b1, b2, epsVal, wd, stepBc1, stepBc2, ref adamWSegments);
+                for (int p = 0; p < paramCount; p++)
+                {
+                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                    MarkHostWeightMutated(p);
                 }
                 return;
             }
@@ -7911,6 +8021,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int genericBackwardCount = 0;
         // Steps whose backward is the generic accumulator: AccumulateGrad ADDS into their inputs' gradient buffers.
         var genericBackwardSteps = new List<CompiledStep<T>>();
+        // Specialized steps whose delegates claim each multi-consumer input gradient's first write (AccumulatesInto).
+        var firstWriteClaimingSteps = new List<CompiledStep<T>>();
 
         // Gradient relevance: a tensor's gradient can reach a parameter only when the tensor was COMPUTED FROM one
         // (requiresGradTensors, above). The traced input batch, the labels, and everything derived from them alone
@@ -7977,12 +8089,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             // On a GPU engine, skip the host BLAS specialization (preferGenericForGpu) so the backward
             // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
+            var claims = new System.Runtime.CompilerServices.StrongBox<bool>();
             var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
-                requiresGrad: requiresGradTensors);
+                requiresGrad: requiresGradTensors, claimsFirstWrite: claims);
             if (action != null)
             {
                 backwardActions.Add(action);
                 backwardStepNames.Add($"specialized:{step.OpName}");
+                if (claims.Value) firstWriteClaimingSteps.Add(step);
             }
             else
             {
@@ -8191,11 +8305,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // (a specialized/fused/analytic delegate, which neither claims nor respects first-write marks) is excluded
         // and stays zeroed. consumerCount counts every consuming step, so equality with the generic-only count
         // means no other consumer exists. Pooled buffers keep their own re-zero schedule.
+        // A specialized delegate that claims the first write the same way (firstWriteClaimingSteps: the residual add, the
+        // shared Q/K/V matmul) counts with the generic writers. On the parity CPU Transformer that leaves the residual
+        // streams and the norm outputs unzeroed: they were all seven buffers the step still cleared (787K floats).
         bool[]? eagerFirstWriteCandidates = null;
         if (!useGradPool && genericBackwardCount > 0 && genericBackwardSteps.Count > 0)
         {
             var genericConsumers = new Dictionary<Tensor<T>, int>();
-            foreach (var genericStep in genericBackwardSteps)
+            foreach (var genericStep in genericBackwardSteps.Concat(firstWriteClaimingSteps))
             {
                 foreach (var inp in genericStep.Inputs)
                     genericConsumers[inp] = genericConsumers.TryGetValue(inp, out int seen) ? seen + 1 : 1;
@@ -9816,6 +9933,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // uninitialised pool-padding tail does not leak into the norm.
         var numOps = MathHelper.GetNumericOperations<T>();
         double totalNormSq = 0.0;
+        _hostClipCovered.Clear();
+        // Every dense float gradient's sum of squares first, all of them in one pool dispatch (SumSquaresMany); the
+        // loop below then adds the per-tensor sums in tensor order, so the total is bit-identical to summing each
+        // tensor where it falls.
+        _clipFloatItems.Clear();
+        for (int p = 0; p < gradients.Length; p++)
+        {
+            var tensor = gradients[p];
+            if (tensor == null || SkipUnexercised(p)) continue;
+            if (tensor.IsContiguous && tensor.GetCpuBackingForStridedRead(out int floatOffset) is float[] fItem && floatOffset == 0)
+                _clipFloatItems.Add((fItem, tensor.Length));
+        }
+        if (_clipFloatSums.Length < _clipFloatItems.Count) _clipFloatSums = new double[_clipFloatItems.Count];
+        SumSquaresMany(_clipFloatItems, _clipFloatSums, ref _clipPartials, ref _clipUnits);
+        int floatItem = 0;
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
@@ -9830,7 +9962,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (tensor.IsContiguous && offset == 0 && arr is double[] dNorm)
                 totalNormSq += SumSquaresVectorized(dNorm, len);
             else if (tensor.IsContiguous && offset == 0 && arr is float[] fNorm)
-                totalNormSq += SumSquaresChunked(fNorm, len);
+            {
+                if (floatItem >= _clipFloatItems.Count || !ReferenceEquals(_clipFloatItems[floatItem].Array, fNorm))
+                    throw new InvalidOperationException("Gradient clip: a float gradient's backing changed between the norm passes.");
+                totalNormSq += _clipFloatSums[floatItem++];
+                _hostClipCovered.Add((fNorm, len));
+            }
             else if (tensor.IsContiguous && arr is not null)
                 for (int i = 0; i < len; i++)
                 {
@@ -9844,12 +9981,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     totalNormSq += v * v;
                 }
         }
+        _hostClipSumFinite = !double.IsNaN(totalNormSq) && !double.IsInfinity(totalNormSq);
         if (totalNormSq == 0.0) return;
         double totalNorm = Math.Sqrt(totalNormSq);
         if (totalNorm <= maxNorm) return;
 
-        // Step 2: scale every gradient by maxNorm / (totalNorm + 1e-6).
+        // Step 2: scale every gradient by maxNorm / (totalNorm + 1e-6). The dense float gradients are gathered and scaled
+        // in one pool dispatch (ScaleInPlaceMany), the rest in place as before.
         T scale = numOps.FromDouble(maxNorm / (totalNorm + 1e-6));
+        _clipFloatItems.Clear();
         for (int p = 0; p < gradients.Length; p++)
         {
             var tensor = gradients[p];
@@ -9863,13 +10003,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             else if (offset == 0 && arr is float[] fScale)
             {
-                ScaleInPlaceChunked(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
-                tensor.IncrementVersion();
+                _clipFloatItems.Add((fScale, len));
+                _clipScaledTensors.Add(tensor);
             }
             else
                 tensor.ScaleLogicalInPlace(scale);
         }
+        ScaleInPlaceMany(_clipFloatItems, (float)(maxNorm / (totalNorm + 1e-6)), ref _clipUnits);
+        foreach (var scaled in _clipScaledTensors) scaled.IncrementVersion();
+        _clipScaledTensors.Clear();
+        _clipFloatItems.Clear();
     }
+
+    private readonly List<Tensor<T>> _clipScaledTensors = new();
+
+    // Scratch of the host gradient clip's multi-tensor passes (SumSquaresMany / ScaleInPlaceMany), reused across steps.
+    private readonly List<(float[] Array, int Length)> _clipFloatItems = new();
+    private double[] _clipFloatSums = Array.Empty<double>();
+    private double[] _clipPartials = Array.Empty<double>();
+    private int[] _clipUnits = Array.Empty<int>();
 
     // Below this many FMAs a linear-backward GEMM stays on the direct managed kernel: BlasManaged's thin-M kernels
     // start at 1M FMAs and its general strategy path loses to SimdGemm on small shapes (measured on the parity MLP's
@@ -9913,6 +10065,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>dst[start..+count] += src (accumulate) or = src.</summary>
+    /// <summary>
+    /// Whether a backward delegate must ADD its contribution into a multi-consumer input's gradient buffer. Under the
+    /// host step's GradWriteGeneration the first writer of the step claims the buffer and overwrites it, exactly as the
+    /// generic AccumulateGrad copies its first contribution in, so a buffer whose every writer claims needs no zeroing
+    /// (see the first-write candidates in the compile). Outside a generation nothing is claimed and the buffer was
+    /// zeroed, so a shared operand accumulates. A single-consumer operand always overwrites; its write is still claimed,
+    /// so the step's first-write coverage check (RecordEagerFirstWriteCoverage) sees the buffer written.
+    /// </summary>
+    private static bool AccumulatesInto(Tensor<T> grad, bool shared)
+    {
+        bool first = Autodiff.DifferentiableOps.ClaimFirstWrite(grad);
+        return shared && !first;
+    }
+
     private static void AddOrCopy(float[] src, float[] dst, int start, int count, bool accumulate)
     {
         if (!accumulate) { Array.Copy(src, start, dst, start, count); return; }
@@ -9926,15 +10092,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// The backward of <c>C[M,N] = A[M,K] · B[K,N]</c> (A's leading dims collapsed into M) when at least one operand
     /// has several consumers: <c>dA = dC · Bᵀ</c> and <c>dB = Aᵀ · dC</c>, each one transposed GEMM into the plan's
     /// gradient buffer. A single-consumer operand's gradient overwrites its buffer (beta = 0); a shared operand's
-    /// accumulates into it (beta = 1), relying on the plan zeroing every multi-consumer tensor's gradient buffer at the
-    /// start of the step. A gradient no parameter reads (<paramref name="requiresGrad"/>) is not computed. Returns null
-    /// for any layout the raw-array GEMMs cannot address, so the step keeps the generic backward.
+    /// overwrites it when this is the buffer's first write of the step and accumulates into it (beta = 1) otherwise
+    /// (<see cref="AccumulatesInto"/>), so the plan need not zero it. A gradient no parameter reads
+    /// (<paramref name="requiresGrad"/>) is not computed. Returns null for any layout the raw-array GEMMs cannot
+    /// address, so the step keeps the generic backward; otherwise sets <paramref name="claimsFirstWrite"/>.
     /// </summary>
     private static Action<IEngine>? BuildSharedOperandMatMulBackward(
         CompiledStep<T> step,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
         Dictionary<Tensor<T>, int> consumerCount,
-        HashSet<Tensor<T>>? requiresGrad)
+        HashSet<Tensor<T>>? requiresGrad,
+        System.Runtime.CompilerServices.StrongBox<bool>? claimsFirstWrite)
     {
         var inputA = step.Inputs[0];
         var inputB = step.Inputs[1];
@@ -9973,18 +10141,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var da = TryGetLiveFloatBacking(gradA);
             var db = TryGetLiveFloatBacking(gradB);
             if (dc is null || a is null || b is null || da is null || db is null) return null;
+            float[]? productScratch = null;
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return _ =>
             {
                 // dA[M,K] = dC[M,N] · B[K,N]ᵀ
                 if (needA)
                 {
-                    SharedOperandGemm(dc, n, false, b, n, true, da, m, n, k, accumulateA);
+                    SharedOperandGemm(dc, n, false, b, n, true, da, m, n, k, AccumulatesInto(gradA, accumulateA), ref productScratch);
                     inputA.Grad = gradA;
                 }
                 // dB[K,N] = A[M,K]ᵀ · dC[M,N]
                 if (needB)
                 {
-                    SharedOperandGemm(a, k, true, dc, n, false, db, k, m, n, accumulateB);
+                    SharedOperandGemm(a, k, true, dc, n, false, db, k, m, n, AccumulatesInto(gradB, accumulateB), ref productScratch);
                     inputB.Grad = gradB;
                 }
             };
@@ -10000,16 +10170,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // then added. Sized for the larger accumulated gradient, allocated on first use only.
         int scratchLength = Math.Max(accumulateA && needA ? m * k : 0, accumulateB && needB ? k * n : 0);
         double[]? scratch = null;
+        if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
         return _ =>
         {
             if (needA)
             {
-                SharedOperandGemm(dcD, n, false, bD, n, true, daD, m, n, k, accumulateA, ref scratch, scratchLength);
+                SharedOperandGemm(dcD, n, false, bD, n, true, daD, m, n, k, AccumulatesInto(gradA, accumulateA), ref scratch, scratchLength);
                 inputA.Grad = gradA;
             }
             if (needB)
             {
-                SharedOperandGemm(aD, k, true, dcD, n, false, dbD, k, m, n, accumulateB, ref scratch, scratchLength);
+                SharedOperandGemm(aD, k, true, dcD, n, false, dbD, k, m, n, AccumulatesInto(gradB, accumulateB), ref scratch, scratchLength);
                 inputB.Grad = gradB;
             }
         };
@@ -10022,11 +10193,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// </summary>
     private static void SharedOperandGemm(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c,
-        int rows, int inner, int cols, bool accumulate)
+        int rows, int inner, int cols, bool accumulate, ref float[]? scratch)
     {
         if (!accumulate)
         {
             LinearBackwardGemm(a, lda, transA, b, ldb, transB, c, rows, inner, cols);
+            return;
+        }
+        // The small-K panel routes overwrite, so an accumulating product lands in scratch and is added: a Transformer's
+        // shared Q/K/V input gradient dY[2048,64]·W[64,64]ᵀ took 31 us there plus the add, against ~80 us accumulating
+        // through SgemmAdd (3950X).
+        int length = rows * cols;
+        var product = scratch is { } owned && owned.Length >= length ? owned : (scratch = new float[length]);
+        if (SimdGemm.TryGemmSmallJit(a, lda, transA, b, ldb, transB, product, rows, inner, cols))
+        {
+            int width = System.Numerics.Vector<float>.Count, i = 0;
+            for (; i + width <= length; i += width)
+                (new System.Numerics.Vector<float>(c, i) + new System.Numerics.Vector<float>(product, i)).CopyTo(c, i);
+            for (; i < length; i++) c[i] += product[i];
             return;
         }
         SimdGemm.SgemmAdd(a.AsSpan(0, rows * inner), lda, transA, b.AsSpan(0, inner * cols), ldb, transB,
@@ -10192,6 +10376,92 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             System.Buffers.ArrayPool<double>.Shared.Return(partials);
         }
     }
+
+    /// <summary>
+    /// <see cref="SumSquaresChunked"/> of every item, all items' chunks in ONE pool dispatch: sums[i] is bit-identical to
+    /// SumSquaresChunked(items[i]) (each chunk is the same SumSquaresRange; a multi-chunk item adds its partials in chunk
+    /// order from 0.0, a single-chunk item is its one partial). Per-tensor calls ran every gradient under the chunk size
+    /// on the calling thread in turn: on the parity Transformer (30 tensors, 69K elements) the clip went from ~92 to ~67 us
+    /// per step with this and <see cref="ScaleInPlaceMany"/> (Ryzen 7 4800H, steps 100-200). <paramref name="partials"/>
+    /// and <paramref name="units"/> are caller-owned scratch.
+    /// </summary>
+    internal static void SumSquaresMany(
+        List<(float[] Array, int Length)> items, double[] sums, ref double[] partials, ref int[] units)
+    {
+        int unitCount = 0;
+        long total = 0;
+        foreach (var (_, len) in items)
+        {
+            unitCount += Math.Max(1, (len + ClipChunkElements - 1) / ClipChunkElements);
+            total += len;
+        }
+        if (partials.Length < unitCount) partials = new double[unitCount];
+        if (units.Length < 3 * unitCount) units = new int[3 * unitCount];
+        int u = 0;
+        for (int i = 0; i < items.Count; i++)
+        {
+            int len = items[i].Length;
+            for (int s = 0; s == 0 || s < len; s += ClipChunkElements)
+            {
+                units[u++] = i; units[u++] = s; units[u++] = Math.Min(len, s + ClipChunkElements);
+            }
+        }
+        var p = partials;
+        var list = units;
+        if (unitCount > 1 && total >= ClipParallelMinElements)
+            Helpers.PersistentParallelExecutor.Instance.Execute(unitCount, k =>
+                p[k] = SumSquaresRange(items[list[3 * k]].Array, list[3 * k + 1], list[3 * k + 2]));
+        else
+            for (int k = 0; k < unitCount; k++)
+                p[k] = SumSquaresRange(items[list[3 * k]].Array, list[3 * k + 1], list[3 * k + 2]);
+        int next = 0;
+        for (int i = 0; i < items.Count; i++)
+        {
+            int chunks = Math.Max(1, (items[i].Length + ClipChunkElements - 1) / ClipChunkElements);
+            if (chunks == 1) { sums[i] = p[next++]; continue; }
+            double s = 0.0;
+            for (int c = 0; c < chunks; c++) s += p[next++];
+            sums[i] = s;
+        }
+    }
+
+    /// <summary>Each item's [0, Length) times <paramref name="scale"/>, every item's chunks in one pool dispatch (one
+    /// multiply per element, so identical to <see cref="ScaleInPlaceChunked"/> per item).</summary>
+    internal static void ScaleInPlaceMany(List<(float[] Array, int Length)> items, float scale, ref int[] units)
+    {
+        int unitCount = 0;
+        long total = 0;
+        foreach (var (_, len) in items)
+        {
+            unitCount += (len + ClipChunkElements - 1) / ClipChunkElements;
+            total += len;
+        }
+        if (units.Length < 3 * unitCount) units = new int[3 * unitCount];
+        int u = 0;
+        for (int i = 0; i < items.Count; i++)
+            for (int s = 0; s < items[i].Length; s += ClipChunkElements)
+            {
+                units[u++] = i; units[u++] = s; units[u++] = Math.Min(items[i].Length, s + ClipChunkElements);
+            }
+        var list = units;
+        void Run(int k)
+        {
+            var a = items[list[3 * k]].Array;
+            int start = list[3 * k + 1], end = list[3 * k + 2];
+            int w = System.Numerics.Vector<float>.Count;
+            var vs = new System.Numerics.Vector<float>(scale);
+            int i = start;
+            for (; i <= end - w; i += w) (new System.Numerics.Vector<float>(a, i) * vs).CopyTo(a, i);
+            for (; i < end; i++) a[i] *= scale;
+        }
+        if (unitCount > 1 && total >= ClipParallelMinElements)
+            Helpers.PersistentParallelExecutor.Instance.Execute(unitCount, Run);
+        else
+            for (int k = 0; k < unitCount; k++) Run(k);
+    }
+
+    /// <summary>Below this many gradient elements in all, the multi-tensor norm and scale stay on the calling thread.</summary>
+    private const int ClipParallelMinElements = 1 << 14;
 
     /// <summary><see cref="ScaleInPlaceVectorized(float[], int, float)"/> over the same chunks, in parallel. Each element
     /// is one multiply whichever chunk or lane computes it, so the result is identical to the serial pass.</summary>
@@ -10680,8 +10950,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
         List<GCHandle>? handleTracker = null,
-        HashSet<Tensor<T>>? requiresGrad = null)
+        HashSet<Tensor<T>>? requiresGrad = null,
+        System.Runtime.CompilerServices.StrongBox<bool>? claimsFirstWrite = null)
     {
+        // claimsFirstWrite is set when the returned delegate writes each multi-consumer input's gradient through
+        // AccumulatesInto (claiming the step's first write) rather than always adding into a zeroed buffer.
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
         // PR #319: extend the MatMul backward to cover double via
         // BlasProvider.TryGemmEx(double[], ...) so tape-trained
@@ -10744,7 +11017,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.OutputBuffer.IsContiguous)
         {
-            var sharedOperandBackward = BuildSharedOperandMatMulBackward(step, gradMap, consumerCount, requiresGrad);
+            var sharedOperandBackward = BuildSharedOperandMatMulBackward(step, gradMap, consumerCount, requiresGrad,
+                claimsFirstWrite);
             if (sharedOperandBackward is not null)
                 return sharedOperandBackward;
         }
@@ -11318,6 +11592,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             // Float host buffers of one shape: both gradients in one chunked pass across the pool. The engine add and
             // the single-threaded span copy took ~170 us per residual add of [64,32,64] (3990X).
+            // A multi-consumer operand's buffer is overwritten when this is its first write of the step (see
+            // AccumulatesInto), so the plan does not zero it.
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             if (typeof(T) == typeof(float) && !engine.SupportsGpu
                 && gradA.Length == gradOut.Length && gradB.Length == gradOut.Length
                 && TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
@@ -11332,12 +11609,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // An operand whose gradient views gradOut (AliasReshapeViewGradients) already holds it.
                     bool skipA = !accumA && ReferenceEquals(ga, g) && gradA._storageOffset == gradOut._storageOffset;
                     bool skipB = !accumB && ReferenceEquals(gb, g) && gradB._storageOffset == gradOut._storageOffset;
+                    bool addA = !skipA && AccumulatesInto(gradA, accumA);
+                    bool addB = !skipB && AccumulatesInto(gradB, accumB);
                     int chunks = Math.Max(1, (addLen + ReluChunkElements - 1) / ReluChunkElements);
                     CpuParallelSettings.ParallelForOrSerial(0, chunks, 2L * addLen, c =>
                     {
                         int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, addLen - start);
-                        if (!skipA) AddOrCopy(g, ga, start, count, accumA);
-                        if (!skipB) AddOrCopy(g, gb, start, count, accumB);
+                        if (!skipA) AddOrCopy(g, ga, start, count, addA);
+                        if (!skipB) AddOrCopy(g, gb, start, count, addB);
                     }, deterministicSafe: true);
                     inputA.Grad = gradA;
                     inputB.Grad = gradB;
@@ -11346,12 +11625,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             return eng =>
             {
-                if (accumA)
+                if (AccumulatesInto(gradA, accumA))
                     eng.TensorAddInto(gradA, gradA, gradOut);
                 else
                     gradOut.AsSpan().CopyTo(gradA.AsWritableSpan());
 
-                if (accumB)
+                if (AccumulatesInto(gradB, accumB))
                     eng.TensorAddInto(gradB, gradB, gradOut);
                 else
                     gradOut.AsSpan().CopyTo(gradB.AsWritableSpan());
@@ -11415,9 +11694,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
+            // A multi-consumer operand's buffer is overwritten on its first write of the step (AccumulatesInto).
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return eng =>
             {
-                if (accumA)
+                if (AccumulatesInto(gradA, accumA))
                 {
                     // gradA += gradOut * inputB
                     var temp = eng.TensorMultiply(gradOut, inputB);
@@ -11426,7 +11707,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 else
                     eng.TensorMultiplyInto(gradA, gradOut, inputB);
 
-                if (accumB)
+                if (AccumulatesInto(gradB, accumB))
                 {
                     // gradB += gradOut * inputA
                     var temp = eng.TensorMultiply(gradOut, inputA);
