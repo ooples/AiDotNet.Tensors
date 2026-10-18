@@ -1709,6 +1709,10 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         iwp = iw0 + (PHASE ? (q - i * Wp) * sW : q - i * Wp) + pW;
     }
     const float* dyBatch = gradOutput + (long long)nb * outC * L;
+    // PHASE: the phase's taps kh = rh + th * sH hit dY row (ihp - rh) / sH - th exactly (ihp - rh is a non-negative
+    // multiple of sH), so each K tile's row and column are a subtraction, not two runtime divisions per lane per tile
+    // (measured: those divisions were most of the phase kernel's integer instructions).
+    const int ohBase = PHASE ? (ihp - rh) / sH : 0, owBase = PHASE ? (iwp - rw) / sW : 0;
 
     // Tile state: tap (kh, kw) and first output channel co0 (K tiles never straddle a tap: Cout % 8 == 0).
     // K order (co group of CE_BK, tap, co within the group), as in the forward: the taps of one group read the weights
@@ -1729,13 +1733,23 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         #pragma unroll
         for (int r = 0; r < RA; r++)
             ra[r] = m < inC ? wTap[r * rowStep] : 0.0f;
-        int ty_ = ihp - kh * dH, tx_ = iwp - kw * dW;
-        int oh = ty_, ow = tx_;
-        bool valid = nIn && ty_ >= 0 && tx_ >= 0;
-        if (valid && (sH > 1 || sW > 1))
+        int oh, ow;
+        bool valid;
+        if (PHASE)
         {
-            oh = ty_ / sH; ow = tx_ / sW;
-            valid = PHASE || (oh * sH == ty_ && ow * sW == tx_);
+            oh = ohBase - th; ow = owBase - tw;
+            valid = nIn && oh >= 0 && ow >= 0;
+        }
+        else
+        {
+            int ty_ = ihp - kh * dH, tx_ = iwp - kw * dW;
+            oh = ty_; ow = tx_;
+            valid = nIn && ty_ >= 0 && tx_ >= 0;
+            if (valid && (sH > 1 || sW > 1))
+            {
+                oh = ty_ / sH; ow = tx_ / sW;
+                valid = oh * sH == ty_ && ow * sW == tx_;
+            }
         }
         valid = valid && oh < outH && ow < outW;
         const float* src = dyBatch + (long long)(co0 + bk) * L + (valid ? oh * outW + ow : 0);
