@@ -15,7 +15,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// its K position (b, oh, ow) incrementally per tile instead of dividing, so a gathered input element costs a table
 /// read, an add, two unsigned range checks and a load;</item>
 /// <item>split-K partial rows are written as 16-byte stores and summed in split order by conv2d_wgrad_splitk_reduce
-/// (deterministic).</item>
+/// (deterministic);</item>
+/// <item>the r8v variants read dY's K tile as 16-byte loads: for one output channel, consecutive K positions of one image
+/// are consecutive in dY, so where an image's K positions (outH * outW) are a multiple of the K tile, a tile never crosses
+/// an image and each thread fetches four positions of one row with one aligned load instead of four indexed scalar loads
+/// (ResNet-18, batch 8: 64@32 66.8 -> 54.9 us, 128@16 65.7 -> 60.2, 256@8 69.2 -> 63.3, 512@4 56.2 -> 52.4).</item>
 /// </list>
 /// </summary>
 internal static class CudaConvWgradKernels
@@ -31,7 +35,8 @@ internal static class CudaConvWgradKernels
 // Column table entry: x offset of column (ci, kh, kw) relative to the K position's window origin, and its shifts.
 struct WrCol { int off; int khd; int kwd; int valid; };
 
-template <int BM, int BN, int WR_BK>
+// VECA: dY's K tile read as float4s (the r8v kernels; the host's condition: outH * outW a multiple of WR_BK).
+template <int BM, int BN, int WR_BK, bool VECA = false>
 __device__ __forceinline__ void conv2d_wgrad_r8_body(
     const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out,
     int batch, int inC, int H, int W, int outC, int outH, int outW,
@@ -69,15 +74,36 @@ __device__ __forceinline__ void conv2d_wgrad_r8_body(
     if (kAbs < K) { kb = kAbs / L; int l = kAbs - kb * L; koh = l / outW; kow = l - koh * outW; }
 
     float ra[RA], rb[RB];
+    // VECA: the block's K-tile base as (image, position in image), advanced with the tile; thread tid + v * THREADS
+    // loads row (idx / (WR_BK / 4)), K positions 4 * (idx % (WR_BK / 4)) .. + 3 of the tile.
+    constexpr int VA = BM * WR_BK / 4 / THREADS > 0 ? BM * WR_BK / 4 / THREADS : 1;
+    float4 rav[VA];
+    int tileK = kBegin, vImage = kBegin / L, vPos = kBegin - (kBegin / L) * L;
     auto load = [&]()
     {
         bool kIn = kAbs < kEnd;
-        const float* dyK = gradOutput + ((long long)kb * outC + m0 + group) * L + koh * outW + kow;
-        #pragma unroll
-        for (int i = 0; i < RA; i++)
+        if constexpr (VECA)
         {
-            int m = m0 + group + GROUPS * i;
-            ra[i] = (kIn && m < outC) ? dyK[(long long)(GROUPS * i) * L] : 0.0f;
+            bool tileIn = tileK < kEnd;
+            #pragma unroll
+            for (int v = 0; v < VA; v++)
+            {
+                int idx = tid + v * THREADS, mm = idx / (WR_BK / 4), qq = idx - mm * (WR_BK / 4);
+                int m = m0 + mm;
+                rav[v] = (tileIn && m < outC)
+                    ? *reinterpret_cast<const float4*>(gradOutput + ((long long)vImage * outC + m) * L + vPos + qq * 4)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        else
+        {
+            const float* dyK = gradOutput + ((long long)kb * outC + m0 + group) * L + koh * outW + kow;
+            #pragma unroll
+            for (int i = 0; i < RA; i++)
+            {
+                int m = m0 + group + GROUPS * i;
+                ra[i] = (kIn && m < outC) ? dyK[(long long)(GROUPS * i) * L] : 0.0f;
+            }
         }
         int ihBase = koh * sH - pH, iwBase = kow * sW - pW;
         const float* xK = input + (long long)kb * inC * HW + (long long)ihBase * W + iwBase;
@@ -91,13 +117,31 @@ __device__ __forceinline__ void conv2d_wgrad_r8_body(
     };
     auto store = [&](int buf)
     {
-        #pragma unroll
-        for (int i = 0; i < RA; i++) As[buf][klane][group + GROUPS * i] = ra[i];
+        if constexpr (VECA)
+        {
+            #pragma unroll
+            for (int v = 0; v < VA; v++)
+            {
+                int idx = tid + v * THREADS, mm = idx / (WR_BK / 4), qq = idx - mm * (WR_BK / 4);
+                As[buf][qq * 4][mm] = rav[v].x;
+                As[buf][qq * 4 + 1][mm] = rav[v].y;
+                As[buf][qq * 4 + 2][mm] = rav[v].z;
+                As[buf][qq * 4 + 3][mm] = rav[v].w;
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int i = 0; i < RA; i++) As[buf][klane][group + GROUPS * i] = ra[i];
+        }
         #pragma unroll
         for (int j = 0; j < RB; j++) Bs[buf][klane][group + GROUPS * j] = rb[j];
     };
     auto advance = [&]()
     {
+        tileK += WR_BK;
+        vPos += WR_BK;
+        if (vPos >= L) { vPos -= L; ++vImage; }
         kAbs += WR_BK;
         kow += WR_BK;
         while (kow >= outW) { kow -= outW; if (++koh == outH) { koh = 0; ++kb; } }
@@ -170,18 +214,22 @@ __device__ __forceinline__ void conv2d_wgrad_r8_body(
     }
 }
 
-#define WR_KERNEL(NAME, BM, BN, BK) \
+#define WR_KERNEL(NAME, BM, BN, BK) WR_KERNEL_V(NAME, BM, BN, BK, false)
+#define WR_KERNEL_V(NAME, BM, BN, BK, VECA) \
 extern ""C"" __global__ __launch_bounds__((BM / 8) * (BN / 8)) void NAME( \
     const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out, \
     int batch, int inC, int H, int W, int outC, int outH, int outW, \
     int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
 { \
-    conv2d_wgrad_r8_body<BM, BN, BK>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
+    conv2d_wgrad_r8_body<BM, BN, BK, VECA>(input, gradOutput, out, batch, inC, H, W, outC, outH, outW, \
         kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
 }
-" + string.Concat(TileShapes.Select(t => $"WR_KERNEL({KernelName(t.M, t.N)}, {t.M}, {t.N}, {KTile})\n"));
+" + string.Concat(TileShapes.Select(t => $"WR_KERNEL({KernelName(t.M, t.N)}, {t.M}, {t.N}, {KTile})\n"))
+     + string.Concat(TileShapes.Select(t => $"WR_KERNEL_V({KernelName(t.M, t.N, vectorDy: true)}, {t.M}, {t.N}, {KTile}, true)\n"));
 
-    public static string[] GetKernelNames() => TileShapes.Select(t => KernelName(t.M, t.N)).ToArray();
+    public static string[] GetKernelNames() => TileShapes.Select(t => KernelName(t.M, t.N))
+        .Concat(TileShapes.Select(t => KernelName(t.M, t.N, vectorDy: true))).ToArray();
 
-    internal static string KernelName(int tileM, int tileN) => $"conv2d_wgrad_r8_{tileM}x{tileN}";
+    internal static string KernelName(int tileM, int tileN, bool vectorDy = false) =>
+        $"conv2d_wgrad_r8{(vectorDy ? "v" : "")}_{tileM}x{tileN}";
 }
