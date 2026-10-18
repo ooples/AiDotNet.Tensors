@@ -5865,11 +5865,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             using var inputDataKeep21 = new KeepAliveScope(input);
             using var destinationDataKeep33 = new KeepAliveScope(destination);
-            using var fSrcLease = input.LeaseArray();
-            var fSrc = (float[])(object)fSrcLease.Array;
-            using var fDstLease = destination.LeaseArray();
-            var fDst = (float[])(object)fDstLease.Array;
-            for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
+            // Spans, not leased arrays: a contiguous view with a storage offset leases a detached copy, so writes to
+            // it never reached the destination. MathF stays (SimdKernels.Sin's float range reduction loses accuracy
+            // at large arguments).
+            var fSrc = ((Tensor<float>)(object)input).AsSpanUnmarked();
+            var fDst = ((Tensor<float>)(object)destination).AsWritableSpanUnmarked();
+            for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -5897,11 +5898,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             using var inputDataKeep23 = new KeepAliveScope(input);
             using var destinationDataKeep35 = new KeepAliveScope(destination);
-            using var fSrcLease = input.LeaseArray();
-            var fSrc = (float[])(object)fSrcLease.Array;
-            using var fDstLease = destination.LeaseArray();
-            var fDst = (float[])(object)fDstLease.Array;
-            for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
+            // Spans, not leased arrays (see TensorSinInto).
+            var fSrc = ((Tensor<float>)(object)input).AsSpanUnmarked();
+            var fDst = ((Tensor<float>)(object)destination).AsWritableSpanUnmarked();
+            for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -7880,16 +7880,11 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            unsafe
-            {
-                using var tensorDataKeep14 = new KeepAliveScope(tensor);
-                using var resultDataKeep30 = new KeepAliveScope(result);
-                using var fSrcLease = tensor.LeaseArray();
-                var fSrc = (float[])(object)fSrcLease.Array;
-                using var fDstLease = result.LeaseArray();
-                var fDst = (float[])(object)fDstLease.Array;
-                for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
-            }
+            using var tensorDataKeep14 = new KeepAliveScope(tensor);
+            using var resultDataKeep30 = new KeepAliveScope(result);
+            var fSrc = ((Tensor<float>)(object)tensor).AsSpanUnmarked();
+            var fDst = ((Tensor<float>)(object)result).AsWritableSpanUnmarked();
+            for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
         }
         else
         {
@@ -7934,16 +7929,11 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
-            unsafe
-            {
-                using var tensorDataKeep15 = new KeepAliveScope(tensor);
-                using var resultDataKeep31 = new KeepAliveScope(result);
-                using var fSrcLease = tensor.LeaseArray();
-                var fSrc = (float[])(object)fSrcLease.Array;
-                using var fDstLease = result.LeaseArray();
-                var fDst = (float[])(object)fDstLease.Array;
-                for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
-            }
+            using var tensorDataKeep15 = new KeepAliveScope(tensor);
+            using var resultDataKeep31 = new KeepAliveScope(result);
+            var fSrc = ((Tensor<float>)(object)tensor).AsSpanUnmarked();
+            var fDst = ((Tensor<float>)(object)result).AsWritableSpanUnmarked();
+            for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
         }
         else
         {
@@ -16020,30 +16010,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     int gradOutOff = b * gradSliceSize1x1;
                     int destSliceOff = b * inputSliceSize1x1;
-                    // Cold path — build transposed kernel once per batch (rare).
-                    var poolKt = System.Buffers.ArrayPool<double>.Shared;
-                    var kT = poolKt.Rent(inChannels * outChannels);
-                    try
-                    {
-                        for (int r = 0; r < outChannels; r++)
-                            for (int c = 0; c < inChannels; c++)
-                                kT[c * outChannels + r] = kernelD1x1[r * inChannels + c];
-                        var dstSpan = new Span<double>(gradInputD1x1, destSliceOff, inputSliceSize1x1);
-                        dstSpan.Clear();
-                        for (int ic = 0; ic < inChannels; ic++)
-                        {
-                            int kRowBase = ic * outChannels;
-                            int dRowBase = ic * N1x1;
-                            for (int n = 0; n < N1x1; n++)
-                            {
-                                double sum = 0.0;
-                                for (int oc = 0; oc < outChannels; oc++)
-                                    sum += kT[kRowBase + oc] * gradOutputD1x1[gradOutOff + oc * N1x1 + n];
-                                dstSpan[dRowBase + n] += sum;
-                            }
-                        }
-                    }
-                    finally { poolKt.Return(kT); }
+                    // gradInput_b[inC, N] = kernel[outC, inC]ᵀ · gradOut_b[outC, N] through the managed GEMM, which
+                    // reads the kernel transposed in place and overwrites the slice.
+                    Helpers.BlasProvider.TryGemmEx(
+                        inChannels, N1x1, outChannels,
+                        kernelD1x1, 0, inChannels, true,
+                        gradOutputD1x1, gradOutOff, N1x1, false,
+                        gradInputD1x1, destSliceOff, N1x1);
                 });
                 return TensorAllocator.Rent<T>(inputShape, (Vector<T>)(object)Vector<double>.FromMemory(gradInputD1x1));
             }
@@ -16628,35 +16601,30 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     int gradOutOff = b * gradSliceSize;
                     int destSliceOff = destOff + b * inputSliceSize;
-                    // gradInput_b = kernel^T (inC × outC) @ gradOut_b (outC × N)
-                    // Use TryGemmEx with TransA=true so kernel is consumed
-                    // in its natural [outC, inC] row-major layout.
-                    // Fallback: build transposed kernel once on demand
-                    // (rare path — only when BLAS is unavailable). Per-batch
-                    // alloc is fine here since this is the cold path.
-                    var kT = System.Buffers.ArrayPool<double>.Shared.Rent(inChannels * outChannels);
+                    // gradInput_b = kernel^T (inC × outC) @ gradOut_b (outC × N), with TransA=true so the kernel is
+                    // consumed in its natural [outC, inC] row-major layout. The managed GEMM overwrites its output,
+                    // so an accumulating call lands the product in a pooled slice and adds it.
+                    if (!accumulate)
+                    {
+                        Helpers.BlasProvider.TryGemmEx(
+                            inChannels, N, outChannels,
+                            kernelD, 0, inChannels, true,
+                            gradOutputD, gradOutOff, N, false,
+                            destD, destSliceOff, N);
+                        return;
+                    }
+                    var product = System.Buffers.ArrayPool<double>.Shared.Rent(inputSliceSize);
                     try
                     {
-                        for (int r = 0; r < outChannels; r++)
-                            for (int c = 0; c < inChannels; c++)
-                                kT[c * outChannels + r] = kernelD[r * inChannels + c];
+                        Helpers.BlasProvider.TryGemmEx(
+                            inChannels, N, outChannels,
+                            kernelD, 0, inChannels, true,
+                            gradOutputD, gradOutOff, N, false,
+                            product, 0, N);
                         var dstSpan = new Span<double>(destD, destSliceOff, inputSliceSize);
-                        if (!accumulate) dstSpan.Clear();
-                        // dstSpan += kT[inC, outC] @ gradOut_b[outC, N]
-                        for (int ic = 0; ic < inChannels; ic++)
-                        {
-                            int kRowBase = ic * outChannels;
-                            int dRowBase = ic * N;
-                            for (int n = 0; n < N; n++)
-                            {
-                                double sum = 0.0;
-                                for (int oc = 0; oc < outChannels; oc++)
-                                    sum += kT[kRowBase + oc] * gradOutputD[gradOutOff + oc * N + n];
-                                dstSpan[dRowBase + n] += sum;
-                            }
-                        }
+                        for (int i = 0; i < inputSliceSize; i++) dstSpan[i] += product[i];
                     }
-                    finally { System.Buffers.ArrayPool<double>.Shared.Return(kT); }
+                    finally { System.Buffers.ArrayPool<double>.Shared.Return(product); }
                 });
                 return;
             }
@@ -17276,32 +17244,35 @@ public partial class CpuEngine : ITensorLevelEngine
             // For k=1/s=1/p=0, im2col is identity over the input slice, so
             // the GEMM becomes
             //   gradKernel[oc, ic] += gradOut_b[oc, N] @ input_b^T[ic, N]
-            // accumulated across batches via sequential β=1 dgemm calls into
-            // the same destination (saves the per-batch staging buffer +
-            // final merge pass the general path uses).
+            // accumulated across batches through one reused product buffer
+            // (no im2col, no per-batch allocation).
             if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
                 && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
             {
                 int N1x1 = outputHeight * outputWidth;
                 int totalLen1x1 = outChannels * inChannels;
-                for (int b = 0; b < batch; b++)
+                // The managed GEMM overwrites its output, so batch 0 writes gradKernel directly and every later
+                // batch's product lands in a pooled buffer that is added in.
+                var product1x1 = batch > 1 ? System.Buffers.ArrayPool<double>.Shared.Rent(totalLen1x1) : null;
+                try
                 {
-                    double betaThis = (b == 0) ? 0.0 : 1.0;
-                    int gradOutOff = b * outChannels * N1x1;
-                    int inOff = b * inChannels * N1x1;
-                    if (b == 0) Array.Clear(gradKernelD, 0, totalLen1x1);
-                    for (int oc = 0; oc < outChannels; oc++)
+                    for (int b = 0; b < batch; b++)
                     {
-                        int goRowBase = gradOutOff + oc * N1x1;
-                        for (int ic = 0; ic < inChannels; ic++)
-                        {
-                            double sum = 0.0;
-                            int inRowBase = inOff + ic * N1x1;
-                            for (int n = 0; n < N1x1; n++)
-                                sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
-                            gradKernelD[oc * inChannels + ic] += sum;
-                        }
+                        int gradOutOff = b * outChannels * N1x1;
+                        int inOff = b * inChannels * N1x1;
+                        var target = b == 0 || product1x1 is null ? gradKernelD : product1x1;
+                        Helpers.BlasProvider.TryGemmEx(
+                            outChannels, inChannels, N1x1,
+                            gradOutputD, gradOutOff, N1x1, false,
+                            inputD, inOff, N1x1, true,
+                            target, 0, inChannels);
+                        if (b > 0)
+                            for (int i = 0; i < totalLen1x1; i++) gradKernelD[i] += target[i];
                     }
+                }
+                finally
+                {
+                    if (product1x1 is not null) System.Buffers.ArrayPool<double>.Shared.Return(product1x1);
                 }
                 return TensorAllocator.Rent<T>(kernelShape, (Vector<T>)(object)Vector<double>.FromMemory(gradKernelD));
             }
@@ -17774,36 +17745,40 @@ public partial class CpuEngine : ITensorLevelEngine
             // 1×1 conv fast path: kH=kW=1, stride=1, pad=0, dil=1 ⇒ Im2Col
             // is identity and totalLen == outC*inC. The per-batch GEMM becomes
             //   gradKernel += gradOut_b @ input_b^T
-            // We sequentially accumulate into destD with β=1 (first batch's β
-            // depends on the caller-supplied accumulate flag). This avoids the
-            // per-batch new double[totalLen] allocations + final merge pass
-            // that the general path does. With 17 of 19 1×1 convs on
+            // We accumulate into destD through one reused product buffer (the
+            // first batch writes destD directly unless the caller asked to
+            // accumulate). This avoids the per-batch new double[totalLen]
+            // allocations + final merge pass that the general path does. With 17 of 19 1×1 convs on
             // GraFPrint, eliminating that B×totalLen allocation footprint is
             // the dominant backward-pass perf bottleneck at small batch.
             if (kernelHeight == 1 && kernelWidth == 1 && strideH == 1 && strideW == 1
                 && padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1)
             {
                 int N = outputHeight * outputWidth;
-                for (int b = 0; b < batch; b++)
+                // The managed GEMM overwrites its output: only a non-accumulating batch 0 writes destD directly;
+                // every other batch's product lands in a pooled buffer that is added in.
+                bool needsProduct = accumulate || batch > 1;
+                var product1x1 = needsProduct ? System.Buffers.ArrayPool<double>.Shared.Rent(totalLen) : null;
+                try
                 {
-                    double betaThis = (b == 0) ? (accumulate ? 1.0 : 0.0) : 1.0;
-                    int gradOutOff = b * outChannels * N;
-                    int inOff = b * inChannels * N;
-                    // No-BLAS scalar fallback (very cold path).
-                    if (b == 0 && !accumulate)
-                        Array.Clear(destD, destOff, totalLen);
-                    for (int oc = 0; oc < outChannels; oc++)
+                    for (int b = 0; b < batch; b++)
                     {
-                        for (int ic = 0; ic < inChannels; ic++)
-                        {
-                            double sum = 0.0;
-                            int goRowBase = gradOutOff + oc * N;
-                            int inRowBase = inOff + ic * N;
-                            for (int n = 0; n < N; n++)
-                                sum += gradOutputD[goRowBase + n] * inputD[inRowBase + n];
-                            destD[destOff + oc * inChannels + ic] += sum;
-                        }
+                        int gradOutOff = b * outChannels * N;
+                        int inOff = b * inChannels * N;
+                        bool direct = b == 0 && !accumulate;
+                        var target = direct || product1x1 is null ? destD : product1x1;
+                        Helpers.BlasProvider.TryGemmEx(
+                            outChannels, inChannels, N,
+                            gradOutputD, gradOutOff, N, false,
+                            inputD, inOff, N, true,
+                            target, direct ? destOff : 0, inChannels);
+                        if (!direct)
+                            for (int i = 0; i < totalLen; i++) destD[destOff + i] += target[i];
                     }
+                }
+                finally
+                {
+                    if (product1x1 is not null) System.Buffers.ArrayPool<double>.Shared.Return(product1x1);
                 }
                 return;
             }

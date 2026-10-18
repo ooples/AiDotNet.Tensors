@@ -16,8 +16,11 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 [Collection("BlasManaged-Perf-Serial")]
 public class GemvRowTimesMatrixTests
 {
-    [Theory]
-    [InlineData(8, 1)]
+    // k = 1 is routed to the outer-product kernel, so the smallest case here is k = 2; (64, 2) fills whole blocks with
+    // no tail.
+    [SkippableTheory]
+    [InlineData(8, 2)]
+    [InlineData(64, 2)]
     [InlineData(13, 37)]
     [InlineData(63, 64)]
     [InlineData(64, 257)]
@@ -26,7 +29,7 @@ public class GemvRowTimesMatrixTests
     [InlineData(4100, 600)]   // above the parallel threshold, partial last block
     public void Float_MatchesTheAscendingKChain(int n, int k)
     {
-        if (!Fma.IsSupported || !Avx2.IsSupported) return;
+        Skip.IfNot(Fma.IsSupported && Avx2.IsSupported, "The row-times-matrix kernel needs AVX2 and FMA.");
         foreach (bool transA in new[] { false, true })
         {
             int lda = transA ? 3 : k;
@@ -53,14 +56,15 @@ public class GemvRowTimesMatrixTests
         }
     }
 
-    [Theory]
-    [InlineData(4, 1)]
+    [SkippableTheory]
+    [InlineData(4, 2)]
+    [InlineData(32, 2)]
     [InlineData(31, 40)]
     [InlineData(33, 129)]
     [InlineData(2050, 600)]
     public void Double_MatchesTheAscendingKChain(int n, int k)
     {
-        if (!Fma.IsSupported || !Avx2.IsSupported) return;
+        Skip.IfNot(Fma.IsSupported && Avx2.IsSupported, "The row-times-matrix kernel needs AVX2 and FMA.");
         var rng = new Random(n * 17 + k);
         var a = new double[k];
         var b = new double[k * n];

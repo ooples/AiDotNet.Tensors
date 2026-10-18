@@ -8971,7 +8971,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Sigmoid: don't specialize forward — the eager allocating path is faster
         // (SigmoidInto has auto-materialization overhead that exceeds the allocation savings)
 
-        // Tanh forward: VML → SIMD fallback, pinned GCHandle
+        // Tanh forward: SIMD TanhUnsafe, pinned GCHandle
         if (step.OpType == OpType.Tanh && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -9252,7 +9252,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Exp forward: VML → SIMD fallback, pinned GCHandle
+        // Exp forward: SIMD ExpUnsafe, pinned GCHandle
         if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -9591,7 +9591,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             };
         }
 
-        // LogSoftmax forward: pinned SIMD with VML exp for inner loop
+        // LogSoftmax forward: pinned SIMD FusedLogSoftmaxRow per row
         if (step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1 && typeof(T) == typeof(float)
             && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
         {
@@ -9641,22 +9641,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             };
         }
 
-        // Exp forward: pinned ExpUnsafe SIMD
-        if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
-            && typeof(T) == typeof(float))
-        {
-            var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            var inH = PinAndTrack(
-                GetPinnableFloatBacking((Tensor<float>)(object)inp), handleTracker);
-            var outH = PinAndTrack(
-                GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
-            int len = inp.Length;
-            return eng =>
-            {
-                unsafe { SimdKernels.ExpUnsafe((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
-            };
-        }
-
         // Sqrt forward: direct SIMD SqrtUnsafe into output buffer
         if (step.OpType == OpType.TensorSqrt && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
@@ -9664,14 +9648,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Sin forward: VML/SIMD via CpuEngine.TensorSinInto
+        // Sin forward: SIMD via CpuEngine.TensorSinInto
         if (step.OpType == OpType.Sin && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
-        // Cos forward: VML/SIMD via CpuEngine.TensorCosInto
+        // Cos forward: SIMD via CpuEngine.TensorCosInto
         if (step.OpType == OpType.Cos && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
@@ -12474,16 +12458,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         List<Action<IEngine>> fusedBackward,
         HashSet<int> consumedIndices)
     {
-        // PR #319: dual-precision pattern detection. Float fires the L1-resident
-        // FusedMultiLayerGemm fast path (Phase B); double fires a simpler
-        // BLAS-Dgemm × ReLU × BLAS-Dgemm chain that still beats the eager
-        // tape path because the two matmuls dispatch to OpenBLAS Dgemm
-        // directly (75 GFLOPS) instead of going through the eager
-        // engine.TensorMatMul → tape recording → AutoTracer pipeline. The
-        // L1-cache-residency benefit specifically requires the FusedMultiLayer
-        // kernel which is float-only; extending it to double is a separate
-        // 200+ line SIMD effort tracked as a follow-up.
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
+        // Only the float FusedMultiLayerGemm kernel exists (it takes float[]); every other T, double included, runs
+        // the triple through the ordinary compiled steps.
+        if (typeof(T) != typeof(float)) return;
 
         // Issue #338 Phase G.6: detect consecutive MatMul→MatMul chains
         // (no op between them) and pre-pack the fused weight at compile
@@ -12591,25 +12568,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             // Pre-allocate activated intermediate buffer
             var activatedBuffer = TensorAllocator.RentUninitialized<T>(new[] { m, h });
-
-            // FP64 is not fused: the triple runs through the ordinary compiled steps.
-            if (typeof(T) == typeof(double))
-            {
-                TensorAllocator.Return(activatedBuffer);
-                continue;
-            }
-
-            // Issue #340: the block below is float-only (FusedMultiLayerGemm
-            // takes float[]; every cast is to (float[])(object)X). The
-            // T=double branch above continues; any other T (e.g. BFloat16)
-            // would crash on the cast at first replay. Skip the fused
-            // float kernel for non-float T so the plan falls through to
-            // the generic step path.
-            if (typeof(T) != typeof(float))
-            {
-                TensorAllocator.Return(activatedBuffer);
-                continue;
-            }
 
             // Capture for closures
             var capturedInput = inputTensor;
