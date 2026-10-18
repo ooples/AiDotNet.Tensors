@@ -1717,9 +1717,18 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
     // Tile state: tap (kh, kw) and first output channel co0 (K tiles never straddle a tap: Cout % 8 == 0).
     // K order (co group of CE_BK, tap, co within the group), as in the forward: the taps of one group read the weights
     // w[co][ci][0 .. kH*kW-1] back to back, so in the forward layout each (co, ci) run stays in L1 across its taps.
+    // A tapless phase (a kernel smaller than its stride, e.g. a 1x1 stride-2 downsample) has K = 0 and no tiles; it
+    // only writes zeros, so its tap state is never read and must not be derived by dividing by taps or tapsW.
     const int taps = tapsH * tapsW;
-    int g0 = kBegin / (CE_BK * taps), tapIndex = (kBegin - g0 * CE_BK * taps) / CE_BK, co0 = g0 * CE_BK;
-    int th = tapIndex / tapsW, tw = tapIndex - th * tapsW;
+    int g0 = 0, tapIndex = 0, th = 0, tw = 0;
+    if (taps > 0)
+    {
+        g0 = kBegin / (CE_BK * taps);
+        tapIndex = (kBegin - g0 * CE_BK * taps) / CE_BK;
+        th = tapIndex / tapsW;
+        tw = tapIndex - th * tapsW;
+    }
+    int co0 = g0 * CE_BK;
     int kh = PHASE ? rh + th * sH : th, kw = PHASE ? rw + tw * sW : tw;
 
     float ra[RA], rb[RB];

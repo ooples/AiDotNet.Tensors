@@ -248,8 +248,12 @@ public sealed partial class CudaBackend
                        && pkPerSplit / 2 % ConvEngineTileK == 0)
                     pkPerSplit /= 2;
             }
-            if (!TryTapMajor(ptilesN)) return false;
+            // One grid layer per (phase, split), and CUDA caps gridDim.z at 65535: a 1x1 kernel over a very large stride
+            // (256x256: 65536 tapless-or-not phases) would fail to launch, so leave it to the split-K fallback. Checked
+            // before TryTapMajor, which already launches the weight relayout.
             long gridZ = PhaseUnits(pkPerSplit);
+            if (gridZ > 65535) return false;
+            if (!TryTapMajor(ptilesN)) return false;
             bool split = gridZ > phases;
             int maxSplits = (int)((phaseK + pkPerSplit - 1) / pkPerSplit);
             if (!_kernelCache.TryGetValue((ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase")
