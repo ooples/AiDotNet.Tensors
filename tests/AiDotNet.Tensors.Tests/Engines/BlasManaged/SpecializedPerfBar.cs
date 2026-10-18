@@ -4,7 +4,7 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// Frozen per-variant perf bars for #379. Values are placeholders until the first
 /// authoritative bench run on the self-hosted runner (AIDOTNET_PERF_RUNNER=1) lands,
 /// at which point the project owner sets them in a single gating commit — same
-/// discipline as <see cref="PerfBar"/> for dense GEMM (#368).
+/// discipline as the former dense-GEMM perf bar (#368).
 /// </summary>
 public static class SpecializedPerfBar
 {

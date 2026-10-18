@@ -192,31 +192,7 @@ public static class CpuFusedOperations
         }
 
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
-        if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
-        {
-            ApplyBiasActivationInPlace(output, bias, M, N, activation, activationParams);
-            return;
-        }
-
-        // BLAS unavailable: Path A's SgemmWithCachedB pre-packs B (the weight)
-        // once and amortises over every forward call. Falls through to the
-        // standard Sgemm inside SgemmWithCachedB for shapes where caching
-        // isn't applicable (n > Nc=4096 or AVX-512 eligible).
-        //
-        // allowCachedB MUST be false when B can mutate between calls (e.g. the
-        // training-plan forward path: optimizer.Step() updates the weight in
-        // place, and the cached pre-packed copy would go stale). Inference
-        // plans bind frozen weights and can safely re-use the packed cache.
-        if (allowCachedB)
-        {
-            SimdGemm.SgemmWithCachedB(
-                A.AsSpan(0, M * K), B, output.AsSpan(0, M * N), M, K, N);
-        }
-        else
-        {
-            SimdGemm.Sgemm(
-                A.AsSpan(0, M * K), B.AsSpan(0, K * N), output.AsSpan(0, M * N), M, K, N);
-        }
+        BlasProvider.Gemm(M, N, K, A, 0, K, B, 0, N, output, 0, N);
         ApplyBiasActivationInPlace(output, bias, M, N, activation, activationParams);
     }
 
@@ -1529,25 +1505,7 @@ public static class CpuFusedOperations
             throw new ArgumentException($"bias must have at least {N} elements", nameof(bias));
 
         // Use BLAS for the O(MNK) GEMM, then fuse bias+activation in a cheap O(MN) second pass.
-        if (BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, output, 0, N))
-        {
-            ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation, activationParams);
-            return;
-        }
-
-        // BLAS unavailable: route through MatrixMultiplyHelper.MultiplyBlocked,
-        // whose inner kernel is SimdKernels.ScalarMultiplyAdd — AVX2/FMA
-        // Vector256<double> on modern x64. ~50-100x faster than the previous
-        // naive parallel scalar row loop. Same structural fix as TensorMatMul's
-        // fallback (see CpuEngine.TensorMatMul2D). Without this, every DiT
-        // block's MLP dense layers (the 80% of DiT wall-clock for double
-        // diffusion models per Pika21 probe) runs at ~1-2 GFLOPS scalar
-        // instead of ~40 GFLOPS SIMD.
-        System.Array.Clear(output, 0, M * N);
-        MatrixMultiplyHelper.MultiplyBlocked(
-            MathHelper.GetNumericOperations<double>(),
-            A.AsMemory(0, M * K), B.AsMemory(0, K * N), output.AsMemory(0, M * N),
-            M, K, N, K, N, N);
+        BlasProvider.Gemm(M, N, K, A, 0, K, B, 0, N, output, 0, N);
         ApplyBiasActivationInPlaceDouble(output, bias, M, N, activation, activationParams);
     }
 

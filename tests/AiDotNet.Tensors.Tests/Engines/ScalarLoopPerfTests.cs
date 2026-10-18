@@ -185,10 +185,10 @@ public class ScalarLoopPerfTests
         var A = (float[])(object)input.GetDataArray();
         var B = (float[])(object)weights.GetDataArray();
         var C = new float[M * N];
-        BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, C, 0, N);
+        BlasProvider.Gemm(M, N, K, A, 0, K, B, 0, N, C, 0, N);
         sw.Restart();
         for (int i = 0; i < iters; i++)
-            BlasProvider.TryGemm(M, N, K, A, 0, K, B, 0, N, C, 0, N);
+            BlasProvider.Gemm(M, N, K, A, 0, K, B, 0, N, C, 0, N);
         sw.Stop();
         _output.WriteLine($"E. Raw BLAS (pre-alloc): {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
 

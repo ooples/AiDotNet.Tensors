@@ -182,6 +182,131 @@ internal static class GemvKernel
         throw new NotSupportedException($"GemvKernel does not support T={typeof(T).Name}.");
     }
 
+#if NETCOREAPP
+    // Row x matrix keeps eight accumulators across the whole K loop, so each B row contributes one contiguous run
+    // (64 floats / 32 doubles: four cache lines). The earlier kernel kept one accumulator per 8 columns and walked B
+    // down all K rows for each strip, reading half of every cache line it touched, on one thread. Column blocks run
+    // in parallel above RowTimesMatrixParallelWork; each output is still one thread's ascending-K FMA chain (the tails
+    // keep the earlier vector/scalar forms), so results are bit-identical to the serial kernel at any thread count.
+    // On 1x4096x4096 and 1x11008x4096 FP32 (Llama-7B single-token inference) the strip kernel ran ~5.4x OpenBLAS.
+    private const int RowBlockFloat = 64, RowBlockDouble = 32;
+    private const long RowTimesMatrixParallelWork = 1L << 20;
+
+    private static unsafe void RowTimesMatrixAvx2(float* a, int aStride, float* b, int ldb, float* c, int n, int k)
+    {
+        int blocks = (n + RowBlockFloat - 1) / RowBlockFloat;
+        if ((long)n * k < RowTimesMatrixParallelWork || blocks == 1)
+        {
+            RowTimesMatrixColumns(a, aStride, b, ldb, c, 0, n, k);
+            return;
+        }
+        IntPtr ap = (IntPtr)a, bp = (IntPtr)b, cp = (IntPtr)c;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)n * k, blk =>
+        {
+            int j0 = blk * RowBlockFloat;
+            RowTimesMatrixColumns((float*)ap, aStride, (float*)bp, ldb, (float*)cp, j0, Math.Min(n, j0 + RowBlockFloat), k);
+        }, deterministicSafe: true);
+    }
+
+    [MethodImpl(Hot)]
+    private static unsafe void RowTimesMatrixColumns(float* a, int aStride, float* b, int ldb, float* c, int j0, int j1, int k)
+    {
+        int j = j0;
+        for (; j + RowBlockFloat <= j1; j += RowBlockFloat)
+        {
+            Vector256<float> c0 = default, c1 = default, c2 = default, c3 = default,
+                c4 = default, c5 = default, c6 = default, c7 = default;
+            float* bj = b + j;
+            for (int kk = 0; kk < k; kk++)
+            {
+                var av = Vector256.Create(a[(long)kk * aStride]);
+                float* br = bj + (long)kk * ldb;
+                c0 = Fma.MultiplyAdd(av, Avx.LoadVector256(br), c0);
+                c1 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 8), c1);
+                c2 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 16), c2);
+                c3 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 24), c3);
+                c4 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 32), c4);
+                c5 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 40), c5);
+                c6 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 48), c6);
+                c7 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 56), c7);
+            }
+            float* cj = c + j;
+            Avx.Store(cj, c0); Avx.Store(cj + 8, c1); Avx.Store(cj + 16, c2); Avx.Store(cj + 24, c3);
+            Avx.Store(cj + 32, c4); Avx.Store(cj + 40, c5); Avx.Store(cj + 48, c6); Avx.Store(cj + 56, c7);
+        }
+        for (; j + 8 <= j1; j += 8)
+        {
+            var acc = Vector256<float>.Zero;
+            for (int kk = 0; kk < k; kk++)
+                acc = Fma.MultiplyAdd(Vector256.Create(a[(long)kk * aStride]), Avx.LoadVector256(b + (long)kk * ldb + j), acc);
+            Avx.Store(c + j, acc);
+        }
+        for (; j < j1; j++)
+        {
+            float sum = 0;
+            for (int kk = 0; kk < k; kk++) sum += a[(long)kk * aStride] * b[(long)kk * ldb + j];
+            c[j] = sum;
+        }
+    }
+
+    private static unsafe void RowTimesMatrixAvx2(double* a, int aStride, double* b, int ldb, double* c, int n, int k)
+    {
+        int blocks = (n + RowBlockDouble - 1) / RowBlockDouble;
+        if ((long)n * k < RowTimesMatrixParallelWork || blocks == 1)
+        {
+            RowTimesMatrixColumns(a, aStride, b, ldb, c, 0, n, k);
+            return;
+        }
+        IntPtr ap = (IntPtr)a, bp = (IntPtr)b, cp = (IntPtr)c;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)n * k, blk =>
+        {
+            int j0 = blk * RowBlockDouble;
+            RowTimesMatrixColumns((double*)ap, aStride, (double*)bp, ldb, (double*)cp, j0, Math.Min(n, j0 + RowBlockDouble), k);
+        }, deterministicSafe: true);
+    }
+
+    [MethodImpl(Hot)]
+    private static unsafe void RowTimesMatrixColumns(double* a, int aStride, double* b, int ldb, double* c, int j0, int j1, int k)
+    {
+        int j = j0;
+        for (; j + RowBlockDouble <= j1; j += RowBlockDouble)
+        {
+            Vector256<double> c0 = default, c1 = default, c2 = default, c3 = default,
+                c4 = default, c5 = default, c6 = default, c7 = default;
+            double* bj = b + j;
+            for (int kk = 0; kk < k; kk++)
+            {
+                var av = Vector256.Create(a[(long)kk * aStride]);
+                double* br = bj + (long)kk * ldb;
+                c0 = Fma.MultiplyAdd(av, Avx.LoadVector256(br), c0);
+                c1 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 4), c1);
+                c2 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 8), c2);
+                c3 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 12), c3);
+                c4 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 16), c4);
+                c5 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 20), c5);
+                c6 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 24), c6);
+                c7 = Fma.MultiplyAdd(av, Avx.LoadVector256(br + 28), c7);
+            }
+            double* cj = c + j;
+            Avx.Store(cj, c0); Avx.Store(cj + 4, c1); Avx.Store(cj + 8, c2); Avx.Store(cj + 12, c3);
+            Avx.Store(cj + 16, c4); Avx.Store(cj + 20, c5); Avx.Store(cj + 24, c6); Avx.Store(cj + 28, c7);
+        }
+        for (; j + 4 <= j1; j += 4)
+        {
+            var acc = Vector256<double>.Zero;
+            for (int kk = 0; kk < k; kk++)
+                acc = Fma.MultiplyAdd(Vector256.Create(a[(long)kk * aStride]), Avx.LoadVector256(b + (long)kk * ldb + j), acc);
+            Avx.Store(c + j, acc);
+        }
+        for (; j < j1; j++)
+        {
+            double sum = 0;
+            for (int kk = 0; kk < k; kk++) sum += a[(long)kk * aStride] * b[(long)kk * ldb + j];
+            c[j] = sum;
+        }
+    }
+#endif
+
     [MethodImpl(Hot)]
     private static unsafe void RunRowTimesMatrix<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
@@ -201,31 +326,10 @@ internal static class GemvKernel
             // AVX2 fast path for transB=false (B is [K, N] row-major).
             if (!transB && Avx2.IsSupported && Fma.IsSupported && n >= 8)
             {
-                int nFull = n & ~7;
                 fixed (float* aPtr = af)
                 fixed (float* bPtr = bf)
                 fixed (float* cPtr = cf)
-                {
-                    Span<Vector256<float>> accs = stackalloc Vector256<float>[1];
-                    for (int j = 0; j < nFull; j += 8)
-                    {
-                        var acc = Vector256<float>.Zero;
-                        for (int kk = 0; kk < k; kk++)
-                        {
-                            var av = Vector256.Create(aPtr[kk * aStride]);
-                            var bv = Avx.LoadVector256(bPtr + kk * ldb + j);
-                            acc = Fma.MultiplyAdd(av, bv, acc);
-                        }
-                        Avx.Store(cPtr + j, acc);
-                    }
-                    // N-tail scalar.
-                    for (int j = nFull; j < n; j++)
-                    {
-                        float sum = 0;
-                        for (int kk = 0; kk < k; kk++) sum += aPtr[kk * aStride] * bPtr[kk * ldb + j];
-                        cPtr[j] = sum;
-                    }
-                }
+                    RowTimesMatrixAvx2(aPtr, aStride, bPtr, ldb, cPtr, n, k);
                 return;
             }
 #endif
@@ -254,29 +358,10 @@ internal static class GemvKernel
 #if NETCOREAPP
             if (!transB && Avx2.IsSupported && Fma.IsSupported && n >= 4)
             {
-                int nFull = n & ~3;
                 fixed (double* aPtr = ad)
                 fixed (double* bPtr = bd)
                 fixed (double* cPtr = cd)
-                {
-                    for (int j = 0; j < nFull; j += 4)
-                    {
-                        var acc = Vector256<double>.Zero;
-                        for (int kk = 0; kk < k; kk++)
-                        {
-                            var av = Vector256.Create(aPtr[kk * aStride]);
-                            var bv = Avx.LoadVector256(bPtr + kk * ldb + j);
-                            acc = Fma.MultiplyAdd(av, bv, acc);
-                        }
-                        Avx.Store(cPtr + j, acc);
-                    }
-                    for (int j = nFull; j < n; j++)
-                    {
-                        double sum = 0;
-                        for (int kk = 0; kk < k; kk++) sum += aPtr[kk * aStride] * bPtr[kk * ldb + j];
-                        cPtr[j] = sum;
-                    }
-                }
+                    RowTimesMatrixAvx2(aPtr, aStride, bPtr, ldb, cPtr, n, k);
                 return;
             }
 #endif

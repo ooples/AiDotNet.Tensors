@@ -58,7 +58,7 @@ public class PerformanceProfileTests
         sw.Restart();
         for (int i = 0; i < iters; i++)
             for (int s = 0; s < 4; s++)
-                BlasProvider.TryGemm(32, 32, 64, af, s * 32 * 64, 64, bf, s * 64 * 32, 32, cf, s * 32 * 32, 32);
+                BlasProvider.Gemm(32, 32, 64, af, s * 32 * 64, 64, bf, s * 64 * 32, 32, cf, s * 32 * 32, 32);
         sw.Stop();
         _output.WriteLine($"C. 4x raw BLAS [32,64]: {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
 
@@ -163,10 +163,10 @@ public class PerformanceProfileTests
         var ad = (double[])(object)input.GetDataArray();
         var wd = (double[])(object)weights.GetDataArray();
         var cd = new double[32 * 256];
-        BlasProvider.TryGemm(32, 256, 256, ad, 0, 256, wd, 0, 256, cd, 0, 256);
+        BlasProvider.Gemm(32, 256, 256, ad, 0, 256, wd, 0, 256, cd, 0, 256);
         sw.Restart();
         for (int i = 0; i < iters; i++)
-            BlasProvider.TryGemm(32, 256, 256, ad, 0, 256, wd, 0, 256, cd, 0, 256);
+            BlasProvider.Gemm(32, 256, 256, ad, 0, 256, wd, 0, 256, cd, 0, 256);
         sw.Stop();
         _output.WriteLine($"B. Raw DGEMM (pre-alloc): {sw.Elapsed.TotalMilliseconds / iters:F4}ms");
 

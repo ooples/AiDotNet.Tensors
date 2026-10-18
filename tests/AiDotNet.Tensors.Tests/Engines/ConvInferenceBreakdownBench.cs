@@ -33,9 +33,9 @@ public class ConvInferenceBreakdownBench
         // System.Runtime.Intrinsics.X86 and OneDnnProvider are .NET-Core-only; net471
         // lacks both (CS0234 / CS0103), so this richer diagnostic is net5+ only.
         _output.WriteLine($"AVX2={System.Runtime.Intrinsics.X86.Avx2.IsSupported} cores={Environment.ProcessorCount} " +
-            $"HasRawSgemm={BlasProvider.HasRawSgemm} OneDnn={OneDnnProvider.IsAvailable}");
+            $"OneDnn={OneDnnProvider.IsAvailable}");
 #else
-        _output.WriteLine($"cores={Environment.ProcessorCount} HasRawSgemm={BlasProvider.HasRawSgemm}");
+        _output.WriteLine($"cores={Environment.ProcessorCount}");
 #endif
 
         // The two CNN conv layers from benchmarks/AiDotNet.PyTorchParity:

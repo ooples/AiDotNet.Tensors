@@ -535,7 +535,7 @@ public static class AiDotNetEngine
     /// <para>
     /// Enabling deterministic mode:
     /// <list type="bullet">
-    ///   <item>Has <c>BlasProvider.TryGemm</c> and <c>IsMklVerified</c> short-circuit at the top,
+    ///   <item>Has <c>BlasProvider.Gemm</c> and <c>IsMklVerified</c> short-circuit at the top,
     ///         bypassing both MKL.NET managed GEMM and any native BLAS GEMM paths entirely.</item>
     ///   <item>Routes matmul through the blocked C# fallback (<c>MatrixMultiplyHelper.MultiplyBlocked</c>
     ///         for matrices, <c>CpuEngine.TensorMatMul2D</c>'s <c>Parallel.For</c> path for tensors),

@@ -100,21 +100,10 @@ internal static class NhwcConv
                 outH, outW);
 
             // GEMM: output[spatial, outC] = workspace[spatial, patchLen] @ kernel[outC, patchLen]^T
-            if (!BlasProvider.TryGemmEx(spatialOut, outChannels, patchLen,
+            BlasProvider.GemmEx(spatialOut, outChannels, patchLen,
                 workspace, 0, patchLen, false,
                 kernelFlat, 0, patchLen, true,
-                outputNhwc, outputOff, outChannels))
-            {
-                // Scalar fallback: C[i,j] = sum_k A[i,k] * B[j,k]
-                for (int i = 0; i < spatialOut; i++)
-                    for (int j = 0; j < outChannels; j++)
-                    {
-                        float sum = 0f;
-                        for (int k = 0; k < patchLen; k++)
-                            sum += workspace[i * patchLen + k] * kernelFlat[j * patchLen + k];
-                        outputNhwc[outputOff + i * outChannels + j] = sum;
-                    }
-            }
+                outputNhwc, outputOff, outChannels);
         }
     }
 

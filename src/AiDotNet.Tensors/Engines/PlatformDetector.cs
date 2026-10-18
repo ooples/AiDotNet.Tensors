@@ -75,8 +75,6 @@ namespace AiDotNet.Tensors.Engines
 
             // Check for native library availability
             var nativeStatus = NativeLibraryDetector.Status;
-            caps.HasOpenBlas = nativeStatus.HasOpenBlas;
-            caps.HasMkl = nativeStatus.HasMkl;
             caps.HasClBlast = nativeStatus.HasClBlast;
             caps.HasHipSupport = nativeStatus.HasHip;
 
@@ -216,8 +214,6 @@ namespace AiDotNet.Tensors.Engines
 
             desc.AppendLine();
             desc.AppendLine("Native Acceleration Libraries:");
-            desc.AppendLine($"  OpenBLAS: {(caps.HasOpenBlas ? "Available" : "Not found - install AiDotNet.Native.OpenBLAS")}");
-            desc.AppendLine($"  Intel MKL: {(caps.HasMkl ? "Available" : "Not found")}");
             desc.AppendLine($"  CLBlast: {(caps.HasClBlast ? "Available" : "Not found - install AiDotNet.Native.CLBlast")}");
 
             return desc.ToString();
@@ -271,14 +267,7 @@ namespace AiDotNet.Tensors.Engines
         public bool HasHipSupport { get; set; }
 
         // Native library availability (optional acceleration packages)
-        public bool HasOpenBlas { get; set; }
-        public bool HasMkl { get; set; }
         public bool HasClBlast { get; set; }
-
-        /// <summary>
-        /// Gets whether any CPU BLAS acceleration is available (OpenBLAS or MKL).
-        /// </summary>
-        public bool HasCpuBlas => HasOpenBlas || HasMkl;
 
         /// <summary>
         /// Returns the best available SIMD instruction set

@@ -9,9 +9,9 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Benchmarks.PyTorchComparison;
 
 /// <summary>
-/// #475: where the AIsEval MLP (Dense 784->512->128->10 @ bs=128) spends its time with native BLAS off (the default).
-/// Times each layer's GEMM through the managed kernels -- SgemmSequential (what MlpForward uses for every layer when
-/// HasRawSgemm is false), SgemmWithCachedB and Sgemm (the parallel dispatch) -- across thread budgets, and MlpForward
+/// #475: where the AIsEval MLP (Dense 784->512->128->10 @ bs=128) spends its time.
+/// Times each layer's GEMM through the managed kernels -- SgemmSequential (what MlpForward uses for the small
+/// layers), SgemmWithCachedB and Sgemm (the parallel dispatch) -- across thread budgets, and MlpForward
 /// end to end. Median of 300 after 50 warmups, microseconds.
 /// Run with: <c>dotnet run -c Release -- --ab-mlp-gemm</c>
 /// </summary>
@@ -25,7 +25,7 @@ internal static class MlpGemmSweep
         var rng = new Random(1);
         float[] Rand(int n) { var v = new float[n]; for (int i = 0; i < n; i++) v[i] = (float)(rng.NextDouble() * 2 - 1); return v; }
 
-        Console.WriteLine($"=== #475 MLP GEMM sweep (M={m}), cores={Environment.ProcessorCount}, HasRawSgemm={BlasProvider.HasRawSgemm} ===");
+        Console.WriteLine($"=== #475 MLP GEMM sweep (M={m}), cores={Environment.ProcessorCount} ===");
         Console.WriteLine($"{"layer",-14}{"kernel",-18}" + string.Concat(Array.ConvertAll(dops, d => $"{"dop" + d,9}")));
         foreach (var (k, n) in shapes)
         {

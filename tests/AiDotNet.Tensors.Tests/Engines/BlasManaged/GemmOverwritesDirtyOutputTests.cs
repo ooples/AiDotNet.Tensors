@@ -5,7 +5,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
 /// <summary>
-/// TryGemmEx is C := op(A)·op(B) (beta = 0) and passes the BetaZero hint to the managed GEMM, which then skips the
+/// GemmEx is C := op(A)·op(B) (beta = 0) and passes the BetaZero hint to the managed GEMM, which then skips the
 /// output pre-clear on write-first routes. Every route must therefore fully overwrite C: the output is pre-filled
 /// with NaN (any element left unwritten, or accumulated into, stays NaN or wrong) and compared with a double
 /// reference. Shapes cover the GotoGemm per-tile route with M/N tails, the tiny-shape bypass, GEMV, and transposes.
@@ -30,7 +30,7 @@ public class GemmOverwritesDirtyOutputTests
         for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
 
         int lda = transA ? m : k, ldb = transB ? k : n;
-        Assert.True(BlasProvider.TryGemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n));
+        BlasProvider.GemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n);
 
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
@@ -55,7 +55,7 @@ public class GemmOverwritesDirtyOutputTests
         for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() - 0.5;
         var c = new double[m * n];
         for (int i = 0; i < c.Length; i++) c[i] = double.NaN;
-        Assert.True(BlasProvider.TryGemmEx(m, n, k, a, 0, k, false, b, 0, n, false, c, 0, n));
+        BlasProvider.GemmEx(m, n, k, a, 0, k, false, b, 0, n, false, c, 0, n);
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
             {

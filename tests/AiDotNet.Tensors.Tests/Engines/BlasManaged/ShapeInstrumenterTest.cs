@@ -48,7 +48,7 @@ public class ShapeInstrumenterTest
         BlasProvider.ShapeLogHook = null;
     }
 
-    // PR #402 merge-resolution: the test class originally called BlasProvider.TryGemm
+    // PR #402 merge-resolution: the test class originally called BlasProvider.Gemm
     // directly and relied on the in-method LogShape call to feed the catalog. Main's
     // helper-test class (Helpers/ShapeInstrumenterTests.cs) takes a different
     // approach — it invokes BlasProvider.ShapeLogHook!.Invoke(...) directly to

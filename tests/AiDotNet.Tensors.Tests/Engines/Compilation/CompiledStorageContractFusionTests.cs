@@ -273,62 +273,6 @@ public sealed class CompiledStorageContractFusionTests
         }
     }
 
-    [Fact]
-    public void BatchedWeightGradients_PoolPaddedDestinations_WriteLiveStorage_WhenAvailable()
-    {
-        if (!BlasProvider.IsMklBatchedAvailable) return;
-
-        const int m = 2, k = 3, n = 5;
-        var x1 = PooledTensor(new[] { m, k }, 1.0f);
-        var x2 = PooledTensor(new[] { m, k }, 2.0f);
-        var w1 = PooledTensor(new[] { k, n }, 1.0f);
-        var w2 = PooledTensor(new[] { k, n }, 1.0f);
-        AssertPoolPadded(x1, x2, w1, w2);
-
-        var engine = new CpuEngine();
-        var previousEngine = AiDotNetEngine.Current;
-        // Save restores the thread's options and determinism override; SetCurrent(Current) would leave an override behind (#1221).
-        var previousOptions = TensorCodecOptions.Save();
-        string? previousBatch = Environment.GetEnvironmentVariable("AIDOTNET_DW_BATCHING");
-        Environment.SetEnvironmentVariable("AIDOTNET_DW_BATCHING", "1");
-        TensorCodecOptions.SetCurrent(new TensorCodecOptions
-        {
-            EnableDataflowFusion = false,
-            EnableBackwardGradientPooling = false,
-        });
-        AiDotNetEngine.Current = engine;
-
-        try
-        {
-            var parameters = new[] { w1, w2 };
-            CompiledTrainingPlan<float> plan;
-            using (var scope = GraphMode.EnableTraining(parameters))
-            {
-                var y1 = engine.TensorMatMul(x1, w1);
-                var y2 = engine.TensorMatMul(x2, w2);
-                var loss = engine.ReduceSum(engine.TensorAdd(y1, y2), axes: null, keepDims: false);
-                plan = scope.CompileTraining(parameters, loss);
-            }
-
-            using (plan)
-            {
-                _ = plan.Step();
-                AssertAllClose(plan.Gradients[0], 2.0f);
-                AssertAllClose(plan.Gradients[1], 4.0f);
-            }
-        }
-        finally
-        {
-            AiDotNetEngine.Current = previousEngine;
-            previousOptions.Dispose();
-            Environment.SetEnvironmentVariable("AIDOTNET_DW_BATCHING", previousBatch);
-            TensorAllocator.Return(x1);
-            TensorAllocator.Return(x2);
-            TensorAllocator.Return(w1);
-            TensorAllocator.Return(w2);
-        }
-    }
-
     private static Tensor<float> PooledTensor(int[] shape, float value)
     {
         int length = 1;

@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 /// K/2D splits for large K), but in deterministic mode the K-axis is forbidden, so a
 /// "medium" shape (m gives enough M-blocks, n only modestly large) falls through to the
 /// N-axis — which under-subscribes the cores vs the M-axis. This measures each forced
-/// axis vs the live default heuristic and vs native OpenBLAS, at full DOP, deterministic
+/// axis vs the live default heuristic, at full DOP, deterministic
 /// mode, warmed min-of-N, through the real <see cref="BlasManaged.Gemm{T}"/> strategy path.
 ///
 /// <para>
@@ -28,8 +28,8 @@ public static class AxisRoutingAbBench
     public static void Run()
     {
         Console.WriteLine("=== #475 medium-axis routing A/B (FP32, full DOP, deterministic) ===");
-        Console.WriteLine($"Host: cores={Environment.ProcessorCount}  HasRawSgemm={BlasProvider.HasRawSgemm}  Deterministic={BlasProvider.IsDeterministicMode}");
-        Console.WriteLine("Per shape: native OpenBLAS bar, the live heuristic's pick, and each forced axis (GF/s, min-of-N).");
+        Console.WriteLine($"Host: cores={Environment.ProcessorCount}  Deterministic={BlasProvider.IsDeterministicMode}");
+        Console.WriteLine("Per shape: the live heuristic's pick and each forced axis (GF/s, min-of-N).");
         Console.WriteLine();
 
         int procs = Environment.ProcessorCount;
@@ -53,7 +53,6 @@ public static class AxisRoutingAbBench
             double flops = 2.0 * m * n * k;
             var heuristic = AxisSelector.Select(m, n, k, mr, nr, procs, BlasProvider.IsDeterministicMode);
 
-            double obGf  = BlasProvider.HasRawSgemm ? Gf(flops, TimeMinNative(a, b, c, m, n, k)) : double.NaN;
             double defGf = Gf(flops, TimeMinManaged(a, b, c, m, n, k, null));
             double mGf   = Gf(flops, TimeMinManaged(a, b, c, m, n, k, ParallelismAxis.M));
             double nGf   = Gf(flops, TimeMinManaged(a, b, c, m, n, k, ParallelismAxis.N));
@@ -63,7 +62,7 @@ public static class AxisRoutingAbBench
             string bestAxis = best == mGf ? "M" : best == nGf ? "N" : "2D";
 
             Console.WriteLine($"  {label}   (heuristic picks {heuristic})");
-            Console.WriteLine($"    OpenBLAS {obGf,6:F0} | default {defGf,6:F0} | M {mGf,6:F0}  N {nGf,6:F0}  2D {gGf,6:F0}  GF/s");
+            Console.WriteLine($"    default {defGf,6:F0} | M {mGf,6:F0}  N {nGf,6:F0}  2D {gGf,6:F0}  GF/s");
             Console.WriteLine($"    best-forced {bestAxis} {best,6:F0} -> default is {defGf / best * 100,4:F0}% of best (gap {best - defGf,5:F0} GF/s)");
             Console.WriteLine();
         }
@@ -221,14 +220,14 @@ public static class AxisRoutingAbBench
     }
 
     /// <summary>
-    /// #475 Phase 1: JIT specialized FP32 GEMM A/B vs native OpenBLAS on small/medium shapes (the
+    /// #475 Phase 1: JIT specialized FP32 GEMM on small/medium shapes (the
     /// libxsmm regime). Correctness vs a double-precision scalar reference (small float-rounding
     /// maxErr expected, not 0). Run: <c>--ab-jit</c>.
     /// </summary>
     public static unsafe void JitAb()
     {
         Console.WriteLine("=== #475 Phase 1: JIT specialized FP32 GEMM A/B (single-thread) ===");
-        Console.WriteLine($"JIT supported={JitGemmGenerator.IsSupported}  HasRawSgemm={BlasProvider.HasRawSgemm}");
+        Console.WriteLine($"JIT supported={JitGemmGenerator.IsSupported}");
         var shapes = new (int m, int n, int k)[]
         {
             (6,16,64),(12,32,128),(24,48,128),(48,64,256),(64,64,128),
@@ -246,10 +245,8 @@ public static class AxisRoutingAbBench
             double maxErr = 0;
             for (int i = 0; i < c.Length; i++) { double e = Math.Abs((double)c[i] - cref[i]); if (e > maxErr) maxErr = e; }
             double flops = 2.0 * m * n * k;
-            double jitSec = ok ? TimeMinPtr(a, b, c, m, n, k, jit: true) : double.NaN;
-            double obSec = BlasProvider.HasRawSgemm ? TimeMinPtr(a, b, c, m, n, k, jit: false) : double.NaN;
-            string cmp = (BlasProvider.HasRawSgemm && ok) ? $"  {obSec / jitSec:F2}x vs OpenBLAS" : "";
-            Console.WriteLine($"  {m,4}x{n,4}x{k,4}  ok={ok} maxErr={maxErr:E1}  JIT {flops / jitSec / 1e9,5:F0}  OB {flops / obSec / 1e9,5:F0} GF/s{cmp}");
+            double jitSec = ok ? TimeMinJit(a, b, c, m, n, k) : double.NaN;
+            Console.WriteLine($"  {m,4}x{n,4}x{k,4}  ok={ok} maxErr={maxErr:E1}  JIT {flops / jitSec / 1e9,5:F0} GF/s");
         }
     }
 
@@ -264,23 +261,18 @@ public static class AxisRoutingAbBench
             }
     }
 
-    private static unsafe double TimeMinPtr(float[] a, float[] b, float[] c, int m, int n, int k, bool jit)
-    {
-        Action op = jit
-            ? () => { fixed (float* pa = a, pb = b, pc = c) JitGemmGenerator.TryRunFp32(pa, k, pb, n, pc, n, m, n, k); }
-            : () => { fixed (float* pa = a, pb = b, pc = c) BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n); };
-        return TimeMin(op, m, n, k);
-    }
+    private static unsafe double TimeMinJit(float[] a, float[] b, float[] c, int m, int n, int k)
+        => TimeMin(() => { fixed (float* pa = a, pb = b, pc = c) JitGemmGenerator.TryRunFp32(pa, k, pb, n, pc, n, m, n, k); }, m, n, k);
 
     /// <summary>
     /// #475 medium/large gap: sweep the PackBoth blocking (Mc/Nc/Kc) against OpenBLAS's Zen sgemm
-    /// P/Q/R (320/320/large) on the diffusion shapes, single- and multi-thread, vs the OpenBLAS bar.
+    /// P/Q/R (320/320/large) on the diffusion shapes, single- and multi-thread.
     /// Tests whether precise blocking closes the 1.3-1.7x single-core gap. Run: <c>--ab-blocking</c>.
     /// </summary>
     public static unsafe void BlockingSweep()
     {
         Console.WriteLine("=== #475 medium/large blocking A/B (vs OpenBLAS P/Q/R = 320/320) ===");
-        Console.WriteLine($"HasRawSgemm={BlasProvider.HasRawSgemm}  cores={Environment.ProcessorCount}");
+        Console.WriteLine($"cores={Environment.ProcessorCount}");
         var shapes = new (string label, int m, int n, int k)[]
         {
             ("ffn-up 384x6144x1536", 384, 6144, 1536),
@@ -310,13 +302,6 @@ public static class AxisRoutingAbBench
                 }
             }
             AutotuneDispatcher.s_overrideMc = AutotuneDispatcher.s_overrideNc = AutotuneDispatcher.s_overrideKc = null;
-            if (BlasProvider.HasRawSgemm)
-                foreach (int dop in new[] { 1, 32 })
-                {
-                    CpuParallelSettings.MaxDegreeOfParallelism = dop;
-                    double sec = TimeMinPtr(a, b, c, m, n, k, jit: false);
-                    Console.WriteLine($"    OpenBLAS    DOP={dop,2}: {flops / sec / 1e9,6:F0} GF/s");
-                }
         }
         AutotuneDispatcher.s_overrideMc = AutotuneDispatcher.s_overrideNc = AutotuneDispatcher.s_overrideKc = null;
         PackBothStrategy.s_macroKernel = false;
@@ -326,7 +311,7 @@ public static class AxisRoutingAbBench
     /// <summary>
     /// #475 thread-scaling curve: GF/s + scaling + efficiency at DOP 1..32 on the diffusion shapes,
     /// vs OpenBLAS. Locates WHERE multi-thread scaling breaks (SMT/CCX/contention) before changing
-    /// anything. Run: <c>--ab-scaling</c> (with AIDOTNET_USE_BLAS=1 for the OB bar).
+    /// anything. Run: <c>--ab-scaling</c> .
     /// </summary>
     public static unsafe void ScalingSweep()
     {
@@ -368,11 +353,6 @@ public static class AxisRoutingAbBench
                 double gf = flops / TimeMinGemm(a, b, c, m, n, k) / 1e9;
                 if (dop == 1) s1 = gf;
                 Console.WriteLine($"    DOP={dop,2}: {gf,6:F0} GF/s   {gf / s1,4:F1}x   eff={gf / s1 / dop * 100,3:F0}%");
-            }
-            if (BlasProvider.HasRawSgemm)
-            {
-                CpuParallelSettings.MaxDegreeOfParallelism = 32;
-                Console.WriteLine($"    OpenBLAS (auto-threaded): {flops / TimeMinPtr(a, b, c, m, n, k, jit: false) / 1e9,6:F0} GF/s");
             }
         }
         PackBothStrategy.s_macroKernel = false;
@@ -672,9 +652,6 @@ public static class AxisRoutingAbBench
     }
 
     private static double Gf(double flops, double sec) => flops / sec / 1e9;
-
-    private static unsafe double TimeMinNative(float[] a, float[] b, float[] c, int m, int n, int k)
-        => TimeMin(() => { fixed (float* pa = a, pb = b, pc = c) BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n); }, m, n, k);
 
     private static double TimeMinManaged(float[] a, float[] b, float[] c, int m, int n, int k, ParallelismAxis? force)
     {

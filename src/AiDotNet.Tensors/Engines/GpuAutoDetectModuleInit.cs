@@ -11,9 +11,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Mirrors the pattern used by the consumer-side <c>BlasEnvDefault</c>
-/// initializer (which auto-sets <c>AIDOTNET_USE_BLAS=1</c>): defaults are
-/// "always on, opt-out via environment variable" so paper-canonical
+/// Defaults are "always on, opt-out via environment variable" so paper-canonical
 /// performance is the out-of-the-box behaviour. Previously
 /// <see cref="AiDotNetEngine.Current"/> defaulted to <see cref="CpuEngine"/>
 /// and nothing in the consumer code, test base, or model classes called
@@ -24,8 +22,7 @@ namespace AiDotNet.Tensors.Engines;
 /// <para>
 /// <b>Opt-out:</b> set <c>AIDOTNET_DISABLE_GPU</c> to any non-empty value
 /// before the process starts (it's checked at module-init time, BEFORE
-/// the AiDotNet.Tensors assembly's static state is touched). Same pattern
-/// as the existing <c>AIDOTNET_USE_BLAS</c> env var.
+/// the AiDotNet.Tensors assembly's static state is touched).
 /// </para>
 /// <para>
 /// <b>Failure modes:</b> if <see cref="DirectGpuTensorEngine"/>'s ctor

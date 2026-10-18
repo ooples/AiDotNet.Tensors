@@ -440,9 +440,7 @@ public class TensorCodecVsPyTorchBenchmarks
     public void AiDotNet_DirectMatMul()
     {
         Array.Clear(_spectralOut!, 0, _spectralOut!.Length);
-        if (!BlasProvider.TryGemm(32, 64, 64, _spectralX!, 0, 64, _spectralW!, 0, 64, _spectralOut!, 0, 64))
-            SimdGemm.Sgemm(_spectralX!.AsSpan(0, 32 * 64), _spectralW!.AsSpan(0, 64 * 64),
-                _spectralOut!.AsSpan(0, 32 * 64), 32, 64, 64);
+        BlasProvider.Gemm(32, 64, 64, _spectralX!, 0, 64, _spectralW!, 0, 64, _spectralOut!, 0, 64);
     }
     // ═══════════════════════════════════════════════════════════════════
     // 9. INDIVIDUAL OPERATIONS: Broad coverage across op types

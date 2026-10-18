@@ -290,7 +290,7 @@ internal static class WinogradHelper
             int outputOffset = elem * ocTileSize;
 
             // Try BLAS GEMM first for this element
-            bool usedBlas = BlasProvider.TryGemm(
+            BlasProvider.Gemm(
                 outChannels, numTiles, inChannels,
                 transformedKernels.Slice(kernelOffset, ocIcSize),
                 inChannels,
@@ -298,25 +298,6 @@ internal static class WinogradHelper
                 numTiles,
                 transformedOutput.Slice(outputOffset, ocTileSize),
                 numTiles);
-
-            if (!usedBlas)
-            {
-                // Fallback to scalar implementation for this element
-                for (int oc = 0; oc < outChannels; oc++)
-                {
-                    for (int ic = 0; ic < inChannels; ic++)
-                    {
-                        float kernelVal = transformedKernels[kernelOffset + oc * inChannels + ic];
-                        int inSliceOffset = inputOffset + ic * numTiles;
-                        int outSliceOffset = outputOffset + oc * numTiles;
-
-                        for (int t = 0; t < numTiles; t++)
-                        {
-                            transformedOutput[outSliceOffset + t] += kernelVal * transformedInput[inSliceOffset + t];
-                        }
-                    }
-                }
-            }
         }
     }
 

@@ -471,7 +471,7 @@ public class DCGANStepProbe
                             Stride, Stride, Padding, Padding, 1, 1, SpatialOut, SpatialOut);
                 });
         // Measure the GEMM through the SAME production chokepoint the wrapper
-        // uses (BlasProvider.TryGemmEx), not BlasManaged.Gemm directly — the
+        // uses (BlasProvider.GemmEx), not BlasManaged.Gemm directly — the
         // routing the wrapper sees is what actually matters. NOTE: a swapped
         // formulation (gradKernel^T = im2colAll @ gradOutAll^T, M=colH big +
         // blocked transpose) was profiled here and is ~145µs faster in isolation,
@@ -479,7 +479,7 @@ public class DCGANStepProbe
         // freshly-built im2colAll as its large-M operand cold), so the direct GEMM
         // is the one shipped. Left as the single GEMM measurement below.
         double GemmDirect() => MinTime(() =>
-            AiDotNet.Tensors.Helpers.BlasProvider.TryGemmEx(
+            AiDotNet.Tensors.Helpers.BlasProvider.GemmEx(
                 OutChannels, colH, batchColW,
                 gradOutAll, 0, batchColW, false,
                 im2colAll, 0, batchColW, true,

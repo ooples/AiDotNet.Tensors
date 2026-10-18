@@ -160,17 +160,14 @@ internal static class AisEvalHeadToHeadBench
     }
 
     /// <summary>
-    /// Diagnostic: re-measure each primitive with a <see cref="NativeInferencePool"/>
-    /// active (pre-pinned weights + native activation buffers, zero-GC), and report
-    /// per-call allocation. Quantifies the achievable floor vs the baseline path so
-    /// we know whether the gap is allocation/jitter (closable here) or raw BLAS
-    /// kernel quality (OpenBLAS-vs-MKL, needs deeper work). Run: --ab-aiseval-diag.
+    /// Diagnostic: re-measure each primitive and report per-call allocation, to tell an
+    /// allocation/jitter gap from a kernel-quality gap. Run: --ab-aiseval-diag.
     /// </summary>
     public static void Diag()
     {
         torch.set_grad_enabled(false);
         torch.set_num_threads(Environment.ProcessorCount);
-        Console.WriteLine("=== Issue #436 — diagnostic: zero-alloc pool floor + per-call alloc ===");
+        Console.WriteLine("=== Issue #436 — diagnostic: per-call time + alloc ===");
         Console.WriteLine($"Host: cores={Environment.ProcessorCount}");
         Console.WriteLine();
 
@@ -186,7 +183,6 @@ internal static class AisEvalHeadToHeadBench
                 Tensor<float>.CreateRandom(512), Tensor<float>.CreateRandom(128), Tensor<float>.CreateRandom(10) };
             Func<Tensor<float>> fwd = () => engine.MlpForward(input, weights, biases, FusedActivationType.ReLU, FusedActivationType.None);
             ReportDiag("MLP baseline", fwd);
-            using (NativeInferencePool.Create()) ReportDiag("MLP pooled  ", fwd);
         }
         // LSTM
         {
@@ -196,7 +192,6 @@ internal static class AisEvalHeadToHeadBench
             var wHh = Tensor<float>.CreateRandom(4 * hidden, hidden);
             Func<Tensor<float>> fwd = () => engine.LstmSequenceForward(input, null, null, wIh, wHh, null, null);
             ReportDiag("LSTM baseline", fwd);
-            using (NativeInferencePool.Create()) ReportDiag("LSTM pooled  ", fwd);
         }
         // MHA
         {
@@ -206,137 +201,7 @@ internal static class AisEvalHeadToHeadBench
             var vW = Tensor<float>.CreateRandom(dModel, dModel); var oW = Tensor<float>.CreateRandom(dModel, dModel);
             Func<Tensor<float>> fwd = () => engine.MultiHeadAttentionForward(input, qW, kW, vW, oW, heads);
             ReportDiag("MHA baseline", fwd);
-            using (NativeInferencePool.Create()) ReportDiag("MHA pooled  ", fwd);
         }
-    }
-
-    /// <summary>
-    /// Raw-GEMM compute floor: the 3 MLP GEMMs (bias+ReLU folded in) run directly
-    /// through the loaded native BLAS with ZERO managed allocation and zero Tensor
-    /// ceremony — the absolute best our current backend can do for this workload.
-    /// If this floor already exceeds PyTorch's median, the p95&lt;median bar is
-    /// unreachable without a faster GEMM backend (OpenBLAS-vs-MKL), not an
-    /// allocation/dispatch fix. Run: --ab-aiseval-floor.
-    /// </summary>
-    public static unsafe void RawGemmFloor()
-    {
-        torch.set_grad_enabled(false);
-        torch.set_num_threads(Environment.ProcessorCount);
-        Console.WriteLine("=== Issue #436 — raw-GEMM compute floor (MLP shapes, zero-alloc native BLAS) ===");
-        Console.WriteLine($"Host: cores={Environment.ProcessorCount}");
-        Console.WriteLine($"BLAS backend: HasRawSgemm={BlasProvider.HasRawSgemm}, HasNativeSgemm={BlasProvider.HasNativeSgemm}, IsMklVerified={BlasProvider.IsMklVerified}");
-        Console.WriteLine();
-
-        const int bs = 128;
-        // 3 layers: (128x784)*(784x512), (128x512)*(512x128), (128x128)*(128x10)
-        var x0 = NewAligned(bs * 784);
-        var w0 = NewAligned(784 * 512); var h0 = NewAligned(bs * 512);
-        var w1 = NewAligned(512 * 128); var h1 = NewAligned(bs * 128);
-        var w2 = NewAligned(128 * 10);  var y = NewAligned(bs * 10);
-        var rng = new Random(7);
-        foreach (var buf in new[] { x0, w0, w1, w2 })
-            for (int i = 0; i < buf.Length; i++) buf[i] = (float)(rng.NextDouble() * 2 - 1);
-
-        Action gemm3 = () =>
-        {
-            fixed (float* px = x0, pw0 = w0, ph0 = h0, pw1 = w1, ph1 = h1, pw2 = w2, py = y)
-            {
-                BlasProvider.SgemmRaw(bs, 512, 784, px, 784, pw0, 512, ph0, 512);
-                for (int i = 0; i < bs * 512; i++) if (ph0[i] < 0) ph0[i] = 0; // ReLU
-                BlasProvider.SgemmRaw(bs, 128, 512, ph0, 512, pw1, 128, ph1, 128);
-                for (int i = 0; i < bs * 128; i++) if (ph1[i] < 0) ph1[i] = 0;
-                BlasProvider.SgemmRaw(bs, 10, 128, ph1, 128, pw2, 10, py, 10);
-            }
-        };
-
-        // MKL variant: same 3 GEMMs through the verified-MKL entry point (the
-        // backend torch uses), to see whether routing inference GEMMs to MKL
-        // instead of the OpenBLAS raw fptr closes the kernel-quality gap.
-        Action gemm3Mkl = () =>
-        {
-            BlasProvider.MklSgemmZeroOffset(bs, 512, 784, x0, 784, w0, 512, h0, 512);
-            for (int i = 0; i < bs * 512; i++) if (h0[i] < 0) h0[i] = 0;
-            BlasProvider.MklSgemmZeroOffset(bs, 128, 512, h0, 512, w1, 128, h1, 128);
-            for (int i = 0; i < bs * 128; i++) if (h1[i] < 0) h1[i] = 0;
-            BlasProvider.MklSgemmZeroOffset(bs, 10, 128, h1, 128, w2, 10, y, 10);
-        };
-
-        // Managed variant: all 3 layers through SgemmWithCachedB (the BlasManaged
-        // cached-B machine-code path, #409). Weights are stable arrays so the
-        // pre-pack cache hits. Tests whether the managed microkernel beats native
-        // BLAS at these small inference shapes (the #475 routing question).
-        Action gemm3Managed = () =>
-        {
-            AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(x0.AsSpan(0, bs * 784), w0, h0.AsSpan(0, bs * 512), bs, 784, 512);
-            for (int i = 0; i < bs * 512; i++) if (h0[i] < 0) h0[i] = 0;
-            AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(h0.AsSpan(0, bs * 512), w1, h1.AsSpan(0, bs * 128), bs, 512, 128);
-            for (int i = 0; i < bs * 128; i++) if (h1[i] < 0) h1[i] = 0;
-            AiDotNet.Tensors.Engines.Simd.SimdGemm.SgemmWithCachedB(h1.AsSpan(0, bs * 128), w2, y.AsSpan(0, bs * 10), bs, 128, 10);
-        };
-
-        // OpenBLAS thread-count sweep: tiny GEMMs (esp. 128x10x128) may be hurt
-        // by spinning all cores — torch's MKL uses small-GEMM thread heuristics.
-        var sw = new Stopwatch();
-        Console.WriteLine("  OpenBLAS thread sweep (raw 3xGEMM):");
-        foreach (int t in new[] { 1, 2, 4, 8, 16 })
-        {
-            if (t > Environment.ProcessorCount) break;
-            // Scope the override so the prior OpenBLAS thread state is restored after each
-            // iteration (and after the loop), instead of hardcoding ProcessorCount — which
-            // would contaminate the later measurements in this same process.
-            using (BlasProvider.ScopeOpenBlasThreads(t))
-            {
-                for (int i = 0; i < Warmup; i++) gemm3();
-                SettleGc();
-                var tt = new double[Iters];
-                for (int i = 0; i < Iters; i++) { sw.Restart(); gemm3(); sw.Stop(); tt[i] = sw.Elapsed.TotalMilliseconds; }
-                var (tm, tp) = Percentiles(tt);
-                Console.WriteLine($"    threads={t,2}: med {tm,7:F3}ms  p95 {tp,7:F3}ms");
-            }
-        }
-
-        for (int i = 0; i < Warmup; i++) gemm3();
-        SettleGc();
-        var times = new double[Iters];
-        for (int i = 0; i < Iters; i++) { sw.Restart(); gemm3(); sw.Stop(); times[i] = sw.Elapsed.TotalMilliseconds; }
-        var (med, p95) = Percentiles(times);
-
-        double mklMed = double.NaN, mklP95 = double.NaN;
-        if (BlasProvider.IsMklVerified)
-        {
-            for (int i = 0; i < Warmup; i++) gemm3Mkl();
-            SettleGc();
-            var mt = new double[Iters];
-            for (int i = 0; i < Iters; i++) { sw.Restart(); gemm3Mkl(); sw.Stop(); mt[i] = sw.Elapsed.TotalMilliseconds; }
-            (mklMed, mklP95) = Percentiles(mt);
-        }
-
-        // Managed machine-code path timing
-        for (int i = 0; i < Warmup; i++) gemm3Managed();
-        SettleGc();
-        var gt = new double[Iters];
-        for (int i = 0; i < Iters; i++) { sw.Restart(); gemm3Managed(); sw.Stop(); gt[i] = sw.Elapsed.TotalMilliseconds; }
-        var (mgMed, mgP95) = Percentiles(gt);
-
-        // torch reference at the same shapes
-        var mlp = torch.nn.Sequential(
-            ("fc1", torch.nn.Linear(784, 512)), ("relu1", torch.nn.ReLU()),
-            ("fc2", torch.nn.Linear(512, 128)), ("relu2", torch.nn.ReLU()),
-            ("fc3", torch.nn.Linear(128, 10)));
-        mlp.eval();
-        using var tInput = torch.randn(bs, 784);
-        var (tMed, tP95) = TimeTorch(() => mlp.forward(tInput));
-
-        Console.WriteLine($"  raw 3xGEMM (OpenBLAS fptr) : med {med,7:F3}ms  p95 {p95,7:F3}ms");
-        if (!double.IsNaN(mklMed))
-            Console.WriteLine($"  raw 3xGEMM (MKL verified) : med {mklMed,7:F3}ms  p95 {mklP95,7:F3}ms");
-        Console.WriteLine($"  raw 3xGEMM (managed mc)   : med {mgMed,7:F3}ms  p95 {mgP95,7:F3}ms");
-        Console.WriteLine($"  torch MLP                 : med {tMed,7:F3}ms  p95 {tP95,7:F3}ms");
-        Console.WriteLine();
-        double bestFloor = double.IsNaN(mklMed) ? med : Math.Min(med, mklMed);
-        Console.WriteLine(bestFloor < tMed
-            ? $"  → best floor ({bestFloor:F3}) < torch median ({tMed:F3}): p95<median bar REACHABLE if we route to the faster kernel + kill alloc."
-            : $"  → best floor ({bestFloor:F3}) >= torch median ({tMed:F3}): bar UNREACHABLE on available backends (kernel-quality gap).");
     }
 
     private static float[] NewAligned(int n) => new float[n];

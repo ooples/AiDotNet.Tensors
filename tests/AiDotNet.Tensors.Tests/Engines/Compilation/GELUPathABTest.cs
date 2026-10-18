@@ -75,7 +75,6 @@ public class GELUPathABTest
             _output.WriteLine($"  Max diff A vs C: {maxDiff:E3}");
             _output.WriteLine($"  GELU overhead vs raw multiply: {msA / msD:F1}x");
             _output.WriteLine($"");
-            _output.WriteLine($"  VML available: {AiDotNet.Tensors.Helpers.VmlProvider.IsInitialized}");
             _output.WriteLine($"  PyTorch reference: ~0.815ms (from BDN)");
             _output.WriteLine($"  Our target: < 0.815ms");
             _output.WriteLine($"  Gap to close: {msA / 0.815:F1}x");

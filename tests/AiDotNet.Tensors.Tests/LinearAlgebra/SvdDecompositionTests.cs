@@ -192,10 +192,10 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra
             var spectralOut = new float[batchSize * n];
 
             for (int i = 0; i < warmup; i++)
-                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(batchSize, n, k, x, 0, k, w, 0, n, directOut, 0, n);
+                AiDotNet.Tensors.Helpers.BlasProvider.Gemm(batchSize, n, k, x, 0, k, w, 0, n, directOut, 0, n);
             var sw = System.Diagnostics.Stopwatch.StartNew();
             for (int i = 0; i < iters; i++)
-                AiDotNet.Tensors.Helpers.BlasProvider.TryGemm(batchSize, n, k, x, 0, k, w, 0, n, directOut, 0, n);
+                AiDotNet.Tensors.Helpers.BlasProvider.Gemm(batchSize, n, k, x, 0, k, w, 0, n, directOut, 0, n);
             sw.Stop();
             double directMs = sw.Elapsed.TotalMilliseconds / iters;
 

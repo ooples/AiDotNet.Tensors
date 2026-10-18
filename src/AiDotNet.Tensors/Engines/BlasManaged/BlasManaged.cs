@@ -254,46 +254,11 @@ public static partial class BlasManaged
 #endif
     }
 
-    /// <summary>
-    /// Sub-issue F (#374): when true, <see cref="Helpers.BlasProvider.TryGemm"/> and
-    /// <see cref="Helpers.BlasProvider.TryGemmEx"/> route through <see cref="Gemm{T}"/>
-    /// instead of the native cblas P/Invoke. Provides a single flag to opt all 144
-    /// production call sites into managed dispatch — zero caller-side edits.
-    ///
-    /// <para>
-    /// Defaults to <see langword="false"/> (native path). Supply-chain-conscious
-    /// deployments set this to <see langword="true"/> at process startup to
-    /// eliminate the libopenblas / MKL attack surface.
-    /// </para>
-    /// </summary>
-    public static bool PreferManaged { get; set; } = false;
-
     // #475 Phase 1: route small FP32 GEMMs to the libxsmm-style JIT generator, which exceeds OpenBLAS
     // 1.5-6x for n<=128 (measured --ab-jit). Gate to the win region (large-N unpacked streaming loses
     // to OpenBLAS's blocking — Phase 1 extension adds K-blocking). A/B toggle; default on.
     internal static bool s_useJitGemm = true;
     private const int JitMaxN = 128, JitMaxM = 256, JitMaxK = 1024;
-
-    /// <summary>
-    /// Sub-F3 (#374 follow-up): when true, the <see cref="Helpers.BlasProvider"/>
-    /// <c>TryGemm</c> / <c>TryGemmEx</c> entry points consult
-    /// <see cref="PrefersManagedCache"/> in NON-deterministic mode. The cache measures
-    /// both managed and native paths once per (shape, hardware) tuple (disk-persisted)
-    /// and routes future calls to the faster one — managed where it wins, native where
-    /// it wins — so flipping toward managed never costs throughput.
-    ///
-    /// <para>
-    /// Defaults to <see langword="true"/> (ManagedBlas deterministic-parallel +
-    /// non-deterministic best-of is the intended CPU GEMM behavior; native OpenBLAS is
-    /// kept as an optional per-shape accelerator the router picks where it still wins).
-    /// Precedence is resolved in <see cref="Helpers.BlasProvider.ShouldRouteManaged"/>:
-    /// <see cref="PreferManaged"/> and <see cref="Helpers.BlasProvider.IsDeterministicMode"/>
-    /// both force managed BEFORE this timing-based routing is consulted — deterministic
-    /// mode must not pick its kernel by measurement noise (it would break
-    /// bit-reproducibility), so autotune only governs the non-deterministic path.
-    /// </para>
-    /// </summary>
-    public static bool AutotuneRouting { get; set; } = true;
 
     // #375: the earlier opt-in Gemm-level autotune (EnableAutotuneV2 + AutotuneCacheV2 +
     // a synchronous warmup sweep) was superseded by the hybrid hardware-aware strategy

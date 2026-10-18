@@ -92,9 +92,7 @@ internal static class TensorCodecOptimizer
         else
         {
             Array.Clear(output, 0, xRows * wCols);
-            if (!BlasProvider.TryGemm(xRows, wCols, xCols, x, 0, xCols, weights, 0, wCols, output, 0, wCols))
-                SimdGemm.Sgemm(x.AsSpan(0, xRows * xCols), weights.AsSpan(0, wRows * wCols),
-                    output.AsSpan(0, xRows * wCols), xRows, xCols, wCols);
+            BlasProvider.Gemm(xRows, wCols, xCols, x, 0, xCols, weights, 0, wCols, output, 0, wCols);
         }
     }
 }

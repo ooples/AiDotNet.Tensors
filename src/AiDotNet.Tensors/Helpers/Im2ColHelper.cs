@@ -957,7 +957,7 @@ internal static class Im2ColHelper
                 int outputOffset = b * outChannels * outputH * outputW;
 
                 // Use span-based GEMM to avoid array copies
-                bool usedBlas = BlasProvider.TryGemm(
+                BlasProvider.Gemm(
                     outChannels, colW, colH,
                     kernel,  // ReadOnlySpan<float>
                     colH,
@@ -965,16 +965,6 @@ internal static class Im2ColHelper
                     colW,
                     output.Slice(outputOffset, outChannels * colW),  // Span<float>
                     colW);
-
-                if (!usedBlas)
-                {
-                    // Fallback to blocked matrix multiply
-                    MultiplyMatrixBlocked(
-                        kernel,
-                        im2colBuffer.AsSpan(im2colOffset, colH * colW),
-                        output.Slice(outputOffset, outChannels * colW),
-                        outChannels, colH, colW);
-                }
             }
 
             return true;
@@ -2098,7 +2088,7 @@ internal static class Im2ColHelper
             return;
         }
 #endif
-        // Clear C — we accumulate from zero. Matches BlasProvider.TryGemmEx
+        // Clear C — we accumulate from zero. Matches BlasProvider.GemmEx
         // (beta=0) behaviour the dispatcher contract expects.
         Array.Clear(c, cOffset, m * ldc);
 

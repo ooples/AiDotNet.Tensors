@@ -354,13 +354,6 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
-          # Pack OpenBLAS native package
-          if (Test-Path "src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj") {
-            Write-Host "Packing AiDotNet.Native.OpenBLAS..."
-            dotnet pack src/AiDotNet.Native.OpenBLAS/AiDotNet.Native.OpenBLAS.csproj -c Release -o out --no-build /p:PackageVersion=$VERSION
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-
           # Pack CLBlast native package
           if (Test-Path "src/AiDotNet.Native.CLBlast/AiDotNet.Native.CLBlast.csproj") {
             Write-Host "Packing AiDotNet.Native.CLBlast..."

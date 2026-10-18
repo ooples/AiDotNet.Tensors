@@ -84,7 +84,7 @@ internal static class BackwardParallel
     /// <param name="workPerRow">Estimated scalar work per row body.</param>
     /// <param name="body">Row index → body. MUST NOT call BLAS — use
     /// <see cref="ForRowsSerialOnBlasPath"/> when the body invokes
-    /// <c>BlasProvider.TryGemm</c> or similar.</param>
+    /// <c>BlasProvider.Gemm</c> or similar.</param>
     internal static void ForRows(int rows, long workPerRow, Action<int> body)
     {
         if (rows <= 0) return;

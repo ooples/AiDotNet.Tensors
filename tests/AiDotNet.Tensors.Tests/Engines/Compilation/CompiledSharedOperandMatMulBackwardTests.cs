@@ -3,7 +3,6 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
-using ManagedBlas = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
@@ -26,7 +25,6 @@ public sealed class CompiledSharedOperandMatMulBackwardTests : IDisposable
     private const int Blocks = 3, Layers = 2, Hidden = 48, Lookback = 8, Horizon = 4, Theta = 3, Batch = 40;
 
     private readonly IEngine _priorEngine = AiDotNetEngine.Current;
-    private readonly bool _priorPreferManaged = ManagedBlas.PreferManaged;
 
     public CompiledSharedOperandMatMulBackwardTests()
     {
@@ -35,7 +33,6 @@ public sealed class CompiledSharedOperandMatMulBackwardTests : IDisposable
 
     public void Dispose()
     {
-        ManagedBlas.PreferManaged = _priorPreferManaged;
         AiDotNetEngine.Current = _priorEngine;
     }
 
@@ -156,21 +153,15 @@ public sealed class CompiledSharedOperandMatMulBackwardTests : IDisposable
         }
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void NBeatsStack_Float_GradientsMatchEagerTape(bool preferManaged)
+    [Fact]
+    public void NBeatsStack_Float_GradientsMatchEagerTape()
     {
-        ManagedBlas.PreferManaged = preferManaged;
         CheckAgainstEagerTape<float>(v => (float)v, v => v, 1e-4);
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void NBeatsStack_Double_GradientsMatchEagerTape(bool preferManaged)
+    [Fact]
+    public void NBeatsStack_Double_GradientsMatchEagerTape()
     {
-        ManagedBlas.PreferManaged = preferManaged;
         CheckAgainstEagerTape<double>(v => v, v => v, 1e-10);
     }
 

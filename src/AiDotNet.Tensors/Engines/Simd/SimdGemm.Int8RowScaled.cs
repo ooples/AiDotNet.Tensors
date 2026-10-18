@@ -170,24 +170,14 @@ internal static partial class SimdGemm
                 DequantizeInt8WithRowScalesToFloat32_Reference(
                     bInt8, dequantFull.AsSpan(0, n * k), rowScales, n, k);
                 // bInt8 is [n, k] row-major; Sgemm wants B in [k, n].
-                // Use transB:true to read the dequantized [n, k] buffer through the shared BLAS
-                // dispatcher. The former SgemmAddInternal call bypassed native BLAS entirely, so
-                // paper-scale FFNs (N=16,384) ran the managed fallback even in production mode and
-                // timed out. TryGemmEx retains the deterministic/managed/autotuned routing contract
-                // and uses native multi-threaded BLAS when selected. Keep the original kernel as a
-                // defensive fallback if a provider reports failure.
-                if (!BlasProvider.TryGemmEx(
+                // Use transB:true to read the dequantized [n, k] buffer through the shared GEMM
+                // dispatcher (the managed multi-threaded GEMM). The former SgemmAddInternal call ran
+                // single-threaded, so paper-scale FFNs (N=16,384) timed out.
+                BlasProvider.GemmEx(
                         m, n, k,
                         a, 0, k, false,
                         dequantFull, 0, k, true,
-                        c, 0, n))
-                {
-                    SgemmAddInternal(
-                        a.AsSpan(0, m * k), k, false,
-                        dequantFull.AsSpan(0, n * k), k, true,
-                        c.AsSpan(0, m * n), m, k, n,
-                        allowParallel: true, clearedOutput: true);
-                }
+                        c, 0, n);
             }
             finally
             {

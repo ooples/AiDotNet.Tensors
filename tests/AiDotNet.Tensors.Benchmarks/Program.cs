@@ -837,19 +837,8 @@ class Program
             AiDotNet.Tensors.Benchmarks.PyTorchComparison.MlpGemmSweep.Run();
             return;
         }
-        if (args[0] == "--ab-aiseval-floor")
-        {
-            AiDotNet.Tensors.Benchmarks.PyTorchComparison.AisEvalHeadToHeadBench.RawGemmFloor();
-            return;
-        }
 
-        if (args[0] == "--ab-mlp-kernel-bakeoff")
-        {
-            AiDotNet.Tensors.Benchmarks.MlpKernelBakeoffBench.Run();
-            return;
-        }
-
-        // #475 medium-axis routing A/B — forced M/N/2D vs the live heuristic vs OpenBLAS
+        // #475 medium-axis routing A/B — forced M/N/2D vs the live heuristic
         // on the diffusion FP32 shapes, full DOP, deterministic. (--ab-axis-routing)
         if (args[0] == "--ab-axis-routing")
         {
@@ -2224,7 +2213,6 @@ class Program
         Console.WriteLine("  --dcgan-probe : Run DCGAN step allocation / shape probe (#403 Phase A)");
         Console.WriteLine("  --ab-aiseval-h2h      : AIsEval head-to-head (AiDotNet fused vs TorchSharp)");
         Console.WriteLine("  --ab-aiseval-diag     : AIsEval diagnostics (pooled vs baseline alloc/latency)");
-        Console.WriteLine("  --ab-aiseval-floor    : AIsEval raw-GEMM floor + OpenBLAS/MKL floor check");
         Console.WriteLine("  --ab-aiseval-dopsweep : AIsEval MaxDOP sweep for MHA/LSTM");
         Console.WriteLine();
         Console.WriteLine("GPU Bottleneck Analysis:");
