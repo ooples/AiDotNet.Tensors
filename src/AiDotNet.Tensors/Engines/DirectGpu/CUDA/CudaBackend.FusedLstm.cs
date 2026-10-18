@@ -4,8 +4,24 @@ using System.Collections.Generic;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 // One block per batch row holds every hidden unit, so the sequence kernels need H <= MaxRnnBlockSize.
-public sealed partial class CudaBackend : IFusedLstmSequenceTraining
+public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastStepTraining
 {
+    bool ILstmLastStepTraining.SupportsLstmLastStepBackward(int hiddenSize)
+        => TryGetLstmRegisterRecurrence("backward_last", hiddenSize, out _) && _kernelCache.ContainsKey("lstm_backward_gemms");
+
+    void ILstmLastStepTraining.LstmBackwardLastStep(IGpuBuffer gradLastHidden, IGpuBuffer allH, IGpuBuffer allC,
+        IGpuBuffer cacheGates, IGpuBuffer hInit, IGpuBuffer cInit, IGpuBuffer weightsIh, IGpuBuffer weightsHh,
+        IGpuBuffer input, IGpuBuffer gradInput, IGpuBuffer gradHInit, IGpuBuffer gradCInit, IGpuBuffer gradWeightsIh,
+        IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh, int seqLen, int batch, int inputSize,
+        int hiddenSize)
+    {
+        if (!TryGetLstmRegisterRecurrence("backward_last", hiddenSize, out _))
+            throw new GpuCapabilityUnavailableException($"CUDA last-step LSTM backward needs hidden size <= 64 (got {hiddenSize}).");
+        LstmBackwardViaGemm(IntPtr.Zero, gradLastHidden, allH, allC, cacheGates, hInit, cInit, weightsIh, weightsHh, input,
+            gradInput, gradHInit, gradCInit, gradWeightsIh, gradWeightsHh, gradBiasIh, gradBiasHh,
+            seqLen, batch, inputSize, hiddenSize, lastStepOnly: true);
+    }
+
     int IFusedLstmSequenceTraining.MaxFusedLstmHidden => MaxRnnBlockSize;
     bool IFusedLstmSequenceTraining.LstmBackwardOverwritesGradients => true;
 
@@ -142,7 +158,7 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining
         IGpuBuffer hInit, IGpuBuffer cInit, IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer input,
         IGpuBuffer gradInput, IGpuBuffer gradHInit, IGpuBuffer gradCInit,
         IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBiasIh, IGpuBuffer gradBiasHh,
-        int seqLen, int batch, int inputSize, int hiddenSize)
+        int seqLen, int batch, int inputSize, int hiddenSize, bool lastStepOnly = false)
     {
         int rows = checked(batch * seqLen);
         int gates = 4 * hiddenSize;
@@ -169,7 +185,8 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining
             args[11] = &batch;
             args[12] = &seqLen;
             args[13] = &hiddenSize;
-            if (TryGetLstmRegisterRecurrence("backward", hiddenSize, out var regKernel))
+            // lastStepOnly: gradOutput is the final hidden state's gradient [batch, hidden] (the caller checked the kernel).
+            if (TryGetLstmRegisterRecurrence(lastStepOnly ? "backward_last" : "backward", hiddenSize, out var regKernel))
                 LaunchKernel(regKernel, (uint)batch, (uint)gates, args);
             else
                 LaunchKernelWithSharedMem(recurrence, (uint)batch, (uint)hiddenSize, (uint)(gates * sizeof(float)), args);

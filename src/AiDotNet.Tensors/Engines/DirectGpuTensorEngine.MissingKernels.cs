@@ -7102,12 +7102,16 @@ public partial class DirectGpuTensorEngine
         if (wHh is null) throw new ArgumentNullException(nameof(wHh));
         // Compiled training: one fused forward + BPTT node in place of the per-timestep op chain (see
         // TryRecordLstmSequenceTrain). The returnSequences = false slice is recorded after it, as the eager path does.
+        // A last-step-only model gets a node whose output is h_T itself where the backend can differentiate that alone.
+        bool lastStepNode = !returnSequences && wIh.Rank == 2 && PlacementBackend is ILstmLastStepTraining lastStep
+            && lastStep.SupportsLstmLastStepBackward(wIh._shape[0] / 4);
         if (GraphMode.IsActive && !GraphMode.IsInferenceTrace && !wantState && h0 is null && c0 is null
             && GraphMode.Current is { } trainScope
-            && TryRecordLstmSequenceTrain(trainScope, input, wIh, wHh, bIh, bHh) is { } recorded)
+            && TryRecordLstmSequenceTrain(trainScope, input, wIh, wHh, bIh, bHh, lastStepNode) is { } recorded)
         {
             finalHidden = null;
             finalCell = null;
+            if (lastStepNode) return recorded;
             int recordedSteps = input._shape[1], recordedHidden = wIh._shape[0] / 4;
             return returnSequences ? recorded
                 : Reshape(TensorSlice(recorded, new[] { 0, recordedSteps - 1, 0 }, new[] { input._shape[0], 1, recordedHidden }),

@@ -1045,9 +1045,11 @@ __device__ __forceinline__ void lstm_forward_recurrence_reg_body(
     }
 }
 
-template <int HP, int BB>
+// LAST: only the final hidden state carries a gradient (a model that reads h_T alone), so gradOutput is [batch, hidden]
+// and is read once, at t = timeSteps - 1, instead of a [batch, timeSteps, hidden] gradient that is zero elsewhere.
+template <int HP, int BB, bool LAST = false>
 __device__ __forceinline__ void lstm_backward_recurrence_reg_body(
-    const float* __restrict__ gradOutput,  // [batch, timeSteps, hidden]
+    const float* __restrict__ gradOutput,  // [batch, timeSteps, hidden] ([batch, hidden] when LAST)
     const float* __restrict__ h_states, const float* __restrict__ c_states,
     const float* __restrict__ gates,       // [timeSteps, batch, 4*hidden], role order f,i,g,o
     const float* __restrict__ c_init, const float* __restrict__ h_init,
@@ -1079,7 +1081,7 @@ __device__ __forceinline__ void lstm_backward_recurrence_reg_body(
     float go = 0.0f, f = 0.0f, ig = 0.0f, g = 0.0f, o = 0.0f, cT = 0.0f, cPrev = 0.0f, hPrevV = 0.0f;
     int t0 = timeSteps - 1;
     if (cell) {
-        go = gradOutput[(b * timeSteps + t0) * H + cj];
+        go = LAST ? gradOutput[cgid] : gradOutput[(b * timeSteps + t0) * H + cj];
         int gateOffset = t0 * batch * G + b * G;
         f = gates[gateOffset + cj];
         ig = gates[gateOffset + H + cj];
@@ -1116,7 +1118,7 @@ __device__ __forceinline__ void lstm_backward_recurrence_reg_body(
 
             if (t > 0) {
                 int tn = t - 1;
-                go = gradOutput[(b * timeSteps + tn) * H + cj];
+                go = LAST ? 0.0f : gradOutput[(b * timeSteps + tn) * H + cj];
                 int gateOffset = tn * batch * G + b * G;
                 f = gates[gateOffset + cj];
                 ig = gates[gateOffset + H + cj];
@@ -1182,6 +1184,19 @@ extern ""C"" __global__ __launch_bounds__(4 * HP) void lstm_backward_recurrence_
 // One batch row per block (BB 1) measured fastest; BB 2 and 4 trade the grid for longer per-step chains.
 LSTM_REG_KERNELS(32, 1)
 LSTM_REG_KERNELS(64, 1)
+
+// The backward recurrence for a gradient on the final hidden state only (gradLast [batch, hidden]).
+#define LSTM_REG_LAST_KERNEL(HP) \
+extern ""C"" __global__ __launch_bounds__(4 * HP) void lstm_backward_last_recurrence_reg_h##HP##_b1( \
+    const float* gradLast, const float* h_states, const float* c_states, const float* gates, const float* c_init, \
+    const float* h_init, const float* Wh, float* dGates, float* hPrev, float* dH_init, float* dC_init, \
+    int batch, int timeSteps, int hiddenSize) \
+{ \
+    lstm_backward_recurrence_reg_body<HP, 1, true>(gradLast, h_states, c_states, gates, c_init, h_init, Wh, dGates, \
+        hPrev, dH_init, dC_init, batch, timeSteps, hiddenSize); \
+}
+LSTM_REG_LAST_KERNEL(32)
+LSTM_REG_LAST_KERNEL(64)
 
 // ===========================================================================
 // LSTM BACKWARD DENSE PRODUCTS (one launch)
@@ -1549,6 +1564,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_forward_recurrence_reg_h32_b1",
             "lstm_backward_recurrence_reg_h32_b1",
             "lstm_forward_recurrence_reg_h64_b1",
+            "lstm_backward_last_recurrence_reg_h32_b1",
+            "lstm_backward_last_recurrence_reg_h64_b1",
             "lstm_backward_recurrence_reg_h64_b1",
             "lstm_accumulate_weight_gradients",
             "lstm_accumulate_weight_gradients_deterministic",
