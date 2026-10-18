@@ -2375,6 +2375,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // C=A@B case; returns false until a shape is GPU-promoted, then falls to cuBLAS.
         if (alpha == 1.0f && beta == 0.0f && TryDirectPtxGemm(A, B, C, M, K, N)) return;
         if (TrySkinnyGemm(A, B, C, M, N, K, transB: false, alpha, beta)) return;
+        if (TrySmallGemm(A, B, C, M, N, K, transA: false, transB: false, alpha, beta)) return;
         // #1265: a shape tuned and measured faster than cuBLAS in the current math mode runs its generated kernel.
         if (TryRoutedGemm(A, B, C, M, N, K, alpha, beta)) return;
         CublasGemm(A, B, C, M, N, K, alpha, beta);
@@ -2411,6 +2412,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.OutputMajor))
             return;
         if (TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
+        if (TrySmallGemm(A, B, C, M, N, K, transA: false, transB: true, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -2452,6 +2454,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
         if (TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
+        if (TrySmallGemm(A, B, C, M, N, K, transA: true, transB: false, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
