@@ -51,6 +51,9 @@ public partial class DirectGpuTensorEngine
         public IGpuBuffer GradC0 { get; }
         public IGpuBuffer GradBiasHh { get; }
 
+        /// <summary>The [B, T, H] sequence a last-step node's forward writes but does not return; made on first use.</summary>
+        public IGpuBuffer? SequenceScratch { get; set; }
+
         /// <summary>Counts forwards into these buffers; each forward's backward checks it still owns them.</summary>
         public int Generation { get; set; }
     }
@@ -148,8 +151,11 @@ public partial class DirectGpuTensorEngine
     /// <remarks>Both biases are inputs of the node: the kernels sum them, and each receives the bias gradient from the
     /// backward. A recorded add before the node (as the eager path sums them) cost the captured step an add kernel
     /// and, in the backward, a gradient copy per bias.</remarks>
+    /// <param name="lastStepOnly">The node's output is the final hidden state [B, H] (written by the forward kernel into
+    /// the node's own buffer) and its backward takes that state's gradient alone (<see cref="ILstmLastStepTraining"/>);
+    /// the caller checked the backend serves it.</param>
     private Tensor<T>? TryRecordLstmSequenceTrain<T>(Compilation.LazyTensorScope scope, Tensor<T> input,
-        Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh)
+        Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh, bool lastStepOnly = false)
     {
         // PlacementBackend, not GetBackend: the latter refuses every backend while a graph is traced (#350),
         // which is exactly when this records. The kernels run later, when the node executes.
@@ -166,11 +172,11 @@ public partial class DirectGpuTensorEngine
 
         var bias = bIh ?? bHh ?? new Tensor<T>(new[] { gateRows });
         var secondBias = bIh is not null ? bHh : null;
-        var node = new LstmRecordedNode();
+        var node = new LstmRecordedNode { LastStepOnly = lastStepOnly };
 
-        return scope.RecordVariadic(Compilation.LazyNodeType.Custom, "LstmSequenceTrain",
+        return scope.RecordVariadic(Compilation.LazyNodeType.Custom, lastStepOnly ? "LstmSequenceTrainLast" : "LstmSequenceTrain",
             secondBias is null ? new[] { input, wIh, wHh, bias } : new[] { input, wIh, wHh, bias, secondBias },
-            new[] { b, t, h },
+            lastStepOnly ? new[] { b, h } : new[] { b, t, h },
             (eng, output) =>
             {
                 var gpu = (DirectGpuTensorEngine)eng;
@@ -179,7 +185,7 @@ public partial class DirectGpuTensorEngine
                 // weight tensor) and stable across steps, so a captured graph keeps valid pointers.
                 var cache = gpu.GetLstmTrainCache(backend, wIh, b, t, inSize, h);
                 node.Cache = cache;
-                var result = gpu.RunLstmForward(input, wIh, wHh, bias, cache, secondBias);
+                var result = gpu.RunLstmForward(input, wIh, wHh, bias, cache, secondBias, lastStepOnly);
                 StampLstmForward(cache, node.Stamp);
                 CopyResultInto(eng, result, output);
             },
@@ -191,6 +197,7 @@ public partial class DirectGpuTensorEngine
     {
         public LstmTrainCache? Cache { get; set; }
         public LstmForwardStamp Stamp { get; } = new();
+        public bool LastStepOnly { get; init; }
     }
 
     private static void LstmSequenceTrainRecordedBackward<T>(
@@ -199,11 +206,13 @@ public partial class DirectGpuTensorEngine
     {
         var node = (LstmRecordedNode)savedState[0];
         var cache = node.Cache ?? throw new InvalidOperationException("The fused GPU LSTM node's backward ran before its forward.");
-        LstmSequenceTrainBackward(gradOutput, inputs, output, new object[] { cache, node.Stamp }, engine, grads);
+        LstmSequenceTrainBackward(gradOutput, inputs, output, new object[] { cache, node.Stamp, node.LastStepOnly }, engine, grads);
     }
     // secondBias: the hidden-hidden bias, summed with bias by the kernel; the cache's zero bias when there is one bias.
+    // lastStepOnly: the result is the final hidden state [B, H], written by the forward into its own buffer; the sequence
+    // goes to the cache's scratch.
     private Tensor<T> RunLstmForward<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias, LstmTrainCache c,
-        Tensor<T>? secondBias = null)
+        Tensor<T>? secondBias = null, bool lastStepOnly = false)
     {
         var backend = GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var inputC = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
@@ -212,15 +221,17 @@ public partial class DirectGpuTensorEngine
         using var bufWhh = GetOrAllocateBuffer(backend, wHh);
         using var bufBias = GetOrAllocateBuffer(backend, bias);
         using var bufBias2 = secondBias is null ? default : GetOrAllocateBuffer(backend, secondBias);
-        int n = c.B * c.T * c.H;
+        int n = lastStepOnly ? c.B * c.H : c.B * c.T * c.H;
+        if (lastStepOnly) c.SequenceScratch ??= backend.AllocateBuffer(c.B * c.T * c.H);
         // The forward writes every output element.
         var output = AllocateFullyWrittenOutputBuffer(backend, n);
         try
         {
             backend.LstmForwardSequence(bufInput.Buffer, c.H0, c.C0, bufWih.Buffer, bufWhh.Buffer, bufBias.Buffer,
                 secondBias is null ? c.ZeroBias : bufBias2.Buffer,
-                output.Buffer, c.FinalH, c.FinalC, c.AllH, c.AllC, c.Gates, c.T, c.B, c.In, c.H);
-            var result = DeferTensorResult<T>(backend, output.Buffer, n, new[] { c.B, c.T, c.H });
+                lastStepOnly ? c.SequenceScratch! : output.Buffer, lastStepOnly ? output.Buffer : c.FinalH, c.FinalC,
+                c.AllH, c.AllC, c.Gates, c.T, c.B, c.In, c.H);
+            var result = DeferTensorResult<T>(backend, output.Buffer, n, lastStepOnly ? new[] { c.B, c.H } : new[] { c.B, c.T, c.H });
             output.RelinquishOwnership();
             return result;
         }
@@ -234,6 +245,7 @@ public partial class DirectGpuTensorEngine
         var gpu = (DirectGpuTensorEngine)engine;
         var c = (LstmTrainCache)savedState[0];
         var stamp = (LstmForwardStamp)savedState[1];
+        bool lastStepOnly = savedState.Length > 2 && savedState[2] is true;
         if (stamp.Generation != c.Generation)
         {
             throw new InvalidOperationException(
@@ -271,10 +283,16 @@ public partial class DirectGpuTensorEngine
         ZeroLstmGradient(backend, gBias.Buffer, nBias);
         ZeroLstmGradient(backend, biasHhTarget, nBias);
 
-        backend.LstmBackwardSequence(bufGradOut.Buffer, c.AllH, c.AllC, c.Gates, c.H0, c.C0,
-            bufWih.Buffer, bufWhh.Buffer, bufInput.Buffer,
-            gIn.Buffer, c.GradH0, c.GradC0, gWih.Buffer, gWhh.Buffer, gBias.Buffer, biasHhTarget,
-            c.T, c.B, c.In, c.H);
+        if (lastStepOnly)
+            ((ILstmLastStepTraining)backend).LstmBackwardLastStep(bufGradOut.Buffer, c.AllH, c.AllC, c.Gates, c.H0, c.C0,
+                bufWih.Buffer, bufWhh.Buffer, bufInput.Buffer,
+                gIn.Buffer, c.GradH0, c.GradC0, gWih.Buffer, gWhh.Buffer, gBias.Buffer, biasHhTarget,
+                c.T, c.B, c.In, c.H);
+        else
+            backend.LstmBackwardSequence(bufGradOut.Buffer, c.AllH, c.AllC, c.Gates, c.H0, c.C0,
+                bufWih.Buffer, bufWhh.Buffer, bufInput.Buffer,
+                gIn.Buffer, c.GradH0, c.GradC0, gWih.Buffer, gWhh.Buffer, gBias.Buffer, biasHhTarget,
+                c.T, c.B, c.In, c.H);
 
         var gradInput = gpu.DeferTensorResult<T>(backend, gIn.Buffer, nIn, new[] { c.B, c.T, c.In }); gIn.RelinquishOwnership();
         var gradWih = gpu.DeferTensorResult<T>(backend, gWih.Buffer, nWih, new[] { 4 * c.H, c.In }); gWih.RelinquishOwnership();
