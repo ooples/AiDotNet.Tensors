@@ -132,7 +132,7 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
             || gradOutput.Size < n || input.Size < n || gradInput.Size < n || gamma.Size < cols
             || mean.Size < rows || variance.Size < rows || gradGamma.Size < cols || gradBeta.Size < cols
             || gradGamma.Handle == gradBeta.Handle
-            || !_kernelCache.TryGetValue("layernorm_grad_params_finish", out var rowsFinishKernel))
+            || !_kernelCache.TryGetValue("layernorm_grad_params_finish_warp", out var rowsFinishKernel))
             return false;
         IntPtr rowsKernel;
         bool found = cols <= 64 ? _kernelCache.TryGetValue("layernorm_backward_rows2", out rowsKernel)
@@ -157,7 +157,8 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         int ch = chunks, ag = addGamma ? 1 : 0, ab = addBeta ? 1 : 0;
         void** fargs = stackalloc void*[7];
         fargs[0] = &part; fargs[1] = &gg; fargs[2] = &gb; fargs[3] = &c; fargs[4] = &ch; fargs[5] = &ag; fargs[6] = &ab;
-        LaunchKernel(rowsFinishKernel, (uint)((cols + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, fargs);
+        // One warp per column: 8 columns per 256-thread block.
+        LaunchKernel(rowsFinishKernel, (uint)((cols + 7) / 8), DefaultBlockSize, fargs);
         return true;
     }
 

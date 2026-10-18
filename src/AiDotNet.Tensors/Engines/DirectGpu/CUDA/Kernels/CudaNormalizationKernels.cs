@@ -900,6 +900,35 @@ LN_ROWS_KERNEL(layernorm_backward_rows4, 4)
 LN_ROWS_KERNEL(layernorm_backward_rows8, 8)
 LN_ROWS_KERNEL(layernorm_backward_rows16, 16)
 
+// layernorm_backward_rows' reduce: one warp per column, its lanes striding over the chunk partials and a fixed xor-shuffle
+// tree adding them (deterministic), gamma's then beta's. The thread-per-column finish summed 32 chunks serially per
+// thread (~1.8 us for 64 columns).
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_finish_warp(
+    const float* __restrict__ partials, float* __restrict__ gradGamma, float* __restrict__ gradBeta,
+    int cols, int chunks, int addGamma, int addBeta)
+{
+    int col = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (col >= cols) return;
+    float g = 0.0f, b = 0.0f;
+    for (int c = lane; c < chunks; c += 32)
+    {
+        g += partials[(long long)c * cols + col];
+        b += partials[(long long)(chunks + c) * cols + col];
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        g += __shfl_xor_sync(0xffffffff, g, o);
+        b += __shfl_xor_sync(0xffffffff, b, o);
+    }
+    if (lane == 0)
+    {
+        gradGamma[col] = addGamma ? gradGamma[col] + g : g;
+        gradBeta[col] = addBeta ? gradBeta[col] + b : b;
+    }
+}
+
 // LayerNorm's input gradient ADDED into gradInput, one warp per row of [rows, cols]:
 // dx += invStd * (g*dy - mean_c(g*dy) - xhat * mean_c(g*dy*xhat)), xhat = (x - mean) * invStd. Lane-strided sums
 // reduced by a fixed xor-shuffle tree: deterministic.
@@ -1114,6 +1143,7 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "layernorm_backward_rows4",
                 "layernorm_backward_rows8",
                 "layernorm_backward_rows16",
+                "layernorm_grad_params_finish_warp",
                 "layernorm_grad_params_partial",
                 "layernorm_grad_params_finish",
                 "column_sum_partial",
