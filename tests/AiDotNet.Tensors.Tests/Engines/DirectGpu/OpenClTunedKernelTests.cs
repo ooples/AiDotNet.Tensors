@@ -333,8 +333,12 @@ public sealed class OpenClTunedKernelTests
         var backend = RequireBackend();
         TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
         bool previousPersist = TunedKernelPolicy.PersistDecisions;
+        double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
+        // The budget is a process-wide running total, so tuning in earlier tests must not decide this one.
+        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.ResetBudget();
         try
         {
             // A shape no profile covers, so the slot measures it (and snapshots candidate outputs to the host).
@@ -356,6 +360,7 @@ public sealed class OpenClTunedKernelTests
         {
             TunedKernelPolicy.ModeOverride = previousMode;
             TunedKernelPolicy.PersistDecisions = previousPersist;
+            TunedKernelPolicy.BudgetMilliseconds = previousBudget;
         }
     }
 #if NET6_0_OR_GREATER // the shared check lives in MetalTunedKernelTests

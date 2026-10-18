@@ -332,8 +332,12 @@ public sealed class HipTunedKernelTests
         var backend = RequireBackend();
         TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
         bool previousPersist = TunedKernelPolicy.PersistDecisions;
+        double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
+        // The budget is a process-wide running total, so tuning in earlier tests must not decide this one.
+        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.ResetBudget();
         try
         {
             // A shape no profile covers, so the slot measures it (and snapshots candidate outputs to the host).
@@ -355,6 +359,7 @@ public sealed class HipTunedKernelTests
         {
             TunedKernelPolicy.ModeOverride = previousMode;
             TunedKernelPolicy.PersistDecisions = previousPersist;
+            TunedKernelPolicy.BudgetMilliseconds = previousBudget;
         }
     }
     // (batch, Cin, H, W, Cout, k, stride, pad, dilation): Winograd's 3x3/s1, 1x1, 5x5, strided, dilated, batched.
