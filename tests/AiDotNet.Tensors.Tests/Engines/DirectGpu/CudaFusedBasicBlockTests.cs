@@ -149,7 +149,7 @@ public sealed class CudaFusedBasicBlockTests
         {
             float[] again = blk.Run(grid);
             for (int i = 0; i < first.Length; i++)
-                Assert.True(BitConverter.SingleToInt32Bits(first[i]) == BitConverter.SingleToInt32Bits(again[i]),
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[i]) == TestHelpers.MathCompat.SingleToInt32Bits(again[i]),
                     $"grid {grid}: [{i}] {again[i]:R} != {first[i]:R}");
         }
     }
