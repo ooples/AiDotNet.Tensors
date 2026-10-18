@@ -38,6 +38,35 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "torch $probe with CUDA"
 $env:PARITY_PYTHON = $Python
 
+# PyTorch at its best includes torch.compile, which compiles C++ (CPU) and Triton's launcher (CUDA) with the host
+# compiler. On Windows that is MSVC 2022 with a Windows 11 SDK (MSVC 2019 rejects Triton's C, and SDK 10.0.19041
+# lacks the C11 headers), so its environment is imported here when cl.exe is not already on PATH.
+if ($IsWindows -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    $install = if (Test-Path $vswhere) {
+        & $vswhere -latest -products * -version '[17.0,)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    }
+    $vcvars = if ($install) { Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat' }
+    if (-not $vcvars -or -not (Test-Path $vcvars)) {
+        [Console]::Error.WriteLine('No Visual Studio 2022 C++ build tools found, so torch.compile cannot run and every case will defer. ' +
+            "Install them with: winget install Microsoft.VisualStudio.2022.BuildTools --override '--quiet --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64' " +
+            'and the Windows 11 SDK (winget install Microsoft.WindowsSDK.10.0.22621).')
+        exit 5
+    }
+    foreach ($line in (& cmd /c "`"$vcvars`" >nul && set")) {
+        if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2]) }
+    }
+    # vcvars also sets Platform=x64, which MSBuild reads as the solution platform and builds into bin\x64\.
+    Remove-Item Env:Platform -ErrorAction SilentlyContinue
+    Write-Host "MSVC environment: $vcvars"
+}
+& $Python -c "import triton" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    [Console]::Error.WriteLine("Triton is not importable with '$Python', so torch.compile cannot run on CUDA and every case will defer. " +
+        "Install it with: $Python -m pip install triton-windows (Windows) or triton (Linux).")
+    exit 5
+}
+
 dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj -f net10.0 -m:2 -p:UseSharedCompilation=false
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

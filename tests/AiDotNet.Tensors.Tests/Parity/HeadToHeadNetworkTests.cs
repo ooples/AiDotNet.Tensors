@@ -15,7 +15,9 @@ namespace AiDotNet.Tensors.Tests.Parity;
 /// <remarks>
 /// <para>
 /// Every run checks that the two loss curves agree, because a timing is meaningless if the two sides are not
-/// doing the same arithmetic. Then:
+/// doing the same arithmetic. Each side is timed at its best: PyTorch over every execution mode it offers (eager,
+/// channels_last, whole-step CUDA graph, every torch.compile mode, every CPU thread count) and Tensors over eager
+/// and its compiled plan, each mode checked against the loss curve; the step ratio is best over best. Then:
 /// </para>
 /// <list type="bullet">
 /// <item><b>Ratchet</b> (every PR): the ours/theirs step-time ratio may not rise above the ratio recorded for
@@ -57,23 +59,24 @@ public abstract class HeadToHeadTestBase
             _output.WriteLine($"  {phase,-10} {theirs,10:F3} {ours,10:F3} {ours / theirs,7:F2}");
         }
 
+        _output.WriteLine("  (eager, synchronised at every phase boundary: reported, not gated)");
+        foreach (var (side, sideResult) in new[] { ("torch", r.Torch), ("ours", r.Tensors) })
+        {
+            _output.WriteLine($"  {side} modes (whole step, min ms; best = {sideResult.BestMode}):");
+            foreach (var m in sideResult.Modes)
+                _output.WriteLine($"    {m.Name,-40} {m.Status,-8} {(m.Step is null ? "" : m.Step.MinMs.ToString("F3"))} {m.Reason}");
+        }
+
+        _output.WriteLine($"  best vs best: ours {r.Tensors.Best.MinMs:F3} ms ({r.Tensors.BestMode}), torch {r.Torch.Best.MinMs:F3} ms ({r.Torch.BestMode})");
         _output.WriteLine($"  step ratio (min/min, gated) {r.StepRatio:F3}; median/median {r.MedianStepRatio:F3}; run noise {r.NoiseBand:P1}");
     }
 
     private static void AssertLossesAgree(HeadToHeadNetworkHarness.CaseResult r)
     {
-        int n = Math.Min(r.Torch.Losses.Count, r.Tensors.Losses.Count);
-        Assert.True(n > 0, "Neither side recorded a loss curve.");
-        for (int i = 0; i < n; i++)
-        {
-            double theirs = r.Torch.Losses[i], ours = r.Tensors.Losses[i];
-            // The first loss sees identical weights and data, so only the reduction order differs; later steps
-            // compound that through SGD, so their tolerance is looser.
-            double tolerance = i == 0 ? 1e-4 : 1e-3;
-            Assert.True(Math.Abs(ours - theirs) <= tolerance * Math.Max(1.0, Math.Abs(theirs)),
-                $"{r.Network}: loss at step {i} disagrees (torch {theirs:G9}, ours {ours:G9}). The two sides are not " +
-                "training the same network, so their timings are not comparable.");
-        }
+        string? mismatch = HeadToHeadNetworkHarness.LossMismatch(r.Tensors.Losses, r.Torch.Losses);
+        Assert.True(mismatch is null,
+            $"{r.Network}: {mismatch} (ours against torch). The two sides are not training the same network, so " +
+            "their timings are not comparable.");
     }
 
     private protected void AssertRatchet(HeadToHeadNetworkHarness.CaseResult r)
@@ -83,6 +86,10 @@ public abstract class HeadToHeadTestBase
         string key = $"{r.Network}:{r.Device}";
         using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, BaselineFile)));
         double band = doc.RootElement.GetProperty("noiseFloor").GetDouble();
+        int baselineProtocol = doc.RootElement.TryGetProperty("protocol", out var protocolElement) ? protocolElement.GetInt32() : 1;
+        Assert.True(baselineProtocol == HeadToHeadNetworkHarness.Protocol,
+            $"{BaselineFile} was recorded under parity protocol {baselineProtocol}; the harness measures protocol " +
+            $"{HeadToHeadNetworkHarness.Protocol}. Ratios under different protocols mean different things.");
 
         bool recorded = doc.RootElement.GetProperty("cases").TryGetProperty(key, out var perMachine)
                         && perMachine.TryGetProperty(r.MachineKey, out var baselineElement);
@@ -103,9 +110,9 @@ public abstract class HeadToHeadTestBase
     {
         const double band = 0.05;
         Assert.True(r.StepRatio <= 1 + band,
-            $"{r.Network} on {r.Device}: Tensors takes {r.StepRatio:F3}x PyTorch's step time " +
-            $"(fastest step {r.Tensors.Phases["step"].MinMs:F3} ms against {r.Torch.Phases["step"].MinMs:F3} ms). " +
-            "Slowest phase: " + r.Tensors.Phases.Where(p => p.Key != "step")
+            $"{r.Network} on {r.Device}: Tensors takes {r.StepRatio:F3}x PyTorch's step time at its best " +
+            $"(ours {r.Tensors.Best.MinMs:F3} ms {r.Tensors.BestMode}, torch {r.Torch.Best.MinMs:F3} ms {r.Torch.BestMode}). " +
+            "Slowest eager phase: " + r.Tensors.Phases.Where(p => p.Key != "step")
                 .OrderByDescending(p => p.Value.MinMs / r.Torch.Phases[p.Key].MinMs)
                 .Select(p => $"{p.Key} {p.Value.MinMs / r.Torch.Phases[p.Key].MinMs:F2}x").First());
     }
