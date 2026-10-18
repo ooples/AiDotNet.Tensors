@@ -68,12 +68,25 @@ internal static class VulkanTorchParityElementwiseKernels
 
     private const string Int64Extension = "#extension GL_ARB_gpu_shader_int64 : require\n";
 
-    private static string Head(bool int64, int localSize = LocalSize)
-        => "#version 450\n" + (int64 ? Int64Extension : "") + "layout(local_size_x = " + localSize + ") in;\n";
+    // SPIR-V SignedZeroInfNanPreserve (execution mode 4461, capability 4466, SPV_KHR_float_controls) for 64-bit floats.
+    // Without it a driver may compile double arithmetic assuming no infinity or NaN ever occurs: on an RTX 3080's Vulkan
+    // driver the library's overflow-to-infinity and NaN returns (built from bit patterns) were folded away, so I0(800)
+    // came out as its scaled value times 800 and K(0) as 0 (#1411).
+    private const string PreserveDoubleSpecialsMode = "#extension GL_EXT_spirv_intrinsics : require\n"
+        + "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4466], 4461, 64);\n";
+
+    /// <summary>Set by <see cref="VulkanDevice"/> from the device's float-controls properties: the double kernels then
+    /// request SignedZeroInfNanPreserve for 64-bit floats.</summary>
+    internal static bool PreserveDoubleSpecials { get; set; }
+
+    private static string Head(bool int64, int localSize = LocalSize, bool preserveDoubleSpecials = false)
+        => "#version 450\n" + (int64 ? Int64Extension : "")
+            + (preserveDoubleSpecials && PreserveDoubleSpecials ? PreserveDoubleSpecialsMode : "")
+            + "layout(local_size_x = " + localSize + ") in;\n";
 
     // A kernel that computes in double: header, declarations, the double library, then the body.
     private static string DoubleShader(string declarations, string body, bool special, bool int64 = false)
-        => Head(int64) + declarations + VulkanTorchParityMath.Tables + VulkanTorchParityMath.ElementaryFunctions
+        => Head(int64, preserveDoubleSpecials: true) + declarations + VulkanTorchParityMath.Tables + VulkanTorchParityMath.ElementaryFunctions
             + Conversions + (special ? VulkanTorchParityMath.SpecialFunctionsSource : "") + VulkanTorchParityMath.Doubles(body);
 
     // Buffer values cross between float and double by bit pattern: D widens exactly and F rounds to nearest even,
