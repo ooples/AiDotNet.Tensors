@@ -72,6 +72,7 @@ public sealed partial class CudaBackend
         public ulong State;
         public fixed int Len[StepIoMaxInputs];
         public int Vector;
+        public ulong Guard;
     }
 
     // Learning rates a slot's table holds: one per step number a replay may run as while earlier replays' finiteness
@@ -308,6 +309,7 @@ public sealed partial class CudaBackend
                 args.LrTable0 = (ulong)_lrTableDevice[0].ToInt64();
                 args.LrTable1 = (ulong)_lrTableDevice[1].ToInt64();
                 args.DynScalars = (ulong)_dynamicScalars.Handle.ToInt64();
+                args.Guard = (ulong)(_guard?.Handle.ToInt64() ?? 0);
             }
             void** launchArgs = stackalloc void*[1];
             launchArgs[0] = &args;

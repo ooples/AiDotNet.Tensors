@@ -86,6 +86,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public int NonFiniteStepsSkipped;
         public int OptimizerStep;
         public bool UpdateCapturedInGraph;   // the optimizer update ran inside the step graph (step I/O)
+        public bool UpdateCapturedBeforeClip;   // ... at the step before clipOnFromStep
+        public int CheckpointStep;   // the step count an optimizer checkpoint (export / save) records
     }
 
     private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue)
@@ -135,7 +137,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             {
                 FeedBatch(x, y, s);
                 if (s == clipOffFromStep) plan.SetMaxGradNorm(0);
-                if (s == clipOnFromStep) plan.SetMaxGradNorm(0.5);
+                if (s == clipOnFromStep)
+                {
+                    run.UpdateCapturedBeforeClip = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete) is not null;
+                    plan.SetMaxGradNorm(0.5);
+                }
                 if (s == nonFiniteStep)
                 {
                     // One non-finite input makes every gradient non-finite: the whole step must be discarded.
@@ -191,6 +198,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             run.ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead;
             run.LastGradients = lastGradients;
             run.StepStates = states;
+            // Read before anything else resolves the plan's step count: a checkpoint must resolve it itself.
+            run.CheckpointStep = concrete.CaptureFusedOptimizerCheckpoint()?.OptimizerStep ?? -1;
             run.NonFiniteStepsSkipped = plan.NonFiniteStepsSkipped;
             run.OptimizerStep = concrete.OptimizerStep;
             run.UpdateCapturedInGraph = typeof(CompiledTrainingPlan<float>)
@@ -315,6 +324,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
             Assert.True(captured.UpdateCapturedInGraph, "the replayed graph does not run the optimizer update (step I/O)");
             Assert.Equal(eager.OptimizerStep, captured.OptimizerStep);
+            Assert.Equal(eager.CheckpointStep, captured.CheckpointStep);
             Assert.Equal(eager.NonFiniteStepsSkipped, captured.NonFiniteStepsSkipped);
             for (int s = 0; s < Steps; s++)
             {
@@ -347,6 +357,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
             var eager = Train(gpu, capture: false, clipOnFromStep: 6);
             var captured = Train(gpu, capture: true, clipOnFromStep: 6);
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+            Assert.True(captured.UpdateCapturedBeforeClip, "the update was not captured into the graph before clipping was switched on");
             Assert.False(captured.UpdateCapturedInGraph, "a graph whose update skips clipping kept replaying after clipping was switched on");
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),

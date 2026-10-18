@@ -38,6 +38,7 @@ struct StepIoArgs
     unsigned long long state;           // device unsigned int[4]: replays done, finite steps applied, fault, unused
     int len[SIO_MAX];                   // the inputs' float counts
     int vector;                         // 1: every address is 16-byte aligned, copy float4 units
+    unsigned long long guard;           // device double: the captured update's finiteness guard, or 0
 };
 
 // grid-stride over every input float; block 0 thread 0 also resolves the learning rate.
@@ -67,8 +68,13 @@ extern ""C"" __global__ __launch_bounds__(256) void step_io_prologue(StepIoArgs 
         int idx = step - table[0];
         int n = table[1];
         // The host's table always covers the device's step number; one that does not is a bookkeeping fault, reported
-        // through the published results rather than run with a neighbouring step's rate.
-        if (idx < 0 || idx >= n) { state[2] = 1u; idx = idx < 0 ? 0 : n - 1; }
+        // through the published results. The step is not run with a neighbouring step's rate: the guard the gradients'
+        // sum of squares accumulates onto is poisoned, so the update kernels skip it and the epilogue does not count it.
+        if (idx < 0 || idx >= n) {
+            state[2] = 1u;
+            idx = idx < 0 ? 0 : n - 1;
+            if (a.guard != 0) *(double*)a.guard = __longlong_as_double(0x7ff8000000000000LL);
+        }
         float* dyn = (float*)a.dynScalars;
         dyn[0] = ((const float*)(table + 2))[idx];
         dyn[1] = (float)step;
@@ -95,6 +101,9 @@ extern ""C"" __global__ __launch_bounds__(32) void step_io_epilogue(
     volatile StepIoResults* results = (volatile StepIoResults*)resultsAddress;
     unsigned int slot = state[0] & 1u;
     for (int i = threadIdx.x; i < lossCount; i += 32) results->loss[slot][i] = loss[i];
+    // Every lane's loss writes reach the host before lane 0 publishes the progress that says they are there.
+    __threadfence_system();
+    __syncwarp();
     if (threadIdx.x == 0) {
         double sum = guard != 0 ? *guard : 0.0;
         if (guard != 0) *guard = 0.0;

@@ -723,15 +723,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private void DisposeStepIo()
     {
+        // A disposed engine's context took the page-locked results with it: nothing in them can be read any more.
+        bool live = _engine is Engines.DirectGpuTensorEngine gte
+            && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true };
         if (_capturedOptimizer is not null && _stepIo is not null)
         {
             // Land the counter before the published state goes; later steps run the eager update from it.
-            ResolveCapturedOptimizer();
+            if (live) ResolveCapturedOptimizer();
             _capturedOptimizer = null;
         }
-        // A loss armed from the step I/O reads its page-locked results: land it before they go.
+        // A loss armed from the step I/O reads its page-locked results: land it before they go, or drop it.
         if (_stepIo is not null && _lossOutput.GetBackingArrayForCacheLookupUnsafe() is { } lossKey)
-            Helpers.HostSync.TryMaterialize(lossKey);
+        {
+            if (live) Helpers.HostSync.TryMaterialize(lossKey);
+            else if (_stepIoLossCaptured) Helpers.HostSync.Remove(lossKey);
+        }
         _stepIo?.Dispose();
         _stepIo = null;
         _stepIoLeaves = null;
@@ -7205,6 +7211,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (_optimizerUpdate is null || _optimizerRuntimeState is null)
             return null;
+        // Captured replays advance the step count on the device only: land it, and every in-flight update, first.
+        ResolveDeferredFiniteness();
 
         var rt = _optimizerRuntimeState;
         var schedules = new FusedLrScheduleCheckpoint[rt.Schedules.Length];

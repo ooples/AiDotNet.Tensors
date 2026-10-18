@@ -14144,11 +14144,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     /// <summary>
-    /// Sum of squares of every element of every tensor, in one launch, written as a double to
-    /// <paramref name="sumOfSquares"/> (at least two float slots). Accumulated in double, so it is finite exactly when
-    /// every element is: one reduction serves the global-norm clip and the non-finite-gradient check.
-    /// </summary>
-    /// <summary>
     /// <see cref="MultiTensorSumOfSquares"/> over a table the caller built and owns (captured step graphs). With
     /// <paramref name="zeroFirst"/> false the sum accumulates onto <paramref name="sumOfSquares"/>, which the caller keeps
     /// at zero between uses (a captured step's epilogue resets it), saving the graph a memset node.
@@ -14168,6 +14163,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorReductionMaxBlocks), MultiTensorChunk, args);
     }
 
+    /// <summary>
+    /// Sum of squares of every element of every tensor, in one launch, written as a double to
+    /// <paramref name="sumOfSquares"/> (at least two float slots). Accumulated in double, so it is finite exactly when
+    /// every element is: one reduction serves the global-norm clip and the non-finite-gradient check.
+    /// </summary>
     public unsafe void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
     {
         if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
