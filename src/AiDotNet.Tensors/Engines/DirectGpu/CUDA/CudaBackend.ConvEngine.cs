@@ -194,8 +194,10 @@ public sealed partial class CudaBackend
         if (outputs <= 0 || kTotal <= 0 || outputs > int.MaxValue || kTotal > int.MaxValue
             || (long)batch * outChannels * outHeight * outWidth > int.MaxValue)
             return false;
-        bool phase = (strideH > 1 || strideW > 1) && dilationH == 1 && dilationW == 1
-                     && kernelH >= strideH && kernelW >= strideW;
+        // Strided and undilated: the sub-pixel phase kernel. A kernel smaller than its stride (the 1x1 stride-2
+        // downsample) leaves some phases without taps; those phases' blocks write zeros, and the others compute only the
+        // pixels that receive a gradient (the tap-uniform path computed all of them, three quarters to zero).
+        bool phase = (strideH > 1 || strideW > 1) && dilationH == 1 && dilationW == 1;
         using var context = PushContext();
         // Every column tile reads all of its rows' weights; in the forward layout each lane of those reads is its own
         // 32-byte sector (consecutive ci are kH*kW floats apart). Relaying the weights out tap-major (one pass over
@@ -232,8 +234,8 @@ public sealed partial class CudaBackend
                 long units = 0;
                 for (int ph = 0; ph < strideH; ph++)
                     for (int pw = 0; pw < strideW; pw++)
-                        units += ((long)outChannels * ((kernelH - ph + strideH - 1) / strideH) * ((kernelW - pw + strideW - 1) / strideW)
-                                  + slice - 1) / slice;
+                        units += Math.Max(1L, ((long)outChannels * ((kernelH - ph + strideH - 1) / strideH)
+                                                * ((kernelW - pw + strideW - 1) / strideW) + slice - 1) / slice);   // a tapless phase: one zero-writing layer
                 return units;
             }
             // No split while the phases fill the device; else one tap's channels per slice, halved (to multiples of
@@ -246,8 +248,12 @@ public sealed partial class CudaBackend
                        && pkPerSplit / 2 % ConvEngineTileK == 0)
                     pkPerSplit /= 2;
             }
-            if (!TryTapMajor(ptilesN)) return false;
+            // One grid layer per (phase, split), and CUDA caps gridDim.z at 65535: a 1x1 kernel over a very large stride
+            // (256x256: 65536 tapless-or-not phases) would fail to launch, so leave it to the split-K fallback. Checked
+            // before TryTapMajor, which already launches the weight relayout.
             long gridZ = PhaseUnits(pkPerSplit);
+            if (gridZ > 65535) return false;
+            if (!TryTapMajor(ptilesN)) return false;
             bool split = gridZ > phases;
             int maxSplits = (int)((phaseK + pkPerSplit - 1) / pkPerSplit);
             if (!_kernelCache.TryGetValue((ptile == 128 ? "conv2d_dgrad_ce128_phase" : "conv2d_dgrad_ce64_phase")
