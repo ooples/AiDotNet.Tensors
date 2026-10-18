@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // Row-major FP32 GEMMs for narrow products (see CudaSkinnyGemmKernels): Gemm, MatMulTransposed and MatMulTransposedA
 // try these before cuBLAS. Strict fp32 and deterministic (fixed summation order, no atomics on values), so they serve
 // GpuDeterminism as well as the default mode.
-public sealed partial class CudaBackend : IGemmBiasActivationBackend
+public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBiasGradientBackend
 {
     // AIDOTNET_SKINNY_GEMM=0: every GEMM goes to cuBLAS as before.
     private static readonly bool SkinnyGemmEnabled =
@@ -47,16 +47,54 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend
         return true;
     }
 
+    // wgrad_tile_tn takes reductions of [WgradTileMinReduce, SkinnyTnMinReduce) rows; skinny_gemm_tn the longer ones.
+    private const int WgradTileMinReduce = 64, SkinnyTnMinReduce = 512;
+    // wgrad_tile_tn's compiled layout: one 16x16 output tile per 256-thread block.
+    private const int WgradTileSize = 16, WgradTileBlockThreads = 256;
+
     /// <summary>
-    /// <c>C[M,N] = alpha · A[K,M]ᵀ · B[K,N] + beta · C</c> through skinny_gemm_tn, for a long reduction (K ≥ 512)
-    /// into a small output (M, N ≤ 256): a weight gradient. Its split partials go in the calling thread's cuBLAS
-    /// workspace, which cuBLAS and cuBLASLt use only in this stream's order. False -- nothing launched -- when the
-    /// shape, alignment, workspace or kernel does not qualify; the caller then runs cuBLAS.
+    /// <c>C[M,N] = alpha * A[K,M]ᵀ * B[K,N] + beta * C</c> through wgrad_tile_tn for a reduction of 64..511 rows with
+    /// M, N &lt;= 256 (multiples of 4, 16-byte aligned): one launch where cuBLASLt ran a GEMM and a split-K reduce.
+    /// False -- nothing launched -- for any other shape.
+    /// </summary>
+    internal unsafe bool TryWgradTile(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta,
+        IGpuBuffer? bias = null, float biasBeta = 0f)
+    {
+        if (!SkinnyGemmEnabled || K < WgradTileMinReduce || K >= SkinnyTnMinReduce || M <= 0 || N <= 0
+            || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
+            || (bias is not null && (bias.Size < N || bias.Handle == C.Handle || bias.Handle == B.Handle || bias.Handle == A.Handle))
+            || !_kernelCache.TryGetValue("wgrad_tile_tn", out var wgradKernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr a = A.Handle, b = B.Handle, c = C.Handle, bi = bias?.Handle ?? IntPtr.Zero;
+        int m = M, n = N, k = K;
+        float al = alpha, be = beta, bb = biasBeta;
+        void** args = stackalloc void*[10];
+        args[0] = &a; args[1] = &b; args[2] = &c; args[3] = &m; args[4] = &n; args[5] = &k; args[6] = &al; args[7] = &be;
+        args[8] = &bi; args[9] = &bb;
+        // One more row of blocks for the bias sums.
+        LaunchKernel2D(wgradKernel, (uint)((N + WgradTileSize - 1) / WgradTileSize),
+            (uint)((M + WgradTileSize - 1) / WgradTileSize + (bias is null ? 0 : 1)), 1, WgradTileBlockThreads, 1, args);
+        return true;
+    }
+
+    // A linear layer's dW = Aᵀ·dY with its bias gradient (dY's column sums) in the same wgrad_tile_tn launch.
+    bool IWeightBiasGradientBackend.TryWeightAndBiasGradient(IGpuBuffer a, IGpuBuffer gradOutput, IGpuBuffer gradWeight,
+        IGpuBuffer gradBias, int k, int n, int m, float betaW, float betaB)
+        => TryWgradTile(a, gradOutput, gradWeight, k, n, m, 1f, betaW, gradBias, betaB);
+
+    /// <summary>
+    /// <c>C[M,N] = alpha · A[K,M]ᵀ · B[K,N] + beta · C</c> into a small output (M, N ≤ 256): a weight gradient. A reduction
+    /// of 64 up to (not including) 512 rows runs wgrad_tile_tn (<see cref="TryWgradTile"/>, no workspace); 512 or more runs
+    /// skinny_gemm_tn, whose split partials go in the calling thread's cuBLAS workspace, which cuBLAS and cuBLASLt use only
+    /// in this stream's order. False -- nothing launched -- when the shape, alignment, workspace or kernel does not
+    /// qualify; the caller then runs cuBLAS.
     /// </summary>
     internal unsafe bool TrySkinnyGemmTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
         float alpha, float beta)
     {
-        if (!SkinnyGemmEnabled || K < 512 || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow
+        if (K < SkinnyTnMinReduce) return TryWgradTile(A, B, C, M, N, K, alpha, beta);
+        if (!SkinnyGemmEnabled || K < SkinnyTnMinReduce || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow
             || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
             || !_kernelCache.TryGetValue("skinny_gemm_tn", out var kernel))
             return false;

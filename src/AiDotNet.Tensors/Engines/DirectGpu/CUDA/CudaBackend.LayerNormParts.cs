@@ -7,6 +7,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColumnSumBackend, IBroadcastReducedBackend,
     ISumAroundKeptBackend
 {
+    // column_sum_small serves matrices up to this many rows (32 row lanes, so at most 32 loads per thread); taller ones
+    // keep the chunked partial/finish pair, which spreads the rows over ~128 blocks.
+    private const int ColumnSumSmallMaxRows = 1024;
+
     int IColumnSumBackend.ColumnSumScratchFloats(int rows, int cols) =>
         rows <= 0 || cols <= 0 ? 0 : checked(LayerNormAffineGradientChunks(rows, cols) * cols);
 
@@ -14,8 +18,19 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         int rows, int cols, bool add)
     {
         if (!IsAvailable || rows <= 0 || cols <= 0 || input.Size < (long)rows * cols || output.Size < cols
-            || output.Handle == input.Handle
-            || !_kernelCache.TryGetValue("column_sum_partial", out var partialKernel)
+            || output.Handle == input.Handle)
+            return false;
+        if (rows <= ColumnSumSmallMaxRows && _kernelCache.TryGetValue("column_sum_small", out var smallKernel))
+        {
+            using var __ = PushContext();
+            IntPtr sx = input.Handle, so = output.Handle;
+            int sr = rows, sc = cols, sad = add ? 1 : 0;
+            void** sargs = stackalloc void*[5];
+            sargs[0] = &sx; sargs[1] = &so; sargs[2] = &sr; sargs[3] = &sc; sargs[4] = &sad;
+            LaunchKernel2D(smallKernel, (uint)((cols + 31) / 32), 1, 32, 32, sargs);
+            return true;
+        }
+        if (!_kernelCache.TryGetValue("column_sum_partial", out var partialKernel)
             || !_kernelCache.TryGetValue("column_sum_finish", out var finishKernel))
             return false;
         int chunks = LayerNormAffineGradientChunks(rows, cols);
@@ -94,6 +109,57 @@ public sealed partial class CudaBackend : ILayerNormBackwardPartsBackend, IColum
         int wanted = Math.Max(1, 128 / columnTiles);
         int most = Math.Max(1, (rows + 31) / 32);
         return Math.Min(wanted, most);
+    }
+
+    // layernorm_backward_rows holds each row in registers: at most 32 lanes x 16 columns.
+    private const int LayerNormRowBackwardMaxColumns = 512;
+
+    // Chunks for layernorm_backward_rows: one row per warp (8 per block) until there are ~128 blocks, then more rows
+    // per chunk.
+    private static int LayerNormRowBackwardChunks(int rows) => Math.Max(1, Math.Min(128, (rows + 7) / 8));
+
+    int ILayerNormBackwardPartsBackend.LayerNormRowBackwardScratchFloats(int rows, int cols) =>
+        rows <= 0 || cols <= 0 || cols > LayerNormRowBackwardMaxColumns ? 0
+            : checked(2 * LayerNormRowBackwardChunks(rows) * cols);
+
+    unsafe bool ILayerNormBackwardPartsBackend.TryLayerNormRowBackward(IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer gamma, IGpuBuffer mean, IGpuBuffer variance, IGpuBuffer scratch, IGpuBuffer gradInput,
+        IGpuBuffer gradGamma, IGpuBuffer gradBeta, int rows, int cols, float epsilon, bool addInput, bool addGamma,
+        bool addBeta)
+    {
+        long n = (long)rows * cols;
+        if (!IsAvailable || rows <= 0 || cols <= 0 || cols > LayerNormRowBackwardMaxColumns
+            || gradOutput.Size < n || input.Size < n || gradInput.Size < n || gamma.Size < cols
+            || mean.Size < rows || variance.Size < rows || gradGamma.Size < cols || gradBeta.Size < cols
+            || gradGamma.Handle == gradBeta.Handle
+            || !_kernelCache.TryGetValue("layernorm_grad_params_finish_warp", out var rowsFinishKernel))
+            return false;
+        IntPtr rowsKernel;
+        bool found = cols <= 64 ? _kernelCache.TryGetValue("layernorm_backward_rows2", out rowsKernel)
+            : cols <= 128 ? _kernelCache.TryGetValue("layernorm_backward_rows4", out rowsKernel)
+            : cols <= 256 ? _kernelCache.TryGetValue("layernorm_backward_rows8", out rowsKernel)
+            : _kernelCache.TryGetValue("layernorm_backward_rows16", out rowsKernel);
+        int chunks = LayerNormRowBackwardChunks(rows);
+        if (!found || scratch.Size < 2L * chunks * cols) return false;
+        int rowsPerChunk = (rows + chunks - 1) / chunks;
+
+        using var _ = PushContext();
+        IntPtr g = gradOutput.Handle, x = input.Handle, ga = gamma.Handle, mu = mean.Handle, va = variance.Handle,
+            dx = gradInput.Handle, part = scratch.Handle;
+        int r = rows, c = cols, rpc = rowsPerChunk, ai = addInput ? 1 : 0;
+        float eps = epsilon;
+        void** rargs = stackalloc void*[12];
+        rargs[0] = &g; rargs[1] = &x; rargs[2] = &ga; rargs[3] = &mu; rargs[4] = &va; rargs[5] = &eps;
+        rargs[6] = &dx; rargs[7] = &part; rargs[8] = &r; rargs[9] = &c; rargs[10] = &rpc; rargs[11] = &ai;
+        LaunchKernel(rowsKernel, (uint)chunks, DefaultBlockSize, rargs);
+
+        IntPtr gg = gradGamma.Handle, gb = gradBeta.Handle;
+        int ch = chunks, ag = addGamma ? 1 : 0, ab = addBeta ? 1 : 0;
+        void** fargs = stackalloc void*[7];
+        fargs[0] = &part; fargs[1] = &gg; fargs[2] = &gb; fargs[3] = &c; fargs[4] = &ch; fargs[5] = &ag; fargs[6] = &ab;
+        // One warp per column: 8 columns per 256-thread block.
+        LaunchKernel(rowsFinishKernel, (uint)((cols + 7) / 8), DefaultBlockSize, fargs);
+        return true;
     }
 
     int ILayerNormBackwardPartsBackend.LayerNormAffineGradientScratchFloats(int rows, int cols) =>

@@ -4,6 +4,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     public sealed partial class OpenClBackend : IGpuBufferViews
     {
         /// <inheritdoc/>
+        // A view is a sub-buffer object, created per view.
+        bool IGpuBufferViews.ViewsAreFreeAtAnyOffset => false;
+
+        /// <inheritdoc/>
         /// <remarks>
         /// An OpenCL sub-buffer: kernels address it like any buffer. The device fixes the alignment a sub-buffer
         /// origin needs (CL_DEVICE_MEM_BASE_ADDR_ALIGN), so an offset off that alignment yields null, as the contract

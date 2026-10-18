@@ -8,6 +8,10 @@ public sealed partial class WebGpuBackend : IGpuBufferViews
     internal const int ViewOffsetAlignment = 256;
 
     /// <inheritdoc/>
+    // Offsets must meet ViewOffsetAlignment.
+    bool IGpuBufferViews.ViewsAreFreeAtAnyOffset => false;
+
+    /// <inheritdoc/>
     /// <remarks>
     /// The view shares the parent's device buffer: bind groups bind only its byte range and reads, writes and copies
     /// start at its offset, so kernels and transfers address only its elements. An offset that is not a multiple of

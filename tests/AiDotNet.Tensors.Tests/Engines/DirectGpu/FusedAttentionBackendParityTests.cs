@@ -168,6 +168,111 @@ public sealed class FusedAttentionBackendParityTests
         for (int i = 0; i < expected.Length; i++) AssertClose(expected[i], actual[i], $"{what}[{i}]");
     }
 
+    /// <summary>
+    /// The packed layout MultiHeadAttentionPacked runs: q, k and v as views at column offsets 0, W and 2W of one row-major
+    /// [B * S, 3W] projection (row stride 3W), and dQ, dK, dV as views of a second such buffer (dQSpan) pre-filled with a
+    /// pattern. Every element of that gradient buffer must come out equal to the dense interleaved run's gradients, which
+    /// the reference check above already holds the backend to.
+    /// </summary>
+    private static void CheckPacked(IDirectGpuBackend backend)
+    {
+        var fused = Assert.IsAssignableFrom<IFusedAttentionBackend>(backend);
+        var views = Assert.IsAssignableFrom<IGpuBufferViews>(backend);
+        foreach (var (b, h, s, d, causal) in new[] { (2, 2, 9, 16, false), (1, 3, 6, 32, true) })
+        {
+            Assert.True(fused.SupportsFusedAttention(d));
+            int w = h * d, rowWidth = 3 * w, rows = b * s;
+            float[] x = Random(rows * rowWidth, 21 + d), dO = Random(rows * w, 22 + d);
+            float[] q = new float[rows * w], k = new float[rows * w], v = new float[rows * w];
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c < w; c++)
+                {
+                    q[r * w + c] = x[r * rowWidth + c];
+                    k[r * w + c] = x[r * rowWidth + w + c];
+                    v[r * w + c] = x[r * rowWidth + 2 * w + c];
+                }
+            var dense = new FusedAttentionParams
+            {
+                B = b, H = h, Sq = s, Sk = s,
+                Qb = (long)s * w, Qh = d, Qr = w, Kb = (long)s * w, Kh = d, Kr = w,
+                Vb = (long)s * w, Vh = d, Vr = w, Ob = (long)s * w, Oh = d, Or = w,
+                Scale = 1f / MathF.Sqrt(d), Causal = causal ? 1 : 0,
+            };
+            var packed = dense;
+            packed.Qb = packed.Kb = packed.Vb = (long)s * rowWidth;
+            packed.Qr = packed.Kr = packed.Vr = rowWidth;
+
+            using var qBuf = backend.AllocateBuffer(q);
+            using var kBuf = backend.AllocateBuffer(k);
+            using var vBuf = backend.AllocateBuffer(v);
+            using var dOBuf = backend.AllocateBuffer(dO);
+            using var oDense = backend.AllocateBuffer(Filled(rows * w));
+            using var lseDense = backend.AllocateBuffer(Filled(b * h * s));
+            using var dqDense = backend.AllocateBuffer(Filled(rows * w));
+            using var dkDense = backend.AllocateBuffer(Filled(rows * w));
+            using var dvDense = backend.AllocateBuffer(Filled(rows * w));
+            fused.FusedAttentionForward(qBuf, kBuf, vBuf, oDense, lseDense, null, dense, d);
+            fused.FusedAttentionBackward(qBuf, kBuf, vBuf, oDense, dOBuf, lseDense, null, dqDense, dkDense, dvDense, dense, d);
+
+            using var xBuf = backend.AllocateBuffer(x);
+            using var gBuf = backend.AllocateBuffer(Filled(rows * rowWidth));
+            using var oPacked = backend.AllocateBuffer(Filled(rows * w));
+            using var lsePacked = backend.AllocateBuffer(Filled(b * h * s));
+            IGpuBuffer View(IGpuBuffer whole, int start) => views.TryCreateView(whole, start, whole.Size - start)
+                ?? throw new InvalidOperationException("view refused");
+            using var qv = View(xBuf, 0);
+            using var kv = View(xBuf, w);
+            using var vv = View(xBuf, 2 * w);
+            using var dqv = View(gBuf, 0);
+            using var dkv = View(gBuf, w);
+            using var dvv = View(gBuf, 2 * w);
+            fused.FusedAttentionForward(qv, kv, vv, oPacked, lsePacked, null, packed, d);
+            fused.FusedAttentionBackward(qv, kv, vv, oPacked, dOBuf, lsePacked, null, dqv, dkv, dvv, packed, d, gBuf);
+
+            string what = $"packed B{b} H{h} S{s} D{d} causal={causal}";
+            float[] o = backend.DownloadBuffer(oDense), oP = backend.DownloadBuffer(oPacked);
+            for (int i = 0; i < o.Length; i++) AssertClose(o[i], oP[i], $"{what} o[{i}]");
+            float[] dq = backend.DownloadBuffer(dqDense), dk = backend.DownloadBuffer(dkDense), dv = backend.DownloadBuffer(dvDense);
+            float[] g = backend.DownloadBuffer(gBuf);
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c < w; c++)
+                {
+                    AssertClose(dq[r * w + c], g[r * rowWidth + c], $"{what} dq[{r},{c}]");
+                    AssertClose(dk[r * w + c], g[r * rowWidth + w + c], $"{what} dk[{r},{c}]");
+                    AssertClose(dv[r * w + c], g[r * rowWidth + 2 * w + c], $"{what} dv[{r},{c}]");
+                }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Cuda_PackedAttention_MatchesTheDenseLayout(bool deterministic)
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        bool prior = CpuParallelSettings.DeterministicReductions;
+        try
+        {
+            CpuParallelSettings.DeterministicReductions = deterministic;
+            CheckPacked(backend);
+        }
+        finally
+        {
+            CpuParallelSettings.DeterministicReductions = prior;
+        }
+    }
+
+    // The packed node runs on CUDA and HIP only (pointer-offset views); HIP runs the shared portable kernels, which this
+    // checks on OpenCL, whose sub-buffers take these offsets.
+    [SkippableFact]
+    public void OpenCl_PackedAttention_MatchesTheDenseLayout()
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        CheckPacked(backend);
+    }
+
     [SkippableFact]
     public void OpenCl_FusedAttention_MatchesReference()
     {
@@ -203,7 +308,8 @@ public sealed class FusedAttentionBackendParityTests
             in FusedAttentionParams p, int headDim)
             => PortableFusedAttention.Forward(_host, _launch, q, k, v, o, lse, mask, p, headDim);
         public void FusedAttentionBackward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer dO, IGpuBuffer lse,
-            IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim)
+            IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim,
+            IGpuBuffer? dQSpan = null)
             => PortableFusedAttention.Backward(_host, _launch, q, k, v, o, dO, lse, mask, dQ, dK, dV, p, headDim);
     }
 

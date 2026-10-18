@@ -7,6 +7,10 @@ public sealed partial class MetalBackend : IGpuBufferViews
     internal const int ViewOffsetAlignment = 256;
 
     /// <inheritdoc/>
+    // Offsets must meet ViewOffsetAlignment.
+    bool IGpuBufferViews.ViewsAreFreeAtAnyOffset => false;
+
+    /// <inheritdoc/>
     /// <remarks>
     /// The view binds the parent's MTLBuffer at a byte offset (every compute binding goes through
     /// <see cref="ScopedComputeEncoder.SetBuffer(MetalGpuBuffer, int)"/>, which applies it) and offsets its CPU-visible contents the
