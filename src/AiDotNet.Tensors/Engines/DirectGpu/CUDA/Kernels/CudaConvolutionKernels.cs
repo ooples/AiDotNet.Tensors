@@ -1145,7 +1145,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_phase_reduce(
     if (i >= count) return;
     int iw = i % W, ih = (i / W) % H;
     int rh = (ih + pH) % sH, rw = (iw + pW) % sW;
-    int units = (outC * ((kH - rh + sH - 1) / sH) * ((kW - rw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit;
+    int units = max(1, (outC * ((kH - rh + sH - 1) / sH) * ((kW - rw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit);
     float sum = 0.0f;
     for (int z = 0; z < units; z++) sum += partials[(long long)z * count + i];
     gradInput[i] = sum;
@@ -1651,7 +1651,7 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
 // wt[kh*kW + kw][co][ci] (conv2d_dgrad_weight_tapmajor), so those lanes read contiguous floats; else the forward layout
 // w[co][ci][kh][kw], where consecutive ci are kH*kW floats apart (a 1x1 kernel's layout is the same either way). The
 // host relays out only when enough column tiles reread the weights to pay for the copy. PHASE = false: unit stride or any stride with per-tile divisibility checks,
-// split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation, kernel >= stride): blockIdx.z is the
+// split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation): blockIdx.z is the
 // sub-pixel phase (rh, rw); the block's columns are that phase's pixels and only the taps kh = rh (mod sH),
 // kw = rw (mod sW) are visited, every one of which hits; phases write disjoint pixels. With split-K, each phase's K
 // is cut into ceil(K_phase / kPerSplit) slices (a 4-tap phase gets four times the slices of a 1-tap one, so every grid
@@ -1680,7 +1680,7 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         for (; phase < phases - 1; phase++)
         {
             const int ph = phase / sW, pw = phase - ph * sW;
-            const int units = (outC * ((kH - ph + sH - 1) / sH) * ((kW - pw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit;
+            const int units = max(1, (outC * ((kH - ph + sH - 1) / sH) * ((kW - pw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit);
             if (rem < units) break;
             rem -= units;
         }
