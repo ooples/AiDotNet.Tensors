@@ -4,6 +4,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 public sealed partial class VulkanBackend : IGpuBufferViews
 {
     /// <inheritdoc/>
+    // Offsets must be 256-byte multiples, and each view allocates a staging buffer.
+    bool IGpuBufferViews.ViewsAreFreeAtAnyOffset => false;
+
+    /// <inheritdoc/>
     /// <remarks>
     /// The view binds the parent's VkBuffer at a byte offset, so kernels, copies and transfers address only its range.
     /// An offset that is not a multiple of 256 bytes (the largest storage-buffer offset alignment a device may

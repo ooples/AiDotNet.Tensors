@@ -80,10 +80,12 @@ public class CompiledPackedAttentionTests : IDisposable
     }
 
     [SkippableTheory]
-    [InlineData(3, 0, 1, 2, true)]    // torch's order
-    [InlineData(3, 2, 0, 1, true)]    // any order of the three blocks
-    [InlineData(4, 0, 1, 3, false)]   // a fourth block nothing reads: not covered, kept composed
-    public void A_packed_qkv_attention_fuses_on_the_gpu_and_trains_like_the_cpu_plan(int blocks, int q, int k, int v, bool fuses)
+    [InlineData(3, 0, 1, 2, true, false)]    // torch's order
+    [InlineData(3, 0, 1, 2, true, true)]     // ... with deterministic reductions: the two-pass backward, no dQ memset
+    [InlineData(3, 2, 0, 1, true, false)]    // any order of the three blocks
+    [InlineData(4, 0, 1, 3, false, false)]   // a fourth block nothing reads: not covered, kept composed
+    public void A_packed_qkv_attention_fuses_on_the_gpu_and_trains_like_the_cpu_plan(int blocks, int q, int k, int v, bool fuses,
+        bool deterministic)
     {
         DirectGpuTensorEngine? gpu = null;
         try
@@ -97,7 +99,17 @@ public class CompiledPackedAttentionTests : IDisposable
         {
             var starts = new[] { q, k, v };
             var reference = Train(new CpuEngine(), onDevice: false, blocks, starts);
-            var device = Train(gpu!, onDevice: true, blocks, starts);
+            bool priorDeterministic = AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions;
+            Run device;
+            try
+            {
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = deterministic;
+                device = Train(gpu!, onDevice: true, blocks, starts);
+            }
+            finally
+            {
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = priorDeterministic;
+            }
             _output.WriteLine("steps: " + string.Join(", ", device.StepNames));
             _output.WriteLine("cpu  : " + string.Join(" ", reference.Losses.Select(l => l.ToString("G7"))));
             _output.WriteLine("gpu  : " + string.Join(" ", device.Losses.Select(l => l.ToString("G7"))));

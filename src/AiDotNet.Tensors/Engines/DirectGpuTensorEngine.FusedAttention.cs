@@ -164,7 +164,10 @@ public partial class DirectGpuTensorEngine
     {
         if (attention.SavedState is not { Length: >= 1 } state || state[0] is not FusedAttentionRecordedNode recorded
             || !recorded.Interleaved || attention.RecordingEngine is not DirectGpuTensorEngine engine || packed.Rank != 2
-            || engine.PlacementBackend is not (IGpuBufferViews and IFusedAttentionBackend))
+            // The blocks are viewed per launch at offsets of W floats: only where views are free device-pointer offsets
+            // (CUDA, HIP). Elsewhere a view can be refused for its offset's alignment or allocate; those keep the split.
+            || engine.PlacementBackend is not IGpuBufferViews { ViewsAreFreeAtAnyOffset: true }
+            || engine.PlacementBackend is not IFusedAttentionBackend)
             return null;
         var p0 = recorded.Params;
         int headDim = recorded.HeadDim, width = p0.H * headDim, rowWidth = packed._shape[1];
@@ -177,12 +180,24 @@ public partial class DirectGpuTensorEngine
         var outputShape = (int[])attention.Output._shape.Clone();
         var node = new FusedAttentionRecordedNode { Params = p, HeadDim = headDim, Interleaved = true };
 
+        // Views of the three blocks; on a refused view the ones already made are disposed. The caller disposes them after
+        // its launches.
         (IGpuBuffer Q, IGpuBuffer K, IGpuBuffer V) Blocks(IDirectGpuBackend backend, IGpuBuffer whole)
         {
             var views = backend as IGpuBufferViews ?? throw new NotSupportedException("The backend has no buffer views.");
-            IGpuBuffer Block(int start) => views.TryCreateView(whole, start, packedLength - start)
-                ?? throw new NotSupportedException("A packed attention block's view was refused.");
-            return (Block(qStart), Block(kStart), Block(vStart));
+            var made = new List<IGpuBuffer>(3);
+            try
+            {
+                foreach (int start in new[] { qStart, kStart, vStart })
+                    made.Add(views.TryCreateView(whole, start, packedLength - start)
+                        ?? throw new NotSupportedException("A packed attention block's view was refused."));
+                return (made[0], made[1], made[2]);
+            }
+            catch
+            {
+                foreach (var view in made) view.Dispose();
+                throw;
+            }
         }
 
         return new LazyNode<float>(LazyNodeType.Custom, "MultiHeadAttentionPacked", new[] { packed }, attention.Output,
@@ -195,6 +210,9 @@ public partial class DirectGpuTensorEngine
                     Gpu.GpuTensorRole.Intermediate, ownsBuffer: true);
                 using var x = gpu.GetOrAllocateBuffer(backend, packed);
                 var (q, k, v) = Blocks(backend, x.Buffer);
+                using var qView = q;
+                using var kView = k;
+                using var vView = v;
                 var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
                 bool ownsResult = true;
                 try
@@ -252,7 +270,13 @@ public partial class DirectGpuTensorEngine
             if (target is null) { fresh = AllocateFullyWrittenOutputBuffer(backend, packed.Length); ownsFresh = true; }
             var gradBuffer = target ?? fresh.Buffer;
             var (q, k, v) = blocks(backend, x.Buffer);
+            using var qView = q;
+            using var kView = k;
+            using var vView = v;
             var (dq, dk, dv) = blocks(backend, gradBuffer);
+            using var dqView = dq;
+            using var dkView = dk;
+            using var dvView = dv;
             fused.FusedAttentionBackward(q, k, v, o.Buffer, dO.Buffer, l.Buffer, null, dq, dk, dv, p, headDim, gradBuffer);
             if (into is not null && target is not null)
             {
