@@ -3,6 +3,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed partial class CudaBackend : IGpuBufferViews
 {
     /// <inheritdoc/>
+    // A view is the parent's device pointer plus the offset.
+    bool IGpuBufferViews.ViewsAreFreeAtAnyOffset => true;
+
+    /// <inheritdoc/>
     IGpuBuffer? IGpuBufferViews.TryCreateView(IGpuBuffer parent, int elementOffset, int elementCount)
     {
         if (parent is null || parent.Handle == IntPtr.Zero) return null;

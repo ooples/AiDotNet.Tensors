@@ -94,6 +94,12 @@ public class CudaSkinnyGemmTests
     [InlineData(256, 256, 4096)]   // 32 tiles, the most the per-thread counters hold
     [InlineData(4, 8, 513)]        // a partial tile and a reduction that is not a multiple of the 32-row chunk
     [InlineData(36, 68, 1000)]
+    [InlineData(64, 192, 256)]     // a 256-row batch's weight gradients: wgrad_tile_tn, one launch
+    [InlineData(64, 64, 256)]
+    [InlineData(128, 64, 256)]
+    [InlineData(256, 256, 511)]    // the longest reduction it takes, a partial last chunk
+    [InlineData(4, 8, 64)]         // the shortest, one partial tile
+    [InlineData(36, 68, 100)]      // partial tiles both ways
     public void SkinnyGemmTransposedA_EqualsTheReference(int m, int n, int k)
     {
         using var backend = new CudaBackend();
@@ -108,6 +114,41 @@ public class CudaSkinnyGemmTests
                 $"skinny_gemm_tn declined {m}x{n}x{k}");
             AssertClose(backend.DownloadBuffer(cBuf), i => TransposedAReference(a, b, c0, m, n, k, alpha, beta, i),
                 $"{m}x{n}x{k} alpha={alpha} beta={beta}");
+        }
+    }
+
+    /// <summary>
+    /// A linear layer's weight and bias gradients in one wgrad_tile_tn launch (IWeightBiasGradientBackend): dW = Aᵀ·dY
+    /// and db = dY's column sums, each overwritten (NaN sentinel) or added to, with several row tiles of dW (only the first
+    /// row of blocks writes the bias) and partial column tiles.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(64, 192, 256)]
+    [InlineData(128, 64, 256)]
+    [InlineData(36, 68, 100)]
+    [InlineData(4, 8, 64)]
+    public void WeightAndBiasGradient_EqualsTheReference(int m, int n, int k)
+    {
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        var fused = (AiDotNet.Tensors.Engines.DirectGpu.IWeightBiasGradientBackend)backend;
+        float[] a = Fill(k * m, 7), dy = Fill(k * n, 8), w0 = Fill(m * n, 9), b0 = Fill(n, 10);
+        using var aBuf = backend.AllocateBuffer(a);
+        using var dyBuf = backend.AllocateBuffer(dy);
+        foreach (bool add in new[] { false, true })
+        {
+            using var wBuf = backend.AllocateBuffer(add ? w0 : Enumerable.Repeat(float.NaN, m * n).ToArray());
+            using var bBuf = backend.AllocateBuffer(add ? b0 : Enumerable.Repeat(float.NaN, n).ToArray());
+            float beta = add ? 1f : 0f;
+            Assert.True(fused.TryWeightAndBiasGradient(aBuf, dyBuf, wBuf, bBuf, m, n, k, beta, beta), $"declined {m}x{n}x{k}");
+            AssertClose(backend.DownloadBuffer(wBuf), i => TransposedAReference(a, dy, w0, m, n, k, 1f, beta, i),
+                $"dW {m}x{n}x{k} add={add}");
+            AssertClose(backend.DownloadBuffer(bBuf), c =>
+            {
+                double s = add ? b0[c] : 0, bound = add ? Math.Abs(b0[c]) : 0;
+                for (int r = 0; r < k; r++) { s += dy[r * n + c]; bound += Math.Abs(dy[r * n + c]); }
+                return (s, bound);
+            }, $"db {m}x{n}x{k} add={add}");
         }
     }
 
@@ -162,6 +203,7 @@ public class CudaSkinnyGemmTests
     [InlineData("skinny_gemm_m16", 256)]
     [InlineData("skinny_gemm_m8", 256)]
     [InlineData("skinny_gemm_tn", 256)]
+    [InlineData("wgrad_tile_tn", 256)]
     public void SkinnyGemmKernels_KeepTheirAccumulatorsInRegisters(string kernel, int blockThreads)
     {
         using var backend = new CudaBackend();

@@ -313,7 +313,10 @@ public sealed class CudaTunedKernelTests
             backend.Softmax(inPlace, inPlace, rows, n);
             backend.Synchronize();
             AssertClose(backend.DownloadBuffer(viaReference), backend.DownloadBuffer(inPlace), x.Length, "in-place softmax");
-            Assert.Empty(backend.SoftmaxSlot.CachedDecisions);
+            // No decision that came from timing candidates. A device with a shipped profile (cuda:sm75 has one) still
+            // caches the profile's choice, which measures nothing, so "no decision at all" was the wrong contract.
+            Assert.DoesNotContain(backend.SoftmaxSlot.CachedDecisions, d => d.Reason is TunedKernelDecisionReason.Tuned
+                or TunedKernelDecisionReason.ReferenceWon or TunedKernelDecisionReason.Inconclusive);
         }
         finally
         {

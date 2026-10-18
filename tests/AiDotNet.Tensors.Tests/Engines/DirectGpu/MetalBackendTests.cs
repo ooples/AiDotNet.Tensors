@@ -321,16 +321,16 @@ public class MetalBackendTests : IDisposable
 
         var result = _backend.DownloadBuffer(bufferB);
 
-        // Tanh(-10) ≈ -1, Tanh(0) = 0, Tanh(10) ≈ 1
-        Assert.True(result[0] < -0.999f); // tanh(-10) ≈ -1
-        Assert.Equal(0, result[2], precision: 5); // tanh(0) = 0
-        Assert.True(result[4] > 0.999f); // tanh(10) ≈ 1
-
-        // All values should be in (-1, 1)
-        foreach (var v in result)
+        // Each element against tanh in double. tanh(+-10) = +-0.99999999588, which rounds to exactly +-1.0f in fp32, so
+        // the closed interval [-1, 1] is the right range check; the old open one failed every correct kernel (first run
+        // on an Apple GPU).
+        for (int i = 0; i < input.Length; i++)
         {
-            Assert.True(v > -1 && v < 1);
+            double expected = Math.Tanh(input[i]);
+            Assert.True(Math.Abs(result[i] - expected) <= 1e-6, $"tanh({input[i]}): got {result[i]:R}, expected {expected:R}");
+            Assert.True(result[i] >= -1f && result[i] <= 1f, $"tanh({input[i]}) = {result[i]:R} is outside [-1, 1]");
         }
+        Assert.Equal(0f, result[2]);
     }
 
     [SkippableFact]

@@ -44,6 +44,8 @@ public sealed class MetalShaderCompilationTests
         yield return ("Comparison", () => MetalKernels.ComparisonKernels, false);
         yield return ("Random", () => MetalKernels.RandomKernels, false);
         yield return ("DotProduct", () => MetalKernels.DotProductKernels, false);
+        yield return ("GatedActivation", () => MetalKernels.GatedActivationKernels, false);
+        yield return ("ExtendedReduction", () => MetalKernels.ExtendedReductionKernels, false);
         yield return ("Hyperbolic", () => MetalKernels.HyperbolicKernels, false);
         yield return ("Octonion", () => MetalKernels.OctonionKernels, false);
         yield return ("SpectralPerf", () => MetalKernels.SpectralPerfKernels, false);
@@ -177,6 +179,57 @@ public sealed class MetalShaderCompilationTests
         var catalogued = new HashSet<string>(Catalog().Select(e => e.Name), StringComparer.Ordinal);
         var missing = compiled.Where(n => !catalogued.Contains(n)).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Assert.True(missing.Length == 0, "Metal libraries compiled by the backend but not by this test: " + string.Join(", ", missing));
+    }
+
+    [SkippableFact]
+    public void EveryKernelLookup_NamesAKernelDefinedInThatLibrary()
+    {
+        // GetPipeline("Name", _xLibrary, "kernel") and the Simple*/Dispatch* helpers that forward to it look a kernel
+        // up by name in one compiled library; a name that library does not define throws "Function ... not found in
+        // library" on a Mac, and only there. The first run on an Apple GPU found two such failures, and this test, which
+        // needs no compiler, found the rest. Each library field is resolved through its CompileLibrary("Name", ...)
+        // assignment to the catalogued source.
+        string? root = RepositoryRoot();
+        Skip.If(root is null, "The repository sources are not next to the test binaries.");
+        string metal = Path.Combine(root!, "src", "AiDotNet.Tensors", "Engines", "DirectGpu", "Metal");
+        var timeout = TimeSpan.FromSeconds(5);
+        var files = Directory.GetFiles(metal, "*.cs").ToDictionary(Path.GetFileName, File.ReadAllText, StringComparer.Ordinal);
+        var catalog = Catalog().ToDictionary(e => e.Name, e => e.Source, StringComparer.Ordinal);
+
+        var fieldToLibrary = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (string text in files.Values)
+            foreach (Match m in Regex.Matches(text, @"(_\w+Library)\s*=\s*_shaderLibrary\.CompileLibrary\(\s*""(\w+)""", RegexOptions.None, timeout))
+                fieldToLibrary[m.Groups[1].Value] = m.Groups[2].Value;
+
+        var definedCache = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        HashSet<string> Defined(string library)
+        {
+            if (!definedCache.TryGetValue(library, out var set))
+            {
+                set = new HashSet<string>(Regex.Matches(catalog[library](), @"kernel\s+void\s+(\w+)\s*\(", RegexOptions.None, timeout)
+                    .Cast<Match>().Select(k => k.Groups[1].Value), StringComparer.Ordinal);
+                definedCache[library] = set;
+            }
+            return set;
+        }
+
+        var problems = new List<string>();
+        int checkedLookups = 0;
+        foreach (var file in files)
+            foreach (Match m in Regex.Matches(file.Value, @"\(\s*""\w+""\s*,\s*(_\w+Library)\s*,\s*""(\w+)""", RegexOptions.None, timeout))
+            {
+                string field = m.Groups[1].Value, kernel = m.Groups[2].Value;
+                if (!fieldToLibrary.TryGetValue(field, out string? library) || !catalog.ContainsKey(library)) continue;
+                checkedLookups++;
+                if (!Defined(library).Contains(kernel))
+                {
+                    int line = file.Value.Take(m.Index).Count(c => c == '\n') + 1;
+                    problems.Add($"{file.Key}:{line} asks {library} for '{kernel}'");
+                }
+            }
+        Assert.True(checkedLookups > 100, $"Only {checkedLookups} kernel lookups were recognised; the pattern no longer matches the backend.");
+        Assert.True(problems.Count == 0, "Kernel lookups naming a kernel the library does not define:" + Environment.NewLine
+            + string.Join(Environment.NewLine, problems));
     }
 
     private static string? RepositoryRoot()

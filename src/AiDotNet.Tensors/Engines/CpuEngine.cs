@@ -28846,6 +28846,111 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    // RMSNorm backward's input gradient for one row: gradInput = invRms * (gamma*go - xhat * mean(gamma*go*xhat)).
+    // The correction sum was one scalar add chain per element (latency-bound: 7.6 ms single-threaded for a 2M-element
+    // backward against LayerNorm's 2.6 ms); it now accumulates in vector lanes, reduced in a fixed lane order, then the
+    // scalar tail, so it does not depend on the thread count. The output pass multiplies and subtracts exactly as the
+    // scalar tail (no fused multiply-add), so every element's bits follow from the row's correction alone.
+    [MethodImpl(Hot)]
+    private static void RmsNormBackwardInputRow(float[] gradOut, float[] input, float[] gamma, float[] rms, float[] gradInput,
+        int b, int fs, float invFs)
+    {
+        int off = b * fs;
+        float invRms = 1f / rms[b];
+        float sumCorrection = 0f;
+        int f = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && fs >= 2 * Vector256<float>.Count)
+        {
+            var vInv = Vector256.Create(invRms);
+            var acc0 = Vector256<float>.Zero;
+            var acc1 = Vector256<float>.Zero;
+            for (; f + 2 * Vector256<float>.Count <= fs; f += 2 * Vector256<float>.Count)
+            {
+                acc0 += Vector256.LoadUnsafe(ref gamma[f]) * Vector256.LoadUnsafe(ref gradOut[off + f])
+                    * (Vector256.LoadUnsafe(ref input[off + f]) * vInv);
+                acc1 += Vector256.LoadUnsafe(ref gamma[f + 8]) * Vector256.LoadUnsafe(ref gradOut[off + f + 8])
+                    * (Vector256.LoadUnsafe(ref input[off + f + 8]) * vInv);
+            }
+            sumCorrection = Vector256.Sum(acc0 + acc1);
+        }
+#endif
+        for (; f < fs; f++)
+            sumCorrection += gamma[f] * gradOut[off + f] * (input[off + f] * invRms);
+        float meanCorrection = sumCorrection * invFs;
+
+        f = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && fs >= Vector256<float>.Count)
+        {
+            var vInv = Vector256.Create(invRms);
+            var vMean = Vector256.Create(meanCorrection);
+            for (; f + Vector256<float>.Count <= fs; f += Vector256<float>.Count)
+            {
+                var scaledGrad = Vector256.LoadUnsafe(ref gamma[f]) * Vector256.LoadUnsafe(ref gradOut[off + f]);
+                var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                (vInv * (scaledGrad - normalized * vMean)).StoreUnsafe(ref gradInput[off + f]);
+            }
+        }
+#endif
+        for (; f < fs; f++)
+        {
+            float scaledGrad = gamma[f] * gradOut[off + f];
+            float normalized = input[off + f] * invRms;
+            gradInput[off + f] = invRms * (scaledGrad - normalized * meanCorrection);
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static void RmsNormBackwardInputRow(double[] gradOut, double[] input, double[] gamma, double[] rms, double[] gradInput,
+        int b, int fs, double invFs)
+    {
+        int off = b * fs;
+        double invRms = 1.0 / rms[b];
+        double sumCorrection = 0.0;
+        int f = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && fs >= 2 * Vector256<double>.Count)
+        {
+            var vInv = Vector256.Create(invRms);
+            var acc0 = Vector256<double>.Zero;
+            var acc1 = Vector256<double>.Zero;
+            for (; f + 2 * Vector256<double>.Count <= fs; f += 2 * Vector256<double>.Count)
+            {
+                acc0 += Vector256.LoadUnsafe(ref gamma[f]) * Vector256.LoadUnsafe(ref gradOut[off + f])
+                    * (Vector256.LoadUnsafe(ref input[off + f]) * vInv);
+                acc1 += Vector256.LoadUnsafe(ref gamma[f + 4]) * Vector256.LoadUnsafe(ref gradOut[off + f + 4])
+                    * (Vector256.LoadUnsafe(ref input[off + f + 4]) * vInv);
+            }
+            sumCorrection = Vector256.Sum(acc0 + acc1);
+        }
+#endif
+        for (; f < fs; f++)
+            sumCorrection += gamma[f] * gradOut[off + f] * (input[off + f] * invRms);
+        double meanCorrection = sumCorrection * invFs;
+
+        f = 0;
+#if NET5_0_OR_GREATER
+        if (Vector256.IsHardwareAccelerated && fs >= Vector256<double>.Count)
+        {
+            var vInv = Vector256.Create(invRms);
+            var vMean = Vector256.Create(meanCorrection);
+            for (; f + Vector256<double>.Count <= fs; f += Vector256<double>.Count)
+            {
+                var scaledGrad = Vector256.LoadUnsafe(ref gamma[f]) * Vector256.LoadUnsafe(ref gradOut[off + f]);
+                var normalized = Vector256.LoadUnsafe(ref input[off + f]) * vInv;
+                (vInv * (scaledGrad - normalized * vMean)).StoreUnsafe(ref gradInput[off + f]);
+            }
+        }
+#endif
+        for (; f < fs; f++)
+        {
+            double scaledGrad = gamma[f] * gradOut[off + f];
+            double normalized = input[off + f] * invRms;
+            gradInput[off + f] = invRms * (scaledGrad - normalized * meanCorrection);
+        }
+    }
+
     private static void RmsNormBackwardAccumGamma(float[] gradOut, float[] input, float[] rms, float[] gradGamma, int rows, int fs)
     {
         int blocks = (rows + NormRowBlock - 1) / NormRowBlock;
@@ -30163,25 +30268,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // gradGamma over feature-column ranges, each accumulated over the rows in order (bit-identical).
             RmsNormBackwardAccumGamma(fGradOut, fInput, fRms, fGradGamma, batchSize, fs);
 
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
-            {
-                int off = b * fs;
-                float invRms = 1f / fRms[b];
-                float sumCorrection = 0f;
-                for (int f = 0; f < fs; f++)
-                {
-                    float scaledGrad = fGamma[f] * fGradOut[off + f];
-                    float normalized = fInput[off + f] * invRms;
-                    sumCorrection += scaledGrad * normalized;
-                }
-                float meanCorrection = sumCorrection * invFeatureSizeF;
-                for (int f = 0; f < fs; f++)
-                {
-                    float scaledGrad = fGamma[f] * fGradOut[off + f];
-                    float normalized = fInput[off + f] * invRms;
-                    fGradInput[off + f] = invRms * (scaledGrad - normalized * meanCorrection);
-                }
-            });
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs,
+                b => RmsNormBackwardInputRow(fGradOut, fInput, fGamma, fRms, fGradInput, b, fs, invFeatureSizeF));
         }
         else if (typeof(T) == typeof(double))
         {
@@ -30196,25 +30284,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
             RmsNormBackwardAccumGamma(dGradOut, dInput, dRms, dGradGamma, batchSize, fs);
 
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
-            {
-                int off = b * fs;
-                double invRms = 1.0 / dRms[b];
-                double sumCorrection = 0.0;
-                for (int f = 0; f < fs; f++)
-                {
-                    double scaledGrad = dGamma[f] * dGradOut[off + f];
-                    double normalized = dInput[off + f] * invRms;
-                    sumCorrection += scaledGrad * normalized;
-                }
-                double meanCorrection = sumCorrection * invFeatureSizeD;
-                for (int f = 0; f < fs; f++)
-                {
-                    double scaledGrad = dGamma[f] * dGradOut[off + f];
-                    double normalized = dInput[off + f] * invRms;
-                    dGradInput[off + f] = invRms * (scaledGrad - normalized * meanCorrection);
-                }
-            });
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs,
+                b => RmsNormBackwardInputRow(dGradOut, dInput, dGamma, dRms, dGradInput, b, fs, invFeatureSizeD));
         }
         else
         {

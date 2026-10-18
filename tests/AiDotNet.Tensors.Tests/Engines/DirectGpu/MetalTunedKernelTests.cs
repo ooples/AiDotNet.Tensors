@@ -460,8 +460,14 @@ public sealed class MetalTunedKernelTests
                 backend.Synchronize();
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
-            // Every candidate applies to these small shapes, so a variant that silently dropped out fails here.
-            Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count);
+            // Direct and im2col apply to every shape here, Winograd exactly to the 3x3 / stride 1 / dilation 1 ones it
+            // admits, so a variant that silently dropped out (a library that failed to build on the device) fails here.
+            // (This asserted that every candidate applies to every shape, which stopped holding when Winograd joined.)
+            var applicable = Applicable(backend.Conv2DForwardSlot, args.Shape()).Select(cand => cand.Id).ToList();
+            Assert.Contains("metal.conv2d.direct", applicable);
+            Assert.Contains("metal.conv2d.im2col_gemm", applicable);
+            Assert.Equal(WinogradF23Pipeline.AdmitsShape(args.Shape()), applicable.Contains("metal.conv2d.winograd_gemm"));
+            Assert.Equal(3, backend.Conv2DForwardSlot.CandidateIds.Count);
         }
     }
 }

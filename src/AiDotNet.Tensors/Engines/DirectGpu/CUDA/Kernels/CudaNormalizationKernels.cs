@@ -800,6 +800,135 @@ extern ""C"" __global__ __launch_bounds__(256) void sum_around_kept_finish(
     output[c] = scale * t;
 }
 
+// LayerNorm's whole backward over [rows, cols <= 32 * CPL] from the saved mean and VARIANCE, in one pass plus the
+// layernorm_grad_params_finish reduce: block = 8 warps over one chunk of rows [chunk * rowsPerChunk, +rowsPerChunk),
+// each warp taking every 8th row. Per row the warp holds the row in registers (CPL floats per lane), forms
+// invStd = 1 / sqrt(var + eps) as layernorm_inverse_std does, writes (or adds) the input gradient
+// dx = invStd * (g*dy - mean_c(g*dy) - xhat * mean_c(g*dy*xhat)) as layernorm_input_grad_add does, and accumulates
+// gamma's dy*xhat and beta's dy per column. The 8 warps' column sums are added in warp order into
+// partials[chunk][col] (gamma) and partials[chunks + chunk][col] (beta). All orders fixed: deterministic. Replaces
+// the inverse-std, input-gradient and affine-partial launches (three dependent kernels) with one.
+template <int CPL>
+__device__ __forceinline__ void layernorm_backward_rows_body(
+    const float* __restrict__ dy, const float* __restrict__ x, const float* __restrict__ gamma,
+    const float* __restrict__ mean, const float* __restrict__ variance, float epsilon,
+    float* __restrict__ dx, float* __restrict__ partials, int rows, int cols, int rowsPerChunk, int addInput)
+{
+    __shared__ float sg[8][CPL * 32];
+    __shared__ float sb[8][CPL * 32];
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int chunk = blockIdx.x;
+    int r0 = chunk * rowsPerChunk, r1 = min(rows, r0 + rowsPerChunk);
+    float gam[CPL], ag[CPL], ab[CPL];
+    #pragma unroll
+    for (int j = 0; j < CPL; j++)
+    {
+        int c = lane + 32 * j;
+        gam[j] = c < cols ? gamma[c] : 0.0f;
+        ag[j] = 0.0f; ab[j] = 0.0f;
+    }
+    float invCols = 1.0f / cols;
+    for (int r = r0 + warp; r < r1; r += 8)
+    {
+        const float* dyr = dy + (long long)r * cols;
+        const float* xr = x + (long long)r * cols;
+        float mu = mean[r];
+        float is = 1.0f / sqrtf(variance[r] + epsilon);
+        float d[CPL], xh[CPL];
+        float s1 = 0.0f, s2 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < CPL; j++)
+        {
+            int c = lane + 32 * j;
+            d[j] = 0.0f; xh[j] = 0.0f;
+            if (c < cols)
+            {
+                d[j] = dyr[c];
+                xh[j] = (xr[c] - mu) * is;
+                float gdy = gam[j] * d[j];
+                s1 += gdy;
+                s2 += gdy * xh[j];
+                ag[j] += d[j] * xh[j];
+                ab[j] += d[j];
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            s1 += __shfl_xor_sync(0xffffffff, s1, o);
+            s2 += __shfl_xor_sync(0xffffffff, s2, o);
+        }
+        s1 *= invCols;
+        s2 *= invCols;
+        float* dxr = dx + (long long)r * cols;
+        #pragma unroll
+        for (int j = 0; j < CPL; j++)
+        {
+            int c = lane + 32 * j;
+            if (c < cols)
+            {
+                float v = is * (gam[j] * d[j] - s1 - xh[j] * s2);
+                dxr[c] = addInput ? dxr[c] + v : v;
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < CPL; j++)
+    {
+        sg[warp][lane + 32 * j] = ag[j];
+        sb[warp][lane + 32 * j] = ab[j];
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+    {
+        float tg = 0.0f, tb = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; w++) { tg += sg[w][c]; tb += sb[w][c]; }
+        partials[(long long)chunk * cols + c] = tg;
+        partials[(long long)(gridDim.x + chunk) * cols + c] = tb;
+    }
+}
+
+#define LN_ROWS_KERNEL(NAME, CPL) \
+extern ""C"" __global__ __launch_bounds__(256) void NAME( \
+    const float* __restrict__ dy, const float* __restrict__ x, const float* __restrict__ gamma, \
+    const float* __restrict__ mean, const float* __restrict__ variance, float epsilon, \
+    float* __restrict__ dx, float* __restrict__ partials, int rows, int cols, int rowsPerChunk, int addInput) \
+{ layernorm_backward_rows_body<CPL>(dy, x, gamma, mean, variance, epsilon, dx, partials, rows, cols, rowsPerChunk, addInput); }
+LN_ROWS_KERNEL(layernorm_backward_rows2, 2)
+LN_ROWS_KERNEL(layernorm_backward_rows4, 4)
+LN_ROWS_KERNEL(layernorm_backward_rows8, 8)
+LN_ROWS_KERNEL(layernorm_backward_rows16, 16)
+
+// layernorm_backward_rows' reduce: one warp per column, its lanes striding over the chunk partials and a fixed xor-shuffle
+// tree adding them (deterministic), gamma's then beta's. The thread-per-column finish summed 32 chunks serially per
+// thread (~1.8 us for 64 columns).
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params_finish_warp(
+    const float* __restrict__ partials, float* __restrict__ gradGamma, float* __restrict__ gradBeta,
+    int cols, int chunks, int addGamma, int addBeta)
+{
+    int col = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (col >= cols) return;
+    float g = 0.0f, b = 0.0f;
+    for (int c = lane; c < chunks; c += 32)
+    {
+        g += partials[(long long)c * cols + col];
+        b += partials[(long long)(chunks + c) * cols + col];
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        g += __shfl_xor_sync(0xffffffff, g, o);
+        b += __shfl_xor_sync(0xffffffff, b, o);
+    }
+    if (lane == 0)
+    {
+        gradGamma[col] = addGamma ? gradGamma[col] + g : g;
+        gradBeta[col] = addBeta ? gradBeta[col] + b : b;
+    }
+}
+
 // LayerNorm's input gradient ADDED into gradInput, one warp per row of [rows, cols]:
 // dx += invStd * (g*dy - mean_c(g*dy) - xhat * mean_c(g*dy*xhat)), xhat = (x - mean) * invStd. Lane-strided sums
 // reduced by a fixed xor-shuffle tree: deterministic.
@@ -866,6 +995,31 @@ extern ""C"" __global__ __launch_bounds__(256) void broadcast_reduced_middle(
         long long o = e / ((long long)reduced * inner);
         float r = scale * g[o * inner + i];
         output[e] = add ? output[e] + r : r;
+    }
+}
+
+// Column sums of a short matrix (rows <= ColumnSumSmallMaxRows) in one launch: block (32 x 32) sums a 32-column
+// tile, each of its 32 row lanes striding over the rows, then lane 0 adds the 32 lane sums in lane order
+// (deterministic). Replaces the partial/finish pair, two dependent launches, where the rows are too few to need them.
+extern ""C"" __global__ __launch_bounds__(1024) void column_sum_small(
+    const float* __restrict__ input, float* __restrict__ output, int rows, int cols, int add)
+{
+    __shared__ float s[32][33];
+    int col = blockIdx.x * 32 + threadIdx.x;
+    float acc = 0.0f;
+    if (col < cols)
+    {
+        #pragma unroll 4
+        for (int r = threadIdx.y; r < rows; r += 32)
+            acc += input[(long long)r * cols + col];
+    }
+    s[threadIdx.y][threadIdx.x] = acc;
+    __syncthreads();
+    if (threadIdx.y == 0 && col < cols)
+    {
+        float t = 0.0f;
+        for (int y = 0; y < 32; y++) t += s[y][threadIdx.x];
+        output[col] = add ? output[col] + t : t;
     }
 }
 
@@ -985,10 +1139,16 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "rmsnorm_grad_gamma",
                 "layernorm_inverse_std",
                 "layernorm_variance_from_inverse_std",
+                "layernorm_backward_rows2",
+                "layernorm_backward_rows4",
+                "layernorm_backward_rows8",
+                "layernorm_backward_rows16",
+                "layernorm_grad_params_finish_warp",
                 "layernorm_grad_params_partial",
                 "layernorm_grad_params_finish",
                 "column_sum_partial",
                 "column_sum_finish",
+                "column_sum_small",
                 "broadcast_reduced_middle",
                 "layernorm_input_grad_add",
                 "sum_around_kept_partial",

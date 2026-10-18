@@ -441,7 +441,7 @@ public sealed partial class MetalBackend
         ThrowIfDisposed();
         if (logits is not MetalGpuBuffer lBuffer || targets is not MetalGpuBuffer tBuffer || loss is not MetalGpuBuffer oBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
-        var pipeline = GetPipeline("Loss", _lossLibrary, "bce_with_logits_elementwise");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "bce_with_logits_elementwise");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -474,7 +474,7 @@ public sealed partial class MetalBackend
         ThrowIfDisposed();
         if (input is not MetalGpuBuffer iBuffer || target is not MetalGpuBuffer tBuffer || loss is not MetalGpuBuffer oBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
-        var pipeline = GetPipeline("Loss", _lossLibrary, "kl_div_elementwise");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "kl_div_elementwise");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -500,7 +500,7 @@ public sealed partial class MetalBackend
         if (gradOutput is not MetalGpuBuffer goBuffer || predictions is not MetalGpuBuffer pBuffer ||
             targets is not MetalGpuBuffer tBuffer || gradInput is not MetalGpuBuffer giBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
-        var pipeline = GetPipeline("Loss", _lossLibrary, "l1_loss_backward");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "l1_loss_backward");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -528,7 +528,7 @@ public sealed partial class MetalBackend
         if (gradOutput is not MetalGpuBuffer goBuffer || logits is not MetalGpuBuffer lBuffer ||
             targets is not MetalGpuBuffer tBuffer || gradInput is not MetalGpuBuffer giBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
-        var pipeline = GetPipeline("Loss", _lossLibrary, "bce_with_logits_backward");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "bce_with_logits_backward");
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);

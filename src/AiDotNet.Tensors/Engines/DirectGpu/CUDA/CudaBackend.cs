@@ -4861,8 +4861,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _ = PushContext();
 
         // Each thread owns 4 columns, so the y-grid spans N/4 thread-columns.
-        uint gridX = (uint)M;
-        uint gridY = (uint)((N / 4 + DefaultBlockSize - 1) / DefaultBlockSize);
+        // An empty output has nothing to write (and N = 0 would divide by zero lanes in the packed layout).
+        if (M <= 0 || N <= 0) return;
+
+        // Mirrors the kernel's layout: rows narrower than a block are packed DefaultBlockSize / (N / 4) per block.
+        int lanes = N / 4;
+        uint gridX, gridY;
+        if (lanes >= DefaultBlockSize)
+        {
+            gridX = (uint)M;
+            gridY = (uint)((lanes + DefaultBlockSize - 1) / DefaultBlockSize);
+        }
+        else
+        {
+            int rowsPerBlock = DefaultBlockSize / Math.Max(1, lanes);
+            gridX = (uint)((M + rowsPerBlock - 1) / rowsPerBlock);
+            gridY = 1;
+        }
 
         IntPtr valuesPtr = csrValues.Handle;
         IntPtr colIndicesPtr = csrColIndices.Handle;

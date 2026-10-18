@@ -585,6 +585,10 @@ public sealed unsafe partial class VulkanDevice : IDisposable
     /// <summary>Whether 64-bit buffer atomics (VK_KHR_shader_atomic_int64) were enabled.</summary>
     public bool BufferInt64AtomicsEnabled { get; private set; }
 
+    /// <summary>True when shaders may request SignedZeroInfNanPreserve for 64-bit floats (float controls), which the
+    /// double-precision parity kernels need for their infinity and NaN results.</summary>
+    public bool SignedZeroInfNanPreserveFloat64 { get; private set; }
+
     /// <summary>Whether 32-bit float buffer atomic add (VK_EXT_shader_atomic_float) was enabled.</summary>
     public bool BufferFloat32AtomicAddEnabled { get; private set; }
 
@@ -693,7 +697,29 @@ public sealed unsafe partial class VulkanDevice : IDisposable
                 chain = &atomicInt64;
                 BufferInt64AtomicsEnabled = atomicInt64.shaderBufferInt64Atomics != 0;
             }
+
+            // Float controls: core in 1.2, else VK_KHR_shader_float_controls (enabled here so shaders may use it).
+            const string FloatControlsExtension = "VK_KHR_shader_float_controls";
+            bool floatControlsCore = deviceProperties.apiVersion >= (uint)VulkanNativeBindings.VK_API_VERSION_1_2;
+            bool hasFloatControls = floatControlsCore || available.Contains(FloatControlsExtension);
+            if (hasFloatControls)
+            {
+                var floatControls = new VkPhysicalDeviceFloatControlsProperties
+                {
+                    sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES,
+                };
+                var properties2 = new VkPhysicalDeviceProperties2
+                {
+                    sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                    pNext = &floatControls,
+                };
+                VulkanNativeBindings.vkGetPhysicalDeviceProperties2(_physicalDevice, &properties2);
+                SignedZeroInfNanPreserveFloat64 = _shaderFloat64
+                    && floatControls.Bits[VkPhysicalDeviceFloatControlsProperties.SignedZeroInfNanPreserveFloat64] != 0;
+                if (SignedZeroInfNanPreserveFloat64 && !floatControlsCore) extensionNames.Add(FloatControlsExtension);
+            }
         }
+        VulkanTorchParityElementwiseKernels.PreserveDoubleSpecials = SignedZeroInfNanPreserveFloat64;
 
         var nameBytes = new byte[extensionNames.Count][];
         for (int i = 0; i < nameBytes.Length; i++) nameBytes[i] = Encoding.UTF8.GetBytes(extensionNames[i] + "\0");

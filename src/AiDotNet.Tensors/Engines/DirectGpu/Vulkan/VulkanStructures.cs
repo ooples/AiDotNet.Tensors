@@ -730,6 +730,28 @@ public unsafe struct VkPhysicalDeviceFeatures2
     public VkPhysicalDeviceFeatures features;
 }
 
+/// <summary>VkPhysicalDeviceProperties2 (Vulkan 1.1): the core properties plus a pNext chain of extension property structs.</summary>
+public unsafe struct VkPhysicalDeviceProperties2
+{
+    public int sType;
+    public void* pNext;
+    public VkPhysicalDeviceProperties properties;
+}
+
+/// <summary>VkPhysicalDeviceFloatControlsProperties (Vulkan 1.2 / VK_KHR_shader_float_controls): two
+/// VkShaderFloatControlsIndependence values, then 15 VkBool32 members (SignedZeroInfNanPreserve, DenormPreserve,
+/// DenormFlushToZero, RoundingModeRTE, RoundingModeRTZ, each for 16-, 32- and 64-bit floats).</summary>
+public unsafe struct VkPhysicalDeviceFloatControlsProperties
+{
+    public const int Count = 15;
+    public const int SignedZeroInfNanPreserveFloat64 = 2;
+    public int sType;
+    public void* pNext;
+    public uint denormBehaviorIndependence;
+    public uint roundingModeIndependence;
+    public fixed uint Bits[Count];
+}
+
 /// <summary>VkPhysicalDeviceShaderAtomicInt64Features (VK_KHR_shader_atomic_int64).</summary>
 public unsafe struct VkPhysicalDeviceShaderAtomicInt64Features
 {
