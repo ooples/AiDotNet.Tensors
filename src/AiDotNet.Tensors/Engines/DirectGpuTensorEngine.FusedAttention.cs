@@ -63,10 +63,14 @@ public partial class DirectGpuTensorEngine
     }
 
     // What a recorded fused-attention node's forward leaves for its backward: the log-sum-exp rows, in one device
-    // buffer allocated at the node's first run and reused by every replay (a captured graph bakes its pointer).
-    private sealed class FusedAttentionRecordedNode
+    // buffer allocated at the node's first run and reused by every replay (a captured graph bakes its pointer). It
+    // also carries the call's parameters, which MultiHeadAttentionPackedFusionPattern reads.
+    internal sealed class FusedAttentionRecordedNode
     {
         public Tensor<float>? Lse { get; set; }
+        public FusedAttentionParams Params { get; init; }
+        public int HeadDim { get; init; }
+        public bool Interleaved { get; init; }
     }
 
     // Under a compiled trace: ONE node whose forward is the fused FlashAttention-2 kernel and whose backward is its
@@ -89,7 +93,7 @@ public partial class DirectGpuTensorEngine
         if (!scope.BindEngine(this)) return null;
 
         var p = FusedParams(batch, heads, seqQ, seqK, headDim, interleaved, scale, softcap, causal, causalOffset);
-        var node = new FusedAttentionRecordedNode();
+        var node = new FusedAttentionRecordedNode { Params = p, HeadDim = headDim, Interleaved = interleaved };
         int outLength = batch * heads * seqQ * headDim, rows = batch * heads * seqQ;
         return scope.RecordVariadic(LazyNodeType.Custom, opName, new[] { query, key, value }, outputShape,
             (eng, output) =>
@@ -144,6 +148,127 @@ public partial class DirectGpuTensorEngine
                 Land(inputs[2], intoV, dV);
             },
             new object[] { node });
+    }
+
+    /// <summary>
+    /// The packed form of a recorded head-interleaved attention (<see cref="MultiHeadAttentionCore{T}"/>) whose query,
+    /// key and value are column blocks of one row-major [rows, 3 * width] projection: one node that reads q, k and v in
+    /// place (row stride 3 * width, at <paramref name="qStart"/> / <paramref name="kStart"/> / <paramref name="vStart"/>)
+    /// and writes their gradients straight into the projection's gradient, which they exactly cover. The composed form
+    /// copied each block out in the forward (three kernels) and, in the backward, built each block's gradient as a
+    /// zeroed full-width tensor plus a slice copy, then added the three (three memsets, three copies, two adds).
+    /// Null when the recorded node is not one this can replace.
+    /// </summary>
+    internal static LazyNode<float>? BuildPackedAttentionNode(LazyNode<float> attention, Tensor<float> packed,
+        int qStart, int kStart, int vStart)
+    {
+        if (attention.SavedState is not { Length: >= 1 } state || state[0] is not FusedAttentionRecordedNode recorded
+            || !recorded.Interleaved || attention.RecordingEngine is not DirectGpuTensorEngine engine || packed.Rank != 2
+            || engine.PlacementBackend is not (IGpuBufferViews and IFusedAttentionBackend))
+            return null;
+        var p0 = recorded.Params;
+        int headDim = recorded.HeadDim, width = p0.H * headDim, rowWidth = packed._shape[1];
+        if (p0.Sq != p0.Sk || packed._shape[0] != p0.B * p0.Sq || rowWidth != 3 * width) return null;
+        var p = p0;
+        p.Qb = (long)p.Sq * rowWidth; p.Qr = rowWidth;
+        p.Kb = (long)p.Sk * rowWidth; p.Kr = rowWidth;
+        p.Vb = p.Kb; p.Vr = rowWidth;
+        int outLength = p.B * p.H * p.Sq * headDim, rows = p.B * p.H * p.Sq, packedLength = packed.Length;
+        var outputShape = (int[])attention.Output._shape.Clone();
+        var node = new FusedAttentionRecordedNode { Params = p, HeadDim = headDim, Interleaved = true };
+
+        (IGpuBuffer Q, IGpuBuffer K, IGpuBuffer V) Blocks(IDirectGpuBackend backend, IGpuBuffer whole)
+        {
+            var views = backend as IGpuBufferViews ?? throw new NotSupportedException("The backend has no buffer views.");
+            IGpuBuffer Block(int start) => views.TryCreateView(whole, start, packedLength - start)
+                ?? throw new NotSupportedException("A packed attention block's view was refused.");
+            return (Block(qStart), Block(kStart), Block(vStart));
+        }
+
+        return new LazyNode<float>(LazyNodeType.Custom, "MultiHeadAttentionPacked", new[] { packed }, attention.Output,
+            (eng, output) =>
+            {
+                var gpu = (DirectGpuTensorEngine)eng;
+                var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
+                var fused = (IFusedAttentionBackend)backend;
+                node.Lse ??= Tensor<float>.FromGpuBuffer(backend, backend.AllocateBuffer(rows), new[] { rows },
+                    Gpu.GpuTensorRole.Intermediate, ownsBuffer: true);
+                using var x = gpu.GetOrAllocateBuffer(backend, packed);
+                var (q, k, v) = Blocks(backend, x.Buffer);
+                var result = AllocateFullyWrittenOutputBuffer(backend, outLength);
+                bool ownsResult = true;
+                try
+                {
+                    fused.FusedAttentionForward(q, k, v, result.Buffer,
+                        node.Lse._gpuBuffer ?? throw new InvalidOperationException("The attention node lost its log-sum-exp buffer."),
+                        null, p, headDim);
+                    var tensor = gpu.DeferTensorResult<float>(backend, result.Buffer, outLength, outputShape);
+                    result.RelinquishOwnership();
+                    ownsResult = false;
+                    CopyResultInto(eng, tensor, output);
+                }
+                finally
+                {
+                    if (ownsResult) result.Dispose();
+                }
+            },
+            (gradOutput, inputs, output, savedState, engine, grads) =>
+            {
+                var lse = node.Lse ?? throw new InvalidOperationException("The packed attention node's backward ran before its forward.");
+                var gpu = (DirectGpuTensorEngine)engine;
+                var into = Autodiff.DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add) is { } t
+                    && !add ? t : null;
+                var grad = gpu.PackedAttentionBackwardOnDevice(gradOutput, inputs[0], output, lse, p, headDim, Blocks, into);
+                if (into is not null && ReferenceEquals(grad, into))
+                    Autodiff.DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], into);
+                else
+                    Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+            },
+            new object[] { node })
+        {
+            RecordingEngine = attention.RecordingEngine,
+        };
+    }
+
+    // The packed projection's gradient from a packed attention: zeroed whole (dQ accumulates; dK and dV are written),
+    // then the attention backward writes each block in place. Into the accumulator when it is receiving its first
+    // contribution, else a fresh buffer.
+    private Tensor<float> PackedAttentionBackwardOnDevice(Tensor<float> gradOutput, Tensor<float> packed, Tensor<float> output,
+        Tensor<float> lse, FusedAttentionParams p, int headDim,
+        Func<IDirectGpuBackend, IGpuBuffer, (IGpuBuffer Q, IGpuBuffer K, IGpuBuffer V)> blocks, Tensor<float>? into)
+    {
+        if (!TryGetBackend(out var backend) || backend is not IFusedAttentionBackend fused)
+            throw new InvalidOperationException("The GPU backend that recorded a packed attention node is no longer available.");
+        using var x = GetOrAllocateBuffer(backend, packed);
+        using var o = GetOrAllocateBuffer(backend, output);
+        using var dO = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+        using var l = GetOrAllocateBuffer(backend, lse);
+        var target = ResolveDirectGradTarget(backend, into, packed.Length, x.Buffer, o.Buffer, dO.Buffer);
+        if (target is not null && target.Handle == l.Buffer.Handle) target = null;
+        OwnedBuffer fresh = default;
+        bool ownsFresh = false;
+        try
+        {
+            if (target is null) { fresh = AllocateFullyWrittenOutputBuffer(backend, packed.Length); ownsFresh = true; }
+            var gradBuffer = target ?? fresh.Buffer;
+            var (q, k, v) = blocks(backend, x.Buffer);
+            var (dq, dk, dv) = blocks(backend, gradBuffer);
+            fused.FusedAttentionBackward(q, k, v, o.Buffer, dO.Buffer, l.Buffer, null, dq, dk, dv, p, headDim, gradBuffer);
+            if (into is not null && target is not null)
+            {
+                into.IncrementVersion();
+                BindResidentBuffer(into, target, backend);
+                return into;
+            }
+            var result = DeferTensorResult<float>(backend, fresh.Buffer, packed.Length, (int[])packed._shape.Clone());
+            fresh.RelinquishOwnership();
+            ownsFresh = false;
+            return result;
+        }
+        finally
+        {
+            if (ownsFresh) fresh.Dispose();
+        }
     }
 
     // One fused attention on the device, or null when this call cannot take it (the caller then runs its base path).

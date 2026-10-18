@@ -14,6 +14,7 @@ public sealed partial class OpenClBackend : IFusedAttentionBackend
         => P.Forward(this, LaunchBatch, q, k, v, o, lse, mask, p, headDim);
 
     void IFusedAttentionBackend.FusedAttentionBackward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer dO,
-        IGpuBuffer lse, IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim)
+        IGpuBuffer lse, IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim,
+        IGpuBuffer? dQSpan)   // the portable kernels write every dQ element: nothing to zero
         => P.Backward(this, LaunchBatch, q, k, v, o, dO, lse, mask, dQ, dK, dV, p, headDim);
 }

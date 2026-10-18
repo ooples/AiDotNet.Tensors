@@ -203,7 +203,8 @@ public sealed class FusedAttentionBackendParityTests
             in FusedAttentionParams p, int headDim)
             => PortableFusedAttention.Forward(_host, _launch, q, k, v, o, lse, mask, p, headDim);
         public void FusedAttentionBackward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer dO, IGpuBuffer lse,
-            IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim)
+            IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim,
+            IGpuBuffer? dQSpan = null)
             => PortableFusedAttention.Backward(_host, _launch, q, k, v, o, dO, lse, mask, dQ, dK, dV, p, headDim);
     }
 

@@ -32,9 +32,12 @@ internal interface IFusedAttentionBackend
     void FusedAttentionForward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer lse, IGpuBuffer? mask,
         in FusedAttentionParams p, int headDim);
 
-    /// <summary>dQ, dK and dV (written, not accumulated) in the layouts of q, k and v; dO in o's layout.</summary>
+    /// <summary>dQ, dK and dV (written, not accumulated) in the layouts of q, k and v; dO in o's layout. A dQ whose
+    /// layout is not dense (q read in place from a packed projection) needs <paramref name="dQSpan"/>: the buffer it lies
+    /// in, zeroed whole where the kernels accumulate dQ, its other elements being written by the kernels or left zero.</summary>
     void FusedAttentionBackward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o, IGpuBuffer dO, IGpuBuffer lse,
-        IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim);
+        IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, in FusedAttentionParams p, int headDim,
+        IGpuBuffer? dQSpan = null);
 }
 
 public sealed partial class CudaBackend : IFusedAttentionBackend
@@ -99,10 +102,15 @@ public sealed partial class CudaBackend : IFusedAttentionBackend
 
     unsafe void IFusedAttentionBackend.FusedAttentionBackward(IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer o,
         IGpuBuffer dO, IGpuBuffer lse, IGpuBuffer? mask, IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV,
-        in FusedAttentionParams p, int headDim)
+        in FusedAttentionParams p, int headDim, IGpuBuffer? dQSpan)
     {
         if (p.B * p.H <= 0) return;
         CheckFusedAttentionGrid(p);
+        // dQ's dense extent is what the atomic path zeroes; a strided dQ must come with the buffer it lies in.
+        long dQElements = (long)p.B * p.H * p.Sq * headDim;
+        long dQExtent = p.Sq <= 0 ? 0 : (p.B - 1) * p.Qb + (p.H - 1) * p.Qh + (p.Sq - 1) * p.Qr + headDim;
+        if (dQSpan is null && dQExtent != dQElements)
+            throw new NotSupportedException("fused attention backward: a strided dQ needs the buffer it lies in (dQSpan).");
         IntPtr deltaKernel = FusedAttentionKernel("fa_backward_delta");
         IntPtr kvKernel = FusedAttentionKernel($"fa_backward_kv_d{headDim}");
         IntPtr qKernel = FusedAttentionKernel($"fa_backward_q_d{headDim}");
@@ -131,8 +139,10 @@ public sealed partial class CudaBackend : IFusedAttentionBackend
         if (!AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions)
         {
             // With no query rows the fused kernel still runs: its query loop is empty and it writes zero dK / dV.
-            if (p.Sq > 0)
-                MemsetBuffer(dQ, 0, (long)p.B * p.H * p.Sq * headDim * sizeof(float));   // dQ covers q's elements exactly
+            if (dQSpan is not null)
+                MemsetBuffer(dQSpan, 0, dQSpan.SizeInBytes);
+            else if (p.Sq > 0)
+                MemsetBuffer(dQ, 0, dQElements * sizeof(float));   // dQ covers q's elements exactly
             if (p.Sk <= 0) return;
             IntPtr fusedKernel = FusedAttentionKernel($"fa_backward_fused_d{headDim}");
             void** fargs = stackalloc void*[11];
