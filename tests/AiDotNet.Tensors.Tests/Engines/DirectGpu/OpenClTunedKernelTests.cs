@@ -415,9 +415,10 @@ public sealed class OpenClTunedKernelTests
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
             // Every candidate applies to these small shapes, so a variant that silently dropped out fails here --
-            // except the Winograd route, which admits only 3x3 stride-1 undilated shapes (WinogradF23Pipeline).
+            // except the three Winograd routes (F(2x2,3x3) unfused and fused, F(4x4,3x3)), which admit only 3x3 stride-1
+            // undilated shapes (WinogradF23Pipeline), and the split-K GEMM route, which admits only batch 1.
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 1));
+                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1));
         }
     }
 }

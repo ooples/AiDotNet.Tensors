@@ -966,6 +966,68 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Trace.TraceWarning($"OpenCL Winograd kernels unavailable: {ex.Message}");
                 }
 
+                // Winograd F(4x4, 3x3) forward transforms: a separate module so a driver that rejects it drops only this
+                // candidate.
+                try
+                {
+                    var f43Program = CompileOrLoadCached(Kernels.WinogradF43Kernels.Source, OpenClBuildOptions.SafeMathFlags,
+                        "Winograd F(4x4,3x3) kernels");
+                    var builtF43 = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in Kernels.WinogradF43Kernels.GetKernelNames())
+                        builtF43.Add((name, new DirectOpenClKernel(_context, f43Program, name)));
+                    _programs.Add(f43Program);
+                    foreach (var (name, kernel) in builtF43) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL Winograd F(4x4,3x3) kernels unavailable: {ex.Message}");
+                }
+
+                // Row-vector GEMV for batch-1 fully connected layers (see TryExecuteRowVectorGemv).
+                try
+                {
+                    var gemvProgram = CompileOrLoadCached(Kernels.GemvKernels.Source, OpenClBuildOptions.SafeMathFlags, "GEMV kernels");
+                    var builtGemv = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in Kernels.GemvKernels.GetKernelNames())
+                        builtGemv.Add((name, new DirectOpenClKernel(_context, gemvProgram, name)));
+                    _programs.Add(gemvProgram);
+                    foreach (var (name, kernel) in builtGemv) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL GEMV kernels unavailable: {ex.Message}");
+                }
+
+                // Register-blocked batched GEMM for the Winograd per-point products (see BatchedGemm).
+                try
+                {
+                    var rbProgram = CompileOrLoadCached(Kernels.BatchedGemmKernels.Source, OpenClBuildOptions.SafeMathFlags, "Batched GEMM kernels");
+                    var builtRb = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in Kernels.BatchedGemmKernels.GetKernelNames())
+                        builtRb.Add((name, new DirectOpenClKernel(_context, rbProgram, name)));
+                    _programs.Add(rbProgram);
+                    foreach (var (name, kernel) in builtRb) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL batched GEMM kernels unavailable: {ex.Message}");
+                }
+
+                // Fused Winograd F(2x2, 3x3) forward (see TryConv2DForwardWinogradFused).
+                try
+                {
+                    var wfProgram = CompileOrLoadCached(Kernels.WinogradFusedKernels.Source, OpenClBuildOptions.SafeMathFlags, "Fused Winograd kernels");
+                    var builtWf = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in Kernels.WinogradFusedKernels.GetKernelNames())
+                        builtWf.Add((name, new DirectOpenClKernel(_context, wfProgram, name)));
+                    _programs.Add(wfProgram);
+                    foreach (var (name, kernel) in builtWf) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"OpenCL fused Winograd kernels unavailable: {ex.Message}");
+                }
+
                 // Compile Parity-210 kernels (hot-path subset of #210 op surface).
                 // Optional — on drivers that reject any op the whole module we
                 // swallow the exception and fall back to the CpuEngine path.
@@ -1426,6 +1488,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
                 return pooled;
             }
+            if (DeviceMemoryReclaim.CollectOnPoolMiss())
+            {
+                DirectOpenClGpuBuffer.PendingFrees.Drain();
+                if (_bufferPool.TryRent(data.Length, affinity, out pooled) && pooled != null)
+                {
+                    pooled.Buffer.CopyFromHost(data);
+                    DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
+                    return pooled;
+                }
+            }
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, data));
@@ -1444,6 +1516,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
                 return pooled;
+            }
+            // A result nobody disposed returns to the pool only when the GC finalizes it, and a GPU forward allocates too
+            // little managed memory to collect often: each miss became a driver allocation (41% of a ResNet-50 GPU
+            // inference call). Collect on a miss, as the Vulkan allocator does, and look again.
+            if (DeviceMemoryReclaim.CollectOnPoolMiss())
+            {
+                DirectOpenClGpuBuffer.PendingFrees.Drain();
+                if (_bufferPool.TryRent(size, affinity, out pooled) && pooled != null)
+                {
+                    DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
+                    return pooled;
+                }
             }
 
             var context = _context;
@@ -2661,6 +2745,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (ClBlastNative.IsAvailable)
             {
+                EnsureNativeClBlastTuned();
                 IntPtr queue = _context.CommandQueue;
                 var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
 
@@ -2721,6 +2806,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             bool offlineEnabled = GetOfflineTuningMode() != OfflineTuningMode.Disabled;
             RecordGemmDispatch(OpenClGemmDispatchPath.None);
+
+            // A single row (a fully connected layer at batch 1) is a memory-bound GEMV: every weight read once.
+            if (TryExecuteRowVectorGemv(A, B, C, M, N, K, alpha, beta))
+                return;
 
             // A deployment reaches this slot only after the first-party experiment scaffold has
             // compiled it, compared its output with the independent CPU oracle, and applied the
@@ -2858,8 +2947,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             WriteDiag($"[OpenClBackend.MatMul] Called: {M}x{N}x{K}");
             var C = AllocateBuffer(M * N);
             Gemm(A, B, C, M, N, K, 1.0f, 0.0f);
-            // Sync only when returning buffer that might be immediately read
-            _context?.Finish();
             return C;
         }
 
@@ -2997,6 +3084,30 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
             var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
 
+            // The vendor GEMM per batch item, by element offset into the concatenated buffers: the 16x16-tile kernel below
+            // reached about a third of CLBlast's rate on the Winograd convolutions' sixteen per-point GEMMs.
+            // A plain product through the register-blocked kernel: on the F(4x4,3x3) convolutions' 36 per-point GEMMs it
+            // measured 1.27 / 1.09 / 1.01 ms against CLBlast's 1.58 / 1.34 / 1.27 ms (64/128/256 channels at 224/112/56).
+            if (alpha == 1f && beta == 0f
+                && _kernelCache.TryGetValue(Kernels.BatchedGemmKernels.Rb64, out var rb))
+            {
+                // Products of at least 128 x 128 through the 128-tile kernel: 0.85 / 0.93 ms against 0.99 / 1.07 ms on
+                // the F(4x4,3x3) convolutions at 256@56 and 128@112.
+                if (M >= 128 && N >= 128
+                    && _kernelCache.TryGetValue(Kernels.BatchedGemmKernels.Rb128V, out var rb128))
+                {
+                    rb128.SetArg(0, BufferHandle(A)); rb128.SetArg(1, BufferHandle(B)); rb128.SetArg(2, BufferHandle(C));
+                    rb128.SetArg(3, M); rb128.SetArg(4, N); rb128.SetArg(5, K);
+                    rb128.Execute3D(RoundUpToMultiple(N, 128) / 8, RoundUpToMultiple(M, 128) / 8, batchCount, 16, 16, 1);
+                    return;
+                }
+                rb.SetArg(0, BufferHandle(A)); rb.SetArg(1, BufferHandle(B)); rb.SetArg(2, BufferHandle(C));
+                rb.SetArg(3, M); rb.SetArg(4, N); rb.SetArg(5, K);
+                rb.Execute3D(RoundUpToMultiple(N, 64) / 4, RoundUpToMultiple(M, 64) / 4, batchCount, 16, 16, 1);
+                return;
+            }
+            if (TryExecuteClBlastBatchedGemm(A, B, C, M, N, K, batchCount, alpha, beta)) return;
+
             // One 16x16 output tile per work group, the batch in z (see gemm_batched_tiled).
             var kernel = _kernelCache["gemm_batched_tiled"];
             kernel.SetArg(0, bufferA.Handle);
@@ -3008,7 +3119,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.SetArg(6, alpha);
             kernel.SetArg(7, beta);
             kernel.Execute3D(RoundUpToMultiple(N, 16), RoundUpToMultiple(M, 16), batchCount, 16, 16, 1);
-            _context?.Finish();  // Sync for batched - ensures all batches complete
+            // No Finish: the queue is in order, so every later kernel sees these results, and a host read
+            // waits on its own download. A full device sync here stalled the host on every batched GEMM
+            // (25% of a ResNet-50 GPU inference call, whose 1x1 convolutions run through it).
         }
 
         #endregion
@@ -3024,7 +3137,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Relu(temp, output, M * N);
-                _context?.Finish(); // Ensure GPU work completes before returning buffer
                 temp.Dispose();
                 return output;
             }
@@ -3045,7 +3157,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Gelu(temp, output, M * N);
-                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -3086,7 +3197,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int local = CalculateOptimalWorkGroupSize1D(heads);
                 int global = ((heads + local - 1) / local) * local;
                 kernel.Execute1D(global, local);
-                _context.Finish();
                 return output;
             }
             catch
@@ -3128,7 +3238,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int local = CalculateOptimalWorkGroupSize1D(totalItems);
                 int global = ((totalItems + local - 1) / local) * local;
                 kernel.Execute1D(global, local);
-                _context.Finish();
                 return output;
             }
             catch
@@ -3165,7 +3274,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int local = CalculateOptimalWorkGroupSize1D(heads);
                 int global = ((heads + local - 1) / local) * local;
                 kernel.Execute1D(global, local);
-                _context.Finish();
                 return output;
             }
             catch { output.Dispose(); throw; }
@@ -3200,7 +3308,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int local = CalculateOptimalWorkGroupSize1D(totalItems);
                 int global = ((totalItems + local - 1) / local) * local;
                 kernel.Execute1D(global, local);
-                _context.Finish();
                 return output;
             }
             catch { output.Dispose(); throw; }
@@ -3263,7 +3370,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int localR = CalculateOptimalWorkGroupSize1D(heads);
                 int globalR = ((heads + localR - 1) / localR) * localR;
                 reduce.Execute1D(globalR, localR);
-                _context.Finish();
                 return output;
             }
             catch { output.Dispose(); throw; }
@@ -3308,7 +3414,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int globalX = ((M + localX - 1) / localX) * localX;
                 int globalY = ((N + localY - 1) / localY) * localY;
                 kernel.Execute2D(globalX, globalY, localX, localY);
-                _context.Finish();
                 return output;
             }
             catch
@@ -3354,7 +3459,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int globalX = ((M + localX - 1) / localX) * localX;
                 int globalY = ((N + localY - 1) / localY) * localY;
                 kernel.Execute2D(globalX, globalY, localX, localY);
-                _context.Finish();
                 return output;
             }
             catch
@@ -3400,7 +3504,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 int globalX = ((M + localX - 1) / localX) * localX;
                 int globalY = ((N + localY - 1) / localY) * localY;
                 kernel.Execute2D(globalX, globalY, localX, localY);
-                _context.Finish();
                 return output;
             }
             catch
@@ -3419,7 +3522,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Sigmoid(temp, output, M * N);
-                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -3440,7 +3542,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Tanh(temp, output, M * N);
-                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -3479,7 +3580,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 Silu(temp, output, M * N);
-                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -3500,7 +3600,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 temp = GemmBias(A, B, bias, M, N, K);
                 output = AllocateBuffer(M * N);
                 LeakyRelu(temp, output, alpha, M * N);
-                _context?.Finish();
                 temp.Dispose();
                 return output;
             }
@@ -3552,7 +3651,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // Local work size must be 16x16 to match kernel's TILE_SIZE
             var (globalSizeX, globalSizeY, tile) = FusedGemmLaunchShape(M, N);
             kernel.Execute2D(globalSizeX, globalSizeY, tile, tile);
-            _context?.Finish();  // Sync when returning buffer for immediate use
 
             return C;
         }
@@ -4177,7 +4275,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Single kernel launch — all phases happen inside the kernel
                 k.Execute1D(numGroups * localSize, localSize);
             }
-            _context?.Finish();
         }
 
         public void Squash(IGpuBuffer input, IGpuBuffer output, int numCapsules, int capsuleDim, float epsilon)
@@ -4601,7 +4698,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var (localSizeX, localSizeY) = CalculateOptimalWorkGroupSize(M, N);
             kernel.Execute2D(M, N, localSizeX, localSizeY);
-            _context?.Finish();  // Sync when returning buffer for immediate use
 
             return C;
         }
@@ -4770,7 +4866,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             zeroKernel.SetArg(0, bufferOutput.Handle);
             zeroKernel.SetArg(1, outputSize);
             zeroKernel.Execute1D(outputSize, 256);
-            _context?.Finish();
 
             // Then scatter-add. Issue #382: route to atomic-free variant when
             // GpuDeterminism.IsActive — that variant parallelizes per (tgt, feat)
@@ -4900,6 +4995,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         #endregion
 
+        // The one place this backend drains its queue for a caller. Operations do not Finish after enqueuing:
+        // the queue is in order, so a later kernel sees an earlier one's results; a host read is a blocking
+        // download that waits on its own; and OpenCL keeps a released buffer alive until the commands using it
+        // complete (pooled buffers are retired against completion events before reuse). Per-op Finish calls
+        // had serialized the host with the device on every GEMM, fused GEMM, attention and scan.
         public void Synchronize()
         {
             _context?.Finish();
@@ -5201,7 +5301,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     gemmBias.Dispose();   // release the temp even if Softmax throws
                 }
-                _context?.Finish();
                 return;
             }
 
@@ -6039,10 +6138,107 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// Executes GEMM using the actual CLBlast library for head-to-head comparison.
         /// Returns the execution time in milliseconds, or -1 if CLBlast is not available.
         /// </summary>
+        // C[1 x N] = alpha * A[1 x K] * B[K x N] through the split-K GEMV kernels. VGG-16's 25088 x 4096 classifier
+        // took 4.7 ms through the tiled GEMM; its weights are 411 MB, so the bandwidth floor is under 2 ms. False (nothing
+        // launched) unless M is 1, beta is 0, N is a multiple of 4 (vload4 alignment) and the kernels compiled.
+        private bool TryExecuteRowVectorGemv(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
+        {
+            if (M != 1 || beta != 0f || N < 4 || (N & 3) != 0 || K < 256
+                || !_kernelCache.TryGetValue(Kernels.GemvKernels.Partial, out var partialKernel)
+                || !_kernelCache.TryGetValue(Kernels.GemvKernels.Reduce, out var reduceKernel))
+                return false;
+
+            // About 64K work items in flight: enough to cover the device's memory latency at any N.
+            int columnGroups = N / 4;
+            int splits = Math.Max(1, Math.Min(K / 64, (65536 + columnGroups - 1) / columnGroups));
+            int kChunk = (K + splits - 1) / splits;
+            splits = (K + kChunk - 1) / kChunk;
+            using var partial = AllocateBuffer(checked(splits * N));
+
+            uint arg = 0;
+            partialKernel.SetArg(arg++, BufferHandle(A)); partialKernel.SetArg(arg++, BufferHandle(B));
+            partialKernel.SetArg(arg++, BufferHandle(partial));
+            partialKernel.SetArg(arg++, N); partialKernel.SetArg(arg++, K); partialKernel.SetArg(arg++, kChunk);
+            partialKernel.Execute2D(RoundUpToMultiple(columnGroups, 64), splits, 64, 1);
+
+            arg = 0;
+            reduceKernel.SetArg(arg++, BufferHandle(partial)); reduceKernel.SetArg(arg++, BufferHandle(C));
+            reduceKernel.SetArg(arg++, N); reduceKernel.SetArg(arg++, splits); reduceKernel.SetArg(arg++, alpha);
+            reduceKernel.Execute1D(RoundUpToMultiple(N, 64), 64);
+            return true;
+        }
+
+        // C[b] = alpha * A[b] * B[b] + beta * C[b] for each b, over row-major batches laid end to end (A[b] at b*M*K, B[b] at
+        // b*K*N, C[b] at b*M*N), as one CLBlast strided-batched SGEMM.
+        private bool TryExecuteClBlastBatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount,
+            float alpha, float beta)
+        {
+            if (_context == null || !ClBlastNative.IsAvailable || K <= 0 || beta != 0f)
+                return false;
+
+            EnsureNativeClBlastTuned();
+
+            var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
+            var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
+            var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
+
+            IntPtr queue = _context.CommandQueue;
+            var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
+            var status = ClBlastNative.StatusCode.Success;
+            int launched = 0;
+            try
+            {
+                lock (DirectOpenClSubmission.Gate)
+                {
+                    using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                    waits.EnqueueBridgeMarker(queue);
+                    // One strided-batched launch: the per-item launches it replaced cost more than the arithmetic on the
+                    // late, small-tile Winograd GEMMs (36 launches of a 512 x 49 x 512 product).
+                    try
+                    {
+                        status = ClBlastNative.SgemmStridedBatched(
+                            ClBlastNative.Layout.RowMajor,
+                            ClBlastNative.Transpose.No,
+                            ClBlastNative.Transpose.No,
+                            (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
+                            alpha,
+                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K, (UIntPtr)((long)M * K),
+                            bufferB.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)K * N),
+                            beta,
+                            bufferC.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)M * N),
+                            (UIntPtr)batchCount,
+                            ref queue,
+                            IntPtr.Zero);
+                    }
+                    catch (EntryPointNotFoundException)
+                    {
+                        // A CLBlast build without the strided-batched entry point: the tiled kernel runs instead.
+                        return false;
+                    }
+                    if (status == ClBlastNative.StatusCode.Success) launched = batchCount;
+                    if (launched > 0)
+                        DirectOpenClSubmission.CommitLocked(queue, memories);
+                }
+            }
+            finally
+            {
+                DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+            }
+
+            if (status == ClBlastNative.StatusCode.Success)
+                return true;
+            if (EnableTuningDiagnostics)
+                WriteDiag($"CLBlast strided-batched SGEMM failed with status: {status}");
+            // beta is 0 here, so the caller's fallback rewriting every slice is correct whatever was launched.
+            return false;
+        }
+
         private bool TryExecuteClBlastLibraryGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
         {
             if (_context == null || !ClBlastNative.IsAvailable)
                 return false;
+
+            EnsureNativeClBlastTuned();
 
             var bufferA = ((DirectOpenClGpuBuffer)A).Buffer;
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
@@ -8355,6 +8551,14 @@ KERNEL VARIANTS (A/B testing):
             IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
             int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
         {
+            // Inference reduces nothing, so it runs one work-item per element instead of the training
+            // kernel's work-group per channel (which left most of the device idle on early, low-channel
+            // layers: 0.59 ms vs 0.19 ms for an element-wise pass over a [1,256,56,56] activation).
+            // Neither route writes saveMean/saveInvVar in inference.
+            if (!training && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean, runningVar, batch,
+                    channels, spatialSize, epsilon, relu: false))
+                return;
+
             var k = _kernelCache["batchnorm_forward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -8380,6 +8584,33 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(channels * bnLocalSize, bnLocalSize);
         }
 
+        // batchnorm_inference: one work item per element, the running statistics, ReLU when relu is set. False (nothing
+        // launched) when the kernel did not compile or the element count does not fit an int.
+        private bool TryLaunchBatchNormInference(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+            IGpuBuffer runningMean, IGpuBuffer runningVar, int batch, int channels, int spatialSize, float epsilon, bool relu)
+        {
+            long total = (long)batch * channels * spatialSize;
+            if (total <= 0 || total > int.MaxValue || !_kernelCache.TryGetValue("batchnorm_inference", out var kernel))
+                return false;
+            uint arg = 0;
+            kernel.SetArg(arg++, BufferHandle(input));
+            kernel.SetArg(arg++, BufferHandle(output));
+            kernel.SetArg(arg++, BufferHandle(gamma));
+            kernel.SetArg(arg++, BufferHandle(beta));
+            kernel.SetArg(arg++, BufferHandle(runningMean));
+            kernel.SetArg(arg++, BufferHandle(runningVar));
+            kernel.SetArg(arg++, batch);
+            kernel.SetArg(arg++, channels);
+            kernel.SetArg(arg++, spatialSize);
+            kernel.SetArg(arg++, epsilon);
+            kernel.SetArg(arg++, relu ? 1 : 0);
+            // The largest power of two within 256 and the device work-group limit.
+            int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
+            local = 1 << (int)Math.Floor(Math.Log(local, 2));
+            kernel.Execute1D(RoundUpToMultiple((int)total, local), local);
+            return true;
+        }
+
         public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
             IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
             int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
@@ -8387,6 +8618,12 @@ KERNEL VARIANTS (A/B testing):
         {
             if (training || activation == FusedActivationType.None)
                 return false;
+
+            // ReLU through the element-wise inference kernel: batchnorm_relu measured slower than batch norm then a
+            // separate ReLU (0.114 vs 0.096 ms on [1,256,56,56]), where this one-pass form beats both.
+            if (activation == FusedActivationType.ReLU && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean,
+                    runningVar, batch, channels, spatialSize, epsilon, relu: true))
+                return true;
 
             string kernelName = activation switch
             {
@@ -8574,7 +8811,6 @@ KERNEL VARIANTS (A/B testing):
                 kpi.SetArg(api++, 1);
                 int nc = batch * channels;
                 kpi.Execute1D(nc, Math.Min(256, nc));
-                _context.Finish();
             }
             else
             {
@@ -8594,7 +8830,6 @@ KERNEL VARIANTS (A/B testing):
                 k1.SetArg(arg++, spatialSize); // H
                 k1.SetArg(arg++, 1);           // W = 1 (treat spatialSize as flat)
                 k1.Execute1D(totalSize, localSize);
-                _context.Finish();
             }
 
             // Pass 2: compute gradInput using the accumulated sums (deterministic by
@@ -8615,7 +8850,6 @@ KERNEL VARIANTS (A/B testing):
             k2.SetArg(arg2++, 1);           // W = 1
 
             k2.Execute1D(totalSize, localSize);
-            _context.Finish();
         }
 
         public void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
@@ -13634,7 +13868,6 @@ KERNEL VARIANTS (A/B testing):
             int localSize = CalculateOptimalWorkGroupSize1D(total);
             int globalSize = ((total + localSize - 1) / localSize) * localSize;
             kernel.Execute1D(globalSize, localSize);
-            _context?.Finish();
         }
 
         public void ComplexDiagonalSsmScanForward(
@@ -13657,7 +13890,6 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(11u, batch); kernel.SetArg(12u, time); kernel.SetArg(13u, groups); kernel.SetArg(14u, width); kernel.SetArg(15u, state);
             int local = CalculateOptimalWorkGroupSize1D(total);
             kernel.Execute1D(((total + local - 1) / local) * local, local);
-            _context.Finish();
         }
 
         public void MesaScanForward(
@@ -13678,7 +13910,6 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(11u, heads); kernel.SetArg(12u, headDim);
             int total = batch * heads, local = CalculateOptimalWorkGroupSize1D(total);
             kernel.Execute1D(((total + local - 1) / local) * local, local);
-            _context.Finish();
         }
 
         public void RoutedDiagonalSsmScanForward(
@@ -13690,7 +13921,7 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("routed_diagonal_ssm_scan_forward", out var kernel)) throw new GpuCapabilityUnavailableException("OpenCL kernel not found: routed_diagonal_ssm_scan_forward");
             IGpuBuffer[] buffers = { input, activeMask, transition, inputMap, outputMap, skip, output, stateScratch }; for (uint i = 0; i < buffers.Length; i++) kernel.SetArg(i, ((DirectOpenClGpuBuffer)buffers[i]).Buffer.Handle);
             kernel.SetArg(8u, batch); kernel.SetArg(9u, time); kernel.SetArg(10u, model); kernel.SetArg(11u, experts); kernel.SetArg(12u, state);
-            int total = batch * experts, local = CalculateOptimalWorkGroupSize1D(total); kernel.Execute1D(((total + local - 1) / local) * local, local); _context.Finish();
+            int total = batch * experts, local = CalculateOptimalWorkGroupSize1D(total); kernel.Execute1D(((total + local - 1) / local) * local, local);
         }
 
         // ── Fused Mamba-2 SSD scan forward (#1464) ──────────────────────────────────────────
@@ -14097,6 +14328,7 @@ KERNEL VARIANTS (A/B testing):
 
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
+            ReleaseF43FilterCache();
             _bufferPool.Dispose();
             lock (_constantIntTablesGate)
             {
@@ -14290,6 +14522,9 @@ KERNEL VARIANTS (A/B testing):
 
             if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
                 return;
+
+            // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back.
+            DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float));
 
             if (GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))
                 return;
