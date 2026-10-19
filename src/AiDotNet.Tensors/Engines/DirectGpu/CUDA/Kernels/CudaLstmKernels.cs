@@ -1317,7 +1317,7 @@ LSTM_REG_LAST_KERNEL(64)
 
 // Every dense product of the LSTM backward over all R = batch*timeSteps rows, after the recurrence has written dGates
 // and Hprev:
-//   [dWi | dWh | dBias] = dGates^T [X | Hprev | 1]    ([G, In + H + 1], G = 4*hidden)
+//   [dWi | dWh] = dGates^T [X | Hprev]    ([G, In + H], G = 4*hidden),  dBias = column sums of dGates
 //   dX                  = dGates Wi                   ([R, In])
 // They were four GEMMs (and a copy for the second bias), each a few dozen blocks or fewer at a parity LSTM's sizes
 // (measured 9.8 + 9.8 + 14.8 + 2.4 us at B 32, T 16, In 32, H 64 on an RTX 3080). Blocks [0, nW) take 32x32 tiles of
@@ -1326,8 +1326,12 @@ LSTM_REG_LAST_KERNEL(64)
 // an eighth of a slice with a 4x4 register tile per thread, and the eight partial tiles are summed in a fixed order at
 // the end (deterministic, no atomics). Every output is written, not accumulated into.
 // With splits > 1 each weight-gradient tile takes `splits` blocks, each reducing rowsPerSplit of the R rows into its own
-// slot of `partial`, and lstm_backward_gemms_reduce sums the slots in split order: R grows the grid instead of each
-// block's loop (one 32x32 tile per block left a long sequence's weight gradient on a few dozen blocks).
+// slot of `partial`, and the slots are summed in split order: R grows the grid instead of each block's loop (one 32x32
+// tile per block left a long sequence's weight gradient on a few dozen blocks). The last split block to finish a tile
+// (counters, one zeroed uint per tile) sums the tile's slots in split order and writes it, resetting the counter: no
+// second launch. The bias gradient comes from the blocks of the first column tile, which already stage dGates' rows:
+// a ones column of its own made a fourth column tile at a parity LSTM's In + H = 96 (a third more weight blocks for one
+// column), and the host sizes the split count so the grid stays one wave (a 512-thread block per SM).
 #define LBG_KC 64          // reduction depth per staged slice
 #define LBG_LD 36          // shared row stride: float4-aligned
 #define LBG_GROUPS 8       // 64-thread groups splitting each slice
@@ -1344,8 +1348,11 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
     float* __restrict__ dX,             // [R, In]
     int R, int In, int H, int wTilesJ, int nW,
     int splits, int rowsPerSplit,
-    float* __restrict__ partial)        // [splits][nW][32 * 32] when splits > 1
+    float* __restrict__ partial,        // [splits][nW][32 * 32], then [splits][G / 32][32] bias slots, when splits > 1
+    unsigned int* __restrict__ counters) // [nW], zero between launches (splits > 1)
 {
+    __shared__ int isLastSplit;
+    __shared__ float biasPart[LBG_GROUPS][32];
     // sA[k][row], sB[k][col] for one slice; reused for the groups' partial tiles (LBG_GROUPS x 32 x 32) at the end.
     __shared__ __align__(16) float smem[LBG_GROUPS * 32 * 32 > 2 * LBG_KC * LBG_LD ? LBG_GROUPS * 32 * 32 : 2 * LBG_KC * LBG_LD];
     float (*sA)[LBG_LD] = reinterpret_cast<float (*)[LBG_LD]>(smem);
@@ -1375,6 +1382,11 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
     for (int i = 0; i < 4; i++)
 #pragma unroll
         for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+    // The first column tile's blocks also sum dGates over their rows (the bias gradient): lanes with lc == 0 hold rows
+    // lr .. lr + 3 of every slice's A operand once per group.
+    const bool biasTile = weights && col0 == 0;
+    const bool biasLane = biasTile && lc == 0;
+    float bacc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     // Each thread stages LBG_KC * 32 / LBG_THREADS elements of each operand per slice.
     constexpr int PER = LBG_KC * 32 / LBG_THREADS;
@@ -1391,7 +1403,6 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
                 if (r < kEnd) {
                     if (j < In) z = X[(size_t)r * In + j];
                     else if (j < In + H) z = Hprev[(size_t)r * H + (j - In)];
-                    else if (j == In + H) z = 1.0f;
                 }
                 lb[u] = z;
             } else {
@@ -1424,6 +1435,10 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
             for (int i = 0; i < 4; i++)
 #pragma unroll
                 for (int j = 0; j < 4; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+            if (biasLane) {
+#pragma unroll
+                for (int i = 0; i < 4; i++) bacc[i] += av[i];
+            }
         }
         __syncthreads();
     }
@@ -1434,7 +1449,21 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
     for (int i = 0; i < 4; i++)
 #pragma unroll
         for (int j = 0; j < 4; j++) part[(grp * 32 + lr + i) * 32 + lc + j] = acc[i][j];
+    if (biasLane) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) biasPart[grp][lr + i] = bacc[i];
+    }
     __syncthreads();
+    const int rowTiles = (G + 31) / 32, rowTile = row0 >> 5;
+    float* biasSlots = partial + (size_t)splits * nW * 1024;   // [splits][rowTiles][32]
+    if (biasTile && tid < 32) {
+        float b = 0.0f;
+#pragma unroll
+        for (int g = 0; g < LBG_GROUPS; g++) b += biasPart[g][tid];
+        int row = row0 + tid;
+        if (splits > 1) biasSlots[((size_t)split * rowTiles + rowTile) * 32 + tid] = b;
+        else if (row < G) { dBiasIh[row] = b; dBiasHh[row] = b; }
+    }
 #pragma unroll
     for (int u = 0; u < 1024 / LBG_THREADS; u++) {
         int e = tid + u * LBG_THREADS, rowL = e >> 5, colL = e & 31;
@@ -1448,34 +1477,40 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
             if (row >= G) continue;
             if (col < In) dWi[(size_t)row * In + col] = v;
             else if (col < In + H) dWh[(size_t)row * H + (col - In)] = v;
-            else if (col == In + H) { dBiasIh[row] = v; dBiasHh[row] = v; }
         } else if (row < R && col < In) {
             dX[(size_t)row * In + col] = v;
         }
     }
+    if (!(weights && splits > 1)) return;
+    // The last of the tile's split blocks to arrive sums every slot in split order (so the bits do not depend on which
+    // block finished last) and writes the tile.
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) isLastSplit = atomicAdd(&counters[tile], 1u) == (unsigned int)(splits - 1);
+    __syncthreads();
+    if (!isLastSplit) return;
+    __threadfence();
+#pragma unroll
+    for (int u = 0; u < 1024 / LBG_THREADS; u++) {
+        int e = tid + u * LBG_THREADS, row = row0 + (e >> 5), col = col0 + (e & 31);
+        float v = 0.0f;
+        for (int s = 0; s < splits; s++) v += __ldcg(partial + ((size_t)s * nW + tile) * 1024 + e);
+        if (row >= G) continue;
+        if (col < In) dWi[(size_t)row * In + col] = v;
+        else if (col < In + H) dWh[(size_t)row * H + (col - In)] = v;
+    }
+    if (biasTile && tid < 32 && row0 + tid < G) {
+        float b = 0.0f;
+        for (int s = 0; s < splits; s++) b += __ldcg(biasSlots + ((size_t)s * rowTiles + rowTile) * 32 + tid);
+        dBiasIh[row0 + tid] = b;
+        dBiasHh[row0 + tid] = b;
+    }
+    if (tid == 0) counters[tile] = 0u;
 }
 #undef LBG_KC
 #undef LBG_LD
 #undef LBG_GROUPS
 #undef LBG_THREADS
-
-// Sums lstm_backward_gemms' split partials (splits > 1) in split order into dWi, dWh and both bias gradients: one thread
-// per element of the [G, In + H + 1] weight-gradient matrix.
-extern ""C"" __global__ __launch_bounds__(256) void lstm_backward_gemms_reduce(
-    const float* __restrict__ partial, float* __restrict__ dWi, float* __restrict__ dWh,
-    float* __restrict__ dBiasIh, float* __restrict__ dBiasHh, int splits, int nW, int wTilesJ, int In, int H)
-{
-    int G = 4 * H, J = In + H + 1;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= G * J) return;
-    int row = idx / J, col = idx - row * J;
-    int tile = (row >> 5) * wTilesJ + (col >> 5), e = (row & 31) * 32 + (col & 31);
-    float v = 0.0f;
-    for (int s = 0; s < splits; s++) v += partial[((size_t)s * nW + tile) * 1024 + e];
-    if (col < In) dWi[(size_t)row * In + col] = v;
-    else if (col < In + H) dWh[(size_t)row * H + (col - In)] = v;
-    else { dBiasIh[row] = v; dBiasHh[row] = v; }
-}
 
 // ===========================================================================
 // LSTM WEIGHT GRADIENT ACCUMULATION KERNEL
@@ -1673,7 +1708,6 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_backward_recurrence",
             "lstm_forward_recurrence",
             "lstm_backward_gemms",
-            "lstm_backward_gemms_reduce",
             "lstm_forward_recurrence_reg_h32_b1",
             "lstm_backward_recurrence_reg_h32_b1",
             "lstm_forward_recurrence_reg_h64_b1",

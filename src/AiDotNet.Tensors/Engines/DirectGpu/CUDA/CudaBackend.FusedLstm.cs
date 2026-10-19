@@ -39,6 +39,8 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
         public IGpuBuffer HPrev { get; }
         /// <summary>lstm_backward_gemms' split partials, sized on first use (stable afterwards, for captured graphs).</summary>
         public IGpuBuffer? Partials { get; set; }
+        /// <summary>One zeroed arrival counter per weight-gradient tile (the kernel's last split block resets it).</summary>
+        public IGpuBuffer? Counters { get; set; }
     }
 
     private readonly Dictionary<(int Rows, int Hidden), LstmBackwardScratch> _lstmBackwardScratch = new();
@@ -197,38 +199,50 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
                 LaunchKernelWithSharedMem(recurrence, (uint)batch, (uint)hiddenSize, (uint)(gates * sizeof(float)), args);
         }
 
-        // [dWi | dWh | dBias] = dGatesᵀ · [X | Hprev | 1] and dX = dGates · Wi in one launch (lstm_backward_gemms); both
-        // biases are summed into the gates, so each receives the column sums of dGates. The recurrence used to store a
+        // [dWi | dWh] = dGatesᵀ · [X | Hprev], dBias = dGates' column sums and dX = dGates · Wi in one launch
+        // (lstm_backward_gemms); both biases are summed into the gates, so each receives the column sums of dGates. The recurrence used to store a
         // transposed copy of dGates for these products as well: one scattered store per gate per step on its
         // critical path. The kernel is in the recurrence kernels' module, so present whenever the caller found one.
         if (!_kernelCache.TryGetValue("lstm_backward_gemms", out var gemms))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_gemms");
         using (PushContext())
         {
-            const int Tile = 32, MinRowsPerSplit = 512;
-            int wTilesJ = (inputSize + hiddenSize + 1 + Tile - 1) / Tile;
-            int nW = (gates + Tile - 1) / Tile * wTilesJ;
+            // A 512-thread block takes a whole SM's registers, so the grid is held to one wave: as many row splits of the
+            // weight-gradient tiles as fit beside the dX tiles, each split at least two 64-row slices (the last block
+            // of a tile sums its splits in the same launch). Measured on the parity LSTM: a second wave cost more than
+            // the shorter row loops saved (10.2 us at 48 blocks, 10.9 at 80, 12.5 at 144).
+            const int Tile = 32, MinRowsPerSplit = 128;
+            int wTilesJ = (inputSize + hiddenSize + Tile - 1) / Tile;
+            int rowTiles = (gates + Tile - 1) / Tile;
+            int nW = rowTiles * wTilesJ;
             int nX = (rows + Tile - 1) / Tile * ((inputSize + Tile - 1) / Tile);
-            // Enough weight-gradient blocks for about two per SM, each reducing at least MinRowsPerSplit rows.
-            int splits = Math.Max(1, Math.Min((2 * Math.Max(1, ComputeUnits) + nW - 1) / nW, rows / MinRowsPerSplit));
+            int oneWave = Math.Max(1, (Math.Max(1, ComputeUnits) - nX) / nW);
+            int splits = Math.Max(1, Math.Min(oneWave, rows / MinRowsPerSplit));
             int rowsPerSplit = (rows + splits - 1) / splits;
             rowsPerSplit = (rowsPerSplit + 63) / 64 * 64;   // whole 64-row slices
             splits = (rows + rowsPerSplit - 1) / rowsPerSplit;
             IntPtr partialPtr = IntPtr.Zero;
             if (splits > 1)
             {
-                int partialFloats = checked(splits * nW * Tile * Tile);
+                int partialFloats = checked(splits * nW * Tile * Tile + splits * rowTiles * Tile);   // tiles, then bias slots
                 if (scratch.Partials is null || scratch.Partials.Size < partialFloats)
                 {
                     scratch.Partials?.Dispose();
                     scratch.Partials = AllocateBuffer(partialFloats);
                 }
                 partialPtr = scratch.Partials.Handle;
+                if (scratch.Counters is null || scratch.Counters.Size < nW)
+                {
+                    scratch.Counters?.Dispose();
+                    scratch.Counters = AllocateBuffer(nW);
+                    ((IDeviceZeroFill)this).ZeroBuffer(scratch.Counters, nW);
+                }
             }
+            IntPtr countersPtr = splits > 1 ? scratch.Counters!.Handle : IntPtr.Zero;
             IntPtr dGatesPtr = scratch.DGates.Handle, xPtr = input.Handle, hPrevPtr = scratch.HPrev.Handle;
             IntPtr wiPtr = weightsIh.Handle, dWiPtr = gradWeightsIh.Handle, dWhPtr = gradWeightsHh.Handle;
             IntPtr dBiPtr = gradBiasIh.Handle, dBhPtr = gradBiasHh.Handle, dXPtr = gradInput.Handle;
-            void** args = stackalloc void*[17];
+            void** args = stackalloc void*[18];
             args[0] = &dGatesPtr;
             args[1] = &xPtr;
             args[2] = &hPrevPtr;
@@ -246,18 +260,8 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
             args[14] = &splits;
             args[15] = &rowsPerSplit;
             args[16] = &partialPtr;
+            args[17] = &countersPtr;
             LaunchKernel(gemms, (uint)(nW * splits + nX), 512, args);   // LBG_THREADS
-            if (splits > 1)
-            {
-                if (!_kernelCache.TryGetValue("lstm_backward_gemms_reduce", out var reduce))
-                    throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_gemms_reduce");
-                int elements = gates * (inputSize + hiddenSize + 1);
-                void** reduceArgs = stackalloc void*[10];
-                reduceArgs[0] = &partialPtr; reduceArgs[1] = &dWiPtr; reduceArgs[2] = &dWhPtr;
-                reduceArgs[3] = &dBiPtr; reduceArgs[4] = &dBhPtr; reduceArgs[5] = &splits; reduceArgs[6] = &nW;
-                reduceArgs[7] = &wTilesJ; reduceArgs[8] = &inputSize; reduceArgs[9] = &hiddenSize;
-                LaunchKernel(reduce, (uint)((elements + 255) / 256), 256, reduceArgs);
-            }
         }
     }
 }
