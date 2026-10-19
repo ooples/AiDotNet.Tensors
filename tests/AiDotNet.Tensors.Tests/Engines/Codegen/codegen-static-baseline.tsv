@@ -12,6 +12,14 @@ depthwise_conv2d_3x3_bwd_weights	1072	70	14	225	2
 conv2d_1x1_bwd_weights	1511	56	56	256	2
 conv2d_3x3_bwd_weights	717	43	14	150	2
 conv2d_1x1_deep_epilogue	3199	136	128	456	0
+conv2d_3x3_stride2	1313	41	0	192	1
+conv2d_3x3_dilation2	1337	41	0	168	1
+conv2d_3x3_grouped	1400	41	0	225	1
+conv2d_3x3_stride2_bwd_data	692	19	0	56	1
+conv2d_3x3_stride2_bwd_weights	986	57	28	215	2
+conv2d_3x3_dilation2_bwd_data	1290	37	0	164	1
+conv2d_3x3_grouped_bwd_data	1345	37	0	217	1
+conv2d_3x3_grouped_bwd_weights	609	35	7	150	2
 bias_gelu	636	16	16	0	0
 bias_swish	316	16	16	0	0
 residual_add_relu	157	16	16	0	0

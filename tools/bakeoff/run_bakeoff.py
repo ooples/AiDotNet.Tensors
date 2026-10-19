@@ -76,6 +76,15 @@ WORK = {
                                          16 * 64 * 28 * 28 * 64 * 2),
     "conv2d_3x3_bwd_weights":           ((8 * 32 * 28 * 28 + 8 * 64 * 28 * 28) * 4,
                                          8 * 64 * 28 * 28 * 32 * 9 * 2),
+    # General convolution (#890 phase 4b): bytes are input + output, FLOPs 2*MACs.
+    "conv2d_3x3_stride2":              ((8 * 64 * 56 * 56 + 8 * 128 * 28 * 28) * 4, 8 * 128 * 28 * 28 * 64 * 9 * 2),
+    "conv2d_3x3_stride2_bwd_data":     ((8 * 64 * 56 * 56 + 8 * 128 * 28 * 28) * 4, 8 * 128 * 28 * 28 * 64 * 9 * 2),
+    "conv2d_3x3_stride2_bwd_weights":  ((8 * 64 * 56 * 56 + 8 * 128 * 28 * 28) * 4, 8 * 128 * 28 * 28 * 64 * 9 * 2),
+    "conv2d_3x3_dilation2":            (2 * 8 * 32 * 28 * 28 * 4, 8 * 32 * 28 * 28 * 32 * 9 * 2),
+    "conv2d_3x3_dilation2_bwd_data":   (2 * 8 * 32 * 28 * 28 * 4, 8 * 32 * 28 * 28 * 32 * 9 * 2),
+    "conv2d_3x3_grouped":              (2 * 8 * 64 * 28 * 28 * 4, 8 * 64 * 28 * 28 * 8 * 9 * 2),
+    "conv2d_3x3_grouped_bwd_data":     (2 * 8 * 64 * 28 * 28 * 4, 8 * 64 * 28 * 28 * 8 * 9 * 2),
+    "conv2d_3x3_grouped_bwd_weights":  (2 * 8 * 64 * 28 * 28 * 4, 8 * 64 * 28 * 28 * 8 * 9 * 2),
     # Pointwise and normalisation (#890 phase 4a). Bytes are the MINIMUM an operator must
     # move -- read the input once, write the output once -- not what our passes move, so
     # %bw shows the cost of running a normalisation as several passes instead of one.

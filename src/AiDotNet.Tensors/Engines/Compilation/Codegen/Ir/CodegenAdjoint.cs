@@ -116,7 +116,7 @@ public static class CodegenAdjoint
         var determined = new bool[fwdAxes.Count];
         var newAxes = new List<CodegenAxis>();
         var substitution = new CodegenAffineExpr?[fwdAxes.Count];
-        var windowDims = new List<(int Dim, int Spatial, int Tap, int Stride, int Padding)>();
+        var windowDims = new List<(int Dim, int Spatial, int Tap, int Stride, int Padding, int Dilation)>();
 
         for (int d = 0; d < data.Map.Count; d++)
         {
@@ -151,12 +151,13 @@ public static class CodegenAdjoint
                 int spatial = firstIsTap ? second : first;
                 int stride = firstIsTap ? expr.Terms[1].Coefficient : expr.Terms[0].Coefficient;
                 int tapCoefficient = firstIsTap ? expr.Terms[0].Coefficient : expr.Terms[1].Coefficient;
-                if (tapCoefficient != 1)
+                // The tap's coefficient is the DILATION; a non-positive one is not a window.
+                if (tapCoefficient < 1 || stride < 1)
                     throw new NotSupportedException(
-                        "Window dimension " + d + " must use the tap with coefficient 1.");
+                        "Window dimension " + d + " needs a positive stride and dilation.");
 
                 determined[spatial] = true;
-                windowDims.Add((d, spatial, tap, stride, -expr.Constant));
+                windowDims.Add((d, spatial, tap, stride, -expr.Constant, tapCoefficient));
                 continue;
             }
 
@@ -177,14 +178,17 @@ public static class CodegenAdjoint
         }
 
         // ---- 3. A determined spatial axis resolves through the ADJOINT window.
-        // Forward  ih = oh*stride + kh - pad
-        // Backward oh = (ih + pad - kh)/stride, valid only when it divides exactly.
+        // Forward  ih = oh*stride + kh*dilation - pad
+        // Backward oh = (ih + pad - kh*dilation)/stride, valid only when it divides exactly.
         foreach (var w in windowDims)
         {
             if (freeIndex[w.Tap] < 0)
                 throw new NotSupportedException("The tap axis of a window must be free in the adjoint.");
-            substitution[w.Spatial] = CodegenAffineExpr.TransposedWindow(
-                w.Dim, freeIndex[w.Tap], w.Stride, w.Padding);
+            substitution[w.Spatial] = w.Dilation == 1
+                ? CodegenAffineExpr.TransposedWindow(w.Dim, freeIndex[w.Tap], w.Stride, w.Padding)
+                : new CodegenAffineExpr(
+                    new[] { new CodegenAffineTerm(w.Dim, 1), new CodegenAffineTerm(freeIndex[w.Tap], -w.Dilation) },
+                    constant: w.Padding, divisor: w.Stride, requiresExactDivision: w.Stride != 1);
         }
 
         var space = new CodegenIterationSpace(newAxes.ToArray());

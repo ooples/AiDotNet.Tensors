@@ -399,6 +399,42 @@ def main():
         emit_both("conv2d_3x3_bwd_weights",
              lambda: conv2d_weight(x3, list(w3.shape), g3, 1, 1))
 
+    # ---- GENERAL CONVOLUTION (#890 phase 4b): stride, dilation and groups, forward and the
+    # derived gradients, on the catalog's bench shapes.
+    xs = torch.randn(8, 64, 56, 56, device=dev)
+    ws = torch.randn(128, 64, 3, 3, device=dev)
+    bs = torch.randn(128, device=dev)
+    gs = torch.randn(8, 128, 28, 28, device=dev)
+    if selected("conv2d_3x3_stride2"):
+        emit_both("conv2d_3x3_stride2",
+                  lambda: torch.relu(torch.nn.functional.conv2d(xs, ws, bs, 2, 1)))
+    if selected("conv2d_3x3_stride2_bwd_data"):
+        emit_both("conv2d_3x3_stride2_bwd_data", lambda: conv2d_input(list(xs.shape), ws, gs, 2, 1))
+    if selected("conv2d_3x3_stride2_bwd_weights"):
+        emit_both("conv2d_3x3_stride2_bwd_weights", lambda: conv2d_weight(xs, list(ws.shape), gs, 2, 1))
+
+    xd = torch.randn(8, 32, 28, 28, device=dev)
+    wd = torch.randn(32, 32, 3, 3, device=dev)
+    bd = torch.randn(32, device=dev)
+    gd = torch.randn(8, 32, 28, 28, device=dev)
+    if selected("conv2d_3x3_dilation2"):
+        emit_both("conv2d_3x3_dilation2",
+                  lambda: torch.relu(torch.nn.functional.conv2d(xd, wd, bd, 1, 2, 2)))
+    if selected("conv2d_3x3_dilation2_bwd_data"):
+        emit_both("conv2d_3x3_dilation2_bwd_data", lambda: conv2d_input(list(xd.shape), wd, gd, 1, 2, 2))
+
+    xg = torch.randn(8, 64, 28, 28, device=dev)
+    wg = torch.randn(64, 8, 3, 3, device=dev)
+    bg = torch.randn(64, device=dev)
+    gg = torch.randn(8, 64, 28, 28, device=dev)
+    if selected("conv2d_3x3_grouped"):
+        emit_both("conv2d_3x3_grouped",
+                  lambda: torch.relu(torch.nn.functional.conv2d(xg, wg, bg, 1, 1, 1, 8)))
+    if selected("conv2d_3x3_grouped_bwd_data"):
+        emit_both("conv2d_3x3_grouped_bwd_data", lambda: conv2d_input(list(xg.shape), wg, gg, 1, 1, 1, 8))
+    if selected("conv2d_3x3_grouped_bwd_weights"):
+        emit_both("conv2d_3x3_grouped_bwd_weights", lambda: conv2d_weight(xg, list(wg.shape), gg, 1, 1, 1, 8))
+
     return 0
 
 

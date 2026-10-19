@@ -267,6 +267,51 @@ public static class CodegenKernelCatalog
             Conv2D1x1DeepEpilogue(2, 8, 8, 16, 16),
             Conv2D1x1DeepEpilogue(16, 64, 64, 28, 28)),
 
+        // GENERAL CONVOLUTION (#890 phase 4b): stride, dilation and groups through one
+        // builder, so each is an index map rather than a kernel. Shapes are the ones the
+        // common networks use them at: ResNet's stride-2 downsample, a DeepLab-style
+        // dilated 3x3, and a ResNeXt-style grouped 3x3. Each derives its data and weight
+        // gradients from the same linear operator.
+        new("conv2d_3x3_stride2",
+            "dense 3x3 stride 2 + bias + ReLU (the ResNet downsample)",
+            Conv2D(2, 8, 8, 16, 16, 3, stride: 2, pad: 1, dilation: 1, groups: 1, epilogue: true),
+            Conv2D(8, 64, 128, 56, 56, 3, stride: 2, pad: 1, dilation: 1, groups: 1, epilogue: true)),
+
+        new("conv2d_3x3_dilation2",
+            "dense 3x3 dilation 2 + bias + ReLU (a dilated / atrous convolution)",
+            Conv2D(2, 8, 8, 16, 16, 3, stride: 1, pad: 2, dilation: 2, groups: 1, epilogue: true),
+            Conv2D(8, 32, 32, 28, 28, 3, stride: 1, pad: 2, dilation: 2, groups: 1, epilogue: true)),
+
+        new("conv2d_3x3_grouped",
+            "grouped 3x3 (8 groups) + bias + ReLU (ResNeXt-style)",
+            Conv2D(2, 16, 16, 16, 16, 3, stride: 1, pad: 1, dilation: 1, groups: 4, epilogue: true),
+            Conv2D(8, 64, 64, 28, 28, 3, stride: 1, pad: 1, dilation: 1, groups: 8, epilogue: true)),
+
+        new("conv2d_3x3_stride2_bwd_data",
+            "gradient wrt data of the stride-2 3x3 (derived adjoint: exact-division windows)",
+            CodegenAdjoint.BackwardData(Conv2D(2, 8, 8, 16, 16, 3, 2, 1, 1, 1, epilogue: false), 0),
+            CodegenAdjoint.BackwardData(Conv2D(8, 64, 128, 56, 56, 3, 2, 1, 1, 1, epilogue: false), 0)),
+
+        new("conv2d_3x3_stride2_bwd_weights",
+            "gradient wrt weights of the stride-2 3x3 (derived)",
+            CodegenAdjoint.BackwardWeights(Conv2D(2, 8, 8, 16, 16, 3, 2, 1, 1, 1, epilogue: false), 1),
+            CodegenAdjoint.BackwardWeights(Conv2D(8, 64, 128, 56, 56, 3, 2, 1, 1, 1, epilogue: false), 1)),
+
+        new("conv2d_3x3_dilation2_bwd_data",
+            "gradient wrt data of the dilated 3x3 (derived)",
+            CodegenAdjoint.BackwardData(Conv2D(2, 8, 8, 16, 16, 3, 1, 2, 2, 1, epilogue: false), 0),
+            CodegenAdjoint.BackwardData(Conv2D(8, 32, 32, 28, 28, 3, 1, 2, 2, 1, epilogue: false), 0)),
+
+        new("conv2d_3x3_grouped_bwd_data",
+            "gradient wrt data of the grouped 3x3 (derived)",
+            CodegenAdjoint.BackwardData(Conv2D(2, 16, 16, 16, 16, 3, 1, 1, 1, 4, epilogue: false), 0),
+            CodegenAdjoint.BackwardData(Conv2D(8, 64, 64, 28, 28, 3, 1, 1, 1, 8, epilogue: false), 0)),
+
+        new("conv2d_3x3_grouped_bwd_weights",
+            "gradient wrt weights of the grouped 3x3 (derived)",
+            CodegenAdjoint.BackwardWeights(Conv2D(2, 16, 16, 16, 16, 3, 1, 1, 1, 4, epilogue: false), 1),
+            CodegenAdjoint.BackwardWeights(Conv2D(8, 64, 64, 28, 28, 3, 1, 1, 1, 8, epilogue: false), 1)),
+
         // POINTWISE (#890 phase 4a). No reduction axis, so each is one thread per element
         // and the question the bench answers is purely how close to DRAM bandwidth it runs.
         new("bias_gelu",
@@ -304,6 +349,76 @@ public static class CodegenKernelCatalog
             ChannelAffine(2, 8, 6, 6, CodegenActivationKind.ReLU),
             ChannelAffine(32, 64, 56, 56, CodegenActivationKind.ReLU)),
     ];
+
+    /// <summary>
+    /// General 2D convolution over NCHW: square kernel, uniform stride, padding and dilation,
+    /// and channel groups. With groups the operands are bound as [n, G, C/G, h, w],
+    /// [G, K/G, C/G, kh, kw] and [n, G, K/G, oh, ow] -- the same bytes as the NCHW and OIHW
+    /// layouts -- so a group is an axis rather than a division, every map is a single axis or
+    /// a window, and the adjoint differentiates it like any other convolution. With
+    /// epilogue it adds a per-output-channel bias and ReLU; without, it is the linear
+    /// operator the adjoint differentiates.
+    /// </summary>
+    internal static CodegenKernelSpec Conv2D(
+        int n, int c, int k, int h, int w, int kernel, int stride, int pad, int dilation, int groups, bool epilogue)
+    {
+        if (groups < 1 || c % groups != 0 || k % groups != 0)
+            throw new ArgumentException("Groups must divide both channel counts.", nameof(groups));
+        int cg = c / groups, kg = k / groups;
+        int oh = (h + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
+        int ow = (w + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
+        string name = "conv2d_" + kernel + "x" + kernel + "_s" + stride + "_d" + dilation + "_g" + groups;
+
+        static CodegenAffineExpr A(int axis) => CodegenAffineExpr.Axis(axis);
+        static CodegenAffineExpr Win(int spatial, int tap, int stride, int dilation, int pad) =>
+            new(new[] { new CodegenAffineTerm(spatial, stride), new CodegenAffineTerm(tap, dilation) }, -pad);
+
+        CodegenIterationSpace space;
+        CodegenTensorBinding input, weights;
+        CodegenAffineExpr[] outMap, biasMap;
+        int[] outShape, biasShape;
+        if (groups > 1)
+        {
+            space = new CodegenIterationSpace(
+                CodegenAxis.Parallel("n", n), CodegenAxis.Parallel("g", groups), CodegenAxis.Parallel("kg", kg),
+                CodegenAxis.Parallel("oh", oh), CodegenAxis.Parallel("ow", ow),
+                CodegenAxis.Reduce("cg", cg), CodegenAxis.Reduce("kh", kernel), CodegenAxis.Reduce("kw", kernel));
+            const int N = 0, G = 1, KG = 2, OH = 3, OW = 4, CG = 5, KH = 6, KW = 7;
+            input = new CodegenTensorBinding(0, "input", [n, groups, cg, h, w],
+                [A(N), A(G), A(CG), Win(OH, KH, stride, dilation, pad), Win(OW, KW, stride, dilation, pad)]);
+            weights = new CodegenTensorBinding(1, "weights", [groups, kg, cg, kernel, kernel],
+                [A(G), A(KG), A(CG), A(KH), A(KW)]);
+            outShape = [n, groups, kg, oh, ow];
+            outMap = [A(N), A(G), A(KG), A(OH), A(OW)];
+            biasShape = [groups, kg];
+            biasMap = [A(G), A(KG)];
+        }
+        else
+        {
+            space = new CodegenIterationSpace(
+                CodegenAxis.Parallel("n", n), CodegenAxis.Parallel("k", k),
+                CodegenAxis.Parallel("oh", oh), CodegenAxis.Parallel("ow", ow),
+                CodegenAxis.Reduce("c", c), CodegenAxis.Reduce("kh", kernel), CodegenAxis.Reduce("kw", kernel));
+            const int N = 0, K = 1, OH = 2, OW = 3, C = 4, KH = 5, KW = 6;
+            input = new CodegenTensorBinding(0, "input", [n, c, h, w],
+                [A(N), A(C), Win(OH, KH, stride, dilation, pad), Win(OW, KW, stride, dilation, pad)]);
+            weights = new CodegenTensorBinding(1, "weights", [k, c, kernel, kernel], [A(K), A(C), A(KH), A(KW)]);
+            outShape = [n, k, oh, ow];
+            outMap = [A(N), A(K), A(OH), A(OW)];
+            biasShape = [k];
+            biasMap = [A(K)];
+        }
+
+        if (!epilogue)
+        {
+            var output = new CodegenTensorBinding(2, "output", outShape, outMap, isOutput: true);
+            return new CodegenKernelSpec(name, space, [input, weights], output, [0, 1], CodegenReduceKind.Sum);
+        }
+        var bias = new CodegenTensorBinding(2, "bias", biasShape, biasMap);
+        var withBias = new CodegenTensorBinding(3, "output", outShape, outMap, isOutput: true);
+        return new CodegenKernelSpec(name + "_bias_relu", space, [input, weights, bias], withBias, [0, 1],
+            CodegenReduceKind.Sum, biasInput: 2, activation: CodegenActivationKind.ReLU);
+    }
 
     private static CodegenKernelSpec BiasActivation(int rows, int columns, CodegenActivationKind activation)
     {
