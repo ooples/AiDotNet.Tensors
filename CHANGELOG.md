@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.140.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.2...v0.140.0) (2026-10-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **blas:** AIDOTNET_USE_BLAS, AIDOTNET_BLAS_PROVIDER and the AIDOTNET_OPENBLAS_* switches no longer do anything. Removed public API: NativeLibraryDetector.HasOpenBlas/HasMkl/HasCpuBlas/OpenBlasLoadDiagnostic/ RequireOpenBlas/RequireCpuBlas, NativeLibraryStatus and PlatformCapabilities HasOpenBlas/HasMkl/HasCpuBlas, OpenBlasNotFoundException, CpuInferenceConfig, NativeInferencePool, PrefersManagedCache, BlasManaged.PreferManaged and BlasManaged.AutotuneRouting.
+
+### Features
+
+* five-issue batch - Metal CI lane ([#915](https://github.com/ooples/AiDotNet.Tensors/issues/915), [#921](https://github.com/ooples/AiDotNet.Tensors/issues/921)), GPU SpMM ([#515](https://github.com/ooples/AiDotNet.Tensors/issues/515)), CPU saturation ([#653](https://github.com/ooples/AiDotNet.Tensors/issues/653)), fused basic block ([#1353](https://github.com/ooples/AiDotNet.Tensors/issues/1353)) ([#1400](https://github.com/ooples/AiDotNet.Tensors/issues/1400)) ([b98a640](https://github.com/ooples/AiDotNet.Tensors/commit/b98a64002a3a00b296346bd562b066603b7ba121))
+
+
+### Bug Fixes
+
+* **cuda-gemm:** a tuned GEMM route comes before the narrow kernels' shape heuristics; LastGemmDispatchPath reports NarrowGemm ([#1426](https://github.com/ooples/AiDotNet.Tensors/issues/1426)) ([dcdb2c9](https://github.com/ooples/AiDotNet.Tensors/commit/dcdb2c94653a100955e2693eb3586e67bc18f176))
+* **vulkan:** double parity kernels request SignedZeroInfNanPreserve (float controls) so infinities and NaNs survive; device-gated ([#1416](https://github.com/ooples/AiDotNet.Tensors/issues/1416)) ([a7a01d4](https://github.com/ooples/AiDotNet.Tensors/commit/a7a01d499a345cd4fb49a54a9596768f85a5fef3))
+
+
+### Performance
+
+* **blas:** remove native OpenBLAS and Intel MKL; parallel row-times-matrix GEMV ([#1401](https://github.com/ooples/AiDotNet.Tensors/issues/1401)) ([9ca36ad](https://github.com/ooples/AiDotNet.Tensors/commit/9ca36ad1ed054bebc69ca8a468796c895537846d))
+* **compiled-gpu:** a captured training step costs the host one graph launch (step I/O + optimizer in the graph) ([#1405](https://github.com/ooples/AiDotNet.Tensors/issues/1405)) ([b82bcef](https://github.com/ooples/AiDotNet.Tensors/commit/b82bcef0092b247de84330d1f46c68acc8f8432a))
+* **compiled-gpu:** one fused node for a composed MSE loss (ReduceMean(Square(Subtract))) ([#1407](https://github.com/ooples/AiDotNet.Tensors/issues/1407)) ([fbb734f](https://github.com/ooples/AiDotNet.Tensors/commit/fbb734f05590cc0faf1be0abd3aec26a370c6011))
+* **cuda-conv:** phase input gradient indexes dY without divisions and takes 1x1 stride-2 kernels ([#1415](https://github.com/ooples/AiDotNet.Tensors/issues/1415)) ([50eaf11](https://github.com/ooples/AiDotNet.Tensors/commit/50eaf11ac8ca07c30da18ea6cf574c5f5e1bffab))
+* **cuda-conv:** r8v weight-gradient kernels read dY's K tile as 16-byte loads (ResNet-18 3x3 layers 3-18% faster) ([#1428](https://github.com/ooples/AiDotNet.Tensors/issues/1428)) ([fe01a5a](https://github.com/ooples/AiDotNet.Tensors/commit/fe01a5aec5b35222ab554c590d8d220a4b20d06c))
+* **cuda-gemm:** skinny_gemm on four warp groups with prefetch + 16/8-row tiles, and small-shape GEMMs (Transformer GEMMs 50.7 -&gt; 24.7 us/step, head 16 -&gt; 8 us) ([#1410](https://github.com/ooples/AiDotNet.Tensors/issues/1410)) ([0c9fc80](https://github.com/ooples/AiDotNet.Tensors/commit/0c9fc809da30582ec7254c9d0c143dbdd08d0b7b))
+* **cuda-lstm:** a last-step LSTM node outputs h_T directly and differentiates it alone (ILstmLastStepTraining) ([#1418](https://github.com/ooples/AiDotNet.Tensors/issues/1418)) ([e06e790](https://github.com/ooples/AiDotNet.Tensors/commit/e06e790b013e7e3acb6a0075da2ab01b3e4ec0cb))
+* **cuda-lstm:** forward recurrence with a unit's four gates on adjacent lanes (13.7 -&gt; 10.9 us) ([#1420](https://github.com/ooples/AiDotNet.Tensors/issues/1420)) ([4099af8](https://github.com/ooples/AiDotNet.Tensors/commit/4099af855fad1f7081874e2bf8a69295eb4440fc))
+* **cuda-lstm:** register-resident recurrence + one fused backward-GEMM kernel; LSTM step 309 -&gt; 155 us ([#1403](https://github.com/ooples/AiDotNet.Tensors/issues/1403)) ([12b5393](https://github.com/ooples/AiDotNet.Tensors/commit/12b5393c0970cede78ca1b2ffc92c510a10fdc73))
+* **cuda-optimizer:** ping-pong captured SGD - one fused pass updates into the other weight set and takes the finiteness reduction (ResNet-18 step -43.5 us) ([#1422](https://github.com/ooples/AiDotNet.Tensors/issues/1422)) ([481b039](https://github.com/ooples/AiDotNet.Tensors/commit/481b039f9c458b8ad5ee936e6f41763b32c3d34c))
+* **cuda:** Transformer step 140 -&gt; ~99 us - single-launch bias/LayerNorm/weight gradients, in-place packed QKV attention ([#1413](https://github.com/ooples/AiDotNet.Tensors/issues/1413)) ([427c164](https://github.com/ooples/AiDotNet.Tensors/commit/427c164602eb21bcc7c21bf45f73edc57293d9de))
+* **cuda:** tune candidates as captured-graph replays (device time without per-launch host cost) ([#1427](https://github.com/ooples/AiDotNet.Tensors/issues/1427)) ([507f95f](https://github.com/ooples/AiDotNet.Tensors/commit/507f95f15eaa2b8f77a537271b26e10d3c998673))
+
 ## [0.139.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.139.1...v0.139.2) (2026-10-17)
 
 
