@@ -34,7 +34,8 @@ jobs:
   ratchet:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # PyTorch is timed at its best: every execution mode, torch.compile included (see the parity job).
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -93,7 +94,9 @@ jobs:
   parity:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Every case times PyTorch in each mode it offers, torch.compile (default and max-autotune, with and without
+    # channels_last) at both thread counts included, so a run compiles each network several times.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
