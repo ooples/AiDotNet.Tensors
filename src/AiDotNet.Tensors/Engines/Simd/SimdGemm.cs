@@ -3509,17 +3509,62 @@ internal static partial class SimdGemm
         }
     }
 
+    /// <summary>
+    /// Rows [4*blockStart, 4*blockEnd) of C = A*Bt, B stored [n, k]: every element is an 8-lane FMA dot product over the
+    /// vectorizable k, summed across lanes, plus the scalar k tail - the same arithmetic in every column group below,
+    /// so the grouping does not change a bit. Columns run three at a time (12 accumulators: 7 loads per 12 FMAs against
+    /// the two-column group's 6 per 8), then two, then one, so an odd n writes its last column too.
+    /// </summary>
     [MethodImpl(Hot)]
     private static unsafe void SgemmTransBBlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n)
     {
-        const int MRf = 4, NRf = 2;
+        const int MRf = 4;
         int kVec = (k / 8) * 8;
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * MRf;
             float* a0 = A + (long)(i0 + 0) * k; float* a1 = A + (long)(i0 + 1) * k;
             float* a2 = A + (long)(i0 + 2) * k; float* a3 = A + (long)(i0 + 3) * k;
-            for (int j = 0; j + NRf <= n; j += NRf)
+            float* r0 = C + (long)(i0 + 0) * n; float* r1 = C + (long)(i0 + 1) * n;
+            float* r2 = C + (long)(i0 + 2) * n; float* r3 = C + (long)(i0 + 3) * n;
+            int j = 0;
+            for (; j + 3 <= n; j += 3)
+            {
+                float* bj0 = B + (long)(j + 0) * k; float* bj1 = B + (long)(j + 1) * k; float* bj2 = B + (long)(j + 2) * k;
+                var acc00 = Vector256<float>.Zero; var acc01 = Vector256<float>.Zero; var acc02 = Vector256<float>.Zero;
+                var acc10 = Vector256<float>.Zero; var acc11 = Vector256<float>.Zero; var acc12 = Vector256<float>.Zero;
+                var acc20 = Vector256<float>.Zero; var acc21 = Vector256<float>.Zero; var acc22 = Vector256<float>.Zero;
+                var acc30 = Vector256<float>.Zero; var acc31 = Vector256<float>.Zero; var acc32 = Vector256<float>.Zero;
+                for (int p = 0; p < kVec; p += 8)
+                {
+                    var bv0 = Avx.LoadVector256(bj0 + p); var bv1 = Avx.LoadVector256(bj1 + p); var bv2 = Avx.LoadVector256(bj2 + p);
+                    var av = Avx.LoadVector256(a0 + p);
+                    acc00 = Fma.MultiplyAdd(av, bv0, acc00); acc01 = Fma.MultiplyAdd(av, bv1, acc01); acc02 = Fma.MultiplyAdd(av, bv2, acc02);
+                    av = Avx.LoadVector256(a1 + p);
+                    acc10 = Fma.MultiplyAdd(av, bv0, acc10); acc11 = Fma.MultiplyAdd(av, bv1, acc11); acc12 = Fma.MultiplyAdd(av, bv2, acc12);
+                    av = Avx.LoadVector256(a2 + p);
+                    acc20 = Fma.MultiplyAdd(av, bv0, acc20); acc21 = Fma.MultiplyAdd(av, bv1, acc21); acc22 = Fma.MultiplyAdd(av, bv2, acc22);
+                    av = Avx.LoadVector256(a3 + p);
+                    acc30 = Fma.MultiplyAdd(av, bv0, acc30); acc31 = Fma.MultiplyAdd(av, bv1, acc31); acc32 = Fma.MultiplyAdd(av, bv2, acc32);
+                }
+                float s00 = Vector256.Sum(acc00), s01 = Vector256.Sum(acc01), s02 = Vector256.Sum(acc02);
+                float s10 = Vector256.Sum(acc10), s11 = Vector256.Sum(acc11), s12 = Vector256.Sum(acc12);
+                float s20 = Vector256.Sum(acc20), s21 = Vector256.Sum(acc21), s22 = Vector256.Sum(acc22);
+                float s30 = Vector256.Sum(acc30), s31 = Vector256.Sum(acc31), s32 = Vector256.Sum(acc32);
+                for (int p = kVec; p < k; p++)
+                {
+                    float a0p = a0[p], a1p = a1[p], a2p = a2[p], a3p = a3[p], b0p = bj0[p], b1p = bj1[p], b2p = bj2[p];
+                    s00 += a0p * b0p; s01 += a0p * b1p; s02 += a0p * b2p;
+                    s10 += a1p * b0p; s11 += a1p * b1p; s12 += a1p * b2p;
+                    s20 += a2p * b0p; s21 += a2p * b1p; s22 += a2p * b2p;
+                    s30 += a3p * b0p; s31 += a3p * b1p; s32 += a3p * b2p;
+                }
+                r0[j] = s00; r0[j + 1] = s01; r0[j + 2] = s02;
+                r1[j] = s10; r1[j + 1] = s11; r1[j + 2] = s12;
+                r2[j] = s20; r2[j + 1] = s21; r2[j + 2] = s22;
+                r3[j] = s30; r3[j + 1] = s31; r3[j + 2] = s32;
+            }
+            for (; j + 2 <= n; j += 2)
             {
                 float* bj0 = B + (long)(j + 0) * k; float* bj1 = B + (long)(j + 1) * k;
                 var acc00 = Vector256<float>.Zero; var acc01 = Vector256<float>.Zero;
@@ -3546,14 +3591,34 @@ internal static partial class SimdGemm
                     s00 += a0p * b0p; s01 += a0p * b1p; s10 += a1p * b0p; s11 += a1p * b1p;
                     s20 += a2p * b0p; s21 += a2p * b1p; s30 += a3p * b0p; s31 += a3p * b1p;
                 }
-                float* r0 = C + (long)(i0 + 0) * n + j; r0[0] = s00; r0[1] = s01;
-                float* r1 = C + (long)(i0 + 1) * n + j; r1[0] = s10; r1[1] = s11;
-                float* r2 = C + (long)(i0 + 2) * n + j; r2[0] = s20; r2[1] = s21;
-                float* r3 = C + (long)(i0 + 3) * n + j; r3[0] = s30; r3[1] = s31;
+                r0[j] = s00; r0[j + 1] = s01;
+                r1[j] = s10; r1[j + 1] = s11;
+                r2[j] = s20; r2[j + 1] = s21;
+                r3[j] = s30; r3[j + 1] = s31;
+            }
+            for (; j < n; j++)
+            {
+                float* bj0 = B + (long)j * k;
+                var acc0 = Vector256<float>.Zero; var acc1 = Vector256<float>.Zero;
+                var acc2 = Vector256<float>.Zero; var acc3 = Vector256<float>.Zero;
+                for (int p = 0; p < kVec; p += 8)
+                {
+                    var bv = Avx.LoadVector256(bj0 + p);
+                    acc0 = Fma.MultiplyAdd(Avx.LoadVector256(a0 + p), bv, acc0);
+                    acc1 = Fma.MultiplyAdd(Avx.LoadVector256(a1 + p), bv, acc1);
+                    acc2 = Fma.MultiplyAdd(Avx.LoadVector256(a2 + p), bv, acc2);
+                    acc3 = Fma.MultiplyAdd(Avx.LoadVector256(a3 + p), bv, acc3);
+                }
+                float s0 = Vector256.Sum(acc0), s1 = Vector256.Sum(acc1), s2 = Vector256.Sum(acc2), s3 = Vector256.Sum(acc3);
+                for (int p = kVec; p < k; p++)
+                {
+                    float b0p = bj0[p];
+                    s0 += a0[p] * b0p; s1 += a1[p] * b0p; s2 += a2[p] * b0p; s3 += a3[p] * b0p;
+                }
+                r0[j] = s0; r1[j] = s1; r2[j] = s2; r3[j] = s3;
             }
         }
     }
-
     /// <summary>
     /// #209 close-parity: parallel-M wrapper around SgemmDirect's tile loop.
     /// Distributes the outer-M loop's Mr=6 blocks across cores via the
