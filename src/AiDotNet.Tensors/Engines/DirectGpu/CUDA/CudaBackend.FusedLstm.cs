@@ -39,6 +39,8 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
         public IGpuBuffer HPrev { get; }
         /// <summary>lstm_backward_gemms' split partials, sized on first use (stable afterwards, for captured graphs).</summary>
         public IGpuBuffer? Partials { get; set; }
+        /// <summary>One zeroed arrival counter per weight-gradient tile (the kernel's last split block resets it).</summary>
+        public IGpuBuffer? Counters { get; set; }
     }
 
     private readonly Dictionary<(int Rows, int Hidden), LstmBackwardScratch> _lstmBackwardScratch = new();
@@ -205,7 +207,10 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_gemms");
         using (PushContext())
         {
-            const int Tile = 32, MinRowsPerSplit = 512;
+            // Rows per split: with the in-kernel last-block reduce a split costs no extra launch, so a block reduces as few
+            // as two 64-row slices. DBG_LSTM_MINROWS: sweep hook.
+            const int Tile = 32;
+            int MinRowsPerSplit = int.TryParse(Environment.GetEnvironmentVariable("DBG_LSTM_MINROWS"), out var dbgRows) ? dbgRows : 128;
             int wTilesJ = (inputSize + hiddenSize + 1 + Tile - 1) / Tile;
             int nW = (gates + Tile - 1) / Tile * wTilesJ;
             int nX = (rows + Tile - 1) / Tile * ((inputSize + Tile - 1) / Tile);
@@ -224,11 +229,18 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
                     scratch.Partials = AllocateBuffer(partialFloats);
                 }
                 partialPtr = scratch.Partials.Handle;
+                if (scratch.Counters is null || scratch.Counters.Size < nW)
+                {
+                    scratch.Counters?.Dispose();
+                    scratch.Counters = AllocateBuffer(nW);
+                    ((IDeviceZeroFill)this).ZeroBuffer(scratch.Counters, nW);
+                }
             }
+            IntPtr countersPtr = splits > 1 ? scratch.Counters!.Handle : IntPtr.Zero;
             IntPtr dGatesPtr = scratch.DGates.Handle, xPtr = input.Handle, hPrevPtr = scratch.HPrev.Handle;
             IntPtr wiPtr = weightsIh.Handle, dWiPtr = gradWeightsIh.Handle, dWhPtr = gradWeightsHh.Handle;
             IntPtr dBiPtr = gradBiasIh.Handle, dBhPtr = gradBiasHh.Handle, dXPtr = gradInput.Handle;
-            void** args = stackalloc void*[17];
+            void** args = stackalloc void*[18];
             args[0] = &dGatesPtr;
             args[1] = &xPtr;
             args[2] = &hPrevPtr;
@@ -246,8 +258,9 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
             args[14] = &splits;
             args[15] = &rowsPerSplit;
             args[16] = &partialPtr;
+            args[17] = &countersPtr;
             LaunchKernel(gemms, (uint)(nW * splits + nX), 512, args);   // LBG_THREADS
-            if (splits > 1)
+            if (splits > 1 && countersPtr == IntPtr.Zero)
             {
                 if (!_kernelCache.TryGetValue("lstm_backward_gemms_reduce", out var reduce))
                     throw new GpuCapabilityUnavailableException("CUDA kernel not found: lstm_backward_gemms_reduce");

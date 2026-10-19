@@ -1326,8 +1326,10 @@ LSTM_REG_LAST_KERNEL(64)
 // an eighth of a slice with a 4x4 register tile per thread, and the eight partial tiles are summed in a fixed order at
 // the end (deterministic, no atomics). Every output is written, not accumulated into.
 // With splits > 1 each weight-gradient tile takes `splits` blocks, each reducing rowsPerSplit of the R rows into its own
-// slot of `partial`, and lstm_backward_gemms_reduce sums the slots in split order: R grows the grid instead of each
-// block's loop (one 32x32 tile per block left a long sequence's weight gradient on a few dozen blocks).
+// slot of `partial`, and the slots are summed in split order: R grows the grid instead of each block's loop (one 32x32
+// tile per block left a long sequence's weight gradient on a few dozen blocks). With `counters` (one zeroed uint per
+// tile) the last split block to finish a tile sums its slots and writes the outputs, resetting the counter; without,
+// lstm_backward_gemms_reduce does it in a second launch.
 #define LBG_KC 64          // reduction depth per staged slice
 #define LBG_LD 36          // shared row stride: float4-aligned
 #define LBG_GROUPS 8       // 64-thread groups splitting each slice
@@ -1344,8 +1346,10 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
     float* __restrict__ dX,             // [R, In]
     int R, int In, int H, int wTilesJ, int nW,
     int splits, int rowsPerSplit,
-    float* __restrict__ partial)        // [splits][nW][32 * 32] when splits > 1
+    float* __restrict__ partial,        // [splits][nW][32 * 32] when splits > 1
+    unsigned int* __restrict__ counters) // [nW], zero between launches; null: lstm_backward_gemms_reduce sums the splits
 {
+    __shared__ int isLastSplit;
     // sA[k][row], sB[k][col] for one slice; reused for the groups' partial tiles (LBG_GROUPS x 32 x 32) at the end.
     __shared__ __align__(16) float smem[LBG_GROUPS * 32 * 32 > 2 * LBG_KC * LBG_LD ? LBG_GROUPS * 32 * 32 : 2 * LBG_KC * LBG_LD];
     float (*sA)[LBG_LD] = reinterpret_cast<float (*)[LBG_LD]>(smem);
@@ -1453,6 +1457,26 @@ extern ""C"" __global__ __launch_bounds__(LBG_THREADS) void lstm_backward_gemms(
             dX[(size_t)row * In + col] = v;
         }
     }
+    if (!(weights && splits > 1 && counters != nullptr)) return;
+    // The last of the tile's split blocks to arrive sums every slot in split order (so the bits do not depend on which
+    // block finished last) and writes the tile.
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) isLastSplit = atomicAdd(&counters[tile], 1u) == (unsigned int)(splits - 1);
+    __syncthreads();
+    if (!isLastSplit) return;
+    __threadfence();
+#pragma unroll
+    for (int u = 0; u < 1024 / LBG_THREADS; u++) {
+        int e = tid + u * LBG_THREADS, row = row0 + (e >> 5), col = col0 + (e & 31);
+        float v = 0.0f;
+        for (int s = 0; s < splits; s++) v += __ldcg(partial + ((size_t)s * nW + tile) * 1024 + e);
+        if (row >= G) continue;
+        if (col < In) dWi[(size_t)row * In + col] = v;
+        else if (col < In + H) dWh[(size_t)row * H + (col - In)] = v;
+        else if (col == In + H) { dBiasIh[row] = v; dBiasHh[row] = v; }
+    }
+    if (tid == 0) counters[tile] = 0u;
 }
 #undef LBG_KC
 #undef LBG_LD
