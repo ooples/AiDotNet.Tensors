@@ -215,9 +215,10 @@ internal readonly struct TunedConv2DArgs
 {
     internal TunedConv2DArgs(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        IGpuBuffer? bias = null, FusedActivationType activation = FusedActivationType.None)
     {
-        Input = input; Kernel = kernel; Output = output;
+        Input = input; Kernel = kernel; Output = output; Bias = bias; Activation = activation;
         Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
         OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
         KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW;
@@ -227,6 +228,14 @@ internal readonly struct TunedConv2DArgs
     internal IGpuBuffer Input { get; }
     internal IGpuBuffer Kernel { get; }
     internal IGpuBuffer Output { get; }
+
+    /// <summary>A per-output-channel bias added to the convolution's result, or null.</summary>
+    internal IGpuBuffer? Bias { get; }
+
+    /// <summary>The activation applied after the bias. Every route produces the same result: one that cannot apply them
+    /// in its own output kernel runs the bias add and the activation after it.</summary>
+    internal FusedActivationType Activation { get; }
+
     internal int Batch { get; }
     internal int InChannels { get; }
     internal int InHeight { get; }

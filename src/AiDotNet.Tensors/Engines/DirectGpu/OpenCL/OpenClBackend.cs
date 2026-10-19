@@ -7082,6 +7082,27 @@ KERNEL VARIANTS (A/B testing):
                 kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
         }
 
+        /// <inheritdoc/>
+        public bool TryConv2DBiasActivation(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer? bias, IGpuBuffer output,
+            int batch, int inChannels, int inHeight, int inWidth,
+            int outChannels, int outHeight, int outWidth,
+            int kernelH, int kernelW,
+            int strideH, int strideW, int padH, int padW,
+            int dilationH, int dilationW, FusedActivationType activation)
+        {
+            if (activation != FusedActivationType.None && activation != FusedActivationType.ReLU) return false;
+            if (batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+            var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
+            if (!Conv2DForwardSlot.TryExecute(args.Shape(), args))
+            {
+                Conv2DGenericCore(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+                ConvEpiloguePasses(args);
+            }
+            return true;
+        }
+
         private void Conv2DGenericCore(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
             int batch, int inChannels, int inHeight, int inWidth,
             int outChannels, int outHeight, int outWidth,

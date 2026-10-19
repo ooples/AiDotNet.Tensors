@@ -109,6 +109,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 arg = 2;
                 output.SetArg(arg++, n); output.SetArg(arg++, outC); output.SetArg(arg++, outH); output.SetArg(arg++, outW);
                 output.SetArg(arg++, tilesH); output.SetArg(arg++, tilesW);
+                output.SetArg(arg++, ConvEpilogueBias(a)); output.SetArg(arg++, ConvEpilogueFlags(a));
                 RunWinograd(output, (long)outC * p);
                 return true;
             }
