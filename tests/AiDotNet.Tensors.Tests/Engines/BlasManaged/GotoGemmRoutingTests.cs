@@ -52,10 +52,30 @@ public sealed class GotoGemmRoutingTests
         Assert.False(GotoGemmFp32.PackBothUnderOccupies(m, threadBudget));
     }
 
+    // M from 64: a 77-token cross-attention context's K/V projection (M77 K1024 N2304) left PackBoth on 2 threads.
+    // Thin-M very-wide-N with M a multiple of the 6-row microkernel stays on PackBoth's N-axis path.
+    [Theory]
+    [InlineData(77, 2304, 1024)]
+    [InlineData(64, 1152, 1152)]
+    [InlineData(256, 3456, 1152)]
+    public void BeatsPackBoth_ClaimsShortMShapes(int m, int n, int k)
+    {
+        Assert.True(GotoGemmFp32.BeatsPackBoth(m, n, k));
+    }
+
+    [Theory]
+    [InlineData(63, 2304, 1024)]
+    [InlineData(96, 4096, 1024)]
+    public void BeatsPackBoth_CedesTinyMAndSixAlignedVeryWideN(int m, int n, int k)
+    {
+        Assert.False(GotoGemmFp32.BeatsPackBoth(m, n, k));
+    }
+
     [Theory]
     [InlineData(256, 768, 768)]
     [InlineData(256, 768, 3072)]
     [InlineData(250, 768, 520)]
+    [InlineData(77, 1024, 2304)]
     public void TransformerShapes_OnTheNewRoute_MatchADoubleReference(int m, int k, int n)
     {
         int before = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -105,6 +125,7 @@ public sealed class GotoGemmRoutingTests
     [InlineData(256, 768, 768)]
     [InlineData(250, 768, 520)]
     [InlineData(256, 3072, 768)]
+    [InlineData(77, 1024, 2304)]
     public void RoutedPath_OverwritesAGarbageDestination(int m, int k, int n)
     {
         int before = CpuParallelSettings.MaxDegreeOfParallelism;
