@@ -10,6 +10,8 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// <summary>Emits a double-buffered true-FP32 split weight-gradient partial.</summary>
 public sealed class PtxTiledOuterProductEmitter
 {
+    private bool _async = true;
+
     private const int FixedR = 16;
     private const int FixedRd = 8;
     private const int FixedP = 4;
@@ -32,8 +34,8 @@ public sealed class PtxTiledOuterProductEmitter
 
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        if (computeMajor < 8)
-            throw new NotSupportedException("The double-buffered outer product requires cp.async on sm_80+.");
+        // sm_80+ stages tiles with cp.async; Turing (sm_75) with a synchronous register round trip.
+        _async = PtxSharedCopy.HasAsyncCopy(computeMajor);
         if (!CodegenTiledOuterProductPlan.TryCreate(
                 spec, _schedule, out var possible, out string reason))
             throw new NotSupportedException("This spec cannot use the tiled outer product: " + reason);
@@ -76,8 +78,8 @@ public sealed class PtxTiledOuterProductEmitter
             }
 
         EmitAsyncStage(plan, step: 0, buffer: 0);
-        L("cp.async.commit_group;");
-        L("cp.async.wait_group 0;");
+        PtxSharedCopy.Commit(_async, L);
+        PtxSharedCopy.Wait(_async, L);
         L("bar.sync 0;");
 
         for (int step = 0; step < plan.Steps; step++)
@@ -86,12 +88,12 @@ public sealed class PtxTiledOuterProductEmitter
             if (step + 1 < plan.Steps)
             {
                 EmitAsyncStage(plan, step + 1, 1 - current);
-                L("cp.async.commit_group;");
+                PtxSharedCopy.Commit(_async, L);
             }
             EmitCompute(plan, current, accumulators);
             if (step + 1 < plan.Steps)
             {
-                L("cp.async.wait_group 0;");
+                PtxSharedCopy.Wait(_async, L);
                 L("bar.sync 0;");
             }
         }
@@ -160,7 +162,7 @@ public sealed class PtxTiledOuterProductEmitter
             L($"add.u64 {source}, {basePointer}, {bytes};");
             L($"mul.wide.u32 {sharedBytes}, {index}, 16;");
             L($"add.u64 {destination}, %rd3, {sharedBytes};");
-            L($"@{valid} cp.async.ca.shared.global [{destination}+{I(sharedBase)}], [{source}], 16;");
+            PtxSharedCopy.Emit(_async, L, NextF, NextP, $"{destination}+{I(sharedBase)}", source, 16, valid);
         }
     }
 

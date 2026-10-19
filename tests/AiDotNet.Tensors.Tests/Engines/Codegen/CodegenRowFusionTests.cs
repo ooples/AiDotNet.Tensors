@@ -12,6 +12,14 @@ namespace AiDotNet.Tensors.Tests.Engines.Codegen;
 
 public class CodegenRowFusionTests
 {
+    /// <summary>The plan, asserted to exist (with the planner's reason when it does not).</summary>
+    private static CodegenRowFusionPlan Plan(CodegenProgram program)
+    {
+        var plan = CodegenRowFusion.TryPlan(program, out string reason);
+        Assert.True(plan is not null, reason);
+        return plan ?? throw new InvalidOperationException(reason);
+    }
+
     [Fact]
     public void RowShapedProgramsAreAccepted()
     {
@@ -47,10 +55,8 @@ public class CodegenRowFusionTests
     [Fact]
     public void ARowTooWideToHoldIsStreamed()
     {
-        var plan = CodegenRowFusion.TryPlan(
-            CodegenFusedStatistics.LayerNorm(16, CodegenRowFusion.MaxWidth * 2), out string reason);
-        Assert.True(plan is not null, reason);
-        Assert.False(plan!.Holds(4));
+        var plan = Plan(CodegenFusedStatistics.LayerNorm(16, CodegenRowFusion.MaxWidth * 2));
+        Assert.False(plan.Holds(4));
         Assert.NotNull(plan.StreamGeometry(4));
 
         var emitter = new PtxAffineEmitter();
@@ -67,13 +73,11 @@ public class CodegenRowFusionTests
     [Fact]
     public void BatchNormStreamsAsTwoSweepsAroundARowPass()
     {
-        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.BatchNorm2D(32, 64, 56, 56), out string reason);
-        Assert.True(plan is not null, reason);
-        Assert.Contains("batchnorm_rstd", plan!.RowPasses);
+        var plan = Plan(CodegenFusedStatistics.BatchNorm2D(32, 64, 56, 56));
+        Assert.Contains("batchnorm_rstd", plan.RowPasses);
         Assert.Equal(new[] { 64 }, plan.RowExtents);
-        var geometry = plan.StreamGeometry(4);
-        Assert.NotNull(geometry);
-        Assert.Equal(0, 3136 % geometry!.Value.Step);   // a step never straddles an h*w plane
+        var geometry = plan.StreamGeometry(4) ?? throw new InvalidOperationException("no streamed geometry");
+        Assert.Equal(0, 3136 % geometry.Step);   // a step never straddles an h*w plane
 
         string ptx = new PtxAffineEmitter().EmitRowProgram(plan, "rowfused_bn", 7, 5);
         Assert.Contains("SWEEP0:", ptx, StringComparison.Ordinal);
@@ -89,12 +93,11 @@ public class CodegenRowFusionTests
     [Fact]
     public void FusedLayerNormLoadsEachSourceOnce()
     {
-        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(128, 1024), out string reason);
-        Assert.True(plan is not null, reason);
+        var plan = Plan(CodegenFusedStatistics.LayerNorm(128, 1024));
         // Scalar form: one load per element position.
         var scalar = new PtxAffineEmitter { EnableVectorLoads = false };
-        string ptx = scalar.EmitRowProgram(plan!, "rowfused_layernorm", 7, 5);
-        Assert.Equal(3 * plan!.PerLane, scalar.EmittedLoads);
+        string ptx = scalar.EmitRowProgram(plan, "rowfused_layernorm", 7, 5);
+        Assert.Equal(3 * plan.PerLane, scalar.EmittedLoads);
         // Two statistics, five butterfly steps each.
         Assert.Equal(10, CountOccurrences(ptx, "shfl.sync.bfly.b32"));
         // y stored by every lane; negmean and rstd by the leader only.
@@ -118,22 +121,21 @@ public class CodegenRowFusionTests
     [Fact]
     public void ANarrowRowUsesTheWidestAccessThatFits()
     {
-        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(128, 64), out _);
-        string ptx = new PtxAffineEmitter().EmitRowProgram(plan!, "rowfused_d64", 7, 5);
+        var plan = Plan(CodegenFusedStatistics.LayerNorm(128, 64));
+        string ptx = new PtxAffineEmitter().EmitRowProgram(plan, "rowfused_d64", 7, 5);
         Assert.Contains("ld.global.nc.v2.f32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("v4.f32", ptx, StringComparison.Ordinal);
 
-        var single = CodegenRowFusion.TryPlan(CodegenFusedStatistics.RmsNorm(128, 32), out _);
-        string scalar = new PtxAffineEmitter().EmitRowProgram(single!, "rowfused_w32", 7, 5);
+        var single = Plan(CodegenFusedStatistics.RmsNorm(128, 32));
+        string scalar = new PtxAffineEmitter().EmitRowProgram(single, "rowfused_w32", 7, 5);
         Assert.DoesNotContain("ld.global.nc.v", scalar, StringComparison.Ordinal);
     }
 
     [Fact]
     public void ParametersAreSourcesThenOutputs()
     {
-        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(8, 64), out _);
-        Assert.NotNull(plan);
-        Assert.Equal(new[] { "x", "gamma", "beta", "negmean", "rstd", "y" }, plan!.Parameters);
+        var plan = Plan(CodegenFusedStatistics.LayerNorm(8, 64));
+        Assert.Equal(new[] { "x", "gamma", "beta", "negmean", "rstd", "y" }, plan.Parameters);
         Assert.Equal(CodegenRowOperandKind.Matrix, plan.Kinds["x"]);
         // gamma[j] reads the innermost column with stride one, so it streams like x.
         Assert.Equal(CodegenRowOperandKind.Matrix, plan.Kinds["gamma"]);
@@ -147,9 +149,8 @@ public class CodegenRowFusionTests
     [Fact]
     public void GroupNormRunsAsABlockPerGroupWithChunkUniformParameters()
     {
-        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.GroupNorm(4, 64, 8, 1024), out string reason);
-        Assert.True(plan is not null, reason);
-        Assert.Equal(CodegenRowOperandKind.Feature, plan!.Kinds["gamma"]);
+        var plan = Plan(CodegenFusedStatistics.GroupNorm(4, 64, 8, 1024));
+        Assert.Equal(CodegenRowOperandKind.Feature, plan.Kinds["gamma"]);
         Assert.Equal(CodegenRowOperandKind.Row, plan.Kinds["negmean"]);
         Assert.Equal(new[] { 4, 8 }, plan.RowExtents);
         Assert.Equal(8192, plan.Width);
@@ -167,8 +168,8 @@ public class CodegenRowFusionTests
     [Fact]
     public void FusedSoftmaxUsesTheSharedExpSequence()
     {
-        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.Softmax(32, 256), out _);
-        string fused = new PtxAffineEmitter().EmitRowProgram(plan!, "rowfused_softmax", 7, 5);
+        var plan = Plan(CodegenFusedStatistics.Softmax(32, 256));
+        string fused = new PtxAffineEmitter().EmitRowProgram(plan, "rowfused_softmax", 7, 5);
         string pass = new PtxAffineEmitter().Emit(CodegenFusedStatistics.Softmax(32, 256).Passes[1], 7, 5);
         Assert.Contains("ex2.approx.f32", fused, StringComparison.Ordinal);
         Assert.Contains("0f3FB8AA3B", fused, StringComparison.Ordinal);
@@ -192,9 +193,9 @@ public class CodegenRowFusionTests
     [Fact]
     public void AFlatPointwiseSpecStreamsAsRows()
     {
-        var plan = CodegenRowFusion.TryPlanStreaming(Flat(8192 * 3, "other"));
-        Assert.NotNull(plan);
-        Assert.Equal(1024, plan!.Width);
+        var plan = CodegenRowFusion.TryPlanStreaming(Flat(8192 * 3, "other"))
+            ?? throw new InvalidOperationException("a flat contiguous spec must stream");
+        Assert.Equal(1024, plan.Width);
         Assert.Equal(24, plan.Rows);
         Assert.Equal(new[] { "x", "other", "y" }, plan.Parameters);
 

@@ -191,10 +191,12 @@ internal static class KernelAutotuneTool
     {
         GpuBenchmarkEnvironment.RequireIdleGpu("autotune-start");
         using var runtime = new DirectPtxRuntime();
-        if (!DirectPtxArchitecture.HasExperimentalConvolution(
+        // Turing and later: the tiled candidates stage with cp.async on sm_80+ and with a synchronous register round
+        // trip on sm_75 (PtxSharedCopy). Winners are keyed by the device fingerprint, so each device's are its own.
+        if (!DirectPtxArchitecture.HasCodegenConveyor(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
         {
-            Console.WriteLine("Autotuning requires the experimental SM86 device.");
+            Console.WriteLine("Autotuning requires an SM75 (Turing) or newer device.");
             return;
         }
 

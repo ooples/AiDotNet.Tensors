@@ -10,6 +10,8 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// <summary>Emits a cooperative, double-buffered, true-FP32 dense 3x3 row tile.</summary>
 public sealed class PtxTiledConv2DEmitter
 {
+    private bool _async = true;
+
     private const int FixedR = 16;
     private const int FixedRd = 8;
     private const int FixedP = 4;
@@ -32,8 +34,8 @@ public sealed class PtxTiledConv2DEmitter
 
     public string Emit(CodegenKernelSpec spec, int computeMajor, int computeMinor)
     {
-        if (computeMajor < 8)
-            throw new NotSupportedException("The double-buffered dense-convolution tile requires cp.async on sm_80+.");
+        // sm_80+ stages tiles with cp.async; Turing (sm_75) with a synchronous register round trip.
+        _async = PtxSharedCopy.HasAsyncCopy(computeMajor);
         CodegenTiledConv2DPlan? possible;
         string reason;
         bool eligible = _schedule is null
@@ -121,8 +123,8 @@ public sealed class PtxTiledConv2DEmitter
         L("mov.u32 %r9, 0;");
         L("mov.u32 %r10, 0;");
         EmitAsyncStage(plan, "%r9", "%r10");
-        L("cp.async.commit_group;");
-        L("cp.async.wait_group 0;");
+        PtxSharedCopy.Commit(_async, L);
+        PtxSharedCopy.Wait(_async, L);
         L("bar.sync 0;");
         L("TILED_CONV_REDUCE:");
         L("add.u32 %r11, %r9, 1;");
@@ -131,7 +133,7 @@ public sealed class PtxTiledConv2DEmitter
         L("@!%p0 bra TILED_CONV_COMPUTE;");
         EmitAsyncStage(plan, "%r11", "%r12",
             includeMatrix: !plan.AsymmetricStages, includeStream: true);
-        L("cp.async.commit_group;");
+        PtxSharedCopy.Commit(_async, L);
         L("TILED_CONV_COMPUTE:");
         EmitCompute(plan, "%r10", "%r9", accumulators);
         L("@!%p0 bra TILED_CONV_DONE;");
@@ -142,9 +144,9 @@ public sealed class PtxTiledConv2DEmitter
             L("bar.sync 0;");
             EmitAsyncStage(plan, "%r11", "%r12",
                 includeMatrix: true, includeStream: false);
-            L("cp.async.commit_group;");
+            PtxSharedCopy.Commit(_async, L);
         }
-        L("cp.async.wait_group 0;");
+        PtxSharedCopy.Wait(_async, L);
         L("bar.sync 0;");
         L("mov.u32 %r9, %r11;");
         L("mov.u32 %r10, %r12;");
@@ -248,7 +250,7 @@ public sealed class PtxTiledConv2DEmitter
                     L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
                     L($"add.u64 {destination}, {destination}, {sharedBytes};");
                 }
-                L($"@{valid} cp.async.ca.shared.global [{destination}], [{source}], 4;");
+                PtxSharedCopy.Emit(_async, L, NextF, NextP, destination, source, 4, valid);
             }
         }
 
@@ -290,7 +292,7 @@ public sealed class PtxTiledConv2DEmitter
                 L($"add.u64 {destination}, %rd3, {sharedBytes};");
                 L($"cvt.u64.u32 {sharedBytes}, {bufferBase};");
                 L($"add.u64 {destination}, {destination}, {sharedBytes};");
-                L($"@{valid} cp.async.ca.shared.global [{destination}+{I(streamBase)}], [{source}], 16, {ignore};");
+                PtxSharedCopy.Emit(_async, L, NextF, NextP, $"{destination}+{I(streamBase)}", source, 16, valid, ignore);
             }
         }
     }

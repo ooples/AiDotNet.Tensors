@@ -60,6 +60,10 @@ public sealed class CodegenExpr
     /// <summary>Second child of a binary node.</summary>
     public CodegenExpr? Right { get; }
 
+    // The child a binary or unary node always has; a missing one is a construction defect, refused loudly.
+    private CodegenExpr First => Left ?? throw new InvalidOperationException(Kind + " has no first operand.");
+    private CodegenExpr Second => Right ?? throw new InvalidOperationException(Kind + " has no second operand.");
+
     /// <summary>Input <paramref name="input"/> at the current index.</summary>
     public static CodegenExpr Operand(int input)
     {
@@ -126,9 +130,9 @@ public sealed class CodegenExpr
         {
             CodegenExprKind.Operand => operand(Input),
             CodegenExprKind.Constant => Value,
-            CodegenExprKind.Add => Left!.Evaluate(operand) + Right!.Evaluate(operand),
-            CodegenExprKind.Multiply => Left!.Evaluate(operand) * Right!.Evaluate(operand),
-            CodegenExprKind.Negate => -Left!.Evaluate(operand),
+            CodegenExprKind.Add => First.Evaluate(operand) + Second.Evaluate(operand),
+            CodegenExprKind.Multiply => First.Evaluate(operand) * Second.Evaluate(operand),
+            CodegenExprKind.Negate => -First.Evaluate(operand),
             _ => throw new NotSupportedException("Unhandled body node " + Kind + "."),
         };
     }
@@ -141,8 +145,8 @@ public sealed class CodegenExpr
         {
             CodegenExprKind.Operand => Operand(map(Input)),
             CodegenExprKind.Constant => this,
-            CodegenExprKind.Negate => Negate(Left!.Remap(map)),
-            _ => new CodegenExpr(Kind, -1, 0, Left!.Remap(map), Right!.Remap(map)),
+            CodegenExprKind.Negate => Negate(First.Remap(map)),
+            _ => new CodegenExpr(Kind, -1, 0, First.Remap(map), Second.Remap(map)),
         };
     }
 
@@ -161,9 +165,9 @@ public sealed class CodegenExpr
         {
             CodegenExprKind.Operand => operand(Input),
             CodegenExprKind.Constant => constant(Value),
-            CodegenExprKind.Add => op("add.rn.f32", Left!.Lower(operand, constant, op), Right!.Lower(operand, constant, op)),
-            CodegenExprKind.Multiply => op("mul.rn.f32", Left!.Lower(operand, constant, op), Right!.Lower(operand, constant, op)),
-            CodegenExprKind.Negate => op("neg.f32", Left!.Lower(operand, constant, op), null),
+            CodegenExprKind.Add => op("add.rn.f32", First.Lower(operand, constant, op), Second.Lower(operand, constant, op)),
+            CodegenExprKind.Multiply => op("mul.rn.f32", First.Lower(operand, constant, op), Second.Lower(operand, constant, op)),
+            CodegenExprKind.Negate => op("neg.f32", First.Lower(operand, constant, op), null),
             _ => throw new NotSupportedException("Unhandled body node " + Kind + "."),
         };
     }
@@ -181,12 +185,12 @@ public sealed class CodegenExpr
             {
                 case CodegenExprKind.Operand: sb.Append('$').Append(node.Input.ToString(CultureInfo.InvariantCulture)); break;
                 case CodegenExprKind.Constant: sb.Append(node.Value.ToString("R", CultureInfo.InvariantCulture)); break;
-                case CodegenExprKind.Negate: sb.Append("-("); Write(node.Left!, sb); sb.Append(')'); break;
+                case CodegenExprKind.Negate: sb.Append("-("); Write(node.First, sb); sb.Append(')'); break;
                 default:
                     sb.Append('(');
-                    Write(node.Left!, sb);
+                    Write(node.First, sb);
                     sb.Append(node.Kind == CodegenExprKind.Add ? " + " : " * ");
-                    Write(node.Right!, sb);
+                    Write(node.Second, sb);
                     sb.Append(')');
                     break;
             }

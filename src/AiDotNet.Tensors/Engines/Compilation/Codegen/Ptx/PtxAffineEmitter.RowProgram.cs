@@ -36,15 +36,16 @@ public sealed partial class PtxAffineEmitter
         const int Lanes = CodegenWarpReduction.Lanes;
         int maxVector = EnableVectorLoads ? 4 : 1;
         var held = plan.Geometry(maxVector);
-        var streamed = held is null ? plan.StreamGeometry(maxVector) : null;
-        if (held is null && streamed is null)
-            throw new NotSupportedException("No thread geometry fits a " + plan.Width + "-wide row.");
+        (int Threads, int Vector, int Step, int Chunks) shape =
+            held is { } h ? (h.Threads, h.Vector, h.Step, h.PerThread / h.Vector)
+            : plan.StreamGeometry(maxVector) is { } s ? (s.Threads, s.Vector, s.Step, s.Chunks)
+            : throw new NotSupportedException("No thread geometry fits a " + plan.Width + "-wide row.");
 
-        int rowThreads = held?.Threads ?? streamed!.Value.Threads;
-        int vector = held?.Vector ?? streamed!.Value.Vector;
-        int step = held?.Step ?? streamed!.Value.Step;
+        int rowThreads = shape.Threads;
+        int vector = shape.Vector;
+        int step = shape.Step;
         int perThread = held?.PerThread ?? 0;
-        int chunks = held is { } h ? h.PerThread / h.Vector : streamed!.Value.Chunks;
+        int chunks = shape.Chunks;
         // A held row past a warp, and every streamed row, is one block.
         bool blockRow = rowThreads > Lanes || held is null;
         int blockThreads = blockRow ? rowThreads : BlockThreads;
@@ -194,7 +195,9 @@ public sealed partial class PtxAffineEmitter
         }
 
         // The value of input `input` of `pass` at element e, through `step` (chunk) access.
-        Func<CodegenKernelSpec, int, int, string> operand = null!;
+        // Set by the held or streamed lowering below before any pass is emitted.
+        Func<CodegenKernelSpec, int, int, string> operand =
+            (_, _, _) => throw new InvalidOperationException("No operand accessor is set for this lowering.");
 
         string Term(CodegenKernelSpec pass, int e)
         {
