@@ -22,8 +22,13 @@ internal static class CudaStepIoKernels
     // Must match StepIoMaxInputs / the StepIoArgs layout in CudaBackend.StepIo.cs.
     public const int MaxInputs = 16;
 
+    // Copies of each slot's copy mask, one per 128-byte line (SIO_MASK_COPIES / SIO_MASK_STRIDE below).
+    public const int MaskCopies = 32, MaskStrideWords = 32;
+
     public static string GetSource() => @"
 #define SIO_MAX 16
+#define SIO_MASK_COPIES 32
+#define SIO_MASK_STRIDE 32   // words: one copy per 128-byte line
 
 struct StepIoArgs
 {
@@ -39,17 +44,32 @@ struct StepIoArgs
     int len[SIO_MAX];                   // the inputs' float counts
     int vector;                         // 1: every address is 16-byte aligned, copy float4 units
     unsigned long long guard;           // device double: the captured update's finiteness guard, or 0
+    unsigned long long masks;           // page-locked uint[2][SIO_MASK_COPIES][SIO_MASK_STRIDE]: slot s's replay copies
+                                        // input i when bit i is set (every copy the same), or 0: all
 };
 
 // grid-stride over every input float; block 0 thread 0 also resolves the learning rate.
+// An input the host left unchanged since the replay that last copied it is still in its device buffer: the slot's mask
+// (written by the host with the staging) leaves its bit clear and the copy is skipped. Copying a parity network's fixed
+// batch every replay cost the bus time of the whole batch (6.5 us for the LSTM's 66 KB) that a torch loop reusing
+// device tensors never pays. Each block reads its own copy of the mask, on its own line: every block reading one host
+// word serialized the reads (17 blocks: 13.6 us, against 5.0 for the whole copy).
 extern ""C"" __global__ __launch_bounds__(256) void step_io_prologue(StepIoArgs a)
 {
+    __shared__ unsigned int copyMask;
     unsigned int* state = (unsigned int*)a.state;
     unsigned int slot = state[0] & 1u;
+    if (threadIdx.x == 0)
+        copyMask = a.masks != 0
+            ? ((volatile const unsigned int*)a.masks)[(slot * SIO_MASK_COPIES + blockIdx.x % SIO_MASK_COPIES) * SIO_MASK_STRIDE]
+            : 0xFFFFFFFFu;
+    __syncthreads();
+    const unsigned int mask = copyMask;
     int total = a.start[a.count];
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         int t = 0;
         while (t + 1 < a.count && a.start[t + 1] <= i) t++;
+        if (((mask >> t) & 1u) == 0) continue;
         const float* src = (const float*)(slot ? a.src1[t] : a.src0[t]);
         float* dst = (float*)a.dst[t];
         int k = i - a.start[t];

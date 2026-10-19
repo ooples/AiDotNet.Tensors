@@ -617,6 +617,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private Tensor<T>[]? _stepIoLeaves;
     private Engines.DirectGpu.IGpuBuffer[]? _stepIoBuffers;
     private uint _stepIoLaunched;   // replays launched (the device counts the same replays)
+    // Per step-I/O input: the staging slot the last replay that copied it read (what its device buffer holds), or -1.
+    // A later replay whose host contents match that slot byte for byte skips the copy.
+    private int[]? _stepIoCopiedSlot;
+
+    /// <summary>Step-I/O input copies replays have skipped because the input was unchanged (tests).</summary>
+    internal long StepIoInputCopiesSkipped { get; private set; }
     private bool _stepIoLossCaptured;   // the epilogue publishes the loss
 
     /// <summary>
@@ -706,6 +712,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _stepIoLeaves = leaves.ToArray();
         _stepIoBuffers = buffers.ToArray();
         _stepIoLaunched = 0;
+        _stepIoCopiedSlot = Enumerable.Repeat(-1, leaves.Count).ToArray();
         return io;
     }
 
@@ -722,7 +729,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     /// <summary>
     /// Launches the next replay through the step I/O: fills its staging slot (once the replay that last read it has
-    /// completed) with each input's current host contents, then launches the graph.
+    /// completed) with the host contents of each input that changed since the replay that last copied it, then launches
+    /// the graph. An input whose host contents equal, byte for byte, the staging its device buffer was last copied from
+    /// is left out of the replay's copy mask: the buffer already holds it. (Content, not a version: a write through a
+    /// host span advances neither the storage's GPU-cache epoch nor its device-valid flag.) The comparison reads what
+    /// the copy into the staging would have; the device buffers are written only by these copies, or by uploads of the
+    /// same host contents.
     /// </summary>
     private unsafe void LaunchStepGraphWithStepIo(Engines.DirectGpu.IGpuGraphCapture cb, IntPtr exec)
     {
@@ -730,16 +742,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         uint replay = _stepIoLaunched;
         if (replay >= 2) io.WaitForReplays(replay - 1);   // slot replay % 2 was last read by replay - 2
         var leaves = _stepIoLeaves!;
+        var copiedSlot = _stepIoCopiedSlot!;
+        int slot = (int)(replay & 1);
+        uint copyMask = 0;
         for (int i = 0; i < leaves.Length; i++)
         {
             var leaf = leaves[i];
             using var lease = leaf.LeaseArray();
-            var data = (float[])(object)lease.Array;
-            int count = io.InputLength(i);
-            fixed (float* src = data)
-                Buffer.MemoryCopy(src, (void*)io.InputStaging(i, (int)(replay & 1)), (long)count * sizeof(float), (long)count * sizeof(float));
+            var data = new ReadOnlySpan<float>((float[])(object)lease.Array, 0, io.InputLength(i));
+            int last = copiedSlot[i];
+            bool unchanged = last >= 0
+                && System.Runtime.InteropServices.MemoryMarshal.AsBytes(data).SequenceEqual(
+                    new ReadOnlySpan<byte>((void*)io.InputStaging(i, last), data.Length * sizeof(float)));
+            if (!unchanged)
+            {
+                data.CopyTo(new Span<float>((void*)io.InputStaging(i, slot), data.Length));
+                copyMask |= 1u << i;
+                copiedSlot[i] = slot;
+            }
+            else StepIoInputCopiesSkipped++;
             leaf._gpuBufferVersion = leaf.GpuCacheVersion;
         }
+        io.SetInputsToCopy(replay, copyMask);
         if (_capturedOptimizer is { } optimizer)
         {
             // The device's applied count when this replay runs is between what the last completed replay published
