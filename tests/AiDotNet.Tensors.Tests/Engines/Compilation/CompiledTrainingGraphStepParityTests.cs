@@ -215,6 +215,87 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// Two compiled plans training the SAME parameters (one per batch shape, as a trainer compiles for a last partial
+    /// batch): a ping-pong plan binds them to its private second buffers on odd replays, so the other plan must make
+    /// it yield before resolving their device buffers, and both then update in place. Interleaving their steps must
+    /// train bit for bit like the same schedule with both plans in place from the start.
+    /// </summary>
+    [SkippableFact]
+    public void Two_plans_sharing_parameters_train_like_both_in_place()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_SGD_PINGPONG") == "0",
+                "The ping-pong update is disabled for this process.");
+
+            var (oracleWeights, oracleLosses, _, _) = TrainSharedPlans(gpu, pingPong: false);
+            var (weights, losses, firstEngaged, firstYielded) = TrainSharedPlans(gpu, pingPong: true);
+            Assert.True(firstEngaged, "the first plan never alternated two step graphs before the second plan stepped");
+            Assert.Equal(oracleLosses, losses);
+            for (int p = 0; p < oracleWeights.Length; p++) Assert.Equal(oracleWeights[p], weights[p]);
+            Assert.True(firstYielded, "the first plan still alternates graphs on parameters another plan trains");
+        }
+    }
+
+    private static (float[][] Weights, double[] Losses, bool FirstEngaged, bool FirstYielded) TrainSharedPlans(
+        DirectGpuTensorEngine gpu, bool pingPong)
+    {
+        var w1 = Rand([Inputs, Hidden], 3, 0.3f);
+        var b1 = new Tensor<float>([Hidden]);
+        var w2 = Rand([Hidden, Outputs], 4, 0.3f);
+        var b2 = new Tensor<float>([Outputs]);
+        var parameters = new[] { w1, b1, w2, b2 };
+        foreach (var p in parameters) p.Gpu();
+        (ICompiledTrainingPlan<float> Plan, Tensor<float> X, Tensor<float> Y) Compile(int batch)
+        {
+            var x = Rand([batch, Inputs], 1, 1f);
+            var y = Rand([batch, Outputs], 2, 1f);
+            using var scope = GraphMode.EnableTraining(parameters);
+            var h = gpu.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
+            var pred = gpu.FusedLinear(h, w2, b2, FusedActivationType.None);
+            gpu.TensorMSELoss(pred, y);
+            var plan = scope.CompileTraining(parameters);
+            if (!pingPong) ((CompiledTrainingPlan<float>)plan).DisablePingPongForTesting();
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 5e-2f);
+            return (plan, x, y);
+        }
+
+        var first = Compile(Batch);
+        var losses = new System.Collections.Generic.List<double>();
+        bool engaged = false;
+        for (int s = 0; s < 8; s++)   // warm-up, capture and an odd number of replays: the weights sit in the second set
+        {
+            FeedBatch(first.X, first.Y, s);
+            losses.Add(first.Plan.Step().ToArray()[0]);
+        }
+        engaged = ((CompiledTrainingPlan<float>)first.Plan).ReplaysParityGraphs;
+        var second = Compile(8);   // configured while the first plan's parameters are bound to its second buffers
+        for (int s = 8; s < 20; s++)
+        {
+            var (plan, x, y) = s % 3 == 2 ? second : first;
+            FeedBatch(x, y, s);
+            losses.Add(plan.Step().ToArray()[0]);
+        }
+        bool yielded = !((CompiledTrainingPlan<float>)first.Plan).ReplaysParityGraphs;
+        // The first plan goes; the second keeps training the parameters on whatever buffers it resolved.
+        first.Plan.Dispose();
+        for (int s = 20; s < 26; s++)
+        {
+            FeedBatch(second.X, second.Y, s);
+            losses.Add(second.Plan.Step().ToArray()[0]);
+        }
+        var weights = parameters.Select(p => p.ToArray()).ToArray();
+        second.Plan.Dispose();
+        return (weights, losses.ToArray(), engaged, yielded);
+    }
+
+    /// <summary>
     /// The captured SGD update writes the new weights into a second buffer set and two step graphs alternate (one
     /// reads set A and writes B, the other the reverse), so one pass over the gradients both updates and takes their
     /// finiteness reduction. It must train bit for bit like the in-place update: the same arithmetic per element, a
@@ -244,7 +325,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             Assert.True(inPlace.UpdateCapturedInGraph && pingPong.UpdateCapturedInGraph, "the update was not captured into the graph");
             Assert.False(inPlace.ReplayedParityGraphs, "the in-place oracle alternated graphs");
             Assert.True(pingPong.ReplayedParityGraphs, "the ping-pong plan did not alternate two step graphs");
-            Assert.Equal(inPlace.NonFiniteStepsSkipped, pingPong.NonFiniteStepsSkipped);
+            int expectedSkips = nonFiniteStep >= 0 ? 1 : 0;
+            Assert.Equal(expectedSkips, inPlace.NonFiniteStepsSkipped);
+            Assert.Equal(expectedSkips, pingPong.NonFiniteStepsSkipped);
+            if (nonFiniteStep >= 0)
+                Assert.True(pingPong.SkipReportedAtNonFiniteStep && inPlace.SkipReportedAtNonFiniteStep,
+                    "the non-finite step was not reported as skipped");
             Assert.Equal(inPlace.OptimizerStep, pingPong.OptimizerStep);
             for (int s = 0; s < Steps; s++)
                 if (s != nonFiniteStep)

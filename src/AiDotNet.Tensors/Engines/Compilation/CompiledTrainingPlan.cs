@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>
+internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, IPingPongOwner
 {
     // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
     // a rebuilt forward-action array using allowCachedB=true.
@@ -89,8 +89,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // The step graph for odd replays, when the plan alternates two (NeedsParityGraphs): replay r runs
     // _stepGraphExec when r is even, this one when r is odd. Zero: every replay runs _stepGraphExec.
     private IntPtr _stepGraphExecOdd;
-    // Set when a ping-pong optimizer's parity graphs failed their capture or wiring check: later captures update in place.
+    // Set when a ping-pong optimizer's parity graphs failed their capture or wiring check, its buffers or tables could not
+    // be allocated, or another plan trains the same parameters: later captures update in place. Sticky for the plan's
+    // life, so a failure that may be transient (device memory) does not make every later capture retry the allocation.
     private bool _pingPongRejected;
+    // The parameters' storage identities this plan claims while its ping-pong update is live (PingPongParameterClaims).
+    private object[]? _pingPongClaimKeys;
+    private long _pingPongClaimEpochSeen = -1;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
     /// <summary>Set when <see cref="TryRunResidentBody"/> threw; later steps use StepEager.</summary>
@@ -486,17 +491,55 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             "CUDA graph capture of the compiled training step failed; this plan trains without graph replay from now on. " + reason);
     }
 
-    /// <summary>
-    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
-    /// environment switch is read once per process, so this is how a single test process compares a captured plan
-    /// against an eager one (the parity oracle for capture).
-    /// </summary>
     /// <summary>Keeps THIS plan's captured SGD update in place (one step graph): the oracle for the ping-pong update.</summary>
     internal void DisablePingPongForTesting() => _pingPongRejected = true;
 
     /// <summary>True while the plan replays a graph per replay parity.</summary>
     internal bool ReplaysParityGraphs => _stepGraphExecOdd != IntPtr.Zero;
 
+    /// <summary>The storage identity of every parameter: what two plans training the same parameters share.</summary>
+    private object[] PingPongClaimKeys()
+    {
+        var keys = new object[_parameters.Length];
+        for (int p = 0; p < keys.Length; p++)
+            keys[p] = (object?)_parameters[p].GetBackingArrayForCacheLookupUnsafe() ?? _parameters[p].DataVector;
+        return keys;
+    }
+
+    /// <summary>
+    /// Makes any other plan's ping-pong update on this plan's parameters yield before this plan reads their bindings,
+    /// and keeps this plan in place from then on. Runs outside this plan's step lock: the owner yields under its own.
+    /// </summary>
+    private void ResolvePingPongClaims(bool force)
+    {
+        long epoch = PingPongParameterClaims.Epoch;
+        if (!force && epoch == Volatile.Read(ref _pingPongClaimEpochSeen)) return;
+        var others = PingPongParameterClaims.OthersClaiming(this, PingPongClaimKeys());
+        Volatile.Write(ref _pingPongClaimEpochSeen, epoch);
+        if (others.Count == 0) return;
+        _pingPongRejected = true;
+        PingPongDiagnostic("in place: another compiled plan trains the same parameters");
+        foreach (var other in others) other.YieldPingPong();
+    }
+
+    void IPingPongOwner.YieldPingPong()
+    {
+        lock (_stepSync)
+        {
+            _pingPongRejected = true;
+            if (_capturedOptimizer?.PingPong is not null)
+            {
+                PingPongDiagnostic("yielded: another compiled plan trains the same parameters");
+                InvalidateCapturedStepGraph();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
+    /// environment switch is read once per process, so this is how a single test process compares a captured plan
+    /// against an eager one (the parity oracle for capture).
+    /// </summary>
     internal void DisableGraphStep()
     {
         InvalidateCapturedStepGraph();
@@ -777,7 +820,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var release = optimizer.Release;
         optimizer.Release = null;
         optimizer.PingPong = null;
-        release?.Invoke();
+        try { release?.Invoke(); }
+        finally { ReleasePingPongClaims(); }
+    }
+
+    private void ReleasePingPongClaims()
+    {
+        if (_pingPongClaimKeys is { } keys) PingPongParameterClaims.Release(this, keys);
+        _pingPongClaimKeys = null;
     }
 
     private void DisposeStepIo()
@@ -3174,6 +3224,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        ResolvePingPongClaims(force: false);
         // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
         // cannot upload parameters into buffers another thread's StepCore is reading.
         lock (_stepSync)
@@ -4944,6 +4995,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // buffers. Without this the device memory grows every time the user
         // calls ConfigureOptimizer (e.g., to switch from SGD to Adam mid-run
         // or to retune lr via re-configure with a fresh schedule).
+        // The device buffers resolved below come from the parameters' bindings: another plan's ping-pong update must
+        // first bring them back to the shared buffers.
+        ResolvePingPongClaims(force: true);
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
@@ -6252,8 +6306,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             });
             captured.Prepare = io =>
             {
-                if (pingPong is not null) io.PrepareSgdPingPong(capParams, pingPong, capGrads, capSizes);
-                else io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes);
+                if (pingPong is not null)
+                {
+                    try
+                    {
+                        io.PrepareSgdPingPong(capParams, pingPong, capGrads, capSizes);
+                        return;
+                    }
+                    catch (Exception prepareFailure)
+                    {
+                        // Its tables could not be built (device memory): free the second buffers and capture the
+                        // in-place update instead. The capture closures read `pingPong`, so they follow.
+                        foreach (var b in pingPong) b.Dispose();
+                        pingPong = null;
+                        captured.PingPong = null;
+                        captured.CaptureOdd = null;
+                        captured.BindParity = null;
+                        captured.Release = null;
+                        ReleasePingPongClaims();
+                        RejectPingPong("its tables could not be built: " + prepareFailure.Message);
+                    }
+                }
+                io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes);
             };
             // Binds every parameter to buffer set `set` (0: the plan's own, 1: the ping-pong second buffers) as the
             // authoritative copy everywhere it is looked up; `from` is the set the persistent weight cache names now.
@@ -6290,14 +6364,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 captured.BindParity = set => BindSet(set, set == 1 ? 0 : 1);
                 captured.Release = () =>
                 {
-                    if (captured.Latest == 1)
+                    // A dead context took the device memory with it: nothing to copy back or rebind, only buffers to drop.
+                    bool live = owner is Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true };
+                    if (captured.Latest == 1 && live)
                     {
                         // Stream-ordered after every replay: the current weights back into the plan's own buffers.
                         for (int p = 0; p < paramCount; p++) owner.Copy(pingPong[p], gpuParam[p]!, lengths[p]);
                         BindSet(0, 1);
-                        captured.Latest = 0;
                     }
-                    foreach (var b in pingPong) b.Dispose();
+                    captured.Latest = 0;
+                    foreach (var b in pingPong!) b.Dispose();
                 };
             }
             return captured;
@@ -6336,6 +6412,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 PingPongDiagnostic("in place: two parameters' weight buffers overlap");
                 return null;
             }
+        var keys = PingPongClaimKeys();
+        if (!PingPongParameterClaims.TryClaim(this, keys))
+        {
+            RejectPingPong("another compiled plan's ping-pong update trains the same parameters");
+            return null;
+        }
         var second = new Engines.DirectGpu.IGpuBuffer[weights.Count];
         int allocated = 0;
         try
@@ -6346,9 +6428,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             // Out of device memory (or an allocator fault) costs only the faster update: train in place.
             for (int i = 0; i < allocated; i++) second[i].Dispose();
+            PingPongParameterClaims.Release(this, keys);
             RejectPingPong("no device memory for the second weight buffers: " + oom.Message);
             return null;
         }
+        _pingPongClaimKeys = keys;
         return second;
     }
 
