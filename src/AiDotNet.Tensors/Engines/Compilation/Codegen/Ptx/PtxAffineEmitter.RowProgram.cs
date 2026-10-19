@@ -205,6 +205,11 @@ public sealed partial class PtxAffineEmitter
         // must never overwrite a held source.
         string Term(CodegenKernelSpec pass, int e)
         {
+            if (pass.Body is not null)
+            {
+                string value = EmitBody(pass.Body, input => Operand(pass, input, e));
+                return PreReduce(pass, value);
+            }
             string product = NextF();
             L($"mov.f32 {product}, {Operand(pass, pass.ProductInputs[0], e)};");
             for (int k = 1; k < pass.ProductInputs.Count; k++)
@@ -220,18 +225,23 @@ public sealed partial class PtxAffineEmitter
                 else L($"fma.rn.f32 {shifted}, {pv}, {F32(pass.PreBiasScale)}, {product};");
                 product = shifted;
             }
+            return PreReduce(pass, product);
+        }
+
+        string PreReduce(CodegenKernelSpec pass, string product)
+        {
             if (pass.PreReduce == CodegenPreReduceOp.Square)
             {
                 string sq = NextF();
                 L($"mul.rn.f32 {sq}, {product}, {product};");
-                product = sq;
+                return sq;
             }
-            else if (pass.PreReduce == CodegenPreReduceOp.Exp)
+            if (pass.PreReduce == CodegenPreReduceOp.Exp)
             {
                 string scaled = NextF(), ex = NextF();
                 L($"mul.rn.f32 {scaled}, {product}, 0f3FB8AA3B;");
                 L($"ex2.approx.f32 {ex}, {scaled};");
-                product = ex;
+                return ex;
             }
             return product;
         }

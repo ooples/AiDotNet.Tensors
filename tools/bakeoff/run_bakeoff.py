@@ -92,6 +92,10 @@ WORK = {
     "rmsnorm":                         (2 * 8192 * 1024 * 4, 0),
     "batchnorm2d":                     (2 * 32 * 64 * 56 * 56 * 4, 0),
     "groupnorm":                       (2 * 32 * 64 * 1024 * 4, 0),
+    # Backward: read x and dy, write dx (the parameter gradients are [width], negligible).
+    "layernorm_backward":              (3 * 8192 * 1024 * 4, 0),
+    "rmsnorm_backward":                (3 * 8192 * 1024 * 4, 0),
+    "softmax_backward":                (3 * 8192 * 1024 * 4, 0),
 }
 
 

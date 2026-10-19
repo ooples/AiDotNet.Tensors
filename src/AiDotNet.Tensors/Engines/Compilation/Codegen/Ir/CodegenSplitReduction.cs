@@ -454,15 +454,80 @@ public static class CodegenSplitReduction
         partialShape[rank] = splitFactor;
         partialMap[rank] = CodegenAffineExpr.Axis(chunkAxis);
 
+        // CHUNK OUTERMOST FOR A COLUMN REDUCTION. Threads are numbered last-axis-fastest, so
+        // the appended chunk axis is the fastest -- right when the stride-1 data runs along
+        // the reduction (consecutive chunks of a row), wrong when it runs along an OUTPUT
+        // axis. A column reduction (dgamma[j] = sum_i dy[i, j]) then had consecutive threads
+        // a whole chunk of rows apart: LayerNorm backward's dgamma and dbeta took 6.7 ms
+        // against PyTorch's 0.98 ms for the entire backward. Renumbering the chunk axis to
+        // the front makes consecutive threads consecutive columns, in the partial's loads,
+        // its stores and the combine's reads.
+        if (ChunkGoesOuter(spec))
+        {
+            int Outer(int a) => a == chunkAxis ? 0 : a + 1;
+            var outerAxes = new CodegenAxis[partialAxes.Length];
+            for (int a = 0; a < partialAxes.Length; a++) outerAxes[Outer(a)] = partialAxes[a];
+            partialSpace = new CodegenIterationSpace(outerAxes);
+            for (int i = 0; i < partialInputs.Length; i++)
+            {
+                var b = partialInputs[i];
+                partialInputs[i] = new CodegenTensorBinding(
+                    b.ParameterIndex, b.Name, ToArray(b.Shape), Renumber(b.Map, Outer),
+                    elementType: b.ElementType);
+            }
+            var outerShape = new int[rank + 1];
+            var outerMap = new CodegenAffineExpr[rank + 1];
+            outerShape[0] = splitFactor;
+            outerMap[0] = CodegenAffineExpr.Axis(0);
+            var shifted = Renumber(spec.Output.Map, Outer);
+            for (int d = 0; d < rank; d++)
+            {
+                outerShape[d + 1] = spec.Output.Shape[d];
+                outerMap[d + 1] = shifted[d];
+            }
+            partialShape = outerShape;
+            partialMap = outerMap;
+        }
+        bool splitFirst = ChunkGoesOuter(spec);
+
         var partial = new CodegenKernelSpec(
             spec.Name + "_partial", partialSpace, partialInputs,
             new CodegenTensorBinding(partialInputs.Length, "partial", partialShape, partialMap, isOutput: true),
             partialProduct,
             AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None,
             preReduce: spec.PreReduce, preBiasInput: PartialPreBias(spec),
-            preBiasScale: spec.PreBiasScale);
+            preBiasScale: spec.PreBiasScale, body: PartialBody(spec));
 
-        return (partial, BuildCombine(spec, partialShape, new[] { splitFactor }));
+        return (partial, BuildCombine(spec, partialShape, new[] { splitFactor }, splitFirst));
+    }
+
+    /// <summary>
+    /// True when the first body operand's stride-1 dimension is indexed by a PARALLEL axis:
+    /// a reduction down columns, whose chunk index must be the slowest thread coordinate.
+    /// </summary>
+    private static bool ChunkGoesOuter(CodegenKernelSpec spec)
+    {
+        var lead = spec.Inputs[spec.ProductInputs[0]];
+        if (lead.Map.Count == 0) return false;
+        var fastest = lead.Map[lead.Map.Count - 1];
+        if (fastest.Terms.Count != 1 || fastest.Terms[0].Coefficient != 1) return false;
+        foreach (int p in spec.Space.ParallelAxes)
+            if (p == fastest.Terms[0].Axis) return true;
+        return false;
+    }
+
+    private static CodegenAffineExpr[] Renumber(IReadOnlyList<CodegenAffineExpr> map, Func<int, int> axis)
+    {
+        var result = new CodegenAffineExpr[map.Count];
+        for (int d = 0; d < map.Count; d++)
+        {
+            var expr = map[d];
+            var terms = new CodegenAffineTerm[expr.Terms.Count];
+            for (int t = 0; t < terms.Length; t++)
+                terms[t] = new CodegenAffineTerm(axis(expr.Terms[t].Axis), expr.Terms[t].Coefficient);
+            result[d] = new CodegenAffineExpr(terms, expr.Constant, expr.Divisor, expr.RequiresExactDivision);
+        }
+        return result;
     }
 
     private static CodegenAffineExpr[] AddChunkTerm(
@@ -575,7 +640,7 @@ public static class CodegenSplitReduction
             spec.Name + "_partial", partialSpace, partialInputs, partialOutput, partialProduct,
             AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None,
             preReduce: spec.PreReduce, preBiasInput: PartialPreBias(spec),
-            preBiasScale: spec.PreBiasScale);
+            preBiasScale: spec.PreBiasScale, body: PartialBody(spec));
 
         var promotedExtents = new int[promote.Count];
         for (int p = 0; p < promote.Count; p++) promotedExtents[p] = axes[promote[p]].Extent;
@@ -590,6 +655,15 @@ public static class CodegenSplitReduction
         return positions;
     }
 
+    /// <summary>The body re-expressed over the partial pass's renumbered inputs, or null.</summary>
+    private static CodegenExpr? PartialBody(CodegenKernelSpec spec)
+    {
+        if (spec.Body is null) return null;
+        var position = new Dictionary<int, int>();
+        for (int i = 0; i < spec.ProductInputs.Count; i++) position[spec.ProductInputs[i]] = i;
+        return spec.Body.Remap(input => position[input]);
+    }
+
     /// <summary>Partial-pass position of the pre-bias: straight after the product operands.</summary>
     private static int? PartialPreBias(CodegenKernelSpec spec) =>
         spec.PreBiasInput.HasValue ? spec.ProductInputs.Count : null;
@@ -601,7 +675,7 @@ public static class CodegenSplitReduction
     /// <param name="partialShape">Shape the partial pass wrote.</param>
     /// <param name="splitExtents">Trailing dimensions of that shape, which are reduced away.</param>
     private static CodegenKernelSpec BuildCombine(
-        CodegenKernelSpec spec, int[] partialShape, int[] splitExtents)
+        CodegenKernelSpec spec, int[] partialShape, int[] splitExtents, bool splitFirst = false)
     {
         int rank = spec.Output.Shape.Count;
 
@@ -612,8 +686,12 @@ public static class CodegenSplitReduction
             combineAxes[rank + p] = CodegenAxis.Reduce("split" + I(p), splitExtents[p]);
         var combineSpace = new CodegenIterationSpace(combineAxes);
 
+        // The partial is [out..., split...], or [split..., out...] when the split went outer;
+        // the combine's axes are always (out | split).
         var combineInMap = new CodegenAffineExpr[rank + splitExtents.Length];
-        for (int d = 0; d < rank + splitExtents.Length; d++) combineInMap[d] = CodegenAffineExpr.Axis(d);
+        for (int d = 0; d < rank + splitExtents.Length; d++)
+            combineInMap[d] = CodegenAffineExpr.Axis(
+                !splitFirst ? d : d < splitExtents.Length ? rank + d : d - splitExtents.Length);
 
         var combineInputs = new List<CodegenTensorBinding>
         {

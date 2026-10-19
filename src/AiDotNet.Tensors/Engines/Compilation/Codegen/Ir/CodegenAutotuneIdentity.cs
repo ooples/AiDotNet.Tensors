@@ -405,6 +405,8 @@ public sealed record CodegenAutotuneIdentity(
             .Append(";algebra=").Append(spec.Algebra).Append(';');
         // Appended only when present, so every identity recorded before these fields
         // existed still resolves to the same cache entry.
+        if (spec.Body is not null)
+            text.Append("body=").Append(spec.Body).Append(';');
         if (spec.HasExtendedEpilogue)
             text.Append("reduceOffset=").Append(spec.ReduceOffset.ToString("R", CultureInfo.InvariantCulture))
                 .Append(";postScale=").Append(Optional(spec.PostScaleInput))

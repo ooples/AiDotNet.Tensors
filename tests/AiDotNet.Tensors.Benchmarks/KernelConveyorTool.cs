@@ -953,32 +953,52 @@ internal static class KernelConveyorTool
                     it.HostSources.Add(source.Name, wide);
                 }
 
-                // ROW FUSION FIRST: a row-shaped program is one kernel that reads its sources
-                // once. The passes below are the lowering for everything else.
-                if (!_noRowFusion && CodegenRowFusion.TryPlan(program, out _) is { } fused)
+                // ROW FUSION: the longest run of two or more consecutive passes that share a
+                // row shape is ONE kernel that reads its sources once -- a whole forward
+                // normalisation, or a backward's input-gradient passes ahead of its column
+                // reductions. Every other pass is lowered on its own below.
+                var passes = program.Passes;
+                int at = 0;
+                while (at < passes.Count)
                 {
-                    foreach (var pass in program.Passes)
-                        it._named.Add(pass.Output.Name,
-                            runtime.AllocateBytes((nuint)(pass.Output.ElementCount * sizeof(float))));
-                    var emitter = new PtxAffineEmitter();
-                    string kernelName = "rowfused_" + catalogName;
-                    string ptx = emitter.EmitRowProgram(
-                        fused, kernelName, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                    var args = new IntPtr[fused.Parameters.Count];
-                    for (int i = 0; i < args.Length; i++) args[i] = it._named[fused.Parameters[i]].Pointer;
-                    var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
-                    it._modules.Add(module);
-                    IntPtr fn = module.GetFunction(kernelName, out DirectPtxFunctionInfo info);
-                    it.RegistersPerThread = info.RegistersPerThread;
-                    it._steps.Add((module, fn, args, emitter.LaunchBlocks,
-                        (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, 0u));
-                    foreach (var _ in program.Passes) it.Lowerings.Add("row-fused x1");
-                    it._graph = runtime.CaptureGraph(it.LaunchDirect);
-                    return it;
-                }
+                    int end = at;
+                    CodegenRowFusionPlan? fused = null;
+                    if (!_noRowFusion)
+                        for (int stop = passes.Count; stop >= at + 2 && fused is null; stop--)
+                        {
+                            var run = new CodegenKernelSpec[stop - at];
+                            for (int k = 0; k < run.Length; k++) run[k] = passes[at + k];
+                            var runTemps = new long[run.Length];
+                            for (int k = 0; k < run.Length; k++) runTemps[k] = run[k].Output.ElementCount;
+                            fused = CodegenRowFusion.TryPlan(
+                                new CodegenProgram(run, runTemps, program.Description), out _);
+                            if (fused is not null) end = stop;
+                        }
 
-                foreach (var pass in program.Passes)
-                {
+                    if (fused is not null)
+                    {
+                        for (int k = at; k < end; k++)
+                            it._named.Add(passes[k].Output.Name,
+                                runtime.AllocateBytes((nuint)(passes[k].Output.ElementCount * sizeof(float))));
+                        var emitter = new PtxAffineEmitter();
+                        string kernelName = "rowfused_" + catalogName + "_" + at.ToString(CultureInfo.InvariantCulture);
+                        string ptx = emitter.EmitRowProgram(
+                            fused, kernelName, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                        var args = new IntPtr[fused.Parameters.Count];
+                        for (int i = 0; i < args.Length; i++) args[i] = it._named[fused.Parameters[i]].Pointer;
+                        var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+                        it._modules.Add(module);
+                        IntPtr fn = module.GetFunction(kernelName, out DirectPtxFunctionInfo info);
+                        it.RegistersPerThread = Math.Max(it.RegistersPerThread, info.RegistersPerThread);
+                        it._steps.Add((module, fn, args, emitter.LaunchBlocks,
+                            (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, 0u));
+                        for (int k = at; k < end; k++)
+                            it.Lowerings.Add("row-fused x" + (end - at).ToString(CultureInfo.InvariantCulture));
+                        at = end;
+                        continue;
+                    }
+
+                    var pass = passes[at++];
                     var output = runtime.AllocateBytes((nuint)(pass.Output.ElementCount * sizeof(float)));
                     it._named.Add(pass.Output.Name, output);
 

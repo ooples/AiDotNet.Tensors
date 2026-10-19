@@ -296,6 +296,27 @@ def main():
         emit_both("batchnorm2d",
                   lambda: F.batch_norm(xbn, rmean.clone(), rvar.clone(), gbn, bbn, True, 0.1, 1e-5),
                   "training-mode cuDNN batch_norm")
+    # ---- BACKWARD, against PyTorch's own fused backward kernels (not autograd, which
+    # would re-run the forward). Each returns dx; the op computes every gradient regardless.
+    dyr = torch.randn(8192, 1024, device=dev)
+    mean_r = xr.mean(dim=1, keepdim=True)
+    rstd_r = torch.rsqrt(xr.var(dim=1, unbiased=False, keepdim=True) + 1e-5)
+    if selected("layernorm_backward"):
+        emit_both("layernorm_backward",
+                  lambda: torch.ops.aten.native_layer_norm_backward(
+                      dyr, xr, [1024], mean_r, rstd_r, gr, br, [True, True, True])[0],
+                  "native_layer_norm_backward: dx, dgamma, dbeta")
+    _, rms_rstd = torch.ops.aten._fused_rms_norm(xr, [1024], gr, 1e-6)
+    if selected("rmsnorm_backward"):
+        emit_both("rmsnorm_backward",
+                  lambda: torch.ops.aten._fused_rms_norm_backward(
+                      dyr, xr, [1024], rms_rstd, gr, [True, True])[0],
+                  "_fused_rms_norm_backward: dx, dgamma")
+    ysm = torch.softmax(xr, dim=1)
+    if selected("softmax_backward"):
+        emit_both("softmax_backward",
+                  lambda: torch._softmax_backward_data(dyr, ysm, 1, torch.float32))
+
     xgn = torch.randn(32, 64, 32, 32, device=dev)
     if selected("groupnorm"):
         emit_both("groupnorm", lambda: F.group_norm(xgn, 8, gbn, bbn, 1e-5))

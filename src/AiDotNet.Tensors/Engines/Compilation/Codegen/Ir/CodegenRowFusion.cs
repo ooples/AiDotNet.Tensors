@@ -316,7 +316,8 @@ public static class CodegenRowFusion
             activation: spec.Activation, reduceScale: spec.ReduceScale, preReduce: spec.PreReduce,
             preBiasInput: spec.PreBiasInput, preBiasScale: spec.PreBiasScale,
             reduceOffset: spec.ReduceOffset,
-            postScaleInput: spec.PostScaleInput, postBiasInput: spec.PostBiasInput);
+            postScaleInput: spec.PostScaleInput, postBiasInput: spec.PostBiasInput,
+            body: spec.Body);
         return TryPlan(new CodegenProgram(new[] { reshaped }, new long[] { n }, spec.Name), out _);
     }
 

@@ -143,6 +143,21 @@ public static class CodegenKernelCatalog
             CodegenFusedStatistics.BatchNorm2D(2, 8, 6, 6),
             CodegenFusedStatistics.BatchNorm2D(32, 64, 56, 56)),
 
+        new("layernorm_backward",
+            "LayerNorm backward: dx (row-fused) and dgamma/dbeta (column reductions)",
+            CodegenFusedStatistics.LayerNormBackward(16, 96),
+            CodegenFusedStatistics.LayerNormBackward(8192, 1024)),
+
+        new("rmsnorm_backward",
+            "RMSNorm backward: dx (row-fused) and dgamma (column reduction)",
+            CodegenFusedStatistics.RmsNormBackward(16, 96),
+            CodegenFusedStatistics.RmsNormBackward(8192, 1024)),
+
+        new("softmax_backward",
+            "row softmax backward: dx = y * (dy - sum_j dy*y)",
+            CodegenFusedStatistics.SoftmaxBackward(16, 96),
+            CodegenFusedStatistics.SoftmaxBackward(8192, 1024)),
+
         new("groupnorm",
             "GroupNorm: statistics per (sample, group), per-channel affine",
             CodegenFusedStatistics.GroupNorm(2, 8, 4, 36),

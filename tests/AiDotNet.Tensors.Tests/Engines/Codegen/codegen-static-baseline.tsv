@@ -33,6 +33,16 @@ rmsnorm/rmsnorm_scale	160	17	16	0	0
 batchnorm2d/batchnorm_negmean	81	1	0	4	2
 batchnorm2d/batchnorm_rstd	91	2	0	5	2
 batchnorm2d/batchnorm_affine	82	5	0	12	0
+layernorm_backward/layernorm_bwd_m1	478	64	0	97	0
+layernorm_backward/layernorm_bwd_m2	842	129	0	194	0
+layernorm_backward/layernorm_bwd_dx	376	28	24	0	0
+layernorm_backward/layernorm_bwd_dgamma	87	4	0	7	1
+layernorm_backward/layernorm_bwd_dbeta	48	1	0	3	1
+rmsnorm_backward/rmsnorm_bwd_m	704	96	0	161	0
+rmsnorm_backward/rmsnorm_bwd_dx	336	26	24	0	0
+rmsnorm_backward/rmsnorm_bwd_dgamma	80	3	0	6	1
+softmax_backward/softmax_bwd_dot	509	64	0	129	0
+softmax_backward/softmax_bwd_dx	193	17	16	0	0
 groupnorm/groupnorm_negmean	358	32	0	130	1
 groupnorm/groupnorm_rstd	587	64	0	194	1
 groupnorm/groupnorm_affine	237	12	8	0	0

@@ -504,6 +504,196 @@ public static class CodegenFusedStatistics
             "groupnorm " + batch + "x" + channels + "/" + groups + "x" + spatial);
     }
 
+    // ---- BACKWARD ---------------------------------------------------------------------------
+    //
+    // Each takes the forward's saved statistics (negmean, rstd) rather than recomputing them,
+    // as PyTorch and the hand-written kernels do. The input gradient is a row program --
+    // two per-row reductions and a pointwise pass, which row fusion runs as one kernel -- and
+    // the parameter gradients are column reductions over the rows.
+
+    private static CodegenExpr Op(int input) => CodegenExpr.Operand(input);
+
+    /// <summary>
+    /// LayerNorm backward. With xhat = (x + negmean) * rstd, g = gamma:
+    /// <c>dx = rstd * (g*dy - mean_j(g*dy) - xhat * mean_j(g*dy*xhat))</c>,
+    /// <c>dgamma = sum_i dy*xhat</c>, <c>dbeta = sum_i dy</c>.
+    /// </summary>
+    public static CodegenProgram LayerNormBackward(int rows, int columns)
+    {
+        RequireRowShape(rows, columns, 0);
+        int[] matrix = { rows, columns };
+        int[] vector = { rows };
+        int[] feature = { columns };
+        double inverse = 1.0 / columns;
+        CodegenIterationSpace RowReduce() => new(
+            CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("j", columns));
+
+        // m1[i] = mean_j g*dy
+        var m1 = new CodegenKernelSpec(
+            "layernorm_bwd_m1", RowReduce(),
+            new[] { Bind(0, "dy", matrix, Axis(0), Axis(1)), Bind(1, "gamma", feature, Axis(1)) },
+            Bind(2, "m1", vector, isOutput: true, Axis(0)),
+            new[] { 0, 1 }, CodegenReduceKind.Sum, reduceScale: inverse,
+            body: CodegenExpr.Product(Op(1), Op(0)));
+
+        // m2[i] = mean_j g*dy*xhat; rstd is constant along the row, so it scales the mean.
+        var m2 = new CodegenKernelSpec(
+            "layernorm_bwd_m2", RowReduce(),
+            new[]
+            {
+                Bind(0, "x", matrix, Axis(0), Axis(1)), Bind(1, "dy", matrix, Axis(0), Axis(1)),
+                Bind(2, "gamma", feature, Axis(1)), Bind(3, "negmean", vector, Axis(0)),
+                Bind(4, "rstd", vector, Axis(0)),
+            },
+            Bind(5, "m2", vector, isOutput: true, Axis(0)),
+            new[] { 0, 1, 2, 3 }, CodegenReduceKind.Sum, reduceScale: inverse, scaleInput: 4,
+            body: CodegenExpr.Product(Op(2), Op(1), CodegenExpr.Add(Op(0), Op(3))));
+
+        // dx = rstd * (g*dy - m1 - (x + negmean)*rstd*m2)
+        var dx = new CodegenKernelSpec(
+            "layernorm_bwd_dx",
+            new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Parallel("j", columns)),
+            new[]
+            {
+                Bind(0, "x", matrix, Axis(0), Axis(1)), Bind(1, "dy", matrix, Axis(0), Axis(1)),
+                Bind(2, "gamma", feature, Axis(1)), Bind(3, "negmean", vector, Axis(0)),
+                Bind(4, "rstd", vector, Axis(0)), Bind(5, "m1", vector, Axis(0)),
+                Bind(6, "m2", vector, Axis(0)),
+            },
+            Bind(7, "dx", matrix, isOutput: true, Axis(0), Axis(1)),
+            new[] { 0, 1, 2, 3, 4, 5, 6 }, CodegenReduceKind.None, scaleInput: 4,
+            body: CodegenExpr.Subtract(
+                CodegenExpr.Product(Op(2), Op(1)),
+                CodegenExpr.Add(Op(5), CodegenExpr.Product(CodegenExpr.Add(Op(0), Op(3)), Op(4), Op(6)))));
+
+        var (dgamma, dbeta) = ColumnParameterGradients("layernorm", rows, columns);
+        return new CodegenProgram(
+            new[] { m1, m2, dx, dgamma, dbeta },
+            new long[] { rows, rows, (long)rows * columns, columns, columns },
+            "layernorm backward " + rows + "x" + columns);
+    }
+
+    /// <summary>
+    /// RMSNorm backward. With g = gamma: <c>m = mean_j g*dy*x</c>,
+    /// <c>dx = rstd*g*dy - x*rstd^3*m</c>, <c>dgamma = sum_i dy*x*rstd</c>.
+    /// </summary>
+    public static CodegenProgram RmsNormBackward(int rows, int columns)
+    {
+        RequireRowShape(rows, columns, 0);
+        int[] matrix = { rows, columns };
+        int[] vector = { rows };
+        int[] feature = { columns };
+
+        var m = new CodegenKernelSpec(
+            "rmsnorm_bwd_m",
+            new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("j", columns)),
+            new[]
+            {
+                Bind(0, "x", matrix, Axis(0), Axis(1)), Bind(1, "dy", matrix, Axis(0), Axis(1)),
+                Bind(2, "gamma", feature, Axis(1)),
+            },
+            Bind(3, "m", vector, isOutput: true, Axis(0)),
+            new[] { 0, 1, 2 }, CodegenReduceKind.Sum, reduceScale: 1.0 / columns,
+            body: CodegenExpr.Product(Op(2), Op(1), Op(0)));
+
+        var dx = new CodegenKernelSpec(
+            "rmsnorm_bwd_dx",
+            new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Parallel("j", columns)),
+            new[]
+            {
+                Bind(0, "x", matrix, Axis(0), Axis(1)), Bind(1, "dy", matrix, Axis(0), Axis(1)),
+                Bind(2, "gamma", feature, Axis(1)), Bind(3, "rstd", vector, Axis(0)),
+                Bind(4, "m", vector, Axis(0)),
+            },
+            Bind(5, "dx", matrix, isOutput: true, Axis(0), Axis(1)),
+            new[] { 0, 1, 2, 3, 4 }, CodegenReduceKind.None, scaleInput: 3,
+            // rstd * (g*dy - x*rstd^2*m)
+            body: CodegenExpr.Subtract(
+                CodegenExpr.Product(Op(2), Op(1)),
+                CodegenExpr.Product(Op(0), Op(3), Op(3), Op(4))));
+
+        var dgamma = new CodegenKernelSpec(
+            "rmsnorm_bwd_dgamma",
+            new CodegenIterationSpace(CodegenAxis.Parallel("j", columns), CodegenAxis.Reduce("i", rows)),
+            new[]
+            {
+                Bind(0, "x", matrix, Axis(1), Axis(0)), Bind(1, "dy", matrix, Axis(1), Axis(0)),
+                Bind(2, "rstd", vector, Axis(1)),
+            },
+            Bind(3, "dgamma", feature, isOutput: true, Axis(0)),
+            new[] { 0, 1, 2 }, CodegenReduceKind.Sum,
+            body: CodegenExpr.Product(Op(1), Op(0), Op(2)));
+
+        return new CodegenProgram(
+            new[] { m, dx, dgamma },
+            new long[] { rows, (long)rows * columns, columns },
+            "rmsnorm backward " + rows + "x" + columns);
+    }
+
+    /// <summary>Row softmax backward: <c>dx = y * (dy - sum_j dy*y)</c>.</summary>
+    public static CodegenProgram SoftmaxBackward(int rows, int columns)
+    {
+        RequireRowShape(rows, columns, 0);
+        int[] matrix = { rows, columns };
+        int[] vector = { rows };
+
+        var dot = new CodegenKernelSpec(
+            "softmax_bwd_dot",
+            new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("j", columns)),
+            new[] { Bind(0, "y", matrix, Axis(0), Axis(1)), Bind(1, "dy", matrix, Axis(0), Axis(1)) },
+            Bind(2, "dot", vector, isOutput: true, Axis(0)),
+            new[] { 0, 1 }, CodegenReduceKind.Sum);
+
+        var dx = new CodegenKernelSpec(
+            "softmax_bwd_dx",
+            new CodegenIterationSpace(CodegenAxis.Parallel("i", rows), CodegenAxis.Parallel("j", columns)),
+            new[]
+            {
+                Bind(0, "y", matrix, Axis(0), Axis(1)), Bind(1, "dy", matrix, Axis(0), Axis(1)),
+                Bind(2, "dot", vector, Axis(0)),
+            },
+            Bind(3, "dx", matrix, isOutput: true, Axis(0), Axis(1)),
+            new[] { 0, 1, 2 }, CodegenReduceKind.None,
+            body: CodegenExpr.Product(Op(0), CodegenExpr.Subtract(Op(1), Op(2))));
+
+        return new CodegenProgram(
+            new[] { dot, dx },
+            new long[] { rows, (long)rows * columns },
+            "softmax backward " + rows + "x" + columns);
+    }
+
+    /// <summary>
+    /// dgamma[j] = sum_i dy*(x + negmean)*rstd and dbeta[j] = sum_i dy: reductions DOWN the
+    /// rows, one output per column.
+    /// </summary>
+    private static (CodegenKernelSpec Gamma, CodegenKernelSpec Beta) ColumnParameterGradients(
+        string prefix, int rows, int columns)
+    {
+        int[] matrix = { rows, columns };
+        int[] vector = { rows };
+        int[] feature = { columns };
+        CodegenIterationSpace ColumnReduce() => new(
+            CodegenAxis.Parallel("j", columns), CodegenAxis.Reduce("i", rows));
+
+        var dgamma = new CodegenKernelSpec(
+            prefix + "_bwd_dgamma", ColumnReduce(),
+            new[]
+            {
+                Bind(0, "x", matrix, Axis(1), Axis(0)), Bind(1, "dy", matrix, Axis(1), Axis(0)),
+                Bind(2, "negmean", vector, Axis(1)), Bind(3, "rstd", vector, Axis(1)),
+            },
+            Bind(4, "dgamma", feature, isOutput: true, Axis(0)),
+            new[] { 0, 1, 2, 3 }, CodegenReduceKind.Sum,
+            body: CodegenExpr.Product(Op(1), CodegenExpr.Add(Op(0), Op(2)), Op(3)));
+
+        var dbeta = new CodegenKernelSpec(
+            prefix + "_bwd_dbeta", ColumnReduce(),
+            new[] { Bind(0, "dy", matrix, Axis(1), Axis(0)) },
+            Bind(1, "dbeta", feature, isOutput: true, Axis(0)),
+            new[] { 0 }, CodegenReduceKind.Sum);
+        return (dgamma, dbeta);
+    }
+
     private static void RequireRowShape(int rows, int columns, double epsilon)
     {
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));

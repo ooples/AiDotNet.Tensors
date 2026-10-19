@@ -313,6 +313,21 @@ public sealed class CodegenKernelSpec
     /// <see cref="PostBiasInput"/>. Lowerings that do not carry these fields must refuse such
     /// a spec rather than emit a kernel that silently drops part of its epilogue.
     /// </summary>
+    /// <summary>
+    /// The term as an expression over the inputs, replacing the product of
+    /// <see cref="ProductInputs"/>; null for the product form. When set, ProductInputs lists
+    /// exactly the inputs the expression reads (so every lowering that loads "the body
+    /// operands" still loads the right ones), and there is no pre-bias: the expression
+    /// subsumes it. A pre-reduction still applies to the expression's value.
+    /// </summary>
+    public CodegenExpr? Body { get; }
+
+    /// <summary>
+    /// True when the body is an expression. Lowerings built around a product of operands
+    /// (tiled contraction, outer products, Winograd, the adjoint) must refuse such a spec.
+    /// </summary>
+    public bool HasExpressionBody => Body is not null;
+
     public bool HasExtendedEpilogue =>
         ReduceOffset != 0.0 || PostScaleInput.HasValue || PostBiasInput.HasValue;
 
@@ -337,7 +352,8 @@ public sealed class CodegenKernelSpec
         CodegenAffineExpr? secondaryIndexExpr = null,
         double reduceOffset = 0.0,
         int? postScaleInput = null,
-        int? postBiasInput = null)
+        int? postBiasInput = null,
+        CodegenExpr? body = null)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
@@ -356,7 +372,26 @@ public sealed class CodegenKernelSpec
         ReduceOffset = reduceOffset;
         PostScaleInput = postScaleInput;
         PostBiasInput = postBiasInput;
+        Body = body;
         Algebra = algebra;
+
+        if (body is not null)
+        {
+            int[] read = body.Operands();
+            bool same = read.Length == productInputs.Length;
+            for (int i = 0; same && i < read.Length; i++) same = read[i] == productInputs[i];
+            if (!same)
+                throw new ArgumentException(
+                    "With an expression body, productInputs must list exactly the inputs the " +
+                    "expression reads, ascending; the body reads [" + string.Join(",", read) + "].",
+                    nameof(productInputs));
+            if (preBiasInput.HasValue)
+                throw new ArgumentException(
+                    "An expression body subsumes the pre-bias; write the shift into the expression.",
+                    nameof(preBiasInput));
+            if (algebra != CodegenAlgebra.Real)
+                throw new ArgumentException("An expression body is defined over the reals only.", nameof(body));
+        }
 
         // ONE MECHANISM. The legacy secondaryOutput/secondaryIndexExpr pair is folded into
         // the extras list rather than kept beside it: two ways to express "an extra output"
@@ -880,12 +915,27 @@ public sealed class CodegenKernelSpec
 
                 double product = 1.0;
                 bool anyOutOfBounds = false;
-                for (int k = 0; k < _productInputs.Length; k++)
+                if (Body is not null)
                 {
-                    var binding = _inputs[_productInputs[k]];
-                    long off = binding.ResolveOffset(values, inputData, out bool ok);
-                    if (!ok) { anyOutOfBounds = true; break; }
-                    product *= inputData[_productInputs[k]][off];
+                    var read = new Dictionary<int, double>();
+                    for (int k = 0; k < _productInputs.Length; k++)
+                    {
+                        var binding = _inputs[_productInputs[k]];
+                        long off = binding.ResolveOffset(values, inputData, out bool ok);
+                        if (!ok) { anyOutOfBounds = true; break; }
+                        read[_productInputs[k]] = inputData[_productInputs[k]][off];
+                    }
+                    if (!anyOutOfBounds) product = Body.Evaluate(i => read[i]);
+                }
+                else
+                {
+                    for (int k = 0; k < _productInputs.Length; k++)
+                    {
+                        var binding = _inputs[_productInputs[k]];
+                        long off = binding.ResolveOffset(values, inputData, out bool ok);
+                        if (!ok) { anyOutOfBounds = true; break; }
+                        product *= inputData[_productInputs[k]][off];
+                    }
                 }
                 // An out-of-range tap contributes the identity OF THE REDUCTION, which is
                 // not always zero. Zero is the additive identity, but for a maximum it is a
@@ -1018,10 +1068,17 @@ public sealed class CodegenKernelSpec
               .Append(_inputs[i].NeedsBoundsCheck ? "  [guarded]" : "").Append('\n');
         sb.Append("  out ").Append(Output.Describe(Space.Axes)).Append('\n');
         sb.Append("  body ").Append(Reduce.ToString().ToLowerInvariant()).Append('(');
-        for (int i = 0; i < _productInputs.Length; i++)
+        if (Body is not null)
         {
-            if (i > 0) sb.Append(" * ");
-            sb.Append(_inputs[_productInputs[i]].Name);
+            sb.Append(Body);
+        }
+        else
+        {
+            for (int i = 0; i < _productInputs.Length; i++)
+            {
+                if (i > 0) sb.Append(" * ");
+                sb.Append(_inputs[_productInputs[i]].Name);
+            }
         }
         sb.Append(')');
         if (BiasInput.HasValue) sb.Append(" + ").Append(_inputs[BiasInput.Value].Name);

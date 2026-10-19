@@ -30,8 +30,9 @@ public static class CodegenWarpReduction
     /// Eligible means: a real-valued sum or max with no argmax and no indirection; at least
     /// <see cref="MinimumTrips"/> reduction trips; the first product operand's stride-1
     /// dimension indexed by a reduction axis with coefficient one and an extent divisible by
-    /// <see cref="Lanes"/>; and NO cross-output reuse -- every body operand reads every
-    /// parallel axis.
+    /// <see cref="Lanes"/>; and no cross-output reuse worth a tile -- the lead operand reads
+    /// every parallel axis and any operand that skips one is a broadcast no larger than the
+    /// reduction.
     /// </para>
     /// <para>
     /// The last condition is what keeps matmul out. A[m,k] does not read n, so one load of it
@@ -109,7 +110,8 @@ public static class CodegenWarpReduction
             preBiasInput: spec.PreBiasInput, preBiasScale: spec.PreBiasScale,
             extraOutputs: extras,
             reduceOffset: spec.ReduceOffset,
-            postScaleInput: spec.PostScaleInput, postBiasInput: spec.PostBiasInput);
+            postScaleInput: spec.PostScaleInput, postBiasInput: spec.PostBiasInput,
+            body: spec.Body);
         return true;
     }
 
@@ -125,6 +127,7 @@ public static class CodegenWarpReduction
         if (spec.Output.HasIndirection || spec.Output.NeedsAtomicStore) return -1;
         foreach (var input in spec.Inputs) if (input.HasIndirection) return -1;
         if (spec.Space.ReductionTripCount < MinimumTrips) return -1;
+        if (spec.Body is not null && spec.Reduce == CodegenReduceKind.Max && spec.ProductInputs.Count > 1) return -1;
 
         var lead = spec.Inputs[spec.ProductInputs[0]];
         if (lead.Map.Count == 0) return -1;
@@ -139,12 +142,23 @@ public static class CodegenWarpReduction
         }
         if (axis < 0 || spec.Space.Axes[axis].Extent % Lanes != 0) return -1;
 
-        // No cross-output reuse: every body operand reads every parallel axis.
+        // No cross-output reuse worth a tile: the lead operand reads every parallel axis, and
+        // any other body operand that skips one is a broadcast parameter no larger than the
+        // reduction it runs along (LayerNorm backward's gamma[j]), which caches. A
+        // contraction's second operand, B[k, n], is far larger than k and is the reuse the
+        // tiled lowering exists to exploit.
         var body = new List<int>(spec.ProductInputs);
         if (spec.PreBiasInput is { } preBias) body.Add(preBias);
+        foreach (int p in spec.Space.ParallelAxes)
+            if (!References(lead, p)) return -1;
+        long reductionLength = spec.Space.ReductionTripCount;
         foreach (int operand in body)
+        {
+            bool skips = false;
             foreach (int p in spec.Space.ParallelAxes)
-                if (!References(spec.Inputs[operand], p)) return -1;
+                if (!References(spec.Inputs[operand], p)) skips = true;
+            if (skips && spec.Inputs[operand].ElementCount > reductionLength) return -1;
+        }
 
         // Only the body may read the interleaved axis. An epilogue operand indexed by a
         // reduction axis is not something any declared kernel does, and rewriting it would

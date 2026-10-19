@@ -270,6 +270,23 @@ public sealed partial class PtxAffineEmitter
     /// </summary>
     public bool EnableStreamingRows { get; set; } = true;
 
+    /// <summary>
+    /// Emits an expression body, one rounded instruction per node, and returns a FRESH
+    /// register: an in-place activation must never write over a loaded or held operand.
+    /// </summary>
+    private string EmitBody(CodegenExpr body, Func<int, string> operand)
+    {
+        string result = body.Lower(operand, F32, (op, a, b) =>
+        {
+            string d = NextF();
+            L(b is null ? $"{op} {d}, {a};" : $"{op} {d}, {a}, {b};");
+            return d;
+        });
+        string fresh = NextF();
+        L($"mov.f32 {fresh}, {result};");
+        return fresh;
+    }
+
     /// <summary>True when the last emission used the warp-per-output lowering.</summary>
     public bool WarpReduced { get; private set; }
 
@@ -1680,6 +1697,7 @@ public sealed partial class PtxAffineEmitter
             {
                 string? product = null;
                 string? productPred = null;
+                var operandValue = new Dictionary<int, string>();
                 foreach (int inputIdx in spec.ProductInputs)
                 {
                     var binding = spec.Inputs[inputIdx];
@@ -1778,7 +1796,14 @@ public sealed partial class PtxAffineEmitter
                             scalarCache[key] = (value, pred);
                         }
                     }
-                    if (product is null) { product = value; productPred = pred; }
+                    if (spec.Body is not null)
+                    {
+                        // Loaded exactly as a product operand would be; the expression,
+                        // not a multiply chain, combines them below.
+                        operandValue[inputIdx] = value;
+                        productPred = productPred is null ? pred : AndPred(productPred, pred);
+                    }
+                    else if (product is null) { product = value; productPred = pred; }
                     else
                     {
                         string mul = NextF();
@@ -1787,6 +1812,8 @@ public sealed partial class PtxAffineEmitter
                         productPred = AndPred(productPred, pred);
                     }
                 }
+                if (spec.Body is not null)
+                    product = EmitBody(spec.Body, input => operandValue[input]);
 
                 // The pre-reduction slot: shift, then transform, per TERM. An epilogue
                 // activation cannot do this -- it runs once on the finished accumulator,

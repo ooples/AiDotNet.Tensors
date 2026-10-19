@@ -78,7 +78,7 @@ public static class CodegenAdjoint
             throw new NotSupportedException(
                 "Activation backward needs the forward pre-activation value, which is not " +
                 "an index-map transform. Differentiate the activation-free operator.");
-        if (forward.BiasInput.HasValue || forward.ScaleInput.HasValue || forward.HasExtendedEpilogue)
+        if (forward.BiasInput.HasValue || forward.ScaleInput.HasValue || forward.HasExtendedEpilogue || forward.HasExpressionBody)
             throw new NotSupportedException(
                 "Bias and scale make the operator affine, not linear; drop the epilogue first.");
         if (forward.ProductInputs.Count != 2)

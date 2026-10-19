@@ -90,7 +90,7 @@ public sealed class CodegenTiledOuterProductPlan
             return false;
         }
         if (spec.PreBiasInput.HasValue || spec.BiasInput.HasValue ||
-            spec.ScaleInput.HasValue || spec.ReduceScale != 1.0 || spec.HasExtendedEpilogue ||
+            spec.ScaleInput.HasValue || spec.ReduceScale != 1.0 || spec.HasExtendedEpilogue || spec.HasExpressionBody ||
             spec.Activation != CodegenActivationKind.None ||
             spec.SecondaryOutput is not null || spec.ExtraOutputs.Count != 0)
         {
