@@ -3343,7 +3343,8 @@ internal static class BackwardFunctions<T>
     /// Backward of the compiled plan's fused linear head and mean squared error (<c>FusedLinear(x, w, b)</c> into
     /// <c>ReduceMean(Square(Subtract(p, y)))</c>, see LinearMseLossFusionPattern); inputs are { x, w, b, y } or { x, w, y }.
     /// One launch for the head's gradients on a backend with the fused kernels; otherwise the head's output is recomputed
-    /// and the loss's gradient composed, then the linear's own backward.
+    /// and the loss's gradient composed, then the linear's own backward. The composed path also serves a backward that
+    /// records (higher-order gradients): the kernel's results carry no tape entries.
     /// </summary>
     internal static void FusedLinearMseLossBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -3358,7 +3359,7 @@ internal static class BackwardFunctions<T>
         bool needB = b is not null && DifferentiableOps.IsGradientRequired(b);
         bool needY = DifferentiableOps.IsGradientRequired(y);
         if (!needX && !needW && !needB && !needY) return;
-        if (!needY && engine is DirectGpuTensorEngine gpu
+        if (!needY && engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>()
             && gpu.TryFusedLinearMseLossBackward(gradOutput, x, w, b, y, out var gradX, out var gradW, out var gradB))
         {
             if (needX) DifferentiableOps.AccumulateGrad(grads, x, gradX!, engine);

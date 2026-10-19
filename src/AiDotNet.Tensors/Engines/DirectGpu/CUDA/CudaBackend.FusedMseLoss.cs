@@ -11,7 +11,8 @@ public sealed partial class CudaBackend : IFusedMseLossBackend, IFusedLinearMseL
     // padded to 20 floats and read as float4 chunks), with x, w, y, the partial predictions and the backward's dp staged
     // in at most 48 KB of shared memory. A parity LSTM's head is [32, 64] x [64, 10] (22 KB).
     private const int LinearMseMaxOutputs = 16, LinearMseThreads = 512, LinearMseRowFloats = 20, LinearMseKParts = 4;
-    private const int LinearMseMaxSharedFloats = 12 * 1024;
+    // 48 KB (the default per-block limit) less the kernels' static shared memory (the forward's 16 warp sums).
+    private const int LinearMseMaxSharedFloats = 12 * 1024 - 16;
 
     private static long Round4(long n) => (n + 3) & ~3L;
 
