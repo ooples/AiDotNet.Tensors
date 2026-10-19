@@ -39,8 +39,8 @@ internal readonly struct ResidentStage
         long elements = (long)rows * cols;
         RequireSize(a, elements, op, "input", nameof(a));
         RequireSize(output, elements, op, "output", nameof(output));
-        if (needsB) RequireSize(b!, op == ResidentOp.Add ? elements : cols, op, "second operand", nameof(b));
-        if (needsC) RequireSize(c!, cols, op, "bias", nameof(c));
+        if (needsB && b is not null) RequireSize(b, op == ResidentOp.Add ? elements : cols, op, "second operand", nameof(b));
+        if (needsC && c is not null) RequireSize(c, cols, op, "bias", nameof(c));
         Op = op; Rows = rows; Cols = cols; A = a; B = b; C = c; Output = output;
     }
 
