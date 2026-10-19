@@ -81,30 +81,6 @@ jobs:
             --logger "console;verbosity=detailed" | tee "$RUNNER_TEMP/ratchet.log"
           exit "${PIPESTATUS[0]}"
 
-      # TEMPORARY (#1055 EPYC CNN gap): a CPU-sampling EventPipe trace of the CNN case on this runner.
-      - name: Profile CNN (temporary)
-        if: always()
-        env:
-          DOTNET_EnableEventPipe: '1'
-          DOTNET_EventPipeOutputPath: ${{ runner.temp }}/cnn-{pid}.nettrace
-          DOTNET_EventPipeConfig: 'Microsoft-DotNETCore-SampleProfiler:0:5,Microsoft-Windows-DotNETRuntime:0x14C14FCCBD:4'
-          DOTNET_EventPipeCircularMB: '2048'
-        run: |
-          lscpu | head -30 > "$RUNNER_TEMP/lscpu.txt" || true
-          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0             --filter "FullyQualifiedName~HeadToHeadNetworkTests.Cnn_Cpu_IsAsFastAsPyTorch"             --logger "console;verbosity=detailed" > "$RUNNER_TEMP/cnn-profile.log" 2>&1 || true
-          ls -la "$RUNNER_TEMP"/*.nettrace || true
-
-      - name: Upload CNN profile (temporary)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cnn-profile-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/*.nettrace
-            ${{ runner.temp }}/cnn-profile.log
-            ${{ runner.temp }}/lscpu.txt
-          if-no-files-found: warn
-
       - name: Summary
         if: always()
         run: |
@@ -125,6 +101,46 @@ jobs:
           path: |
             ${{ runner.temp }}/ratchet.log
             /tmp/aidotnet-parity/*-latest.json
+          if-no-files-found: warn
+
+  # TEMPORARY (#1055 runner CPU gap): sampling traces of the parity MLP/CNN steps outside the test host, three legs so
+  # at least one lands on each runner CPU type. To be removed once the runner gap is closed.
+  profile:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build probe
+        run: |
+          dotnet tool install --global dotnet-trace
+          dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj --configuration Release
+      - name: Trace
+        run: |
+          lscpu > "$RUNNER_TEMP/lscpu.txt"
+          probe=$(find tests/AiDotNet.Tensors.Benchmarks/bin/Release -name AiDotNet.Tensors.Benchmarks.dll | head -1)
+          for net in mlp cnn; do
+            steps=$([ "$net" = mlp ] && echo 3000 || echo 600)
+            dotnet "$probe" --parity-step "$net" 300 | tee -a "$RUNNER_TEMP/probe.txt"
+            dotnet-trace collect --output "$RUNNER_TEMP/$net.nettrace"               --providers Microsoft-DotNETCore-SampleProfiler,Microsoft-Windows-DotNETRuntime:0x14C14FCCBD:4               -- dotnet "$probe" --parity-step "$net" "$steps" | tee -a "$RUNNER_TEMP/probe.txt"
+          done
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-profile-${{ github.run_id }}-${{ matrix.leg }}
+          path: |
+            ${{ runner.temp }}/*.nettrace
+            ${{ runner.temp }}/probe.txt
+            ${{ runner.temp }}/lscpu.txt
           if-no-files-found: warn
 
   parity:
