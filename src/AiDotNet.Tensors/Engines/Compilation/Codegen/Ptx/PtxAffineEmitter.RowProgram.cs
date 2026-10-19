@@ -28,6 +28,13 @@ public sealed partial class PtxAffineEmitter
 
         const int Lanes = CodegenWarpReduction.Lanes;
         int perLane = plan.PerLane;
+
+        // 128-BIT ACCESS. When a row is a whole number of 128-element chunks, each lane owns
+        // FOUR consecutive elements per chunk and moves them with one v4 load or store.
+        // Scalar accesses kept the fused softmax at 0.99x PyTorch with both sides at ~254
+        // GB/s; a v4 access is a quarter of the instructions for the same bytes. Element e
+        // of a lane is then chunk e/4, component e%4.
+        int vector = EnableVectorLoads && plan.Width % (Lanes * 4) == 0 ? 4 : 1;
         long threads = (long)plan.Rows * Lanes;
         long blocks = (threads + BlockThreads - 1) / BlockThreads;
 
@@ -72,7 +79,7 @@ public sealed partial class PtxAffineEmitter
 
         string rowBytes = NextRd(), laneBytes = NextRd(), rowStatBytes = NextRd();
         L($"mul.wide.u32 {rowBytes}, {row}, {I(plan.Width * 4)};");
-        L($"mul.wide.u32 {laneBytes}, {lane}, 4;");
+        L($"mul.wide.u32 {laneBytes}, {lane}, {I(4 * vector)};");
         L($"mul.wide.u32 {rowStatBytes}, {row}, 4;");
 
         // Per-thread base addresses, built once per tensor on first use.
@@ -111,24 +118,33 @@ public sealed partial class PtxAffineEmitter
                     EmittedLoads++;
                     return rowStat[name] = v;
                 case CodegenRowOperandKind.Feature:
-                {
-                    string key = name + "#" + I(t);
-                    if (held.TryGetValue(key, out string? f)) return f;
-                    string value = NextF();
-                    L($"ld.global.nc.f32 {value}, [{FeaturePtr(name)}+{I(t * Lanes * 4)}];");
-                    EmittedLoads++;
-                    return held[key] = value;
-                }
+                    return Held(name, t, FeaturePtr(name));
                 default:
-                {
-                    string key = name + "#" + I(t);
-                    if (held.TryGetValue(key, out string? m)) return m;
-                    string value = NextF();
-                    L($"ld.global.nc.f32 {value}, [{MatrixPtr(name)}+{I(t * Lanes * 4)}];");
-                    EmittedLoads++;
-                    return held[key] = value;
-                }
+                    return Held(name, t, MatrixPtr(name));
             }
+        }
+
+        string Held(string name, int t, string pointer)
+        {
+            string key = name + "#" + I(t);
+            if (held.TryGetValue(key, out string? value)) return value;
+            if (vector == 1)
+            {
+                value = NextF();
+                L($"ld.global.nc.f32 {value}, [{pointer}+{I(t * Lanes * 4)}];");
+                EmittedLoads++;
+                return held[key] = value;
+            }
+            int chunk = t / vector;
+            string a = NextF(), b = NextF(), c = NextF(), d = NextF();
+            L($"ld.global.nc.v4.f32 {{{a}, {b}, {c}, {d}}}, [{pointer}+{I(chunk * Lanes * vector * 4)}];");
+            EmittedLoads++;
+            VectorisedLoads++;
+            held[name + "#" + I(chunk * vector)] = a;
+            held[name + "#" + I(chunk * vector + 1)] = b;
+            held[name + "#" + I(chunk * vector + 2)] = c;
+            held[name + "#" + I(chunk * vector + 3)] = d;
+            return held[key];
         }
 
         // The body of one term, exactly as the affine emitter forms it: product, pre-bias,
@@ -219,10 +235,20 @@ public sealed partial class PtxAffineEmitter
             else
             {
                 string ptr = MatrixPtr(output);
+                var pending = new string[vector];
                 for (int t = 0; t < perLane; t++)
                 {
                     string value = Epilogue(pass, Term(pass, t), t);
-                    L($"st.global.f32 [{ptr}+{I(t * Lanes * 4)}], {value};");
+                    if (vector == 1)
+                    {
+                        L($"st.global.f32 [{ptr}+{I(t * Lanes * 4)}], {value};");
+                        continue;
+                    }
+                    pending[t % vector] = value;
+                    if (t % vector != vector - 1) continue;
+                    L($"st.global.v4.f32 [{ptr}+{I(t / vector * Lanes * vector * 4)}], " +
+                      $"{{{pending[0]}, {pending[1]}, {pending[2]}, {pending[3]}}};");
+                    VectorisedStores++;
                 }
             }
         }

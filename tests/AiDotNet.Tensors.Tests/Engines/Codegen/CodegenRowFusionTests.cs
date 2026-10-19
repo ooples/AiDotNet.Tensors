@@ -52,16 +52,33 @@ public class CodegenRowFusionTests
     {
         var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(128, 1024), out string reason);
         Assert.True(plan is not null, reason);
-        var emitter = new PtxAffineEmitter();
-        string ptx = emitter.EmitRowProgram(plan!, "rowfused_layernorm", 7, 5);
-
-        Assert.Equal(3 * plan!.PerLane, emitter.EmittedLoads);
+        // Scalar form: one load per element position.
+        var scalar = new PtxAffineEmitter { EnableVectorLoads = false };
+        string ptx = scalar.EmitRowProgram(plan!, "rowfused_layernorm", 7, 5);
+        Assert.Equal(3 * plan!.PerLane, scalar.EmittedLoads);
         // Two statistics, five butterfly steps each.
         Assert.Equal(10, CountOccurrences(ptx, "shfl.sync.bfly.b32"));
         // y stored by every lane; negmean and rstd by the leader only.
         Assert.Equal(plan.PerLane + 2, CountOccurrences(ptx, "st.global.f32"));
         Assert.Equal(2, CountOccurrences(ptx, "@%p1 st.global.f32"));
-        Assert.Equal(128u * 32u / 256u, emitter.LaunchBlocks);
+        Assert.Equal(128u * 32u / 256u, scalar.LaunchBlocks);
+
+        // 128-bit form: four elements per load and per store, still each loaded once.
+        var vector = new PtxAffineEmitter();
+        string wide = vector.EmitRowProgram(plan, "rowfused_layernorm", 7, 5);
+        Assert.Equal(3 * plan.PerLane / 4, vector.EmittedLoads);
+        Assert.Equal(3 * plan.PerLane / 4, CountOccurrences(wide, "ld.global.nc.v4.f32"));
+        Assert.Equal(plan.PerLane / 4, CountOccurrences(wide, "st.global.v4.f32"));
+        Assert.Equal(2, CountOccurrences(wide, "@%p1 st.global.f32"));
+    }
+
+    /// <summary>A row that is not a whole number of 128-element chunks stays scalar.</summary>
+    [Fact]
+    public void ANarrowRowStaysScalar()
+    {
+        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(128, 64), out _);
+        string ptx = new PtxAffineEmitter().EmitRowProgram(plan!, "rowfused_d64", 7, 5);
+        Assert.DoesNotContain("v4.f32", ptx, StringComparison.Ordinal);
     }
 
     [Fact]
