@@ -9596,8 +9596,13 @@ public partial class CpuEngine : ITensorLevelEngine
                         else { var eager = eng.MaxPool2D(captured, ps, st, pd); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
                     // The node saves no argmax, so its backward recovers the winners from the input: MaxPool2DBackward
-                    // casts savedState[0] to the indices array, and a compiled plan's first backward threw on it.
-                    pd == 0 ? BackwardFunctions<T>.MaxPool2DRecomputeBackward : BackwardFunctions<T>.MaxPool2DPaddedRecomputeBackward,
+                    // casts savedState[0] to the indices array, and a compiled plan's first backward threw on it. On a GPU
+                    // engine in a resident step the unpadded pool's gradient is one recompute kernel; otherwise
+                    // MaxPool2DRecomputeBackward replays the pool with indices (two extra pool launches per pool per step).
+                    pd == 0
+                        ? BackwardFunctions<T>.MaxPool2DRecomputeOnDeviceOr(new[] { ps, ps }, new[] { st, st },
+                            BackwardFunctions<T>.MaxPool2DRecomputeBackward)
+                        : BackwardFunctions<T>.MaxPool2DPaddedRecomputeBackward,
                     pd == 0
                         ? new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } }
                         : new object[] { new[] { poolSize, poolSize }, new[] { stride, stride }, pd });
