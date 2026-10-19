@@ -57,6 +57,9 @@ public sealed class CrossBackendKernelCoverageTests
     // the CUDA home. Adding an entry here is an assertion "this op already runs on-device on CUDA/HIP".
     private static readonly HashSet<string> CoveredUnderDifferentName = new(StringComparer.Ordinal)
     {
+        // OpenCL's element-parallel batch-norm inference (optionally with ReLU): CUDA/HIP run the same op as
+        // batchnorm_forward with training = 0, and batchnorm_relu for the ReLU form (CudaNormalizationKernels.cs).
+        "batchnorm_inference",
         // OpenCL batch-execution kernels whose CUDA/HIP twin is a shared mode kernel (BatchExecutionCudaKernels.cs):
         "bx_crop_2d_backward",               // -> bx_window_2d mode 3
         "bx_mse_loss_rows",                  // -> bx_row_loss mode 1
