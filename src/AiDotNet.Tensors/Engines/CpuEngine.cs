@@ -2594,6 +2594,11 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon,
+        FusedActivationType activation)
+        => ApplyFusedActivation(BatchNormInference(x, gamma, beta, mean, variance, epsilon), activation);
+
+    /// <inheritdoc/>
     public virtual Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
         if (x == null) throw new ArgumentNullException(nameof(x));

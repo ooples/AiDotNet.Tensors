@@ -540,6 +540,35 @@ __kernel void batchnorm_relu(
     output[idx] = fmax(0.0f, result);  // ReLU
 }
 
+// BatchNorm (Inference), no activation: one work-item per element. The per-channel
+// batchnorm_forward kernel is the training kernel (a work-group per channel looping over every
+// spatial position with a local-memory reduction); in inference there is nothing to reduce, and
+// a work-group per channel left most of the device idle on early, low-channel layers.
+// output = gamma * (input - runningMean) / sqrt(runningVar + eps) + beta, then ReLU when applyRelu is set.
+__kernel void batchnorm_inference(
+    __global const float* input,
+    __global float* output,
+    __global const float* gamma,
+    __global const float* beta,
+    __global const float* runningMean,
+    __global const float* runningVar,
+    const int batch,
+    const int channels,
+    const int spatialSize,
+    const float epsilon,
+    const int applyRelu)
+{
+    const int idx = get_global_id(0);
+    const int totalSize = batch * channels * spatialSize;
+    if (idx >= totalSize) return;
+
+    const int c = (idx / spatialSize) % channels;
+    // Same arithmetic as batchnorm_forward's inference branch (1/sqrt, then g * ((x - mean) * invVar) + b),
+    // so the routes agree up to the compiler's multiply-add contraction.
+    float invVar = 1.0f / sqrt(runningVar[c] + epsilon);
+    float r = gamma[c] * ((input[idx] - runningMean[c]) * invVar) + beta[c];
+    output[idx] = applyRelu ? fmax(0.0f, r) : r;
+}
 // Fused BatchNorm + GELU (Inference)
 __kernel void batchnorm_gelu(
     __global const float* input,
@@ -780,7 +809,7 @@ __kernel void reduce_variance_local(
                 "gemm_bias_sigmoid", "gemm_bias_tanh", "gemm_bias",
                 "layernorm_relu", "layernorm_gelu",
                 "residual_layernorm", "scaled_softmax", "bias_dropout",
-                "batchnorm_relu", "batchnorm_gelu",
+                "batchnorm_inference", "batchnorm_relu", "batchnorm_gelu",
                 "batchnorm_sigmoid", "batchnorm_tanh", "residual_batchnorm_relu",
                 "lerp_fused", "add_scaled",
                 "reduce_sum_local", "reduce_variance_local"

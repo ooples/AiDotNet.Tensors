@@ -66,6 +66,151 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         internal bool TryConv2DForwardWinograd(in TunedConv2DArgs a)
             => WinogradKernelsReady && WinogradF23Pipeline.TryForward(this, this, a);
 
+        private bool WinogradF43KernelsReady => HasTunedKernel(Kernels.WinogradF43Kernels.Filter);
+
+        private const int WinogradF43Points = 36;
+
+        // y = conv3x3_s1(x) through F(4x4, 3x3): U[36][K][C] = G g G^T, V[36][C][P] = B^T d B, the 36 per-point GEMMs
+        // M[x] (K x P) = U[x] (K x C) * V[x] (C x P), and Y = A^T m A. False, with nothing launched, when the shape is
+        // not admitted or a plane would not fit 32-bit indexing.
+        internal bool TryConv2DForwardWinogradF43(in TunedConv2DArgs a)
+        {
+            if (!WinogradF43KernelsReady || !WinogradF23Pipeline.Admits(a)) return false;
+            int n = a.Batch, inC = a.InChannels, outC = a.OutChannels, outH = a.OutHeight, outW = a.OutWidth;
+            int tilesH = (outH + 3) / 4, tilesW = (outW + 3) / 4;
+            long p = (long)n * tilesH * tilesW;
+            long uCount = WinogradF43Points * (long)outC * inC, vCount = WinogradF43Points * inC * p;
+            long mCount = WinogradF43Points * outC * p;
+            if (uCount > int.MaxValue || vCount > int.MaxValue || mCount > int.MaxValue) return false;
+            int pi = (int)p;
+            IGpuBuffer? owned = null;
+            IGpuBuffer u = GetCachedF43Filter(outC, inC) ?? (owned = AllocateBuffer((int)uCount));
+            using var v = AllocateBuffer((int)vCount);
+            using var m = AllocateBuffer((int)mCount);
+            try
+            {
+                if (owned is not null)
+                {
+                    var filter = WinogradKernel(Kernels.WinogradF43Kernels.Filter, a.Kernel, owned);
+                    filter.SetArg(2, outC); filter.SetArg(3, inC);
+                    RunWinograd(filter, (long)outC * inC);
+                    if (StoreF43Filter(owned, outC, inC)) owned = null;
+                }
+
+                var input = WinogradKernel(Kernels.WinogradF43Kernels.Input, a.Input, v);
+                uint arg = 2;
+                input.SetArg(arg++, n); input.SetArg(arg++, inC); input.SetArg(arg++, a.InHeight); input.SetArg(arg++, a.InWidth);
+                input.SetArg(arg++, a.PadH); input.SetArg(arg++, tilesH); input.SetArg(arg++, tilesW);
+                RunWinograd(input, (long)inC * p);
+
+                BatchedGemm(u, v, m, outC, pi, inC, WinogradF43Points);
+
+                var output = WinogradKernel(Kernels.WinogradF43Kernels.Output, m, a.Output);
+                arg = 2;
+                output.SetArg(arg++, n); output.SetArg(arg++, outC); output.SetArg(arg++, outH); output.SetArg(arg++, outW);
+                output.SetArg(arg++, tilesH); output.SetArg(arg++, tilesW);
+                RunWinograd(output, (long)outC * p);
+                return true;
+            }
+            finally
+            {
+                owned?.Dispose();
+            }
+        }
+
+        // Transformed filters by weight identity (ConvWeightIdentity): inference reuses them, where every call
+        // re-transformed the weights (a 512x512 filter writes 37.7 MB of U: 0.3 ms of a 1.9 ms convolution). Bounded,
+        // since U is four times the weights; past the budget a convolution transforms into scratch as before.
+        private const long F43FilterCacheBudgetBytes = 768L << 20;
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> _f43Filters = new();
+        private readonly object _f43FilterLock = new();
+        private long _f43FilterBytes;
+        // Buffers of entries whose weights were collected: freed by the next cache access, never on the finalizer thread.
+        private readonly System.Collections.Concurrent.ConcurrentQueue<IGpuBuffer> _f43Retired = new();
+        private readonly System.Collections.Generic.List<WeakReference<F43FilterEntry>> _f43Live = new();
+
+        private sealed class F43FilterEntry
+        {
+            internal F43FilterEntry(OpenClBackend owner, IGpuBuffer u, int version, int outC, int inC, long bytes)
+            {
+                Owner = owner; U = u; Version = version; OutC = outC; InC = inC; Bytes = bytes;
+            }
+
+            internal OpenClBackend Owner { get; }
+            internal IGpuBuffer U { get; }
+            internal int Version { get; }
+            internal int OutC { get; }
+            internal int InC { get; }
+            internal long Bytes { get; }
+
+            // The key is a host weight array: when it is collected the entry goes, and its device buffer is retired.
+            ~F43FilterEntry()
+            {
+                System.Threading.Interlocked.Add(ref Owner._f43FilterBytes, -Bytes);
+                Owner._f43Retired.Enqueue(U);
+            }
+        }
+
+        private IGpuBuffer? GetCachedF43Filter(int outC, int inC)
+        {
+            if (!ConvWeightIdentity.TryGet(out var key, out int version)) return null;
+            lock (_f43FilterLock)
+            {
+                DrainRetiredF43Filters();
+                if (_f43Filters.TryGetValue(key, out var entry) && entry.Version == version && entry.OutC == outC
+                    && entry.InC == inC)
+                    return entry.U;
+            }
+            return null;
+        }
+
+        private void DrainRetiredF43Filters()
+        {
+            while (_f43Retired.TryDequeue(out var retired)) retired.Dispose();
+            _f43Live.RemoveAll(w => !w.TryGetTarget(out _));
+        }
+
+        // Frees every cached transform; called when the backend is disposed.
+        private void ReleaseF43FilterCache()
+        {
+            lock (_f43FilterLock)
+            {
+                foreach (var weak in _f43Live)
+                {
+                    if (!weak.TryGetTarget(out var entry)) continue;
+                    GC.SuppressFinalize(entry);
+                    entry.U.Dispose();
+                }
+                _f43Live.Clear();
+                while (_f43Retired.TryDequeue(out var retired)) retired.Dispose();
+                _f43FilterBytes = 0;
+            }
+        }
+
+        // True when the cache took ownership of u.
+        private bool StoreF43Filter(IGpuBuffer u, int outC, int inC)
+        {
+            if (!ConvWeightIdentity.TryGet(out var key, out int version)) return false;
+            long bytes = (long)WinogradF43Points * outC * inC * sizeof(float);
+            lock (_f43FilterLock)
+            {
+                DrainRetiredF43Filters();
+                if (_f43Filters.TryGetValue(key, out var stale))
+                {
+                    _f43Filters.Remove(key);
+                    System.Threading.Interlocked.Add(ref _f43FilterBytes, -stale.Bytes);
+                    GC.SuppressFinalize(stale);
+                    stale.U.Dispose();
+                }
+                if (System.Threading.Interlocked.Read(ref _f43FilterBytes) + bytes > F43FilterCacheBudgetBytes) return false;
+                var added = new F43FilterEntry(this, u, version, outC, inC, bytes);
+                _f43Filters.Add(key, added);
+                _f43Live.Add(new WeakReference<F43FilterEntry>(added));
+                System.Threading.Interlocked.Add(ref _f43FilterBytes, bytes);
+                return true;
+            }
+        }
+
         internal bool TryConv2DBackwardDataWinograd(in TunedConv2DBackwardArgs a)
             => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardData(this, this, a);
 

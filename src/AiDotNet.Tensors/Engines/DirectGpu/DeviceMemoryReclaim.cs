@@ -108,6 +108,18 @@ internal static class DeviceMemoryReclaim
         GC.Collect(0, GCCollectionMode.Forced, blocking: true);
     }
 
+    /// <summary>
+    /// Credits back a buffer its owner disposed explicitly (it is back in the pool, so no collection is needed to
+    /// recover it). Without the credit, scratch that is always disposed (a Winograd convolution's transform planes, a
+    /// split-K GEMM's partials) counted toward the collection threshold like an abandoned result: a ResNet-50 forward
+    /// forced one blocking collection per call (about 1.5 ms) to recover nothing.
+    /// </summary>
+    internal static void OnDeviceRelease(long bytes)
+    {
+        long after = Interlocked.Add(ref s_driverBytesSinceCollection, -bytes);
+        if (after < 0) Interlocked.CompareExchange(ref s_driverBytesSinceCollection, 0, after);
+    }
+
     // Buffers handed out since the last collection this class ran, pool hits included.
     private static long s_allocationsSinceCollection;
 

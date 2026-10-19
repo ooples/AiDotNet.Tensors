@@ -1509,6 +1509,51 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean,
+        Tensor<T> variance, double epsilon, FusedActivationType activation)
+    {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (activation == FusedActivationType.None)
+            return BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+        if (IsTapeActive<T>() || x.Rank != 4 || !TryGetBackend(out var backend))
+            return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
+
+        var bufOut = default(OwnedBuffer);
+        bool ownershipTransferred = false;
+        try
+        {
+            int batch = x.Shape._dims[0];
+            int channels = x.Shape._dims[1];
+            int spatial = x.Length / (batch * channels);
+            using var bufIn = GetOrAllocateBuffer(backend, x);
+            using var bufGamma = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.NormalizationParams);
+            using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.NormalizationParams);
+            using var bufMean = GetWeightBufferPreferResident(backend, mean, PersistentTensorRole.NormalizationParams);
+            using var bufVar = GetWeightBufferPreferResident(backend, variance, PersistentTensorRole.NormalizationParams);
+            bufOut = AllocateOutputBuffer(backend, x.Length);
+            using var bufSaveMean = AllocateOutputBuffer(backend, channels);
+            using var bufSaveInvVar = AllocateOutputBuffer(backend, channels);
+            // One pass: normalize with the running statistics and apply the activation (batchnorm_relu and kin).
+            if (!backend.TryFusedBatchNormActivation(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
+                    bufMean.Buffer, bufVar.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer,
+                    batch, channels, spatial, (float)epsilon, 0.1f, /*training:*/ false, activation))
+            {
+                bufOut.Dispose();
+                bufOut = default;
+                return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
+            }
+            var result = DeferTensorResult<T>(backend, bufOut.Buffer, x.Length, x.Shape.ToArray());
+            bufOut.RelinquishOwnership();
+            ownershipTransferred = true;
+            return result;
+        }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("BatchNormInferenceActivation", capabilityGap);
+            if (!ownershipTransferred) bufOut.Dispose();
+            return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
+        }
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> BatchNormInference<T>(
         Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon)
     {
@@ -1534,10 +1579,13 @@ public partial class DirectGpuTensorEngine
             int channels = x.Shape._dims[1];
             int spatial = x.Length / (batch * channels);
             using var bufIn = GetOrAllocateBuffer(backend, x);
-            using var bufGamma = GetOrAllocateBuffer(backend, gamma);
-            using var bufBeta = GetOrAllocateBuffer(backend, beta);
-            using var bufMean = GetOrAllocateBuffer(backend, mean);
-            using var bufVar = GetOrAllocateBuffer(backend, variance);
+            // The affine parameters and running statistics are the layer's persistent state: fetch them the way
+            // FusedBatchNorm does, through the resident weight cache (version-checked against host writes), not
+            // the activation path, which uploaded all four on every call and blocked on each upload.
+            using var bufGamma = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.NormalizationParams);
+            using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.NormalizationParams);
+            using var bufMean = GetWeightBufferPreferResident(backend, mean, PersistentTensorRole.NormalizationParams);
+            using var bufVar = GetWeightBufferPreferResident(backend, variance, PersistentTensorRole.NormalizationParams);
             bufOut = AllocateOutputBuffer(backend, x.Length);
             // saveMean/saveInvVar are training-only outputs; the inference path ignores them but
             // the kernel signature requires the buffers, so hand it scratch of size [channels].

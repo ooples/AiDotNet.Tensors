@@ -2024,6 +2024,21 @@ public partial interface IEngine
     Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon);
 
     /// <summary>
+    /// <see cref="BatchNormInference{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double)"/> followed by
+    /// <paramref name="activation"/>: the same values, which a backend may compute in one pass (batch norm then ReLU
+    /// after every convolution of a residual network is two full passes over each activation otherwise).
+    /// </summary>
+    /// <param name="x">Input tensor, rank-4 NCHW.</param>
+    /// <param name="gamma">Scale, shape [C].</param>
+    /// <param name="beta">Bias, shape [C].</param>
+    /// <param name="mean">Running mean, shape [C].</param>
+    /// <param name="variance">Running variance, shape [C].</param>
+    /// <param name="epsilon">Numerical stabiliser.</param>
+    /// <param name="activation">The activation applied to the normalized values.</param>
+    Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean, Tensor<T> variance, double epsilon,
+        FusedActivationType activation);
+
+    /// <summary>
     /// Performs batched matrix multiplication on 3D tensors.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

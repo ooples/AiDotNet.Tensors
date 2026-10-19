@@ -39,6 +39,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
                                 shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                                 (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) Conv2DGeneric(a); }),
+                            // F(4x4, 3x3): 36 per-point GEMMs for 4x fewer multiplies than direct, against F(2x2, 3x3)'s 2.25x.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_f43_gemm", TunedKernelOrigin.Builtin, true,
+                                shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradF43KernelsReady,
+                                (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinogradF43(a)) Conv2DGeneric(a); }),
+                            // Fused F(2x2, 3x3): transforms, per-point products and output transform in one launch, so
+                            // the 16-plane V and M never reach global memory.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_fused", TunedKernelOrigin.Builtin, true,
+                                shape => WinogradF23Pipeline.AdmitsShape(shape) && HasTunedKernel(Kernels.WinogradFusedKernels.Forward),
+                                (in TunedConv2DArgs a) => Conv2DWinogradFused(a)),
+                            // im2col (none for a 1x1 stride-1 unpadded batch-1 conv) + the register-blocked split-K GEMM,
+                            // which keeps every CU busy on the small late-layer products CLBlast leaves underfilled.
+                            new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.im2col_rb_gemm", TunedKernelOrigin.Builtin, true,
+                                shape => TunedConv2DArgs.GemmScratchFits(shape) && shape[0] == 1
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.Im2ColWide)
+                                    && HasTunedKernel(Kernels.BatchedGemmKernels.Rb64SplitK),
+                                (in TunedConv2DArgs a) => Conv2DIm2ColRbGemm(a)),
                         };
                         _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                             new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
@@ -85,11 +101,85 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             k.Execute3D(tilesX * TileOut, tilesY * TileOut, a.Batch * a.OutChannels, TileOut, TileOut, 1);
         }
 
+        private void Conv2DWinogradFused(in TunedConv2DArgs a)
+        {
+            int tilesH = (a.OutHeight + 1) / 2, tilesW = (a.OutWidth + 1) / 2;
+            int p = a.Batch * tilesH * tilesW;
+            var k = _kernelCache[Kernels.WinogradFusedKernels.Forward];
+            uint arg = 0;
+            k.SetArg(arg++, BufferHandle(a.Input)); k.SetArg(arg++, BufferHandle(a.Kernel)); k.SetArg(arg++, BufferHandle(a.Output));
+            k.SetArg(arg++, a.Batch); k.SetArg(arg++, a.InChannels); k.SetArg(arg++, a.InHeight); k.SetArg(arg++, a.InWidth);
+            k.SetArg(arg++, a.OutChannels); k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth); k.SetArg(arg++, a.PadH);
+            k.SetArg(arg++, tilesH); k.SetArg(arg++, tilesW);
+            k.Execute2D(RoundUpToMultiple(p, 32) / 32 * 256, (a.OutChannels + 31) / 32, 256, 1);
+        }
+
+        // Batch 1 only (the slot admits it only there): y[Cout, L] = W[Cout, P] * col[P, L], col the input itself for a
+        // 1x1 stride-1 unpadded convolution.
+        private void Conv2DIm2ColRbGemm(in TunedConv2DArgs a)
+        {
+            int l = a.OutHeight * a.OutWidth, p = a.InChannels * a.KernelH * a.KernelW;
+            if (a.KernelH == 1 && a.KernelW == 1 && a.StrideH == 1 && a.StrideW == 1 && a.PadH == 0 && a.PadW == 0)
+            {
+                RbSplitKGemm(a.Kernel, a.Input, a.Output, a.OutChannels, l, p);
+                return;
+            }
+            long colCount = (long)p * l;
+            using var col = AllocateBuffer(checked((int)colCount));
+            var k = _kernelCache[Kernels.BatchedGemmKernels.Im2ColWide];
+            uint arg = 0;
+            k.SetArg(arg++, BufferHandle(a.Input)); k.SetArg(arg++, BufferHandle(col));
+            k.SetArg(arg++, a.InChannels); k.SetArg(arg++, a.InHeight); k.SetArg(arg++, a.InWidth);
+            k.SetArg(arg++, a.KernelH); k.SetArg(arg++, a.KernelW); k.SetArg(arg++, a.StrideH); k.SetArg(arg++, a.StrideW);
+            k.SetArg(arg++, a.PadH); k.SetArg(arg++, a.PadW); k.SetArg(arg++, a.DilationH); k.SetArg(arg++, a.DilationW);
+            k.SetArg(arg++, a.OutHeight); k.SetArg(arg++, a.OutWidth);
+            k.Execute1D(RoundUpToMultiple(checked((int)colCount), 256), 256);
+            RbSplitKGemm(a.Kernel, col, a.Output, a.OutChannels, l, p);
+        }
+
+        // C[M x N] = A[M x K] * B[K x N] (row-major, contiguous) through gemm_rb64_splitk: K is split into slices of at
+        // least 64 until the 64 x 64 tile grid times the slices covers about four work groups per compute unit, and the
+        // slices' partial planes are summed by gemm_splitk_reduce.
+        internal void RbSplitKGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+        {
+            int tiles = ((m + 63) / 64) * ((n + 63) / 64);
+            int target = 4 * (int)Math.Max(1u, _context?.MaxComputeUnits ?? 8u);
+            int splits = Math.Max(1, Math.Min((target + tiles - 1) / tiles, k / 64));
+            int kChunk = RoundUpToMultiple((k + splits - 1) / splits, 16);
+            splits = (k + kChunk - 1) / kChunk;
+            var gemm = _kernelCache[Kernels.BatchedGemmKernels.Rb64SplitK];
+            IGpuBuffer? partial = splits > 1 ? AllocateBuffer(checked(splits * m * n)) : null;
+            try
+            {
+                gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
+                gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, k); gemm.SetArg(7, n);
+                gemm.SetArg(8, kChunk);
+                gemm.Execute3D(RoundUpToMultiple(n, 64) / 4, RoundUpToMultiple(m, 64) / 4, splits, 16, 16, 1);
+                if (partial is null) return;
+                var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
+                reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
+                reduce.SetArg(2, m * n); reduce.SetArg(3, splits);
+                reduce.Execute1D(RoundUpToMultiple(m * n, 256), 256);
+            }
+            finally
+            {
+                partial?.Dispose();
+            }
+        }
+
         // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for
         // B = 1).
         private void Conv2DIm2ColGemm(in TunedConv2DArgs a)
         {
             int l = a.OutHeight * a.OutWidth, p = a.InChannels * a.KernelH * a.KernelW;
+            // A 1x1, stride-1, unpadded convolution's im2col is the input itself ([Cin, H*W] per batch item): multiply it
+            // directly instead of copying it to a column buffer first.
+            if (a.KernelH == 1 && a.KernelW == 1 && a.StrideH == 1 && a.StrideW == 1 && a.PadH == 0 && a.PadW == 0
+                && a.Batch == 1)
+            {
+                Gemm(a.Kernel, a.Input, a.Output, a.OutChannels, l, p);
+                return;
+            }
             using var col = AllocateBuffer(checked(a.Batch * p * l));
             var k = _kernelCache[Kernels.OpenClTunedRowKernels.Im2ColName];
             uint arg = 0;
