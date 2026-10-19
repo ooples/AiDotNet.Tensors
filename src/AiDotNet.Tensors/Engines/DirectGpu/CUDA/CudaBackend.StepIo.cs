@@ -73,6 +73,9 @@ public sealed partial class CudaBackend
         public fixed int Len[StepIoMaxInputs];
         public int Vector;
         public ulong Guard;
+        public ulong CopySrc;
+        public ulong CopyDst;
+        public int CopyCount;
     }
 
     // Learning rates a slot's table holds: one per step number a replay may run as while earlier replays' finiteness
@@ -103,7 +106,12 @@ public sealed partial class CudaBackend
         private readonly MultiTensorTable?[] _pingPong = new MultiTensorTable?[2];   // A -> B, B -> A (PrepareSgdPingPong)
         private IGpuBuffer? _pingPongPartials;   // a double per chunk
         private IGpuBuffer? _pingPongDone;       // the kernel's finished-block counter, zero between launches
+        private IGpuBuffer? _copySource, _copyDestination;   // the prologue's per-replay device copy (TrySetPrologueCopy)
+        private int _copyCount;
         private bool _disposed;
+
+        // The prologue's grid covers its copy in one pass up to 1024 blocks of 256 threads; past that it strides.
+        private const int PrologueCopyMaxFloats = 1 << 20;
 
         public CudaGraphStepIo(CudaBackend backend, IReadOnlyList<IGpuBuffer> inputs, IReadOnlyList<int> lengths)
         {
@@ -317,6 +325,21 @@ public sealed partial class CudaBackend
             CudaNativeBindings.cuStreamQuery(_backend._mainStream);
         }
 
+        public bool TrySetPrologueCopy(IGpuBuffer? source, IGpuBuffer? destination, int count)
+        {
+            if (source is null || destination is null || count <= 0)
+            {
+                _copySource = _copyDestination = null;
+                _copyCount = 0;
+                return source is null && destination is null;
+            }
+            if (count > PrologueCopyMaxFloats || source.Size < count || destination.Size < count) return false;
+            _copySource = source;
+            _copyDestination = destination;
+            _copyCount = count;
+            return true;
+        }
+
         public void CapturePrologue(int parity)
         {
             if (!_backend._kernelCache.TryGetValue("step_io_prologue", out var prologueKernel))
@@ -346,9 +369,15 @@ public sealed partial class CudaBackend
                 args.DynScalars = (ulong)_dynamicScalars.Handle.ToInt64();
                 args.Guard = (ulong)(_guard?.Handle.ToInt64() ?? 0);
             }
+            if (_copySource is not null && _copyDestination is not null)
+            {
+                args.CopySrc = (ulong)_copySource.Handle.ToInt64();
+                args.CopyDst = (ulong)_copyDestination.Handle.ToInt64();
+                args.CopyCount = _copyCount;
+            }
             void** launchArgs = stackalloc void*[1];
             launchArgs[0] = &args;
-            uint blocks = (uint)Math.Max(1, Math.Min(1024, (total + 255) / 256));
+            uint blocks = (uint)Math.Max(1, Math.Min(1024, (Math.Max(total, _copyCount) + 255) / 256));
             _backend.LaunchKernel(prologueKernel, blocks, 256, launchArgs);
         }
 
