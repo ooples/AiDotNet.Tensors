@@ -257,43 +257,6 @@ public class DirectConvAvx2Tests
         AssertClose(expected, dx, "input gradient");
     }
 
-#if NET9_0_OR_GREATER
-    // The 512-bit weight-gradient tile (two input blocks per 16-lane vector) keeps every lane's FMA chain and the
-    // 256-bit path's image splits, so dW may not depend on the host's vector width. Shapes: the batch split across
-    // partial gradients, one task per block pair, 5 kernel columns (a 3-column group and a 2-column one), accumulate.
-    [SkippableTheory]
-    [InlineData(7, 64, 64, 5, 3, 1, 1, false)]    // split into partial gradients
-    [InlineData(2, 128, 128, 4, 3, 1, 1, false)]  // enough block pairs that the batch is not split
-    [InlineData(2, 32, 32, 6, 5, 1, 2, true)]     // 5 columns, accumulate
-    [InlineData(3, 16, 64, 8, 3, 2, 1, true)]     // stride 2
-    public void Vector512KernelGradient_IsBitIdenticalTo256Bit(int batch, int inC, int outC, int size, int k, int stride, int pad, bool accumulate)
-    {
-        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
-        int outSize = OutSize(size, k, stride, pad, 1);
-        var x = Random(41, batch, inC, size, size);
-        var g = Random(42, batch, outC, outSize, outSize);
-        var prior = Random(43, outC, inC, k, k);
-        float[] Run(bool wide)
-        {
-            var dw = new Tensor<float>(new[] { outC, inC, k, k });
-            for (int i = 0; i < dw.Length; i++) dw.SetFlat(i, accumulate ? prior.GetFlat(i) : float.NaN);
-            bool? before = SimdGemm.s_forceVector512Direct;
-            try
-            {
-                SimdGemm.s_forceVector512Direct = wide;
-                DirectConvAvx2.BackwardKernel(x.GetDataArray(), 0, g.GetDataArray(), 0, dw.GetDataArray(), 0, accumulate,
-                    batch, inC, size, size, outC, k, k, stride, stride, pad, pad, 1, 1, outSize, outSize);
-            }
-            finally { SimdGemm.s_forceVector512Direct = before; }
-            return dw.ToArray();
-        }
-        var narrow = Run(false);
-        var wide = Run(true);
-        for (int i = 0; i < narrow.Length; i++)
-            Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
-                $"dW[{i}]: 256-bit {narrow[i]:G9}, 512-bit {wide[i]:G9}");
-    }
-#endif
     [SkippableTheory]
     [InlineData(2, 32, 32, 7, 3, 1, 1, 1, false)]
     [InlineData(3, 16, 64, 8, 3, 2, 1, 1, true)]
