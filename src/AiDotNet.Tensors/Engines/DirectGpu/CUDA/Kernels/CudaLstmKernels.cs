@@ -1083,6 +1083,17 @@ __device__ __forceinline__ void lstm_backward_recurrence_reg_body(
     const int BH = batch * H;
 
     float dHnext = 0.0f, dC = 0.0f;
+    // Per-step coefficients that do not depend on the incoming dH, formed when the step's inputs are prefetched (off
+    // the serial chain): dO = dH * kO, dC += dH * kC, then dF, dI, dGc from dC.
+    float kO = 0.0f, kC = 0.0f, kF = 0.0f, kI = 0.0f, kG = 0.0f;
+    auto coefficients = [&](float f_, float ig_, float g_, float o_, float c_, float cPrev_) {
+        float tanh_c = 2.0f * lstm_fast_sigmoid(2.0f * c_) - 1.0f;
+        kO = tanh_c * sigmoid_derivative(o_);
+        kC = o_ * tanh_derivative(tanh_c);
+        kF = cPrev_ * sigmoid_derivative(f_);
+        kI = g_ * sigmoid_derivative(ig_);
+        kG = ig_ * tanh_derivative(g_);
+    };
     // The cell inputs of step t, loaded during step t+1.
     float go = 0.0f, f = 0.0f, ig = 0.0f, g = 0.0f, o = 0.0f, cT = 0.0f, cPrev = 0.0f, hPrevV = 0.0f;
     int t0 = timeSteps - 1;
@@ -1096,18 +1107,18 @@ __device__ __forceinline__ void lstm_backward_recurrence_reg_body(
         cT = c_states[t0 * BH + cgid];
         cPrev = t0 == 0 ? c_init[cgid] : c_states[(t0 - 1) * BH + cgid];
         hPrevV = t0 == 0 ? h_init[cgid] : h_states[(t0 - 1) * BH + cgid];
+        coefficients(f, ig, g, o, cT, cPrev);
     }
     __syncthreads();
 
     for (int t = timeSteps - 1; t >= 0; t--) {
         if (cell) {
             float dH = dHnext + go;
-            float tanh_c = lstm_tanh(cT);
-            float dO = dH * tanh_c * sigmoid_derivative(o);
-            dC += dH * o * tanh_derivative(tanh_c);
-            float dF = dC * cPrev * sigmoid_derivative(f);
-            float dI = dC * g * sigmoid_derivative(ig);
-            float dGc = dC * ig * tanh_derivative(g);
+            float dO = dH * kO;
+            dC += dH * kC;
+            float dF = dC * kF;
+            float dI = dC * kI;
+            float dGc = dC * kG;
             dC = dC * f;
 
             dg[cb][0][cj] = dI;
@@ -1133,6 +1144,7 @@ __device__ __forceinline__ void lstm_backward_recurrence_reg_body(
                 cT = cPrev;
                 cPrev = tn == 0 ? c_init[cgid] : c_states[(tn - 1) * BH + cgid];
                 hPrevV = tn == 0 ? h_init[cgid] : h_states[(tn - 1) * BH + cgid];
+                coefficients(f, ig, g, o, cT, cPrev);
             }
         }
         __syncthreads();   // dg holds this step's gate gradients
