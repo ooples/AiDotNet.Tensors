@@ -115,7 +115,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct(
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
+    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi)
 {
     int ow = blockIdx.x * blockDim.x + threadIdx.x;
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
@@ -141,7 +141,11 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_direct(
         }
     }
 
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+    // The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
+    float r = sum;
+    if (epi & 1) r += bias[oc];
+    if ((epi & 2) && r < 0.0f) r = 0.0f;
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
 }
 
 // Conv2D backward pass for input gradients
@@ -402,7 +406,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_tiled(
     int batch, int inChannels, int inHeight, int inWidth,
     int outChannels, int outHeight, int outWidth,
     int kernelH, int kernelW, int strideH, int strideW,
-    int padH, int padW, int dilationH, int dilationW)
+    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi)
 {
     // Block handles one (batch, outChannel) pair for a TILE_OUT x TILE_OUT output region
     int tileRow = blockIdx.y * TILE_OUT;
@@ -469,7 +473,11 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_tiled(
     }
 
     if (oh < outHeight && ow < outWidth) {
-        output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+        // The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
+        float r = sum;
+        if (epi & 1) r += bias[oc];
+        if ((epi & 2) && r < 0.0f) r = 0.0f;
+        output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
     }
 }
 

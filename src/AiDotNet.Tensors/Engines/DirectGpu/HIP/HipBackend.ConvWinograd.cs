@@ -133,10 +133,15 @@ public sealed partial class HipBackend : IWinogradF23Transforms
     }
 
     unsafe void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH,
-        int tilesW)
+        int tilesW, IGpuBuffer? bias, int epilogue)
     {
-        int* ints = stackalloc int[] { n, k, outH, outW, tilesH, tilesW };
-        LaunchWinograd(WinogradF23KernelTemplate.Output, (long)k * n * tilesH * tilesW, m, y, ints, 6);
+        IntPtr readPtr = m.Handle, writePtr = y.Handle, biasPtr = (bias ?? y).Handle;
+        int* ints = stackalloc int[] { n, k, outH, outW, tilesH, tilesW, epilogue };
+        void** args = stackalloc void*[10];
+        args[0] = &readPtr; args[1] = &writePtr; args[2] = &biasPtr;
+        for (int i = 0; i < 7; i++) args[3 + i] = &ints[i];
+        long threads = (long)k * n * tilesH * tilesW;
+        LaunchKernel(TunedKernel(WinogradF23KernelTemplate.Output), (uint)((threads + 255) / 256), 256, args);
     }
 
     unsafe void IWinogradF23Transforms.GradOutputTiles(IGpuBuffer dy, IGpuBuffer u, int n, int k, int outH, int outW,

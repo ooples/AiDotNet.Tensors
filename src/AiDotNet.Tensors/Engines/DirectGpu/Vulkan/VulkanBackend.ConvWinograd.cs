@@ -159,8 +159,11 @@ public sealed unsafe partial class VulkanBackend : IWinogradF23Transforms
     void IWinogradF23Transforms.Input(IGpuBuffer x, IGpuBuffer v, int n, int c, int h, int w, int pad, int tilesH, int tilesW)
         => RunWinograd(WinogradF23KernelTemplate.Input, (long)c * n * tilesH * tilesW, x, v, n, c, h, w, pad, tilesH, tilesW);
 
-    void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW)
-        => RunWinograd(WinogradF23KernelTemplate.Output, (long)k * n * tilesH * tilesW, m, y, n, k, outH, outW, tilesH, tilesW);
+    void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW,
+        IGpuBuffer? bias, int epilogue)
+        => TryDispatchConvPoolGlsl(s_winogradShaders[WinogradF23KernelTemplate.Output],
+            new[] { (uint)n, (uint)k, (uint)outH, (uint)outW, (uint)tilesH, (uint)tilesW, (uint)epilogue },
+            checked((int)((long)k * n * tilesH * tilesW)), m, y, bias ?? y);
 
     void IWinogradF23Transforms.GradOutputTiles(IGpuBuffer dy, IGpuBuffer u, int n, int k, int outH, int outW, int tilesH,
         int tilesW)

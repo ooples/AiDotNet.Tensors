@@ -535,6 +535,29 @@ public sealed class VulkanTunedKernelTests
                 backend.Synchronize();
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
+            // The same candidates with the convolution's epilogue (ConvEpilogue): each adds the bias and applies ReLU in its
+            // output kernel or as passes after it, and must equal the convolution, then the bias add, then the ReLU.
+            float[] bias = Values(o, o * 3 + k, 1f);
+            using var bb = backend.AllocateBuffer(bias);
+            foreach (var (withBias, relu) in new[] { (true, false), (true, true), (false, true) })
+            {
+                var epilogued = new float[expected.Length];
+                for (int i = 0; i < epilogued.Length; i++)
+                {
+                    float v = withBias ? expected[i] + bias[(i / (oh * ow)) % o] : expected[i];
+                    epilogued[i] = relu && v < 0f ? 0f : v;
+                }
+                var epiArgs = new TunedConv2DArgs(xb, wb, yb, bt, c, h, w, o, oh, ow, k, k, s, s, p, p, d, d,
+                    withBias ? bb : null,
+                    relu ? AiDotNet.Tensors.Engines.FusedActivationType.ReLU : AiDotNet.Tensors.Engines.FusedActivationType.None);
+                foreach (var cand in Applicable(backend.Conv2DForwardSlot, epiArgs.Shape()))
+                {
+                    cand.Execute(epiArgs);
+                    backend.Synchronize();
+                    AssertClose(epilogued, backend.DownloadBuffer(yb), expected.Length,
+                        $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d} bias={withBias} relu={relu}", termScale: 1.0);
+                }
+            }
             // Every candidate applies to these small shapes except Winograd F(2x2,3x3) (#1371), which takes only 3x3
             // stride-1 undilated convolutions, so a variant that silently dropped out fails here.
             int notAdmitted = (k > 7 ? 1 : 0) + (AiDotNet.Tensors.Engines.DirectGpu.WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 1);

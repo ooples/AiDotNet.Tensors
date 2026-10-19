@@ -404,11 +404,36 @@ public sealed class HipTunedKernelTests
                 backend.Synchronize();
                 AssertClose(expected, backend.DownloadBuffer(yb), expected.Length, $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d}", termScale: 1.0);
             }
-            // Every candidate applies to these small shapes except Winograd off its 3x3 / stride-1 / undilated class, so a
-            // variant that silently dropped out fails here.
+            // The same candidates with the convolution's epilogue (ConvEpilogue): each adds the bias and applies ReLU in its
+            // output kernel or as passes after it, and must equal the convolution, then the bias add, then the ReLU.
+            float[] bias = Values(o, o * 3 + k, 1f);
+            using var bb = backend.AllocateBuffer(bias);
+            foreach (var (withBias, relu) in new[] { (true, false), (true, true), (false, true) })
+            {
+                var epilogued = new float[expected.Length];
+                for (int i = 0; i < epilogued.Length; i++)
+                {
+                    float v = withBias ? expected[i] + bias[(i / (oh * ow)) % o] : expected[i];
+                    epilogued[i] = relu && v < 0f ? 0f : v;
+                }
+                var epiArgs = new TunedConv2DArgs(xb, wb, yb, bt, c, h, w, o, oh, ow, k, k, s, s, p, p, d, d,
+                    withBias ? bb : null,
+                    relu ? AiDotNet.Tensors.Engines.FusedActivationType.ReLU : AiDotNet.Tensors.Engines.FusedActivationType.None);
+                foreach (var cand in Applicable(backend.Conv2DForwardSlot, epiArgs.Shape()))
+                {
+                    cand.Execute(epiArgs);
+                    backend.Synchronize();
+                    AssertClose(epilogued, backend.DownloadBuffer(yb), expected.Length,
+                        $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d} bias={withBias} relu={relu}", termScale: 1.0);
+                }
+            }
+            // Every candidate applies to these small shapes except the two Winograd routes off their classes, so a variant
+            // that silently dropped out fails here: the single-kernel F(2x2,3x3) takes 3x3 / stride-1 / undilated, and the
+            // transform + batched-GEMM pipeline (#1368) also needs equal padding of at most 2.
             bool winograd = k == 3 && s == 1 && d == 1;
+            bool winogradPipeline = AiDotNet.Tensors.Engines.DirectGpu.WinogradF23Pipeline.AdmitsShape(args.Shape());
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (winograd ? 0 : 1));
+                + (winograd ? 0 : 1) + (winogradPipeline ? 0 : 1));
         }
     }
 
