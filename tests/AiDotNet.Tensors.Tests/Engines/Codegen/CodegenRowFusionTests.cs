@@ -32,15 +32,53 @@ public class CodegenRowFusionTests
     }
 
     [Fact]
-    public void ProgramsTheRowKernelCannotHoldAreRefused()
+    public void ProgramsTheRowKernelCannotFitAreRefused()
     {
-        // Statistics over (n, h*w) per channel: the passes do not share a row/column split.
-        Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.BatchNorm2D(2, 8, 4, 8), out _));
-        // A width no warp divides.
+        // A width no warp divides, held or streamed.
         Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(16, 56), out _));
-        // Wider than the registers hold.
-        Assert.Null(CodegenRowFusion.TryPlan(
-            CodegenFusedStatistics.LayerNorm(16, CodegenRowFusion.MaxWidth * 2), out _));
+        // The multi-pass softmax over different extents per pass is not one row shape.
+        var mixed = new CodegenProgram(
+            new[] { CodegenFusedStatistics.Softmax(16, 128).Passes[0], CodegenFusedStatistics.Softmax(16, 256).Passes[2] },
+            new long[] { 16, 16 * 256 }, "mixed");
+        Assert.Null(CodegenRowFusion.TryPlan(mixed, out _));
+    }
+
+    /// <summary>A row wider than the registers hold is STREAMED rather than refused.</summary>
+    [Fact]
+    public void ARowTooWideToHoldIsStreamed()
+    {
+        var plan = CodegenRowFusion.TryPlan(
+            CodegenFusedStatistics.LayerNorm(16, CodegenRowFusion.MaxWidth * 2), out string reason);
+        Assert.True(plan is not null, reason);
+        Assert.False(plan!.Holds(4));
+        Assert.NotNull(plan.StreamGeometry(4));
+
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.EmitRowProgram(plan, "rowfused_wide", 7, 5);
+        Assert.Contains("SWEEP0:", ptx, StringComparison.Ordinal);
+        Assert.True(emitter.LoopedAxes > 0);
+    }
+
+    /// <summary>
+    /// BatchNorm is one streamed kernel: the mean and the shifted moment share the first
+    /// sweep (one read of x), rstd is a row pass between sweeps, and the affine pass is the
+    /// second sweep. Two sweeps means x is read twice -- three transfers with the write.
+    /// </summary>
+    [Fact]
+    public void BatchNormStreamsAsTwoSweepsAroundARowPass()
+    {
+        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.BatchNorm2D(32, 64, 56, 56), out string reason);
+        Assert.True(plan is not null, reason);
+        Assert.Contains("batchnorm_rstd", plan!.RowPasses);
+        Assert.Equal(new[] { 64 }, plan.RowExtents);
+        var geometry = plan.StreamGeometry(4);
+        Assert.NotNull(geometry);
+        Assert.Equal(0, 3136 % geometry!.Value.Step);   // a step never straddles an h*w plane
+
+        string ptx = new PtxAffineEmitter().EmitRowProgram(plan, "rowfused_bn", 7, 5);
+        Assert.Contains("SWEEP0:", ptx, StringComparison.Ordinal);
+        Assert.Contains("SWEEP1:", ptx, StringComparison.Ordinal);
+        Assert.DoesNotContain("SWEEP2:", ptx, StringComparison.Ordinal);
     }
 
     /// <summary>

@@ -74,7 +74,7 @@ internal static class KernelConveyorTool
         var entries = Select(selector);
         var programs = SelectPrograms(selector);
         // Program entries are carried by verify and bench; the other stages are per-kernel.
-        bool programStage = stage is "verify" or "bench";
+        bool programStage = stage is "verify" or "bench" or "incumbent";
         if (entries.Count == 0 && (!programStage || programs.Count == 0))
         {
             Console.WriteLine("No catalog entry matches '" + selector + "'. Known kernels:");
@@ -96,6 +96,9 @@ internal static class KernelConveyorTool
             case "bench":
                 if (entries.Count != 0) Bench(entries, args);
                 if (programs.Count != 0) BenchPrograms(programs);
+                break;
+            case "incumbent":
+                Incumbent(programs);
                 break;
             case "vector-ab": VectorAb(entries); break;
             case "dump": Dump(entries, args); break;
@@ -1249,6 +1252,152 @@ internal static class KernelConveyorTool
             throw new InvalidOperationException(
                 failures.Count.ToString(CultureInfo.InvariantCulture) +
                 " selected program(s) produced no stable benchmark row. " + string.Join("; ", failures));
+    }
+
+    /// <summary>
+    /// The phase-4 gate: each declared program against the HAND-WRITTEN backend kernel it
+    /// replaces, in one process, at the catalog's bench shape. Rounds alternate the two
+    /// sides so drift and preemption land on both, and the ratio is taken per round; the
+    /// median of the rounds is reported (incumbent / ours, above one means the declared
+    /// program is faster). The incumbent is launched eagerly, as the engine launches it;
+    /// with 50 launches per timed region its launch cost is amortised, not removed.
+    /// </summary>
+    private static void Incumbent(IReadOnlyList<CodegenCatalogProgramEntry> entries)
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("kernel-incumbent-start");
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+        using var engine = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine();
+        var backend = engine.Backend ??
+            throw new InvalidOperationException("No direct GPU backend is available for the incumbent lane.");
+        Console.WriteLine();
+        Console.WriteLine("INCUMBENT - declared program vs the hand-written " + engine.BackendName + " kernel, paired rounds");
+        Console.WriteLine();
+        Console.WriteLine("program                       ours us   incumbent us   ratio (round spread)");
+
+        foreach (var entry in entries)
+        {
+            Action? incumbent = null;
+            var buffers = new List<IDisposable>();
+            try
+            {
+                var program = entry.Bench;
+                var shapes = new Dictionary<string, IReadOnlyList<int>>(StringComparer.Ordinal);
+                foreach (var source in program.Sources()) shapes[source.Name] = source.Shape;
+                AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer Buffer(long count)
+                {
+                    var data = new float[count];
+                    for (long i = 0; i < count; i++) data[i] = (float)((((i * 37) % 97) - 48) / 64.0 + 1.0);
+                    var b = backend.AllocateBuffer(data);
+                    buffers.Add(b);
+                    return b;
+                }
+                long Count(IReadOnlyList<int> shape) => Elements(shape);
+
+                switch (entry.Name)
+                {
+                    case "softmax_rows":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var a = Buffer((long)r * c); var o = Buffer((long)r * c);
+                        incumbent = () => backend.Softmax(a, o, r, c);
+                        break;
+                    }
+                    case "layernorm":
+                    case "layernorm_d64":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var x = Buffer((long)r * c); var y = Buffer((long)r * c);
+                        var g = Buffer(c); var b = Buffer(c); var m = Buffer(r); var v = Buffer(r);
+                        incumbent = () => backend.LayerNorm(x, y, g, b, m, v, r, c, 1e-5f);
+                        break;
+                    }
+                    case "rmsnorm":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var x = Buffer((long)r * c); var y = Buffer((long)r * c);
+                        var g = Buffer(c); var s = Buffer(r);
+                        incumbent = () => backend.RmsNorm(x, y, g, s, r, c, 1e-6f);
+                        break;
+                    }
+                    case "batchnorm2d":
+                    {
+                        // Statistics bind x as [n, c, h*w].
+                        int n = shapes["x"][0], c = shapes["x"][1], s = shapes["x"][2];
+                        var x = Buffer((long)n * c * s); var y = Buffer((long)n * c * s);
+                        var g = Buffer(c); var b = Buffer(c); var rm = Buffer(c); var rv = Buffer(c);
+                        var sm = Buffer(c); var sv = Buffer(c);
+                        incumbent = () => backend.BatchNorm(x, y, g, b, rm, rv, sm, sv, n, c, s, 1e-5f, 0.1f, true);
+                        break;
+                    }
+                    case "groupnorm":
+                    {
+                        var xs = shapes["x"];   // [n, groups, channels/groups, spatial]
+                        int n = xs[0], groups = xs[1], c = xs[1] * xs[2], s = xs[3];
+                        var x = Buffer((long)n * c * s); var y = Buffer((long)n * c * s);
+                        var g = Buffer(c); var b = Buffer(c); var m = Buffer((long)n * groups); var v = Buffer((long)n * groups);
+                        incumbent = () => backend.GroupNorm(x, y, g, b, m, v, n, groups, c, s, 1e-5f);
+                        break;
+                    }
+                    case "layernorm_backward":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var dy = Buffer((long)r * c); var x = Buffer((long)r * c); var dx = Buffer((long)r * c);
+                        var g = Buffer(c); var m = Buffer(r); var v = Buffer(r); var dg = Buffer(c); var db = Buffer(c);
+                        incumbent = () => backend.LayerNormBackward(dy, x, g, m, v, dx, dg, db, r, c, 1e-5f);
+                        break;
+                    }
+                    case "rmsnorm_backward":
+                    {
+                        int r = shapes["x"][0], c = shapes["x"][1];
+                        var dy = Buffer((long)r * c); var x = Buffer((long)r * c); var dx = Buffer((long)r * c);
+                        var g = Buffer(c); var s = Buffer(r); var dg = Buffer(c);
+                        incumbent = () => backend.RmsNormBackward(dy, x, g, s, dx, dg, r, c, 1e-6f);
+                        break;
+                    }
+                    case "softmax_backward":
+                    {
+                        int r = shapes["y"][0], c = shapes["y"][1];
+                        var dy = Buffer((long)r * c); var y = Buffer((long)r * c); var dx = Buffer((long)r * c);
+                        incumbent = () => backend.SoftmaxBackward(dy, y, dx, r, c);
+                        break;
+                    }
+                    default:
+                        Console.WriteLine(entry.Name.PadRight(28) + "  no hand-written incumbent declared");
+                        continue;
+                }
+
+                using var ours = ProgramLaunchable.Create(runtime, program, entry.Name);
+                var oursUs = new List<double>();
+                var theirsUs = new List<double>();
+                var ratios = new List<double>();
+                for (int round = 0; round < Runs; round++)
+                {
+                    double a = Measure(runtime.Synchronize, ours.Launch).Median * 1000.0;
+                    double b = Measure(backend.Synchronize, incumbent).Median * 1000.0;
+                    oursUs.Add(a);
+                    theirsUs.Add(b);
+                    ratios.Add(b / a);
+                }
+                ratios.Sort();
+                double median = ratios[ratios.Count / 2];
+                double spread = ratios[0] > 0 ? (ratios[ratios.Count - 1] / ratios[0] - 1) * 100 : double.NaN;
+                Console.WriteLine(entry.Name.PadRight(28) +
+                    oursUs.OrderBy(v => v).ElementAt(oursUs.Count / 2).ToString("F1", CultureInfo.InvariantCulture).PadLeft(9) +
+                    theirsUs.OrderBy(v => v).ElementAt(theirsUs.Count / 2).ToString("F1", CultureInfo.InvariantCulture).PadLeft(15) +
+                    (median.ToString("F2", CultureInfo.InvariantCulture) + "x").PadLeft(9) +
+                    (" (" + spread.ToString("F1", CultureInfo.InvariantCulture) + "%)"));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(entry.Name.PadRight(28) + "  ERROR " + ex.Message.Split('\n')[0]);
+            }
+            finally
+            {
+                foreach (var b in buffers) b.Dispose();
+            }
+        }
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-incumbent-end", afterSuite: true);
     }
 
     private static string Describe(int loopedAxes) =>

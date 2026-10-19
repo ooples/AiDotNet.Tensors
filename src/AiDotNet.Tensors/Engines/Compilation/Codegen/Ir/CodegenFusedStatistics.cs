@@ -374,10 +374,27 @@ public static class CodegenFusedStatistics
 
     /// <summary>
     /// Training-mode BatchNorm over NCHW: per-channel statistics over (n, h, w), then the
-    /// channel affine. The reduction axes are NOT contiguous -- each channel's values are
-    /// <c>n</c> separate planes -- which is exactly what an index map states and a
-    /// hand-written kernel has to re-derive.
+    /// channel affine.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every pass runs in ONE iteration space, (c | n, h*w): x is bound as [n, c, h*w] -- the
+    /// same bytes -- so a channel is a row whose columns are n separate planes, and h*w is the
+    /// contiguous run (h and w as two axes would leave a stride-1 axis of 56, which no warp
+    /// divides). Row fusion streams such a channel through one block.
+    /// </para>
+    /// <para>
+    /// THREE TRANSFERS, as cuDNN's. The variance is taken as a moment shifted by
+    /// <c>shift</c> -- the running mean, or any per-channel estimate of the mean:
+    /// <c>var = mean((x - shift)^2) - (mean - shift)^2</c>. That moment does not depend on
+    /// the mean, so both statistics are computed from ONE read of x; rstd is then per-channel
+    /// arithmetic, and the affine pass is the second read and the write. Centring on
+    /// (x - mean) instead needed the mean first -- two reads before the affine, four
+    /// transfers, measured 0.65x the hand-written kernel. The shift only conditions the
+    /// arithmetic: the result is the same for every shift, and near the mean the
+    /// subtraction cancels nothing that matters.
+    /// </para>
+    /// </remarks>
     public static CodegenProgram BatchNorm2D(int batch, int channels, int height, int width, double epsilon = 1e-5)
     {
         if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
@@ -385,57 +402,66 @@ public static class CodegenFusedStatistics
         if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
         if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
         RequireEpsilon(epsilon);
-        int[] nchw = { batch, channels, height, width };
         int plane = height * width;
         int[] planes = { batch, channels, plane };
         int[] channel = { channels };
         double count = (double)batch * plane;
 
-        // Axis order (c | n, hw): the channel is the only parallel axis. The statistics bind
-        // x as [n, c, h*w] -- the same bytes -- because h and w are one contiguous run. As
-        // two axes the stride-1 one has extent w (56 at ResNet's first stage), which no
-        // warp divides; as one it has extent h*w, which the warp lowering and the split
-        // can both use.
-        CodegenIterationSpace StatisticsSpace() => new(
+        CodegenIterationSpace Statistics() => new(
             CodegenAxis.Parallel("c", channels), CodegenAxis.Reduce("n", batch),
             CodegenAxis.Reduce("hw", plane));
-        CodegenTensorBinding StatisticsInput() =>
-            Bind(0, "x", planes, Axis(1), Axis(0), Axis(2));
+        CodegenTensorBinding X(int parameter) => Bind(parameter, "x", planes, Axis(1), Axis(0), Axis(2));
 
         var negMean = new CodegenKernelSpec(
-            "batchnorm_negmean", StatisticsSpace(),
-            new[] { StatisticsInput() },
+            "batchnorm_negmean", Statistics(),
+            new[] { X(0) },
             Bind(1, "negmean", channel, isOutput: true, Axis(0)),
             new[] { 0 }, CodegenReduceKind.Sum, reduceScale: -1.0 / count);
 
+        // m2s[c] = mean((x - shift)^2), independent of the mean.
+        var shiftedMoment = new CodegenKernelSpec(
+            "batchnorm_shifted_moment", Statistics(),
+            new[] { X(0), Bind(1, "shift", channel, Axis(0)) },
+            Bind(2, "m2s", channel, isOutput: true, Axis(0)),
+            new[] { 0, 1 }, CodegenReduceKind.Sum, reduceScale: 1.0 / count,
+            preReduce: CodegenPreReduceOp.Square,
+            body: CodegenExpr.Subtract(Op(0), Op(1)));
+
+        // rstd[c] = rsqrt(m2s - (shift - mean)^2 + eps); shift - mean = shift + negmean.
         var rstd = new CodegenKernelSpec(
-            "batchnorm_rstd", StatisticsSpace(),
-            new[] { StatisticsInput(), Bind(1, "negmean", channel, Axis(0)) },
-            Bind(2, "rstd", channel, isOutput: true, Axis(0)),
-            new[] { 0 }, CodegenReduceKind.Sum, reduceScale: 1.0 / count,
-            activation: CodegenActivationKind.Rsqrt,
-            preReduce: CodegenPreReduceOp.Square, preBiasInput: 1, reduceOffset: epsilon);
+            "batchnorm_rstd",
+            new CodegenIterationSpace(CodegenAxis.Parallel("c", channels)),
+            new[]
+            {
+                Bind(0, "m2s", channel, Axis(0)), Bind(1, "negmean", channel, Axis(0)),
+                Bind(2, "shift", channel, Axis(0)),
+            },
+            Bind(3, "rstd", channel, isOutput: true, Axis(0)),
+            new[] { 0, 1, 2 }, CodegenReduceKind.None,
+            activation: CodegenActivationKind.Rsqrt, reduceOffset: epsilon,
+            body: CodegenExpr.Subtract(Op(0),
+                CodegenExpr.Multiply(CodegenExpr.Add(Op(1), Op(2)), CodegenExpr.Add(Op(1), Op(2)))));
 
         var affine = new CodegenKernelSpec(
             "batchnorm_affine",
             new CodegenIterationSpace(
-                CodegenAxis.Parallel("n", batch), CodegenAxis.Parallel("c", channels),
-                CodegenAxis.Parallel("h", height), CodegenAxis.Parallel("w", width)),
+                CodegenAxis.Parallel("c", channels), CodegenAxis.Parallel("n", batch),
+                CodegenAxis.Parallel("hw", plane)),
             new[]
             {
-                Bind(0, "x", nchw, Axis(0), Axis(1), Axis(2), Axis(3)),
-                Bind(1, "negmean", channel, Axis(1)),
-                Bind(2, "rstd", channel, Axis(1)),
-                Bind(3, "gamma", channel, Axis(1)),
-                Bind(4, "beta", channel, Axis(1)),
+                X(0),
+                Bind(1, "negmean", channel, Axis(0)),
+                Bind(2, "rstd", channel, Axis(0)),
+                Bind(3, "gamma", channel, Axis(0)),
+                Bind(4, "beta", channel, Axis(0)),
             },
-            Bind(5, "y", nchw, isOutput: true, Axis(0), Axis(1), Axis(2), Axis(3)),
+            Bind(5, "y", planes, isOutput: true, Axis(1), Axis(0), Axis(2)),
             new[] { 0 }, CodegenReduceKind.None,
             scaleInput: 2, preBiasInput: 1, postScaleInput: 3, postBiasInput: 4);
 
         return new CodegenProgram(
-            new[] { negMean, rstd, affine },
-            new long[] { channels, channels, (long)batch * channels * height * width },
+            new[] { negMean, shiftedMoment, rstd, affine },
+            new long[] { channels, channels, channels, (long)batch * channels * plane },
             "batchnorm2d " + batch + "x" + channels + "x" + height + "x" + width);
     }
 

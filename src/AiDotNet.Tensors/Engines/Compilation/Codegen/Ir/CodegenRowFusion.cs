@@ -111,8 +111,14 @@ public sealed class CodegenRowFusionPlan
     /// <summary>The kind of every named tensor.</summary>
     public IReadOnlyDictionary<string, CodegenRowOperandKind> Kinds { get; }
 
-    /// <summary>Elements each thread holds, at the scalar geometry.</summary>
+    /// <summary>Elements each thread holds, at the scalar geometry (0 when streamed).</summary>
     public int PerLane => Geometry(1) is { } g ? g.PerThread : 0;
+
+    /// <summary>
+    /// Passes over the ROW axes only -- per-row arithmetic on statistics, such as BatchNorm's
+    /// rstd from its two moments. Every thread of the row computes them from registers.
+    /// </summary>
+    public IReadOnlyCollection<string> RowPasses { get; internal set; } = Array.Empty<string>();
 
     /// <summary>
     /// Threads per row and elements per access for a requested vector width: the
@@ -123,6 +129,7 @@ public sealed class CodegenRowFusionPlan
     /// </summary>
     public (int Threads, int Vector, int Step, int PerThread)? Geometry(int maxVector)
     {
+        // HELD: the narrowest power-of-two thread count that holds the row in registers.
         for (int vector = maxVector; vector >= 1; vector /= 2)
         {
             if (vector != 1 && vector != 2 && vector != 4) continue;
@@ -138,6 +145,40 @@ public sealed class CodegenRowFusionPlan
         }
         return null;
     }
+
+    /// <summary>
+    /// The STREAMED geometry for a row too wide to hold: the most threads (a multiple of 32,
+    /// up to a block) and the widest access such that one step divides the innermost column
+    /// run. A BatchNorm channel is 32 x 3136 elements and 3136 = 64 x 49, so this is
+    /// 224 threads x 2 elements rather than any power of two. Null when nothing divides.
+    /// </summary>
+    public (int Threads, int Vector, int Step, int Chunks)? StreamGeometry(int maxVector)
+    {
+        int innermost = ColumnExtents[ColumnExtents.Count - 1];
+        (int, int, int, int)? best = null;
+        long bestThreads = 0;
+        for (int vector = maxVector; vector >= 1; vector /= 2)
+        {
+            if (vector != 1 && vector != 2 && vector != 4) continue;
+            for (int threads = CodegenRowFusion.MaxRowThreads; threads >= CodegenWarpReduction.Lanes;
+                 threads -= CodegenWarpReduction.Lanes)
+            {
+                long step = (long)threads * vector;
+                if (innermost % step != 0) continue;
+                // Prefer more threads; at equal threads, the wider access found first.
+                if (threads > bestThreads)
+                {
+                    bestThreads = threads;
+                    best = (threads, vector, (int)step, (int)(Width / step));
+                }
+                break;
+            }
+        }
+        return best;
+    }
+
+    /// <summary>True when the row is held in registers; false when it is streamed in sweeps.</summary>
+    public bool Holds(int maxVector) => Geometry(maxVector) is not null;
 }
 
 /// <summary>Decides whether a program can run as one row-per-warp-or-block kernel.</summary>
@@ -149,7 +190,10 @@ public static class CodegenRowFusion
     /// <summary>Most threads cooperating on one row: one full block.</summary>
     public const int MaxRowThreads = 1024;
 
-    /// <summary>Widest row: every thread of a full block holding its maximum.</summary>
+    /// <summary>
+    /// Widest row HELD in registers: every thread of a full block holding its maximum. Wider
+    /// rows are streamed in sweeps instead.
+    /// </summary>
     public const int MaxWidth = MaxPerThread * MaxRowThreads;
 
     /// <summary>Returns the plan, or null with the reason the program does not fit.</summary>
@@ -177,10 +221,51 @@ public static class CodegenRowFusion
 
         var bindings = new Dictionary<string, CodegenRowBinding>(StringComparer.Ordinal);
         var produced = new HashSet<string>(StringComparer.Ordinal);
+        var rowPasses = new HashSet<string>(StringComparer.Ordinal);
         foreach (var pass in program.Passes)
         {
             var axes = pass.Space.Axes;
             bool reduces = pass.Reduce != CodegenReduceKind.None;
+
+            // A ROW PASS: pointwise over the row axes alone, reading and writing statistics.
+            if (!reduces && axes.Count == rowAxes)
+            {
+                bool shaped = true;
+                for (int a = 0; a < rowAxes; a++)
+                    if (axes[a].IsReduction || axes[a].Extent != extents[a]) shaped = false;
+                if (!shaped || pass.SecondaryOutput is not null || pass.ExtraOutputs.Count != 0 ||
+                    pass.Algebra != CodegenAlgebra.Real)
+                {
+                    reason = pass.Name + " is neither (row | column) nor a row pass";
+                    return null;
+                }
+                foreach (var input in pass.Inputs)
+                {
+                    var binding = Classify(input, rowAxes, extents);
+                    if (binding is null || binding.Kind != CodegenRowOperandKind.Row)
+                    {
+                        reason = pass.Name + " is a row pass reading the non-row '" + input.Name + "'";
+                        return null;
+                    }
+                    if (bindings.TryGetValue(input.Name, out var seen) && !Same(seen, binding))
+                    {
+                        reason = "'" + input.Name + "' is read two different ways";
+                        return null;
+                    }
+                    bindings[input.Name] = binding;
+                }
+                var rowOut = Classify(pass.Output, rowAxes, extents);
+                if (rowOut is null || rowOut.Kind != CodegenRowOperandKind.Row)
+                {
+                    reason = pass.Name + "'s output is not per-row";
+                    return null;
+                }
+                bindings[pass.Output.Name] = rowOut;
+                produced.Add(pass.Output.Name);
+                rowPasses.Add(pass.Name);
+                continue;
+            }
+
             if (axes.Count != extents.Length)
             {
                 reason = pass.Name + " has a different axis count";
@@ -241,11 +326,6 @@ public static class CodegenRowFusion
                 reason = pass.Name + "'s output is not a " + expected + " binding";
                 return null;
             }
-            if (!reduces && !IsFlatColumns(output, columnExtents))
-            {
-                reason = pass.Name + "'s output is not stored in column order";
-                return null;
-            }
             bindings[pass.Output.Name] = output;
             produced.Add(pass.Output.Name);
         }
@@ -253,11 +333,13 @@ public static class CodegenRowFusion
         var parameters = new List<string>();
         foreach (var source in program.Sources()) parameters.Add(source.Name);
         foreach (var pass in program.Passes) parameters.Add(pass.Output.Name);
-        var plan = new CodegenRowFusionPlan(program, rowExtents, columnExtents, parameters, bindings);
-        if (plan.Geometry(1) is null)
+        var plan = new CodegenRowFusionPlan(program, rowExtents, columnExtents, parameters, bindings)
         {
-            reason = "no thread geometry holds a " + plan.Width + "-wide row within " +
-                     MaxPerThread + " elements per thread";
+            RowPasses = rowPasses,
+        };
+        if (plan.Geometry(1) is null && plan.StreamGeometry(1) is null)
+        {
+            reason = "no thread geometry divides the innermost column run of a " + plan.Width + "-wide row";
             return null;
         }
         return plan;
@@ -375,18 +457,6 @@ public static class CodegenRowFusion
         else if (innermost == 0) kind = CodegenRowOperandKind.Feature;
         else return null;   // the innermost column axis is read, but not contiguously
         return new CodegenRowBinding(binding.Name, kind, rowStrides, columnStrides);
-    }
-
-    /// <summary>True when the column strides are exactly the row-major strides of the columns.</summary>
-    private static bool IsFlatColumns(CodegenRowBinding binding, int[] columnExtents)
-    {
-        long stride = 1;
-        for (int c = columnExtents.Length - 1; c >= 0; c--)
-        {
-            if (binding.ColumnStrides[c] != stride) return false;
-            stride *= columnExtents[c];
-        }
-        return true;
     }
 
     private static bool Same(CodegenRowBinding a, CodegenRowBinding b)
