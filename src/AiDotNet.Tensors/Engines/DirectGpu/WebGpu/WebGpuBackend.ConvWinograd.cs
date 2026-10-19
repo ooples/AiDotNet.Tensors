@@ -139,8 +139,18 @@ public sealed partial class WebGpuBackend : IWinogradF23Transforms
     void IWinogradF23Transforms.Input(IGpuBuffer x, IGpuBuffer v, int n, int c, int h, int w, int pad, int tilesH, int tilesW)
         => RunWinograd(WinogradF23KernelTemplate.Input, (long)c * n * tilesH * tilesW, x, v, n, c, h, w, pad, tilesH, tilesW);
 
-    void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW)
-        => RunWinograd(WinogradF23KernelTemplate.Output, (long)k * n * tilesH * tilesW, m, y, n, k, outH, outW, tilesH, tilesW);
+    void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW,
+        IGpuBuffer? bias, int epilogue)
+    {
+        int[] ints = { n, k, outH, outW, tilesH, tilesW, epilogue };
+        var uniforms = new float[(ints.Length + 3) / 4 * 4];
+        for (int i = 0; i < ints.Length; i++) uniforms[i] = BitConverter.Int32BitsToSingle(ints[i]);
+        // WebGPU rejects one buffer bound as both read and read-write storage, so the absent bias gets its own placeholder.
+        using var placeholder = bias is null ? AllocateBuffer(1) : null;
+        Dispatch3BufferAsync(WinogradModulePrefix + WinogradF23KernelTemplate.Output, WebGpuWinogradKernels.Output,
+            WinogradF23KernelTemplate.Output, m, y, bias ?? placeholder ?? y, uniforms, checked((int)((long)k * n * tilesH * tilesW)))
+            .GetAwaiter().GetResult();
+    }
 
     void IWinogradF23Transforms.GradOutputTiles(IGpuBuffer dy, IGpuBuffer u, int n, int k, int outH, int outW, int tilesH,
         int tilesW)

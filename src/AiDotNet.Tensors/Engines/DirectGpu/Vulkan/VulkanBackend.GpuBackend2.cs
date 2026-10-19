@@ -46,8 +46,9 @@ public sealed unsafe partial class VulkanBackend
             int total = batch * outChannels * outHeight * outWidth;
             var pc = new uint[] { (uint)batch, (uint)inChannels, (uint)inHeight, (uint)inWidth,
                 (uint)outChannels, (uint)outHeight, (uint)outWidth, (uint)kernelH, (uint)kernelW,
-                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW };
-            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output)) return;
+                (uint)strideH, (uint)strideW, (uint)padH, (uint)padW, (uint)dilationH, (uint)dilationW, 0u };
+            // No epilogue (flags 0); the output stands in for the bias binding.
+            if (TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, pc, total, input, kernel, output, output)) return;
         }
         catch { throw; }
     }

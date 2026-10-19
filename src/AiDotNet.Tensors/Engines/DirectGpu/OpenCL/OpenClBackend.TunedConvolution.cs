@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     // Convolution forward through the tuned-kernel registry on OpenCL (#1114), as CudaBackend.TunedConvolution: the
     // reference is the established generic dispatch (Winograd F(2x2,3x3) for 3x3 stride 1, else tiled up to 7x7, else
     // direct); the candidates are the explicit tiled and direct kernels and im2col + GEMM.
-    public sealed partial class OpenClBackend
+    public sealed partial class OpenClBackend : IConvBiasActivationBackend
     {
         // Convolution reassociates long K = Cin*kH*kW dot products; Winograd and GEMM differ by a few ulps of the scale.
         private const double ConvolutionTolerance = 1e-4;
@@ -31,14 +31,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                                 (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpiloguePasses(a); }),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.tiled", TunedKernelOrigin.Builtin, true,
                                 shape => shape[5] <= 7 && shape[6] <= 7 && HasTunedKernel("conv2d_tiled"),
-                                (in TunedConv2DArgs a) => { Conv2DTiled(a); ConvEpiloguePasses(a); }),
+                                (in TunedConv2DArgs a) => Conv2DTiled(a)),
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.direct", TunedKernelOrigin.Builtin, true,
-                                _ => HasTunedKernel("conv2d_direct"), (in TunedConv2DArgs a) => { Conv2DDirect(a); ConvEpiloguePasses(a); }),
+                                _ => HasTunedKernel("conv2d_direct"), (in TunedConv2DArgs a) => Conv2DDirect(a)),
                             // #1370: Winograd as transforms around one batched GEMM, where the generic route's Winograd
                             // kernel computes each output tile's whole channel sum in one work item.
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
                                 shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
-                                (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) Conv2DGeneric(a); ConvEpiloguePasses(a); }),
+                                (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) { Conv2DGeneric(a); ConvEpiloguePasses(a); } }),
                             // F(4x4, 3x3): 36 per-point GEMMs for 4x fewer multiplies than direct, against F(2x2, 3x3)'s 2.25x.
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_f43_gemm", TunedKernelOrigin.Builtin, true,
                                 shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradF43KernelsReady,
@@ -81,18 +81,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // The epilogue flags the output kernels take (see conv_epilogue): bit 0 bias, bit 1 ReLU. The routes that write
         // the output themselves (fused Winograd, F(4x4) output transform, split-K GEMM) apply these; the others run
         // ConvEpiloguePasses after the convolution.
-        private static int ConvEpilogueFlags(in TunedConv2DArgs a)
-            => (a.Bias is null ? 0 : 1) | (a.Activation == FusedActivationType.ReLU ? 2 : 0);
+        private static int ConvEpilogueFlags(in TunedConv2DArgs a) => ConvEpilogue.Flags(a);
 
         // A bias buffer for the epilogue argument; the output stands in when there is none (the kernel never reads it).
         private static IntPtr ConvEpilogueBias(in TunedConv2DArgs a) => BufferHandle(a.Bias ?? a.Output);
 
-        private void ConvEpiloguePasses(in TunedConv2DArgs a)
-        {
-            int spatial = a.OutHeight * a.OutWidth;
-            if (a.Bias is { } bias) Conv2DBiasAdd(a.Output, bias, a.Batch, a.OutChannels, spatial);
-            if (a.Activation == FusedActivationType.ReLU) Relu(a.Output, a.Output, a.OutputCount);
-        }
+        private void ConvEpiloguePasses(in TunedConv2DArgs a) => ConvEpilogue.RunPasses(this, a);
 
         private void Conv2DGeneric(in TunedConv2DArgs a)
             => Conv2DGenericCore(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels,
@@ -102,6 +96,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             var k = _kernelCache["conv2d_direct"];
             ConvArgs(k, a, withKernelGeometry: true);
+            k.SetArg(18, ConvEpilogueBias(a)); k.SetArg(19, ConvEpilogueFlags(a));
             k.Execute3D(a.OutWidth, a.OutHeight, a.Batch * a.OutChannels, 8, 8, 1);
         }
 
@@ -113,6 +108,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int tileInH = TileOut * a.StrideH + (a.KernelH - 1) * a.DilationH;
             int tileInW = TileOut * a.StrideW + (a.KernelW - 1) * a.DilationW;
             k.SetLocalArg(18, tileInH * tileInW * sizeof(float));
+            k.SetArg(19, ConvEpilogueBias(a)); k.SetArg(20, ConvEpilogueFlags(a));
             int tilesX = (a.OutWidth + TileOut - 1) / TileOut, tilesY = (a.OutHeight + TileOut - 1) / TileOut;
             k.Execute3D(tilesX * TileOut, tilesY * TileOut, a.Batch * a.OutChannels, TileOut, TileOut, 1);
         }

@@ -7,7 +7,7 @@ using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend
+public sealed partial class HipBackend : IConvBiasActivationBackend
 {
     private const double ConvolutionTolerance = 1e-4;
     private TunedKernelSlot<TunedConv2DArgs>? _conv2DForwardSlot;
@@ -24,22 +24,22 @@ public sealed partial class HipBackend
                     var candidates = new ITunedKernelCandidate<TunedConv2DArgs>[]
                     {
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.generic", TunedKernelOrigin.Builtin, true,
-                            _ => true, (in TunedConv2DArgs a) => Conv2DGeneric(a)),
+                            _ => true, (in TunedConv2DArgs a) => { Conv2DGeneric(a); ConvEpilogue.RunPasses(this, a); }),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                             shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedKernel(HipTunedRowKernels.Im2ColName),
-                            (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
+                            (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpilogue.RunPasses(this, a); }),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.winograd_f2x2_3x3", TunedKernelOrigin.Builtin, true,
                             shape => IsWinogradShape(shape) && HasTunedKernel("conv2d_winograd_f2x2_3x3"),
-                            (in TunedConv2DArgs a) => Conv2DWinograd(a)),
+                            (in TunedConv2DArgs a) => { Conv2DWinograd(a); ConvEpilogue.RunPasses(this, a); }),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.tiled", TunedKernelOrigin.Builtin, true,
-                            _ => HasTunedKernel("conv2d_tiled"), (in TunedConv2DArgs a) => Conv2DTiledOrDirect(a, tiled: true)),
+                            _ => HasTunedKernel("conv2d_tiled"), (in TunedConv2DArgs a) => Conv2DTiledOrDirect(a, tiled: true, epilogue: true)),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.direct", TunedKernelOrigin.Builtin, true,
-                            _ => HasTunedKernel("conv2d_direct"), (in TunedConv2DArgs a) => Conv2DTiledOrDirect(a, tiled: false)),
+                            _ => HasTunedKernel("conv2d_direct"), (in TunedConv2DArgs a) => Conv2DTiledOrDirect(a, tiled: false, epilogue: true)),
                         // #1368: Winograd as transforms around one batched GEMM, where conv2d_winograd_f2x2_3x3 computes
                         // each output tile's whole channel sum in one thread.
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("hip.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
                             shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
-                            (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) Conv2DGeneric(a); }),
+                            (in TunedConv2DArgs a) => { if (!TryConv2DForwardWinograd(a)) { Conv2DGeneric(a); ConvEpilogue.RunPasses(this, a); } }),
                     };
                     _conv2DForwardSlot = new TunedKernelSlot<TunedConv2DArgs>(TunedKernelOp.Conv2DForward, TunedDeviceKey,
                         new BackendTunedKernelHarness<TunedConv2DArgs>(this, ConvolutionTolerance, () => IsAvailable,
@@ -60,7 +60,7 @@ public sealed partial class HipBackend
     private void Conv2DGeneric(in TunedConv2DArgs a)
     {
         if (IsWinogradShape(a.Shape()) && HasTunedKernel("conv2d_winograd_f2x2_3x3")) Conv2DWinograd(a);
-        else Conv2DTiledOrDirect(a, tiled: HasTunedKernel("conv2d_tiled"));
+        else Conv2DTiledOrDirect(a, tiled: HasTunedKernel("conv2d_tiled"), epilogue: false);
     }
 
     private unsafe void Conv2DWinograd(in TunedConv2DArgs a)
@@ -76,18 +76,22 @@ public sealed partial class HipBackend
         LaunchKernel(kernel, (uint)((tiles + 255) / 256), 256, args);
     }
 
-    // conv2d_tiled and conv2d_direct take the same 18 arguments; they differ in block shape and shared memory.
-    private unsafe void Conv2DTiledOrDirect(in TunedConv2DArgs a, bool tiled)
+    // conv2d_tiled and conv2d_direct take the same 20 arguments; they differ in block shape and shared memory. With
+    // epilogue, the kernel adds the args' bias and applies their activation (ConvEpilogue); without, it writes the plain
+    // convolution (the generic dispatch, whose caller runs the passes).
+    private unsafe void Conv2DTiledOrDirect(in TunedConv2DArgs a, bool tiled, bool epilogue)
     {
         IntPtr kernel = TunedKernel(tiled ? "conv2d_tiled" : "conv2d_direct");
         IntPtr x = a.Input.Handle, w = a.Kernel.Handle, y = a.Output.Handle;
         int batch = a.Batch, cin = a.InChannels, h = a.InHeight, wd = a.InWidth, cout = a.OutChannels;
         int oh = a.OutHeight, ow = a.OutWidth, kh = a.KernelH, kw = a.KernelW, sh = a.StrideH, sw = a.StrideW;
         int ph = a.PadH, pw = a.PadW, dh = a.DilationH, dw = a.DilationW;
-        void** args = stackalloc void*[18];
+        IntPtr b = epilogue && a.Bias is { } bias ? bias.Handle : y;
+        int epi = epilogue ? ConvEpilogue.Flags(a) : 0;
+        void** args = stackalloc void*[20];
         args[0] = &x; args[1] = &w; args[2] = &y; args[3] = &batch; args[4] = &cin; args[5] = &h; args[6] = &wd;
         args[7] = &cout; args[8] = &oh; args[9] = &ow; args[10] = &kh; args[11] = &kw; args[12] = &sh; args[13] = &sw;
-        args[14] = &ph; args[15] = &pw; args[16] = &dh; args[17] = &dw;
+        args[14] = &ph; args[15] = &pw; args[16] = &dh; args[17] = &dw; args[18] = &b; args[19] = &epi;
         const int Tile = 16;
         uint gx = (uint)((ow + Tile - 1) / Tile), gy = (uint)((oh + Tile - 1) / Tile), gz = (uint)(batch * cout);
         if (!tiled)
@@ -122,5 +126,27 @@ public sealed partial class HipBackend
         using var tmp = AllocateBuffer(checked(a.OutChannels * a.Batch * l));
         Gemm(a.Kernel, col, tmp, a.OutChannels, a.Batch * l, p);
         Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
+    }
+
+    /// <inheritdoc/>
+    public bool TryConv2DBiasActivation(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer? bias, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, FusedActivationType activation)
+    {
+        if (!ConvEpilogue.Fuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
+        // As Conv2D: the tuned routes (each applies the epilogue, in its output kernel or as passes after it), else the
+        // generic dispatch and the passes.
+        if (!Conv2DForwardSlot.TryExecute(args.Shape(), args))
+        {
+            Conv2DGeneric(args);
+            ConvEpilogue.RunPasses(this, args);
+        }
+        Synchronize();
+        return true;
     }
 }

@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 // Convolution forward through the tuned-kernel registry on Vulkan (#1115): the established direct shader as the
 // reference, im2col + GEMM as the candidate (see CudaBackend.TunedConvolution).
-public sealed unsafe partial class VulkanBackend
+public sealed unsafe partial class VulkanBackend : IConvBiasActivationBackend
 {
     private const double ConvolutionTolerance = 1e-4;
     private TunedKernelSlot<TunedConv2DArgs>? _conv2DForwardSlot;
@@ -51,7 +51,7 @@ void main()
                             _ => true, (in TunedConv2DArgs a) => Conv2DDirectReference(a)),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("vulkan.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                             shape => TunedConv2DArgs.GemmScratchFits(shape) && TunedVariantsAvailable,
-                            (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
+                            (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpilogue.RunPasses(this, a); }),
                         // #1371: Winograd F(2x2,3x3) as transforms around one batched GEMM.
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("vulkan.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
                             shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
@@ -72,12 +72,14 @@ void main()
     {
         (uint)a.Batch, (uint)a.InChannels, (uint)a.InHeight, (uint)a.InWidth, (uint)a.OutChannels, (uint)a.OutHeight,
         (uint)a.OutWidth, (uint)a.KernelH, (uint)a.KernelW, (uint)a.StrideH, (uint)a.StrideW, (uint)a.PadH, (uint)a.PadW,
-        (uint)a.DilationH, (uint)a.DilationW,
+        (uint)a.DilationH, (uint)a.DilationW, (uint)ConvEpilogue.Flags(a),
     };
 
+    // Applies the args' epilogue (ConvEpilogue) in the shader; the output stands in for an absent bias.
     private void Conv2DDirectReference(in TunedConv2DArgs a)
     {
-        if (!TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, ConvPush(a), a.OutputCount, a.Input, a.Kernel, a.Output))
+        if (!TryDispatchConvPoolGlsl(VulkanConvPoolKernels.Conv2D, ConvPush(a), a.OutputCount, a.Input, a.Kernel, a.Output,
+                a.Bias ?? a.Output))
             throw new GpuCapabilityUnavailableException("The Vulkan Conv2D shader is unavailable.");
     }
 
@@ -99,5 +101,21 @@ void main()
         using var tmp = AllocateBuffer(checked(a.OutChannels * a.Batch * l));
         Gemm(a.Kernel, col, tmp, a.OutChannels, a.Batch * l, p);
         Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
+    }
+
+    /// <inheritdoc/>
+    public bool TryConv2DBiasActivation(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer? bias, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, FusedActivationType activation)
+    {
+        if (!ConvEpilogue.Fuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+        EnsureInitialized();
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
+        if (!Conv2DForwardSlot.TryExecute(args.Shape(), args)) Conv2DDirectReference(args);
+        return true;
     }
 }

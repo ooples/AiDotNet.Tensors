@@ -210,6 +210,28 @@ internal readonly struct TunedConv2DBackwardArgs
     }
 }
 
+/// <summary>
+/// A convolution's epilogue (<see cref="TunedConv2DArgs.Bias"/> and <see cref="TunedConv2DArgs.Activation"/>) on every
+/// backend: the flags an output kernel takes (bit 0 adds the per-channel bias, bit 1 applies ReLU, the activations the
+/// kernels fuse), and the bias add and activation as separate passes for a route whose kernels do not take them.
+/// </summary>
+internal static class ConvEpilogue
+{
+    /// <summary>Whether the output kernels can apply <paramref name="activation"/> (no activation, or ReLU).</summary>
+    internal static bool Fuses(FusedActivationType activation)
+        => activation == FusedActivationType.None || activation == FusedActivationType.ReLU;
+
+    internal static int Flags(in TunedConv2DArgs a)
+        => (a.Bias is null ? 0 : 1) | (a.Activation == FusedActivationType.ReLU ? 2 : 0);
+
+    /// <summary>The bias add and the ReLU after a convolution that wrote <see cref="TunedConv2DArgs.Output"/> without them.</summary>
+    internal static void RunPasses(IDirectGpuBackend backend, in TunedConv2DArgs a)
+    {
+        if (a.Bias is { } bias) backend.Conv2DBiasAdd(a.Output, bias, a.Batch, a.OutChannels, a.OutHeight * a.OutWidth);
+        if (a.Activation == FusedActivationType.ReLU) backend.Relu(a.Output, a.Output, a.OutputCount);
+    }
+}
+
 /// <summary>2-D convolution arguments (any backend): NCHW input, [Cout, Cin, kH, kW] filter.</summary>
 internal readonly struct TunedConv2DArgs
 {

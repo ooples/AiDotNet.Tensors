@@ -7165,6 +7165,8 @@ KERNEL VARIANTS (A/B testing):
                 int tileInW = TILE_OUT * strideW + (kernelW - 1) * dilationW;
                 int sharedMemSize = tileInH * tileInW * sizeof(float);
                 k.SetLocalArg(arg++, sharedMemSize);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
+                k.SetArg(arg++, 0);
 
                 int numTilesX = (outWidth + TILE_OUT - 1) / TILE_OUT;
                 int numTilesY = (outHeight + TILE_OUT - 1) / TILE_OUT;
@@ -7193,6 +7195,8 @@ KERNEL VARIANTS (A/B testing):
                 k.SetArg(arg++, padW);
                 k.SetArg(arg++, dilationH);
                 k.SetArg(arg++, dilationW);
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
+                k.SetArg(arg++, 0);
 
                 int localX = 8, localY = 8, localZ = 1;
                 k.Execute3D(outWidth, outHeight, batch * outChannels, localX, localY, localZ);

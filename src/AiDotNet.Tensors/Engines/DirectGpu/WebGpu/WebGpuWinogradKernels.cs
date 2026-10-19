@@ -134,10 +134,14 @@ struct Params { N: i32, K: i32, outH: i32, outW: i32, tilesH: i32, tilesW: i32, 
 @group(0) @binding(2) var<uniform> pm: Params;
 ";
 
+    // The convolution's epilogue: epi bit 0 adds bias[k], bit 1 applies ReLU (v < 0 is false for NaN, which passes). The
+    // bias is a third buffer, so the uniform struct moves to binding 3.
     public const string Output = @"
 @group(0) @binding(0) var<storage, read> mm: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
-" + TileHeader + @"
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+struct Params { N: i32, K: i32, outH: i32, outW: i32, tilesH: i32, tilesW: i32, epi: i32, pad1: i32, }
+@group(0) @binding(3) var<uniform> pm: Params;
 @compute @workgroup_size(256)
 fn wino_f23_output(@builtin(global_invocation_id) gid: vec3<u32>) {
     let P = pm.N * pm.tilesH * pm.tilesW;
@@ -160,10 +164,19 @@ fn wino_f23_output(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dst = (n * pm.K + k) * pm.outH * pm.outW;
     let h = th * 2;
     let w2 = tw * 2;
+    var bk: f32 = 0.0;
+    if ((pm.epi & 1) != 0) { bk = bias[k]; }
+    let relu = (pm.epi & 2) != 0;
     for (var i = 0; i < 2; i = i + 1) {
         if (h + i >= pm.outH) { break; }
-        y[dst + (h + i) * pm.outW + w2] = s[i * 4] + s[i * 4 + 1] + s[i * 4 + 2];
-        if (w2 + 1 < pm.outW) { y[dst + (h + i) * pm.outW + w2 + 1] = s[i * 4 + 1] - s[i * 4 + 2] - s[i * 4 + 3]; }
+        var o0 = s[i * 4] + s[i * 4 + 1] + s[i * 4 + 2] + bk;
+        if (relu && o0 < 0.0) { o0 = 0.0; }
+        y[dst + (h + i) * pm.outW + w2] = o0;
+        if (w2 + 1 < pm.outW) {
+            var o1 = s[i * 4 + 1] - s[i * 4 + 2] - s[i * 4 + 3] + bk;
+            if (relu && o1 < 0.0) { o1 = 0.0; }
+            y[dst + (h + i) * pm.outW + w2 + 1] = o1;
+        }
     }
 }
 ";

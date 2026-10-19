@@ -3305,15 +3305,18 @@ kernel void maxpool3d_backward(
 }
 
 // ---- Conv family (issue #646): gather-form ports of the verified OpenCL kernels. ----
+// The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
 kernel void conv2d_direct(
     device const float* inp [[buffer(0)]], device const float* wgt [[buffer(1)]], device float* outp [[buffer(2)]],
-    constant uint& batch [[buffer(3)]], constant uint& inChannels [[buffer(4)]],
-    constant uint& inHeight [[buffer(5)]], constant uint& inWidth [[buffer(6)]],
-    constant uint& outChannels [[buffer(7)]], constant uint& outHeight [[buffer(8)]], constant uint& outWidth [[buffer(9)]],
-    constant uint& kernelH [[buffer(10)]], constant uint& kernelW [[buffer(11)]],
-    constant uint& strideH [[buffer(12)]], constant uint& strideW [[buffer(13)]],
-    constant uint& padH [[buffer(14)]], constant uint& padW [[buffer(15)]],
-    constant uint& dilationH [[buffer(16)]], constant uint& dilationW [[buffer(17)]],
+    device const float* bias [[buffer(3)]],
+    constant uint& batch [[buffer(4)]], constant uint& inChannels [[buffer(5)]],
+    constant uint& inHeight [[buffer(6)]], constant uint& inWidth [[buffer(7)]],
+    constant uint& outChannels [[buffer(8)]], constant uint& outHeight [[buffer(9)]], constant uint& outWidth [[buffer(10)]],
+    constant uint& kernelH [[buffer(11)]], constant uint& kernelW [[buffer(12)]],
+    constant uint& strideH [[buffer(13)]], constant uint& strideW [[buffer(14)]],
+    constant uint& padH [[buffer(15)]], constant uint& padW [[buffer(16)]],
+    constant uint& dilationH [[buffer(17)]], constant uint& dilationW [[buffer(18)]],
+    constant uint& epi [[buffer(19)]],
     uint gid [[thread_position_in_grid]])
 {
     uint total = batch * outChannels * outHeight * outWidth;
@@ -3332,7 +3335,10 @@ kernel void conv2d_direct(
                 sum += inp[((b * int(inChannels) + ic) * int(inHeight) + ih) * int(inWidth) + iw]
                      * wgt[((oc * int(inChannels) + ic) * int(kernelH) + kh) * int(kernelW) + kw];
         }
-    outp[((b * int(outChannels) + oc) * int(outHeight) + oh) * int(outWidth) + ow] = sum;
+    float r = sum;
+    if ((epi & 1u) != 0u) r += bias[oc];
+    if ((epi & 2u) != 0u && r < 0.0f) r = 0.0f;
+    outp[((b * int(outChannels) + oc) * int(outHeight) + oh) * int(outWidth) + ow] = r;
 }
 
 kernel void conv2d_backward_input(

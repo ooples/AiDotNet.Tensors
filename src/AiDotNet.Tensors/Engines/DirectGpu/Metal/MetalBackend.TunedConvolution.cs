@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 // As CudaBackend / OpenClBackend.TunedConvolution: the reference is Metal's established direct convolution (a thread
 // per output element); the candidate is im2col + ONE GEMM over the whole batch.
-public sealed partial class MetalBackend
+public sealed partial class MetalBackend : IConvBiasActivationBackend
 {
     // Convolution reassociates long K = Cin*kH*kW dot products; GEMM and the direct loop differ by a few ulps of the scale.
     private const double ConvolutionTolerance = 1e-4;
@@ -27,7 +27,7 @@ public sealed partial class MetalBackend
                             _ => true, (in TunedConv2DArgs a) => Conv2DDirect(a)),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("metal.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                             shape => TunedConv2DArgs.GemmScratchFits(shape) && HasTunedKernel(TunedRowKernelTemplate.Im2ColName, 1),
-                            (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
+                            (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpilogue.RunPasses(this, a); }),
                         // #1369: Winograd F(2x2,3x3) as transforms around one batched GEMM.
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("metal.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
                             shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
@@ -44,11 +44,13 @@ public sealed partial class MetalBackend
         }
     }
 
+    // Applies the args' epilogue (ConvEpilogue) in the kernel; the output stands in for an absent bias.
     private void Conv2DDirect(in TunedConv2DArgs a)
         => TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv2d_direct",
-            a.Batch * a.OutChannels * a.OutHeight * a.OutWidth, new[] { a.Input, a.Kernel, a.Output },
+            a.Batch * a.OutChannels * a.OutHeight * a.OutWidth, new[] { a.Input, a.Kernel, a.Output, a.Bias ?? a.Output },
             new[] { a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels, a.OutHeight, a.OutWidth,
-                a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW });
+                a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW,
+                ConvEpilogue.Flags(a) });
 
     // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for
     // B = 1).
@@ -79,5 +81,21 @@ public sealed partial class MetalBackend
         using var tmp = AllocateBuffer(checked(a.OutChannels * a.Batch * l));
         Gemm(a.Kernel, col, tmp, a.OutChannels, a.Batch * l, p);
         Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
+    }
+
+    /// <inheritdoc/>
+    public bool TryConv2DBiasActivation(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer? bias, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, FusedActivationType activation)
+    {
+        if (!ConvEpilogue.Fuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+        ThrowIfDisposed();
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
+        if (!Conv2DForwardSlot.TryExecute(args.Shape(), args)) Conv2DDirect(args);
+        return true;
     }
 }
