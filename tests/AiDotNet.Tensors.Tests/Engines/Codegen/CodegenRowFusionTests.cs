@@ -105,6 +105,48 @@ public class CodegenRowFusionTests
         Assert.Contains("rcp.approx.f32", fused, StringComparison.Ordinal);
     }
 
+    private static CodegenKernelSpec Flat(int n, string otherName)
+    {
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("i", n));
+        var x = new CodegenTensorBinding(0, "x", new[] { n }, new[] { CodegenAffineExpr.Axis(0) });
+        var other = new CodegenTensorBinding(1, otherName, new[] { n }, new[] { CodegenAffineExpr.Axis(0) });
+        var y = new CodegenTensorBinding(2, "y", new[] { n }, new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        return new CodegenKernelSpec("mul", space, new[] { x, other }, y, new[] { 0, 1 }, CodegenReduceKind.None);
+    }
+
+    /// <summary>
+    /// A flat contiguous pointwise spec streams through the row kernel as rows of the widest
+    /// width that divides it, keeping its own parameter order.
+    /// </summary>
+    [Fact]
+    public void AFlatPointwiseSpecStreamsAsRows()
+    {
+        var plan = CodegenRowFusion.TryPlanStreaming(Flat(8192 * 3, "other"));
+        Assert.NotNull(plan);
+        Assert.Equal(1024, plan!.Width);
+        Assert.Equal(24, plan.Rows);
+        Assert.Equal(new[] { "x", "other", "y" }, plan.Parameters);
+
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.Emit(Flat(8192 * 3, "other"), 8, 6);
+        Assert.Contains("ld.global.nc.v4.f32", ptx, StringComparison.Ordinal);
+        Assert.Equal(32, emitter.CoarsenedLanes);
+    }
+
+    [Fact]
+    public void StreamingIsDeclinedWhereRowsCannotCarryIt()
+    {
+        // Two operands with one name would collapse into one parameter.
+        Assert.Null(CodegenRowFusion.TryPlanStreaming(Flat(4096, "x")));
+        // No row width divides it.
+        Assert.Null(CodegenRowFusion.TryPlanStreaming(Flat(1000, "other")));
+        // A reduction is not a stream.
+        Assert.Null(CodegenRowFusion.TryPlanStreaming(CodegenFusedStatistics.Softmax(8, 128).Passes[0]));
+        // The off-switch restores the one-element-per-thread kernel.
+        var off = new PtxAffineEmitter { EnableStreamingRows = false };
+        Assert.DoesNotContain("ld.global.nc.v4.f32", off.Emit(Flat(8192, "other"), 8, 6), StringComparison.Ordinal);
+    }
+
     private static int CountOccurrences(string text, string token)
     {
         int count = 0;
@@ -114,3 +156,4 @@ public class CodegenRowFusionTests
         return count;
     }
 }
+

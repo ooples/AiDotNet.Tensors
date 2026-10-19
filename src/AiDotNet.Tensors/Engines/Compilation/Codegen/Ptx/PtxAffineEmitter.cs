@@ -263,6 +263,13 @@ public sealed partial class PtxAffineEmitter
     /// </remarks>
     public bool EnableWarpReduction { get; set; } = true;
 
+    /// <summary>
+    /// Emits a streaming pointwise spec through the warp-per-row kernel and its 128-bit
+    /// accesses (<see cref="CodegenRowFusion.TryPlanStreaming"/>). Default on; off-switch
+    /// kept for paired A/B. The parameters are the spec's own, in order.
+    /// </summary>
+    public bool EnableStreamingRows { get; set; } = true;
+
     /// <summary>True when the last emission used the warp-per-output lowering.</summary>
     public bool WarpReduced { get; private set; }
 
@@ -1023,6 +1030,9 @@ public sealed partial class PtxAffineEmitter
         // PtxAffineEmitter.Algebra.cs for why that separation is deliberate rather than lazy.
         if (spec.Algebra != CodegenAlgebra.Real)
             return EmitAlgebraic(spec, computeMajor, computeMinor);
+
+        if (EnableStreamingRows && CodegenRowFusion.TryPlanStreaming(spec) is { } stream)
+            return EmitRowProgram(stream, spec.Name, computeMajor, computeMinor);
 
         // WARP PER OUTPUT. Everything below emits the lane-interleaved spec unchanged except
         // for three things the lowering forbids -- tiling, staging and a block that is not a

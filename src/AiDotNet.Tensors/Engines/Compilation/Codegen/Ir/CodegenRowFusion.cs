@@ -159,6 +159,77 @@ public static class CodegenRowFusion
         return new CodegenRowFusionPlan(program, rows, width, parameters, kinds);
     }
 
+    /// <summary>
+    /// Plans a single POINTWISE spec as a one-pass row program, so it streams through the
+    /// warp-per-row kernel's 128-bit accesses.
+    /// </summary>
+    /// <remarks>
+    /// Measured on a GTX 1660 Ti at 8192x1024: bias+GELU 316.1 us one element per thread,
+    /// 260.9 us through the row kernel. A (row | j) spec is used as it is. A flat spec whose
+    /// every binding is the same contiguous run is viewed as rows of the widest of 1024,
+    /// 512, 256 or 128 that divides it -- the same bytes, indexed in two parts.
+    /// </remarks>
+    public static CodegenRowFusionPlan? TryPlanStreaming(CodegenKernelSpec spec)
+    {
+        if (spec is null) throw new ArgumentNullException(nameof(spec));
+        if (spec.Reduce != CodegenReduceKind.None || spec.Space.ReductionAxes.Length != 0) return null;
+        if (spec.ExtraOutputs.Count != 0 || spec.SecondaryOutput is not null) return null;
+        if (!Distinct(spec)) return null;
+
+        var axes = spec.Space.Axes;
+        if (axes.Count == 2)
+            return TryPlan(new CodegenProgram(new[] { spec }, new long[] { spec.Output.ElementCount }, spec.Name), out _);
+        if (axes.Count != 1) return null;
+
+        int n = axes[0].Extent;
+        foreach (var binding in Bindings(spec))
+            if (binding.Shape.Count != 1 || binding.Shape[0] != n || !IsAxis(binding.Map[0], 0) ||
+                binding.HasIndirection || binding.ElementType != CodegenElementType.Float32)
+                return null;
+
+        int width = 0;
+        foreach (int candidate in new[] { 1024, 512, 256, 128 })
+            if (n % candidate == 0) { width = candidate; break; }
+        if (width == 0) return null;
+        int rows = n / width;
+
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("row", rows), CodegenAxis.Parallel("j", width));
+        CodegenTensorBinding Reshape(CodegenTensorBinding b) => new(
+            b.ParameterIndex, b.Name, new[] { rows, width },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, b.IsOutput, b.ElementType);
+        var inputs = new CodegenTensorBinding[spec.Inputs.Count];
+        for (int i = 0; i < inputs.Length; i++) inputs[i] = Reshape(spec.Inputs[i]);
+        var products = new int[spec.ProductInputs.Count];
+        for (int i = 0; i < products.Length; i++) products[i] = spec.ProductInputs[i];
+
+        var reshaped = new CodegenKernelSpec(spec.Name, space, inputs, Reshape(spec.Output), products,
+            CodegenReduceKind.None, biasInput: spec.BiasInput, scaleInput: spec.ScaleInput,
+            activation: spec.Activation, reduceScale: spec.ReduceScale, preReduce: spec.PreReduce,
+            preBiasInput: spec.PreBiasInput, preBiasScale: spec.PreBiasScale,
+            reduceOffset: spec.ReduceOffset,
+            postScaleInput: spec.PostScaleInput, postBiasInput: spec.PostBiasInput);
+        return TryPlan(new CodegenProgram(new[] { reshaped }, new long[] { n }, spec.Name), out _);
+    }
+
+    /// <summary>
+    /// A row program binds by NAME, a spec by position; two operands sharing a name would
+    /// collapse into one parameter, so such a spec is not streamed this way.
+    /// </summary>
+    private static bool Distinct(CodegenKernelSpec spec)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var binding in Bindings(spec))
+            if (!names.Add(binding.Name)) return false;
+        return true;
+    }
+
+    private static IEnumerable<CodegenTensorBinding> Bindings(CodegenKernelSpec spec)
+    {
+        foreach (var input in spec.Inputs) yield return input;
+        yield return spec.Output;
+    }
+
     private static bool Classify(CodegenTensorBinding binding, int rows, int width, out CodegenRowOperandKind kind)
     {
         kind = CodegenRowOperandKind.Matrix;

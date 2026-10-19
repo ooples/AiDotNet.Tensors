@@ -41,7 +41,10 @@ public sealed partial class PtxAffineEmitter
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0;
         EmittedLoads = 0; ElidedGuards = 0; IndirectIndexLoads = 0; AtomicStores = 0;
         ExtraOutputStores = 0; VectorisedStores = 0; VectorisedLoads = 0;
-        SharedMemoryBytes = 0; StagedOperands = "none"; CoarsenedLanes = 1; LoopedAxes = 0;
+        SharedMemoryBytes = 0; StagedOperands = "none"; LoopedAxes = 0;
+        // Each thread covers Width/32 elements of its row, which is what every launch
+        // invariant divides the iteration space by.
+        CoarsenedLanes = perLane;
         UsedTwoDimensionalBlock = false; WarpReduced = true; Unrolled = true;
         LaunchBlockX = BlockThreads; LaunchBlockY = 1; LaunchBlockThreads = BlockThreads;
         LaunchBlocks = checked((uint)blocks);
@@ -70,9 +73,10 @@ public sealed partial class PtxAffineEmitter
         L($"mad.lo.u32 {gid}, {ctaid}, {I(BlockThreads)}, {tid};");
         L($"shr.u32 {row}, {gid}, 5;");
         L($"and.b32 {lane}, {gid}, 31;");
-        // Rows x 32 threads in 256-thread blocks: the guard retires whole warps.
+        // Rows x 32 threads in 256-thread blocks. The guard tests the same thread count the
+        // grid is built from; since that count is a multiple of 32 it retires whole warps.
         string guard = NextP();
-        L($"setp.ge.u32 {guard}, {row}, {I(plan.Rows)};");
+        L($"setp.ge.u32 {guard}, {gid}, {I(threads)};");
         L($"@{guard} bra END;");
         string leader = NextP();
         L($"setp.eq.u32 {leader}, {lane}, 0;");
