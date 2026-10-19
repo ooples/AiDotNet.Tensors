@@ -452,6 +452,18 @@ kernel void clamp_kernel(
     }
 }
 
+// A convolution's per-channel bias, in place over NCHW: out[i] += bias[(i / spatial) % channels].
+kernel void conv2d_bias_add(
+    device float* out [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    constant uint& total [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& spatial [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < total) out[gid] += bias[(gid / spatial) % channels];
+}
+
 // Broadcast add along last axis: C[i,j] = A[i,j] + B[j]
 kernel void broadcast_add_last(
     device const float* A [[buffer(0)]],
