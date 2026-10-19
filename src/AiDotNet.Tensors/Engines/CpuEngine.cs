@@ -31784,6 +31784,37 @@ public partial class CpuEngine : ITensorLevelEngine
         return resultGen;
     }
 
+    /// <summary>Multiplies <paramref name="n"/> floats at <paramref name="off"/> by <paramref name="scale"/> in place and
+    /// returns their maximum.</summary>
+    private static float ScaleRowAndMax(float[] x, int off, int n, float scale)
+    {
+        int w = System.Numerics.Vector<float>.Count, i = 0;
+        float max = float.NegativeInfinity;
+        if (n >= w)
+        {
+            var vs = new System.Numerics.Vector<float>(scale);
+            var vmax = new System.Numerics.Vector<float>(float.NegativeInfinity);
+            for (; i <= n - w; i += w)
+            {
+                var v = new System.Numerics.Vector<float>(x, off + i) * vs;
+                v.CopyTo(x, off + i);
+                vmax = System.Numerics.Vector.Max(vmax, v);
+            }
+            for (int l = 0; l < w; l++) if (vmax[l] > max) max = vmax[l];
+        }
+        for (; i < n; i++) { float v = x[off + i] * scale; x[off + i] = v; if (v > max) max = v; }
+        return max;
+    }
+
+    /// <summary>Multiplies <paramref name="n"/> floats at <paramref name="off"/> by <paramref name="scale"/> in place.</summary>
+    private static void ScaleRow(float[] x, int off, int n, float scale)
+    {
+        int w = System.Numerics.Vector<float>.Count, i = 0;
+        var vs = new System.Numerics.Vector<float>(scale);
+        for (; i <= n - w; i += w) (new System.Numerics.Vector<float>(x, off + i) * vs).CopyTo(x, off + i);
+        for (; i < n; i++) x[off + i] *= scale;
+    }
+
     /// <summary>
     /// SimdGemm-backed float fast path for <see cref="FlashAttention{T}"/>.
     /// Uses materialized softmax (not tiled online-softmax): computes
@@ -31835,47 +31866,67 @@ public partial class CpuEngine : ITensorLevelEngine
             biasBroadcastBatch = attentionBias.Rank == 3;
         }
 
-        // scoresData is internal scratch pooled from ArrayPool. weightsData and
-        // outputData are returned to the caller (via the tensor pair + softmaxStats).
+        // scoresData is internal scratch pooled from ArrayPool; the softmax is computed in place in it (the
+        // probabilities never leave this method). outputData and statsData are returned to the caller.
         int scoresLen = bhCount * seqQ * seqK;
         var scoresData = System.Buffers.ArrayPool<float>.Shared.Rent(scoresLen);
+        // Kᵀ for every head, transposed once (SimdGemm has no transB) and shared by that head's query blocks.
+        var ktData = System.Buffers.ArrayPool<float>.Shared.Rent(bhCount * headDim * seqK);
         try
         {
-            var weightsData = new float[scoresLen];
             var outputData = new float[bhCount * seqQ * d_v];
             var statsData = new float[bhCount * seqQ];
 
             float scaleF  = (float)scaleValue;
             float negInfF = float.NegativeInfinity;
 
-            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * headDim, [MethodImpl(Hot)] (bh) =>
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqK * headDim, [MethodImpl(Hot)] (bh) =>
             {
+                int kOff = bh * seqK * headDim, tOff = bh * headDim * seqK;
+                for (int i = 0; i < seqK; i++)
+                    for (int j = 0; j < headDim; j++)
+                        ktData[tOff + j * seqK + i] = kf[kOff + i * headDim + j];
+            });
+
+            // #653: the work runs in fixed blocks of query rows per head, not one task per head: a single image's 8
+            // heads were 8 tasks, and the per-call 32 MB probability array (1024x1024 per head) was allocated and
+            // zeroed besides. The block size does not depend on the thread count, so neither does the result.
+            const int QueryBlock = 64;
+            int queryBlocks = (seqQ + QueryBlock - 1) / QueryBlock;
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount * queryBlocks, (long)bhCount * seqQ * seqK * headDim, [MethodImpl(Hot)] (task) =>
+            {
+                int bh = task / queryBlocks;
                 int b = bh / heads;
                 int h = bh % heads;
+                int r0 = (task % queryBlocks) * QueryBlock;
+                int rows = Math.Min(QueryBlock, seqQ - r0);
 
-                int qOff = bh * seqQ * headDim;
-                int kOff = bh * seqK * headDim;
+                int qOff = (bh * seqQ + r0) * headDim;
                 int sOff = bh * seqQ * seqK;
 
-                // Step 1: scores = Q · K^T. Same pattern as SDPA fast path —
-                // pre-transpose this head's K slice into a pooled scratch buffer
-                // (SimdGemm has no transB support) then call SgemmSequential.
-                var kt = System.Buffers.ArrayPool<float>.Shared.Rent(headDim * seqK);
-                try
-                {
-                    for (int i = 0; i < seqK; i++)
-                        for (int j = 0; j < headDim; j++)
-                            kt[j * seqK + i] = kf[kOff + i * headDim + j];
-                    Engines.Simd.SimdGemm.SgemmSequential(
-                        qf.AsSpan(qOff, seqQ * headDim),
-                        kt.AsSpan(0, headDim * seqK),
-                        scoresData.AsSpan(sOff, seqQ * seqK),
-                        seqQ, headDim, seqK);
-                }
-                finally { System.Buffers.ArrayPool<float>.Shared.Return(kt); }
+                // Step 1: scores = Q · Kᵀ for this block's rows.
+                Engines.Simd.SimdGemm.SgemmSequential(
+                    qf.AsSpan(qOff, rows * headDim),
+                    ktData.AsSpan(bh * headDim * seqK, headDim * seqK),
+                    scoresData.AsSpan(sOff + r0 * seqK, rows * seqK),
+                    rows, headDim, seqK);
 
-                // Step 2: fused scale + causal-mask + bias + stable softmax per row.
-                for (int i = 0; i < seqQ; i++)
+                // Step 2: fused scale + causal-mask + bias + stable softmax per row, in place. Without a mask or bias
+                // no score is -inf, so the row runs vectorized (the polynomial exp other attention kernels use); a
+                // masked row keeps the scalar path, which gives its masked positions an exact 0.
+                if (!isCausal && biasData is null)
+                {
+                    for (int i = r0; i < r0 + rows; i++)
+                    {
+                        int rowOff = sOff + i * seqK;
+                        float maxVal = ScaleRowAndMax(scoresData, rowOff, seqK, scaleF);
+                        float sumExp = ExpShiftedSum(scoresData, rowOff, seqK, maxVal);
+                        ScaleRow(scoresData, rowOff, seqK, sumExp != 0f ? 1f / sumExp : 0f);
+                        statsData[bh * seqQ + i] = maxVal + MathF.Log(sumExp);
+                    }
+                }
+                else
+                for (int i = r0; i < r0 + rows; i++)
                 {
                     int rowOff = sOff + i * seqK;
                     float maxVal = negInfF;
@@ -31902,7 +31953,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     if (float.IsNegativeInfinity(maxVal))
                     {
                         for (int j = 0; j < seqK; j++)
-                            weightsData[rowOff + j] = 0f;
+                            scoresData[rowOff + j] = 0f;
                         statsData[bh * seqQ + i] = negInfF;
                         continue;
                     }
@@ -31911,26 +31962,23 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int j = 0; j < seqK; j++)
                     {
                         float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
-                        weightsData[rowOff + j] = e;
+                        scoresData[rowOff + j] = e;
                         sumExp += e;
                     }
                     float inv = sumExp != 0f ? 1f / sumExp : 0f;
                     for (int j = 0; j < seqK; j++)
-                        weightsData[rowOff + j] *= inv;
+                        scoresData[rowOff + j] *= inv;
 
                     // logsumexp = max + log(sum) — the backward pass needs this.
                     statsData[bh * seqQ + i] = maxVal + MathF.Log(sumExp);
                 }
 
-                // Step 3: output = softmax · V via SimdGemm (no transpose).
-                int wOff = bh * seqQ * seqK;
-                int vOff = bh * seqK * d_v;
-                int oOff = bh * seqQ * d_v;
+                // Step 3: output = softmax · V for this block's rows (no transpose).
                 Engines.Simd.SimdGemm.SgemmSequential(
-                    weightsData.AsSpan(wOff, seqQ * seqK),
-                    vf.AsSpan(vOff, seqK * d_v),
-                    outputData.AsSpan(oOff, seqQ * d_v),
-                    seqQ, seqK, d_v);
+                    scoresData.AsSpan(sOff + r0 * seqK, rows * seqK),
+                    vf.AsSpan(bh * seqK * d_v, seqK * d_v),
+                    outputData.AsSpan((bh * seqQ + r0) * d_v, rows * d_v),
+                    rows, seqK, d_v);
             });
 
             softmaxStats = TensorAllocator.Rent<float>(
@@ -31943,6 +31991,7 @@ public partial class CpuEngine : ITensorLevelEngine
         finally
         {
             System.Buffers.ArrayPool<float>.Shared.Return(scoresData, clearArray: false);
+            System.Buffers.ArrayPool<float>.Shared.Return(ktData, clearArray: false);
         }
     }
 
