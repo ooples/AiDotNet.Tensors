@@ -106,7 +106,7 @@ public sealed class CudaResidentProgramTests
         var separate = chain.Download();
 
         for (int i = 0; i < separate.Length; i++)
-            Assert.True(BitConverter.SingleToInt32Bits(separate[i]) == BitConverter.SingleToInt32Bits(resident[i]),
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(separate[i]) == TestHelpers.MathCompat.SingleToInt32Bits(resident[i]),
                 $"[{i / cols},{i % cols}]: separate {separate[i]:G9}, resident {resident[i]:G9}");
         var expected = chain.Reference();
         for (int i = 0; i < expected.Length; i++)
@@ -131,7 +131,7 @@ public sealed class CudaResidentProgramTests
         chain.Poison();
         backend.RunStagesSeparately(chain.Stages);
         var separate = chain.Download();
-        Assert.True(resident.Zip(separate).All(p => BitConverter.SingleToInt32Bits(p.First) == BitConverter.SingleToInt32Bits(p.Second)),
+        Assert.True(resident.Zip(separate, (r, s) => TestHelpers.MathCompat.SingleToInt32Bits(r) == TestHelpers.MathCompat.SingleToInt32Bits(s)).All(same => same),
             "the 300th resident launch differs from the separate stages");
     }
 

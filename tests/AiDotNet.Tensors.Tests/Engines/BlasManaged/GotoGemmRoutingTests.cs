@@ -91,7 +91,7 @@ public sealed class GotoGemmRoutingTests
                 else
                 {
                     for (int i = 0; i < c.Length; i++)
-                        Assert.True(BitConverter.SingleToInt32Bits(first[i]) == BitConverter.SingleToInt32Bits(c[i]),
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[i]) == TestHelpers.MathCompat.SingleToInt32Bits(c[i]),
                             $"C[{i / n},{i % n}] at {threads} threads: {c[i]:G9}, at 1 thread {first[i]:G9}");
                 }
             }

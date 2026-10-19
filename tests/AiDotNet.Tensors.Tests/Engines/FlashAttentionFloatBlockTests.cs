@@ -86,10 +86,10 @@ public class FlashAttentionFloatBlockTests
         }
 
         for (int i = 0; i < serialOut.Length; i++)
-            Assert.True(BitConverter.SingleToInt32Bits(serialOut.GetFlat(i)) == BitConverter.SingleToInt32Bits(parallelOut.GetFlat(i)),
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(serialOut.GetFlat(i)) == TestHelpers.MathCompat.SingleToInt32Bits(parallelOut.GetFlat(i)),
                 $"output[{i}] differs between 1 and 7 threads");
         for (int i = 0; i < serialStats.Length; i++)
-            Assert.True(BitConverter.SingleToInt32Bits(serialStats.GetFlat(i)) == BitConverter.SingleToInt32Bits(parallelStats.GetFlat(i)),
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(serialStats.GetFlat(i)) == TestHelpers.MathCompat.SingleToInt32Bits(parallelStats.GetFlat(i)),
                 $"stats[{i}] differs between 1 and 7 threads");
 
         var (expectedOut, expectedStats) = Reference(q, k, v, bias, causal, scale);
