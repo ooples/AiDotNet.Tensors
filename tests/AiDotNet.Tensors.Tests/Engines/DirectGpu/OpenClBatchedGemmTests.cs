@@ -5,7 +5,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// OpenCL's <see cref="OpenClBackend.BatchedGemm"/> (gemm_batched_tiled) against a CPU product accumulated in double:
+/// OpenCL's <see cref="OpenClBackend.BatchedGemm"/> (the register-blocked kernels for plain products, the tiled one otherwise) against a CPU product accumulated in double:
 /// sizes that are not multiples of the 16-wide tile in every dimension, several batches, and both the beta = 0 and the
 /// beta != 0 paths (the latter reads C back).
 /// </summary>
@@ -18,6 +18,9 @@ public class OpenClBatchedGemmTests
         { 3, 17, 5, 33, 1f, 0f },
         { 16, 64, 512, 64, 1f, 0f },
         { 4, 31, 47, 19, 0.5f, 2f },
+        // M and N >= 128 take the 128-tile kernel; K not a multiple of its 8-step and N not of its four-wide loads.
+        { 2, 130, 131, 37, 1f, 0f },
+        { 1, 256, 128, 64, 1f, 0f },
     };
 
     [SkippableTheory]

@@ -283,6 +283,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private readonly ConcurrentDictionary<object, GpuBufferCacheEntry> _persistentBufferCache = new();
     private readonly object _persistentBufferLock = new();
 
+    // Roles of tensors registered persistent but not yet read on the GPU. Registration defers the upload to the first
+    // read; without this record an op that fetched a registered weight through GetOrAllocateBuffer (TensorMatMul,
+    // BatchNormInference, ...) found no persistent-cache entry and uploaded it UNCACHED on every call (a 256x64 weight
+    // in a [64,3136] GEMM: 0.59 ms per call against 0.15 ms resident). Weak keys so a registration never roots the array.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, PersistentRoleBox> _pendingPersistentRoles = new();
+
+    private sealed class PersistentRoleBox
+    {
+        public PersistentRoleBox(PersistentTensorRole role) => Role = role;
+        public PersistentTensorRole Role { get; }
+    }
+
     // Version tracking for invalidation
     private readonly ConcurrentDictionary<object, int> _tensorVersions = new();
 
@@ -965,7 +977,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void Helpers.IRecycledArrayListener.OnArrayRecycled(object array)
     {
-        if (IsDisposed || !Helpers.HostSync.AnyExists) return;
+        if (IsDisposed) return;
+        // The new owner of a recycled array is not the registered tensor that recorded a persistent role for it.
+        _pendingPersistentRoles.Remove(array);
+        if (!Helpers.HostSync.AnyExists) return;
         if (Helpers.HostSync.IsPending(array))
             Helpers.HostSync.Remove(array);
         // The persistent weight cache and its version maps are keyed by the array too. A new owner's version can equal
@@ -1826,6 +1841,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // retain the array identity while advancing the storage's GPU-cache epoch.
             if (_persistentBufferCache.TryGetValue(backingArray, out var persistentEntry))
                 return GetOrCacheWeightBuffer(backend, backingArray, persistentEntry.Role, hostVersion);
+            if (_pendingPersistentRoles.TryGetValue(backingArray, out var pendingRole))
+                return GetOrCacheWeightBuffer(backend, backingArray, pendingRole.Role, hostVersion);
 
             bool staleActivation = false;
             lock (_activationCacheLock)
@@ -2203,6 +2220,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (_persistentBufferCache.TryGetValue(backingArray, out var persistentEntry))
                 return GetOrCacheWeightBuffer(backend, backingArray, persistentEntry.Role, hostVersion);
+            if (_pendingPersistentRoles.TryGetValue(backingArray, out var pendingRole))
+                return GetOrCacheWeightBuffer(backend, backingArray, pendingRole.Role, hostVersion);
 
             bool upcastNeeded2 = false;
             bool staleActivation = false;
@@ -9045,13 +9064,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
 
-            // Execute GPU convolution
-            backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
-                batch, inChannels, inHeight, inWidth,
-                outChannels, outHeight, outWidth,
-                kernelH, kernelW,
-                strideH, strideW, padH, padW,
-                dilationH, dilationW);
+            // Execute GPU convolution. The weights' identity lets a backend reuse a form derived from them (the
+            // Winograd filter transform) while they are unchanged: only for host-authoritative weights outside a tape
+            // or resident step, where a new host version is the only way the device copy changes. The tape is read
+            // directly: IsTapeActive would count this cache decision as a tape bail.
+            object? weightKey = Autodiff.GradientTape<T>.Current is null && !ResidentStepActive && kernel._gpuBuffer is null
+                ? kernel.GetBackingArrayForCacheLookupUnsafe()
+                : null;
+            using (AiDotNet.Tensors.Engines.DirectGpu.ConvWeightIdentity.Enter(weightKey, kernel.GpuCacheVersion))
+            {
+                backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW,
+                    strideH, strideW, padH, padW,
+                    dilationH, dilationW);
+            }
 
             // Add bias if present
             if (bias != null)
@@ -13643,6 +13671,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         base.RegisterPersistentTensor(tensor, role);
 
+        // Record the role so the first GPU read of this tensor, through any fetch path, uploads it into the persistent
+        // cache once instead of treating it as an activation.
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } registeredKey)
+        {
+            _pendingPersistentRoles.Remove(registeredKey);
+            _pendingPersistentRoles.Add(registeredKey, new PersistentRoleBox(role));
+        }
+
         // NO EAGER UPLOAD. Registration used to convert the whole tensor to float and allocate a
         // GPU buffer immediately. That is work the READ path already does on demand:
         // GetOrCacheWeightBuffer allocates on a cache miss and re-uploads when the host Version
@@ -13683,6 +13719,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (key is null)
             return;
 
+        _pendingPersistentRoles.Remove(key);
         lock (_persistentBufferLock)
         {
             if (_persistentBufferCache.TryRemove(key, out var entry))

@@ -720,6 +720,18 @@ public static class ClBlastNative
         ColMajor = 102
     }
 
+    /// <summary>
+    /// Replaces CLBlast's database parameters for one kernel family ("Xgemm", "XgemmDirect", ...) on one device; the next
+    /// routine call compiles with them. Names and values are parallel arrays.
+    /// </summary>
+    [DllImport(ClBlastLibrary, EntryPoint = "CLBlastOverrideParameters", CallingConvention = CallingConvention.Cdecl)]
+    public static extern StatusCode OverrideParameters(IntPtr device, [MarshalAs(UnmanagedType.LPStr)] string kernelName,
+        int precision, UIntPtr numParameters, [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string[] names,
+        UIntPtr[] values);
+
+    /// <summary>CLBlast's precision code for single precision (CLBlastPrecisionSingle).</summary>
+    public const int PrecisionSingle = 32;
+
     /// <summary>Transpose operation.</summary>
     public enum Transpose : int
     {
@@ -799,6 +811,25 @@ public static class ClBlastNative
         IntPtr bBuffer, UIntPtr bOffset, UIntPtr bLd,
         float beta,
         IntPtr cBuffer, UIntPtr cOffset, UIntPtr cLd,
+        ref IntPtr queue,
+        IntPtr eventPtr);
+
+    /// <summary>
+    /// Single-precision strided batched GEMM in one launch: C[i] = alpha*A[i]*B[i] + beta*C[i] for i in [0, batchCount),
+    /// item i at offset + i * stride of each buffer.
+    /// </summary>
+    [DllImport(ClBlastLibrary, EntryPoint = "CLBlastSgemmStridedBatched", CallingConvention = CallingConvention.Cdecl)]
+    public static extern StatusCode SgemmStridedBatched(
+        Layout layout,
+        Transpose transA,
+        Transpose transB,
+        UIntPtr m, UIntPtr n, UIntPtr k,
+        float alpha,
+        IntPtr aBuffer, UIntPtr aOffset, UIntPtr aLd, UIntPtr aStride,
+        IntPtr bBuffer, UIntPtr bOffset, UIntPtr bLd, UIntPtr bStride,
+        float beta,
+        IntPtr cBuffer, UIntPtr cOffset, UIntPtr cLd, UIntPtr cStride,
+        UIntPtr batchCount,
         ref IntPtr queue,
         IntPtr eventPtr);
 
