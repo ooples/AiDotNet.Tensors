@@ -3476,6 +3476,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Moves <paramref name="param"/>'s persistent weight-cache entry from <paramref name="from"/> to
+    /// <paramref name="to"/> without retiring <paramref name="from"/>: a ping-pong optimizer keeps both buffers and
+    /// alternates which one holds the current weights (see CompiledTrainingPlan's parity graphs), and the cache must
+    /// name the current one or a lookup through it would judge it stale and re-upload over it. No-op when the entry is
+    /// missing or holds neither buffer. The caller owns both buffers and restores the entry before disposing one.
+    /// </summary>
+    internal void MovePersistentParameterBuffer(Tensor<float> param, IGpuBuffer from, IGpuBuffer to)
+    {
+        if (ReferenceEquals(from, to)) return;
+        var arr = param.GetBackingArrayForCacheLookupUnsafe();
+        if (arr is null) return;
+        lock (_persistentBufferLock)
+        {
+            if (!_persistentBufferCache.TryGetValue(arr, out var existing) || !ReferenceEquals(existing.Buffer, from)) return;
+            _persistentBufferCache[arr] = new GpuBufferCacheEntry(to, existing.Role) { Version = existing.Version };
+        }
+    }
+
+    /// <summary>
     /// A zero-filled float tensor whose data lives in a dedicated device buffer (not the activation cache, so no
     /// step release or eviction frees it while the tensor is alive); a host read downloads it lazily.
     /// </summary>

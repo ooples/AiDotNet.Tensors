@@ -101,6 +101,12 @@ public sealed partial class CudaBackend
             return Current is { } capturing && capturing.TryPark(release);
         }
 
+        /// <summary>The buffers pinned so far (empty once retired).</summary>
+        internal object[] PinnedSnapshot()
+        {
+            lock (_lock) return _pinned is null ? Array.Empty<object>() : new List<object>(_pinned).ToArray();
+        }
+
         /// <summary>Runs every parked release; later releases of this pool's buffers run immediately.</summary>
         internal void Retire()
         {
@@ -171,6 +177,32 @@ public sealed partial class CudaBackend
             s_graphMemoryPools.Remove(graphExec);
         }
         pool.Retire();
+    }
+
+    /// <summary>
+    /// True when the capture that produced <paramref name="graphExec"/> handed any memory of
+    /// <paramref name="buffers"/> to captured work: one of them, or another buffer overlapping one (a view), was pinned.
+    /// A graph whose pool is gone (nothing pinned) uses none.
+    /// </summary>
+    internal bool CapturedGraphUses(IntPtr graphExec, IReadOnlyList<IGpuBuffer> buffers)
+    {
+        CaptureMemoryPool? pool;
+        lock (s_graphMemoryLock) s_graphMemoryPools.TryGetValue(graphExec, out pool);
+        if (pool is null) return false;
+        var ranges = new List<(long Start, long End)>(buffers.Count);
+        foreach (var b in buffers)
+        {
+            long start = b.Handle.ToInt64();
+            ranges.Add((start, start + Math.Max(1L, b.SizeInBytes)));
+        }
+        foreach (var pinned in pool.PinnedSnapshot())
+        {
+            if (pinned is not IGpuBuffer buffer) continue;
+            long start = buffer.Handle.ToInt64(), end = start + Math.Max(1L, buffer.SizeInBytes);
+            foreach (var (s, e) in ranges)
+                if (start < e && s < end) return true;
+        }
+        return false;
     }
 
     /// <summary>Retires the pools of every graph this backend captured (backend disposal).</summary>

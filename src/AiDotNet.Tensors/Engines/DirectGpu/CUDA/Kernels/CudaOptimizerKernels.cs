@@ -1210,6 +1210,146 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device
             p[i] *= s;
     }
 }
+
+// ---- Ping-pong SGD for captured step graphs ------------------------------------------------------------------
+// Two step graphs alternate: one reads the weights from buffer A and writes the updated weights to buffer B, the
+// other the reverse. Writing the update elsewhere lets one pass over the gradients both update and take their sum of
+// squares: an in-place update has to wait for the whole reduction (a non-finite gradient anywhere skips the step), so
+// it read the gradients twice. A non-finite step is undone afterwards by copying the old weights over the new ones.
+// Table: ptrs[t] = tensor t's source weights, ptrs[n + t] its destination, ptrs[2n + t] its gradient; MT_CHUNK-element
+// chunks, one block each.
+
+// The block's sum, valid in thread 0. warpSums: 8 doubles of shared memory, free on entry and on return.
+__device__ __forceinline__ double pp_block_sum(double v, double* warpSums)
+{
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        v += __shfl_down_sync(0xFFFFFFFF, v, o);
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) warpSums[warp] = v;
+    __syncthreads();
+    v = 0.0;
+    if (warp == 0)
+    {
+        v = lane < (int)((blockDim.x + 31) >> 5) ? warpSums[lane] : 0.0;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            v += __shfl_down_sync(0xFFFFFFFF, v, o);
+    }
+    __syncthreads();
+    return v;
+}
+
+// dst = src - lr * (g + wd * src) (sgd_multi_tensor_update's arithmetic, so the weights match it bit for bit), and the
+// gradients' sum of squares (multi_tensor_sum_squares' arithmetic) onto *guard. Each block leaves its chunk's partial
+// sum; the last block to finish adds them in chunk order, so the sum does not depend on block scheduling, and resets
+// *done for the next launch. dyn: device float[2], [0] = this step's learning rate.
+extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
+    const unsigned long long* __restrict__ ptrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart,
+    int n, int totalChunks, float weightDecay,
+    const float* __restrict__ dyn,
+    double* __restrict__ partials,
+    unsigned int* __restrict__ done,
+    double* __restrict__ guard)
+{
+    __shared__ double warpSums[8];
+    __shared__ int isLast;
+    const float learningRate = dyn[0];
+    int c = blockIdx.x;
+    int t = chunkTensor[c];
+    int start = chunkStart[c];
+    int end = min(start + MT_CHUNK, sizes[t]);
+    const float* src = (const float*)ptrs[t];
+    float* dst = (float*)ptrs[n + t];
+    const float* gradient = (const float*)ptrs[2 * n + t];
+    double v = 0.0;
+    int i = start;
+    if (((ptrs[t] | ptrs[n + t] | ptrs[2 * n + t]) & 15ULL) == 0)
+    {
+        int nvec = (end - start) >> 2;
+        const float4* s4 = (const float4*)(src + start);
+        const float4* g4 = (const float4*)(gradient + start);
+        float4* d4 = (float4*)(dst + start);
+        for (int k = threadIdx.x; k < nvec; k += blockDim.x)
+        {
+            float4 g = g4[k];
+            float4 w = s4[k];
+            float s = g.x * g.x + g.y * g.y + g.z * g.z + g.w * g.w;
+            v += isfinite(s) ? (double)s
+                : (double)g.x * (double)g.x + (double)g.y * (double)g.y + (double)g.z * (double)g.z + (double)g.w * (double)g.w;
+            if (weightDecay > 0.0f) {
+                g.x += weightDecay * w.x; g.y += weightDecay * w.y; g.z += weightDecay * w.z; g.w += weightDecay * w.w;
+            }
+            w.x -= learningRate * g.x; w.y -= learningRate * g.y; w.z -= learningRate * g.z; w.w -= learningRate * g.w;
+            d4[k] = w;
+        }
+        i = start + (nvec << 2);
+    }
+    for (i += threadIdx.x; i < end; i += blockDim.x)
+    {
+        float g = gradient[i];
+        float w = src[i];
+        v += (double)g * (double)g;
+        if (weightDecay > 0.0f) {
+            g += weightDecay * w;
+        }
+        w -= learningRate * g;
+        dst[i] = w;
+    }
+    v = pp_block_sum(v, warpSums);
+    if (threadIdx.x == 0)
+    {
+        partials[c] = v;
+        __threadfence();   // the partial is visible device-wide before the ticket that says it is there
+        isLast = atomicAdd(done, 1u) == (unsigned int)(totalChunks - 1);
+    }
+    __syncthreads();
+    if (!isLast) return;
+    double total = 0.0;
+    for (int k = threadIdx.x; k < totalChunks; k += blockDim.x)
+        total += __ldcg(partials + k);
+    total = pp_block_sum(total, warpSums);
+    if (threadIdx.x == 0)
+    {
+        *guard += total;   // onto the guard, which a learning-rate fault may already have poisoned
+        *done = 0u;
+    }
+}
+
+// Undoes a ping-pong update whose gradients were not finite: every destination gets its source weights back. Every
+// block returns at once on a finite step. A bounded grid strides over the chunks.
+extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_revert(
+    const unsigned long long* __restrict__ ptrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart,
+    int n, int totalChunks,
+    const double* __restrict__ guard)
+{
+    // Exponent bits, not isfinite(): see clip_scale_from_sum_squares.
+    if ((__double_as_longlong(*guard) & 0x7ff0000000000000LL) != 0x7ff0000000000000LL) return;
+    for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
+    {
+        int t = chunkTensor[c];
+        int start = chunkStart[c];
+        int end = min(start + MT_CHUNK, sizes[t]);
+        const float* src = (const float*)ptrs[t];
+        float* dst = (float*)ptrs[n + t];
+        int i = start;
+        if (((ptrs[t] | ptrs[n + t]) & 15ULL) == 0)
+        {
+            int nvec = (end - start) >> 2;
+            const float4* s4 = (const float4*)(src + start);
+            float4* d4 = (float4*)(dst + start);
+            for (int k = threadIdx.x; k < nvec; k += blockDim.x) d4[k] = s4[k];
+            i = start + (nvec << 2);
+        }
+        for (i += threadIdx.x; i < end; i += blockDim.x) dst[i] = src[i];
+    }
+}
 ";
     }
 
@@ -1230,6 +1370,8 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device
             "multi_tensor_sum_squares",
             "clip_scale_from_sum_squares",
             "multi_tensor_scale_by_device_scalar",
+            "sgd_pingpong_update",
+            "sgd_pingpong_revert",
             "adam_bf16_update",
             "adamw_bf16_update",
             "rmsprop_update",
