@@ -27,6 +27,8 @@ public sealed class DirectConvSingleImageRouteTests
     [InlineData(1, 64, 160, 1, true)]    // the 160x160 upper bound
     [InlineData(1, 64, 161, 1, false)]   // past it (unmeasured)
     [InlineData(1, 32, 64, 1, false)]    // 32 channels measured slower at 16 threads
+    [InlineData(1, 768, 32, 1, true)]    // a 32x32 plane, exactly the batch rule's 1024 (since the cache-sized input passes)
+    [InlineData(1, 64, 31, 1, false)]    // 961 positions: below it
     [InlineData(1, 256, 16, 1, false)]   // a 256-position plane stays on the GEMM routes for a single image
     [InlineData(1, 64, 64, 2, false)]    // stride 2 is outside the single-image rule
     [InlineData(2, 64, 16, 1, true)]     // the batch rule is unchanged
@@ -42,6 +44,7 @@ public sealed class DirectConvSingleImageRouteTests
     [InlineData(64, 48, 4)]
     [InlineData(64, 128, 16)]
     [InlineData(64, 41, 1)]      // 1681 positions: the last staged run is partial
+    [InlineData(256, 32, 4)]     // 32x32, 256 channels: the input channels in two cache-sized passes
     public void SingleImageDirectConv_MatchesFullIm2Col(int channels, int hw, int threads)
     {
         Skip.IfNot(DirectConvAvx2.IsSupported, "The direct kernels need AVX2 and FMA.");

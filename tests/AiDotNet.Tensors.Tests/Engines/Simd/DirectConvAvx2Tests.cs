@@ -78,6 +78,62 @@ public class DirectConvAvx2Tests
         AssertClose(expected, y, "output");
     }
 
+    // #653: the forward runs the input channels in passes whose kernel slice fits a cache budget, later passes
+    // accumulating onto the first. A small budget forces several passes (one block each at 9 KB for 3x3), an uneven
+    // split, a single image on the staged contiguous store, a batch on the per-position store, 1x1, and accumulate.
+    [SkippableTheory]
+    [InlineData(1, 64, 32, 34, 3, 1, 1, false, 9 * 1024)]     // staged single image, 8 passes of one block
+    [InlineData(1, 72, 64, 33, 3, 1, 1, true, 30 * 1024)]     // staged, accumulate, 9 blocks in passes of 3
+    [InlineData(2, 40, 32, 7, 3, 1, 1, false, 20 * 1024)]     // batched per-position store, 5 blocks split 3 + 2
+    [InlineData(2, 48, 32, 6, 3, 2, 0, true, 10 * 1024)]      // strided, no padding, accumulate
+    [InlineData(2, 64, 32, 5, 1, 1, 0, false, 2 * 1024)]      // 1x1: 2 blocks per pass
+    public void Forward_InInputChannelPasses_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride,
+        int pad, bool accumulate, int passBudgetBytes)
+    {
+        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
+        int outSize = OutSize(size, k, stride, pad, 1);
+        int inBlocks = (inC + 7) / 8;
+        int before = DirectConvAvx2.s_forwardPassKernelBytes;
+        try
+        {
+            DirectConvAvx2.s_forwardPassKernelBytes = passBudgetBytes;
+            Assert.True(DirectConvAvx2.ForwardInputBlocksPerPass(inBlocks, k * k) < inBlocks, "the budget must force passes");
+
+            var x = Random(11, batch, inC, size, size);
+            var w = Random(12, outC, inC, k, k);
+            var prior = Random(13, batch, outC, outSize, outSize);
+            var y = new Tensor<float>(new[] { batch, outC, outSize, outSize });
+            for (int i = 0; i < y.Length; i++) y.SetFlat(i, accumulate ? prior.GetFlat(i) : float.NaN);
+
+            DirectConvAvx2.Forward(x.GetDataArray(), 0, w.GetDataArray(), 0, y.GetDataArray(), 0, accumulate,
+                batch, inC, size, size, outC, k, k, stride, stride, pad, pad, 1, 1, outSize, outSize);
+
+            var expected = new double[batch * outC * outSize * outSize];
+            for (int b = 0; b < batch; b++)
+            for (int o = 0; o < outC; o++)
+            for (int oh = 0; oh < outSize; oh++)
+            for (int ow = 0; ow < outSize; ow++)
+            {
+                int index = ((b * outC + o) * outSize + oh) * outSize + ow;
+                double acc = accumulate ? prior.GetFlat(index) : 0;
+                for (int c = 0; c < inC; c++)
+                for (int i = 0; i < k; i++)
+                for (int j = 0; j < k; j++)
+                {
+                    int ih = oh * stride + i - pad, iw = ow * stride + j - pad;
+                    if (ih < 0 || ih >= size || iw < 0 || iw >= size) continue;
+                    acc += (double)w[o, c, i, j] * x[b, c, ih, iw];
+                }
+                expected[index] = acc;
+            }
+            AssertClose(expected, y, "output");
+        }
+        finally
+        {
+            DirectConvAvx2.s_forwardPassKernelBytes = before;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(2, 32, 8, 7, 3, 1, 1, false)]
     [InlineData(3, 64, 16, 4, 3, 1, 1, true)]
