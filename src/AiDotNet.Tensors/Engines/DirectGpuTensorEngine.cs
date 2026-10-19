@@ -9047,8 +9047,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // Execute GPU convolution. The weights' identity lets a backend reuse a form derived from them (the
             // Winograd filter transform) while they are unchanged: only for host-authoritative weights outside a tape
-            // or resident step, where a new host version is the only way the device copy changes.
-            object? weightKey = !IsTapeActive<T>() && !ResidentStepActive && kernel._gpuBuffer is null
+            // or resident step, where a new host version is the only way the device copy changes. The tape is read
+            // directly: IsTapeActive would count this cache decision as a tape bail.
+            object? weightKey = Autodiff.GradientTape<T>.Current is null && !ResidentStepActive && kernel._gpuBuffer is null
                 ? kernel.GetBackingArrayForCacheLookupUnsafe()
                 : null;
             using (AiDotNet.Tensors.Engines.DirectGpu.ConvWeightIdentity.Enter(weightKey, kernel.GpuCacheVersion))
