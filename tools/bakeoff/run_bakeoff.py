@@ -96,6 +96,8 @@ WORK = {
     "layernorm_backward":              (3 * 8192 * 1024 * 4, 0),
     "rmsnorm_backward":                (3 * 8192 * 1024 * 4, 0),
     "softmax_backward":                (3 * 8192 * 1024 * 4, 0),
+    "groupnorm_backward":              (3 * 32 * 64 * 1024 * 4, 0),
+    "batchnorm2d_backward":            (3 * 32 * 64 * 56 * 56 * 4, 0),
 }
 
 

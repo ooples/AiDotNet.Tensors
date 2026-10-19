@@ -158,6 +158,16 @@ public static class CodegenKernelCatalog
             CodegenFusedStatistics.SoftmaxBackward(16, 96),
             CodegenFusedStatistics.SoftmaxBackward(8192, 1024)),
 
+        new("groupnorm_backward",
+            "GroupNorm backward: dx (row-fused per group), dgamma/dbeta per channel",
+            CodegenFusedStatistics.GroupNormBackward(2, 8, 4, 36),
+            CodegenFusedStatistics.GroupNormBackward(32, 64, 8, 32 * 32)),
+
+        new("batchnorm2d_backward",
+            "training BatchNorm backward: both channel sums in one streamed sweep, then dx",
+            CodegenFusedStatistics.BatchNorm2DBackward(2, 8, 6, 6),
+            CodegenFusedStatistics.BatchNorm2DBackward(32, 64, 56, 56)),
+
         new("groupnorm",
             "GroupNorm: statistics per (sample, group), per-channel affine",
             CodegenFusedStatistics.GroupNorm(2, 8, 4, 36),

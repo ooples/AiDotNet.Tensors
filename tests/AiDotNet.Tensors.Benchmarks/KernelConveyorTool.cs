@@ -1355,6 +1355,14 @@ internal static class KernelConveyorTool
                         incumbent = () => backend.RmsNormBackward(dy, x, g, s, dx, dg, r, c, 1e-6f);
                         break;
                     }
+                    case "batchnorm2d_backward":
+                    {
+                        int n = shapes["dy"][0], c = shapes["dy"][1], s = shapes["dy"][2];
+                        var dy = Buffer((long)n * c * s); var x = Buffer((long)n * c * s); var dx = Buffer((long)n * c * s);
+                        var g = Buffer(c); var m = Buffer(c); var v = Buffer(c); var dg = Buffer(c); var db = Buffer(c);
+                        incumbent = () => backend.BatchNormBackward(dy, x, g, m, v, dx, dg, db, n, c, s, 1e-5f);
+                        break;
+                    }
                     case "softmax_backward":
                     {
                         int r = shapes["y"][0], c = shapes["y"][1];

@@ -320,6 +320,21 @@ def main():
     xgn = torch.randn(32, 64, 32, 32, device=dev)
     if selected("groupnorm"):
         emit_both("groupnorm", lambda: F.group_norm(xgn, 8, gbn, bbn, 1e-5))
+    _, gn_mean, gn_rstd = torch.ops.aten.native_group_norm(xgn, gbn, bbn, 32, 64, 1024, 8, 1e-5)
+    dygn = torch.randn_like(xgn)
+    if selected("groupnorm_backward"):
+        emit_both("groupnorm_backward",
+                  lambda: torch.ops.aten.native_group_norm_backward(
+                      dygn, xgn, gn_mean, gn_rstd, gbn, 32, 64, 1024, 8, [True, True, True])[0],
+                  "native_group_norm_backward: dx, dgamma, dbeta")
+    _, bn_mean, bn_invstd = torch.ops.aten.native_batch_norm(
+        xbn, gbn, bbn, rmean.clone(), rvar.clone(), True, 0.1, 1e-5)
+    dybn = torch.randn_like(xbn)
+    if selected("batchnorm2d_backward"):
+        emit_both("batchnorm2d_backward",
+                  lambda: torch.ops.aten.native_batch_norm_backward(
+                      dybn, xbn, gbn, rmean, rvar, bn_mean, bn_invstd, True, 1e-5, [True, True, True])[0],
+                  "native_batch_norm_backward (cuDNN): dx, dgamma, dbeta")
 
     # ---- 2x2 max pool, N32/C64/112x112
     xp = torch.randn(32, 64, 112, 112, device=dev)

@@ -689,6 +689,140 @@ public static class CodegenFusedStatistics
     }
 
     /// <summary>
+    /// GroupNorm backward over (n, g | cg, s): LayerNorm's input gradient with a row of
+    /// channels-by-spatial, gamma indexed by channel, and parameter gradients reduced over
+    /// (n, s) per channel.
+    /// </summary>
+    public static CodegenProgram GroupNormBackward(int batch, int channels, int groups, int spatial)
+    {
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (groups <= 0 || channels % groups != 0) throw new ArgumentOutOfRangeException(nameof(groups));
+        if (spatial <= 0) throw new ArgumentOutOfRangeException(nameof(spatial));
+        int perGroup = channels / groups;
+        int[] grouped = { batch, groups, perGroup, spatial };
+        int[] statistic = { batch, groups };
+        int[] channel = { groups, perGroup };
+        double inverse = 1.0 / ((double)perGroup * spatial);
+        CodegenIterationSpace RowReduce() => new(
+            CodegenAxis.Parallel("n", batch), CodegenAxis.Parallel("g", groups),
+            CodegenAxis.Reduce("cg", perGroup), CodegenAxis.Reduce("s", spatial));
+        CodegenTensorBinding Grid(int p, string name) => Bind(p, name, grouped, Axis(0), Axis(1), Axis(2), Axis(3));
+        CodegenTensorBinding Stat(int p, string name) => Bind(p, name, statistic, Axis(0), Axis(1));
+        CodegenTensorBinding Gamma(int p) => Bind(p, "gamma", channel, Axis(1), Axis(2));
+
+        var m1 = new CodegenKernelSpec(
+            "groupnorm_bwd_m1", RowReduce(),
+            new[] { Grid(0, "dy"), Gamma(1) },
+            Bind(2, "m1", statistic, isOutput: true, Axis(0), Axis(1)),
+            new[] { 0, 1 }, CodegenReduceKind.Sum, reduceScale: inverse,
+            body: CodegenExpr.Product(Op(1), Op(0)));
+
+        var m2 = new CodegenKernelSpec(
+            "groupnorm_bwd_m2", RowReduce(),
+            new[] { Grid(0, "x"), Grid(1, "dy"), Gamma(2), Stat(3, "negmean"), Stat(4, "rstd") },
+            Bind(5, "m2", statistic, isOutput: true, Axis(0), Axis(1)),
+            new[] { 0, 1, 2, 3 }, CodegenReduceKind.Sum, reduceScale: inverse, scaleInput: 4,
+            body: CodegenExpr.Product(Op(2), Op(1), CodegenExpr.Add(Op(0), Op(3))));
+
+        var dx = new CodegenKernelSpec(
+            "groupnorm_bwd_dx",
+            new CodegenIterationSpace(
+                CodegenAxis.Parallel("n", batch), CodegenAxis.Parallel("g", groups),
+                CodegenAxis.Parallel("cg", perGroup), CodegenAxis.Parallel("s", spatial)),
+            new[]
+            {
+                Grid(0, "x"), Grid(1, "dy"), Gamma(2), Stat(3, "negmean"), Stat(4, "rstd"),
+                Stat(5, "m1"), Stat(6, "m2"),
+            },
+            Grid(7, "dx").AsOutput(),
+            new[] { 0, 1, 2, 3, 4, 5, 6 }, CodegenReduceKind.None, scaleInput: 4,
+            body: CodegenExpr.Subtract(
+                CodegenExpr.Product(Op(2), Op(1)),
+                CodegenExpr.Add(Op(5), CodegenExpr.Product(CodegenExpr.Add(Op(0), Op(3)), Op(4), Op(6)))));
+
+        // Per channel (g, cg), over (n, s).
+        CodegenIterationSpace ChannelReduce() => new(
+            CodegenAxis.Parallel("g", groups), CodegenAxis.Parallel("cg", perGroup),
+            CodegenAxis.Reduce("n", batch), CodegenAxis.Reduce("s", spatial));
+        CodegenTensorBinding ByChannel(int p, string name) => Bind(p, name, grouped, Axis(2), Axis(0), Axis(1), Axis(3));
+        CodegenTensorBinding StatByChannel(int p, string name) => Bind(p, name, statistic, Axis(2), Axis(0));
+
+        var dgamma = new CodegenKernelSpec(
+            "groupnorm_bwd_dgamma", ChannelReduce(),
+            new[] { ByChannel(0, "x"), ByChannel(1, "dy"), StatByChannel(2, "negmean"), StatByChannel(3, "rstd") },
+            Bind(4, "dgamma", channel, isOutput: true, Axis(0), Axis(1)),
+            new[] { 0, 1, 2, 3 }, CodegenReduceKind.Sum,
+            body: CodegenExpr.Product(Op(1), CodegenExpr.Add(Op(0), Op(2)), Op(3)));
+
+        var dbeta = new CodegenKernelSpec(
+            "groupnorm_bwd_dbeta", ChannelReduce(),
+            new[] { ByChannel(0, "dy") },
+            Bind(1, "dbeta", channel, isOutput: true, Axis(0), Axis(1)),
+            new[] { 0 }, CodegenReduceKind.Sum);
+
+        return new CodegenProgram(
+            new[] { m1, m2, dx, dgamma, dbeta },
+            new long[] { batch * groups, batch * groups, (long)batch * channels * spatial, channels, channels },
+            "groupnorm backward " + batch + "x" + channels + "/" + groups + "x" + spatial);
+    }
+
+    /// <summary>
+    /// Training BatchNorm backward over (c | n, h*w). The two channel sums are independent --
+    /// dbeta = sum dy and dgamma = sum dy*xhat -- so a streamed row computes both in ONE
+    /// sweep, and dx = gamma*rstd*(dy - dbeta/m - xhat*dgamma/m) is the second: five
+    /// transfers, as cuDNN's.
+    /// </summary>
+    public static CodegenProgram BatchNorm2DBackward(int batch, int channels, int height, int width)
+    {
+        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
+        if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels));
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
+        int plane = height * width;
+        int[] planes = { batch, channels, plane };
+        int[] channel = { channels };
+        double inverse = 1.0 / ((double)batch * plane);
+        CodegenIterationSpace Statistics() => new(
+            CodegenAxis.Parallel("c", channels), CodegenAxis.Reduce("n", batch), CodegenAxis.Reduce("hw", plane));
+        CodegenTensorBinding Planes(int p, string name) => Bind(p, name, planes, Axis(1), Axis(0), Axis(2));
+        CodegenTensorBinding Channel(int p, string name) => Bind(p, name, channel, Axis(0));
+
+        var dbeta = new CodegenKernelSpec(
+            "batchnorm_bwd_dbeta", Statistics(),
+            new[] { Planes(0, "dy") },
+            Bind(1, "dbeta", channel, isOutput: true, Axis(0)),
+            new[] { 0 }, CodegenReduceKind.Sum);
+
+        var dgamma = new CodegenKernelSpec(
+            "batchnorm_bwd_dgamma", Statistics(),
+            new[] { Planes(0, "x"), Planes(1, "dy"), Channel(2, "negmean"), Channel(3, "rstd") },
+            Bind(4, "dgamma", channel, isOutput: true, Axis(0)),
+            new[] { 0, 1, 2 }, CodegenReduceKind.Sum, scaleInput: 3,
+            body: CodegenExpr.Product(Op(1), CodegenExpr.Add(Op(0), Op(2))));
+
+        var dx = new CodegenKernelSpec(
+            "batchnorm_bwd_dx",
+            new CodegenIterationSpace(
+                CodegenAxis.Parallel("c", channels), CodegenAxis.Parallel("n", batch), CodegenAxis.Parallel("hw", plane)),
+            new[]
+            {
+                Planes(0, "x"), Planes(1, "dy"), Channel(2, "gamma"), Channel(3, "negmean"),
+                Channel(4, "rstd"), Channel(5, "dbeta"), Channel(6, "dgamma"),
+            },
+            Planes(7, "dx").AsOutput(),
+            new[] { 0, 1, 2, 3, 4, 5, 6 }, CodegenReduceKind.None,
+            // gamma*rstd*(dy - dbeta/m - (x + negmean)*rstd*dgamma/m)
+            body: CodegenExpr.Product(Op(2), Op(4), CodegenExpr.Subtract(Op(1), CodegenExpr.Add(
+                CodegenExpr.Product(Op(5), CodegenExpr.Constant(inverse)),
+                CodegenExpr.Product(CodegenExpr.Add(Op(0), Op(3)), Op(4), Op(6), CodegenExpr.Constant(inverse))))));
+
+        return new CodegenProgram(
+            new[] { dbeta, dgamma, dx },
+            new long[] { channels, channels, (long)batch * channels * plane },
+            "batchnorm2d backward " + batch + "x" + channels + "x" + height + "x" + width);
+    }
+
+    /// <summary>
     /// dgamma[j] = sum_i dy*(x + negmean)*rstd and dbeta[j] = sum_i dy: reductions DOWN the
     /// rows, one output per column.
     /// </summary>
@@ -743,4 +877,13 @@ public static class CodegenFusedStatistics
     private static CodegenTensorBinding Bind(
         int parameterIndex, string name, int[] shape, bool isOutput, params CodegenAffineExpr[] map) =>
         new(parameterIndex, name, (int[])shape.Clone(), map, isOutput);
+
+    private static CodegenTensorBinding AsOutput(this CodegenTensorBinding binding)
+    {
+        var shape = new int[binding.Shape.Count];
+        for (int d = 0; d < shape.Length; d++) shape[d] = binding.Shape[d];
+        var map = new CodegenAffineExpr[binding.Map.Count];
+        for (int d = 0; d < map.Length; d++) map[d] = binding.Map[d];
+        return new CodegenTensorBinding(binding.ParameterIndex, binding.Name, shape, map, isOutput: true);
+    }
 }

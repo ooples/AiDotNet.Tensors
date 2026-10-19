@@ -206,6 +206,72 @@ public class CodegenBackwardProgramTests
         }
     }
 
+    /// <summary>
+    /// Central differences of L = sum(dy * norm(x)) for a normalisation whose forward is
+    /// given as a program, checking dx, dgamma and dbeta.
+    /// </summary>
+    private static void CheckAgainstFiniteDifferences(
+        Func<double[], double[], double[], double[]> forward,
+        double[] x, double[] dy, double[] g, double[] b, IReadOnlyDictionary<string, double[]> grads)
+    {
+        const double H = 1e-5;
+        double Loss(double[] xv, double[] gv, double[] bv) => Dot(dy, forward(xv, gv, bv));
+        void Check(double[] param, double[] analytic, Func<double[], double> loss)
+        {
+            for (int k = 0; k < param.Length; k++)
+            {
+                double keep = param[k];
+                param[k] = keep + H; double up = loss(param);
+                param[k] = keep - H; double down = loss(param);
+                param[k] = keep;
+                Assert.Equal((up - down) / (2 * H), analytic[k], 4);
+            }
+        }
+        Check(x, grads["dx"], xv => Loss(xv, g, b));
+        Check(g, grads["dgamma"], gv => Loss(x, gv, b));
+        Check(b, grads["dbeta"], bv => Loss(x, g, bv));
+    }
+
+    [Fact]
+    public void GroupNormBackward_MatchesFiniteDifferences()
+    {
+        const int N = 2, C = 4, G = 2, S = 3;
+        double[] x = Fill(N * C * S, 2.0, 11), dy = Fill(N * C * S, 1.0, 12);
+        double[] g = Fill(C, 0.7, 13), b = Fill(C, 0.3, 14);
+        double[] Forward(double[] xv, double[] gv, double[] bv) =>
+            CodegenFusedStatistics.GroupNorm(N, C, G, S).Interpret(new Dictionary<string, double[]>
+                { ["x"] = xv, ["gamma"] = gv, ["beta"] = bv })["y"];
+        var stats = CodegenFusedStatistics.GroupNorm(N, C, G, S).Interpret(new Dictionary<string, double[]>
+            { ["x"] = x, ["gamma"] = g, ["beta"] = b });
+        var grads = CodegenFusedStatistics.GroupNormBackward(N, C, G, S).Interpret(new Dictionary<string, double[]>
+        {
+            ["x"] = x, ["dy"] = dy, ["gamma"] = g, ["negmean"] = stats["negmean"], ["rstd"] = stats["rstd"],
+        });
+        CheckAgainstFiniteDifferences(Forward, x, dy, g, b, grads);
+    }
+
+    /// <summary>
+    /// BatchNorm backward against differences of the training forward. The forward's shift
+    /// is a constant here, as the running mean is during a step, so it carries no gradient.
+    /// </summary>
+    [Fact]
+    public void BatchNormBackward_MatchesFiniteDifferences()
+    {
+        const int N = 2, C = 3, H = 2, W = 2;
+        double[] x = Fill(N * C * H * W, 2.0, 15), dy = Fill(N * C * H * W, 1.0, 16);
+        double[] g = Fill(C, 0.7, 17), b = Fill(C, 0.3, 18), shift = Fill(C, 0.2, 19);
+        Dictionary<string, double[]> Sources(double[] xv, double[] gv, double[] bv) => new()
+            { ["x"] = xv, ["gamma"] = gv, ["beta"] = bv, ["shift"] = shift };
+        double[] Forward(double[] xv, double[] gv, double[] bv) =>
+            CodegenFusedStatistics.BatchNorm2D(N, C, H, W).Interpret(Sources(xv, gv, bv))["y"];
+        var stats = CodegenFusedStatistics.BatchNorm2D(N, C, H, W).Interpret(Sources(x, g, b));
+        var grads = CodegenFusedStatistics.BatchNorm2DBackward(N, C, H, W).Interpret(new Dictionary<string, double[]>
+        {
+            ["x"] = x, ["dy"] = dy, ["gamma"] = g, ["negmean"] = stats["negmean"], ["rstd"] = stats["rstd"],
+        });
+        CheckAgainstFiniteDifferences(Forward, x, dy, g, b, grads);
+    }
+
     /// <summary>The input-gradient passes fuse into one row kernel; the column reductions do not.</summary>
     [Fact]
     public void TheInputGradientFusesAndTheColumnReductionsStayApart()
