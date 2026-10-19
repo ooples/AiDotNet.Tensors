@@ -1004,16 +1004,16 @@ internal static class KernelAutotuneTool
             resources.Add(output);
 
             var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-            for (int i = 0; i < spec.ProductInputs.Count; i++)
-                partialArgs[i] = uploaded[spec.ProductInputs[i]];
+            int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+            for (int i = 0; i < partialSources.Length; i++)
+                partialArgs[i] = uploaded[partialSources[i]];
             partialArgs[^1] = temporary.Pointer;
 
             var combineArgs = new IntPtr[plan.Combine.ParameterCount];
             combineArgs[0] = temporary.Pointer;
-            if (plan.Combine.BiasInput is { } bias)
-                combineArgs[bias] = uploaded[spec.BiasInput!.Value];
-            if (plan.Combine.ScaleInput is { } scale)
-                combineArgs[scale] = uploaded[spec.ScaleInput!.Value];
+            int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+            for (int i = 0; i < combineSources.Length; i++)
+                combineArgs[1 + i] = uploaded[combineSources[i]];
             combineArgs[^1] = output.Pointer;
 
             void LaunchPartial() => LaunchOne(
@@ -1131,16 +1131,16 @@ internal static class KernelAutotuneTool
             resources.Add(output);
 
             var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-            for (int i = 0; i < spec.ProductInputs.Count; i++)
-                partialArgs[i] = uploaded[spec.ProductInputs[i]];
+            int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+            for (int i = 0; i < partialSources.Length; i++)
+                partialArgs[i] = uploaded[partialSources[i]];
             partialArgs[partialArgs.Length - 1] = temporary.Pointer;
 
             var combineArgs = new IntPtr[plan.Combine.ParameterCount];
             combineArgs[0] = temporary.Pointer;
-            if (plan.Combine.BiasInput is { } bias)
-                combineArgs[bias] = uploaded[spec.BiasInput!.Value];
-            if (plan.Combine.ScaleInput is { } scale)
-                combineArgs[scale] = uploaded[spec.ScaleInput!.Value];
+            int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+            for (int i = 0; i < combineSources.Length; i++)
+                combineArgs[1 + i] = uploaded[combineSources[i]];
             combineArgs[combineArgs.Length - 1] = output.Pointer;
 
             void LaunchPartial()

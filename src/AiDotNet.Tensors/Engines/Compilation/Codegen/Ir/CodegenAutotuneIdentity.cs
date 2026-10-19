@@ -375,7 +375,7 @@ public sealed record CodegenAutotuneIdentity(
         text.Append(";end-candidate;");
     }
 
-    private static string CanonicalSpec(CodegenKernelSpec spec)
+    internal static string CanonicalSpec(CodegenKernelSpec spec)
     {
         var text = new StringBuilder();
         text.Append("name=").Append(spec.Name).Append(';');
@@ -403,6 +403,12 @@ public sealed record CodegenAutotuneIdentity(
             .Append(";preBias=").Append(Optional(spec.PreBiasInput))
             .Append(";preBiasScale=").Append(spec.PreBiasScale.ToString("R", CultureInfo.InvariantCulture))
             .Append(";algebra=").Append(spec.Algebra).Append(';');
+        // Appended only when present, so every identity recorded before these fields
+        // existed still resolves to the same cache entry.
+        if (spec.HasExtendedEpilogue)
+            text.Append("reduceOffset=").Append(spec.ReduceOffset.ToString("R", CultureInfo.InvariantCulture))
+                .Append(";postScale=").Append(Optional(spec.PostScaleInput))
+                .Append(";postBias=").Append(Optional(spec.PostBiasInput)).Append(';');
 
         for (int i = 0; i < spec.ExtraOutputs.Count; i++)
         {

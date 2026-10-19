@@ -287,6 +287,35 @@ public sealed class CodegenKernelSpec
     /// </remarks>
     public double PreBiasScale { get; }
 
+    /// <summary>
+    /// Constant added after <see cref="ReduceScale"/> and before the bias. A normalisation's
+    /// epsilon lives here: <c>rsqrt(mean(x^2) + eps)</c> needs it INSIDE the activation, and
+    /// carrying a constant as a bias tensor would cost a load per output for one number.
+    /// </summary>
+    public double ReduceOffset { get; }
+
+    /// <summary>
+    /// A second multiplicative epilogue operand, applied after <see cref="ScaleInput"/>.
+    /// A normalisation multiplies by two broadcasts of different axes -- the per-row
+    /// <c>rstd</c> and the per-feature <c>gamma</c> -- and neither can absorb the other.
+    /// </summary>
+    public int? PostScaleInput { get; }
+
+    /// <summary>
+    /// An additive epilogue operand applied after <see cref="PostScaleInput"/> and before the
+    /// activation: the normalisation's <c>beta</c>. <see cref="BiasInput"/> cannot serve,
+    /// because it lands before the scales and would be scaled with the value.
+    /// </summary>
+    public int? PostBiasInput { get; }
+
+    /// <summary>
+    /// True when the spec uses <see cref="ReduceOffset"/>, <see cref="PostScaleInput"/> or
+    /// <see cref="PostBiasInput"/>. Lowerings that do not carry these fields must refuse such
+    /// a spec rather than emit a kernel that silently drops part of its epilogue.
+    /// </summary>
+    public bool HasExtendedEpilogue =>
+        ReduceOffset != 0.0 || PostScaleInput.HasValue || PostBiasInput.HasValue;
+
     /// <summary>Creates a kernel spec and validates its internal consistency.</summary>
     public CodegenKernelSpec(
         string name,
@@ -305,7 +334,10 @@ public sealed class CodegenKernelSpec
         CodegenAlgebra algebra = CodegenAlgebra.Real,
         CodegenExtraOutput[]? extraOutputs = null,
         CodegenTensorBinding? secondaryOutput = null,
-        CodegenAffineExpr? secondaryIndexExpr = null)
+        CodegenAffineExpr? secondaryIndexExpr = null,
+        double reduceOffset = 0.0,
+        int? postScaleInput = null,
+        int? postBiasInput = null)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Kernel needs a name.", nameof(name));
         Name = name;
@@ -321,6 +353,9 @@ public sealed class CodegenKernelSpec
         PreReduce = preReduce;
         PreBiasInput = preBiasInput;
         PreBiasScale = preBiasScale;
+        ReduceOffset = reduceOffset;
+        PostScaleInput = postScaleInput;
+        PostBiasInput = postBiasInput;
         Algebra = algebra;
 
         // ONE MECHANISM. The legacy secondaryOutput/secondaryIndexExpr pair is folded into
@@ -382,6 +417,11 @@ public sealed class CodegenKernelSpec
                 throw new ArgumentException(
                     "Pre-reduction " + preReduce + " is a real transform; over " + algebra +
                     " it is a different operator.", nameof(preReduce));
+
+            if (HasExtendedEpilogue)
+                throw new ArgumentException(
+                    "The reduce offset and post-scale/post-bias epilogue are defined over " +
+                    "the reals only; the " + algebra + " lowering does not carry them.");
 
             for (int i = 0; i < _inputs.Length; i++)
                 if (_inputs[i].ElementType != CodegenElementType.Float32)
@@ -459,6 +499,8 @@ public sealed class CodegenKernelSpec
         if (biasInput.HasValue) RefuseIndexOperand(biasInput.Value, "the bias");
         if (scaleInput.HasValue) RefuseIndexOperand(scaleInput.Value, "the scale");
         if (preBiasInput.HasValue) RefuseIndexOperand(preBiasInput.Value, "the pre-bias");
+        if (postScaleInput.HasValue) RefuseIndexOperand(postScaleInput.Value, "the post-scale");
+        if (postBiasInput.HasValue) RefuseIndexOperand(postBiasInput.Value, "the post-bias");
 
         ValidateIndirection(output, "output");
         for (int i = 0; i < _inputs.Length; i++) ValidateIndirection(_inputs[i], "input " + i);
@@ -482,12 +524,18 @@ public sealed class CodegenKernelSpec
             throw new ArgumentException(
                 "ReduceScale must be finite; got " + reduceScale + ".", nameof(reduceScale));
 
+        if (double.IsNaN(reduceOffset) || double.IsInfinity(reduceOffset))
+            throw new ArgumentException(
+                "ReduceOffset must be finite; got " + reduceOffset + ".", nameof(reduceOffset));
+
         if (_productInputs.Length == 0)
             throw new ArgumentException("At least one operand must feed the body.", nameof(productInputs));
         foreach (int i in _productInputs) Require(i, nameof(productInputs));
         if (biasInput.HasValue) Require(biasInput.Value, nameof(biasInput));
         if (scaleInput.HasValue) Require(scaleInput.Value, nameof(scaleInput));
         if (preBiasInput.HasValue) Require(preBiasInput.Value, nameof(preBiasInput));
+        if (postScaleInput.HasValue) Require(postScaleInput.Value, nameof(postScaleInput));
+        if (postBiasInput.HasValue) Require(postBiasInput.Value, nameof(postBiasInput));
         if (!output.IsOutput)
             throw new ArgumentException("Output binding must be marked IsOutput.", nameof(output));
 
@@ -890,6 +938,7 @@ public sealed class CodegenKernelSpec
             }
 
             if (ReduceScale != 1.0) acc *= ReduceScale;
+            if (ReduceOffset != 0.0) acc += ReduceOffset;
 
             if (BiasInput.HasValue)
             {
@@ -902,6 +951,18 @@ public sealed class CodegenKernelSpec
                 var s = _inputs[ScaleInput.Value];
                 long off = s.ResolveOffset(values, out bool ok);
                 if (ok) acc *= inputData[ScaleInput.Value][off];
+            }
+            if (PostScaleInput.HasValue)
+            {
+                var s = _inputs[PostScaleInput.Value];
+                long off = s.ResolveOffset(values, out bool ok);
+                if (ok) acc *= inputData[PostScaleInput.Value][off];
+            }
+            if (PostBiasInput.HasValue)
+            {
+                var b = _inputs[PostBiasInput.Value];
+                long off = b.ResolveOffset(values, out bool ok);
+                if (ok) acc += inputData[PostBiasInput.Value][off];
             }
             acc = ApplyActivation(Activation, acc);
 
@@ -920,7 +981,7 @@ public sealed class CodegenKernelSpec
                 // Scale * primary, then optionally + BiasScale * bias. The primary here is
                 // the FINISHED value -- after the epilogue activation -- because an
                 // optimizer's parameter update steps by the state just computed.
-                double value = ApplyActivation(Activation, acc) * extra.Scale;
+                double value = acc * extra.Scale;
                 if (extra.BiasInput.HasValue)
                 {
                     var biasBinding = _inputs[extra.BiasInput.Value];
@@ -965,6 +1026,11 @@ public sealed class CodegenKernelSpec
         sb.Append(')');
         if (BiasInput.HasValue) sb.Append(" + ").Append(_inputs[BiasInput.Value].Name);
         if (ScaleInput.HasValue) sb.Append(" * ").Append(_inputs[ScaleInput.Value].Name);
+        if (ReduceOffset != 0.0)
+            sb.Append(" [+").Append(ReduceOffset.ToString("R", System.Globalization.CultureInfo.InvariantCulture))
+              .Append(" before bias]");
+        if (PostScaleInput.HasValue) sb.Append(" * ").Append(_inputs[PostScaleInput.Value].Name);
+        if (PostBiasInput.HasValue) sb.Append(" + ").Append(_inputs[PostBiasInput.Value].Name);
         if (Activation != CodegenActivationKind.None) sb.Append(" -> ").Append(Activation.ToString().ToLowerInvariant());
         return sb.Append('\n').ToString();
     }

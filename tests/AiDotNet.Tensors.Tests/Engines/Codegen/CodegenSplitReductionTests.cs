@@ -511,4 +511,175 @@ public class CodegenSplitReductionTests
     {
         Assert.NotNull(CodegenSplitReduction.TryPlan(RowReduce(4096, 1024, CodegenReduceKind.Max)));
     }
+
+    // ---- per-term transforms -------------------------------------------------------------
+    //
+    // A pre-bias and a pre-reduction act on each TERM before it is summed. The split used to
+    // build its partial pass from the product operands alone, so a softmax denominator or a
+    // variance that took the split summed raw x instead of exp(x - max) or (x - mean)^2 --
+    // a plausible number, silently wrong.
+
+    /// <summary>
+    /// Runs a split through <see cref="CodegenSplitReduction.PartialOperandSources"/> and
+    /// <see cref="CodegenSplitReduction.CombineOperandSources"/>, the mapping every launcher
+    /// binds with, so the test exercises the same binding the device paths use.
+    /// </summary>
+    private static double[] RunSplit(
+        CodegenKernelSpec spec, CodegenKernelSpec partial, CodegenKernelSpec combine, double[][] operands)
+    {
+        int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+        Assert.Equal(partial.Inputs.Count, partialSources.Length);
+        var partialOperands = new double[partialSources.Length][];
+        for (int i = 0; i < partialSources.Length; i++) partialOperands[i] = operands[partialSources[i]];
+
+        int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+        Assert.Equal(combine.Inputs.Count, 1 + combineSources.Length);
+        var combineOperands = new double[combine.Inputs.Count][];
+        combineOperands[0] = partial.Interpret(partialOperands);
+        for (int i = 0; i < combineSources.Length; i++) combineOperands[1 + i] = operands[combineSources[i]];
+        return combine.Interpret(combineOperands);
+    }
+
+    private static CodegenKernelSpec RowVariance(int rows, int inner, double epsilon)
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", rows), CodegenAxis.Reduce("k", inner));
+        var x = new CodegenTensorBinding(0, "x", new[] { rows, inner },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var negMean = new CodegenTensorBinding(1, "negmean", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) });
+        var y = new CodegenTensorBinding(2, "rstd", new[] { rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        return new CodegenKernelSpec("rowvar", space, new[] { x, negMean }, y, new[] { 0 },
+            CodegenReduceKind.Sum, activation: CodegenActivationKind.Rsqrt,
+            reduceScale: 1.0 / inner, preReduce: CodegenPreReduceOp.Square, preBiasInput: 1,
+            reduceOffset: epsilon);
+    }
+
+    /// <summary>
+    /// rsqrt(mean((x - mean)^2) + eps), split, must equal a hand-written scan. Holding it to
+    /// an independent reference rather than to the unsplit spec matters here: the bug was in
+    /// what the split CARRIED, and both passes interpret through the same spec code.
+    /// </summary>
+    [Theory]
+    [InlineData(16, 128, 8)]
+    [InlineData(8, 96, 4)]
+    public void SplitKeepsPreBiasAndPreReduceOnThePartial(int rows, int inner, int factor)
+    {
+        const double Epsilon = 1e-3;
+        var spec = RowVariance(rows, inner, Epsilon);
+        var (partial, combine) = CodegenSplitReduction.SplitChunked(spec, 1, factor);
+
+        Assert.Equal(CodegenPreReduceOp.Square, partial.PreReduce);
+        Assert.Equal(CodegenPreReduceOp.None, combine.PreReduce);
+        Assert.True(partial.PreBiasInput.HasValue);
+        Assert.Equal(Epsilon, combine.ReduceOffset);
+        Assert.Equal(0.0, partial.ReduceOffset);
+
+        double[] x = Fill(rows * inner, 3);
+        var negMean = new double[rows];
+        var want = new double[rows];
+        for (int i = 0; i < rows; i++)
+        {
+            double mean = 0;
+            for (int k = 0; k < inner; k++) mean += x[i * inner + k];
+            mean /= inner;
+            negMean[i] = -mean;
+            double sum = 0;
+            for (int k = 0; k < inner; k++) sum += (x[i * inner + k] - mean) * (x[i * inner + k] - mean);
+            want[i] = 1.0 / Math.Sqrt(sum / inner + Epsilon);
+        }
+
+        double[] got = RunSplit(spec, partial, combine, new[] { x, negMean });
+        for (int i = 0; i < rows; i++) Assert.Equal(want[i], got[i], 9);
+    }
+
+    /// <summary>The same through the promoting split, which builds its partial separately.</summary>
+    [Fact]
+    public void PromotingSplitKeepsPreReduce()
+    {
+        // Two reduction axes, so promoting one leaves the partial real work.
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", 6), CodegenAxis.Reduce("a", 8), CodegenAxis.Reduce("b", 16));
+        var x = new CodegenTensorBinding(0, "x", new[] { 6, 8, 16 },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1), CodegenAffineExpr.Axis(2) });
+        var y = new CodegenTensorBinding(1, "y", new[] { 6 },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var spec = new CodegenKernelSpec("expsum", space, new[] { x }, y, new[] { 0 },
+            CodegenReduceKind.Sum, preReduce: CodegenPreReduceOp.Exp);
+
+        var (partial, combine) = CodegenSplitReduction.Split(spec, 1);
+        double[] xv = Fill(6 * 8 * 16, 5);
+        double[] got = RunSplit(spec, partial, combine, new[] { xv });
+
+        for (int i = 0; i < 6; i++)
+        {
+            double sum = 0;
+            for (int k = 0; k < 8 * 16; k++) sum += Math.Exp(xv[i * 128 + k]);
+            Assert.Equal(sum, got[i], 9);
+        }
+    }
+
+    /// <summary>
+    /// A post-scale and post-bias move to the combine with the rest of the epilogue, in the
+    /// order the mapping reports them.
+    /// </summary>
+    [Fact]
+    public void ExtendedEpilogueMovesToTheCombine()
+    {
+        const int Rows = 8, Inner = 64;
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", Rows), CodegenAxis.Reduce("k", Inner));
+        CodegenTensorBinding Vector(int index, string name) => new(index, name, new[] { Rows },
+            new[] { CodegenAffineExpr.Axis(0) });
+        var x = new CodegenTensorBinding(0, "x", new[] { Rows, Inner },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var y = new CodegenTensorBinding(5, "y", new[] { Rows },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var spec = new CodegenKernelSpec("affine_sum", space,
+            new[] { x, Vector(1, "bias"), Vector(2, "scale"), Vector(3, "pscale"), Vector(4, "pbias") },
+            y, new[] { 0 }, CodegenReduceKind.Sum,
+            biasInput: 1, scaleInput: 2, reduceOffset: 0.25, postScaleInput: 3, postBiasInput: 4);
+
+        Assert.Equal(new[] { 1, 2, 3, 4 }, CodegenSplitReduction.CombineOperandSources(spec));
+        var (partial, combine) = CodegenSplitReduction.SplitChunked(spec, 1, 8);
+        Assert.False(partial.HasExtendedEpilogue);
+
+        var operands = new double[5][];
+        operands[0] = Fill(Rows * Inner, 1);
+        for (int i = 1; i < 5; i++) operands[i] = Fill(Rows, i + 7);
+        double[] got = RunSplit(spec, partial, combine, operands);
+
+        for (int r = 0; r < Rows; r++)
+        {
+            double sum = 0;
+            for (int k = 0; k < Inner; k++) sum += operands[0][r * Inner + k];
+            double want = ((sum + 0.25 + operands[1][r]) * operands[2][r]) * operands[3][r] + operands[4][r];
+            Assert.Equal(want, got[r], 9);
+        }
+    }
+
+    /// <summary>
+    /// A spec whose extra outputs the combine cannot rebuild is not splittable, rather than
+    /// split with its extra outputs dropped.
+    /// </summary>
+    [Fact]
+    public void ExtraOutputsAreRefusedNotDropped()
+    {
+        var space = new CodegenIterationSpace(
+            CodegenAxis.Parallel("i", 8), CodegenAxis.Reduce("k", 64));
+        var x = new CodegenTensorBinding(0, "x", new[] { 8, 64 },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) });
+        var y = new CodegenTensorBinding(1, "y", new[] { 8 },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var twice = new CodegenTensorBinding(2, "twice", new[] { 8 },
+            new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var spec = new CodegenKernelSpec("sum_and_twice", space, new[] { x }, y, new[] { 0 },
+            CodegenReduceKind.Sum,
+            extraOutputs: new[] { new CodegenExtraOutput(twice, CodegenExtraOutputKind.AffineOfPrimary, null, 2.0) });
+
+        Assert.False(CodegenSplitReduction.IsSplittable(spec));
+        Assert.Null(CodegenSplitReduction.TryPlan(spec));
+        Assert.Throws<NotSupportedException>(() => CodegenSplitReduction.SplitChunked(spec, 1, 8));
+    }
 }

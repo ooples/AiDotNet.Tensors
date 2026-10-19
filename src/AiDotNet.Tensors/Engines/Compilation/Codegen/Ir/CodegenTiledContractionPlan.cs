@@ -227,7 +227,7 @@ public sealed class CodegenTiledContractionPlan
             return false;
         }
 
-        if (spec.PreBiasInput.HasValue || spec.ReduceScale != 1.0 ||
+        if (spec.PreBiasInput.HasValue || spec.ReduceScale != 1.0 || spec.HasExtendedEpilogue ||
             (spec.Activation != CodegenActivationKind.None &&
              spec.Activation != CodegenActivationKind.ReLU) ||
             spec.SecondaryOutput is not null || spec.ExtraOutputs.Count != 0)

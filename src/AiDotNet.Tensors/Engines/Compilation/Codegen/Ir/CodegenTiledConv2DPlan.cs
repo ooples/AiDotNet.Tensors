@@ -267,7 +267,7 @@ public sealed class CodegenTiledConv2DPlan
             reason = "a tiled dense convolution needs an untransformed sum of two operands";
             return false;
         }
-        if (spec.PreBiasInput.HasValue || spec.ReduceScale != 1.0 ||
+        if (spec.PreBiasInput.HasValue || spec.ReduceScale != 1.0 || spec.HasExtendedEpilogue ||
             spec.ScaleInput.HasValue ||
             (spec.Activation != CodegenActivationKind.None &&
              spec.Activation != CodegenActivationKind.ReLU) ||

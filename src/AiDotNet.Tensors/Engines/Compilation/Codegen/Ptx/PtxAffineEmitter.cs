@@ -1874,6 +1874,12 @@ public sealed partial class PtxAffineEmitter
                 L($"mul.rn.f32 {scaled}, {acc}, {F32(spec.ReduceScale)};");
                 acc = scaled;
             }
+            if (spec.ReduceOffset != 0.0)
+            {
+                string offset = NextF();
+                L($"add.rn.f32 {offset}, {acc}, {F32(spec.ReduceOffset)};");
+                acc = offset;
+            }
 
             if (spec.BiasInput.HasValue)
             {
@@ -1903,7 +1909,28 @@ public sealed partial class PtxAffineEmitter
                 L($"mul.rn.f32 {na}, {acc}, {v};");
                 acc = na;
             }
+            if (spec.PostScaleInput.HasValue)
+                acc = EpilogueOperand(spec.PostScaleInput.Value, "mul", acc);
+            if (spec.PostBiasInput.HasValue)
+                acc = EpilogueOperand(spec.PostBiasInput.Value, "add", acc);
             acc = EmitActivation(spec.Activation, acc);
+
+            // Loads (once per distinct address, through the same cache as the bias and the
+            // scale) and applies one post-scale or post-bias operand.
+            string EpilogueOperand(int input, string op, string value)
+            {
+                var binding = spec.Inputs[input];
+                string key = LoadKey(input, binding, tileAxes, laneOffsets[l], -1);
+                if (!epilogueCache.TryGetValue(key, out string? loaded))
+                {
+                    loaded = EmitLoad(binding, basePtr[binding.ParameterIndex], laneAxisReg[l],
+                                      reductionValues, reduction, out _);
+                    epilogueCache[key] = loaded;
+                }
+                string result = NextF();
+                L($"{op}.rn.f32 {result}, {value}, {loaded};");
+                return result;
+            }
 
             if (pendingStore is not null)
             {

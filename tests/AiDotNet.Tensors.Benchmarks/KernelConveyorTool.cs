@@ -59,27 +59,72 @@ internal static class KernelConveyorTool
     {
         _forceInputStaging = args.Contains("--input-staging", StringComparer.Ordinal);
         string selector = KernelToolArgs.Selector(args);
+        if (stage == "static-rows")
+        {
+            StaticRows();
+            return;
+        }
         var entries = Select(selector);
-        if (entries.Count == 0)
+        var programs = SelectPrograms(selector);
+        // Program entries are carried by verify and bench; the other stages are per-kernel.
+        bool programStage = stage is "verify" or "bench";
+        if (entries.Count == 0 && (!programStage || programs.Count == 0))
         {
             Console.WriteLine("No catalog entry matches '" + selector + "'. Known kernels:");
             foreach (var e in CodegenKernelCatalog.All)
                 Console.WriteLine("  " + e.Name.PadRight(32) + e.Summary);
+            foreach (var e in CodegenKernelCatalog.Programs)
+                Console.WriteLine("  " + e.Name.PadRight(32) + e.Summary + " (program)");
             KernelToolArgs.RequireNonEmptySelection(
                 selector, entries.Count, "kernel-" + stage);
         }
 
         switch (stage)
         {
-            case "verify": Verify(entries); break;
+            case "verify":
+                if (entries.Count != 0) Verify(entries);
+                if (programs.Count != 0) VerifyPrograms(programs);
+                break;
             case "release": Release(entries, args); break;
-            case "bench": Bench(entries, args); break;
+            case "bench":
+                if (entries.Count != 0) Bench(entries, args);
+                if (programs.Count != 0) BenchPrograms(programs);
+                break;
             case "vector-ab": VectorAb(entries); break;
             case "dump": Dump(entries, args); break;
             case "coarsen-ab": CoarsenAb(entries); break;
             case "once": Once(entries, args); break;
             case "predict": Predict(entries, args); break;
             default: Console.WriteLine("Unknown conveyor stage '" + stage + "'."); break;
+        }
+    }
+
+    private static IReadOnlyList<CodegenCatalogProgramEntry> SelectPrograms(string selector)
+    {
+        if (string.Equals(selector, "all", StringComparison.OrdinalIgnoreCase))
+            return CodegenKernelCatalog.Programs;
+        var one = CodegenKernelCatalog.FindProgram(selector);
+        return one is null ? Array.Empty<CodegenCatalogProgramEntry>() : new[] { one };
+    }
+
+    /// <summary>
+    /// Prints the static-ratchet rows (codegen-static-baseline.tsv) for every ratcheted
+    /// kernel, computed exactly as CodegenRatchetTests computes them, so a baseline change
+    /// can be produced without running the test suite.
+    /// </summary>
+    private static void StaticRows()
+    {
+        Console.WriteLine("kernel\tptx_lines\tloads\tvector_loads\telided_guards\tlooped_axes");
+        foreach (var (name, spec) in CodegenKernelCatalog.RatchetedKernels())
+        {
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.Emit(spec, 8, 6);
+            Console.WriteLine(string.Join("\t", name,
+                ptx.Split('\n').Length.ToString(CultureInfo.InvariantCulture),
+                emitter.EmittedLoads.ToString(CultureInfo.InvariantCulture),
+                emitter.VectorisedLoads.ToString(CultureInfo.InvariantCulture),
+                emitter.ElidedGuards.ToString(CultureInfo.InvariantCulture),
+                emitter.LoopedAxes.ToString(CultureInfo.InvariantCulture)));
         }
     }
 
@@ -774,16 +819,16 @@ internal static class KernelConveyorTool
                     // epilogue moved to the combine; binding by position would feed the
                     // partial pass the bias.
                     var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-                    for (int i = 0; i < spec.ProductInputs.Count; i++)
-                        partialArgs[i] = uploaded[spec.ProductInputs[i]];
+                    int[] partialSources = CodegenSplitReduction.PartialOperandSources(spec);
+                    for (int i = 0; i < partialSources.Length; i++)
+                        partialArgs[i] = uploaded[partialSources[i]];
                     partialArgs[partialArgs.Length - 1] = temp.Pointer;
 
                     var combineArgs = new IntPtr[plan.Combine.ParameterCount];
                     combineArgs[0] = temp.Pointer;
-                    if (plan.Combine.BiasInput is { } bias)
-                        combineArgs[bias] = uploaded[spec.BiasInput!.Value];
-                    if (plan.Combine.ScaleInput is { } scaleAt)
-                        combineArgs[scaleAt] = uploaded[spec.ScaleInput!.Value];
+                    int[] combineSources = CodegenSplitReduction.CombineOperandSources(spec);
+                    for (int i = 0; i < combineSources.Length; i++)
+                        combineArgs[1 + i] = uploaded[combineSources[i]];
                     combineArgs[combineArgs.Length - 1] = it._output.Pointer;
 
                     it.Add(runtime, program.Kernels[0], partialArgs);
@@ -845,6 +890,286 @@ internal static class KernelConveyorTool
             foreach (var b in _buffers) b.Dispose();
             foreach (var m in _modules) m.Dispose();
         }
+    }
+
+    /// <summary>
+    /// A whole multi-pass program on the device: one buffer per NAME (sources, then every
+    /// pass output), each pass lowered the way the tuner chose for it, and the chain captured
+    /// as one CUDA graph so it is timed the way the competitor lane is.
+    /// </summary>
+    private sealed class ProgramLaunchable : IDisposable
+    {
+        private readonly List<DirectPtxModule> _modules = new();
+        private readonly Dictionary<string, DirectPtxBuffer> _named = new(StringComparer.Ordinal);
+        private readonly List<DirectPtxBuffer> _temporaries = new();
+        private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args,
+            uint Blocks, uint X, uint Y, uint DynamicSharedMemoryBytes)> _steps = new();
+        private DirectPtxGraph? _graph;
+
+        /// <summary>The fp64 value of every source, as uploaded.</summary>
+        internal Dictionary<string, double[]> HostSources { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Highest register count across every kernel of every pass.</summary>
+        internal int RegistersPerThread { get; private set; }
+
+        /// <summary>Kernels launched per program run, after each pass's lowering.</summary>
+        internal int KernelCount => _steps.Count;
+
+        /// <summary>Lowering label per pass, for the report.</summary>
+        internal List<string> Lowerings { get; } = new();
+
+        internal static ProgramLaunchable Create(
+            DirectPtxRuntime runtime, CodegenProgram program, string catalogName)
+        {
+            var it = new ProgramLaunchable();
+            try
+            {
+                int salt = 0;
+                foreach (var source in program.Sources())
+                {
+                    long count = source.ElementCount;
+                    var single = new float[count];
+                    var wide = new double[count];
+                    // Parameters (gamma, beta, bias) sit near one rather than near zero, so a
+                    // dropped post-scale or post-bias moves the output instead of hiding in it.
+                    double offset = source.Name == "x" ? 0.0 : 1.0;
+                    for (long e = 0; e < count; e++)
+                    {
+                        float v = (float)((((e * 37 + salt * 101) % 97) - 48) / 64.0 + offset);
+                        single[e] = v;
+                        wide[e] = v;
+                    }
+                    salt++;
+                    var buffer = runtime.AllocateBytes((nuint)(count * sizeof(float)));
+                    buffer.Upload<float>(single);
+                    it._named.Add(source.Name, buffer);
+                    it.HostSources.Add(source.Name, wide);
+                }
+
+                foreach (var pass in program.Passes)
+                {
+                    var output = runtime.AllocateBytes((nuint)(pass.Output.ElementCount * sizeof(float)));
+                    it._named.Add(pass.Output.Name, output);
+
+                    var tuned = ResolveTuned(runtime, pass, catalogName + "/" + pass.Name);
+                    it.Lowerings.Add(tuned.Label());
+                    IntPtr Operand(int input) => it._named[pass.Inputs[input].Name].Pointer;
+
+                    if (tuned.Split is { } plan)
+                    {
+                        var temp = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
+                        it._temporaries.Add(temp);
+
+                        var partialArgs = new IntPtr[plan.Partial.ParameterCount];
+                        int[] partialSources = CodegenSplitReduction.PartialOperandSources(pass);
+                        for (int i = 0; i < partialSources.Length; i++) partialArgs[i] = Operand(partialSources[i]);
+                        partialArgs[partialArgs.Length - 1] = temp.Pointer;
+
+                        var combineArgs = new IntPtr[plan.Combine.ParameterCount];
+                        combineArgs[0] = temp.Pointer;
+                        int[] combineSources = CodegenSplitReduction.CombineOperandSources(pass);
+                        for (int i = 0; i < combineSources.Length; i++) combineArgs[1 + i] = Operand(combineSources[i]);
+                        combineArgs[combineArgs.Length - 1] = output.Pointer;
+
+                        it.Add(runtime, tuned.Kernels[0], partialArgs);
+                        it.Add(runtime, tuned.Kernels[1], combineArgs);
+                    }
+                    else
+                    {
+                        var args = new IntPtr[pass.ParameterCount];
+                        for (int i = 0; i < pass.Inputs.Count; i++) args[i] = Operand(i);
+                        args[pass.Inputs.Count] = output.Pointer;
+                        it.Add(runtime, tuned.Kernels[0], args);
+                    }
+                }
+
+                it._graph = runtime.CaptureGraph(it.LaunchDirect);
+                return it;
+            }
+            catch
+            {
+                it.Dispose();
+                throw;
+            }
+        }
+
+        private void Add(DirectPtxRuntime runtime, ProgramKernel kernel, IntPtr[] args)
+        {
+            var module = runtime.LoadModule(kernel.Ptx, allowExperimentalJitFallback: true);
+            _modules.Add(module);
+            IntPtr fn = module.GetFunction(kernel.Spec.Name, out DirectPtxFunctionInfo info);
+            if (kernel.DynamicSharedMemoryBytes != 0)
+                module.SetMaxDynamicSharedMemory(fn, checked((int)kernel.DynamicSharedMemoryBytes));
+            RegistersPerThread = Math.Max(RegistersPerThread, info.RegistersPerThread);
+            _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY,
+                kernel.DynamicSharedMemoryBytes));
+        }
+
+        private void LaunchDirect()
+        {
+            foreach (var (module, fn, args, blocks, x, y, dynamicSharedMemoryBytes) in _steps)
+                LaunchSpec(module, fn, args, blocks, x, y, dynamicSharedMemoryBytes);
+        }
+
+        internal void Launch()
+        {
+            if (_graph is not null) _graph.Launch();
+            else LaunchDirect();
+        }
+
+        internal float[] Download(string name, long count)
+        {
+            var values = new float[count];
+            _named[name].Download<float>(values);
+            return values;
+        }
+
+        public void Dispose()
+        {
+            _graph?.Dispose();
+            foreach (var b in _named.Values) b.Dispose();
+            foreach (var b in _temporaries) b.Dispose();
+            foreach (var m in _modules) m.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Verifies each program at its bench shape -- the shape it is released at, for the same
+    /// reason the single kernels are -- against the fp64 chain. EVERY intermediate is
+    /// compared, not just the final output: a wrong statistic that the affine pass happens to
+    /// mask on this data would otherwise ship.
+    /// </summary>
+    private static void VerifyPrograms(IReadOnlyList<CodegenCatalogProgramEntry> entries)
+    {
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+
+        int passed = 0, failed = 0;
+        Console.WriteLine();
+        Console.WriteLine("CONVEYOR STAGE 1 (programs) - every pass output against the fp64 chain");
+        Console.WriteLine("tolerance " + Tolerance.ToString("E0", CultureInfo.InvariantCulture));
+        Console.WriteLine();
+        Console.WriteLine("program / output                    regs  kernels  lowering             max abs dev   result");
+        foreach (var entry in entries)
+        {
+            try
+            {
+                var program = entry.Bench;
+                using var launchable = ProgramLaunchable.Create(runtime, program, entry.Name);
+                launchable.Launch();
+                runtime.Synchronize();
+                var expected = program.Interpret(launchable.HostSources);
+
+                bool all = true;
+                for (int p = 0; p < program.Passes.Count; p++)
+                {
+                    var pass = program.Passes[p];
+                    long count = pass.Output.ElementCount;
+                    float[] actual = launchable.Download(pass.Output.Name, count);
+                    double[] want = expected[pass.Output.Name];
+                    double worst = 0;
+                    for (long e = 0; e < count; e++)
+                    {
+                        double diff = Math.Abs(actual[e] - want[e]);
+                        worst = Math.Max(worst, diff / Math.Max(1.0, Math.Abs(want[e])));
+                        if (double.IsNaN(actual[e])) worst = double.NaN;
+                        if (double.IsNaN(worst)) break;
+                    }
+                    bool ok = worst <= Tolerance && !double.IsNaN(worst);
+                    all &= ok;
+                    Console.WriteLine((entry.Name + " / " + pass.Output.Name).PadRight(36) +
+                        launchable.RegistersPerThread.ToString(CultureInfo.InvariantCulture).PadLeft(4) +
+                        launchable.KernelCount.ToString(CultureInfo.InvariantCulture).PadLeft(9) + "  " +
+                        launchable.Lowerings[p].PadRight(18) +
+                        worst.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
+                        (ok ? "PASS" : "FAIL").PadLeft(9));
+                }
+                if (all) passed++; else failed++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                Console.WriteLine(entry.Name.PadRight(36) + "   -        -  -                  -     ERROR");
+                Console.WriteLine("    " + ex.GetType().Name + ": " + ex.Message.Split('\n')[0]);
+            }
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("verify (programs): " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
+                          failed.ToString(CultureInfo.InvariantCulture) + " failed");
+        if (failed != 0 || passed != entries.Count)
+            throw new InvalidOperationException(
+                "Program verification failed closed: " +
+                passed.ToString(CultureInfo.InvariantCulture) + " of " +
+                entries.Count.ToString(CultureInfo.InvariantCulture) + " selected programs passed.");
+    }
+
+    /// <summary>Times each whole program as one graph replay, under the stage-3 protocol.</summary>
+    private static void BenchPrograms(IReadOnlyList<CodegenCatalogProgramEntry> entries)
+    {
+        GpuBenchmarkEnvironment.RequireIdleGpu("kernel-bench-programs-start");
+        using var runtime = OpenRuntime();
+        if (runtime is null) return;
+        var failures = new List<string>();
+
+        Console.WriteLine();
+        Console.WriteLine("CONVEYOR STAGE 3 (programs) - whole program per graph replay");
+        Console.WriteLine();
+        Console.WriteLine("program                           kernels    us/launch    p95/med   run spread   SM clock");
+        foreach (var entry in entries)
+        {
+            try
+            {
+                using var launchable = ProgramLaunchable.Create(runtime, entry.Bench, entry.Name);
+                var medians = new List<double>(Runs);
+                var tails = new List<double>(Runs);
+                int clockBefore = 0, clockAfter = 0;
+                bool converged = false;
+                for (int attempt = 0; attempt < StabilityAttempts; attempt++)
+                {
+                    clockBefore = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                    Dist d = Measure(runtime.Synchronize, launchable.Launch);
+                    clockAfter = GpuBenchmarkEnvironment.SampleSmClockMhz();
+                    medians.Add(d.Median);
+                    tails.Add(d.Median > 0 ? d.P95 / d.Median : double.NaN);
+                    if (medians.Count > Runs)
+                    {
+                        medians.RemoveAt(0);
+                        tails.RemoveAt(0);
+                    }
+                    double spreadNow = medians.Min() > 0 ? medians.Max() / medians.Min() - 1.0 : double.MaxValue;
+                    double drift = clockBefore > 0
+                        ? Math.Abs(clockAfter - clockBefore) / (double)clockBefore
+                        : double.MaxValue;
+                    if (medians.Count == Runs && spreadNow <= StableTimer.StableSpread && drift <= 0.02)
+                    {
+                        converged = true;
+                        break;
+                    }
+                }
+                double reported = medians.OrderBy(value => value).ElementAt(medians.Count / 2);
+                if (!converged)
+                    failures.Add(entry.Name + ": timing did not converge within " +
+                                 StabilityAttempts.ToString(CultureInfo.InvariantCulture) + " attempts");
+                Console.WriteLine(entry.Name.PadRight(34) +
+                    launchable.KernelCount.ToString(CultureInfo.InvariantCulture).PadLeft(7) +
+                    (converged ? (reported * 1000.0).ToString("F1", CultureInfo.InvariantCulture) : "UNSTABLE").PadLeft(13) +
+                    tails.Max().ToString("F2", CultureInfo.InvariantCulture).PadLeft(11) +
+                    ((medians.Max() / medians.Min() - 1.0) * 100).ToString("F1", CultureInfo.InvariantCulture).PadLeft(10) + "%   " +
+                    GpuBenchmarkEnvironment.DescribeClockDrift(clockBefore, clockAfter));
+            }
+            catch (Exception ex)
+            {
+                failures.Add(entry.Name + ": " + ex.Message.Split('\n')[0]);
+                Console.WriteLine(entry.Name.PadRight(34) + "  ERROR  " + ex.Message.Split('\n')[0]);
+            }
+        }
+
+        GpuBenchmarkEnvironment.RequireNoForeignCompute("kernel-bench-programs-end", afterSuite: true);
+        if (failures.Count != 0)
+            throw new InvalidOperationException(
+                failures.Count.ToString(CultureInfo.InvariantCulture) +
+                " selected program(s) produced no stable benchmark row. " + string.Join("; ", failures));
     }
 
     private static string Describe(int loopedAxes) =>
@@ -1148,7 +1473,7 @@ internal static class KernelConveyorTool
                               Runs + " stability window");
             Console.WriteLine("harness noise floor measured at 1.05%; differences under ~3% are not claimable");
             Console.WriteLine("protocol " + CodegenMeasurementProtocol.Stamp(
-                "RTX 3080, clocks " + GpuBenchmarkEnvironment.SampleSmClockMhz().ToString(CultureInfo.InvariantCulture) + " MHz"));
+                runtime.DeviceName + ", clocks " + GpuBenchmarkEnvironment.SampleSmClockMhz().ToString(CultureInfo.InvariantCulture) + " MHz"));
             Console.WriteLine();
             Console.WriteLine("kernel                              blocks    us/launch    p95/med   run spread   SM clock");
 

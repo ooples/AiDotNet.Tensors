@@ -93,7 +93,48 @@ public static class CodegenSplitReduction
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         return IsSplittable(spec.Reduce) &&
-            spec.SecondaryOutput is null && spec.SecondaryIndexExpr is null;
+            spec.SecondaryOutput is null && spec.SecondaryIndexExpr is null &&
+            spec.ExtraOutputs.Count == 0 && !AnyIndirection(spec);
+    }
+
+    private static bool AnyIndirection(CodegenKernelSpec spec)
+    {
+        foreach (var input in spec.Inputs) if (input.HasIndirection) return true;
+        return spec.Output.HasIndirection;
+    }
+
+    /// <summary>
+    /// The original operand each partial-pass input parameter reads, in parameter order:
+    /// the product operands, then the pre-bias when there is one. The temporary the pass
+    /// writes is its last parameter and is not listed.
+    /// </summary>
+    /// <remarks>
+    /// Every tool that launches a split binds through this, rather than re-deriving the
+    /// order. Five separate binders each knew only bias and scale, so any operand added to
+    /// the split later would have been passed as a null pointer by all five.
+    /// </remarks>
+    public static int[] PartialOperandSources(CodegenKernelSpec spec)
+    {
+        if (spec is null) throw new ArgumentNullException(nameof(spec));
+        var sources = new List<int>(spec.ProductInputs);
+        if (spec.PreBiasInput is { } preBias) sources.Add(preBias);
+        return sources.ToArray();
+    }
+
+    /// <summary>
+    /// The original operand each combine-pass input parameter after the temporary reads,
+    /// in parameter order (parameter 0 is the temporary; the output is last): bias, scale,
+    /// post-scale, post-bias, each when present.
+    /// </summary>
+    public static int[] CombineOperandSources(CodegenKernelSpec spec)
+    {
+        if (spec is null) throw new ArgumentNullException(nameof(spec));
+        var sources = new List<int>(4);
+        if (spec.BiasInput is { } bias) sources.Add(bias);
+        if (spec.ScaleInput is { } scale) sources.Add(scale);
+        if (spec.PostScaleInput is { } postScale) sources.Add(postScale);
+        if (spec.PostBiasInput is { } postBias) sources.Add(postBias);
+        return sources.ToArray();
     }
 
     /// <summary>Throws with the reason when a spec's reduction cannot be split.</summary>
@@ -105,6 +146,16 @@ public static class CodegenSplitReduction
             throw new NotSupportedException(
                 "A split maximum cannot preserve its argmax secondary output yet; the " +
                 "partial and combine temporaries currently carry values only.");
+
+        if (spec.ExtraOutputs.Count != 0)
+            throw new NotSupportedException(
+                "A split would have to rebuild extra outputs from the combined value; the " +
+                "combine pass does not carry them, so the spec stays single-pass.");
+
+        if (AnyIndirection(spec))
+            throw new NotSupportedException(
+                "An indirect index names its index tensor by parameter number, and the split " +
+                "renumbers parameters; a gathered operand stays single-pass.");
 
         throw new NotSupportedException(
             "A split needs an ASSOCIATIVE reduction, so the combine can apply the same " +
@@ -372,16 +423,17 @@ public static class CodegenSplitReduction
         // with coefficient c, it now also reads the chunk index with coefficient c*chunk.
         // Applied as an extra TERM rather than a substitution, so compound maps -- a
         // convolution window is `oh*stride + kh - pad` -- stay correct without unfolding.
-        var partialInputs = new CodegenTensorBinding[spec.ProductInputs.Count];
-        var partialProduct = new int[spec.ProductInputs.Count];
-        for (int i = 0; i < spec.ProductInputs.Count; i++)
+        int[] partialSources = PartialOperandSources(spec);
+        var partialInputs = new CodegenTensorBinding[partialSources.Length];
+        for (int i = 0; i < partialSources.Length; i++)
         {
-            var b = spec.Inputs[spec.ProductInputs[i]];
+            var b = spec.Inputs[partialSources[i]];
             partialInputs[i] = new CodegenTensorBinding(
                 i, b.Name, ToArray(b.Shape),
-                AddChunkTerm(b.Map, reductionAxis, chunkAxis, chunk));
-            partialProduct[i] = i;
+                AddChunkTerm(b.Map, reductionAxis, chunkAxis, chunk),
+                elementType: b.ElementType);
         }
+        var partialProduct = ProductPositions(spec);
 
         int rank = spec.Output.Shape.Count;
         var partialShape = new int[rank + 1];
@@ -398,7 +450,9 @@ public static class CodegenSplitReduction
             spec.Name + "_partial", partialSpace, partialInputs,
             new CodegenTensorBinding(partialInputs.Length, "partial", partialShape, partialMap, isOutput: true),
             partialProduct,
-            AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None);
+            AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None,
+            preReduce: spec.PreReduce, preBiasInput: PartialPreBias(spec),
+            preBiasScale: spec.PreBiasScale);
 
         return (partial, BuildCombine(spec, partialShape, new[] { splitFactor }));
     }
@@ -476,15 +530,18 @@ public static class CodegenSplitReduction
         // apply once to the finished sum, so a partial pass that carried them would add
         // the bias once per partial; they move to the combine instead. Binding only what
         // the pass reads also keeps its parameter list free of unused pointers.
-        var partialInputs = new CodegenTensorBinding[spec.ProductInputs.Count];
-        var partialProduct = new int[spec.ProductInputs.Count];
-        for (int i = 0; i < spec.ProductInputs.Count; i++)
+        // The per-element pre-bias and pre-reduction DO travel with the partial: they act
+        // on each term before it is summed, so on the combine they would act on partial
+        // sums instead -- exp of a sum is not a sum of exps.
+        int[] partialSources = PartialOperandSources(spec);
+        var partialInputs = new CodegenTensorBinding[partialSources.Length];
+        for (int i = 0; i < partialSources.Length; i++)
         {
-            var b = spec.Inputs[spec.ProductInputs[i]];
+            var b = spec.Inputs[partialSources[i]];
             partialInputs[i] = new CodegenTensorBinding(
-                i, b.Name, ToArray(b.Shape), ToArray(b.Map));
-            partialProduct[i] = i;
+                i, b.Name, ToArray(b.Shape), ToArray(b.Map), elementType: b.ElementType);
         }
+        var partialProduct = ProductPositions(spec);
 
         int rank = spec.Output.Shape.Count;
         var partialShape = new int[rank + promote.Count];
@@ -508,12 +565,26 @@ public static class CodegenSplitReduction
         // has nothing left to reduce and must not claim it does.
         var partial = new CodegenKernelSpec(
             spec.Name + "_partial", partialSpace, partialInputs, partialOutput, partialProduct,
-            AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None);
+            AnyReductionLeft(partialSpace) ? spec.Reduce : CodegenReduceKind.None,
+            preReduce: spec.PreReduce, preBiasInput: PartialPreBias(spec),
+            preBiasScale: spec.PreBiasScale);
 
         var promotedExtents = new int[promote.Count];
         for (int p = 0; p < promote.Count; p++) promotedExtents[p] = axes[promote[p]].Extent;
         return (partial, BuildCombine(spec, partialShape, promotedExtents));
     }
+
+    /// <summary>Partial-pass positions of the product operands: the first N parameters.</summary>
+    private static int[] ProductPositions(CodegenKernelSpec spec)
+    {
+        var positions = new int[spec.ProductInputs.Count];
+        for (int i = 0; i < positions.Length; i++) positions[i] = i;
+        return positions;
+    }
+
+    /// <summary>Partial-pass position of the pre-bias: straight after the product operands.</summary>
+    private static int? PartialPreBias(CodegenKernelSpec spec) =>
+        spec.PreBiasInput.HasValue ? spec.ProductInputs.Count : null;
 
     /// <summary>
     /// Builds the pass that sums the partials back down and applies the epilogue.
@@ -567,6 +638,19 @@ public static class CodegenSplitReduction
             combineInputs.Add(Rebind(spec.Inputs[spec.ScaleInput.Value],
                 combineInputs.Count, originalToCombine, "scale"));
         }
+        int? combinePostScale = null, combinePostBias = null;
+        if (spec.PostScaleInput.HasValue)
+        {
+            combinePostScale = combineInputs.Count;
+            combineInputs.Add(Rebind(spec.Inputs[spec.PostScaleInput.Value],
+                combineInputs.Count, originalToCombine, "post-scale"));
+        }
+        if (spec.PostBiasInput.HasValue)
+        {
+            combinePostBias = combineInputs.Count;
+            combineInputs.Add(Rebind(spec.Inputs[spec.PostBiasInput.Value],
+                combineInputs.Count, originalToCombine, "post-bias"));
+        }
 
         var combineOutMap = new CodegenAffineExpr[rank];
         for (int d = 0; d < rank; d++) combineOutMap[d] = CodegenAffineExpr.Axis(d);
@@ -584,7 +668,11 @@ public static class CodegenSplitReduction
             // The constant scale is part of the epilogue and moves with it. Leaving it on
             // the partial pass would divide once per partial and then again nowhere -- a
             // mean split four ways would come out four times too small.
-            reduceScale: spec.ReduceScale);
+            reduceScale: spec.ReduceScale,
+            // The offset follows the scale for the same reason: added on every partial it
+            // would be counted once per split.
+            reduceOffset: spec.ReduceOffset,
+            postScaleInput: combinePostScale, postBiasInput: combinePostBias);
     }
 
     /// <summary>

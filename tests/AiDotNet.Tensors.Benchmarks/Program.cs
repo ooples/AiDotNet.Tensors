@@ -555,6 +555,12 @@ class Program
             return;
         }
 
+        if (args.Length > 0 && args[0] == "--kernel-static-rows")
+        {
+            KernelConveyorTool.Run("static-rows", args.Skip(1).ToArray());
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--kernel-dump")
         {
             KernelConveyorTool.Run("dump", args.Skip(1).ToArray());
