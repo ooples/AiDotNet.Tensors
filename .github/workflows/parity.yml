@@ -81,6 +81,30 @@ jobs:
             --logger "console;verbosity=detailed" | tee "$RUNNER_TEMP/ratchet.log"
           exit "${PIPESTATUS[0]}"
 
+      # TEMPORARY (#1055 EPYC CNN gap): a CPU-sampling EventPipe trace of the CNN case on this runner.
+      - name: Profile CNN (temporary)
+        if: always()
+        env:
+          DOTNET_EnableEventPipe: '1'
+          DOTNET_EventPipeOutputPath: ${{ runner.temp }}/cnn-{pid}.nettrace
+          DOTNET_EventPipeConfig: 'Microsoft-DotNETCore-SampleProfiler:0:5,Microsoft-Windows-DotNETRuntime:0x14C14FCCBD:4'
+          DOTNET_EventPipeCircularMB: '2048'
+        run: |
+          lscpu | head -30 > "$RUNNER_TEMP/lscpu.txt" || true
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0             --filter "FullyQualifiedName~HeadToHeadNetworkTests.Cnn_Cpu_IsAsFastAsPyTorch"             --logger "console;verbosity=detailed" > "$RUNNER_TEMP/cnn-profile.log" 2>&1 || true
+          ls -la "$RUNNER_TEMP"/*.nettrace || true
+
+      - name: Upload CNN profile (temporary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnn-profile-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/*.nettrace
+            ${{ runner.temp }}/cnn-profile.log
+            ${{ runner.temp }}/lscpu.txt
+          if-no-files-found: warn
+
       - name: Summary
         if: always()
         run: |
