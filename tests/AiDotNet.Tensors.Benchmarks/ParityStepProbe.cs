@@ -130,7 +130,7 @@ internal static class ParityStepProbe
         }
         var tail = times.Skip(steps / 3).OrderBy(t => t).ToArray();
         Console.WriteLine(FormattableString.Invariant(
-            $"PARITY-STEP {network} steps={steps} threads={CpuParallelSettings.MaxDegreeOfParallelism} min_ms={tail[0]:F3} median_ms={tail[tail.Length / 2]:F3}"));
+            $"PARITY-STEP {network} steps={steps} threads={CpuParallelSettings.MaxDegreeOfParallelism} vector512={System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated} avx512f={System.Runtime.Intrinsics.X86.Avx512F.IsSupported} min_ms={tail[0]:F3} median_ms={tail[tail.Length / 2]:F3}"));
         return 0;
     }
 }
