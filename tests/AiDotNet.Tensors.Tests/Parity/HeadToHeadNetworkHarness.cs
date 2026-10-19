@@ -12,6 +12,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Engines.Optimization.Optimizers;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Tests.Parity;
@@ -402,6 +403,23 @@ internal static class HeadToHeadNetworkHarness
             if (gpu is not null) runs[0] = ("eager (phase-synchronised)", phased);
             if (gpu is not null) runs.Add(("eager", TrainTensors(spec, work, gpu, TensorsMode.Eager)));
             runs.Add(("compiled", TrainTensors(spec, work, gpu, TensorsMode.Compiled)));
+            // The thread budgets the PyTorch runner tries: its default (the physical cores, as ours) and every logical
+            // core. SMT siblings help some networks on either side, so each side gets both.
+            int defaultThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+            if (gpu is null && Environment.ProcessorCount > defaultThreads)
+            {
+                int logical = Environment.ProcessorCount;
+                CpuParallelSettings.MaxDegreeOfParallelism = logical;
+                try
+                {
+                    runs.Add(($"eager@{logical}threads", TrainTensors(spec, work, gpu, TensorsMode.Eager)));
+                    runs.Add(($"compiled@{logical}threads", TrainTensors(spec, work, gpu, TensorsMode.Compiled)));
+                }
+                finally
+                {
+                    CpuParallelSettings.MaxDegreeOfParallelism = defaultThreads;
+                }
+            }
 
             var modes = runs.Select(r =>
             {
