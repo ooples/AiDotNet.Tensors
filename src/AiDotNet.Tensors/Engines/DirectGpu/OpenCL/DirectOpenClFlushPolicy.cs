@@ -25,16 +25,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         [ThreadStatic] private static int t_interval;
 
         /// <summary>
-        /// Counts one command submitted on this thread; true when the queue should be flushed now.
+        /// Counts one command submitted on this thread; true when the queue should be flushed now. The ramp advances
+        /// only on <see cref="OnFlushed"/>, so a flush that failed is due again at the next command.
         /// </summary>
-        internal static bool OnSubmitted()
+        internal static bool OnSubmitted() => ++t_unflushed >= Math.Max(1, t_interval);
+
+        /// <summary>The queue was flushed: the count restarts and the interval doubles, up to the cap.</summary>
+        internal static void OnFlushed()
         {
-            int interval = Math.Max(1, t_interval);
-            if (++t_unflushed < interval)
-                return false;
             t_unflushed = 0;
-            t_interval = Math.Min(interval * 2, MaxCommandsPerFlush);
-            return true;
+            t_interval = Math.Min(Math.Max(1, t_interval) * 2, MaxCommandsPerFlush);
         }
 
         /// <summary>The host waited for the device on this thread: the device is idle, so restart the ramp.</summary>

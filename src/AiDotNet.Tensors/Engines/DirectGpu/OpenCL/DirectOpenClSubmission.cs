@@ -152,7 +152,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             for (int i = 0; i < memories.Count; i++)
                 memories[i].LastSubmissionQueue = destinationQueue;
             if (DirectOpenClFlushPolicy.OnSubmitted())
-                OpenClNativeBindings.Flush(destinationQueue);
+            {
+                int flushError = OpenClNativeBindings.Flush(destinationQueue);
+                if (flushError != OpenClNativeBindings.CL_SUCCESS)
+                    throw new InvalidOperationException($"clFlush failed after a submission: {flushError}");
+                DirectOpenClFlushPolicy.OnFlushed();
+            }
         }
 
         internal readonly struct SubmissionWaitList : IDisposable

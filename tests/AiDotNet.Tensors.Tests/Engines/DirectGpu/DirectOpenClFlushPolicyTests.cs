@@ -14,7 +14,11 @@ public class DirectOpenClFlushPolicyTests
     {
         var points = new List<int>();
         for (int i = 1; i <= commands; i++)
-            if (DirectOpenClFlushPolicy.OnSubmitted()) points.Add(i);
+            if (DirectOpenClFlushPolicy.OnSubmitted())
+            {
+                points.Add(i);
+                DirectOpenClFlushPolicy.OnFlushed();
+            }
         return points;
     }
 
@@ -33,6 +37,17 @@ public class DirectOpenClFlushPolicyTests
         FlushPoints(20);
         DirectOpenClFlushPolicy.OnHostWaited();
         Assert.Equal(new[] { 1, 3, 7 }, FlushPoints(7));
+    }
+
+    [Fact]
+    public void A_flush_that_failed_is_due_again_and_does_not_advance_the_ramp()
+    {
+        DirectOpenClFlushPolicy.OnHostWaited();
+        Assert.True(DirectOpenClFlushPolicy.OnSubmitted());
+        // clFlush failed: OnFlushed is not called, so the next command is due again at the same interval.
+        Assert.True(DirectOpenClFlushPolicy.OnSubmitted());
+        DirectOpenClFlushPolicy.OnFlushed();
+        Assert.Equal(new[] { 2, 6 }, FlushPoints(6));
     }
 
     [Fact]
