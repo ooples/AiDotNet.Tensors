@@ -2374,10 +2374,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Fail-closed direct-PTX fast path (issue #836) for the standard alpha=1/beta=0
         // C=A@B case; returns false until a shape is GPU-promoted, then falls to cuBLAS.
         if (alpha == 1.0f && beta == 0.0f && TryDirectPtxGemm(A, B, C, M, K, N)) return;
-        if (TrySkinnyGemm(A, B, C, M, N, K, transB: false, alpha, beta)) return;
-        if (TrySmallGemm(A, B, C, M, N, K, transA: false, transB: false, alpha, beta)) return;
-        // #1265: a shape tuned and measured faster than cuBLAS in the current math mode runs its generated kernel.
+        // #1265: a shape tuned and measured faster than cuBLAS in the current math mode runs its generated kernel. A
+        // measured verdict comes before the narrow kernels' shape heuristics, which otherwise took the shape first.
         if (TryRoutedGemm(A, B, C, M, N, K, alpha, beta)) return;
+        if (TrySkinnyGemm(A, B, C, M, N, K, transB: false, alpha, beta)
+            || TrySmallGemm(A, B, C, M, N, K, transA: false, transB: false, alpha, beta))
+        {
+            System.Threading.Volatile.Write(ref _lastGemmDispatchPath, (int)CudaGemmDispatchPath.NarrowGemm);
+            return;
+        }
         CublasGemm(A, B, C, M, N, K, alpha, beta);
     }
 
