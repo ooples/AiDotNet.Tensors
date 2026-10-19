@@ -55,9 +55,16 @@ internal static class KernelConveyorTool
     /// </remarks>
     private static bool _forceInputStaging;
 
+    /// <summary>
+    /// Runs row-shaped programs as their separate passes instead of one fused kernel, for
+    /// a paired comparison of the two lowerings.
+    /// </summary>
+    private static bool _noRowFusion;
+
     internal static void Run(string stage, string[] args)
     {
         _forceInputStaging = args.Contains("--input-staging", StringComparer.Ordinal);
+        _noRowFusion = args.Contains("--no-row-fusion", StringComparer.Ordinal);
         string selector = KernelToolArgs.Selector(args);
         if (stage == "static-rows")
         {
@@ -944,6 +951,30 @@ internal static class KernelConveyorTool
                     buffer.Upload<float>(single);
                     it._named.Add(source.Name, buffer);
                     it.HostSources.Add(source.Name, wide);
+                }
+
+                // ROW FUSION FIRST: a row-shaped program is one kernel that reads its sources
+                // once. The passes below are the lowering for everything else.
+                if (!_noRowFusion && CodegenRowFusion.TryPlan(program, out _) is { } fused)
+                {
+                    foreach (var pass in program.Passes)
+                        it._named.Add(pass.Output.Name,
+                            runtime.AllocateBytes((nuint)(pass.Output.ElementCount * sizeof(float))));
+                    var emitter = new PtxAffineEmitter();
+                    string kernelName = "rowfused_" + catalogName;
+                    string ptx = emitter.EmitRowProgram(
+                        fused, kernelName, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                    var args = new IntPtr[fused.Parameters.Count];
+                    for (int i = 0; i < args.Length; i++) args[i] = it._named[fused.Parameters[i]].Pointer;
+                    var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
+                    it._modules.Add(module);
+                    IntPtr fn = module.GetFunction(kernelName, out DirectPtxFunctionInfo info);
+                    it.RegistersPerThread = info.RegistersPerThread;
+                    it._steps.Add((module, fn, args, emitter.LaunchBlocks,
+                        (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, 0u));
+                    foreach (var _ in program.Passes) it.Lowerings.Add("row-fused x1");
+                    it._graph = runtime.CaptureGraph(it.LaunchDirect);
+                    return it;
                 }
 
                 foreach (var pass in program.Passes)
