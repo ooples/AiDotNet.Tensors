@@ -1515,7 +1515,17 @@ public partial class DirectGpuTensorEngine
         if (x is null) throw new ArgumentNullException(nameof(x));
         if (activation == FusedActivationType.None)
             return BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (mean is null) throw new ArgumentNullException(nameof(mean));
+        if (variance is null) throw new ArgumentNullException(nameof(variance));
         if (IsTapeActive<T>() || x.Rank != 4 || !TryGetBackend(out var backend))
+            return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
+        // An empty tensor or a parameter shorter than the channel count goes to the base implementation, which
+        // validates it: the kernel would divide by zero or read past a parameter.
+        int channelCount = x.Shape._dims[1];
+        if (x.Length == 0 || gamma.Length < channelCount || beta.Length < channelCount || mean.Length < channelCount
+            || variance.Length < channelCount)
             return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
 
         var bufOut = default(OwnedBuffer);

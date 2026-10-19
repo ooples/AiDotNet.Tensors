@@ -41,8 +41,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null) return;
             var native = new UIntPtr[values.Length];
             for (int i = 0; i < values.Length; i++) native[i] = (UIntPtr)values[i];
-            var status = ClBlastNative.OverrideParameters(_context.Device, kernel, ClBlastNative.PrecisionSingle,
-                (UIntPtr)names.Length, names, native);
+            ClBlastNative.StatusCode status;
+            try
+            {
+                status = ClBlastNative.OverrideParameters(_context.Device, kernel, ClBlastNative.PrecisionSingle,
+                    (UIntPtr)names.Length, names, native);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                // An older CLBlast without CLBlastOverrideParameters keeps its own database parameters.
+                return;
+            }
             if (status != ClBlastNative.StatusCode.Success)
                 System.Diagnostics.Trace.TraceWarning($"CLBlast {kernel} parameter override rejected: {status}");
         }

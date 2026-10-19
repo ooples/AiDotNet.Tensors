@@ -15,6 +15,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
             if (ClBlastNative.IsAvailable)
             {
+                EnsureNativeClBlastTuned();
                 IntPtr queue = _context.CommandQueue;
                 var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
                 ClBlastNative.StatusCode status;

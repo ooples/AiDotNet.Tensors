@@ -121,7 +121,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // Transformed filters by weight identity (ConvWeightIdentity): inference reuses them, where every call
         // re-transformed the weights (a 512x512 filter writes 37.7 MB of U: 0.3 ms of a 1.9 ms convolution). Bounded,
         // since U is four times the weights; past the budget a convolution transforms into scratch as before.
-        private const long F43FilterCacheBudgetBytes = 768L << 20;
+        // An eighth of device memory, at most 768 MiB: the buffer pool takes a quarter, and this cache is not drained on
+        // out-of-memory (an entry goes only with its weights).
+        private long F43FilterCacheBudgetBytes => Math.Min(768L << 20, GlobalMemoryBytes / 8);
         private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> _f43Filters = new();
         private readonly object _f43FilterLock = new();
         private long _f43FilterBytes;

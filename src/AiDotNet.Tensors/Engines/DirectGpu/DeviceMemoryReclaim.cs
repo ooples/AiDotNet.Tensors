@@ -116,8 +116,15 @@ internal static class DeviceMemoryReclaim
     /// </summary>
     internal static void OnDeviceRelease(long bytes)
     {
-        long after = Interlocked.Add(ref s_driverBytesSinceCollection, -bytes);
-        if (after < 0) Interlocked.CompareExchange(ref s_driverBytesSinceCollection, 0, after);
+        // Subtract and floor at zero in one atomic update: a negative counter would hide later allocations.
+        long current = Volatile.Read(ref s_driverBytesSinceCollection);
+        while (true)
+        {
+            long next = Math.Max(0, current - bytes);
+            long observed = Interlocked.CompareExchange(ref s_driverBytesSinceCollection, next, current);
+            if (observed == current) return;
+            current = observed;
+        }
     }
 
     // Buffers handed out since the last collection this class ran, pool hits included.

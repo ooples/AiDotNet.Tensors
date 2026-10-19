@@ -2745,6 +2745,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (ClBlastNative.IsAvailable)
             {
+                EnsureNativeClBlastTuned();
                 IntPtr queue = _context.CommandQueue;
                 var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
 
@@ -6193,19 +6194,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     waits.EnqueueBridgeMarker(queue);
                     // One strided-batched launch: the per-item launches it replaced cost more than the arithmetic on the
                     // late, small-tile Winograd GEMMs (36 launches of a 512 x 49 x 512 product).
-                    status = ClBlastNative.SgemmStridedBatched(
-                        ClBlastNative.Layout.RowMajor,
-                        ClBlastNative.Transpose.No,
-                        ClBlastNative.Transpose.No,
-                        (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
-                        alpha,
-                        bufferA.Handle, UIntPtr.Zero, (UIntPtr)K, (UIntPtr)((long)M * K),
-                        bufferB.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)K * N),
-                        beta,
-                        bufferC.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)M * N),
-                        (UIntPtr)batchCount,
-                        ref queue,
-                        IntPtr.Zero);
+                    try
+                    {
+                        status = ClBlastNative.SgemmStridedBatched(
+                            ClBlastNative.Layout.RowMajor,
+                            ClBlastNative.Transpose.No,
+                            ClBlastNative.Transpose.No,
+                            (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
+                            alpha,
+                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K, (UIntPtr)((long)M * K),
+                            bufferB.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)K * N),
+                            beta,
+                            bufferC.Handle, UIntPtr.Zero, (UIntPtr)N, (UIntPtr)((long)M * N),
+                            (UIntPtr)batchCount,
+                            ref queue,
+                            IntPtr.Zero);
+                    }
+                    catch (EntryPointNotFoundException)
+                    {
+                        // A CLBlast build without the strided-batched entry point: the tiled kernel runs instead.
+                        return false;
+                    }
                     if (status == ClBlastNative.StatusCode.Success) launched = batchCount;
                     if (launched > 0)
                         DirectOpenClSubmission.CommitLocked(queue, memories);
@@ -8546,28 +8555,9 @@ KERNEL VARIANTS (A/B testing):
             // kernel's work-group per channel (which left most of the device idle on early, low-channel
             // layers: 0.59 ms vs 0.19 ms for an element-wise pass over a [1,256,56,56] activation).
             // Neither route writes saveMean/saveInvVar in inference.
-            int inferenceTotal = batch * channels * spatialSize;
-            if (!training && inferenceTotal > 0
-                && _kernelCache.TryGetValue("batchnorm_inference", out var inference))
-            {
-                uint iarg = 0;
-                inference.SetArg(iarg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-                inference.SetArg(iarg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-                inference.SetArg(iarg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-                inference.SetArg(iarg++, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
-                inference.SetArg(iarg++, ((DirectOpenClGpuBuffer)runningMean).Buffer.Handle);
-                inference.SetArg(iarg++, ((DirectOpenClGpuBuffer)runningVar).Buffer.Handle);
-                inference.SetArg(iarg++, batch);
-                inference.SetArg(iarg++, channels);
-                inference.SetArg(iarg++, spatialSize);
-                inference.SetArg(iarg++, epsilon);
-                inference.SetArg(iarg++, 0);
-                int local = Math.Min(256, inferenceTotal);
-                local = (int)Math.Pow(2, Math.Floor(Math.Log(Math.Max(1, local), 2)));
-                int global = ((inferenceTotal + local - 1) / local) * local;
-                inference.Execute1D(global, local);
+            if (!training && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean, runningVar, batch,
+                    channels, spatialSize, epsilon, relu: false))
                 return;
-            }
 
             var k = _kernelCache["batchnorm_forward"];
             uint arg = 0;
@@ -8594,6 +8584,33 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(channels * bnLocalSize, bnLocalSize);
         }
 
+        // batchnorm_inference: one work item per element, the running statistics, ReLU when relu is set. False (nothing
+        // launched) when the kernel did not compile or the element count does not fit an int.
+        private bool TryLaunchBatchNormInference(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+            IGpuBuffer runningMean, IGpuBuffer runningVar, int batch, int channels, int spatialSize, float epsilon, bool relu)
+        {
+            long total = (long)batch * channels * spatialSize;
+            if (total <= 0 || total > int.MaxValue || !_kernelCache.TryGetValue("batchnorm_inference", out var kernel))
+                return false;
+            uint arg = 0;
+            kernel.SetArg(arg++, BufferHandle(input));
+            kernel.SetArg(arg++, BufferHandle(output));
+            kernel.SetArg(arg++, BufferHandle(gamma));
+            kernel.SetArg(arg++, BufferHandle(beta));
+            kernel.SetArg(arg++, BufferHandle(runningMean));
+            kernel.SetArg(arg++, BufferHandle(runningVar));
+            kernel.SetArg(arg++, batch);
+            kernel.SetArg(arg++, channels);
+            kernel.SetArg(arg++, spatialSize);
+            kernel.SetArg(arg++, epsilon);
+            kernel.SetArg(arg++, relu ? 1 : 0);
+            // The largest power of two within 256 and the device work-group limit.
+            int local = (int)Math.Min(256UL, Math.Max(1UL, _maxWorkGroupSize));
+            local = 1 << (int)Math.Floor(Math.Log(local, 2));
+            kernel.Execute1D(RoundUpToMultiple((int)total, local), local);
+            return true;
+        }
+
         public bool TryFusedBatchNormActivation(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
             IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
             int batch, int channels, int spatialSize, float epsilon, float momentum, bool training,
@@ -8604,25 +8621,9 @@ KERNEL VARIANTS (A/B testing):
 
             // ReLU through the element-wise inference kernel: batchnorm_relu measured slower than batch norm then a
             // separate ReLU (0.114 vs 0.096 ms on [1,256,56,56]), where this one-pass form beats both.
-            int reluTotal = batch * channels * spatialSize;
-            if (activation == FusedActivationType.ReLU && reluTotal > 0
-                && _kernelCache.TryGetValue("batchnorm_inference", out var reluKernel))
-            {
-                uint rarg = 0;
-                reluKernel.SetArg(rarg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-                reluKernel.SetArg(rarg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-                reluKernel.SetArg(rarg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-                reluKernel.SetArg(rarg++, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
-                reluKernel.SetArg(rarg++, ((DirectOpenClGpuBuffer)runningMean).Buffer.Handle);
-                reluKernel.SetArg(rarg++, ((DirectOpenClGpuBuffer)runningVar).Buffer.Handle);
-                reluKernel.SetArg(rarg++, batch);
-                reluKernel.SetArg(rarg++, channels);
-                reluKernel.SetArg(rarg++, spatialSize);
-                reluKernel.SetArg(rarg++, epsilon);
-                reluKernel.SetArg(rarg++, 1);
-                reluKernel.Execute1D(RoundUpToMultiple(reluTotal, 256), 256);
+            if (activation == FusedActivationType.ReLU && TryLaunchBatchNormInference(input, output, gamma, beta, runningMean,
+                    runningVar, batch, channels, spatialSize, epsilon, relu: true))
                 return true;
-            }
 
             string kernelName = activation switch
             {

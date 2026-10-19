@@ -977,7 +977,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void Helpers.IRecycledArrayListener.OnArrayRecycled(object array)
     {
-        if (IsDisposed || !Helpers.HostSync.AnyExists) return;
+        if (IsDisposed) return;
+        // The new owner of a recycled array is not the registered tensor that recorded a persistent role for it.
+        _pendingPersistentRoles.Remove(array);
+        if (!Helpers.HostSync.AnyExists) return;
         if (Helpers.HostSync.IsPending(array))
             Helpers.HostSync.Remove(array);
         // The persistent weight cache and its version maps are keyed by the array too. A new owner's version can equal

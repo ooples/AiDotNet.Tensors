@@ -90,6 +90,7 @@ public class OpenClInferenceKernelTests
     public void Batch_norm_inference_matches_the_cpu_reference(bool relu)
     {
         using var backend = RequireBackend();
+        Assert.True(backend.HasCompiledKernel("batchnorm_inference"), "batchnorm_inference did not compile.");
         var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(17);
         int batch = 2, channels = 5, spatial = 37;
         var x = Fill(rng, batch * channels * spatial);
@@ -122,13 +123,26 @@ public class OpenClInferenceKernelTests
         }
     }
 
+    // A GPU engine on the OpenCL backend. Only an unavailable GPU skips: any other construction failure fails the test.
     private static DirectGpuTensorEngine RequireEngine()
     {
         Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
-        DirectGpuTensorEngine? engine = null;
-        try { engine = new DirectGpuTensorEngine(); } catch (Exception) { }
-        Skip.If(engine is null || !engine.SupportsGpu, "No GPU engine.");
-        return engine ?? throw new InvalidOperationException("unreachable");
+        DirectGpuTensorEngine engine;
+        try
+        {
+            engine = new DirectGpuTensorEngine();
+        }
+        catch (GpuCapabilityUnavailableException)
+        {
+            Skip.If(true, "No GPU engine.");
+            throw;
+        }
+        if (!engine.SupportsGpu || engine.GetBackend() is not OpenClBackend)
+        {
+            engine.Dispose();
+            Skip.If(true, "The GPU engine did not select the OpenCL backend.");
+        }
+        return engine;
     }
 
     private static Tensor<float> Random(Random rng, params int[] shape)
@@ -152,7 +166,7 @@ public class OpenClInferenceKernelTests
     [SkippableFact]
     public void Registered_weight_cached_by_matmul_sees_host_writes()
     {
-        var gpu = RequireEngine();
+        using var gpu = RequireEngine();
         var cpu = new CpuEngine();
         var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(19);
         var w = Random(rng, 48, 40);
@@ -175,7 +189,7 @@ public class OpenClInferenceKernelTests
     [SkippableFact]
     public void Winograd_filter_cache_sees_host_writes()
     {
-        var gpu = RequireEngine();
+        using var gpu = RequireEngine();
         var cpu = new CpuEngine();
         var previous = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.OverrideFor(
             AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.Conv2DForward);
@@ -203,7 +217,7 @@ public class OpenClInferenceKernelTests
     [InlineData(FusedActivationType.ReLU)]
     public void Engine_batch_norm_inference_with_activation_matches_cpu(FusedActivationType activation)
     {
-        var gpu = RequireEngine();
+        using var gpu = RequireEngine();
         var cpu = new CpuEngine();
         var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(29);
         var x = Random(rng, 2, 6, 9, 7);
