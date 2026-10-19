@@ -104,6 +104,9 @@ public sealed partial class CudaBackend
         private uint _initialApplied;
         private MultiTensorTable? _gradientTable;   // private to this graph (see PrepareOptimizer)
         private MultiTensorTable? _adamTable;
+        private readonly MultiTensorTable?[] _pingPong = new MultiTensorTable?[2];   // A -> B, B -> A (PrepareSgdPingPong)
+        private IGpuBuffer? _pingPongPartials;   // a double per chunk
+        private IGpuBuffer? _pingPongDone;       // the kernel's finished-block counter, zero between launches
         private bool _disposed;
 
         public CudaGraphStepIo(CudaBackend backend, IReadOnlyList<IGpuBuffer> inputs, IReadOnlyList<int> lengths)
@@ -282,6 +285,38 @@ public sealed partial class CudaBackend
             _backend.SgdMultiTensorImpl(parameters, gradients, sizes, 0f, weightDecay, _guard!.Handle, _dynamicScalars!.Handle);
         }
 
+        public void PrepareSgdPingPong(IReadOnlyList<IGpuBuffer> first, IReadOnlyList<IGpuBuffer> second,
+            IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes)
+        {
+            EnsureOptimizerBuffers();
+            DisposePingPong();
+            _pingPong[0] = _backend.BuildPingPongTable(first, second, gradients, sizes);
+            _pingPong[1] = _backend.BuildPingPongTable(second, first, gradients, sizes);
+            _pingPongPartials = _backend.AllocateBuffer(Math.Max(2, 2 * _pingPong[0]!.TotalChunks));
+            _pingPongDone = _backend.AllocateBuffer(2);
+            ((IDeviceZeroFill)_backend).ZeroBuffer(_pingPongDone, 2);
+        }
+
+        public void CaptureSgdPingPongUpdate(int direction, float weightDecay)
+        {
+            var table = _pingPong[direction & 1]
+                ?? throw new InvalidOperationException("PrepareSgdPingPong was not called before the capture.");
+            // The update and the gradients' sum of squares in one pass, then the undo of a non-finite step.
+            _backend.SgdPingPongUpdate(table, weightDecay, _dynamicScalars!.Handle, _pingPongPartials!, _pingPongDone!, _guard!.Handle);
+            _backend.SgdPingPongRevert(table, _guard.Handle);
+        }
+
+        public bool CapturedGraphReads(IntPtr graphExec, IReadOnlyList<IGpuBuffer> buffers)
+            => _backend.CapturedGraphUses(graphExec, buffers);
+
+        private void DisposePingPong()
+        {
+            _pingPong[0]?.Dispose(); _pingPong[0] = null;
+            _pingPong[1]?.Dispose(); _pingPong[1] = null;
+            _pingPongPartials?.Dispose(); _pingPongPartials = null;
+            _pingPongDone?.Dispose(); _pingPongDone = null;
+        }
+
         public void CaptureAdamUpdate(bool decoupled, IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
             IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments, IReadOnlyList<int> sizes,
             float beta1, float beta2, float epsilon, float weightDecay)
@@ -302,7 +337,7 @@ public sealed partial class CudaBackend
             CudaNativeBindings.cuStreamQuery(_backend._mainStream);
         }
 
-        public void CapturePrologue()
+        public void CapturePrologue(int parity)
         {
             if (!_backend._kernelCache.TryGetValue("step_io_prologue", out var prologueKernel))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: step_io_prologue");
@@ -381,6 +416,7 @@ public sealed partial class CudaBackend
             _guard?.Dispose();
             _gradientTable?.Dispose();
             _adamTable?.Dispose();
+            DisposePingPong();
             if (_results != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_results);
             _results = IntPtr.Zero;
             _state?.Dispose();

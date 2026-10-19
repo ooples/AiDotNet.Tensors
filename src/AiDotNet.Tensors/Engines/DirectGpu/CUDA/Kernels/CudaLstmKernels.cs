@@ -45,6 +45,12 @@ __device__ __forceinline__ float sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+// The hardware exp and divide (a few ulp): the shuffle forward's activations sit on the per-step critical path. For
+// x < -88, __expf(-x) is inf and __fdividef(1, inf) is 0, sigmoid's limit.
+__device__ __forceinline__ float lstm_fast_sigmoid(float x) {
+    return __fdividef(1.0f, 1.0f + __expf(-x));
+}
+
 __device__ __forceinline__ float sigmoid_derivative(float sigmoid_output) {
     return sigmoid_output * (1.0f - sigmoid_output);
 }
@@ -1163,6 +1169,113 @@ __device__ __forceinline__ void lstm_backward_recurrence_reg_body(
     }
 }
 
+// The register-resident forward with the four gates of hidden unit j on four adjacent lanes: thread t owns weight row
+// (t & 3) * H + (t >> 2) (gate t & 3 of unit t >> 2, weight order i,f,g,o). Each lane applies its own gate's activation,
+// the four lanes exchange them by shuffles and each forms the unit's c and h, so a step needs no shared-memory hand-off of
+// the preactivations and only one barrier (h is double-buffered). The thread-per-gate-row layout (reg kernel above)
+// staged all 4H preactivations in shared memory and synchronized twice per step, and one thread evaluated all four
+// activations of its unit in sequence. One batch row per block. Same arguments, outputs and caches as the reg kernel.
+template <int HP>
+__device__ __forceinline__ void lstm_forward_recurrence_shfl_body(
+    const float* __restrict__ xProj, const float* __restrict__ h_init, const float* __restrict__ c_init,
+    const float* __restrict__ Wh, const float* __restrict__ biasIh, const float* __restrict__ biasHh,
+    float* __restrict__ output, float* __restrict__ h_states, float* __restrict__ c_states, float* __restrict__ gates,
+    int batch, int timeSteps, int H, float* __restrict__ hFinal, float* __restrict__ cFinal)
+{
+    __shared__ __align__(16) float hs[2][HP];
+    const int G = 4 * H;
+    const int tid = threadIdx.x;
+    const int j = tid >> 2, q = tid & 3;
+    const int row = q * H + j;
+    const int b = blockIdx.x;
+
+    // Wh's rows staged through shared memory 32 columns at a time (coalesced), as the reg kernel does; thread tid then
+    // takes row `row`.
+    constexpr int CW = 32;
+    __shared__ float stage[4 * HP][CW + 1];
+    float w[HP];
+#pragma unroll
+    for (int c0 = 0; c0 < HP; c0 += CW) {
+        float tmp[CW];
+#pragma unroll
+        for (int n = 0; n < CW; n++) {
+            int i = n * G + tid, r = i / CW, col = i % CW;
+            tmp[n] = c0 + col < H ? Wh[r * H + c0 + col] : 0.0f;
+        }
+#pragma unroll
+        for (int n = 0; n < CW; n++) {
+            int i = n * G + tid;
+            stage[i / CW][i % CW] = tmp[n];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int col = 0; col < CW; col++) w[c0 + col] = stage[row][col];
+        __syncthreads();
+    }
+    const float bias = biasIh[row] + biasHh[row];
+
+    const int gid = b * H + j;
+    for (int i = tid; i < 2 * HP; i += blockDim.x) (&hs[0][0])[i] = 0.0f;
+    __syncthreads();
+    float c = c_init[gid];
+    if (q == 0) hs[0][j] = h_init[gid];
+    float xp = xProj[(b * timeSteps) * G + row];
+    const unsigned int groupMask = 0xFu << (threadIdx.x & 28);
+    const int groupBase = threadIdx.x & 28;   // lane of this unit's gate 0 (lane index & ~3)
+    // Where this lane's gate goes in the gates cache (role order f,i,g,o): i -> H, f -> 0, g -> 2H, o -> 3H.
+    const int gateSlot = (q == 0 ? 1 : q == 1 ? 0 : q) * H + j;
+    __syncthreads();
+
+    for (int t = 0; t < timeSteps; t++) {
+        const int cur = t & 1;
+        float a0 = xp + bias, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        if (t + 1 < timeSteps) xp = xProj[(b * timeSteps + t + 1) * G + row];
+#pragma unroll
+        for (int m = 0; m < HP; m += 16) {
+            float4 h0 = *reinterpret_cast<const float4*>(&hs[cur][m]);
+            float4 h1 = *reinterpret_cast<const float4*>(&hs[cur][m + 4]);
+            float4 h2 = *reinterpret_cast<const float4*>(&hs[cur][m + 8]);
+            float4 h3 = *reinterpret_cast<const float4*>(&hs[cur][m + 12]);
+            a0 = fmaf(w[m], h0.x, a0); a0 = fmaf(w[m + 1], h0.y, a0); a0 = fmaf(w[m + 2], h0.z, a0); a0 = fmaf(w[m + 3], h0.w, a0);
+            a1 = fmaf(w[m + 4], h1.x, a1); a1 = fmaf(w[m + 5], h1.y, a1); a1 = fmaf(w[m + 6], h1.z, a1); a1 = fmaf(w[m + 7], h1.w, a1);
+            a2 = fmaf(w[m + 8], h2.x, a2); a2 = fmaf(w[m + 9], h2.y, a2); a2 = fmaf(w[m + 10], h2.z, a2); a2 = fmaf(w[m + 11], h2.w, a2);
+            a3 = fmaf(w[m + 12], h3.x, a3); a3 = fmaf(w[m + 13], h3.y, a3); a3 = fmaf(w[m + 14], h3.z, a3); a3 = fmaf(w[m + 15], h3.w, a3);
+        }
+        float pre = (a0 + a1) + (a2 + a3);
+        // One path for every lane (no divergence between the tanh and sigmoid lanes): tanh(x) = 2 sigmoid(2x) - 1.
+        float s = lstm_fast_sigmoid(q == 2 ? 2.0f * pre : pre);
+        float act = q == 2 ? 2.0f * s - 1.0f : s;
+        float ig = __shfl_sync(groupMask, act, groupBase);
+        float f = __shfl_sync(groupMask, act, groupBase + 1);
+        float g = __shfl_sync(groupMask, act, groupBase + 2);
+        float o = __shfl_sync(groupMask, act, groupBase + 3);
+        c = f * c + ig * g;
+        float h = o * (2.0f * lstm_fast_sigmoid(2.0f * c) - 1.0f);
+        gates[t * batch * G + b * G + gateSlot] = act;
+        if (q == 0) {
+            hs[cur ^ 1][j] = h;
+            int stateOffset = t * batch * H + gid;
+            h_states[stateOffset] = h;
+            c_states[stateOffset] = c;
+            output[(b * timeSteps + t) * H + j] = h;
+            if (t == timeSteps - 1) { hFinal[gid] = h; cFinal[gid] = c; }
+        }
+        __syncthreads();   // the next step reads hs[cur ^ 1]; every read of hs[cur] this step is done
+    }
+}
+
+#define LSTM_SHFL_KERNEL(HP) \
+extern ""C"" __global__ __launch_bounds__(4 * HP) void lstm_forward_recurrence_shfl_h##HP( \
+    const float* xProj, const float* h_init, const float* c_init, const float* Wh, const float* biasIh, \
+    const float* biasHh, float* output, float* h_states, float* c_states, float* gates, \
+    int batch, int timeSteps, int hiddenSize, float* hFinal, float* cFinal) \
+{ \
+    lstm_forward_recurrence_shfl_body<HP>(xProj, h_init, c_init, Wh, biasIh, biasHh, output, h_states, c_states, gates, \
+        batch, timeSteps, hiddenSize, hFinal, cFinal); \
+}
+LSTM_SHFL_KERNEL(32)
+LSTM_SHFL_KERNEL(64)
+
 #define LSTM_REG_KERNELS(HP, BB) \
 extern ""C"" __global__ __launch_bounds__(4 * HP) void lstm_forward_recurrence_reg_h##HP##_b##BB( \
     const float* xProj, const float* h_init, const float* c_init, const float* Wh, const float* biasIh, \
@@ -1564,6 +1677,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_forward_recurrence_reg_h32_b1",
             "lstm_backward_recurrence_reg_h32_b1",
             "lstm_forward_recurrence_reg_h64_b1",
+            "lstm_forward_recurrence_shfl_h32",
+            "lstm_forward_recurrence_shfl_h64",
             "lstm_backward_last_recurrence_reg_h32_b1",
             "lstm_backward_last_recurrence_reg_h64_b1",
             "lstm_backward_recurrence_reg_h64_b1",

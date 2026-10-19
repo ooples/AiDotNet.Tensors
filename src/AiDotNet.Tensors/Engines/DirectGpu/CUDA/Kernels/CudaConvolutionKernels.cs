@@ -1145,7 +1145,7 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_phase_reduce(
     if (i >= count) return;
     int iw = i % W, ih = (i / W) % H;
     int rh = (ih + pH) % sH, rw = (iw + pW) % sW;
-    int units = (outC * ((kH - rh + sH - 1) / sH) * ((kW - rw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit;
+    int units = max(1, (outC * ((kH - rh + sH - 1) / sH) * ((kW - rw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit);
     float sum = 0.0f;
     for (int z = 0; z < units; z++) sum += partials[(long long)z * count + i];
     gradInput[i] = sum;
@@ -1651,7 +1651,7 @@ __device__ __forceinline__ void conv2d_wgrad_ce_body(
 // wt[kh*kW + kw][co][ci] (conv2d_dgrad_weight_tapmajor), so those lanes read contiguous floats; else the forward layout
 // w[co][ci][kh][kw], where consecutive ci are kH*kW floats apart (a 1x1 kernel's layout is the same either way). The
 // host relays out only when enough column tiles reread the weights to pay for the copy. PHASE = false: unit stride or any stride with per-tile divisibility checks,
-// split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation, kernel >= stride): blockIdx.z is the
+// split-K slices to out + z * B*Cin*H*W. PHASE = true (strided, unit dilation): blockIdx.z is the
 // sub-pixel phase (rh, rw); the block's columns are that phase's pixels and only the taps kh = rh (mod sH),
 // kw = rw (mod sW) are visited, every one of which hits; phases write disjoint pixels. With split-K, each phase's K
 // is cut into ceil(K_phase / kPerSplit) slices (a 4-tap phase gets four times the slices of a 1-tap one, so every grid
@@ -1680,7 +1680,7 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         for (; phase < phases - 1; phase++)
         {
             const int ph = phase / sW, pw = phase - ph * sW;
-            const int units = (outC * ((kH - ph + sH - 1) / sH) * ((kW - pw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit;
+            const int units = max(1, (outC * ((kH - ph + sH - 1) / sH) * ((kW - pw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit);
             if (rem < units) break;
             rem -= units;
         }
@@ -1709,13 +1709,26 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         iwp = iw0 + (PHASE ? (q - i * Wp) * sW : q - i * Wp) + pW;
     }
     const float* dyBatch = gradOutput + (long long)nb * outC * L;
+    // PHASE: the phase's taps kh = rh + th * sH hit dY row (ihp - rh) / sH - th exactly (ihp - rh is a non-negative
+    // multiple of sH), so each K tile's row and column are a subtraction, not two runtime divisions per lane per tile
+    // (measured: those divisions were most of the phase kernel's integer instructions).
+    const int ohBase = PHASE ? (ihp - rh) / sH : 0, owBase = PHASE ? (iwp - rw) / sW : 0;
 
     // Tile state: tap (kh, kw) and first output channel co0 (K tiles never straddle a tap: Cout % 8 == 0).
     // K order (co group of CE_BK, tap, co within the group), as in the forward: the taps of one group read the weights
     // w[co][ci][0 .. kH*kW-1] back to back, so in the forward layout each (co, ci) run stays in L1 across its taps.
+    // A tapless phase (a kernel smaller than its stride, e.g. a 1x1 stride-2 downsample) has K = 0 and no tiles; it
+    // only writes zeros, so its tap state is never read and must not be derived by dividing by taps or tapsW.
     const int taps = tapsH * tapsW;
-    int g0 = kBegin / (CE_BK * taps), tapIndex = (kBegin - g0 * CE_BK * taps) / CE_BK, co0 = g0 * CE_BK;
-    int th = tapIndex / tapsW, tw = tapIndex - th * tapsW;
+    int g0 = 0, tapIndex = 0, th = 0, tw = 0;
+    if (taps > 0)
+    {
+        g0 = kBegin / (CE_BK * taps);
+        tapIndex = (kBegin - g0 * CE_BK * taps) / CE_BK;
+        th = tapIndex / tapsW;
+        tw = tapIndex - th * tapsW;
+    }
+    int co0 = g0 * CE_BK;
     int kh = PHASE ? rh + th * sH : th, kw = PHASE ? rw + tw * sW : tw;
 
     float ra[RA], rb[RB];
@@ -1729,13 +1742,23 @@ __device__ __forceinline__ void conv2d_dgrad_ce_body(
         #pragma unroll
         for (int r = 0; r < RA; r++)
             ra[r] = m < inC ? wTap[r * rowStep] : 0.0f;
-        int ty_ = ihp - kh * dH, tx_ = iwp - kw * dW;
-        int oh = ty_, ow = tx_;
-        bool valid = nIn && ty_ >= 0 && tx_ >= 0;
-        if (valid && (sH > 1 || sW > 1))
+        int oh, ow;
+        bool valid;
+        if (PHASE)
         {
-            oh = ty_ / sH; ow = tx_ / sW;
-            valid = PHASE || (oh * sH == ty_ && ow * sW == tx_);
+            oh = ohBase - th; ow = owBase - tw;
+            valid = nIn && oh >= 0 && ow >= 0;
+        }
+        else
+        {
+            int ty_ = ihp - kh * dH, tx_ = iwp - kw * dW;
+            oh = ty_; ow = tx_;
+            valid = nIn && ty_ >= 0 && tx_ >= 0;
+            if (valid && (sH > 1 || sW > 1))
+            {
+                oh = ty_ / sH; ow = tx_ / sW;
+                valid = oh * sH == ty_ && ow * sW == tx_;
+            }
         }
         valid = valid && oh < outH && ow < outW;
         const float* src = dyBatch + (long long)(co0 + bk) * L + (valid ? oh * outW + ow : 0);

@@ -68,7 +68,12 @@ public sealed partial class CudaBackend : IFusedLstmSequenceTraining, ILstmLastS
     {
         kernel = IntPtr.Zero;
         int padded = hiddenSize <= 32 ? 32 : hiddenSize <= 64 ? 64 : 0;
-        return padded != 0 && _kernelCache.TryGetValue($"lstm_{direction}_recurrence_reg_h{padded}_b1", out kernel);
+        if (padded == 0) return false;
+        // The forward's shuffle layout (same arguments and launch shape) where compiled.
+        if (direction == "forward"
+            && _kernelCache.TryGetValue(padded == 32 ? "lstm_forward_recurrence_shfl_h32" : "lstm_forward_recurrence_shfl_h64", out kernel))
+            return true;
+        return _kernelCache.TryGetValue($"lstm_{direction}_recurrence_reg_h{padded}_b1", out kernel);
     }
 
     /// <summary>

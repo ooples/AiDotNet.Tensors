@@ -334,8 +334,12 @@ public sealed class MetalTunedKernelTests
         var backend = RequireBackend();
         TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
         bool previousPersist = TunedKernelPolicy.PersistDecisions;
+        double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
+        // The budget is a process-wide running total, so tuning in earlier tests must not decide this one.
+        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.ResetBudget();
         try
         {
             // A shape no profile covers, so the slot measures it (and snapshots candidate outputs to the host).
@@ -357,6 +361,7 @@ public sealed class MetalTunedKernelTests
         {
             TunedKernelPolicy.ModeOverride = previousMode;
             TunedKernelPolicy.PersistDecisions = previousPersist;
+            TunedKernelPolicy.BudgetMilliseconds = previousBudget;
         }
     }
     // The public backward entry points run the input gradient and the parameter gradients as separate slots (the

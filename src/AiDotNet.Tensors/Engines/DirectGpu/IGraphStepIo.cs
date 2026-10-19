@@ -48,8 +48,11 @@ internal interface IGraphStepIo : IDisposable
     /// </summary>
     void Flush();
 
-    /// <summary>Records the copy of every input out of the current slot. Call first inside the capture.</summary>
-    void CapturePrologue();
+    /// <summary>
+    /// Records the copy of every input out of the current slot. Call first inside the capture. <paramref name="parity"/>
+    /// is the replay parity the graph being captured runs at (0 or 1) when the plan alternates two graphs, else 0.
+    /// </summary>
+    void CapturePrologue(int parity);
 
     /// <summary>
     /// Records the step's publication: the first <paramref name="lossCount"/> floats of <paramref name="loss"/> (at
@@ -103,6 +106,27 @@ internal interface IGraphStepIo : IDisposable
     void CaptureSgdUpdate(System.Collections.Generic.IReadOnlyList<IGpuBuffer> parameters,
         System.Collections.Generic.IReadOnlyList<IGpuBuffer> gradients, System.Collections.Generic.IReadOnlyList<int> sizes,
         float weightDecay);
+
+    /// <summary>
+    /// Builds, before the captures, the tables of a ping-pong SGD update: direction 0 reads the weights from
+    /// <paramref name="first"/> and writes the updated weights to <paramref name="second"/>, direction 1 the reverse.
+    /// </summary>
+    void PrepareSgdPingPong(System.Collections.Generic.IReadOnlyList<IGpuBuffer> first,
+        System.Collections.Generic.IReadOnlyList<IGpuBuffer> second,
+        System.Collections.Generic.IReadOnlyList<IGpuBuffer> gradients, System.Collections.Generic.IReadOnlyList<int> sizes);
+
+    /// <summary>
+    /// Records, inside the capture, one direction of the ping-pong SGD update: the updated weights written to the other
+    /// buffer in the same pass that takes the gradients' finiteness reduction, then (when that is not finite) the old
+    /// weights copied over them, so the step is discarded as <see cref="CaptureSgdUpdate"/> discards it.
+    /// </summary>
+    void CaptureSgdPingPongUpdate(int direction, float weightDecay);
+
+    /// <summary>
+    /// True when the capture of <paramref name="graphExec"/> handed any memory of <paramref name="buffers"/> to captured
+    /// work (directly or through an overlapping buffer).
+    /// </summary>
+    bool CapturedGraphReads(IntPtr graphExec, System.Collections.Generic.IReadOnlyList<IGpuBuffer> buffers);
 
     /// <summary>As <see cref="CaptureSgdUpdate"/> for Adam (or AdamW when <paramref name="decoupled"/>), fp32 moments.</summary>
     void CaptureAdamUpdate(bool decoupled, System.Collections.Generic.IReadOnlyList<IGpuBuffer> parameters,
