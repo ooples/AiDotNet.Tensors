@@ -3334,7 +3334,14 @@ internal static partial class SimdGemm
             float* cRow = C + (long)i0 * n;
             if (mc == TransAMr)
             {
-                for (int j = 0; j < nFull; j += 16)
+                int j = 0;
+#if NET9_0_OR_GREATER
+                // 32-column steps on the 512-bit tile where the host accelerates it (the same FMA chain per element).
+                if (UseVector512Direct)
+                    for (; j + Nr512 <= nFull; j += Nr512)
+                        TransAKernel6x32(A + i0, m, B + j, n, cRow + j, k);
+#endif
+                for (; j < nFull; j += 16)
                     TransAKernel6x16(A + i0, m, B + j, n, cRow + j, k);
             }
             else
