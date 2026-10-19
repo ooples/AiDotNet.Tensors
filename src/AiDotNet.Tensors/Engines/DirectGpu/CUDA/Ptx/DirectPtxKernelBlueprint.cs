@@ -33,6 +33,15 @@ internal static class DirectPtxArchitecture
     };
 
     /// <summary>
+    /// Devices the kernel conveyor (verify, release, bench: #890) develops specs on: Turing (SM75) and later, where the
+    /// affine emitters' PTX is verified against its fp64 oracle (all 13 catalog kernels on a GTX 1660 Ti, SM75). This is a
+    /// development gate, not a promotion: which generated kernel ships on an architecture is still decided by that
+    /// architecture's own release evidence (competitor and limiter), and the hand-written kernels keep their GA102 gates.
+    /// </summary>
+    internal static bool HasCodegenConveyor(int major, int minor) =>
+        major > 7 || (major == 7 && minor >= 5);
+
+    /// <summary>
     /// The checked-in asynchronous attention implementation is an Ampere
     /// specialization. Other families must supply and benchmark their own
     /// implementation instead of silently inheriting Ampere's tuning.

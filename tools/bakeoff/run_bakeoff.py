@@ -95,8 +95,11 @@ def run_ours_once(dll, selector):
     """Runs one generated-lane selector with contamination retries."""
     command = ["dotnet", dll, "--kernel-bench"]
     command.append(selector)
+    # The bench refuses to measure beside any Python process; this script is its launcher, waiting on it, so it
+    # names itself (GpuBenchmarkEnvironment exempts the launcher from the Python check only).
+    env = dict(os.environ, AIDOTNET_BENCHMARK_LAUNCHER_PID=str(os.getpid()))
     for attempt in range(1, GENERATED_LANE_ATTEMPTS + 1):
-        completed = subprocess.run(command, capture_output=True, text=True)
+        completed = subprocess.run(command, capture_output=True, text=True, env=env)
         got = {}
         for line in completed.stdout.splitlines():
             m = re.match(r"^(\S+)\s+([\d,]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)%", line)

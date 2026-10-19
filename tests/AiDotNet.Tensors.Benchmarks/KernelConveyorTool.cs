@@ -1493,10 +1493,10 @@ internal static class KernelConveyorTool
     private static DirectPtxRuntime? OpenRuntime()
     {
         var runtime = new DirectPtxRuntime();
-        if (DirectPtxArchitecture.HasExperimentalConvolution(
+        if (DirectPtxArchitecture.HasCodegenConveyor(
                 runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             return runtime;
-        Console.WriteLine("The conveyor requires the experimental SM86 device.");
+        Console.WriteLine("The conveyor requires an SM75 (Turing) or newer device.");
         runtime.Dispose();
         return null;
     }
