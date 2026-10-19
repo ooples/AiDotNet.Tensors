@@ -123,7 +123,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // since U is four times the weights; past the budget a convolution transforms into scratch as before.
         // An eighth of device memory, at most 768 MiB: the buffer pool takes a quarter, and this cache is not drained on
         // out-of-memory (an entry goes only with its weights).
-        private long F43FilterCacheBudgetBytes => Math.Min(768L << 20, GlobalMemoryBytes / 8);
+        private const long F43FilterCacheMaxBytes = 768L << 20;
+        private const int F43FilterCacheMemoryDivisor = 8;
+        private long F43FilterCacheBudgetBytes =>
+            Math.Min(F43FilterCacheMaxBytes, GlobalMemoryBytes / F43FilterCacheMemoryDivisor);
         private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, F43FilterEntry> _f43Filters = new();
         private readonly object _f43FilterLock = new();
         private long _f43FilterBytes;

@@ -229,4 +229,25 @@ public class OpenClInferenceKernelTests
         AssertClose(cpu.BatchNormInference(x, gamma, beta, mean, variance, 1e-5, activation),
             gpu.BatchNormInference(x, gamma, beta, mean, variance, 1e-5, activation), 1e-5, $"bn {activation}");
     }
+
+    // An empty batch reaches the six-argument override through the fused overload's CPU fallback; it must not launch a
+    // kernel (which divides by batch * channels).
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.ReLU)]
+    public void Engine_batch_norm_inference_with_an_empty_batch_matches_cpu(FusedActivationType activation)
+    {
+        using var gpu = RequireEngine();
+        var cpu = new CpuEngine();
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(31);
+        var x = new Tensor<float>(new[] { 0, 6, 9, 7 });
+        var gamma = Random(rng, 6);
+        var beta = Random(rng, 6);
+        var mean = Random(rng, 6);
+        var variance = new Tensor<float>(new[] { 6 });
+        for (int i = 0; i < 6; i++) variance[i] = (float)(rng.NextDouble() + 0.1);
+        var actual = gpu.BatchNormInference(x, gamma, beta, mean, variance, 1e-5, activation);
+        Assert.Equal(new[] { 0, 6, 9, 7 }, actual.Shape.ToArray());
+        AssertClose(cpu.BatchNormInference(x, gamma, beta, mean, variance, 1e-5, activation), actual, 1e-5, $"empty bn {activation}");
+    }
 }

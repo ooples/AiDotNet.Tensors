@@ -1508,6 +1508,16 @@ public partial class DirectGpuTensorEngine
         return TensorMatMul(left, right);
     }
 
+    // A non-empty rank-4 input whose every normalization parameter has an entry per channel: the batch-norm kernels
+    // divide by batch * channels and index each parameter by channel.
+    private static bool BatchNormParametersCoverChannels<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean,
+        Tensor<T> variance)
+    {
+        int channels = x.Shape._dims[1];
+        return x.Length > 0 && gamma.Length >= channels && beta.Length >= channels && mean.Length >= channels
+            && variance.Length >= channels;
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> BatchNormInference<T>(Tensor<T> x, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean,
         Tensor<T> variance, double epsilon, FusedActivationType activation)
@@ -1521,11 +1531,13 @@ public partial class DirectGpuTensorEngine
         if (variance is null) throw new ArgumentNullException(nameof(variance));
         if (IsTapeActive<T>() || x.Rank != 4 || !TryGetBackend(out var backend))
             return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
-        // An empty tensor or a parameter shorter than the channel count goes to the base implementation, which
-        // validates it: the kernel would divide by zero or read past a parameter.
-        int channelCount = x.Shape._dims[1];
-        if (x.Length == 0 || gamma.Length < channelCount || beta.Length < channelCount || mean.Length < channelCount
-            || variance.Length < channelCount)
+        // An empty tensor has nothing to activate: the six-argument overload validates the parameters and returns it.
+        // (The base would also run the activation, and a device activation cannot allocate an empty buffer.)
+        if (x.Length == 0)
+            return BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+        // A parameter shorter than the channel count: the CPU path validates it and applies the activation after the
+        // six-argument overload, which repeats this check before any kernel runs.
+        if (!BatchNormParametersCoverChannels(x, gamma, beta, mean, variance))
             return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon, activation);
 
         var bufOut = default(OwnedBuffer);
@@ -1579,6 +1591,11 @@ public partial class DirectGpuTensorEngine
         // defer non-rank-4 to base (it throws the proper error). Tape-active / no-GPU also defer
         // (BatchNormInference is an eval-mode op, so the tape is normally inactive).
         if (IsTapeActive<T>() || x.Rank != 4 || !TryGetBackend(out var backend))
+            return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+        // An empty tensor or a parameter shorter than the channel count goes to the base implementation, which
+        // validates it: the kernel would divide by zero or read past a parameter. The fused-activation overload's
+        // fallback reaches this override too (the base composes it from this one), so the check lives here.
+        if (!BatchNormParametersCoverChannels(x, gamma, beta, mean, variance))
             return base.BatchNormInference(x, gamma, beta, mean, variance, epsilon);
 
         var bufOut = default(OwnedBuffer);
