@@ -91,6 +91,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # A case with no baseline for this runner is skipped, and xUnit drops a skipped test's output, so
+      # the per-mode timings are only in the results the harness writes.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytorch-parity-ratchet-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ratchet.log
+            /tmp/aidotnet-parity/*-latest.json
+          if-no-files-found: warn
+
   parity:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
