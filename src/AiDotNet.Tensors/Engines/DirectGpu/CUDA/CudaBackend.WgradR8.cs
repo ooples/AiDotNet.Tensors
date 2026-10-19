@@ -45,9 +45,12 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// The weight gradient through conv2d_wgrad_r8_{tileM}x{tileN} (8x8 micro-tile per thread) with a split-K count
-    /// (0: enough splits for about two blocks per SM). Overwrites dW. False: nothing launched.
+    /// (0: enough splits for about two blocks per SM). Overwrites dW. False: nothing launched. The r8v kernel (16-byte
+    /// dY loads) runs wherever an image's K positions are a multiple of the K tile; <paramref name="vectorDy"/> false
+    /// forces the scalar-load kernel (tests).
     /// </summary>
-    internal unsafe bool TryConv2DBackwardKernelR8(in TunedConv2DBackwardArgs a, int tileM, int tileN, int splits)
+    internal unsafe bool TryConv2DBackwardKernelR8(in TunedConv2DBackwardArgs a, int tileM, int tileN, int splits,
+        bool vectorDy = true)
     {
         if (!a.WeightGradient || a.Batch <= 0 || a.OutChannels <= 0 || !EnsureWgradR8Module()) return false;
         long p = (long)a.InChannels * a.KernelH * a.KernelW;
@@ -56,7 +59,8 @@ public sealed partial class CudaBackend
         if (p <= 0 || kTotal <= 0 || kTotal > int.MaxValue || outputs > int.MaxValue
             || (long)a.Batch * a.InChannels * a.InHeight * a.InWidth > int.MaxValue
             || (long)a.Batch * a.OutChannels * a.OutHeight * a.OutWidth > int.MaxValue
-            || !_kernelCache.TryGetValue(Kernels.CudaConvWgradKernels.KernelName(tileM, tileN), out var gemm))
+            || !_kernelCache.TryGetValue(Kernels.CudaConvWgradKernels.KernelName(tileM, tileN,
+                vectorDy && (long)a.OutHeight * a.OutWidth % Kernels.CudaConvWgradKernels.KTile == 0), out var gemm))
             return false;
         const int Bk = Kernels.CudaConvWgradKernels.KTile;
         int threads = (tileM / 8) * (tileN / 8);

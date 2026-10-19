@@ -83,17 +83,20 @@ public sealed class WgradR8KernelTests : IClassFixture<DirectGpuTensorEngineTest
 
         double implicitUs = Time(() => cuda.Conv2DBackwardKernelViaImplicit(refArgs));
         var line = new System.Text.StringBuilder($"[dW {inC}->{outC} {size}x{size} k{k} s{s}] implicit {implicitUs:F1}");
+        // Every ResNet-18 layer's outH * outW is a multiple of the K tile, so vectorDy runs the r8v kernels here.
         foreach (var (tm, tn) in CudaConvWgradKernels.TileShapes)
+            foreach (bool vectorDy in new[] { false, true })
             foreach (int splits in new[] { 0, 1 })
             {
+                string name = $"{(vectorDy ? "r8v" : "r8")} {tm}x{tn}";
                 cuda.Fill(dw, float.NaN, dw.Size);
-                Assert.True(cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits), $"r8 {tm}x{tn} refused");
+                Assert.True(cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits, vectorDy), $"{name} refused");
                 var actual = cuda.DownloadBuffer(dw);
                 double maxErr = 0;
                 for (int i = 0; i < expected.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / scale);
-                Assert.True(maxErr < 1e-5, $"r8 {tm}x{tn} splits {splits}: max err {maxErr:E2}");
-                double us = Time(() => cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits));
-                line.Append($" | r8 {tm}x{tn}/{(splits == 0 ? "auto" : splits.ToString())} {us:F1}");
+                Assert.True(maxErr < 1e-5, $"{name} splits {splits}: max err {maxErr:E2}");
+                double us = Time(() => cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits, vectorDy));
+                line.Append($" | {name}/{(splits == 0 ? "auto" : splits.ToString())} {us:F1}");
             }
         _output.WriteLine(line.ToString());
     }
@@ -107,6 +110,7 @@ public sealed class WgradR8KernelTests : IClassFixture<DirectGpuTensorEngineTest
         new object[] { 24, 17, 23, 40, 3, 2, 1, 1 },
         new object[] { 32, 18, 14, 64, 3, 1, 2, 2 },   // dilation 2, padding 2 keeps the size
         new object[] { 33, 15, 9, 70, 1, 1, 0, 1 },    // 1x1 shortcut, odd P
+        new object[] { 24, 16, 8, 40, 3, 1, 1, 1 },    // outH * outW = 128: the r8v (vector dY) kernels, ragged channels
     };
 
     /// <summary>
@@ -136,10 +140,11 @@ public sealed class WgradR8KernelTests : IClassFixture<DirectGpuTensorEngineTest
         double scale = Math.Max(1.0, expected.Max(v => Math.Abs((double)v)));
 
         foreach (var (tm, tn) in CudaConvWgradKernels.TileShapes)
+            foreach (bool vectorDy in new[] { false, true })
             foreach (int splits in new[] { 0, 3, 7 })
             {
                 cuda.Fill(dw, float.NaN, dw.Size);
-                Assert.True(cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits), $"r8 {tm}x{tn} refused");
+                Assert.True(cuda.TryConv2DBackwardKernelR8(args, tm, tn, splits, vectorDy), $"r8 {tm}x{tn} refused");
                 var actual = cuda.DownloadBuffer(dw);
                 double maxErr = 0;
                 for (int i = 0; i < expected.Length; i++) maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / scale);
