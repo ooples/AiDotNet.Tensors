@@ -73,6 +73,8 @@ public sealed partial class CudaBackend
         public fixed int Len[StepIoMaxInputs];
         public int Vector;
         public ulong Guard;
+        public ulong Copy0;
+        public ulong Copy1;
     }
 
     // Learning rates a slot's table holds: one per step number a replay may run as while earlier replays' finiteness
@@ -90,6 +92,8 @@ public sealed partial class CudaBackend
         private readonly int[] _lengths;
         private readonly IntPtr[] _staging;   // [input * 2 + slot], host addresses
         private readonly IntPtr[] _stagingDevice;
+        private readonly IntPtr[] _copyFlags = new IntPtr[2];        // page-locked int[StepIoMaxInputs] per slot
+        private readonly IntPtr[] _copyFlagsDevice = new IntPtr[2];
         private IntPtr _results;              // page-locked StepIoResults
         private IntPtr _resultsDevice;
         private IGpuBuffer? _state;           // device uint[4]: replays, applied, fault, unused
@@ -126,6 +130,14 @@ public sealed partial class CudaBackend
                             "cuMemHostGetDevicePointer(step io)");
                     }
                 }
+                for (int s = 0; s < 2; s++)
+                {
+                    CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAllocHost(out _copyFlags[s], StepIoMaxInputs * sizeof(int)),
+                        "cuMemAllocHost(step io copy flags)");
+                    new Span<int>((void*)_copyFlags[s], StepIoMaxInputs).Fill(1);   // every input copies until told otherwise
+                    CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemHostGetDevicePointer(out _copyFlagsDevice[s], _copyFlags[s], 0),
+                        "cuMemHostGetDevicePointer(step io copy flags)");
+                }
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAllocHost(out _results, StepIoResultsBytes), "cuMemAllocHost(step io results)");
                 new Span<byte>((void*)_results, StepIoResultsBytes).Clear();
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemHostGetDevicePointer(out _resultsDevice, _results, 0),
@@ -145,6 +157,14 @@ public sealed partial class CudaBackend
         public int InputLength(int input) => _lengths[input];
 
         public IntPtr InputStaging(int input, int slot) => _staging[2 * input + (slot & 1)];
+
+        public void SetInputCopied(int input, int slot, bool copy)
+        {
+            if ((uint)input >= (uint)_inputs.Length) throw new ArgumentOutOfRangeException(nameof(input));
+            IntPtr flags = _copyFlags[slot & 1];
+            if (flags == IntPtr.Zero) throw new ObjectDisposedException(nameof(CudaGraphStepIo));
+            Volatile.Write(ref ((int*)flags)[input], copy ? 1 : 0);
+        }
 
         public uint CompletedReplays
         {
@@ -304,6 +324,8 @@ public sealed partial class CudaBackend
             args.Start[_inputs.Length] = total;
             args.Count = _inputs.Length;
             args.State = (ulong)_state!.Handle.ToInt64();
+            args.Copy0 = (ulong)_copyFlagsDevice[0].ToInt64();
+            args.Copy1 = (ulong)_copyFlagsDevice[1].ToInt64();
             if (_dynamicScalars is not null)
             {
                 args.LrTable0 = (ulong)_lrTableDevice[0].ToInt64();
@@ -349,6 +371,11 @@ public sealed partial class CudaBackend
             // A replay may still read the staging or write the results.
             CudaNativeBindings.cuStreamSynchronize(_backend._mainStream);
             foreach (var p in _staging) if (p != IntPtr.Zero) CuBlasNative.cuMemFreeHost(p);
+            for (int s = 0; s < 2; s++)
+            {
+                if (_copyFlags[s] != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_copyFlags[s]);
+                _copyFlags[s] = IntPtr.Zero;
+            }
             foreach (var p in _lrTable) if (p != IntPtr.Zero) CuBlasNative.cuMemFreeHost(p);
             _dynamicScalars?.Dispose();
             _guard?.Dispose();

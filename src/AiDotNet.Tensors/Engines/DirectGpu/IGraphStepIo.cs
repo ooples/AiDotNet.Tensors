@@ -24,6 +24,14 @@ internal interface IGraphStepIo : IDisposable
     /// <summary>Host address of input <paramref name="input"/>'s page-locked staging for <paramref name="slot"/> (0 or 1).</summary>
     IntPtr InputStaging(int input, int slot);
 
+    /// <summary>
+    /// Whether the replay reading <paramref name="slot"/> copies input <paramref name="input"/> out of its staging
+    /// (the default) or leaves the graph's device buffer as the previous copy left it, because the input has not
+    /// changed since. Written under the same rule as the staging: only once the replay that last read the slot has
+    /// completed.
+    /// </summary>
+    void SetInputCopied(int input, int slot, bool copy);
+
     /// <summary>Replays the graph has completed, as the graph last published it.</summary>
     uint CompletedReplays { get; }
 

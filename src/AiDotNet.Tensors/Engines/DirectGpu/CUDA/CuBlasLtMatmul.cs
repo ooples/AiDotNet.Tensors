@@ -163,7 +163,8 @@ public sealed class CuBlasLtMatmul : IDisposable
             {
                 if (!_algoCache.TryGetValue(key, out chosen))
                 {
-                    if ((status = ChooseAlgorithm(opDesc, aDesc, bDesc, dDesc, workspaceSizeInBytes, out chosen))
+                    var problem = new MeasuredProblem(a, b, ldd, n, alpha, beta, workspace, stream);
+                    if ((status = ChooseAlgorithm(opDesc, aDesc, bDesc, dDesc, workspaceSizeInBytes, key, problem, out chosen))
                         != CublasStatus.Success)
                         return status;
                     _algoCache[key] = chosen;
@@ -190,12 +191,50 @@ public sealed class CuBlasLtMatmul : IDisposable
     private readonly record struct LtProblem(bool TransA, bool TransB, int M, int N, int K, int Lda, int Ldb, int Ldd,
         CublasComputeType ComputeType, ulong WorkspaceBytes);
 
-    // The algorithm cuBLASLt's heuristic chose for each problem: the heuristic is host work worth tens of
-    // microseconds, and one fixed choice per problem is what keeps the results reproducible.
+    // The algorithm chosen for each problem: choosing is host (and, when measured, device) work, and one fixed choice
+    // per problem is what keeps a process's results reproducible.
     private readonly Dictionary<LtProblem, CublasLtMatmulHeuristicResult> _algoCache = new();
 
+    /// <summary>The operands of the call that first meets a problem, for timing the heuristic's candidates on it.</summary>
+    private readonly record struct MeasuredProblem(IntPtr A, IntPtr B, int Ldd, int N, float Alpha, float Beta,
+        IntPtr Workspace, IntPtr Stream);
+
+    // How many of cuBLASLt's ranked candidates are timed. Its first choice is often a split-K algorithm whose separate
+    // reduction kernel costs more than the split saves on small problems: on the parity MLP (batch 128) every step ran
+    // eight splitKreduce kernels (~80 us of a ~460 us step) where cuBLAS's own heuristic picks single-kernel
+    // "sliced" algorithms.
+    private const int MeasuredCandidates = 8;
+
+    /// <summary>
+    /// The device this wrapper runs on (name and compute capability), set by the owning backend. With it, a problem's
+    /// algorithm is chosen by timing the heuristic's candidates once and recording the winner's rank on disk
+    /// (<see cref="Helpers.Autotune.AutotuneCache"/>); without it, the heuristic's first choice is taken.
+    /// </summary>
+    internal string? DeviceIdentity { get; set; }
+
+    private static readonly bool s_autotune = Environment.GetEnvironmentVariable("AIDOTNET_CUBLASLT_AUTOTUNE") != "0";
+
+    private static bool IsCapturing(IntPtr stream)
+        => CudaNativeBindings.cuStreamIsCapturing(stream, out int capturing) != CudaResult.Success || capturing != 0;
+
+    /// <summary>
+    /// The autotune cache key of a problem. The winner is recorded as its RANK in the heuristic's list, not as the
+    /// opaque algorithm, which is only meaningful to the cuBLASLt build that produced it; the key therefore carries
+    /// the cuBLASLt version and the device, under which the heuristic's list is fixed. Recording the rank is what
+    /// keeps GpuDeterminism: every later process (and every backend in this one) runs the same algorithm instead of
+    /// re-timing and perhaps choosing differently.
+    /// </summary>
+    private (Helpers.Autotune.KernelId Id, Helpers.Autotune.ShapeProfile Shape) AutotuneKey(in LtProblem p)
+    {
+        ulong version = CuBlasLtNative.cublasLtGetVersion().ToUInt64();
+        var id = new Helpers.Autotune.KernelId("cublaslt-sgemm", $"{DeviceIdentity}-lt{version}-{p.ComputeType}");
+        var shape = new Helpers.Autotune.ShapeProfile(p.TransA ? 1 : 0, p.TransB ? 1 : 0, p.M, p.N, p.K, p.Lda, p.Ldb, p.Ldd,
+            checked((int)(p.WorkspaceBytes >> 10)));
+        return (id, shape);
+    }
+
     private unsafe CublasStatus ChooseAlgorithm(IntPtr opDesc, IntPtr aDesc, IntPtr bDesc, IntPtr dDesc,
-        ulong workspaceSizeInBytes, out CublasLtMatmulHeuristicResult chosen)
+        ulong workspaceSizeInBytes, in LtProblem key, MeasuredProblem problem, out CublasLtMatmulHeuristicResult chosen)
     {
         chosen = default;
         var status = CuBlasLtNative.cublasLtMatmulPreferenceCreate(out var preference);
@@ -211,17 +250,104 @@ public sealed class CuBlasLtMatmul : IDisposable
                     CublasLtMatmulPreferenceAttributes.ReductionSchemeMask, (IntPtr)(&schemes), sizeof(uint)))
                     != CublasStatus.Success)
                 return status;
-            CublasLtMatmulHeuristicResult result;
+            bool tune = s_autotune && DeviceIdentity is not null;
+            int requested = tune ? MeasuredCandidates : 1;
+            var results = stackalloc CublasLtMatmulHeuristicResult[requested];
             status = CuBlasLtNative.cublasLtMatmulAlgoGetHeuristic(_handle, opDesc, aDesc, bDesc, dDesc, dDesc,
-                preference, 1, &result, out int found);
+                preference, requested, results, out int found);
             if (status != CublasStatus.Success) return status;
-            if (found < 1 || result.State != CublasStatus.Success) return CublasStatus.NotSupported;
-            chosen = result;
+            if (found < 1 || results[0].State != CublasStatus.Success) return CublasStatus.NotSupported;
+            chosen = results[0];
+            if (!tune || found < 2) return CublasStatus.Success;
+
+            var (id, shape) = AutotuneKey(key);
+            if (Helpers.Autotune.AutotuneCache.Lookup(id, shape) is { } recorded
+                && recorded.Variant.StartsWith("rank:", StringComparison.Ordinal)
+                && int.TryParse(recorded.Variant.Substring(5), System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out int rank)
+                && rank < found && results[rank].State == CublasStatus.Success)
+            {
+                chosen = results[rank];
+                return CublasStatus.Success;
+            }
+
+            // A capture cannot time; the heuristic's first choice runs and nothing is recorded, so the next
+            // uncaptured call of this problem in a later process still measures.
+            if (IsCapturing(problem.Stream)) return CublasStatus.Success;
+            int best = Fastest(opDesc, aDesc, bDesc, dDesc, results, found, problem, workspaceSizeInBytes, out float bestMs);
+            chosen = results[best];
+            if (bestMs < float.MaxValue)
+                Helpers.Autotune.AutotuneCache.TryStore(id, shape,
+                    new Helpers.Autotune.KernelChoice { Variant = "rank:" + best.ToString(System.Globalization.CultureInfo.InvariantCulture), MeasuredTimeMs = bestMs });
             return CublasStatus.Success;
         }
         finally
         {
             CuBlasLtNative.cublasLtMatmulPreferenceDestroy(preference);
+        }
+    }
+
+    /// <summary>
+    /// Index of the fastest of the <paramref name="count"/> candidates on this problem: each runs twice to warm, then
+    /// three batches of four calls are timed with events and its best batch counts. The output goes to a scratch
+    /// buffer, so the caller's D (which beta may accumulate into) is untouched. A candidate that fails is skipped; if
+    /// timing itself is unavailable the heuristic's first choice stands and <paramref name="bestMs"/> stays MaxValue.
+    /// </summary>
+    private unsafe int Fastest(IntPtr opDesc, IntPtr aDesc, IntPtr bDesc, IntPtr dDesc,
+        CublasLtMatmulHeuristicResult* candidates, int count, MeasuredProblem p, ulong workspaceSizeInBytes, out float bestMs)
+    {
+        const int Warmup = 2, Batches = 3, CallsPerBatch = 4;
+        ulong bytes = (ulong)p.Ldd * (ulong)p.N * sizeof(float);
+        IntPtr scratch = IntPtr.Zero, start = IntPtr.Zero, stop = IntPtr.Zero;
+        bestMs = float.MaxValue;
+        try
+        {
+            if (CudaNativeBindings.cuMemAlloc(out scratch, bytes) != CudaResult.Success) return 0;
+            if (CudaNativeBindings.cuEventCreate(out start, 0) != CudaResult.Success
+                || CudaNativeBindings.cuEventCreate(out stop, 0) != CudaResult.Success)
+                return 0;
+            float alpha = p.Alpha, beta = p.Beta;
+            int best = 0;
+            for (int c = 0; c < count; c++)
+            {
+                if (candidates[c].State != CublasStatus.Success) continue;
+                IntPtr algo = (IntPtr)candidates[c].Algo;
+                bool ok = true;
+                for (int w = 0; w < Warmup && ok; w++)
+                    ok = CuBlasLtNative.cublasLtMatmul(_handle, opDesc, ref alpha, p.A, aDesc, p.B, bDesc, ref beta,
+                        scratch, dDesc, scratch, dDesc, algo, p.Workspace, workspaceSizeInBytes, p.Stream) == CublasStatus.Success;
+                if (!ok) continue;
+                float candidateMs = float.MaxValue;
+                for (int batch = 0; batch < Batches && ok; batch++)
+                {
+                    CudaNativeBindings.cuEventRecord(start, p.Stream);
+                    for (int i = 0; i < CallsPerBatch && ok; i++)
+                        ok = CuBlasLtNative.cublasLtMatmul(_handle, opDesc, ref alpha, p.A, aDesc, p.B, bDesc, ref beta,
+                            scratch, dDesc, scratch, dDesc, algo, p.Workspace, workspaceSizeInBytes, p.Stream) == CublasStatus.Success;
+                    CudaNativeBindings.cuEventRecord(stop, p.Stream);
+                    if (!ok || CudaNativeBindings.cuEventSynchronize(stop) != CudaResult.Success
+                        || CudaNativeBindings.cuEventElapsedTime(out float ms, start, stop) != CudaResult.Success)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    candidateMs = Math.Min(candidateMs, ms);
+                }
+                if (ok && candidateMs < bestMs)
+                {
+                    bestMs = candidateMs;
+                    best = c;
+                }
+            }
+            return best;
+        }
+        finally
+        {
+            // The timed calls must finish before their scratch output is released.
+            if (stop != IntPtr.Zero) CudaNativeBindings.cuEventSynchronize(stop);
+            if (start != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(start);
+            if (stop != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(stop);
+            if (scratch != IntPtr.Zero) CudaNativeBindings.cuMemFree(scratch);
         }
     }
 

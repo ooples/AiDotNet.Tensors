@@ -2390,6 +2390,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         float betaVal = beta;
 
         // Row-major C = A * B. Use cuBLAS column-major trick: C^T = B^T * A^T.
+        // cuBLASLt first: its candidates are timed per problem (CuBlasLtMatmul), where the classic handle's heuristic
+        // ran these layouts as split-K plus a separate reduction kernel, and it takes this thread's workspace
+        // explicitly instead of allocating inside a graph capture.
+        if (TryLtMatmulColumnMajor(transA: false, transB: false, N, M, K, B.Handle, N, A.Handle, K, C.Handle, N, alpha, beta))
+            return;
         BlasSgemm(
                 CublasOperation.None,
                 CublasOperation.None,
@@ -2431,6 +2436,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         //   m_cu=N, n_cu=M, k_cu=K, ldA=K, ldB=K, ldC=N.
         // Earlier version had the transpose flags swapped — produced
         // wrong results for any non-square input.
+        // cuBLASLt first, as in CublasGemm.
+        if (TryLtMatmulColumnMajor(transA: true, transB: false, N, M, K, B.Handle, K, A.Handle, K, C.Handle, N, alpha, beta))
+            return;
         BlasSgemm(
                 CublasOperation.Transpose,   // op(my B) — transposed, becomes N×K
                 CublasOperation.None,        // op(my A) — no transpose, stays K×M
@@ -3124,7 +3132,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private bool TryLtMatmulColumnMajor(bool transA, bool transB, int m, int n, int k,
         IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
     {
-        if (!CurrentCublasHasWorkspace) return false;
+        // cuBLASLt is part of cuBLAS: a caller that opted out of it (TensorCodecOptions.UseCublas) gets the generated kernels.
+        if (!UsesCublas || !CurrentCublasHasWorkspace) return false;
         var lt = TryGetCuBlasLt();
         if (lt is null || _threadCublas?.Value?.Workspace is not { } workspace) return false;
         // The classic handle's fp32 mode: TF32 tensor cores where the init chose them (Ampere+) unless determinism
@@ -3149,7 +3158,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             try
             {
                 if (!CuBlasLtMatmul.IsAvailable) { _cublasLtUnavailable = true; return null; }
-                _cublasLt = new CuBlasLtMatmul();
+                // The device identity turns on its measured, recorded algorithm choice (CuBlasLtMatmul.DeviceIdentity).
+                _cublasLt = new CuBlasLtMatmul { DeviceIdentity = $"{DeviceName}-sm{_ccMajor}{_ccMinor}" };
                 return _cublasLt;
             }
             catch

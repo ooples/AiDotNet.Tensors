@@ -379,7 +379,7 @@ internal static class HeadToHeadNetworkHarness
         Compiled,
     }
 
-    private sealed record TrainRun(IReadOnlyDictionary<string, PhaseStats> Phases, IReadOnlyList<double> Losses);
+    private sealed record TrainRun(IReadOnlyDictionary<string, PhaseStats> Phases, IReadOnlyList<double> Losses, string? Note = null);
 
     /// <summary>
     /// Trains the spec's network with Tensors in every mode, each from the weights PyTorch wrote. With
@@ -406,7 +406,7 @@ internal static class HeadToHeadNetworkHarness
             var modes = runs.Select(r =>
             {
                 string? mismatch = LossMismatch(r.Run.Losses, reference);
-                return new ModeResult(r.Name, mismatch is null ? "ok" : "rejected", mismatch, r.Run.Phases["step"]);
+                return new ModeResult(r.Name, mismatch is null ? "ok" : "rejected", mismatch ?? r.Run.Note, r.Run.Phases["step"]);
             }).ToList();
             var best = modes.Where(m => m.Status == "ok" && m.Step is not null)
                 .OrderBy(m => m.Step?.MinMs ?? double.MaxValue)
@@ -519,7 +519,10 @@ internal static class HeadToHeadNetworkHarness
             if (measuring) { steps.Add(t); measuredSoFar++; }
         }
 
-        return new TrainRun(new Dictionary<string, PhaseStats> { ["step"] = Stats(steps) }, losses);
+        // On the GPU the plan replays the step as one CUDA graph unless capture failed; say which, since an unreplayed
+        // step pays every launch.
+        string? note = gpu is null ? null : plan.GraphCaptureFailureReason is { } why ? "no CUDA graph: " + why : "CUDA graph replay";
+        return new TrainRun(new Dictionary<string, PhaseStats> { ["step"] = Stats(steps) }, losses, note);
     }
 
     private static TrainRun TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, TensorsMode mode,

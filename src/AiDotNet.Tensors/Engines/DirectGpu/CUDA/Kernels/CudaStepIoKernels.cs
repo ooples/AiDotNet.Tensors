@@ -39,6 +39,8 @@ struct StepIoArgs
     int len[SIO_MAX];                   // the inputs' float counts
     int vector;                         // 1: every address is 16-byte aligned, copy float4 units
     unsigned long long guard;           // device double: the captured update's finiteness guard, or 0
+    unsigned long long copy0;           // page-locked int[SIO_MAX] for slot 0: 1 = copy the input, 0 = unchanged since its last copy
+    unsigned long long copy1;           // the same for slot 1
 };
 
 // grid-stride over every input float; block 0 thread 0 also resolves the learning rate.
@@ -46,10 +48,17 @@ extern ""C"" __global__ __launch_bounds__(256) void step_io_prologue(StepIoArgs 
 {
     unsigned int* state = (unsigned int*)a.state;
     unsigned int slot = state[0] & 1u;
+    // One read of the host flags per block, not per element: each read crosses the bus.
+    __shared__ int copy[SIO_MAX];
+    const int* flags = (const int*)(slot ? a.copy1 : a.copy0);
+    if (threadIdx.x < a.count) copy[threadIdx.x] = flags ? flags[threadIdx.x] : 1;
+    __syncthreads();
     int total = a.start[a.count];
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         int t = 0;
         while (t + 1 < a.count && a.start[t + 1] <= i) t++;
+        // An unchanged input: the graph's buffer already holds it from the copy that last ran.
+        if (!copy[t]) continue;
         const float* src = (const float*)(slot ? a.src1[t] : a.src0[t]);
         float* dst = (float*)a.dst[t];
         int k = i - a.start[t];
