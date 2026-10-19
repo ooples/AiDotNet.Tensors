@@ -41,7 +41,9 @@ $env:PARITY_PYTHON = $Python
 # PyTorch at its best includes torch.compile, which compiles C++ (CPU) and Triton's launcher (CUDA) with the host
 # compiler. On Windows that is MSVC 2022 with a Windows 11 SDK (MSVC 2019 rejects Triton's C, and SDK 10.0.19041
 # lacks the C11 headers), so its environment is imported here when cl.exe is not already on PATH.
-if ($IsWindows -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+# $IsWindows does not exist in Windows PowerShell 5.1; the OS check works in both editions.
+$onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+if ($onWindows -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $install = if (Test-Path $vswhere) {
         & $vswhere -latest -products * -version '[17.0,)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -53,7 +55,14 @@ if ($IsWindows -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
             'and the Windows 11 SDK (winget install Microsoft.WindowsSDK.10.0.22621).')
         exit 5
     }
-    foreach ($line in (& cmd /c "`"$vcvars`" >nul && set")) {
+    # A failing vcvars64.bat skips `set` and imports nothing; without this check the script would carry on as if the
+    # environment had loaded, and every torch.compile case would defer -- the failure this block exists to prevent.
+    $envLines = & cmd /c "`"$vcvars`" >nul && set"
+    if ($LASTEXITCODE -ne 0) {
+        [Console]::Error.WriteLine("vcvars64.bat failed (exit $LASTEXITCODE), so torch.compile cannot run.")
+        exit 5
+    }
+    foreach ($line in $envLines) {
         if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2]) }
     }
     # vcvars also sets Platform=x64, which MSBuild reads as the solution platform and builds into bin\x64\.

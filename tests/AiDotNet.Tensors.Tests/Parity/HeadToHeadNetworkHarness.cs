@@ -81,12 +81,17 @@ internal static class HeadToHeadNetworkHarness
     /// </summary>
     internal static string? LossMismatch(IReadOnlyList<double> ours, IReadOnlyList<double> reference)
     {
-        int n = Math.Min(ours.Count, reference.Count);
-        if (n == 0) return "no loss was recorded";
+        // Every reference step must be matched: comparing only the common prefix let a mode that recorded fewer
+        // losses pass on a partly verified curve and win the gated best.
+        int n = reference.Count;
+        if (n == 0 || ours.Count == 0) return "no loss was recorded";
+        if (ours.Count < n) return $"{ours.Count} losses were recorded; the reference has {n}";
         for (int i = 0; i < n; i++)
         {
             double tolerance = i == 0 ? 1e-4 : 1e-3;
-            if (Math.Abs(ours[i] - reference[i]) > tolerance * Math.Max(1.0, Math.Abs(reference[i])))
+            // A NaN difference compares false against any tolerance, so a diverged run must be refused explicitly.
+            if (double.IsNaN(ours[i]) || double.IsInfinity(ours[i])
+                || Math.Abs(ours[i] - reference[i]) > tolerance * Math.Max(1.0, Math.Abs(reference[i])))
                 return $"loss at step {i} is {ours[i]:G9}, the reference gives {reference[i]:G9}";
         }
 
@@ -249,9 +254,13 @@ internal static class HeadToHeadNetworkHarness
         var phases = runs[0].Phases.Keys.ToDictionary(
             phase => phase,
             phase => CombineStats(runs.Select(r => r.Phases[phase]).ToList()));
+        // Repetitions can pick different best modes. The reported best combines only those that picked the fastest
+        // repetition's mode, so its median and spread describe the mode it is labelled with; the gated minimum is
+        // unchanged, since the fastest repetition is one of them.
         var fastest = runs.OrderBy(r => r.Best.MinMs).First();
+        var sameMode = runs.Where(r => r.BestMode == fastest.BestMode).Select(r => r.Best).ToList();
         return new SideResult(runs[0].Framework, runs[0].Version, phases, runs[0].Losses,
-            fastest.BestMode, CombineStats(runs.Select(r => r.Best).ToList()), runs[0].Modes);
+            fastest.BestMode, CombineStats(sameMode), runs[0].Modes);
     }
 
     private static (CaseResult? Result, Deferral? Deferred) RunOnce(string root, string network, string device, DirectGpuTensorEngine? gpu)
@@ -426,9 +435,15 @@ internal static class HeadToHeadNetworkHarness
                 string? mismatch = LossMismatch(r.Run.Losses, reference);
                 return new ModeResult(r.Name, mismatch is null ? "ok" : "rejected", mismatch ?? r.Run.Note, r.Run.Phases["step"]);
             }).ToList();
-            var best = modes.Where(m => m.Status == "ok" && m.Step is not null)
-                .OrderBy(m => m.Step?.MinMs ?? double.MaxValue)
-                .FirstOrDefault() ?? throw new InvalidOperationException(
+            // The fastest agreeing mode, first on a tie. Pattern-matched so the compiler sees that the chosen step is
+            // non-null: the earlier `?? double.MaxValue` and `?? phased step` fallbacks were unreachable, and the
+            // second would have silently substituted the phased step had that contract ever broken.
+            (string Name, PhaseStats Step)? best = null;
+            foreach (var m in modes)
+                if (m.Status == "ok" && m.Step is { } step && (best is null || step.MinMs < best.Value.Step.MinMs))
+                    best = (m.Name, step);
+            if (best is not { } chosen)
+                throw new InvalidOperationException(
                     "No Tensors mode reproduced PyTorch's loss curve: " +
                     string.Join("; ", modes.Select(m => $"{m.Name}: {m.Reason}")));
             return new SideResult(
@@ -436,8 +451,8 @@ internal static class HeadToHeadNetworkHarness
                 typeof(Tensor<>).Assembly.GetName().Version?.ToString() ?? "unknown",
                 phased.Phases,
                 phased.Losses,
-                best.Name,
-                best.Step ?? phased.Phases["step"],
+                chosen.Name,
+                chosen.Step,
                 modes);
         }
         finally

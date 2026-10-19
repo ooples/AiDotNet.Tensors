@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import platform
 import statistics
@@ -398,24 +399,36 @@ def main() -> int:
         thread_counts.append(os.cpu_count())
 
     def agree(losses: list[float]) -> str | None:
-        n = min(len(losses), len(reference))
-        if n == 0:
+        # Every reference step must be matched (a shorter curve is only partly verified), and a non-finite loss is
+        # refused outright: a NaN difference compares false against any tolerance. Same rule as the Tensors side.
+        n = len(reference)
+        if n == 0 or not losses:
             return "no loss was recorded"
+        if len(losses) < n:
+            return f"{len(losses)} losses were recorded; the reference has {n}"
         for i in range(n):
             # Same bounds as the Tensors side: the first step differs only in reduction order.
             tolerance = 1e-4 if i == 0 else 1e-3
-            if abs(losses[i] - reference[i]) > tolerance * max(1.0, abs(reference[i])):
+            if not math.isfinite(losses[i]) or abs(losses[i] - reference[i]) > tolerance * max(1.0, abs(reference[i])):
                 return f"loss at step {i} is {losses[i]:.9g}, eager gives {reference[i]:.9g}"
         return None
 
-    def run_mode(make):
+    # A mode that runs extremely slowly (a max-autotune mode on a small GPU) must not hold up the others and the
+    # DEFERRED decision until the workflow times out: past this budget its measuring loop gives up and the mode is
+    # reported as failed.
+    mode_budget_s = float(spec.get("modeBudgetSeconds", 600))
+
+    class ModeBudgetExceeded(RuntimeError):
+        pass
+
+    def run_mode(make) -> tuple[list[float], list[float]]:
         model, optimizer = fresh()
         initial = [p.detach().clone() for p in model.parameters()]
         step_fn = make(model, optimizer)
         # Setting up a mode (warming, compiling, capturing) trains a few steps; start the measured curve from the
         # same weights as the reference. In-place, so captured graphs and compiled code keep their addresses.
         with torch.no_grad():
-            for p, p0 in zip(model.parameters(), initial):
+            for p, p0 in zip(model.parameters(), initial, strict=True):
                 p.copy_(p0)
         sync()
         losses: list[float] = []
@@ -423,6 +436,9 @@ def main() -> int:
         start = time.perf_counter()
         step = -1
         while len(samples) < spec["measuredSteps"]:
+            if time.perf_counter() - start > mode_budget_s:
+                raise ModeBudgetExceeded(
+                    f"measured {len(samples)} of {spec['measuredSteps']} steps within the {mode_budget_s:g} s budget")
             step += 1
             measuring = step >= spec["warmupSteps"] and (time.perf_counter() - start) * 1e3 >= warmup_ms
             sync()
@@ -438,25 +454,28 @@ def main() -> int:
 
     default_threads = torch.get_num_threads()
     modes = []
-    for threads in thread_counts:
-        torch.set_num_threads(threads)
-        for name, make in plans:
-            label = name if threads == default_threads else f"{name}@{threads}threads"
-            entry = {"name": label, "threads": threads if device.type == "cpu" else None}
-            try:
-                losses, samples = run_mode(make)
-            except Exception as error:  # a mode PyTorch cannot run for this network is reported, not fatal
-                first = (str(error).strip().splitlines() or [""])[0]
-                entry.update(status="failed", reason=f"{type(error).__name__}: {first[:300]}")
-                print(f"mode {label} failed: {entry['reason']}", file=sys.stderr)
-            else:
-                mismatch = agree(losses)
-                entry.update(status="ok" if mismatch is None else "rejected", step=_stats(samples), losses=losses)
-                if mismatch is not None:
-                    entry["reason"] = mismatch
-            modes.append(entry)
-            torch.compiler.reset()
-    torch.set_num_threads(default_threads)
+    try:
+        for threads in thread_counts:
+            torch.set_num_threads(threads)
+            for name, make in plans:
+                label = name if threads == default_threads else f"{name}@{threads}threads"
+                entry = {"name": label, "threads": threads if device.type == "cpu" else None}
+                try:
+                    losses, samples = run_mode(make)
+                except Exception as error:  # noqa: BLE001 - a mode PyTorch cannot run is reported, not fatal
+                    first = (str(error).strip().splitlines() or [""])[0]
+                    entry.update(status="failed", reason=f"{type(error).__name__}: {first[:300]}")
+                    print(f"mode {label} failed: {entry['reason']}", file=sys.stderr)
+                else:
+                    mismatch = agree(losses)
+                    entry.update(status="ok" if mismatch is None else "rejected", step=_stats(samples), losses=losses)
+                    if mismatch is not None:
+                        entry["reason"] = mismatch
+                modes.append(entry)
+                torch.compiler.reset()
+    finally:
+        # Restored even when an interrupt escapes a mode.
+        torch.set_num_threads(default_threads)
 
     usable = [m for m in modes if m["status"] == "ok"]
     if not any(m["name"].startswith("compile:") for m in usable):

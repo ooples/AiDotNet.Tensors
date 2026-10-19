@@ -1816,6 +1816,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var srcKeep1 = new KeepAliveScope(src);
         using var dstKeep1 = new KeepAliveScope(dst);
         src.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
+        // The unmarked span does not advance the version, and the whole-step graph's step I/O skips re-staging a
+        // device-resident input whose version it has already copied - so without this bump a replay after a new
+        // SetInputs trains on the previous input.
+        dst.IncrementVersion();
     }
 
     internal void SetInput(Tensor<T> input)
@@ -1833,6 +1837,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var inputKeep1 = new KeepAliveScope(input);
         using var dstKeep2 = new KeepAliveScope(dst);
         input.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
+        dst.IncrementVersion();   // see SetInputs: the step I/O re-stages only on a version change
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)

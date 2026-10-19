@@ -28,6 +28,9 @@ public sealed class DirectConvSingleImageRouteTests
     [InlineData(1, 64, 161, 1, false)]   // past it (unmeasured)
     [InlineData(1, 32, 64, 1, false)]    // 32 channels measured slower at 16 threads
     [InlineData(1, 768, 32, 1, true)]    // a 32x32 plane, exactly the batch rule's 1024 (since the cache-sized input passes)
+    [InlineData(1, 128, 32, 1, true)]    // 32x32 at 128 channels: 16 input blocks, two 3x3 passes -> direct
+    [InlineData(1, 112, 32, 1, false)]   // 32x32 at 112 channels: 14 blocks fit ONE pass -> stays on GEMM
+    [InlineData(1, 64, 32, 1, false)]    // 32x32 at 64 channels: one pass, measured 0.94-0.97x -> GEMM
     [InlineData(1, 64, 31, 1, false)]    // 961 positions: below it
     [InlineData(1, 256, 16, 1, false)]   // a 256-position plane stays on the GEMM routes for a single image
     [InlineData(1, 64, 64, 2, false)]    // stride 2 is outside the single-image rule

@@ -139,7 +139,8 @@ internal static class DirectConvAvx2
     /// win: 32 channels at 16 threads (0.6-0.7x) and planes of 1024 or less at one thread (0.94-0.97x). Larger planes are
     /// unmeasured. Shape-only, so the route (and the result) is the same at every thread count.
     /// <para>
-    /// A 32x32 plane (exactly 1024) joined once the forward ran its input channels in cache-sized passes: a
+    /// A 32x32 plane (exactly 1024) joins only when the forward runs its input channels in more than one cache-sized
+    /// pass; a channel count that fits one pass keeps GEMM. It joined once those passes existed: a
     /// Kandinsky-sized UNet's 768ch@32 is 106 against 134 ms on one thread and 20-27 against 37 ms on eight, its
     /// decoder's 2304->768ch@32 322 against 375 and 57-60 against 132 ms. A 16x16 plane stays on GEMM: direct wins
     /// at eight threads (1536ch 29-35 against 38 ms) but loses 5-11% on one.
@@ -149,7 +150,20 @@ internal static class DirectConvAvx2
     {
         if (shape.Pass != DirectConvPass.Forward || shape.Batch != 1 || shape.StrideH != 1 || shape.StrideW != 1) return false;
         long plane = (long)shape.OutputHeight * shape.OutputWidth;
-        return shape.InChannels >= 64 && plane >= MaxStride1PlanePositions && plane <= MaxSingleImagePlanePositions;
+        if (shape.InChannels < 64 || plane < MaxStride1PlanePositions || plane > MaxSingleImagePlanePositions) return false;
+        // Exactly 1024 positions joined BECAUSE of the input-channel passes (768ch measured above). A channel count
+        // that fits one pass (64-112 at 3x3) is the single-pass configuration that measured 0.94-0.97x against GEMM
+        // on one thread, so it stays on GEMM.
+        if (plane == MaxStride1PlanePositions)
+        {
+#if NET5_0_OR_GREATER
+            int inBlocks = (shape.InChannels + Block - 1) / Block;
+            return ForwardInputBlocksPerPass(inBlocks, shape.KernelHeight * shape.KernelWidth) < inBlocks;
+#else
+            return false;   // the input-channel passes (and the direct kernel) exist on .NET 5+ only
+#endif
+        }
+        return true;
     }
 
     // Largest output plane SingleImageLargePlaneForward takes: the largest measured (160x160).

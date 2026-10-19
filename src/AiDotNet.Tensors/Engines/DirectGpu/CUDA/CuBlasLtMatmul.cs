@@ -157,17 +157,29 @@ public sealed class CuBlasLtMatmul : IDisposable
                 || (status = CuBlasLtNative.cublasLtMatrixLayoutCreate(out dDesc, CublasDataType.Float32,
                     (ulong)m, (ulong)n, ldd)) != CublasStatus.Success)
                 return status;
-            var key = new LtProblem(transA, transB, m, n, k, lda, ldb, ldd, computeType, workspaceSizeInBytes);
+            var key = new LtProblem(transA, transB, m, n, k, lda, ldb, ldd, computeType, workspaceSizeInBytes,
+                GpuDeterminism.IsActive);
+            // The lock covers the lookup and the insert only. Measuring a new problem times up to eight candidates on
+            // the device, tens of milliseconds on a large GEMM, and holding the lock across it stalled every other
+            // thread's GEMM -- including those whose problems were already cached. Two threads that meet the same new
+            // problem may both measure it; the first insert wins and the other uses it, so each problem still has ONE
+            // fixed choice per process.
             CublasLtMatmulHeuristicResult chosen;
-            lock (_algoCache)
+            bool cached;
+            lock (_algoCache) cached = _algoCache.TryGetValue(key, out chosen);
+            if (!cached)
             {
-                if (!_algoCache.TryGetValue(key, out chosen))
+                var problem = new MeasuredProblem(a, b, ldd, n, alpha, beta, workspace, stream);
+                if ((status = ChooseAlgorithm(opDesc, aDesc, bDesc, dDesc, workspaceSizeInBytes, key, problem,
+                        out CublasLtMatmulHeuristicResult measured)) != CublasStatus.Success)
+                    return status;
+                lock (_algoCache)
                 {
-                    var problem = new MeasuredProblem(a, b, ldd, n, alpha, beta, workspace, stream);
-                    if ((status = ChooseAlgorithm(opDesc, aDesc, bDesc, dDesc, workspaceSizeInBytes, key, problem, out chosen))
-                        != CublasStatus.Success)
-                        return status;
-                    _algoCache[key] = chosen;
+                    if (!_algoCache.TryGetValue(key, out chosen))
+                    {
+                        _algoCache[key] = measured;
+                        chosen = measured;
+                    }
                 }
             }
             return CuBlasLtNative.cublasLtMatmul(_handle, opDesc, ref alpha, a, aDesc, b, bDesc, ref beta,
@@ -188,8 +200,9 @@ public sealed class CuBlasLtMatmul : IDisposable
             return CuBlasLtNative.cublasLtMatmulDescSetAttribute(desc, attr, (IntPtr)p, sizeof(int));
     }
 
+    // Deterministic is part of the key because the choice can differ by mode: see ChooseAlgorithm's fallback.
     private readonly record struct LtProblem(bool TransA, bool TransB, int M, int N, int K, int Lda, int Ldb, int Ldd,
-        CublasComputeType ComputeType, ulong WorkspaceBytes);
+        CublasComputeType ComputeType, ulong WorkspaceBytes, bool Deterministic);
 
     // The algorithm chosen for each problem: choosing is host (and, when measured, device) work, and one fixed choice
     // per problem is what keeps a process's results reproducible.
@@ -276,9 +289,14 @@ public sealed class CuBlasLtMatmul : IDisposable
             if (IsCapturing(problem.Stream)) return CublasStatus.Success;
             int best = Fastest(opDesc, aDesc, bDesc, dDesc, results, found, problem, workspaceSizeInBytes, out float bestMs);
             chosen = results[best];
-            if (bestMs < float.MaxValue)
-                Helpers.Autotune.AutotuneCache.TryStore(id, shape,
+            bool stored = bestMs < float.MaxValue
+                && Helpers.Autotune.AutotuneCache.TryStore(id, shape,
                     new Helpers.Autotune.KernelChoice { Variant = "rank:" + best.ToString(System.Globalization.CultureInfo.InvariantCulture), MeasuredTimeMs = bestMs });
+            // Determinism holds because the measured rank is RECORDED and every later process runs it. A rank that
+            // could not be recorded (an unwritable cache) would be re-measured -- and perhaps chosen differently --
+            // by the next process, so under GpuDeterminism the heuristic's fixed first choice runs instead. Tuning is
+            // not simply disabled under determinism: determinism is on by default, so that would disable it for all.
+            if (!stored && key.Deterministic) chosen = results[0];
             return CublasStatus.Success;
         }
         finally

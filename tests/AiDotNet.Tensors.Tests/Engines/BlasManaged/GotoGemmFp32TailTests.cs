@@ -56,6 +56,38 @@ public class GotoGemmFp32TailTests
         AssertClose(expected, c, k, m, n);
     }
 
+    // The half-B route (RunParallelHalfB -> RunTileHalfB) runs its M-tail rows on KernelMTail too, through its own
+    // paTail sub-panel and its own zeroing of the tail strips. Its output must be bit-identical to RunParallel over the
+    // same B rounded to half: the decode is exact, so any difference is a tail-path defect, not rounding.
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void RunParallelHalfB_MatchesRunParallelOnTheHalfRoundedB(int m, int n, int k, int mc, int nc)
+    {
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "The machine-code microkernel is unavailable on this CPU/OS.");
+        var (a, b, _) = Problem(m, n, k);
+        var bHalf = new Half[b.Length];
+        var bRounded = new float[b.Length];
+        for (int i = 0; i < b.Length; i++)
+        {
+            bHalf[i] = (Half)b[i];
+            bRounded[i] = (float)bHalf[i];
+        }
+        var viaHalf = Garbage(m * n);
+        var viaFloat = Garbage(m * n);
+        unsafe
+        {
+            fixed (float* pa = a, pbf = bRounded, pch = viaHalf, pcf = viaFloat)
+            fixed (Half* pbh = bHalf)
+            {
+                GotoGemmFp32.RunParallelHalfB(pa, k, (ushort*)pbh, n, pch, n, m, n, k, mc, nc, 256);
+                GotoGemmFp32.RunParallel(pa, k, pbf, n, pcf, n, m, n, k, mc, nc, 256);
+            }
+        }
+        for (int i = 0; i < viaFloat.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(viaFloat[i]) == BitConverter.SingleToInt32Bits(viaHalf[i]),
+                $"C[{i / n},{i % n}] of {m}x{n} (k={k}, mc={mc}, nc={nc}): half-B {viaHalf[i]} vs float {viaFloat[i]}");
+    }
+
     // The CCX pool's pre-packed-B routes run the M-tail on the same microkernel as the live pack, so a weight packed
     // once gives exactly the output of the same GEMM packed per call.
     [SkippableTheory]

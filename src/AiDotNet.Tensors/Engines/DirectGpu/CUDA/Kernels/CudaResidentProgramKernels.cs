@@ -14,6 +14,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// resets <c>bar[0]</c>, so the two words are reusable launch after launch once zeroed at allocation. The spin wait is
 /// safe because a cooperative launch guarantees every block is co-resident.
 /// </para>
+/// <para>
+/// CUDA only for now; the other backends are tracked per backend, since each needs a different design for the
+/// barrier: HIP #1448 (cooperative launch, a direct port), OpenCL #1449, Vulkan #1450, Metal #1451 and WebGPU #1452
+/// (no cross-work-group forward-progress guarantee, so one submission of ordered dispatches instead of a spin barrier).
+/// </para>
 /// </summary>
 internal static class CudaResidentProgramKernels
 {
@@ -93,7 +98,9 @@ __device__ __forceinline__ float res_block_reduce(float v, bool isMax, float* sc
 // the row softmax one row per block (a block strides over rows).
 __device__ void res_run_stage(const ResStage& s, float* scratch)
 {
-    int n = s.rows * s.cols;
+    // 64-bit: a stage may hold up to int.MaxValue elements, and a 32-bit start index or stride step wraps negative
+    // within one grid of the end, passing the i < n test and addressing out of bounds.
+    long long n = (long long)s.rows * s.cols;
     if (s.op == RES_OP_ROW_SOFTMAX) {
         for (int r = blockIdx.x; r < s.rows; r += gridDim.x) {
             const float* in = s.a + (long long)r * s.cols;
@@ -109,13 +116,13 @@ __device__ void res_run_stage(const ResStage& s, float* scratch)
         }
         return;
     }
-    int stride = gridDim.x * RES_THREADS;
-    for (int i = blockIdx.x * RES_THREADS + threadIdx.x; i < n; i += stride) {
+    long long stride = (long long)gridDim.x * RES_THREADS;
+    for (long long i = (long long)blockIdx.x * RES_THREADS + threadIdx.x; i < n; i += stride) {
         float v;
         if (s.op == RES_OP_ADD) {
             v = s.a[i] + s.b[i];
         } else {
-            int col = i % s.cols;
+            int col = (int)(i % s.cols);
             v = fmaf(s.a[i], s.b[col], s.c[col]);
             if (s.op == RES_OP_AFFINE_RELU) v = fmaxf(v, 0.0f);
         }

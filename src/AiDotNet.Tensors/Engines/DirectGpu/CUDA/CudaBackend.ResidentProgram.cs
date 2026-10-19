@@ -29,9 +29,25 @@ internal readonly struct ResidentStage
         if ((long)rows * cols > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(rows), "A stage is limited to int.MaxValue elements.");
         bool needsB = op != ResidentOp.RowSoftmax;
         bool needsC = op == ResidentOp.Affine || op == ResidentOp.AffineRelu;
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (output is null) throw new ArgumentNullException(nameof(output));
         if (needsB && b is null) throw new ArgumentNullException(nameof(b), $"{op} reads a second operand.");
         if (needsC && c is null) throw new ArgumentNullException(nameof(c), $"{op} reads a bias operand.");
+        // A short buffer would make the kernel read or write past it: CUDA error 700, which poisons the context --
+        // and the backend runs on the device's SHARED primary context, so one bad stage would break every engine in
+        // the process. Refused here as an ordinary exception instead.
+        long elements = (long)rows * cols;
+        RequireSize(a, elements, op, "input", nameof(a));
+        RequireSize(output, elements, op, "output", nameof(output));
+        if (needsB) RequireSize(b!, op == ResidentOp.Add ? elements : cols, op, "second operand", nameof(b));
+        if (needsC) RequireSize(c!, cols, op, "bias", nameof(c));
         Op = op; Rows = rows; Cols = cols; A = a; B = b; C = c; Output = output;
+    }
+
+    private static void RequireSize(IGpuBuffer buffer, long needed, ResidentOp op, string role, string parameter)
+    {
+        if (buffer.Size < needed)
+            throw new ArgumentException($"{op}: the {role} holds {buffer.Size} elements; the stage needs {needed}.", parameter);
     }
 
     public ResidentOp Op { get; }
@@ -62,6 +78,7 @@ public sealed partial class CudaBackend
 {
     private IntPtr _residentProgramModule;
     private string? _residentProgramError;
+    private int _residentProgramBlocksPerSm;
     private readonly object _residentProgramLock = new object();
 
     /// <summary>Whether this device can run a resident program (it needs a cooperative launch).</summary>
@@ -89,13 +106,22 @@ public sealed partial class CudaBackend
         if (stages.Length > CudaResidentProgramKernels.MaxStages)
             throw new ArgumentException($"A resident program holds at most {CudaResidentProgramKernels.MaxStages} stages.", nameof(stages));
         if (!SupportsResidentProgram) throw new NotSupportedException("A resident program needs a cooperative launch, which this device does not support.");
+        if (barrier is null || barrier.Size < 2)
+            throw new ArgumentException("The barrier must be the two-word buffer from AllocateResidentBarrier.", nameof(barrier));
         IntPtr kernel = ResidentKernel(CudaResidentProgramKernels.ProgramKernel);
         using var _ = PushContext();
 
-        CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(out int perSm, kernel,
-                CudaResidentProgramKernels.BlockThreads, 0, 0),
-            "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(resident_program)");
+        // Occupancy depends only on the kernel, its block size and its (zero) dynamic shared memory, all fixed once
+        // the module is compiled: queried once rather than on every launch of a chain that exists to cut launch cost.
+        int perSm = _residentProgramBlocksPerSm;
+        if (perSm == 0)
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(out perSm, kernel,
+                    CudaResidentProgramKernels.BlockThreads, 0, 0),
+                "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(resident_program)");
+            _residentProgramBlocksPerSm = perSm;
+        }
         int needed = 1;
         foreach (var s in stages) needed = Math.Max(needed, BlocksFor(s));
         int grid = Math.Max(1, Math.Min(perSm * _multiProcessorCount, needed));

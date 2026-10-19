@@ -55,11 +55,14 @@ public sealed class GotoGemmRoutingTests
     // A thin-M no-transpose GEMM with deep K (and at least 128 rows) runs packed (GotoGemm). Its tile width depends on the
     // thread count, so the result may not: with n a multiple of 16 every element is the same K-blocked FMA chain at every
     // count. (N stays above 128, out of the JIT generator's box, which takes small shapes only on one thread.)
-    [Theory]
+    [SkippableTheory]
     [InlineData(128, 784, 512)]   // the parity MLP's first layer
     [InlineData(130, 600, 160)]   // a 4-row M-tail, K not a multiple of the 256 K-block
     public void ThinMDeepK_MatchesADoubleReference_AtEveryThreadCount(int m, int k, int n)
     {
+        // Without the machine-code microkernel the packed route is never taken and this would pass through another
+        // kernel, covering nothing it claims to.
+        Skip.IfNot(GotoGemmFp32.IsAvailable, "The packed GotoGemm route is unavailable on this CPU/OS/runtime.");
         int before = CpuParallelSettings.MaxDegreeOfParallelism;
         var rng = RandomHelper.CreateSeededRandom(1055);
         var a = new float[m * k];

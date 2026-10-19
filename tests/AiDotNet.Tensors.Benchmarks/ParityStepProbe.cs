@@ -21,7 +21,13 @@ internal static class ParityStepProbe
     public static int Run(string[] args)
     {
         string network = args.Length > 1 ? args[1] : "mlp";
-        int steps = args.Length > 2 ? int.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture) : 300;
+        int steps = 300;
+        if (args.Length > 2 && !int.TryParse(args[2], System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out steps))
+        {
+            Console.Error.WriteLine($"--parity-step: steps '{args[2]}' is not an integer.");
+            return 2;
+        }
         if (network != "mlp" && network != "cnn" && network != "resnet18")
         {
             Console.Error.WriteLine($"--parity-step: unknown network '{network}' (mlp, cnn or resnet18).");

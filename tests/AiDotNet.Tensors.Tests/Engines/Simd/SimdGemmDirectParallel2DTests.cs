@@ -125,7 +125,7 @@ public class SimdGemmDirectParallel2DTests
     [Theory]
     [InlineData(784, 64, 512)]    // the parity MLP's first-layer dW
     [InlineData(30, 17, 80)]      // 2 full 32-column steps, then a 16-column step
-    [InlineData(25, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail
+    [InlineData(29, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail (mFull = 28)
     public void Vector512TransATile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
     {
         var a = Rand(k * m, m * 5 + k);   // stored [k, m]

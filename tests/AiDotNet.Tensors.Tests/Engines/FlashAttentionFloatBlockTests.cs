@@ -100,4 +100,64 @@ public class FlashAttentionFloatBlockTests
             Assert.True(Math.Abs(expectedStats[i] - parallelStats.GetFlat(i)) <= 2e-5 * Math.Max(1, Math.Abs(expectedStats[i])),
                 $"stats[{i}]: expected {expectedStats[i]:G9}, got {parallelStats.GetFlat(i):G9}");
     }
+    /// <summary>
+    /// A shape smaller than one 64-row block and narrower than a vector (SeqQ 5, SeqK 3), with a row whose every score
+    /// is -inf. Through the bias that row takes the scalar path's fully-masked guard; through a -inf query row it takes
+    /// the vectorized path's guard (no mask or bias, but a non-finite input), which before the guard computed
+    /// -inf - -inf = NaN. Either way the row's output is zero and its log-sum-exp is -inf; every other row matches a
+    /// double reference.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ARowWhoseEveryScoreIsMinusInfinity_IsZeroWithMinusInfinityStats(bool maskedByBias)
+    {
+        const int b = 1, h = 1, sq = 5, sk = 3, d = 4, dead = 2;
+        var q = Random(11, b, h, sq, d);
+        var k = Random(12, b, h, sk, d);
+        var v = Random(13, b, h, sk, d);
+        Tensor<float>? bias = null;
+        if (maskedByBias)
+        {
+            bias = new Tensor<float>(new[] { b, h, sq, sk });
+            for (int j = 0; j < sk; j++) bias[0, 0, dead, j] = float.NegativeInfinity;
+        }
+        else
+        {
+            // Every key component positive and the query row -inf: every score of that row is -inf.
+            for (int j = 0; j < sk; j++)
+                for (int c = 0; c < d; c++) k[0, 0, j, c] = 0.5f + 0.1f * (j + c);
+            for (int c = 0; c < d; c++) q[0, 0, dead, c] = float.NegativeInfinity;
+        }
+        double scale = 1.0 / Math.Sqrt(d);
+        var output = new CpuEngine().FlashAttention(q, k, v, scale, false, out var stats, bias);
+
+        for (int i = 0; i < sq; i++)
+        {
+            if (i == dead)
+            {
+                for (int c = 0; c < d; c++) Assert.Equal(0f, output[0, 0, i, c]);
+                Assert.True(float.IsNegativeInfinity(stats.GetFlat(i)), $"stats[{i}] = {stats.GetFlat(i)}");
+                continue;
+            }
+            var scores = new double[sk];
+            double max = double.NegativeInfinity;
+            for (int j = 0; j < sk; j++)
+            {
+                double s = 0;
+                for (int c = 0; c < d; c++) s += (double)q[0, 0, i, c] * k[0, 0, j, c];
+                scores[j] = s * scale + (bias is null ? 0 : bias[0, 0, i, j]);
+                max = Math.Max(max, scores[j]);
+            }
+            double sum = 0;
+            for (int j = 0; j < sk; j++) { scores[j] = Math.Exp(scores[j] - max); sum += scores[j]; }
+            Assert.True(Math.Abs(max + Math.Log(sum) - stats.GetFlat(i)) <= 2e-5, $"stats[{i}]");
+            for (int c = 0; c < d; c++)
+            {
+                double acc = 0;
+                for (int j = 0; j < sk; j++) acc += scores[j] / sum * v[0, 0, j, c];
+                Assert.True(Math.Abs(acc - output[0, 0, i, c]) <= 2e-5, $"output[{i},{c}]: expected {acc:G9}, got {output[0, 0, i, c]:G9}");
+            }
+        }
+    }
 }

@@ -31920,57 +31920,68 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         int rowOff = sOff + i * seqK;
                         float maxVal = ScaleRowAndMax(scoresData, rowOff, seqK, scaleF);
+                        // No mask or bias can make a score -inf, but a non-finite INPUT can (and an empty row
+                        // leaves the max at its -inf seed): -inf - -inf is NaN in the exp. Same guard as the
+                        // scalar path: an all-zero row and a -inf log-sum-exp.
+                        if (float.IsNegativeInfinity(maxVal))
+                        {
+                            Array.Clear(scoresData, rowOff, seqK);
+                            statsData[bh * seqQ + i] = negInfF;
+                            continue;
+                        }
                         float sumExp = ExpShiftedSum(scoresData, rowOff, seqK, maxVal);
                         ScaleRow(scoresData, rowOff, seqK, sumExp != 0f ? 1f / sumExp : 0f);
                         statsData[bh * seqQ + i] = maxVal + MathF.Log(sumExp);
                     }
                 }
                 else
-                for (int i = r0; i < r0 + rows; i++)
                 {
-                    int rowOff = sOff + i * seqK;
-                    float maxVal = negInfF;
-                    for (int j = 0; j < seqK; j++)
+                    for (int i = r0; i < r0 + rows; i++)
                     {
-                        float v = scoresData[rowOff + j] * scaleF;
-                        // Additive attention bias (3D [heads,seqQ,seqK] or 4D [B,H,seqQ,seqK])
-                        if (biasData is not null)
-                        {
-                            int biasIdx = biasBroadcastBatch
-                                ? (h * seqQ * seqK + i * seqK + j)
-                                : (b * heads * seqQ * seqK + h * seqQ * seqK + i * seqK + j);
-                            v += biasData[biasIdx];
-                        }
-                        // Causal mask: positions j > i don't attend
-                        if (isCausal && j > i) v = negInfF;
-                        if (v > maxVal) maxVal = v;
-                        scoresData[rowOff + j] = v;
-                    }
-
-                    // Fully-masked row guard (SDPA fix pattern): if every position
-                    // was masked out, the exp(x - (-Inf)) = +Inf trick produces NaN.
-                    // Emit all-zero softmax + log-sum-exp = -Inf for that row.
-                    if (float.IsNegativeInfinity(maxVal))
-                    {
+                        int rowOff = sOff + i * seqK;
+                        float maxVal = negInfF;
                         for (int j = 0; j < seqK; j++)
-                            scoresData[rowOff + j] = 0f;
-                        statsData[bh * seqQ + i] = negInfF;
-                        continue;
-                    }
+                        {
+                            float v = scoresData[rowOff + j] * scaleF;
+                            // Additive attention bias (3D [heads,seqQ,seqK] or 4D [B,H,seqQ,seqK])
+                            if (biasData is not null)
+                            {
+                                int biasIdx = biasBroadcastBatch
+                                    ? (h * seqQ * seqK + i * seqK + j)
+                                    : (b * heads * seqQ * seqK + h * seqQ * seqK + i * seqK + j);
+                                v += biasData[biasIdx];
+                            }
+                            // Causal mask: positions j > i don't attend
+                            if (isCausal && j > i) v = negInfF;
+                            if (v > maxVal) maxVal = v;
+                            scoresData[rowOff + j] = v;
+                        }
 
-                    float sumExp = 0f;
-                    for (int j = 0; j < seqK; j++)
-                    {
-                        float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
-                        scoresData[rowOff + j] = e;
-                        sumExp += e;
-                    }
-                    float inv = sumExp != 0f ? 1f / sumExp : 0f;
-                    for (int j = 0; j < seqK; j++)
-                        scoresData[rowOff + j] *= inv;
+                        // Fully-masked row guard (SDPA fix pattern): if every position
+                        // was masked out, the exp(x - (-Inf)) = +Inf trick produces NaN.
+                        // Emit all-zero softmax + log-sum-exp = -Inf for that row.
+                        if (float.IsNegativeInfinity(maxVal))
+                        {
+                            for (int j = 0; j < seqK; j++)
+                                scoresData[rowOff + j] = 0f;
+                            statsData[bh * seqQ + i] = negInfF;
+                            continue;
+                        }
 
-                    // logsumexp = max + log(sum) — the backward pass needs this.
-                    statsData[bh * seqQ + i] = maxVal + MathF.Log(sumExp);
+                        float sumExp = 0f;
+                        for (int j = 0; j < seqK; j++)
+                        {
+                            float e = MathF.Exp(scoresData[rowOff + j] - maxVal);
+                            scoresData[rowOff + j] = e;
+                            sumExp += e;
+                        }
+                        float inv = sumExp != 0f ? 1f / sumExp : 0f;
+                        for (int j = 0; j < seqK; j++)
+                            scoresData[rowOff + j] *= inv;
+
+                        // logsumexp = max + log(sum) — the backward pass needs this.
+                        statsData[bh * seqQ + i] = maxVal + MathF.Log(sumExp);
+                    }
                 }
 
                 // Step 3: output = softmax · V for this block's rows (no transpose).
