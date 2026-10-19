@@ -35,13 +35,46 @@ public partial class CpuEngine
                 float* gr = pg + oh * outW;
                 int ow = 0;
 #if NET5_0_OR_GREATER
-                if (Avx2.IsSupported)
+                if (Avx2.IsSupported && outW >= 8)
                 {
+                    for (; ow + 8 <= outW; ow += 8) MaxPoolBackward8(x0, x1, gr, d0, d1, ow);
+                    // The last windows as one more 8-window step overlapping the previous one: each window's four
+                    // cells are a pure function of x and g, written rather than accumulated, so a recomputed window
+                    // rewrites the same bits. A 28-wide plane ran 6 of its 14 windows scalar, a 14-wide plane all 7.
+                    if (ow < outW) { MaxPoolBackward8(x0, x1, gr, d0, d1, outW - 8); ow = outW; }
+                }
+                else if (Sse41.IsSupported && outW >= 4)
+                {
+                    for (; ow + 4 <= outW; ow += 4) MaxPoolBackward4(x0, x1, gr, d0, d1, ow);
+                    if (ow < outW) { MaxPoolBackward4(x0, x1, gr, d0, d1, outW - 4); ow = outW; }
+                }
+#endif
+                for (; ow < outW; ow++)
+                {
+                    int iw0 = 2 * ow;
+                    float maxVal = float.MinValue;
+                    int winner = 0;   // a winnerless window routes to its own first cell
+                    float v = x0[iw0]; if (v > maxVal) { maxVal = v; winner = 0; }
+                    v = x0[iw0 + 1]; if (v > maxVal) { maxVal = v; winner = 1; }
+                    v = x1[iw0]; if (v > maxVal) { maxVal = v; winner = 2; }
+                    v = x1[iw0 + 1]; if (v > maxVal) { winner = 3; }
+                    d0[iw0] = 0f; d0[iw0 + 1] = 0f; d1[iw0] = 0f; d1[iw0 + 1] = 0f;
+                    float* target = winner switch { 1 => d0 + iw0 + 1, 2 => d1 + iw0, 3 => d1 + iw0 + 1, _ => d0 + iw0 };
+                    *target += gr[ow];
+                }
+            }
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>Eight windows (output columns <paramref name="ow"/>..+7) of <see cref="MaxPool2x2Stride2TilesBackwardPlane"/>.</summary>
+    [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
+    private static unsafe void MaxPoolBackward8(float* x0, float* x1, float* gr, float* d0, float* d1, int ow)
+    {
                     var minV = Vector256.Create(float.MinValue);
                     var zero = Vector256<float>.Zero;
                     var t0 = Vector256.Create(0f); var t1 = Vector256.Create(1f);
                     var t2 = Vector256.Create(2f); var t3 = Vector256.Create(3f);
-                    for (; ow + 8 <= outW; ow += 8)
                     {
                         int c = 2 * ow;
                         var r0lo = Avx.LoadVector256(x0 + c);
@@ -71,24 +104,40 @@ public partial class CpuEngine
                         StoreInterleaved(d0 + c, dA, dB);
                         StoreInterleaved(d1 + c, dC, dD);
                     }
-                }
-#endif
-                for (; ow < outW; ow++)
-                {
-                    int iw0 = 2 * ow;
-                    float maxVal = float.MinValue;
-                    int winner = 0;   // a winnerless window routes to its own first cell
-                    float v = x0[iw0]; if (v > maxVal) { maxVal = v; winner = 0; }
-                    v = x0[iw0 + 1]; if (v > maxVal) { maxVal = v; winner = 1; }
-                    v = x1[iw0]; if (v > maxVal) { maxVal = v; winner = 2; }
-                    v = x1[iw0 + 1]; if (v > maxVal) { winner = 3; }
-                    d0[iw0] = 0f; d0[iw0 + 1] = 0f; d1[iw0] = 0f; d1[iw0 + 1] = 0f;
-                    float* target = winner switch { 1 => d0 + iw0 + 1, 2 => d1 + iw0, 3 => d1 + iw0 + 1, _ => d0 + iw0 };
-                    *target += gr[ow];
-                }
-            }
-        }
     }
+
+    /// <summary>Four windows of <see cref="MaxPool2x2Stride2TilesBackwardPlane"/> on 128-bit vectors, the same rule.</summary>
+    [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
+    private static unsafe void MaxPoolBackward4(float* x0, float* x1, float* gr, float* d0, float* d1, int ow)
+    {
+        int c = 2 * ow;
+        var r0lo = Sse.LoadVector128(x0 + c); var r0hi = Sse.LoadVector128(x0 + c + 4);
+        var r1lo = Sse.LoadVector128(x1 + c); var r1hi = Sse.LoadVector128(x1 + c + 4);
+        var a = Sse.Shuffle(r0lo, r0hi, 0b10_00_10_00);
+        var b = Sse.Shuffle(r0lo, r0hi, 0b11_01_11_01);
+        var cc = Sse.Shuffle(r1lo, r1hi, 0b10_00_10_00);
+        var dd = Sse.Shuffle(r1lo, r1hi, 0b11_01_11_01);
+        var t0 = Vector128.Create(0f); var t1 = Vector128.Create(1f);
+        var t2 = Vector128.Create(2f); var t3 = Vector128.Create(3f);
+        var m = Vector128.Create(float.MinValue);
+        var sel = t0;
+        var gt = Sse.CompareGreaterThan(a, m);
+        m = Sse41.BlendVariable(m, a, gt); sel = Sse41.BlendVariable(sel, t0, gt);
+        gt = Sse.CompareGreaterThan(b, m);
+        m = Sse41.BlendVariable(m, b, gt); sel = Sse41.BlendVariable(sel, t1, gt);
+        gt = Sse.CompareGreaterThan(cc, m);
+        m = Sse41.BlendVariable(m, cc, gt); sel = Sse41.BlendVariable(sel, t2, gt);
+        gt = Sse.CompareGreaterThan(dd, m);
+        sel = Sse41.BlendVariable(sel, t3, gt);
+        var gv = Sse.Add(Vector128<float>.Zero, Sse.LoadVector128(gr + ow));
+        var dA = Sse.And(gv, Sse.CompareEqual(sel, t0));
+        var dB = Sse.And(gv, Sse.CompareEqual(sel, t1));
+        var dC = Sse.And(gv, Sse.CompareEqual(sel, t2));
+        var dD = Sse.And(gv, Sse.CompareEqual(sel, t3));
+        Sse.Store(d0 + c, Sse.UnpackLow(dA, dB)); Sse.Store(d0 + c + 4, Sse.UnpackHigh(dA, dB));
+        Sse.Store(d1 + c, Sse.UnpackLow(dC, dD)); Sse.Store(d1 + c + 4, Sse.UnpackHigh(dC, dD));
+    }
+#endif
 
 #if NET5_0_OR_GREATER
     /// <summary>Elements 0, 2, 4, ... of the 16 floats <paramref name="lo"/>:<paramref name="hi"/>, in order.</summary>
@@ -123,9 +172,35 @@ public partial class CpuEngine
     {
         int ow = 0;
 #if NET5_0_OR_GREATER
-        if (Avx2.IsSupported)
+        if (Avx2.IsSupported && outW >= 8)
         {
-            for (; ow + 8 <= outW; ow += 8)
+            for (; ow + 8 <= outW; ow += 8) MaxPoolForward8(r0, r1, dst, ow);
+            // The last windows as an overlapping 8-window step: a window's max is a pure function of the window, so a
+            // recomputed one rewrites the same bits. A 14-window row ran 6 of them scalar.
+            if (ow < outW) { MaxPoolForward8(r0, r1, dst, outW - 8); ow = outW; }
+        }
+        else if (Sse41.IsSupported && outW >= 4)
+        {
+            for (; ow + 4 <= outW; ow += 4) MaxPoolForward4(r0, r1, dst, ow);
+            if (ow < outW) { MaxPoolForward4(r0, r1, dst, outW - 4); ow = outW; }
+        }
+#endif
+        for (; ow < outW; ow++)
+        {
+            int iw = 2 * ow;
+            float m = r0[iw];
+            float v = r0[iw + 1]; if (v > m) m = v;
+            v = r1[iw]; if (v > m) m = v;
+            v = r1[iw + 1]; if (v > m) m = v;
+            dst[ow] = m;
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    /// <summary>Eight windows (output columns <paramref name="ow"/>..+7) of <see cref="MaxPool2x2Stride2Row"/>.</summary>
+    [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
+    private static unsafe void MaxPoolForward8(float* r0, float* r1, float* dst, int ow)
+    {
             {
                 int c = 2 * ow;
                 var r0lo = Avx.LoadVector256(r0 + c);
@@ -141,18 +216,25 @@ public partial class CpuEngine
                 m = Avx.BlendVariable(m, v, Avx.Compare(v, m, FloatComparisonMode.OrderedGreaterThanNonSignaling));
                 Avx.Store(dst + ow, m);
             }
-        }
-#endif
-        for (; ow < outW; ow++)
-        {
-            int iw = 2 * ow;
-            float m = r0[iw];
-            float v = r0[iw + 1]; if (v > m) m = v;
-            v = r1[iw]; if (v > m) m = v;
-            v = r1[iw + 1]; if (v > m) m = v;
-            dst[ow] = m;
-        }
     }
+
+    /// <summary>Four windows of <see cref="MaxPool2x2Stride2Row"/> on 128-bit vectors, the same rule.</summary>
+    [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
+    private static unsafe void MaxPoolForward4(float* r0, float* r1, float* dst, int ow)
+    {
+        int c = 2 * ow;
+        var r0lo = Sse.LoadVector128(r0 + c); var r0hi = Sse.LoadVector128(r0 + c + 4);
+        var r1lo = Sse.LoadVector128(r1 + c); var r1hi = Sse.LoadVector128(r1 + c + 4);
+        var m = Sse.Shuffle(r0lo, r0hi, 0b10_00_10_00);
+        var v = Sse.Shuffle(r0lo, r0hi, 0b11_01_11_01);
+        m = Sse41.BlendVariable(m, v, Sse.CompareGreaterThan(v, m));
+        v = Sse.Shuffle(r1lo, r1hi, 0b10_00_10_00);
+        m = Sse41.BlendVariable(m, v, Sse.CompareGreaterThan(v, m));
+        v = Sse.Shuffle(r1lo, r1hi, 0b11_01_11_01);
+        m = Sse41.BlendVariable(m, v, Sse.CompareGreaterThan(v, m));
+        Sse.Store(dst + ow, m);
+    }
+#endif
 
     /// <summary>
     /// Adaptive-pool window bounds for one axis: for output index <c>o</c> of <paramref name="outSize"/>,
