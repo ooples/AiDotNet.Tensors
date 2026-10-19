@@ -127,9 +127,9 @@ jobs:
         run: |
           lscpu > "$RUNNER_TEMP/lscpu.txt"
           probe=$(find tests/AiDotNet.Tensors.Benchmarks/bin/Release -name AiDotNet.Tensors.Benchmarks.dll | head -1)
-          for net in mlp cnn; do
-            steps=$([ "$net" = mlp ] && echo 3000 || echo 600)
-            dotnet "$probe" --parity-step "$net" 300 | tee -a "$RUNNER_TEMP/probe.txt"
+          for net in mlp cnn resnet18; do
+            steps=$([ "$net" = mlp ] && echo 3000 || ([ "$net" = cnn ] && echo 600 || echo 60))
+            dotnet "$probe" --parity-step "$net" $([ "$net" = resnet18 ] && echo 30 || echo 300) | tee -a "$RUNNER_TEMP/probe.txt"
             dotnet-trace collect --output "$RUNNER_TEMP/$net.nettrace"               --providers Microsoft-DotNETCore-SampleProfiler,Microsoft-Windows-DotNETRuntime:0x14C14FCCBD:4               -- dotnet "$probe" --parity-step "$net" "$steps" | tee -a "$RUNNER_TEMP/probe.txt"
           done
       - name: Upload
