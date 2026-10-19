@@ -1,0 +1,197 @@
+{
+  "network": "transformer",
+  "device": "cuda",
+  "machineKey": "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti",
+  "stepRatio": 0.5263799803921313,
+  "medianStepRatio": 0.5295365104054043,
+  "noiseBand": 0.005973847325225228,
+  "protocol": 2,
+  "torch": {
+    "version": "2.11.0\u002Bcu126",
+    "bestMode": "cuda_graph",
+    "best": {
+      "MedianMs": 0.33009999606292695,
+      "IqrMs": 0.00100000761449337,
+      "MinMs": 0.327900008414872,
+      "Samples": 300
+    },
+    "modes": [
+      {
+        "Name": "eager",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 4.6098499951767735,
+          "IqrMs": 0.6030999938957393,
+          "MinMs": 3.480600003967993,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "cuda_graph",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 0.334700001985766,
+          "IqrMs": 0.001300009898841381,
+          "MinMs": 0.33340000663883984,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:default",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 3.5669999924721196,
+          "IqrMs": 0.5544000014197081,
+          "MinMs": 2.8994000022066757,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:reduce-overhead",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.854900001490023,
+          "IqrMs": 0.22050000552553684,
+          "MinMs": 1.4778000040678307,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:max-autotune",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.4658999934908934,
+          "IqrMs": 0.2843000111170113,
+          "MinMs": 1.4036000065971166,
+          "Samples": 100
+        }
+      }
+    ],
+    "phases": {
+      "forward": {
+        "MedianMs": 1.3466499949572608,
+        "IqrMs": 0.36389999149832875,
+        "MinMs": 1.1495999933686107,
+        "Samples": 300
+      },
+      "backward": {
+        "MedianMs": 2.6301000034436584,
+        "IqrMs": 0.440500007243827,
+        "MinMs": 1.8228999979328364,
+        "Samples": 300
+      },
+      "optimizer": {
+        "MedianMs": 0.48160000005736947,
+        "IqrMs": 0.13270000636111945,
+        "MinMs": 0.2700000040931627,
+        "Samples": 300
+      },
+      "step": {
+        "MedianMs": 4.662899998947978,
+        "IqrMs": 0.41789999522734433,
+        "MinMs": 3.2777000014903024,
+        "Samples": 300
+      }
+    },
+    "losses": [
+      1.5844169855117798,
+      1.1979764699935913,
+      0.9078540802001953,
+      0.6894087195396423,
+      0.5245101451873779,
+      0.3997480869293213,
+      0.3051571547985077,
+      0.2333039790391922,
+      0.1786261349916458,
+      0.13694949448108673
+    ]
+  },
+  "tensors": {
+    "version": "1.0.0.0",
+    "bestMode": "compiled",
+    "best": {
+      "MedianMs": 0.1748,
+      "IqrMs": 0.0008999999999999841,
+      "MinMs": 0.1726,
+      "Samples": 300
+    },
+    "modes": [
+      {
+        "Name": "eager (phase-synchronised)",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.53095,
+          "IqrMs": 0.18640000000000012,
+          "MinMs": 1.3545,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "eager",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.1899,
+          "IqrMs": 0.1049,
+          "MinMs": 1.001,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compiled",
+        "Status": "ok",
+        "Reason": "CUDA graph replay",
+        "Step": {
+          "MedianMs": 0.1748,
+          "IqrMs": 0.0007999999999999952,
+          "MinMs": 0.1739,
+          "Samples": 100
+        }
+      }
+    ],
+    "phases": {
+      "forward": {
+        "MedianMs": 0.30315000000000003,
+        "IqrMs": 0.046999999999999986,
+        "MinMs": 0.2373,
+        "Samples": 300
+      },
+      "backward": {
+        "MedianMs": 0.8401000000000001,
+        "IqrMs": 0.10630000000000006,
+        "MinMs": 0.7444999999999999,
+        "Samples": 300
+      },
+      "optimizer": {
+        "MedianMs": 0.03434999999999999,
+        "IqrMs": 0.006899999999999906,
+        "MinMs": 0.026000000000000023,
+        "Samples": 300
+      },
+      "step": {
+        "MedianMs": 1.184,
+        "IqrMs": 0.14789999999999992,
+        "MinMs": 1.016,
+        "Samples": 300
+      }
+    },
+    "losses": [
+      1.5844169855117798,
+      1.1979763507843018,
+      0.9078540802001953,
+      0.6894087195396423,
+      0.5245101451873779,
+      0.3997480869293213,
+      0.3051571547985077,
+      0.2333039492368698,
+      0.1786261647939682,
+      0.13694947957992554
+    ]
+  }
+}
