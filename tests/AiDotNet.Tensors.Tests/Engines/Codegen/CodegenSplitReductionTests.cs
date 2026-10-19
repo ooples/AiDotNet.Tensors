@@ -509,7 +509,10 @@ public class CodegenSplitReductionTests
     [Fact]
     public void PlannerHandlesMax()
     {
-        Assert.NotNull(CodegenSplitReduction.TryPlan(RowReduce(4096, 1024, CodegenReduceKind.Max)));
+        // 64 rows: few enough outputs that even a warp per row (2048 threads) leaves the
+        // device idle. 4096 rows used to be the shape here, but it is now lowered as a warp
+        // per row -- 131072 threads -- which the planner rightly declines to split.
+        Assert.NotNull(CodegenSplitReduction.TryPlan(RowReduce(64, 4096, CodegenReduceKind.Max)));
     }
 
     // ---- per-term transforms -------------------------------------------------------------

@@ -252,6 +252,23 @@ public sealed partial class PtxAffineEmitter
     public bool EnableSharedStaging { get; set; } = true;
 
     /// <summary>
+    /// Lowers an eligible reduction as one WARP per output instead of one thread. Default on.
+    /// </summary>
+    /// <remarks>
+    /// The 32 lanes read CONSECUTIVE elements of the contiguous reduction axis -- term k is
+    /// read by lane <c>k mod 32</c> on trip <c>k / 32</c> -- and a butterfly shuffle combines
+    /// their partials, after which lane 0 alone runs the epilogue and stores. The caller
+    /// still passes the ORIGINAL spec, and the oracle is still that spec. Eligibility and the
+    /// rewrite are <see cref="CodegenWarpReduction"/>. Off-switch kept for paired A/B.
+    /// </remarks>
+    public bool EnableWarpReduction { get; set; } = true;
+
+    /// <summary>True when the last emission used the warp-per-output lowering.</summary>
+    public bool WarpReduced { get; private set; }
+
+    private const int WarpLanes = CodegenWarpReduction.Lanes;
+
+    /// <summary>
     /// Cooperatively loads a block-invariant operand into shared memory, once per
     /// strip-mine iteration, and returns the register holding the shared base address.
     /// </summary>
@@ -1007,6 +1024,18 @@ public sealed partial class PtxAffineEmitter
         if (spec.Algebra != CodegenAlgebra.Real)
             return EmitAlgebraic(spec, computeMajor, computeMinor);
 
+        // WARP PER OUTPUT. Everything below emits the lane-interleaved spec unchanged except
+        // for three things the lowering forbids -- tiling, staging and a block that is not a
+        // whole number of warps -- and the shuffle that closes the reduction.
+        int warpLaneAxis = -1;
+        WarpReduced = false;
+        if (EnableWarpReduction && CodegenWarpReduction.TryLaneInterleave(spec, out var laneSpec))
+        {
+            spec = laneSpec;
+            warpLaneAxis = spec.Space.Axes.Count - 1;
+            WarpReduced = true;
+        }
+
         var space = spec.Space;
         var axes = space.Axes;
         axesMeta = axes;
@@ -1056,7 +1085,9 @@ public sealed partial class PtxAffineEmitter
         // reuse instead of traffic.
         var tileAxes = new List<int>();
         var tileFactors = new List<int>();
-        if (Coarsening > 1 && parallel.Length > 0)
+        // A warp lowering must not tile: a tile would give one thread several lanes'
+        // worth of the interleaved axis, and the shuffle assumes one lane per thread.
+        if (Coarsening > 1 && parallel.Length > 0 && warpLaneAxis < 0)
             SelectTile(spec, axes, parallel, Coarsening, MaxTileLanes, tileAxes, tileFactors);
 
         // NOT COARSENED FOR STREAMING, AND THAT IS A MEASURED DECISION. SelectTile
@@ -1098,7 +1129,9 @@ public sealed partial class PtxAffineEmitter
 
         // Block size derived so a block's threads all agree on the slow axes, which is
         // the precondition for staging a block-invariant operand in shared memory.
-        int blockThreads = EnableSharedStaging
+        // A derived block need not be a whole number of warps, and a warp that straddles two
+        // blocks would shuffle with lanes that are not there.
+        int blockThreads = EnableSharedStaging && warpLaneAxis < 0
             ? ChooseBlockThreads(axes, parallel, tileAxes, tileFactors, out var varyingAxes)
             : PassThroughBlock(out varyingAxes);
 
@@ -1183,7 +1216,7 @@ public sealed partial class PtxAffineEmitter
 
         bool twoDimensional = false;
         int blockX = blockThreads, blockY = 1;
-        if (EnableInputStaging && dataOperand >= 0 &&
+        if (EnableInputStaging && dataOperand >= 0 && warpLaneAxis < 0 &&
             CanStageInput(spec, axes, tileAxes, tileFactors, dataOperand, out int bx, out int by))
         {
             twoDimensional = true;
@@ -1832,6 +1865,32 @@ public sealed partial class PtxAffineEmitter
                 L($"@{cont} bra LOOP{I(i)};");
             }
             accs = (string[])accsFixed.Clone();
+        }
+
+        if (warpLaneAxis >= 0)
+        {
+            // Every lane of the warp is live here: the thread count is outputs x 32 and the
+            // block a multiple of 32, so the bounds guard retires whole warps, never part of
+            // one. The butterfly leaves the full reduction in EVERY lane; lane 0 then runs
+            // the epilogue alone, so each output is written once.
+            if (blockThreads % WarpLanes != 0)
+                throw new InvalidOperationException(
+                    "Warp reduction needs a whole number of warps per block; got " + I(blockThreads) + ".");
+            string combineOp = spec.Reduce == CodegenReduceKind.Max ? "max.f32" : "add.rn.f32";
+            string acc = accs[0];
+            for (int offset = WarpLanes / 2; offset >= 1; offset /= 2)
+            {
+                string bits = NextR(), otherBits = NextR(), other = NextF(), combined = NextF();
+                L($"mov.b32 {bits}, {acc};");
+                L($"shfl.sync.bfly.b32 {otherBits}, {bits}, {I(offset)}, 31, 0xffffffff;");
+                L($"mov.b32 {other}, {otherBits};");
+                L($"{combineOp} {combined}, {acc}, {other};");
+                acc = combined;
+            }
+            accs[0] = acc;
+            string notLeader = NextP();
+            L($"setp.ne.u32 {notLeader}, {axisReg[warpLaneAxis]}, 0;");
+            L($"@{notLeader} bra END;");
         }
 
         // Epilogue and store, per lane. Bias and scale are hoisted when they do not

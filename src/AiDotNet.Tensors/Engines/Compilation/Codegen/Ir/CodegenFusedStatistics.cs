@@ -386,15 +386,21 @@ public static class CodegenFusedStatistics
         if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
         RequireEpsilon(epsilon);
         int[] nchw = { batch, channels, height, width };
+        int plane = height * width;
+        int[] planes = { batch, channels, plane };
         int[] channel = { channels };
-        double count = (double)batch * height * width;
+        double count = (double)batch * plane;
 
-        // Axis order (c | n, h, w): the channel is the only parallel axis.
+        // Axis order (c | n, hw): the channel is the only parallel axis. The statistics bind
+        // x as [n, c, h*w] -- the same bytes -- because h and w are one contiguous run. As
+        // two axes the stride-1 one has extent w (56 at ResNet's first stage), which no
+        // warp divides; as one it has extent h*w, which the warp lowering and the split
+        // can both use.
         CodegenIterationSpace StatisticsSpace() => new(
             CodegenAxis.Parallel("c", channels), CodegenAxis.Reduce("n", batch),
-            CodegenAxis.Reduce("h", height), CodegenAxis.Reduce("w", width));
+            CodegenAxis.Reduce("hw", plane));
         CodegenTensorBinding StatisticsInput() =>
-            Bind(0, "x", nchw, Axis(1), Axis(0), Axis(2), Axis(3));
+            Bind(0, "x", planes, Axis(1), Axis(0), Axis(2));
 
         var negMean = new CodegenKernelSpec(
             "batchnorm_negmean", StatisticsSpace(),

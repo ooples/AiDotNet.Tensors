@@ -952,7 +952,20 @@ internal static class KernelConveyorTool
                     it._named.Add(pass.Output.Name, output);
 
                     var tuned = ResolveTuned(runtime, pass, catalogName + "/" + pass.Name);
-                    it.Lowerings.Add(tuned.Label());
+                    string label = tuned.Label();
+
+                    // NO RECORDED WINNER means the modelled choice, and for a program that is
+                    // what the graph compiler does: PtxGraphEmitter splits whenever the planner
+                    // says one kernel would leave the device idle. Benching the single kernel
+                    // here would time a lowering production never runs -- a BatchNorm's
+                    // per-channel statistics are 64 threads unsplit.
+                    if (tuned.Winner is null && !tuned.IsSplit &&
+                        CodegenSplitReduction.TryPlan(pass) is { } modelled)
+                    {
+                        tuned = ModelledSplit(runtime, pass, modelled);
+                        label = "modelled " + tuned.Label();
+                    }
+                    it.Lowerings.Add(label);
                     IntPtr Operand(int input) => it._named[pass.Inputs[input].Name].Pointer;
 
                     if (tuned.Split is { } plan)
@@ -1003,6 +1016,21 @@ internal static class KernelConveyorTool
             RegistersPerThread = Math.Max(RegistersPerThread, info.RegistersPerThread);
             _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY,
                 kernel.DynamicSharedMemoryBytes));
+        }
+
+        /// <summary>The planner's split, both halves through the affine emitter.</summary>
+        private static TunedProgram ModelledSplit(
+            DirectPtxRuntime runtime, CodegenKernelSpec pass, CodegenSplitPlan plan)
+        {
+            ProgramKernel Half(CodegenKernelSpec half)
+            {
+                var emitter = new PtxAffineEmitter();
+                string text = emitter.Emit(half, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                return new ProgramKernel(half, text, emitter.LaunchBlocks,
+                    (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY,
+                    emitter.LoopedAxes, emitter.ElidedGuards, emitter.StagedOperands);
+            }
+            return new TunedProgram(pass, new[] { Half(plan.Partial), Half(plan.Combine) }, plan, null);
         }
 
         private void LaunchDirect()

@@ -300,9 +300,17 @@ public static class CodegenSplitReduction
 
         // Four blocks per SM is the point past which latency is hidden; a kernel already
         // there does not need the extra launch or the temporary.
+        //
+        // A reduction lowered as a warp per output launches 32 threads per output, so that
+        // is what the UNSPLIT kernel is measured by -- counting one would split row
+        // statistics the warp lowering already spreads over the whole device. Promoted
+        // partials are counted one thread per element below, which is conservative: a
+        // partial can itself be warp-eligible, but deciding to split must not depend on it.
         long target = (long)multiprocessors * 4L;
+        long unsplitThreads = spec.Output.ElementCount *
+            (CodegenWarpReduction.IsEligible(spec) ? CodegenWarpReduction.Lanes : 1);
+        if ((unsplitThreads + blockThreads - 1) / blockThreads >= target) return chosen;
         long threads = spec.Output.ElementCount;
-        if ((threads + blockThreads - 1) / blockThreads >= target) return chosen;
 
         // Largest extent first, ties broken by axis index. List.Sort is UNSTABLE, so
         // without the tie-break two axes of equal extent could order differently between

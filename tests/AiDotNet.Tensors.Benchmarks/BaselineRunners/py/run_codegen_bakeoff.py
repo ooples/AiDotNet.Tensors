@@ -247,6 +247,59 @@ def main():
              lambda: torch.relu(torch.nn.functional.conv2d(x1, w1, b1) * s1),
              "conv+bias then scale then relu: three kernels PyTorch cannot fuse")
 
+    # ---- POINTWISE (#890 phase 4a), 8192x1024 unless noted. Each is PyTorch's own
+    # fastest spelling: a fused native op where one exists (gelu, silu, softmax,
+    # layer_norm, rms_norm, batch_norm, group_norm), the plain composition otherwise.
+    F = torch.nn.functional
+    xr = torch.randn(8192, 1024, device=dev)
+    yr = torch.randn(8192, 1024, device=dev)
+    br = torch.randn(1024, device=dev)
+    if selected("bias_gelu"):
+        emit_both("bias_gelu", lambda: F.gelu(xr + br, approximate="tanh"),
+                  "add then gelu: two kernels")
+    if selected("bias_swish"):
+        emit_both("bias_swish", lambda: F.silu(xr + br), "add then silu: two kernels")
+    if selected("residual_add_relu"):
+        emit_both("residual_add_relu", lambda: torch.relu(xr + yr), "add then relu: two kernels")
+    if selected("multiply"):
+        emit_both("multiply", lambda: xr * yr)
+    if selected("sigmoid"):
+        emit_both("sigmoid", lambda: torch.sigmoid(xr))
+    if selected("tanh"):
+        emit_both("tanh", lambda: torch.tanh(xr))
+
+    xbn = torch.randn(32, 64, 56, 56, device=dev)
+    gbn = torch.randn(64, device=dev)
+    bbn = torch.randn(64, device=dev)
+    rmean = torch.zeros(64, device=dev)
+    rvar = torch.ones(64, device=dev)
+    if selected("batchnorm_inference_relu"):
+        emit_both("batchnorm_inference_relu",
+                  lambda: torch.relu_(F.batch_norm(xbn, rmean, rvar, gbn, bbn, False)),
+                  "cuDNN inference batch_norm then in-place relu")
+
+    # ---- NORMALISATION programs. Ours run as 2-3 passes (statistics, then the affine);
+    # PyTorch's are single fused kernels, so these measure the price of the passes.
+    gr = torch.randn(1024, device=dev)
+    if selected("softmax_rows"):
+        emit_both("softmax_rows", lambda: torch.softmax(xr, dim=1))
+    if selected("layernorm"):
+        emit_both("layernorm", lambda: F.layer_norm(xr, (1024,), gr, br, 1e-5))
+    x64 = torch.randn(8192, 64, device=dev)
+    g64 = torch.randn(64, device=dev)
+    b64 = torch.randn(64, device=dev)
+    if selected("layernorm_d64"):
+        emit_both("layernorm_d64", lambda: F.layer_norm(x64, (64,), g64, b64, 1e-5))
+    if selected("rmsnorm"):
+        emit_both("rmsnorm", lambda: F.rms_norm(xr, (1024,), gr, 1e-6))
+    if selected("batchnorm2d"):
+        emit_both("batchnorm2d",
+                  lambda: F.batch_norm(xbn, rmean.clone(), rvar.clone(), gbn, bbn, True, 0.1, 1e-5),
+                  "training-mode cuDNN batch_norm")
+    xgn = torch.randn(32, 64, 32, 32, device=dev)
+    if selected("groupnorm"):
+        emit_both("groupnorm", lambda: F.group_norm(xgn, 8, gbn, bbn, 1e-5))
+
     # ---- 2x2 max pool, N32/C64/112x112
     xp = torch.randn(32, 64, 112, 112, device=dev)
     if selected("maxpool2d_2x2"):
