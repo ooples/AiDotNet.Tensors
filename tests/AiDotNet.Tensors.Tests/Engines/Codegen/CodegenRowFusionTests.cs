@@ -21,6 +21,9 @@ public class CodegenRowFusionTests
                      CodegenFusedStatistics.LayerNorm(64, 1024),
                      CodegenFusedStatistics.LayerNorm(64, 64),
                      CodegenFusedStatistics.RmsNorm(64, 512),
+                     // (n, g | cg, s): a group is a row of channels x spatial, one block wide.
+                     CodegenFusedStatistics.GroupNorm(2, 64, 8, 1024),
+                     CodegenFusedStatistics.GroupNorm(2, 8, 4, 32),
                  })
         {
             var plan = CodegenRowFusion.TryPlan(program, out string reason);
@@ -31,10 +34,8 @@ public class CodegenRowFusionTests
     [Fact]
     public void ProgramsTheRowKernelCannotHoldAreRefused()
     {
-        // Statistics over (n, h*w) per channel: not a row of contiguous elements.
+        // Statistics over (n, h*w) per channel: the passes do not share a row/column split.
         Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.BatchNorm2D(2, 8, 4, 8), out _));
-        // Four-axis passes.
-        Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.GroupNorm(2, 8, 4, 32), out _));
         // A width no warp divides.
         Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(16, 56), out _));
         // Wider than the registers hold.
@@ -72,13 +73,21 @@ public class CodegenRowFusionTests
         Assert.Equal(2, CountOccurrences(wide, "@%p1 st.global.f32"));
     }
 
-    /// <summary>A row that is not a whole number of 128-element chunks stays scalar.</summary>
+    /// <summary>
+    /// A 64-wide row is two 32-lane steps of two elements, so its widest access is 64-bit; a
+    /// 32-wide row is one element per lane and stays scalar.
+    /// </summary>
     [Fact]
-    public void ANarrowRowStaysScalar()
+    public void ANarrowRowUsesTheWidestAccessThatFits()
     {
         var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNorm(128, 64), out _);
         string ptx = new PtxAffineEmitter().EmitRowProgram(plan!, "rowfused_d64", 7, 5);
+        Assert.Contains("ld.global.nc.v2.f32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("v4.f32", ptx, StringComparison.Ordinal);
+
+        var single = CodegenRowFusion.TryPlan(CodegenFusedStatistics.RmsNorm(128, 32), out _);
+        string scalar = new PtxAffineEmitter().EmitRowProgram(single!, "rowfused_w32", 7, 5);
+        Assert.DoesNotContain("ld.global.nc.v", scalar, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -88,8 +97,32 @@ public class CodegenRowFusionTests
         Assert.NotNull(plan);
         Assert.Equal(new[] { "x", "gamma", "beta", "negmean", "rstd", "y" }, plan!.Parameters);
         Assert.Equal(CodegenRowOperandKind.Matrix, plan.Kinds["x"]);
-        Assert.Equal(CodegenRowOperandKind.Feature, plan.Kinds["gamma"]);
+        // gamma[j] reads the innermost column with stride one, so it streams like x.
+        Assert.Equal(CodegenRowOperandKind.Matrix, plan.Kinds["gamma"]);
         Assert.Equal(CodegenRowOperandKind.Row, plan.Kinds["rstd"]);
+    }
+
+    /// <summary>
+    /// GroupNorm's gamma[g, cg] reads a row axis and an OUTER column axis but not s, so it is
+    /// one value per step of s; and a 8192-wide group is a block of 256 threads, not a warp.
+    /// </summary>
+    [Fact]
+    public void GroupNormRunsAsABlockPerGroupWithChunkUniformParameters()
+    {
+        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.GroupNorm(4, 64, 8, 1024), out string reason);
+        Assert.True(plan is not null, reason);
+        Assert.Equal(CodegenRowOperandKind.Feature, plan!.Kinds["gamma"]);
+        Assert.Equal(CodegenRowOperandKind.Row, plan.Kinds["negmean"]);
+        Assert.Equal(new[] { 4, 8 }, plan.RowExtents);
+        Assert.Equal(8192, plan.Width);
+
+        var emitter = new PtxAffineEmitter();
+        string ptx = emitter.EmitRowProgram(plan, "rowfused_groupnorm", 7, 5);
+        Assert.Equal(256, emitter.LaunchBlockThreads);
+        Assert.Equal(32u, emitter.LaunchBlocks);
+        Assert.Equal(2, CountOccurrences(ptx, "bar.sync 0;"));
+        // x streamed once (8 v4 loads per thread); gamma and beta once per 1024-column step.
+        Assert.Equal(8 + 8 + 8, emitter.EmittedLoads);
     }
 
     /// <summary>The fused kernel must use the same exp the multi-pass kernels do.</summary>
