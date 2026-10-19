@@ -3339,6 +3339,53 @@ internal static class BackwardFunctions<T>
         if (needPredictions) DifferentiableOps.AccumulateGrad(grads, predictions, predGrad, engine);
     }
 
+    /// <summary>
+    /// Backward of the compiled plan's fused linear head and mean squared error (<c>FusedLinear(x, w, b)</c> into
+    /// <c>ReduceMean(Square(Subtract(p, y)))</c>, see LinearMseLossFusionPattern); inputs are { x, w, b, y } or { x, w, y }.
+    /// One launch for the head's gradients on a backend with the fused kernels; otherwise the head's output is recomputed
+    /// and the loss's gradient composed, then the linear's own backward.
+    /// </summary>
+    internal static void FusedLinearMseLossBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var x = inputs[0];
+        var w = inputs[1];
+        var b = inputs.Length == 4 ? inputs[2] : null;
+        var y = inputs[inputs.Length - 1];
+        bool needX = DifferentiableOps.IsGradientRequired(x);
+        bool needW = DifferentiableOps.IsGradientRequired(w);
+        bool needB = b is not null && DifferentiableOps.IsGradientRequired(b);
+        bool needY = DifferentiableOps.IsGradientRequired(y);
+        if (!needX && !needW && !needB && !needY) return;
+        if (!needY && engine is DirectGpuTensorEngine gpu
+            && gpu.TryFusedLinearMseLossBackward(gradOutput, x, w, b, y, out var gradX, out var gradW, out var gradB))
+        {
+            if (needX) DifferentiableOps.AccumulateGrad(grads, x, gradX!, engine);
+            if (needW) DifferentiableOps.AccumulateGrad(grads, w, gradW!, engine);
+            if (needB) DifferentiableOps.AccumulateGrad(grads, b!, gradB!, engine);
+            return;
+        }
+
+        var predictions = engine.FusedLinear(x, w, b, FusedActivationType.None);
+        var diff = engine.TensorSubtract(predictions, y);
+        Tensor<T> predGrad;
+        if (engine is DirectGpuTensorEngine scaleGpu
+            && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
+        {
+            predGrad = deviceScaled;
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            predGrad = engine.TensorMultiplyScalar(diff, numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / predictions.Length));
+        }
+        if (needY) DifferentiableOps.AccumulateGrad(grads, y, engine.TensorNegate(predGrad), engine);
+        if (needX || needW || needB)
+            FusedLinearWithActivationBackward(predGrad, b is null ? new[] { x, w } : new[] { x, w, b }, predictions,
+                Array.Empty<object>(), engine, grads);
+    }
+
     /// <summary>BCE with logits loss backward</summary>
     internal static void BCEWithLogitsLossBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
