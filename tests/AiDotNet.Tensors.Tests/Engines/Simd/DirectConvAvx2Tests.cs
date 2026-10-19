@@ -134,6 +134,81 @@ public class DirectConvAvx2Tests
         }
     }
 
+#if NET9_0_OR_GREATER
+    // The 512-bit forward tile (six positions x two 16-channel vectors) computes every output element with the same
+    // FMA chain as the 256-bit tile, so a conv may not depend on the host's vector width. Forced on, it runs in software
+    // where the CPU lacks AVX-512. Shapes: position counts leaving every tail of the 6-position step, a single image on
+    // the staged store, several input passes, accumulate, stride 2, dilation 2, and the backward-input conv.
+    [SkippableTheory]
+    [InlineData(2, 16, 32, 7, 3, 1, 1, 1, false, 0)]        // 49 positions per image: a 1-position tail
+    [InlineData(1, 64, 64, 34, 3, 1, 1, 1, false, 0)]       // single image, 1156 positions: staged store
+    [InlineData(1, 64, 32, 33, 3, 1, 1, 1, true, 9216)]     // staged, accumulate, one input block per pass
+    [InlineData(3, 24, 32, 9, 3, 2, 1, 1, false, 0)]        // stride 2: 25 positions, a 1-position tail
+    [InlineData(2, 8, 32, 10, 3, 1, 2, 2, true, 0)]         // dilation 2, accumulate
+    [InlineData(2, 40, 64, 5, 1, 1, 0, 1, false, 2048)]     // 1x1, two passes
+    public void Vector512ForwardTile_IsBitIdenticalTo256Bit(int batch, int inC, int outC, int size, int k, int stride,
+        int pad, int dilation, bool accumulate, int passBudgetBytes)
+    {
+        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
+        int outSize = OutSize(size, k, stride, pad, dilation);
+        var x = Random(21, batch, inC, size, size);
+        var w = Random(22, outC, inC, k, k);
+        var prior = Random(23, batch, outC, outSize, outSize);
+        float[] Run(bool wide)
+        {
+            var y = new Tensor<float>(new[] { batch, outC, outSize, outSize });
+            for (int i = 0; i < y.Length; i++) y.SetFlat(i, accumulate ? prior.GetFlat(i) : float.NaN);
+            bool? before = SimdGemm.s_forceVector512Direct;
+            int budget = DirectConvAvx2.s_forwardPassKernelBytes;
+            try
+            {
+                SimdGemm.s_forceVector512Direct = wide;
+                if (passBudgetBytes > 0) DirectConvAvx2.s_forwardPassKernelBytes = passBudgetBytes;
+                DirectConvAvx2.Forward(x.GetDataArray(), 0, w.GetDataArray(), 0, y.GetDataArray(), 0, accumulate,
+                    batch, inC, size, size, outC, k, k, stride, stride, pad, pad, dilation, dilation, outSize, outSize);
+            }
+            finally
+            {
+                SimdGemm.s_forceVector512Direct = before;
+                DirectConvAvx2.s_forwardPassKernelBytes = budget;
+            }
+            return y.ToArray();
+        }
+        var narrow = Run(false);
+        var wide = Run(true);
+        for (int i = 0; i < narrow.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
+                $"output[{i}]: 256-bit {narrow[i]:G9}, 512-bit {wide[i]:G9}");
+    }
+
+    [SkippableFact]
+    public void Vector512ForwardTile_BackwardInputIsBitIdenticalTo256Bit()
+    {
+        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
+        const int batch = 2, inC = 32, outC = 16, size = 9, k = 3;
+        var g = Random(31, batch, outC, size, size);
+        var w = Random(32, outC, inC, k, k);
+        float[] Run(bool wide)
+        {
+            var dx = new Tensor<float>(new[] { batch, inC, size, size });
+            for (int i = 0; i < dx.Length; i++) dx.SetFlat(i, float.NaN);
+            bool? before = SimdGemm.s_forceVector512Direct;
+            try
+            {
+                SimdGemm.s_forceVector512Direct = wide;
+                DirectConvAvx2.BackwardInput(g.GetDataArray(), 0, w.GetDataArray(), 0, dx.GetDataArray(), 0, false,
+                    batch, inC, size, size, outC, k, k, 1, 1, 1, 1, size, size);
+            }
+            finally { SimdGemm.s_forceVector512Direct = before; }
+            return dx.ToArray();
+        }
+        var narrow = Run(false);
+        var wide = Run(true);
+        for (int i = 0; i < narrow.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
+                $"dx[{i}]: 256-bit {narrow[i]:G9}, 512-bit {wide[i]:G9}");
+    }
+#endif
     [SkippableTheory]
     [InlineData(2, 32, 8, 7, 3, 1, 1, false)]
     [InlineData(3, 64, 16, 4, 3, 1, 1, true)]

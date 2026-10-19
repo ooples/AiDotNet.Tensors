@@ -583,7 +583,16 @@ internal static class DirectConvAvx2
         int taskTarget = targetTasks > 0 ? targetTasks : TargetForwardTasks;
         int tiles = geometry.OutChannels / (Block * OutputBlocksPerTile);
         int totalPositions = geometry.TotalPositions;
-        int chunks = (totalPositions + PositionUnroll - 1) / PositionUnroll;
+        // 512-bit tiles where the host accelerates them (the same FMA chain per output element). Task ranges are cut in
+        // whole steps of the tile that runs them, or a six-position tile would spend half of every 3-position range on a
+        // repeated position.
+#if NET9_0_OR_GREATER
+        bool wide = SimdGemm.UseVector512Direct;
+        int unroll = wide ? PositionUnroll512 : PositionUnroll;
+#else
+        const int unroll = PositionUnroll;
+#endif
+        int chunks = (totalPositions + unroll - 1) / unroll;
         int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles + taskTarget - 1) / taskTarget));
         int tasksPerTile = (chunks + chunksPerTask - 1) / chunksPerTask;
         CpuParallelSettings.ParallelForOrSerial(0, tiles * tasksPerTile,
@@ -591,8 +600,13 @@ internal static class DirectConvAvx2
             [MethodImpl(Hot)] (task) =>
             {
                 int tile = task / tasksPerTile, part = task % tasksPerTile;
-                int first = part * chunksPerTask * PositionUnroll;
-                int last = Math.Min(totalPositions, first + chunksPerTask * PositionUnroll);
+                int first = part * chunksPerTask * unroll;
+                int last = Math.Min(totalPositions, first + chunksPerTask * unroll);
+#if NET9_0_OR_GREATER
+                if (wide)
+                    ForwardTile512(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
+                else
+#endif
                 ForwardTile(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
             },
             deterministicSafe: true);
@@ -784,6 +798,116 @@ internal static class DirectConvAvx2
         return (inBlocks + passes - 1) / passes; // even passes, so the last is not a sliver
     }
     private const int StageRun = 48;
+
+#if NET9_0_OR_GREATER
+    /// <summary>Positions per step of <see cref="ForwardTile512"/>: six positions x two 16-channel vectors = 12 accumulators.</summary>
+    private const int PositionUnroll512 = 6;
+
+    /// <summary>
+    /// The 512-bit <see cref="ForwardTile"/>: six positions per step, the tile's 32 output channels in two 16-channel
+    /// vectors, each assembled from two adjacent output blocks' 8-channel weight rows. Every output element is the same
+    /// fused multiply-add chain in the same order (input pass, block, tap, channel), so the result is bit-identical to
+    /// the 256-bit tile: the conv's output does not depend on the host's vector width.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void ForwardTile512(float[] packedInput, float[] packedKernel, int kernelOffset, float[] output, int outputOffset,
+        bool accumulate, in ForwardGeometry g, int tile, int first, int last)
+    {
+        int kernelHeight = g.KernelHeight, kernelWidth = g.KernelWidth, inBlocks = g.InBlocks, planeIn = g.PlaneIn;
+        int rowStep = g.DilationH * g.PaddedW * Block, colStep = g.DilationW * Block;
+        int taps = kernelHeight * kernelWidth;
+        long blockStride = (long)inBlocks * taps * Block * Block;
+        fixed (float* px = packedInput)
+        fixed (float* pw = packedKernel)
+        fixed (float* po = output)
+        {
+            float* tileKernel = pw + kernelOffset + tile * OutputBlocksPerTile * blockStride;
+            bool staged = s_stagedStore && g.PlainContiguous && g.TotalPositions == g.GridPositions;
+            float* stage = stackalloc float[(StageRun + PositionUnroll512) * 32];
+            int pass = ForwardInputBlocksPerPass(inBlocks, taps);
+            int channelBase = tile * OutputBlocksPerTile * Block;
+            for (int cb0 = 0; cb0 < inBlocks; cb0 += pass)
+            {
+                int cbEnd = Math.Min(inBlocks, cb0 + pass);
+                bool accumulatePass = accumulate || cb0 > 0;
+                float* passKernel = tileKernel + (long)cb0 * taps * Block * Block;
+                int runStart = first;
+                for (int q = first; q < last; q += PositionUnroll512)
+                {
+                    int count = Math.Min(PositionUnroll512, last - q);
+                    // A short final chunk repeats its last position; only the real positions are stored.
+                    float* x0 = px + g.InputOrigin(q);
+                    float* x1 = px + g.InputOrigin(count > 1 ? q + 1 : q);
+                    float* x2 = px + g.InputOrigin(count > 2 ? q + 2 : q);
+                    float* x3 = px + g.InputOrigin(count > 3 ? q + 3 : q);
+                    float* x4 = px + g.InputOrigin(count > 4 ? q + 4 : q);
+                    float* x5 = px + g.InputOrigin(count > 5 ? q + 5 : q);
+                    var a0l = Vector512<float>.Zero; var a0h = a0l; var a1l = a0l; var a1h = a0l;
+                    var a2l = a0l; var a2h = a0l; var a3l = a0l; var a3h = a0l;
+                    var a4l = a0l; var a4h = a0l; var a5l = a0l; var a5h = a0l;
+                    float* w = passKernel;
+                    for (int cb = cb0; cb < cbEnd; cb++)
+                    {
+                        int blockOffset = cb * planeIn;
+                        for (int y = 0; y < kernelHeight; y++)
+                        {
+                            int rowOffset = blockOffset + y * rowStep;
+                            for (int x = 0; x < kernelWidth; x++)
+                            {
+                                int tapOffset = rowOffset + x * colStep;
+                                float* s0 = x0 + tapOffset, s1 = x1 + tapOffset, s2 = x2 + tapOffset;
+                                float* s3 = x3 + tapOffset, s4 = x4 + tapOffset, s5 = x5 + tapOffset;
+                                for (int c = 0; c < Block; c++)
+                                {
+                                    var wl = Vector512.Create(Vector256.Load(w), Vector256.Load(w + blockStride));
+                                    var wh = Vector512.Create(Vector256.Load(w + 2 * blockStride), Vector256.Load(w + 3 * blockStride));
+                                    var b = Vector512.Create(s0[c]);
+                                    a0l = Vector512.FusedMultiplyAdd(b, wl, a0l); a0h = Vector512.FusedMultiplyAdd(b, wh, a0h);
+                                    b = Vector512.Create(s1[c]);
+                                    a1l = Vector512.FusedMultiplyAdd(b, wl, a1l); a1h = Vector512.FusedMultiplyAdd(b, wh, a1h);
+                                    b = Vector512.Create(s2[c]);
+                                    a2l = Vector512.FusedMultiplyAdd(b, wl, a2l); a2h = Vector512.FusedMultiplyAdd(b, wh, a2h);
+                                    b = Vector512.Create(s3[c]);
+                                    a3l = Vector512.FusedMultiplyAdd(b, wl, a3l); a3h = Vector512.FusedMultiplyAdd(b, wh, a3h);
+                                    b = Vector512.Create(s4[c]);
+                                    a4l = Vector512.FusedMultiplyAdd(b, wl, a4l); a4h = Vector512.FusedMultiplyAdd(b, wh, a4h);
+                                    b = Vector512.Create(s5[c]);
+                                    a5l = Vector512.FusedMultiplyAdd(b, wl, a5l); a5h = Vector512.FusedMultiplyAdd(b, wh, a5h);
+                                    w += Block;
+                                }
+                            }
+                        }
+                    }
+                    if (staged)
+                    {
+                        int slot = q - runStart;
+                        a0l.Store(stage + slot * 32); a0h.Store(stage + slot * 32 + 16);
+                        if (count > 1) { a1l.Store(stage + (slot + 1) * 32); a1h.Store(stage + (slot + 1) * 32 + 16); }
+                        if (count > 2) { a2l.Store(stage + (slot + 2) * 32); a2h.Store(stage + (slot + 2) * 32 + 16); }
+                        if (count > 3) { a3l.Store(stage + (slot + 3) * 32); a3h.Store(stage + (slot + 3) * 32 + 16); }
+                        if (count > 4) { a4l.Store(stage + (slot + 4) * 32); a4h.Store(stage + (slot + 4) * 32 + 16); }
+                        if (count > 5) { a5l.Store(stage + (slot + 5) * 32); a5h.Store(stage + (slot + 5) * 32 + 16); }
+                        int runEnd = q + count;
+                        if (runEnd - runStart >= StageRun || runEnd >= last)
+                        {
+                            FlushStage(po + outputOffset, accumulatePass, g, channelBase, runStart, runEnd - runStart, stage);
+                            runStart = runEnd;
+                        }
+                    }
+                    else
+                    {
+                        StorePosition(po + outputOffset, accumulatePass, g, channelBase, q, a0l.GetLower(), a0l.GetUpper(), a0h.GetLower(), a0h.GetUpper());
+                        if (count > 1) StorePosition(po + outputOffset, accumulatePass, g, channelBase, q + 1, a1l.GetLower(), a1l.GetUpper(), a1h.GetLower(), a1h.GetUpper());
+                        if (count > 2) StorePosition(po + outputOffset, accumulatePass, g, channelBase, q + 2, a2l.GetLower(), a2l.GetUpper(), a2h.GetLower(), a2h.GetUpper());
+                        if (count > 3) StorePosition(po + outputOffset, accumulatePass, g, channelBase, q + 3, a3l.GetLower(), a3l.GetUpper(), a3h.GetLower(), a3h.GetUpper());
+                        if (count > 4) StorePosition(po + outputOffset, accumulatePass, g, channelBase, q + 4, a4l.GetLower(), a4l.GetUpper(), a4h.GetLower(), a4h.GetUpper());
+                        if (count > 5) StorePosition(po + outputOffset, accumulatePass, g, channelBase, q + 5, a5l.GetLower(), a5l.GetUpper(), a5h.GetLower(), a5h.GetUpper());
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     // Writes `run` consecutive positions x 32 channels from the stage ([position][channel]) as one contiguous run per
     // channel. Only for the plain grid, where position q's output index is q's offset in the plane.
