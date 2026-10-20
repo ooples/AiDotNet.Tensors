@@ -616,16 +616,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private Engines.DirectGpu.IGraphStepIo? _stepIo;
     private Tensor<T>[]? _stepIoLeaves;
     private Engines.DirectGpu.IGpuBuffer[]? _stepIoBuffers;
-    // The storage version each step-I/O input had when last copied into the graph; int.MinValue before the first copy.
-    private int[]? _stepIoCopiedVersion;
-
-    private static int[] NewCopiedVersions(int count)
-    {
-        var versions = new int[count];
-        for (int i = 0; i < count; i++) versions[i] = int.MinValue;
-        return versions;
-    }
-
     private uint _stepIoLaunched;   // replays launched (the device counts the same replays)
     private bool _stepIoLossCaptured;   // the epilogue publishes the loss
     // The loss-gradient reseed (seed -> destination) the graph being captured makes in its step I/O prologue instead of
@@ -717,7 +707,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var io = cb.CreateStepIo(buffers, lengths);
         if (io is null) return null;
         _stepIoLeaves = leaves.ToArray();
-        _stepIoCopiedVersion = NewCopiedVersions(leaves.Count);
         _stepIoBuffers = buffers.ToArray();
         _stepIoLaunched = 0;
         return io;
@@ -744,25 +733,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         uint replay = _stepIoLaunched;
         if (replay >= 2) io.WaitForReplays(replay - 1);   // slot replay % 2 was last read by replay - 2
         var leaves = _stepIoLeaves!;
-        var copiedVersions = _stepIoCopiedVersion ??= NewCopiedVersions(leaves.Length);
-        int slot = (int)(replay & 1);
         for (int i = 0; i < leaves.Length; i++)
         {
             var leaf = leaves[i];
-            int version = leaf.GpuCacheVersion;
-            // A device-resident input's graph buffer is its own storage: a host round trip of an unchanged one only
-            // copies the buffer onto itself (download, page-locked copy, upload). Any write that changes it bumps the
-            // storage version. A host-owned input is copied every step, since its arrays may be written without one.
-            bool copy = !leaf.IsGpuResident || copiedVersions[i] != version;
-            io.SetInputCopied(i, slot, copy);
-            if (!copy) continue;
             using var lease = leaf.LeaseArray();
             var data = (float[])(object)lease.Array;
             int count = io.InputLength(i);
             fixed (float* src = data)
                 Buffer.MemoryCopy(src, (void*)io.InputStaging(i, (int)(replay & 1)), (long)count * sizeof(float), (long)count * sizeof(float));
             leaf._gpuBufferVersion = leaf.GpuCacheVersion;
-            copiedVersions[i] = version;
         }
         if (_capturedOptimizer is { } optimizer)
         {
@@ -876,7 +855,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _stepIo = null;
         _stepIoLeaves = null;
         _stepIoBuffers = null;
-        _stepIoCopiedVersion = null;
         _stepIoLaunched = 0;
         _stepIoLossCaptured = false;
     }
@@ -1819,10 +1797,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var srcKeep1 = new KeepAliveScope(src);
         using var dstKeep1 = new KeepAliveScope(dst);
         src.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
-        // The unmarked span does not advance the version, and the whole-step graph's step I/O skips re-staging a
-        // device-resident input whose version it has already copied - so without this bump a replay after a new
-        // SetInputs trains on the previous input.
-        dst.IncrementVersion();
     }
 
     internal void SetInput(Tensor<T> input)
@@ -1840,7 +1814,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var inputKeep1 = new KeepAliveScope(input);
         using var dstKeep2 = new KeepAliveScope(dst);
         input.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
-        dst.IncrementVersion();   // see SetInputs: the step I/O re-stages only on a version change
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
