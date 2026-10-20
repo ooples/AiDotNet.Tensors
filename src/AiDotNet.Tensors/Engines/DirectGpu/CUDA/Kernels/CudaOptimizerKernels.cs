@@ -1245,9 +1245,11 @@ __device__ __forceinline__ double pp_block_sum(double v, double* warpSums)
 
 // dst = src - lr * (g + wd * src) (sgd_multi_tensor_update's arithmetic, so the weights match it bit for bit), and the
 // gradients' sum of squares (multi_tensor_sum_squares' arithmetic) onto *guard, for a grid that strides over the
-// PP_CHUNK-element chunks (the host bounds it at a few blocks per SM). Each thread issues its chunk's two 16-byte loads
-// before any store. Each block leaves one partial sum; the last block to finish has one warp add them in block order (so
-// the sum does not depend on scheduling), adds that onto the guard and resets *done. If the guard is then not finite
+// PP_CHUNK-element chunks (the host bounds it at a few blocks per SM). Each thread issues each of its 16-byte quads' two
+// loads before that quad's store (one quad per thread at 256 threads; the quad loop strides by blockDim.x, so any block
+// size covers the chunk). Each block leaves one partial sum; the last block to finish has one warp add them in block
+// order, so on one device the sum does not depend on scheduling (its last bits do depend on the SM count, which sets
+// the grid: the guard only gates finiteness, which no grouping changes), adds that onto the guard and resets *done. If the guard is then not finite
 // (a non-finite gradient, or a learning-rate fault that poisoned it), that block also undoes the step, copying every
 // source over its destination: slow, but only on a step that is being discarded. dyn: device float[2], [0] = this
 // step's learning rate.
@@ -1276,32 +1278,34 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
         const float* gradient = (const float*)ptrs[2 * n + t];
         if (((ptrs[t] | ptrs[n + t] | ptrs[2 * n + t]) & 15ULL) == 0)
         {
-            const int e = start + threadIdx.x * 4;
-            if (e + 4 <= end)
+            for (int e = start + threadIdx.x * 4; e < end; e += blockDim.x * 4)
             {
-                float4 g = *reinterpret_cast<const float4*>(gradient + e);
-                float4 w = *reinterpret_cast<const float4*>(src + e);
-                float s = g.x * g.x + g.y * g.y + g.z * g.z + g.w * g.w;
-                v += isfinite(s) ? (double)s
-                    : (double)g.x * (double)g.x + (double)g.y * (double)g.y + (double)g.z * (double)g.z + (double)g.w * (double)g.w;
-                if (weightDecay > 0.0f) {
-                    g.x += weightDecay * w.x; g.y += weightDecay * w.y; g.z += weightDecay * w.z; g.w += weightDecay * w.w;
-                }
-                w.x -= learningRate * g.x; w.y -= learningRate * g.y; w.z -= learningRate * g.z; w.w -= learningRate * g.w;
-                *reinterpret_cast<float4*>(dst + e) = w;
-            }
-            else
-            {
-                for (int i = e; i < end; i++)
+                if (e + 4 <= end)
                 {
-                    float g = gradient[i];
-                    float w = src[i];
-                    v += (double)g * (double)g;
+                    float4 g = *reinterpret_cast<const float4*>(gradient + e);
+                    float4 w = *reinterpret_cast<const float4*>(src + e);
+                    float s = g.x * g.x + g.y * g.y + g.z * g.z + g.w * g.w;
+                    v += isfinite(s) ? (double)s
+                        : (double)g.x * (double)g.x + (double)g.y * (double)g.y + (double)g.z * (double)g.z + (double)g.w * (double)g.w;
                     if (weightDecay > 0.0f) {
-                        g += weightDecay * w;
+                        g.x += weightDecay * w.x; g.y += weightDecay * w.y; g.z += weightDecay * w.z; g.w += weightDecay * w.w;
                     }
-                    w -= learningRate * g;
-                    dst[i] = w;
+                    w.x -= learningRate * g.x; w.y -= learningRate * g.y; w.z -= learningRate * g.z; w.w -= learningRate * g.w;
+                    *reinterpret_cast<float4*>(dst + e) = w;
+                }
+                else
+                {
+                    for (int i = e; i < end; i++)
+                    {
+                        float g = gradient[i];
+                        float w = src[i];
+                        v += (double)g * (double)g;
+                        if (weightDecay > 0.0f) {
+                            g += weightDecay * w;
+                        }
+                        w -= learningRate * g;
+                        dst[i] = w;
+                    }
                 }
             }
         }
