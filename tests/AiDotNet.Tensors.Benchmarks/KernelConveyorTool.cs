@@ -421,6 +421,9 @@ internal static class KernelConveyorTool
             case "input-staging": emitter.EnableInputStaging = true; break;
             case "implicit-gemm": emitter.ImplicitGemm = true; break;
             case "implicit-gemm-32": emitter.ImplicitGemm = true; emitter.ImplicitGemmTile = 32; break;
+            case "implicit-gemm-128x64": emitter.ImplicitGemm = true; emitter.ImplicitGemmTileM = 128; break;
+            case "implicit-gemm-96x64": emitter.ImplicitGemm = true; emitter.ImplicitGemmTileM = 96; break;
+            case "implicit-gemm-64x128": emitter.ImplicitGemm = true; emitter.ImplicitGemmTile = 128; emitter.ImplicitGemmTileM = 64; break;
 
             // A split winner is not a knob -- it is a different PROGRAM, two kernels and a
             // temporary, which this single-kernel path cannot launch. Saying so is the

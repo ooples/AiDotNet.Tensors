@@ -190,6 +190,9 @@ internal static class KernelAutotuneTool
         // refuse. Two tile edges, since a 32-channel layer wastes half a 64 tile.
         new("implicit-gemm", e => e.ImplicitGemm = true),
         new("implicit-gemm-32", e => { e.ImplicitGemm = true; e.ImplicitGemmTile = 32; }),
+        new("implicit-gemm-128x64", e => { e.ImplicitGemm = true; e.ImplicitGemmTileM = 128; }),
+        new("implicit-gemm-96x64", e => { e.ImplicitGemm = true; e.ImplicitGemmTileM = 96; }),
+        new("implicit-gemm-64x128", e => { e.ImplicitGemm = true; e.ImplicitGemmTile = 128; e.ImplicitGemmTileM = 64; }),
     };
 
     internal static void Run(string[] args)
