@@ -476,8 +476,9 @@ __device__ __forceinline__ void wino_f32w_fused_body(
     {
     // Epilogue, in quarters of the block's k rows. Ms[x][8 k][33] gathers each (k, c)'s 16 components (row stride 33: the
     // writers' 4 k rows x 8 column quads hit 32 distinct banks); each (k, c)'s G^T M G goes to Os[8 k][32 c * 9], whose
-    // rows are the contiguous dW[k][c0 .. c0 + 31][3][3] spans, copied out coalesced. out is dW itself (one split) or
-    // split z's dW-shaped slice, summed by conv2d_wgrad_splitk_reduce.
+    // rows are the contiguous dW[k][c0 .. c0 + 31][3][3] spans, copied out coalesced. The host launches this entry
+    // (wino_f32w_fused_direct) with one split only, so out is dW itself; blockIdx.z's dW-sized offset would address a
+    // separate per-split dW slice. The split path is the component-major one below (conv2d_wgrad_winograd_finish).
     float* Ms = smem;                      // [16][8][33]
     float* Os = smem + 16 * 8 * 33;        // [8][32 * 9]
     float* dst = out + (long long)blockIdx.z * K * C * 9;
