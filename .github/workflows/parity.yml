@@ -34,7 +34,8 @@ jobs:
   ratchet:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # PyTorch is timed at its best: every execution mode, torch.compile included (see the parity job).
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -90,10 +91,24 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # A case with no baseline for this runner is skipped, and xUnit drops a skipped test's output, so
+      # the per-mode timings are only in the results the harness writes.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytorch-parity-ratchet-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ratchet.log
+            /tmp/aidotnet-parity/*-latest.json
+          if-no-files-found: warn
+
   parity:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Every case times PyTorch in each mode it offers, torch.compile (default and max-autotune, with and without
+    # channels_last) at both thread counts included, so a run compiles each network several times.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 

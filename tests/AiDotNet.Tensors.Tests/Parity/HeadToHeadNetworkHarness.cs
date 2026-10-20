@@ -12,6 +12,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Engines.Optimization.Optimizers;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Tests.Parity;
@@ -22,43 +23,89 @@ namespace AiDotNet.Tensors.Tests.Parity;
 /// </summary>
 internal static class HeadToHeadNetworkHarness
 {
+    /// <summary>
+    /// What a ratio means; baselines and PyTorch results recorded under another protocol are refused.
+    /// 1: eager on both sides, synchronised at every phase boundary.
+    /// 2: each side at its best, the fastest of every execution mode it offers, timed as whole steps with one
+    ///    synchronisation per step (PyTorch: eager, channels_last, whole-step CUDA graph, every torch.compile mode
+    ///    and, on the CPU, every thread count; Tensors: eager and the compiled training plan).
+    /// </summary>
+    internal const int Protocol = 2;
+
     internal sealed record PhaseStats(double MedianMs, double IqrMs, double MinMs, int Samples);
 
+    /// <summary>One execution mode of one side: "ok" (agreed with the reference loss curve), "rejected" or "failed".</summary>
+    internal sealed record ModeResult(string Name, string Status, string? Reason, PhaseStats? Step);
+
+    /// <summary>
+    /// One side of a case. <see cref="Phases"/> is the eager, phase-synchronised breakdown (reported);
+    /// <see cref="Best"/> is the fastest whole step over every mode that agreed with the reference losses (gated).
+    /// </summary>
     internal sealed record SideResult(
         string Framework,
         string Version,
         IReadOnlyDictionary<string, PhaseStats> Phases,
-        IReadOnlyList<double> Losses);
+        IReadOnlyList<double> Losses,
+        string BestMode,
+        PhaseStats Best,
+        IReadOnlyList<ModeResult> Modes);
 
     internal sealed record CaseResult(string Network, string Device, string MachineKey, SideResult Torch, SideResult Tensors)
     {
         /// <summary>
-        /// The gated ratio: our fastest step over theirs. The minimum is each side's cost with the least
-        /// interference, and it is the stable statistic here. Across five process launches of the MLP case on one
-        /// machine it moved 3.21-3.41x, while the ratio of medians moved 2.99-3.65x.
+        /// The gated ratio: our fastest step over theirs, each side at its best. The minimum is each side's cost
+        /// with the least interference, and it is the stable statistic here. Across five process launches of the
+        /// MLP case on one machine it moved 3.21-3.41x, while the ratio of medians moved 2.99-3.65x.
         /// </summary>
-        public double StepRatio => Tensors.Phases["step"].MinMs / Torch.Phases["step"].MinMs;
+        public double StepRatio => Tensors.Best.MinMs / Torch.Best.MinMs;
 
         /// <summary>The ratio of median steps: reported alongside, not gated.</summary>
-        public double MedianStepRatio => Tensors.Phases["step"].MedianMs / Torch.Phases["step"].MedianMs;
+        public double MedianStepRatio => Tensors.Best.MedianMs / Torch.Best.MedianMs;
 
         /// <summary>Each side's IQR over its median, combined: how noisy this run was.</summary>
         public double NoiseBand
         {
             get
             {
-                var a = Tensors.Phases["step"];
-                var b = Torch.Phases["step"];
+                var a = Tensors.Best;
+                var b = Torch.Best;
                 return Math.Sqrt(Math.Pow(a.IqrMs / a.MedianMs, 2) + Math.Pow(b.IqrMs / b.MedianMs, 2));
             }
         }
     }
 
+    /// <summary>
+    /// Why <paramref name="ours"/> is not the same training run as <paramref name="reference"/>, or null when it
+    /// is. The first loss sees identical weights and data, so only the reduction order differs; later steps
+    /// compound that through SGD, so their tolerance is looser.
+    /// </summary>
+    internal static string? LossMismatch(IReadOnlyList<double> ours, IReadOnlyList<double> reference)
+    {
+        // Every reference step must be matched: comparing only the common prefix let a mode that recorded fewer
+        // losses pass on a partly verified curve and win the gated best.
+        int n = reference.Count;
+        if (n == 0 || ours.Count == 0) return "no loss was recorded";
+        if (ours.Count < n) return $"{ours.Count} losses were recorded; the reference has {n}";
+        for (int i = 0; i < n; i++)
+        {
+            double tolerance = i == 0 ? 1e-4 : 1e-3;
+            // A NaN difference compares false against any tolerance, so a diverged run must be refused explicitly.
+            if (double.IsNaN(ours[i]) || double.IsInfinity(ours[i])
+                || Math.Abs(ours[i] - reference[i]) > tolerance * Math.Max(1.0, Math.Abs(reference[i])))
+                return $"loss at step {i} is {ours[i]:G9}, the reference gives {reference[i]:G9}";
+        }
+
+        return null;
+    }
+
     /// <summary>Why the case could not run: no python, no torch, no CUDA. Null when it ran.</summary>
     internal sealed record Deferral(string Reason);
 
-    /// <summary>One PyTorch run of a spec; the CNN on a 4-core runner takes under two minutes.</summary>
-    private static readonly TimeSpan RunnerTimeout = TimeSpan.FromMinutes(15);
+    /// <summary>
+    /// One PyTorch run of a spec. Measuring every mode compiles the network several times (torch.compile default,
+    /// max-autotune and, on CUDA, reduce-overhead, each with and without channels_last), which dominates the run.
+    /// </summary>
+    private static readonly TimeSpan RunnerTimeout = TimeSpan.FromMinutes(60);
 
     internal static string PythonExecutable
         => Environment.GetEnvironmentVariable("PARITY_PYTHON") is { Length: > 0 } configured ? configured : "python";
@@ -185,7 +232,10 @@ internal static class HeadToHeadNetworkHarness
         return (result, null);
     }
 
-    /// <summary>Fastest step over every repetition (gated); median of medians and of IQRs; losses from the first.</summary>
+    /// <summary>
+    /// Fastest step over every repetition (gated); median of medians and of IQRs; losses and the mode table from
+    /// the first; the best mode is the one of the repetition that ran fastest.
+    /// </summary>
     private static SideResult Combine(List<SideResult> runs)
     {
         if (runs.Count == 1) return runs[0];
@@ -195,14 +245,22 @@ internal static class HeadToHeadNetworkHarness
             return o.Count % 2 == 1 ? o[o.Count / 2] : (o[o.Count / 2 - 1] + o[o.Count / 2]) / 2.0;
         }
 
+        static PhaseStats CombineStats(IReadOnlyList<PhaseStats> stats) => new(
+            Median(stats.Select(s => s.MedianMs)),
+            Median(stats.Select(s => s.IqrMs)),
+            stats.Min(s => s.MinMs),
+            stats.Sum(s => s.Samples));
+
         var phases = runs[0].Phases.Keys.ToDictionary(
             phase => phase,
-            phase => new PhaseStats(
-                Median(runs.Select(r => r.Phases[phase].MedianMs)),
-                Median(runs.Select(r => r.Phases[phase].IqrMs)),
-                runs.Min(r => r.Phases[phase].MinMs),
-                runs.Sum(r => r.Phases[phase].Samples)));
-        return new SideResult(runs[0].Framework, runs[0].Version, phases, runs[0].Losses);
+            phase => CombineStats(runs.Select(r => r.Phases[phase]).ToList()));
+        // Repetitions can pick different best modes. The reported best combines only those that picked the fastest
+        // repetition's mode, so its median and spread describe the mode it is labelled with; the gated minimum is
+        // unchanged, since the fastest repetition is one of them.
+        var fastest = runs.OrderBy(r => r.Best.MinMs).First();
+        var sameMode = runs.Where(r => r.BestMode == fastest.BestMode).Select(r => r.Best).ToList();
+        return new SideResult(runs[0].Framework, runs[0].Version, phases, runs[0].Losses,
+            fastest.BestMode, CombineStats(sameMode), runs[0].Modes);
     }
 
     private static (CaseResult? Result, Deferral? Deferred) RunOnce(string root, string network, string device, DirectGpuTensorEngine? gpu)
@@ -253,7 +311,7 @@ internal static class HeadToHeadNetworkHarness
                           && gpuElement.ValueKind == JsonValueKind.String
             ? gpuElement.GetString()
             : null;
-        var tensors = RunTensors(ReadJson(spec), work, gpu);
+        var tensors = RunTensors(ReadJson(spec), work, gpu, torch.Losses);
         return (new CaseResult(network, device, MachineKey(device, gpuName), torch, tensors), null);
     }
 
@@ -271,8 +329,9 @@ internal static class HeadToHeadNetworkHarness
             stepRatio = r.StepRatio,
             medianStepRatio = r.MedianStepRatio,
             noiseBand = r.NoiseBand,
-            torch = new { version = r.Torch.Version, phases = r.Torch.Phases, losses = r.Torch.Losses },
-            tensors = new { version = r.Tensors.Version, phases = r.Tensors.Phases, losses = r.Tensors.Losses },
+            protocol = Protocol,
+            torch = new { version = r.Torch.Version, bestMode = r.Torch.BestMode, best = r.Torch.Best, modes = r.Torch.Modes, phases = r.Torch.Phases, losses = r.Torch.Losses },
+            tensors = new { version = r.Tensors.Version, bestMode = r.Tensors.BestMode, best = r.Tensors.Best, modes = r.Tensors.Modes, phases = r.Tensors.Phases, losses = r.Tensors.Losses },
         };
         File.WriteAllText(ArtifactPath(r.Network, r.Device), JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true }));
     }
@@ -283,17 +342,28 @@ internal static class HeadToHeadNetworkHarness
         return doc.RootElement.Clone();
     }
 
+    private static PhaseStats ReadStats(JsonElement e) => new(
+        e.GetProperty("medianMs").GetDouble(),
+        e.GetProperty("iqrMs").GetDouble(),
+        e.GetProperty("minMs").GetDouble(),
+        e.GetProperty("samples").GetInt32());
+
     private static SideResult LoadTorchResult(JsonElement root)
     {
-        var phases = root.GetProperty("phases").EnumerateObject().ToDictionary(
-            p => p.Name,
-            p => new PhaseStats(
-                p.Value.GetProperty("medianMs").GetDouble(),
-                p.Value.GetProperty("iqrMs").GetDouble(),
-                p.Value.GetProperty("minMs").GetDouble(),
-                p.Value.GetProperty("samples").GetInt32()));
+        int protocol = root.TryGetProperty("protocol", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 1;
+        if (protocol != Protocol)
+            throw new InvalidDataException(
+                $"torch.json was written under parity protocol {protocol}; this harness reads protocol {Protocol}.");
+        var phases = root.GetProperty("phases").EnumerateObject().ToDictionary(e => e.Name, e => ReadStats(e.Value));
         var losses = root.GetProperty("losses").EnumerateArray().Select(l => l.GetDouble()).ToList();
-        return new SideResult("torch", root.GetProperty("frameworkVersion").GetString() ?? "unknown", phases, losses);
+        var modes = root.GetProperty("modes").EnumerateArray().Select(m => new ModeResult(
+            m.GetProperty("name").GetString() ?? "unknown",
+            m.GetProperty("status").GetString() ?? "unknown",
+            m.TryGetProperty("reason", out var reason) ? reason.GetString() : null,
+            m.TryGetProperty("step", out var step) ? ReadStats(step) : null)).ToList();
+        var best = root.GetProperty("best");
+        return new SideResult("torch", root.GetProperty("frameworkVersion").GetString() ?? "unknown", phases, losses,
+            best.GetProperty("mode").GetString() ?? "unknown", ReadStats(best.GetProperty("step")), modes);
     }
 
     private static float[] ReadFloats(BinaryReader reader, int count)
@@ -306,12 +376,29 @@ internal static class HeadToHeadNetworkHarness
         return values;
     }
 
+    /// <summary>How the Tensors side runs a training step.</summary>
+    internal enum TensorsMode
+    {
+        /// <summary>The eager tape, synchronising the stream at every phase boundary: the reported phase breakdown.</summary>
+        PhaseSynchronized,
+
+        /// <summary>The eager tape, one synchronisation per step.</summary>
+        Eager,
+
+        /// <summary>The compiled training plan (forward, backward and a fused SGD update, replayed per Step()).</summary>
+        Compiled,
+    }
+
+    private sealed record TrainRun(IReadOnlyDictionary<string, PhaseStats> Phases, IReadOnlyList<double> Losses, string? Note = null);
+
     /// <summary>
-    /// Trains the spec's network with Tensors. With <paramref name="gpu"/> the whole step runs on the device:
-    /// data and parameters are uploaded once, the update is the device-side SGD kernel, and every phase
-    /// boundary synchronises the stream, as the PyTorch side does, so a phase's time includes its kernels.
+    /// Trains the spec's network with Tensors in every mode, each from the weights PyTorch wrote. With
+    /// <paramref name="gpu"/> the whole step runs on the device: data and parameters are uploaded once and the
+    /// update is the device-side SGD kernel. The phase-synchronised eager run is the reported breakdown; the
+    /// fastest mode whose losses agree with <paramref name="reference"/> is the gated best. A mode that throws is
+    /// a Tensors defect and fails the case.
     /// </summary>
-    private static SideResult RunTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu)
+    private static SideResult RunTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, IReadOnlyList<double> reference)
     {
         // The CPU case must run on the CPU engine: on a machine with a GPU the default engine is the GPU engine, so the
         // "cpu" case trained and timed the GPU engine over host tensors.
@@ -319,7 +406,54 @@ internal static class HeadToHeadNetworkHarness
         AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
         try
         {
-            return TrainTensors(spec, work, gpu);
+            var phased = TrainTensors(spec, work, gpu, TensorsMode.PhaseSynchronized);
+            var runs = new List<(string Name, TrainRun Run)> { ("eager", phased) };
+            // On the CPU nothing synchronises, so the phase-synchronised run already is the plain eager step.
+            if (gpu is not null) runs[0] = ("eager (phase-synchronised)", phased);
+            if (gpu is not null) runs.Add(("eager", TrainTensors(spec, work, gpu, TensorsMode.Eager)));
+            runs.Add(("compiled", TrainTensors(spec, work, gpu, TensorsMode.Compiled)));
+            // The thread budgets the PyTorch runner tries: its default (the physical cores, as ours) and every logical
+            // core. SMT siblings help some networks on either side, so each side gets both.
+            int defaultThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+            if (gpu is null && Environment.ProcessorCount > defaultThreads)
+            {
+                int logical = Environment.ProcessorCount;
+                CpuParallelSettings.MaxDegreeOfParallelism = logical;
+                try
+                {
+                    runs.Add(($"eager@{logical}threads", TrainTensors(spec, work, gpu, TensorsMode.Eager)));
+                    runs.Add(($"compiled@{logical}threads", TrainTensors(spec, work, gpu, TensorsMode.Compiled)));
+                }
+                finally
+                {
+                    CpuParallelSettings.MaxDegreeOfParallelism = defaultThreads;
+                }
+            }
+
+            var modes = runs.Select(r =>
+            {
+                string? mismatch = LossMismatch(r.Run.Losses, reference);
+                return new ModeResult(r.Name, mismatch is null ? "ok" : "rejected", mismatch ?? r.Run.Note, r.Run.Phases["step"]);
+            }).ToList();
+            // The fastest agreeing mode, first on a tie. Pattern-matched so the compiler sees that the chosen step is
+            // non-null: the earlier `?? double.MaxValue` and `?? phased step` fallbacks were unreachable, and the
+            // second would have silently substituted the phased step had that contract ever broken.
+            (string Name, PhaseStats Step)? best = null;
+            foreach (var m in modes)
+                if (m.Status == "ok" && m.Step is { } step && (best is null || step.MinMs < best.Value.Step.MinMs))
+                    best = (m.Name, step);
+            if (best is not { } chosen)
+                throw new InvalidOperationException(
+                    "No Tensors mode reproduced PyTorch's loss curve: " +
+                    string.Join("; ", modes.Select(m => $"{m.Name}: {m.Reason}")));
+            return new SideResult(
+                "AiDotNet.Tensors",
+                typeof(Tensor<>).Assembly.GetName().Version?.ToString() ?? "unknown",
+                phased.Phases,
+                phased.Losses,
+                chosen.Name,
+                chosen.Step,
+                modes);
         }
         finally
         {
@@ -353,7 +487,7 @@ internal static class HeadToHeadNetworkHarness
         try
         {
             var capture = new StepCrossingCapture(warmupSteps);
-            TrainTensors(spec, work, gpu, capture);
+            TrainTensors(spec, work, gpu, TensorsMode.PhaseSynchronized, capture);
             return capture.Crossings ?? throw new InvalidOperationException("the measured step never ran.");
         }
         finally
@@ -384,7 +518,7 @@ internal static class HeadToHeadNetworkHarness
 
     internal const double DefaultWarmupMs = 1000;
 
-    private static SideResult TrainCompiled(JsonElement spec, IEngine engine, List<Func<Tensor<float>, Tensor<float>>> layers,
+    private static TrainRun TrainCompiled(JsonElement spec, IEngine engine, List<Func<Tensor<float>, Tensor<float>>> layers,
         List<Tensor<float>> parameters, Tensor<float> x, Tensor<float> y, double lr, DirectGpuTensorEngine? gpu)
     {
         var allAxes = new[] { 0, 1 };
@@ -418,15 +552,14 @@ internal static class HeadToHeadNetworkHarness
             if (measuring) { steps.Add(t); measuredSoFar++; }
         }
 
-        var stats = Stats(steps);
-        return new SideResult(
-            "AiDotNet.Tensors (compiled)",
-            typeof(Tensor<>).Assembly.GetName().Version?.ToString() ?? "unknown",
-            new Dictionary<string, PhaseStats> { ["forward"] = stats, ["backward"] = stats, ["optimizer"] = stats, ["step"] = stats },
-            losses);
+        // On the GPU the plan replays the step as one CUDA graph unless capture failed; say which, since an unreplayed
+        // step pays every launch.
+        string? note = gpu is null ? null : plan.GraphCaptureFailureReason is { } why ? "no CUDA graph: " + why : "CUDA graph replay";
+        return new TrainRun(new Dictionary<string, PhaseStats> { ["step"] = Stats(steps) }, losses, note);
     }
 
-    private static SideResult TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, StepCrossingCapture? capture = null)
+    private static TrainRun TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, TensorsMode mode,
+        StepCrossingCapture? capture = null)
     {
         IEngine engine = AiDotNetEngine.Current;
         Tensor<float> Place(Tensor<float> tensor) => gpu is null ? tensor : gpu.UploadToGpu(tensor, GpuTensorRole.General);
@@ -625,11 +758,16 @@ internal static class HeadToHeadNetworkHarness
         }
 
         double lr = spec.GetProperty("optimizer").GetProperty("lr").GetDouble();
-        // PARITY_TENSORS_MODE=compiled: the same layers traced once into a compiled training plan (forward, backward and
-        // a fused SGD update, replayed per Step()) - the engine's counterpart to torch.compile or a captured step. Opt-in:
-        // the gated ratchet keeps measuring the eager tape.
-        if (capture is null && Environment.GetEnvironmentVariable("PARITY_TENSORS_MODE") == "compiled")
+        // The same layers traced once into a compiled training plan (forward, backward and a fused SGD update,
+        // replayed per Step()): the engine's counterpart to torch.compile or a captured step.
+        if (mode == TensorsMode.Compiled)
+        {
+            if (capture is not null) throw new ArgumentException("The crossing capture inspects the eager tape.", nameof(mode));
             return TrainCompiled(spec, engine, layers, parameters, x, y, lr, gpu);
+        }
+
+        // Phase boundaries synchronise only when the phase breakdown is being measured.
+        bool phaseSync = mode == TensorsMode.PhaseSynchronized;
         var optimizer = new SgdOptimizer();
         var group = optimizer.AddParamGroup(new Dictionary<string, double> { ["lr"] = lr });
         // The optimizer updates the parameter tensors in place and reads the tape's gradients directly, as
@@ -673,11 +811,11 @@ internal static class HeadToHeadNetworkHarness
             var h = x;
             foreach (var layer in layers) h = layer(h);
             var loss = engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(h, y)), allAxes, keepDims: false);
-            Sync();
+            if (phaseSync) Sync();
             double t1 = sw.Elapsed.TotalMilliseconds;
 
             var grads = tape.ComputeGradients(loss, sources);
-            Sync();
+            if (phaseSync) Sync();
             double t2 = sw.Elapsed.TotalMilliseconds;
 
             var stepGradients = new Tensor<float>[parameters.Count];
@@ -722,11 +860,7 @@ internal static class HeadToHeadNetworkHarness
             }
         }
 
-        return new SideResult(
-            "AiDotNet.Tensors",
-            typeof(Tensor<>).Assembly.GetName().Version?.ToString() ?? "unknown",
-            phases.ToDictionary(kv => kv.Key, kv => Stats(kv.Value)),
-            losses);
+        return new TrainRun(phases.ToDictionary(kv => kv.Key, kv => Stats(kv.Value)), losses);
     }
 
     private static PhaseStats Stats(List<double> samples)

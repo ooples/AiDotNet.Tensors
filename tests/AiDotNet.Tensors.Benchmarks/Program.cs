@@ -15,6 +15,18 @@ class Program
     static void Main(string[] args)
     {
         // GPU-free cubin generation and verification for the spectral family.
+        if (args.Length > 0 && args[0] == "--resident-program")
+        {
+            Environment.ExitCode = ResidentProgramBench.Run(args);
+            return;
+        }
+
+        if (args.Length > 0 && args[0] == "--parity-step")
+        {
+            Environment.ExitCode = ParityStepProbe.Run(args);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "--generate-direct-ptx-spectral-cubins")
         {
             Environment.ExitCode = DirectPtxSpectralCubinTool.Generate(args);

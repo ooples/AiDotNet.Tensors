@@ -83,10 +83,12 @@ internal static class GotoGemmFp32
     // Cede thin-M very-wide-N ONLY when PackBoth's N-axis can actually take it (m % Mr == 0, Mr=6 for the
     // FP32 6x16 kernel): for m%6!=0 (e.g. the m=256 DiT QKV/MLP shapes) N-axis is disabled and PackBoth
     // falls to M-axis/2D which LOSES to GotoGemm (the old --ab-shortm 2.06x), so GotoGemm must keep those.
+    // M from 64 (not 128): PackBoth splits M only, so the cross-attention K/V projection of a 77-token context
+    // (M77 K1024 N2304) ran on 2 of 8 threads, 3.4-3.8 ms; here it is 1.1-1.3 ms at 8 threads, equal at 1 (#653).
     internal static bool BeatsPackBoth(int m, int n, int k)
         => m >= 512
         || (long)k >= 2L * n
-        || (m >= 128 && n >= 512 && ((long)n < 2L * k || (m % Mr) != 0));
+        || (m >= 64 && n >= 512 && ((long)n < 2L * k || (m % Mr) != 0));
 
     /// <summary>bf16-B win regime (opt-in, gated by BlasManaged.s_gemmBf16). bf16-B halves the streamed
     /// B bytes, so it only pays off once B no longer fits cache and the GEMM is bandwidth-bound — measured
@@ -252,11 +254,12 @@ internal static class GotoGemmFp32
         int m, int n, int k, int mc, int nc, int kc)
     {
         if (k <= 0) { ZeroCBlock(c, ldc, 0, 0, m, n); return; } // C = A·B with K=0 is the zero matrix
-        var kern = Kernel();
+        var kern = Kernel(); var kOw = KernelOw();
         // Per-call scratch (Stage 1: plain alloc; Stage 2 will pool these per worker).
         // packA holds one Mc×Kc A-panel as consecutive mr-row sub-panels: [mt][k][mr].
         // packB holds one Kc×Nc B-panel as consecutive nr-col sub-panels: [nt][k][nr].
-        float[] packAArr = new float[mc * kc];
+        // (+Mr rows: the zero-padded M-tail sub-panel.)
+        float[] packAArr = new float[(mc + Mr) * kc];
         float[] packBArr = new float[kc * nc];
 
         fixed (float* packA = packAArr)
@@ -321,9 +324,16 @@ internal static class GotoGemmFp32
                             }
                         }
 
-                        // M-tail rows [ic+mFull, ic+effMc) × full N tiles + everything in the N-tail:
-                        // handle all remaining (row,col) of this C block with a scalar K-accumulate.
-                        ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                        // M-tail rows [ic+mFull, ic+effMc) × full N tiles on the microkernel, then the N-tail columns
+                        // of every row with a scalar K-accumulate.
+                        int mTail = effMc - mFull;
+                        if (mTail > 0)
+                        {
+                            float* paTail = packA + (long)mTiles * effKc * Mr;
+                            PackATail(a, lda, paTail, ic + mFull, pc, effKc, mTail);
+                            KernelMTail(kOw, paTail, packB, (long)effKc * Nr, c, ldc, ic + mFull, jc, nTiles, effKc, mTail);
+                        }
+                        ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc, mTailRowsDone: true);
                     }
                 }
             }
@@ -465,7 +475,9 @@ internal static class GotoGemmFp32
     {
         int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8); // +8: SIMD A-pack transpose may store 2 past the last tile
+        int mTail = effMc - mFull;
+        // +Mr rows: the zero-padded M-tail sub-panel; +8: the SIMD A-pack transpose may store 2 past the last tile.
+        float[] paArr = ArrayPool<float>.Shared.Rent((mc + Mr) * kc + 8);
         float[] pbArr = ArrayPool<float>.Shared.Rent(kc * nc);
         try
         {
@@ -490,6 +502,9 @@ internal static class GotoGemmFp32
                     }
                     long tB = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     PackA6(a, lda, pa, ic, pc, effKc, mTiles); // SIMD A-pack (8x8 AVX2 transpose; scalar fallback)
+                    // After PackA6: its transpose stores 2 floats past the last full tile, onto the tail panel.
+                    float* paTail = pa + (long)mTiles * effKc * Mr;
+                    if (mTail > 0) PackATail(a, lda, paTail, ic + mFull, pc, effKc, mTail);
                     // First K-panel: overwrite kernel (C = acc) + zero only the scalar-tail strips → skip the
                     // full ZeroCBlock zero-pass + the panel-0 C read-back. Later panels accumulate.
                     var kern = pc == 0 ? kOw : kAcc;
@@ -505,6 +520,7 @@ internal static class GotoGemmFp32
                             kern(ap, bp, cp, (long)ldc * 4, effKc);
                         }
                     }
+                    if (mTail > 0) KernelMTail(kOw, paTail, pb, (long)effKc * Nr, c, ldc, ic + mFull, jc, nTiles, effKc, mTail);
                     if (timing)
                     {
                         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -514,7 +530,7 @@ internal static class GotoGemmFp32
                         Interlocked.Add(ref s_kernTicks, t2 - t1);
                     }
                     long t3 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                    ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc, mTailRowsDone: true);
                     if (timing) Interlocked.Add(ref s_tailTicks, System.Diagnostics.Stopwatch.GetTimestamp() - t3);
                 }
             }
@@ -556,7 +572,8 @@ internal static class GotoGemmFp32
     {
         int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8);
+        int mTail = effMc - mFull;
+        float[] paArr = ArrayPool<float>.Shared.Rent((mc + Mr) * kc + 8); // + the M-tail sub-panel
         float[] pbArr = ArrayPool<float>.Shared.Rent(kc * nc);
         try
         {
@@ -578,6 +595,9 @@ internal static class GotoGemmFp32
                         }
                     }
                     PackA6(a, lda, pa, ic, pc, effKc, mTiles);
+                    // After PackA6: its transpose stores 2 floats past the last full tile, onto the tail panel.
+                    float* paTail = pa + (long)mTiles * effKc * Mr;
+                    if (mTail > 0) PackATail(a, lda, paTail, ic + mFull, pc, effKc, mTail);
                     var kern = pc == 0 ? kOw : kAcc;
                     if (pc == 0) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
                     for (int nt = 0; nt < nTiles; nt++)
@@ -590,7 +610,9 @@ internal static class GotoGemmFp32
                             kern(ap, bp, cp, (long)ldc * 4, effKc);
                         }
                     }
-                    HalfBTails(a, lda, bHalf, ldb, pb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                    // The M-tail rows on the microkernel, as RunTile runs them, so the two stay bit-identical.
+                    if (mTail > 0) KernelMTail(kOw, paTail, pb, (long)effKc * Nr, c, ldc, ic + mFull, jc, nTiles, effKc, mTail);
+                    HalfBTails(a, lda, bHalf, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
                 }
             }
         }
@@ -598,12 +620,12 @@ internal static class GotoGemmFp32
     }
 
     /// <summary>
-    /// The tails of <see cref="RunTileHalfB"/>, in the same per-element K order as <see cref="ScalarTails"/>:
-    /// N-tail columns read B as half; M-tail rows read the already-converted packed panel
-    /// (<paramref name="pb"/>, layout [nt][kk][Nr]), so they cost no second conversion.
+    /// The N-tail columns of <see cref="RunTileHalfB"/>, reading B as half, in the same per-element K order as
+    /// <see cref="ScalarTails"/>. Its M-tail rows run on the microkernel (<see cref="KernelMTail"/>) from the
+    /// already-converted packed panel, as <see cref="RunTile"/> runs them.
     /// </summary>
     private static unsafe void HalfBTails(
-        float* a, int lda, ushort* bHalf, int ldb, float* pb, float* c, int ldc,
+        float* a, int lda, ushort* bHalf, int ldb, float* c, int ldc,
         int ic, int jc, int effMc, int effNc, int mFull, int nFull, int pc, int effKc)
     {
         for (int r = 0; r < effMc; r++)
@@ -616,31 +638,6 @@ internal static class GotoGemmFp32
                 for (int kk = 0; kk < effKc; kk++)
                     s += arow[kk] * (float)BitConverter.UInt16BitsToHalf(bHalf[(long)(pc + kk) * ldb + col]);
                 crow[col] += s;
-            }
-        }
-        int nTiles = nFull / Nr;
-        for (int r = ic + mFull; r < ic + effMc; r++)
-        {
-            float* crow = c + (long)r * ldc + jc;
-            float* arow = a + (long)r * lda + pc;
-            for (int kk = 0; kk < effKc; kk++)
-            {
-                var va = Vector256.Create(arow[kk]);
-                for (int nt = 0; nt < nTiles; nt++)
-                {
-                    float* bseg = pb + ((long)nt * effKc + kk) * Nr;
-                    float* cseg = crow + nt * Nr;
-                    if (Fma.IsSupported)
-                    {
-                        Avx.Store(cseg, Fma.MultiplyAdd(va, Avx.LoadVector256(bseg), Avx.LoadVector256(cseg)));
-                        Avx.Store(cseg + 8, Fma.MultiplyAdd(va, Avx.LoadVector256(bseg + 8), Avx.LoadVector256(cseg + 8)));
-                    }
-                    else
-                    {
-                        Avx.Store(cseg, Avx.Add(Avx.LoadVector256(cseg), Avx.Multiply(va, Avx.LoadVector256(bseg))));
-                        Avx.Store(cseg + 8, Avx.Add(Avx.LoadVector256(cseg + 8), Avx.Multiply(va, Avx.LoadVector256(bseg + 8))));
-                    }
-                }
             }
         }
     }
@@ -718,12 +715,16 @@ internal static class GotoGemmFp32
     {
         int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8); // +8: PackA6 transpose may store 2 past the last tile
+        int mTail = effMc - mFull;
+        // +Mr rows: the zero-padded M-tail sub-panel; +8: the PackA6 transpose may store 2 past the last tile.
+        float[] paArr = ArrayPool<float>.Shared.Rent((mc + Mr) * kc + 8);
         try
         {
             fixed (float* pa = paArr)
             {
                 PackA6(a, lda, pa, ic, pc, effKc, mTiles);
+                float* paTail = pa + (long)mTiles * effKc * Mr; // after PackA6, which overruns onto it
+                if (mTail > 0) PackATail(a, lda, paTail, ic + mFull, pc, effKc, mTail);
                 var kern = firstPc ? KernelOw() : Kernel();    // first panel overwrites C; later accumulate
                 if (firstPc) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
                 for (int nt = 0; nt < nTiles; nt++)
@@ -736,7 +737,8 @@ internal static class GotoGemmFp32
                         kern(ap, bp, cp, (long)ldc * 4, effKc);
                     }
                 }
-                ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                if (mTail > 0) KernelMTail(KernelOw(), paTail, pkB, (long)kc * Nr, c, ldc, ic + mFull, jc, nTiles, effKc, mTail);
+                ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc, mTailRowsDone: true);
             }
         }
         finally { ArrayPool<float>.Shared.Return(paArr); }
@@ -807,11 +809,27 @@ internal static class GotoGemmFp32
         {
             for (int r = mFull; r < effMc; r++) { float* cr = c + (long)(ic0 + r) * ldc + jc0; for (int col = 0; col < effNc; col++) cr[col] = 0f; }
             for (int r = 0; r < mFull; r++) { float* cr = c + (long)(ic0 + r) * ldc + jc0 + nFull; for (int col = nFull; col < effNc; col++) cr[col - nFull] = 0f; }
-            for (int p = 0, pc = 0; pc < k; p++, pc += kc)
+            int mTail = effMc - mFull;
+            float[] tailArr = ArrayPool<float>.Shared.Rent(mTail > 0 ? Mr * kc : 1);
+            try
             {
-                int effKc = Math.Min(kc, k - pc);
-                ScalarTails(a, lda, b, ldb, c, ldc, ic0, jc0, effMc, effNc, mFull, nFull, pc, effKc);
+                fixed (float* paTail = tailArr)
+                {
+                    var kOw = KernelOw();
+                    for (int p = 0, pc = 0; pc < k; p++, pc += kc)
+                    {
+                        int effKc = Math.Min(kc, k - pc);
+                        if (mTail > 0)
+                        {
+                            PackATail(a, lda, paTail, ic0 + mFull, pc, effKc, mTail);
+                            KernelMTail(kOw, paTail, packedB + (long)p * nTiles * kc * Nr, (long)kc * Nr, c, ldc,
+                                ic0 + mFull, jc0, nTiles, effKc, mTail);
+                        }
+                        ScalarTails(a, lda, b, ldb, c, ldc, ic0, jc0, effMc, effNc, mFull, nFull, pc, effKc, mTailRowsDone: true);
+                    }
+                }
             }
+            finally { ArrayPool<float>.Shared.Return(tailArr); }
         }
     }
 
@@ -825,7 +843,9 @@ internal static class GotoGemmFp32
     {
         int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
-        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8); // +8: SIMD A-pack transpose may store 2 past the last tile
+        int mTail = effMc - mFull;
+        // +Mr rows: the zero-padded M-tail sub-panel; +8: the SIMD A-pack transpose may store 2 past the last tile.
+        float[] paArr = ArrayPool<float>.Shared.Rent((mc + Mr) * kc + 8);
         try
         {
             fixed (float* pa = paArr)
@@ -835,6 +855,9 @@ internal static class GotoGemmFp32
                 {
                     int effKc = Math.Min(kc, k - pc);
                     PackA6(a, lda, pa, ic, pc, effKc, mTiles); // SIMD A-pack (8x8 AVX2 transpose; scalar fallback)
+                    // After PackA6: its transpose stores 2 floats past the last full tile, onto the tail panel.
+                    float* paTail = pa + (long)mTiles * effKc * Mr;
+                    if (mTail > 0) PackATail(a, lda, paTail, ic + mFull, pc, effKc, mTail);
                     var kern = pc == 0 ? kOw : kAcc;           // first panel overwrites C; later panels accumulate
                     if (pc == 0) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
                     for (int nt = 0; nt < nTiles; nt++)
@@ -847,7 +870,9 @@ internal static class GotoGemmFp32
                             kern(ap, bp, cp, (long)ldc * 4, effKc);
                         }
                     }
-                    ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                    if (mTail > 0)
+                        KernelMTail(kOw, paTail, packedB + (long)p * nTiles * kc * Nr, (long)kc * Nr, c, ldc, ic + mFull, jc, nTiles, effKc, mTail);
+                    ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc, mTailRowsDone: true);
                 }
             }
         }
@@ -1003,12 +1028,54 @@ internal static class GotoGemmFp32
         }
     }
 
+    /// <summary>
+    /// Packs the last <paramref name="mTail"/> (1-5) rows of an A block, zero-padded to a full <see cref="Mr"/>-row
+    /// sub-panel in the <see cref="PackA6"/> layout ([k][row]), so the tail rows run on the microkernel.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void PackATail(float* a, int lda, float* dst, int row0, int pc, int effKc, int mTail)
+    {
+        for (int kk = 0; kk < effKc; kk++)
+        {
+            float* d = dst + (long)kk * Mr;
+            int row = 0;
+            for (; row < mTail; row++) d[row] = a[(long)(row0 + row) * lda + pc + kk];
+            for (; row < Mr; row++) d[row] = 0f;
+        }
+    }
+
+    /// <summary>
+    /// The M-tail rows of a C block across its full Nr-tiles, on the microkernel: each tile's product goes to a 6x16
+    /// scratch tile (the zero padding rows compute zeros) and its first <paramref name="mTail"/> rows are added into C,
+    /// which the caller zeroed on the first K-panel. The row updates this replaces streamed B from memory once per
+    /// tail row: on M=256 split into two 128-row blocks (2 tail rows each) they were 8.6% of a DiT-XL/2 QKV GEMM on
+    /// one core and 13% on eight (#653).
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void KernelMTail(
+        delegate* unmanaged<float*, float*, float*, long, long, void> kOw,
+        float* paTail, float* pb, long bTileStride, float* c, int ldc, int row0, int jc, int nTiles, int effKc, int mTail)
+    {
+        float* tile = stackalloc float[Mr * Nr];
+        for (int nt = 0; nt < nTiles; nt++)
+        {
+            kOw(paTail, pb + nt * bTileStride, tile, Nr * sizeof(float), effKc);
+            for (int r = 0; r < mTail; r++)
+            {
+                float* crow = c + (long)(row0 + r) * ldc + jc + nt * Nr;
+                float* trow = tile + r * Nr;
+                Vector256.Store(Vector256.Load(crow) + Vector256.Load(trow), crow);
+                Vector256.Store(Vector256.Load(crow + 8) + Vector256.Load(trow + 8), crow + 8);
+            }
+        }
+    }
+
     // Scalar K-accumulate for the rows/cols not covered by the full mr×nr tiles (the M-tail rows and
     // the N-tail cols). Correct but slow — tails are a small fraction of a well-blocked GEMM.
     [MethodImpl(Hot)]
     private static unsafe void ScalarTails(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
-        int ic, int jc, int effMc, int effNc, int mFull, int nFull, int pc, int effKc)
+        int ic, int jc, int effMc, int effNc, int mFull, int nFull, int pc, int effKc, bool mTailRowsDone = false)
     {
         // N-tail columns [jc+nFull, jc+effNc) for ALL rows [ic, ic+effMc).
         for (int r = 0; r < effMc; r++)
@@ -1026,7 +1093,9 @@ internal static class GotoGemmFp32
         // M-tail rows (effMc % Mr of them) across the full-tile columns, as row updates
         // C[r, cols] += A[r, k] * B[k, cols] over contiguous B rows. The per-element dot product this
         // replaces walked a column of B at stride ldb - a cache miss per step - and at M=256 (4 tail
-        // rows) took 50% of the 16-thread budget against 18% for the microkernel (#653).
+        // rows) took 50% of the 16-thread budget against 18% for the microkernel (#653). Callers that ran these rows
+        // on the microkernel (KernelMTail) pass mTailRowsDone.
+        if (mTailRowsDone) return;
         for (int r = ic + mFull; r < ic + effMc; r++)
         {
             float* crow = c + (long)r * ldc + jc;

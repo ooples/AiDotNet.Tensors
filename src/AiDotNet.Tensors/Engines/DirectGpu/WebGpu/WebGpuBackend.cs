@@ -1224,6 +1224,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         _disposed = true;
         _sharedDummyBuffer?.Dispose();
         _sharedDummyBuffer = null;
+        _residentUnusedOperand?.Dispose();
+        _residentUnusedOperand = null;
         DisposeTunedKernelResources();
 
         // Dispose cached complex scratch buffers

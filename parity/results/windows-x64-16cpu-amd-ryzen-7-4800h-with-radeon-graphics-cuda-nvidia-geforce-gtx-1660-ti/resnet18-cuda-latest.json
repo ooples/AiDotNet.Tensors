@@ -1,0 +1,242 @@
+{
+  "network": "resnet18",
+  "device": "cuda",
+  "machineKey": "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti",
+  "stepRatio": 0.9194566115997636,
+  "medianStepRatio": 0.9174171972568441,
+  "noiseBand": 0.011325862102037442,
+  "protocol": 2,
+  "torch": {
+    "version": "2.11.0\u002Bcu126",
+    "bestMode": "cuda_graph",
+    "best": {
+      "MedianMs": 10.947800008580089,
+      "IqrMs": 0.11710001854225993,
+      "MinMs": 10.776799987070262,
+      "Samples": 15
+    },
+    "modes": [
+      {
+        "Name": "eager",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 12.837900008889847,
+          "IqrMs": 0.33099998836405575,
+          "MinMs": 12.51580000098329,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "eager\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 29.783199992380105,
+          "IqrMs": 0.4552000027615577,
+          "MinMs": 29.451399997924455,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "cuda_graph",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 10.947800008580089,
+          "IqrMs": 0.11710001854225993,
+          "MinMs": 10.776799987070262,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "cuda_graph\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 28.289800000493415,
+          "IqrMs": 0.20460000087041408,
+          "MinMs": 28.06530000816565,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "compile:default",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 14.387100003659725,
+          "IqrMs": 0.338700003339909,
+          "MinMs": 13.773799990303814,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "compile:default\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 13.652599998749793,
+          "IqrMs": 0.26649999199435115,
+          "MinMs": 13.305100001161918,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "compile:reduce-overhead",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 13.321699996595271,
+          "IqrMs": 0.20769999537151307,
+          "MinMs": 13.121700001647696,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "compile:reduce-overhead\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 12.548699989565648,
+          "IqrMs": 0.16599999798927456,
+          "MinMs": 12.430000002495944,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "compile:max-autotune",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 13.391700005740859,
+          "IqrMs": 0.20240001322235912,
+          "MinMs": 13.281000006827526,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "compile:max-autotune\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 12.36760000756476,
+          "IqrMs": 0.10689999908208847,
+          "MinMs": 12.210900007630698,
+          "Samples": 15
+        }
+      }
+    ],
+    "phases": {
+      "forward": {
+        "MedianMs": 4.523600000538863,
+        "IqrMs": 0.30590000096708536,
+        "MinMs": 4.362100007710978,
+        "Samples": 15
+      },
+      "backward": {
+        "MedianMs": 7.718200009549037,
+        "IqrMs": 0.1596000074641779,
+        "MinMs": 7.40869999572169,
+        "Samples": 15
+      },
+      "optimizer": {
+        "MedianMs": 0.7831999973859638,
+        "IqrMs": 0.06220000796020031,
+        "MinMs": 0.7539000071119517,
+        "Samples": 15
+      },
+      "step": {
+        "MedianMs": 12.994499993510544,
+        "IqrMs": 0.3466000052867457,
+        "MinMs": 12.713300005998462,
+        "Samples": 15
+      }
+    },
+    "losses": [
+      1.2716327905654907,
+      0.1650700867176056,
+      0.02048591524362564,
+      0.0038845431990921497,
+      0.0009121762705035508
+    ]
+  },
+  "tensors": {
+    "version": "1.0.0.0",
+    "bestMode": "compiled",
+    "best": {
+      "MedianMs": 10.0437,
+      "IqrMs": 0.03739999999999988,
+      "MinMs": 9.9088,
+      "Samples": 15
+    },
+    "modes": [
+      {
+        "Name": "eager (phase-synchronised)",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 11.097,
+          "IqrMs": 1.5222999999999995,
+          "MinMs": 10.6802,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "eager",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 10.6671,
+          "IqrMs": 0.0495000000000001,
+          "MinMs": 10.4802,
+          "Samples": 15
+        }
+      },
+      {
+        "Name": "compiled",
+        "Status": "ok",
+        "Reason": "CUDA graph replay",
+        "Step": {
+          "MedianMs": 10.0437,
+          "IqrMs": 0.03739999999999988,
+          "MinMs": 9.9088,
+          "Samples": 15
+        }
+      }
+    ],
+    "phases": {
+      "forward": {
+        "MedianMs": 3.0629,
+        "IqrMs": 0.11450000000000005,
+        "MinMs": 2.96,
+        "Samples": 15
+      },
+      "backward": {
+        "MedianMs": 7.4047,
+        "IqrMs": 1.437800000000001,
+        "MinMs": 7.110499999999999,
+        "Samples": 15
+      },
+      "optimizer": {
+        "MedianMs": 0.6189999999999998,
+        "IqrMs": 0.012900000000000134,
+        "MinMs": 0.6097000000000001,
+        "Samples": 15
+      },
+      "step": {
+        "MedianMs": 11.097,
+        "IqrMs": 1.5222999999999995,
+        "MinMs": 10.6802,
+        "Samples": 15
+      }
+    },
+    "losses": [
+      1.271633505821228,
+      0.16507668793201447,
+      0.020468169823288918,
+      0.003912837710231543,
+      0.0009102437761612236
+    ]
+  }
+}
