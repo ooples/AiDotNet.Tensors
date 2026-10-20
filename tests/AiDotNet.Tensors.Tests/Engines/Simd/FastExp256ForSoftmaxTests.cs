@@ -141,5 +141,33 @@ public class FastExp256ForSoftmaxTests
             }
         }
     }
+
+#if NET8_0_OR_GREATER
+    // The two softmax exps must agree bit for bit lane for lane, so the AVX-512 and AVX2 rows can differ only in how
+    // they reduce (pinned above). Covers the clamps, both rounding directions and the subnormal-free range.
+    [SkippableFact]
+    public void FastExp512ForSoftmax_MatchesFastExp256ForSoftmax_BitForBit()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx512F.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported,
+            "needs AVX-512F and FMA");
+        var rng = RandomHelper.CreateSeededRandom(0x512);
+        var x = new float[16 * 4096];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 200.0 - 100.0);
+        float[] edges = { -87.3365f, 88.7228f, -90f, 90f, 0f, -0f, 0.5f * 0.693359375f, -0.5f * 0.693359375f };
+        Array.Copy(edges, x, edges.Length);
+        for (int i = 0; i < x.Length; i += 16)
+        {
+            var wide = SimdKernels.FastExp512ForSoftmax(Vector512.Create(x, i));
+            var lo = SimdKernels.FastExp256ForSoftmax(Vector256.Create(x, i));
+            var hi = SimdKernels.FastExp256ForSoftmax(Vector256.Create(x, i + 8));
+            for (int k = 0; k < 16; k++)
+            {
+                float narrow = k < 8 ? lo.GetElement(k) : hi.GetElement(k - 8);
+                if (BitConverter.SingleToInt32Bits(wide.GetElement(k)) != BitConverter.SingleToInt32Bits(narrow))
+                    Assert.Fail($"exp({x[i + k]:R}): AVX-512 {wide.GetElement(k):R}, AVX2 {narrow:R}");
+            }
+        }
+    }
+#endif
 }
 #endif
