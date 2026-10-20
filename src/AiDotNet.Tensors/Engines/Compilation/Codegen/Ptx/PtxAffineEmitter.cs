@@ -2316,7 +2316,7 @@ public sealed partial class PtxAffineEmitter
             _calledFunctions.Clear();
         }
         if (SharedMemoryBytes > 0)
-            _sb.Append("    .shared .align 4 .b8 stageBuf[")
+            _sb.Append("    .shared .align 16 .b8 stageBuf[")
                .Append(I(SharedMemoryBytes)).Append("];\n");
         _sb.Append("    .reg .pred %p<").Append(I(_p + 8)).Append(">;\n")
            .Append("    .reg .b32 %r<").Append(I(_r + 8)).Append(">;\n")

@@ -37,7 +37,10 @@ public sealed partial class PtxAffineEmitter
 
     private const int ImplicitGemmThreads = 256;
     private const int ImplicitGemmSide = 16;   // threads per tile edge
-    private const int ImplicitGemmChunk = 8;   // reduction terms staged per step
+    private const int ImplicitGemmChunk = 16;  // reduction terms staged per step
+    // Floats of padding after each staged row: a multiple of 4 keeps rows 16-byte aligned for the
+    // vector reads, and 4 spreads a reduction-fastest store's chunk rows over different banks.
+    private const int ImplicitGemmPad = 4;
 
     /// <summary>The axis roles of an implicit-GEMM lowering, or null with the reason it does not apply.</summary>
     internal static (int A, int B, int[] M, int[] N, int[] Batch, int[] R)? PlanImplicitGemm(
@@ -80,13 +83,13 @@ public sealed partial class PtxAffineEmitter
         long mTotal = Extent(roles.M), nTotal = Extent(roles.N), bTotal = Extent(roles.Batch), rTotal = Extent(roles.R);
         if (mTotal > int.MaxValue || nTotal > int.MaxValue || rTotal > int.MaxValue)
             throw new NotSupportedException("An implicit GEMM indexes each role in 32 bits.");
-
         int tile = ImplicitGemmTile == 32 ? 32 : 64;
-        int per = tile / ImplicitGemmSide;   // outputs per thread along each edge
+        int per = tile / ImplicitGemmSide;   // outputs per thread along each edge, contiguous so one vector load reads them
+        int rowFloats = tile + ImplicitGemmPad;
+        int bufferBytes = ImplicitGemmChunk * rowFloats * sizeof(float);   // one operand's chunk
         long mBlocks = (mTotal + tile - 1) / tile, nBlocks = (nTotal + tile - 1) / tile;
         long blocks = mBlocks * nBlocks * bTotal;
         if (blocks > int.MaxValue) throw new NotSupportedException("Too many tiles for one grid.");
-
         _sb.Clear(); _body.Clear(); _calledFunctions.Clear(); _r = _f = _p = _rd = 0;
         EmittedLoads = 0; ElidedGuards = 0; IndirectIndexLoads = 0; AtomicStores = 0;
         ExtraOutputStores = 0; VectorisedStores = 0; VectorisedLoads = 0;
@@ -95,13 +98,15 @@ public sealed partial class PtxAffineEmitter
         _outOfRangeFill = "0f00000000";
         _stageLabel = 0;
         StagedOperands = spec.Inputs[roles.A].Name + "+" + spec.Inputs[roles.B].Name;
-        SharedMemoryBytes = 2 * ImplicitGemmChunk * tile * sizeof(float);
+        SharedMemoryBytes = 4 * bufferBytes;   // both operands, double buffered
         CoarsenedLanes = per * per;
         LoopedAxes = 1; Unrolled = false; WarpReduced = false; UsedTwoDimensionalBlock = false;
         LaunchBlockX = ImplicitGemmThreads; LaunchBlockY = 1; LaunchBlockThreads = ImplicitGemmThreads;
         LaunchBlocks = (uint)blocks;
-        TileDescription = "implicit-gemm " + tile + "x" + tile + "x" + ImplicitGemmChunk;
-
+        bool aReductionFastest = StagesReductionFastest(spec, spec.Inputs[roles.A], roles.M, roles.R, tile);
+        bool bReductionFastest = StagesReductionFastest(spec, spec.Inputs[roles.B], roles.N, roles.R, tile);
+        TileDescription = "implicit-gemm " + tile + "x" + tile + "x" + ImplicitGemmChunk + " double-buffered, staged " +
+            (aReductionFastest ? "r" : "m") + (bReductionFastest ? "r" : "n") + "-fastest";
         _sb.Append(".version ").Append(PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
            .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
            .Append(".address_size 64\n\n")
@@ -110,8 +115,7 @@ public sealed partial class PtxAffineEmitter
            .Append(".visible .entry ").Append(spec.Name).Append("(\n");
         for (int i = 0; i < spec.ParameterCount; i++)
             _sb.Append("    .param .u64 p").Append(I(i)).Append(i == spec.ParameterCount - 1 ? "\n" : ",\n");
-        _sb.Append(")\n{\n");
-
+        _sb.Append(")\n.maxntid ").Append(I(ImplicitGemmThreads)).Append(", 1, 1\n{\n");
         var basePtr = new string[spec.ParameterCount];
         for (int i = 0; i < basePtr.Length; i++)
         {
@@ -119,13 +123,11 @@ public sealed partial class PtxAffineEmitter
             L($"ld.param.u64 {basePtr[i]}, [p{I(i)}];");
         }
         _basePointers = basePtr;
-
         string tid = NextR(), ctaid = NextR(), tx = NextR(), ty = NextR();
         L($"mov.u32 {tid}, %tid.x;");
         L($"mov.u32 {ctaid}, %ctaid.x;");
         L($"rem.u32 {tx}, {tid}, {I(ImplicitGemmSide)};");
         L($"div.u32 {ty}, {tid}, {I(ImplicitGemmSide)};");
-
         // Block -> (batch slice, M tile, N tile), N tile fastest.
         string nTile = NextR(), rest = NextR(), mTile = NextR(), bIndex = NextR();
         L($"rem.u32 {nTile}, {ctaid}, {I(nBlocks)};");
@@ -135,7 +137,6 @@ public sealed partial class PtxAffineEmitter
         string m0 = NextR(), n0 = NextR();
         L($"mul.lo.u32 {m0}, {mTile}, {I(tile)};");
         L($"mul.lo.u32 {n0}, {nTile}, {I(tile)};");
-
         // One register per axis; filled per use by decomposing a flat index, last axis fastest.
         var axisReg = new string[axes.Count];
         void Decompose(int[] set, string flat)
@@ -153,11 +154,10 @@ public sealed partial class PtxAffineEmitter
             }
         }
         if (roles.Batch.Length > 0) Decompose(roles.Batch, bIndex);
-
-        string sharedA = NextRd(), sharedB = NextRd();
-        L($"mov.u64 {sharedA}, stageBuf;");
-        L($"add.u64 {sharedB}, {sharedA}, {I(ImplicitGemmChunk * tile * sizeof(float))};");
-
+        // Shared layout: [A0][B0][A1][B1], each chunk x rowFloats; a step reads one pair and fills the other.
+        string sharedBase = NextRd(), current = NextRd();
+        L($"mov.u64 {sharedBase}, stageBuf;");
+        L($"mov.u64 {current}, 0;");
         var acc = new string[per, per];
         for (int i = 0; i < per; i++)
             for (int j = 0; j < per; j++)
@@ -165,22 +165,17 @@ public sealed partial class PtxAffineEmitter
                 acc[i, j] = NextF();
                 L($"mov.f32 {acc[i, j]}, 0f00000000;");
             }
-
-        string r0 = NextR();
-        L($"mov.u32 {r0}, 0;");
-        _body.Append("IG_STEP:\n");
-
-        // ---- stage one operand: KC x tile values, gathered through its own map.
-        void Stage(int input, int[] own, long ownTotal, string origin, string shared, bool reductionFastest)
+        // ---- staging, split so the gather for the next step is in flight while this step computes.
+        // Everything that depends only on the thread -- its slots, its own-axis coordinates -- is
+        // decomposed once here; a step decomposes only the reduction index.
+        int perThread = ImplicitGemmChunk * tile / ImplicitGemmThreads;
+        ImplicitGemmStage Plan(int input, int[] own, long ownTotal, string origin, int operandOffset, bool reductionFastest)
         {
-            var binding = spec.Inputs[input];
-            int count = ImplicitGemmChunk * tile / ImplicitGemmThreads;
-            for (int e = 0; e < count; e++)
+            var plan = new ImplicitGemmStage(input, own, reductionFastest, operandOffset, perThread);
+            for (int e = 0; e < perThread; e++)
             {
                 string lin = NextR(), kk = NextR(), pos = NextR();
                 L($"add.u32 {lin}, {tid}, {I(e * ImplicitGemmThreads)};");
-                // A operand: consecutive threads walk the reduction (contiguous in a weight
-                // tensor); B: consecutive threads walk N (contiguous along output positions).
                 if (reductionFastest)
                 {
                     L($"rem.u32 {kk}, {lin}, {I(ImplicitGemmChunk)};");
@@ -191,73 +186,145 @@ public sealed partial class PtxAffineEmitter
                     L($"rem.u32 {pos}, {lin}, {I(tile)};");
                     L($"div.u32 {kk}, {lin}, {I(tile)};");
                 }
-                string g = NextR(), r = NextR(), inG = NextP(), inR = NextP(), ok = NextP();
-                string gc = NextR(), rc = NextR();
+                string g = NextR();
                 L($"add.u32 {g}, {origin}, {pos};");
-                L($"add.u32 {r}, {r0}, {kk};");
-                L($"setp.lt.u32 {inG}, {g}, {I(ownTotal)};");
-                L($"setp.lt.u32 {inR}, {r}, {I(rTotal)};");
-                L($"and.pred {ok}, {inG}, {inR};");
-                // Clamp so the gathered address is always inside the operand; the result is
-                // then zeroed when the position is outside the tile's problem.
-                L($"min.u32 {gc}, {g}, {I(ownTotal - 1)};");
-                L($"min.u32 {rc}, {r}, {I(rTotal - 1)};");
+                string gc = g;
+                if (ownTotal % tile != 0)
+                {
+                    // Clamp so the gathered address stays inside the operand; the value is zeroed below.
+                    string inG = NextP();
+                    L($"setp.lt.u32 {inG}, {g}, {I(ownTotal)};");
+                    plan.OwnInRange[e] = inG;
+                    gc = NextR();
+                    L($"min.u32 {gc}, {g}, {I(ownTotal - 1)};");
+                }
                 Decompose(own, gc);
-                Decompose(roles.R, rc);
+                var ownAxes = new string[own.Length];
+                for (int k = 0; k < own.Length; k++) ownAxes[k] = axisReg[own[k]];
+                plan.OwnAxes[e] = ownAxes;
+                string slot = NextR();
+                L($"mad.lo.u32 {slot}, {kk}, {I(rowFloats)}, {pos};");
+                L($"shl.b32 {slot}, {slot}, 2;");
+                plan.Slot[e] = slot;
+                plan.Chunk[e] = kk;
+            }
+            return plan;
+        }
+        var stageA = Plan(roles.A, roles.M, mTotal, m0, 0, aReductionFastest);
+        var stageB = Plan(roles.B, roles.N, nTotal, n0, bufferBytes, bReductionFastest);
+        // Gathers one chunk starting at reduction index r0 into registers.
+        string[] Gather(ImplicitGemmStage plan, string r0)
+        {
+            var binding = spec.Inputs[plan.Input];
+            var values = new string[perThread];
+            // Reduction-fastest staging with a thread count that is a multiple of the chunk gives every
+            // element of a thread the same reduction index, so it is decomposed once.
+            bool sharedChunk = plan.ReductionFastest && ImplicitGemmThreads % ImplicitGemmChunk == 0;
+            string? inR = null;
+            for (int e = 0; e < perThread; e++)
+            {
+                if (e == 0 || !sharedChunk)
+                {
+                    string r = NextR();
+                    L($"add.u32 {r}, {r0}, {plan.Chunk[e]};");
+                    string rc = r;
+                    inR = null;
+                    if (rTotal % ImplicitGemmChunk != 0)
+                    {
+                        inR = NextP();
+                        L($"setp.lt.u32 {inR}, {r}, {I(rTotal)};");
+                        rc = NextR();
+                        L($"min.u32 {rc}, {r}, {I(rTotal - 1)};");
+                    }
+                    Decompose(roles.R, rc);
+                }
+                for (int k = 0; k < plan.Own.Length; k++) axisReg[plan.Own[k]] = plan.OwnAxes[e][k];
                 string value = EmitLoad(binding, basePtr[binding.ParameterIndex], axisReg,
                     Array.Empty<int>(), Array.Empty<int>(), out _);
-                string kept = NextF();
-                L($"selp.f32 {kept}, {value}, 0f00000000, {ok};");
-                string slot = NextR(), slotBytes = NextRd(), at = NextRd();
-                L($"mad.lo.u32 {slot}, {kk}, {I(tile)}, {pos};");
-                L($"mul.wide.u32 {slotBytes}, {slot}, 4;");
-                L($"add.u64 {at}, {shared}, {slotBytes};");
-                L($"st.shared.f32 [{at}], {kept};");
+                string? ok = plan.OwnInRange[e];
+                if (inR is not null)
+                {
+                    if (ok is null) ok = inR;
+                    else { string both = NextP(); L($"and.pred {both}, {ok}, {inR};"); ok = both; }
+                }
+                if (ok is not null)
+                {
+                    string kept = NextF();
+                    L($"selp.f32 {kept}, {value}, 0f00000000, {ok};");
+                    value = kept;
+                }
+                values[e] = value;
+            }
+            return values;
+        }
+        void Store(ImplicitGemmStage plan, string[] values, string bufferOffset)
+        {
+            string operandBase = NextRd();
+            L($"add.u64 {operandBase}, {sharedBase}, {bufferOffset};");
+            if (plan.OperandOffset != 0) L($"add.u64 {operandBase}, {operandBase}, {I(plan.OperandOffset)};");
+            for (int e = 0; e < perThread; e++)
+            {
+                string slotBytes = NextRd(), at = NextRd();
+                L($"cvt.u64.u32 {slotBytes}, {plan.Slot[e]};");
+                L($"add.u64 {at}, {operandBase}, {slotBytes};");
+                L($"st.shared.f32 [{at}], {values[e]};");
             }
         }
-        Stage(roles.A, roles.M, mTotal, m0, sharedA, reductionFastest: true);
-        Stage(roles.B, roles.N, nTotal, n0, sharedB, reductionFastest: false);
+        string r0 = NextR();
+        L($"mov.u32 {r0}, 0;");
+        Store(stageA, Gather(stageA, r0), current);
+        Store(stageB, Gather(stageB, r0), current);
         L("bar.sync 0;");
-
-        // ---- compute: thread (ty, tx) owns rows ty + 16i and columns tx + 16j of the tile.
+        _body.Append("IG_STEP:\n");
+        // The loop body is straight-line: a gather under a branch is sunk by ptxas to its stores after
+        // the compute, which exposes the full global latency every step. The last step therefore
+        // re-gathers the final chunk (clamped) and fills a buffer nobody reads.
+        string rNext = NextR(), rFetch = NextR();
+        L($"add.u32 {rNext}, {r0}, {I(ImplicitGemmChunk)};");
+        L($"min.u32 {rFetch}, {rNext}, {I((rTotal - 1) / ImplicitGemmChunk * ImplicitGemmChunk)};");
+        var nextA = Gather(stageA, rFetch);
+        var nextB = Gather(stageB, rFetch);
+        // ---- compute: thread (ty, tx) owns rows ty*per..+per and columns tx*per..+per of the tile.
         string aRow = NextRd(), bRow = NextRd(), tyBytes = NextRd(), txBytes = NextRd();
-        L($"mul.wide.u32 {tyBytes}, {ty}, 4;");
-        L($"mul.wide.u32 {txBytes}, {tx}, 4;");
-        L($"add.u64 {aRow}, {sharedA}, {tyBytes};");
-        L($"add.u64 {bRow}, {sharedB}, {txBytes};");
+        L($"mul.wide.u32 {tyBytes}, {ty}, {I(per * sizeof(float))};");
+        L($"mul.wide.u32 {txBytes}, {tx}, {I(per * sizeof(float))};");
+        L($"add.u64 {aRow}, {sharedBase}, {current};");
+        L($"add.u64 {aRow}, {aRow}, {tyBytes};");
+        L($"add.u64 {bRow}, {sharedBase}, {current};");
+        L($"add.u64 {bRow}, {bRow}, {txBytes};");
+        L($"add.u64 {bRow}, {bRow}, {I(bufferBytes)};");
+        string vector = per == 4 ? "v4" : "v2";
         for (int kk = 0; kk < ImplicitGemmChunk; kk++)
         {
             var av = new string[per];
             var bv = new string[per];
-            for (int i = 0; i < per; i++)
-            {
-                av[i] = NextF();
-                L($"ld.shared.f32 {av[i]}, [{aRow}+{I((kk * tile + i * ImplicitGemmSide) * 4)}];");
-            }
-            for (int j = 0; j < per; j++)
-            {
-                bv[j] = NextF();
-                L($"ld.shared.f32 {bv[j]}, [{bRow}+{I((kk * tile + j * ImplicitGemmSide) * 4)}];");
-            }
+            for (int i = 0; i < per; i++) av[i] = NextF();
+            for (int j = 0; j < per; j++) bv[j] = NextF();
+            L($"ld.shared.{vector}.f32 {{{string.Join(", ", av)}}}, [{aRow}+{I(kk * rowFloats * sizeof(float))}];");
+            L($"ld.shared.{vector}.f32 {{{string.Join(", ", bv)}}}, [{bRow}+{I(kk * rowFloats * sizeof(float))}];");
             for (int i = 0; i < per; i++)
                 for (int j = 0; j < per; j++)
                     L($"fma.rn.f32 {acc[i, j]}, {av[i]}, {bv[j]}, {acc[i, j]};");
         }
+        // The other buffer was last read in the previous step, which ended at a barrier, so it is free.
+        string other = NextRd(), hasNext = NextP();
+        L($"xor.b64 {other}, {current}, {I(2 * bufferBytes)};");
+        Store(stageA, nextA, other);
+        Store(stageB, nextB, other);
         L("bar.sync 0;");
-        string more = NextP();
-        L($"add.u32 {r0}, {r0}, {I(ImplicitGemmChunk)};");
-        L($"setp.lt.u32 {more}, {r0}, {I(rTotal)};");
-        L($"@{more} bra IG_STEP;");
-
+        L($"mov.u64 {current}, {other};");
+        L($"mov.u32 {r0}, {rNext};");
+        L($"setp.lt.u32 {hasNext}, {rNext}, {I(rTotal)};");
+        L($"@{hasNext} bra IG_STEP;");
         // ---- epilogue and store, guarded per output.
         for (int i = 0; i < per; i++)
             for (int j = 0; j < per; j++)
             {
                 string mm = NextR(), nn = NextR(), inM = NextP(), inN = NextP(), skip = NextP();
-                L($"add.u32 {mm}, {m0}, {ty};");
-                if (i > 0) L($"add.u32 {mm}, {mm}, {I(ImplicitGemmSide * i)};");
-                L($"add.u32 {nn}, {n0}, {tx};");
-                if (j > 0) L($"add.u32 {nn}, {nn}, {I(ImplicitGemmSide * j)};");
+                L($"mad.lo.u32 {mm}, {ty}, {I(per)}, {m0};");
+                if (i > 0) L($"add.u32 {mm}, {mm}, {I(i)};");
+                L($"mad.lo.u32 {nn}, {tx}, {I(per)}, {n0};");
+                if (j > 0) L($"add.u32 {nn}, {nn}, {I(j)};");
                 L($"setp.lt.u32 {inM}, {mm}, {I(mTotal)};");
                 L($"setp.lt.u32 {inN}, {nn}, {I(nTotal)};");
                 L($"and.pred {skip}, {inM}, {inN};");
@@ -304,5 +371,70 @@ public sealed partial class PtxAffineEmitter
 
         _body.Append("END:\n    ret;\n}\n");
         return Assemble();
+    }
+
+    /// <summary>
+    /// Whether staging an operand walks the reduction with consecutive threads (otherwise its own
+    /// output axes): the order whose first warp touches fewer 32-byte sectors, so the gather coalesces
+    /// whichever way the operand is laid out. A weight tensor is contiguous along the reduction and
+    /// strided along output channels; an activation is usually the reverse.
+    /// </summary>
+    private static bool StagesReductionFastest(
+        CodegenKernelSpec spec, CodegenTensorBinding binding, int[] own, int[] reduction, int tile)
+    {
+        var axes = spec.Space.Axes;
+        int Sectors(bool reductionFastest)
+        {
+            var sectors = new HashSet<long>();
+            var value = new long[axes.Count];
+            for (int lane = 0; lane < 32; lane++)
+            {
+                long pos = reductionFastest ? lane / ImplicitGemmChunk : lane % tile;
+                long kk = reductionFastest ? lane % ImplicitGemmChunk : lane / tile;
+                Array.Clear(value, 0, value.Length);
+                void Spread(int[] set, long flat)
+                {
+                    for (int k = set.Length - 1; k >= 0; k--)
+                    {
+                        value[set[k]] = flat % axes[set[k]].Extent;
+                        flat /= axes[set[k]].Extent;
+                    }
+                }
+                Spread(own, pos);
+                Spread(reduction, kk);
+                long offset = 0;
+                for (int d = 0; d < binding.Map.Count; d++)
+                {
+                    var expr = binding.Map[d];
+                    long v = expr.Constant;
+                    foreach (var term in expr.Terms) v += (long)term.Coefficient * value[term.Axis];
+                    offset += FloorDiv(v, expr.Divisor) * binding.Stride(d);
+                }
+                sectors.Add(FloorDiv(offset * binding.ElementBytes, 32));
+            }
+            return sectors.Count;
+        }
+        static long FloorDiv(long a, long b) => a >= 0 ? a / b : -((-a + b - 1) / b);
+        return Sectors(reductionFastest: true) < Sectors(reductionFastest: false);
+    }
+
+    /// <summary>What one thread stages of one implicit-GEMM operand: per element, its shared slot (bytes),
+    /// its reduction offset within the chunk, its own-axis coordinates and whether they are in range.</summary>
+    private sealed class ImplicitGemmStage
+    {
+        public ImplicitGemmStage(int input, int[] own, bool reductionFastest, int operandOffset, int count)
+        {
+            Input = input; Own = own; ReductionFastest = reductionFastest; OperandOffset = operandOffset;
+            Slot = new string[count]; Chunk = new string[count];
+            OwnAxes = new string[count][]; OwnInRange = new string?[count];
+        }
+        public int Input { get; }
+        public int[] Own { get; }
+        public bool ReductionFastest { get; }
+        public int OperandOffset { get; }
+        public string[] Slot { get; }
+        public string[] Chunk { get; }
+        public string[][] OwnAxes { get; }
+        public string?[] OwnInRange { get; }
     }
 }
