@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // The declared normalisation programs in the EXACT contract of the hand-written backend kernels they replace
 // (#890 phase 4a), so a backend can route an existing call to them with no change to its callers.
 //
@@ -111,13 +111,12 @@ public static class CodegenBackendPrograms
             RowPass("batchnorm_running_mean", c, new[] { "running_mean", "mean" }, "running_mean_out",
                 CodegenExpr.Add(CodegenExpr.Product(Op(0), CodegenExpr.Constant(1 - momentum)),
                                 CodegenExpr.Product(Op(1), CodegenExpr.Constant(momentum)))),
-            // var = m2s - (shift + negmean)^2 (the program's own shifted variance), unbiased, folded in.
-            RowPass("batchnorm_running_var", c, new[] { "running_var", "m2s", "shift", "negmean" }, "running_var_out",
+            // var = m2s - dmean^2 (the program's own shifted variance), unbiased, folded in.
+            RowPass("batchnorm_running_var", c, new[] { "running_var", "m2s", "dmean" }, "running_var_out",
                 CodegenExpr.Add(
                     CodegenExpr.Product(Op(0), CodegenExpr.Constant(1 - momentum)),
                     CodegenExpr.Product(CodegenExpr.Constant(momentum * unbias),
-                        CodegenExpr.Subtract(Op(1),
-                            CodegenExpr.Product(CodegenExpr.Add(Op(2), Op(3)), CodegenExpr.Add(Op(2), Op(3))))))));
+                        CodegenExpr.Subtract(Op(1), CodegenExpr.Product(Op(2), Op(2)))))));
     }
 
     /// <summary>CudaBackend.LayerNormBackward: sources dy, x, gamma, mean, rstd; outputs dx, dgamma, dbeta.</summary>

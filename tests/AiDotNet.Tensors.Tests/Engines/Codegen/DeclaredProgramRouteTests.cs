@@ -8,6 +8,7 @@
 // hand-written kernel would be the wrong bar -- it carries the same rounding, in another order.
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
@@ -97,6 +98,126 @@ public class DeclaredProgramRouteTests
             {
                 backend.DestroyCapturedGraph(graph);
             }
+        }
+    }
+
+    /// <summary>
+    /// Every other routed family, at shapes that take the ragged and wrapped layouts (7x7 and
+    /// 14x14 BatchNorm planes, 49-element GroupNorm runs, a 100-wide row): the route fires, and
+    /// on well-conditioned data -- no offset, where two fp32 evaluations of the same math agree
+    /// to about 1e-6 -- every output agrees with the incumbent's within 1e-4.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("rmsnorm")]
+    [InlineData("groupnorm")]
+    [InlineData("batchnorm")]
+    [InlineData("layernorm_backward")]
+    [InlineData("rmsnorm_backward")]
+    [InlineData("batchnorm_backward")]
+    [InlineData("softmax")]
+    [InlineData("softmax_backward")]
+    public void EveryRoutedFamilyFiresAndAgreesWithTheIncumbent(string family)
+    {
+        using var backend = OpenBackendOrSkip();
+        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        foreach (var (inputs, outputSizes, call) in FamilyCases(family))
+        {
+            var results = new float[2][][];
+            bool routed = false;
+            for (int run = 0; run < 2; run++)
+            {
+                bool declared = run == 0;
+                backend.DeclaredKernelsSwitch = declared;
+                var buffers = new IGpuBuffer[inputs.Length + outputSizes.Length];
+                try
+                {
+                    for (int i = 0; i < inputs.Length; i++) buffers[i] = backend.AllocateBuffer(inputs[i]);
+                    for (int o = 0; o < outputSizes.Length; o++)
+                        buffers[inputs.Length + o] = backend.AllocateBuffer(new float[outputSizes[o]]);
+                    long before = backend.DeclaredProgramLaunches;
+                    call(backend, buffers);
+                    backend.Synchronize();
+                    if (declared) routed = backend.DeclaredProgramLaunches > before;
+                    results[run] = new float[buffers.Length][];
+                    for (int i = 0; i < buffers.Length; i++) results[run][i] = backend.DownloadBuffer(buffers[i]);
+                }
+                finally
+                {
+                    foreach (var buffer in buffers) buffer?.Dispose();
+                    backend.DeclaredKernelsSwitch = null;
+                }
+            }
+            Assert.True(routed, family + " fell through to the incumbent.");
+            // Every buffer -- outputs, and inputs a call updates in place (BatchNorm's running statistics).
+            for (int i = 0; i < results[0].Length; i++)
+                for (int j = 0; j < results[0][i].Length; j++)
+                {
+                    float declared = results[0][i][j], incumbent = results[1][i][j];
+                    Assert.True(Math.Abs(declared - incumbent) <= 1e-4 * Math.Max(1.0, Math.Abs(incumbent)),
+                        $"{family}: buffer {i}[{j}] declared {declared} incumbent {incumbent}");
+                }
+        }
+    }
+
+    private static IEnumerable<(float[][] Inputs, int[] OutputSizes, Action<CudaBackend, IGpuBuffer[]> Call)> FamilyCases(string family)
+    {
+        float[] R(int n, int seed, double offset = 0)
+        {
+            var rng = new Random(seed);
+            var v = new float[n];
+            for (int i = 0; i < n; i++) v[i] = (float)(offset + rng.NextDouble() * 2 - 1);
+            return v;
+        }
+        float[] Positive(int n, int seed)
+        {
+            var v = R(n, seed, 1.5);
+            return v;
+        }
+        switch (family)
+        {
+            case "rmsnorm":
+                foreach (var (r, c) in new[] { (64, 1024), (100, 100) })
+                    yield return (new[] { R(r * c, 1), R(c, 2) }, new[] { r * c, r },
+                        (k, a) => k.RmsNorm(a[0], a[2], a[1], a[3], r, c, Epsilon));
+                break;
+            case "groupnorm":
+                foreach (var (n, ch, g, sp) in new[] { (4, 32, 8, 64), (4, 32, 8, 49), (2, 6, 3, 10) })
+                    yield return (new[] { R(n * ch * sp, 3), R(ch, 4), R(ch, 5) }, new[] { n * ch * sp, n * g, n * g },
+                        (k, a) => k.GroupNorm(a[0], a[3], a[1], a[2], a[4], a[5], n, g, ch, sp, Epsilon));
+                break;
+            case "batchnorm":
+                foreach (var (n, ch, sp) in new[] { (8, 16, 64), (16, 32, 49), (4, 16, 196) })
+                    yield return (new[] { R(n * ch * sp, 6), R(ch, 7), R(ch, 8), R(ch, 9), Positive(ch, 10) },
+                        new[] { n * ch * sp, ch, ch },
+                        (k, a) => k.BatchNorm(a[0], a[5], a[1], a[2], a[3], a[4], a[6], a[7], n, ch, sp, Epsilon, 0.1f, true));
+                break;
+            case "layernorm_backward":
+                foreach (var (r, c) in new[] { (64, 1024), (100, 100) })
+                    yield return (new[] { R(r * c, 11), R(r * c, 12), R(c, 13), R(r, 14), Positive(r, 15) }, new[] { r * c, c, c },
+                        (k, a) => k.LayerNormBackward(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], r, c, Epsilon));
+                break;
+            case "rmsnorm_backward":
+                foreach (var (r, c) in new[] { (64, 1024), (100, 100) })
+                    yield return (new[] { R(r * c, 16), R(r * c, 17), R(c, 18), Positive(r, 19) }, new[] { r * c, c },
+                        (k, a) => k.RmsNormBackward(a[0], a[1], a[2], a[3], a[4], a[5], r, c, Epsilon));
+                break;
+            case "batchnorm_backward":
+                foreach (var (n, ch, sp) in new[] { (8, 16, 64), (16, 32, 49), (4, 16, 196) })
+                    yield return (new[] { R(n * ch * sp, 20), R(n * ch * sp, 21), R(ch, 22), R(ch, 23), Positive(ch, 24) },
+                        new[] { n * ch * sp, ch, ch },
+                        (k, a) => k.BatchNormBackward(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], n, ch, sp, Epsilon));
+                break;
+            case "softmax":
+                foreach (var (r, c) in new[] { (64, 1024), (100, 100), (16, 5000) })
+                    yield return (new[] { R(r * c, 25) }, new[] { r * c }, (k, a) => k.Softmax(a[0], a[1], r, c));
+                break;
+            case "softmax_backward":
+                foreach (var (r, c) in new[] { (64, 1024), (100, 100), (16, 5000) })
+                    yield return (new[] { R(r * c, 26), Positive(r * c, 27) }, new[] { r * c },
+                        (k, a) => k.SoftmaxBackward(a[0], a[1], a[2], r, c));
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(family));
         }
     }
 

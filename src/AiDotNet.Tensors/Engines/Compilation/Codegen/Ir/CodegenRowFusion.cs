@@ -81,18 +81,21 @@ public sealed class CodegenRowBinding
 /// The thread layout of one row kernel: Threads per row, each access Vector wide, one STEP
 /// (Threads x Vector columns) at a time, Chunks steps per row. HELD rows keep every step in
 /// registers; streamed rows sweep. A RAGGED layout's last step overhangs the row, and its
-/// out-of-row lanes are predicated off.
+/// out-of-row lanes are predicated off. A WRAPPED layout is ragged over several column axes:
+/// a step may cross runs of the innermost axis, so each lane tracks its (outer, inner) column
+/// position as it advances.
 /// </summary>
 public readonly struct CodegenRowGeometry
 {
-    public CodegenRowGeometry(int threads, int vector, int step, int chunks, bool held, bool ragged)
+    public CodegenRowGeometry(int threads, int vector, int step, int chunks, bool held, bool ragged, bool wrapped = false)
     {
         Threads = threads;
         Vector = vector;
         Step = step;
         Chunks = chunks;
         Held = held;
-        Ragged = ragged;
+        Ragged = ragged || wrapped;
+        Wrapped = wrapped;
     }
 
     public int Threads { get; }
@@ -101,6 +104,7 @@ public readonly struct CodegenRowGeometry
     public int Chunks { get; }
     public bool Held { get; }
     public bool Ragged { get; }
+    public bool Wrapped { get; }
 
     /// <summary>Elements each thread holds (0 when streamed).</summary>
     public int PerThread => Held ? Chunks * Vector : 0;
@@ -257,6 +261,53 @@ public sealed class CodegenRowFusionPlan
         return null;
     }
 
+    /// <summary>
+    /// The WRAPPED geometry, for a row over several column axes whose innermost run no step
+    /// divides -- BatchNorm's (n, h*w) at 7x7, 14x14 or 28x28, GroupNorm's (channels, h*w).
+    /// Each binding must address the outer column axes as ONE stride (<see cref="OuterStride"/>),
+    /// so a column is (outer, inner); the vector divides the innermost extent, so a vector never
+    /// crosses a run. Held when a power-of-two thread count holds the row in at most
+    /// <see cref="CodegenRowFusion.MaxPerThread"/> elements a thread, streamed by a
+    /// <see cref="CodegenRowFusion.RaggedStreamThreads"/>-thread block otherwise.
+    /// </summary>
+    public CodegenRowGeometry? WrappedGeometry(int maxVector)
+    {
+        if (ColumnExtents.Count < 2) return null;
+        foreach (var binding in Bindings.Values)
+            if (binding.Kind != CodegenRowOperandKind.Row && OuterStride(binding) is null) return null;
+        int inner = ColumnExtents[ColumnExtents.Count - 1];
+        for (int vector = maxVector; vector >= 1; vector /= 2)
+        {
+            if (vector != 1 && vector != 2 && vector != 4) continue;
+            if (inner % vector != 0 || !VectorAligned(vector)) continue;
+            for (int threads = CodegenWarpReduction.Lanes; threads <= CodegenRowFusion.MaxRowThreads; threads *= 2)
+            {
+                int step = threads * vector;
+                int chunks = (Width + step - 1) / step;
+                if ((long)chunks * vector <= CodegenRowFusion.MaxPerThread)
+                    return new CodegenRowGeometry(threads, vector, step, chunks, held: true, ragged: true, wrapped: true);
+            }
+            int blockStep = CodegenRowFusion.RaggedStreamThreads * vector;
+            return new CodegenRowGeometry(CodegenRowFusion.RaggedStreamThreads, vector, blockStep,
+                (Width + blockStep - 1) / blockStep, held: false, ragged: true, wrapped: true);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The element stride of a binding's OUTER column index -- the flattened index over every
+    /// column axis but the innermost -- or null when those axes do not flatten to one stride
+    /// (each outer axis's stride is the next one's stride times its extent, or the binding
+    /// does not read the outer axes at all).
+    /// </summary>
+    public long? OuterStride(CodegenRowBinding binding)
+    {
+        int last = ColumnExtents.Count - 1;
+        for (int k = 0; k < last - 1; k++)
+            if (binding.ColumnStrides[k] != binding.ColumnStrides[k + 1] * ColumnExtents[k + 1]) return null;
+        return binding.ColumnStrides[last - 1];
+    }
+
     // Every streamed binding's row starts (and fixed offset) on a vector boundary.
     private bool VectorAligned(int vector)
     {
@@ -266,19 +317,23 @@ public sealed class CodegenRowFusionPlan
             if (binding.ConstantOffset % vector != 0) return false;
             foreach (long stride in binding.RowStrides)
                 if (stride % vector != 0) return false;
+            for (int k = 0; k < binding.ColumnStrides.Count - 1; k++)
+                if (binding.ColumnStrides[k] % vector != 0) return false;
         }
         return true;
     }
 
     /// <summary>
-    /// The layout the emitter uses: a row held exactly, else held raggedly, else streamed
-    /// exactly, else streamed raggedly. Null when none fits.
+    /// The layout the emitter uses: a row held exactly, else held raggedly (one column axis) or
+    /// wrapped (several), else streamed exactly, else streamed raggedly or wrapped. Null when
+    /// none fits. A held layout beats an exact stream: it reads the row once, and ragged-held
+    /// LayerNorm ran at the DRAM ceiling (1024x3136: 245 GB/s of ~256 on a GTX 1660 Ti).
     /// </summary>
     public CodegenRowGeometry? Layout(int maxVector)
     {
         if (Geometry(maxVector) is { } h)
             return new CodegenRowGeometry(h.Threads, h.Vector, h.Step, h.PerThread / h.Vector, held: true, ragged: false);
-        var ragged = RaggedGeometry(maxVector);
+        var ragged = RaggedGeometry(maxVector) ?? WrappedGeometry(maxVector);
         if (ragged is { Held: true } r) return r;
         if (StreamGeometry(maxVector) is { } s)
             return new CodegenRowGeometry(s.Threads, s.Vector, s.Step, s.Chunks, held: false, ragged: false);
@@ -444,7 +499,7 @@ public static class CodegenRowFusion
         };
         if (plan.Layout(1) is null)
         {
-            reason = "no thread geometry fits a " + plan.Width + "-wide row over several column axes";
+            reason = "no thread geometry fits a " + plan.Width + "-wide row: its outer column axes do not flatten";
             return null;
         }
         return plan;

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Softmax and LayerNorm as multi-pass programs over the existing spec form.
 //
 // These were blocked on the BODY's shape, not on the number of passes. The spec applies
@@ -399,6 +399,15 @@ public static class CodegenFusedStatistics
     /// 1000 a NEGATIVE variance and NaN. A sample of the channel is within a few standard
     /// deviations of its mean whatever the offset.
     /// </para>
+    /// <para>
+    /// THE MEAN IS SHIFTED TOO: <c>dmean = mean(x - shift)</c>, from the same read as the
+    /// moment, and every consumer works from it -- the variance is <c>m2s - dmean^2</c> and
+    /// the affine centres <c>(x - shift) - dmean</c>. Summing raw x at an offset of 1000 lost
+    /// the low digits of each term, and re-forming <c>shift + negmean</c> in fp32 lost them
+    /// again: at 64x128x14x14 the error was 4x cuDNN's (1.2e-3 against 3.1e-4).
+    /// <c>negmean = -(shift + dmean)</c> is still produced, by a free per-channel pass, for
+    /// callers that save the mean.
+    /// </para>
     /// </remarks>
     public static CodegenProgram BatchNorm2D(int batch, int channels, int height, int width, double epsilon = 1e-5)
     {
@@ -425,11 +434,13 @@ public static class CodegenFusedStatistics
             Bind(1, "shift", channel, isOutput: true, Axis(0)),
             new[] { 0 }, CodegenReduceKind.None);
 
-        var negMean = new CodegenKernelSpec(
-            "batchnorm_negmean", Statistics(),
-            new[] { X(0) },
-            Bind(1, "negmean", channel, isOutput: true, Axis(0)),
-            new[] { 0 }, CodegenReduceKind.Sum, reduceScale: -1.0 / count);
+        // dmean[c] = mean(x - shift): the mean relative to the shift, from the moment's read.
+        var shiftedMean = new CodegenKernelSpec(
+            "batchnorm_dmean", Statistics(),
+            new[] { X(0), Bind(1, "shift", channel, Axis(0)) },
+            Bind(2, "dmean", channel, isOutput: true, Axis(0)),
+            new[] { 0, 1 }, CodegenReduceKind.Sum, reduceScale: 1.0 / count,
+            body: CodegenExpr.Subtract(Op(0), Op(1)));
 
         // m2s[c] = mean((x - shift)^2), independent of the mean.
         var shiftedMoment = new CodegenKernelSpec(
@@ -440,21 +451,26 @@ public static class CodegenFusedStatistics
             preReduce: CodegenPreReduceOp.Square,
             body: CodegenExpr.Subtract(Op(0), Op(1)));
 
-        // rstd[c] = rsqrt(m2s - (shift - mean)^2 + eps); shift - mean = shift + negmean.
+        // rstd[c] = rsqrt(m2s - dmean^2 + eps): the variance about the mean, from shifted terms.
         var rstd = new CodegenKernelSpec(
             "batchnorm_rstd",
             new CodegenIterationSpace(CodegenAxis.Parallel("c", channels)),
-            new[]
-            {
-                Bind(0, "m2s", channel, Axis(0)), Bind(1, "negmean", channel, Axis(0)),
-                Bind(2, "shift", channel, Axis(0)),
-            },
-            Bind(3, "rstd", channel, isOutput: true, Axis(0)),
-            new[] { 0, 1, 2 }, CodegenReduceKind.None,
+            new[] { Bind(0, "m2s", channel, Axis(0)), Bind(1, "dmean", channel, Axis(0)) },
+            Bind(2, "rstd", channel, isOutput: true, Axis(0)),
+            new[] { 0, 1 }, CodegenReduceKind.None,
             activation: CodegenActivationKind.Rsqrt, reduceOffset: epsilon,
-            body: CodegenExpr.Subtract(Op(0),
-                CodegenExpr.Multiply(CodegenExpr.Add(Op(1), Op(2)), CodegenExpr.Add(Op(1), Op(2)))));
+            body: CodegenExpr.Subtract(Op(0), CodegenExpr.Multiply(Op(1), Op(1))));
 
+        // negmean[c] = -(shift + dmean), for callers that save the mean.
+        var negMean = new CodegenKernelSpec(
+            "batchnorm_negmean",
+            new CodegenIterationSpace(CodegenAxis.Parallel("c", channels)),
+            new[] { Bind(0, "shift", channel, Axis(0)), Bind(1, "dmean", channel, Axis(0)) },
+            Bind(2, "negmean", channel, isOutput: true, Axis(0)),
+            new[] { 0, 1 }, CodegenReduceKind.None,
+            body: CodegenExpr.Negate(CodegenExpr.Add(Op(0), Op(1))));
+
+        // y = ((x - shift) - dmean) * rstd * gamma + beta.
         var affine = new CodegenKernelSpec(
             "batchnorm_affine",
             new CodegenIterationSpace(
@@ -463,18 +479,20 @@ public static class CodegenFusedStatistics
             new[]
             {
                 X(0),
-                Bind(1, "negmean", channel, Axis(0)),
-                Bind(2, "rstd", channel, Axis(0)),
-                Bind(3, "gamma", channel, Axis(0)),
-                Bind(4, "beta", channel, Axis(0)),
+                Bind(1, "shift", channel, Axis(0)),
+                Bind(2, "dmean", channel, Axis(0)),
+                Bind(3, "rstd", channel, Axis(0)),
+                Bind(4, "gamma", channel, Axis(0)),
+                Bind(5, "beta", channel, Axis(0)),
             },
-            Bind(5, "y", planes, isOutput: true, Axis(1), Axis(0), Axis(2)),
-            new[] { 0 }, CodegenReduceKind.None,
-            scaleInput: 2, preBiasInput: 1, postScaleInput: 3, postBiasInput: 4);
+            Bind(6, "y", planes, isOutput: true, Axis(1), Axis(0), Axis(2)),
+            new[] { 0, 1, 2 }, CodegenReduceKind.None,
+            scaleInput: 3, postScaleInput: 4, postBiasInput: 5,
+            body: CodegenExpr.Subtract(CodegenExpr.Subtract(Op(0), Op(1)), Op(2)));
 
         return new CodegenProgram(
-            new[] { shift, negMean, shiftedMoment, rstd, affine },
-            new long[] { channels, channels, channels, channels, (long)batch * channels * plane },
+            new[] { shift, shiftedMean, shiftedMoment, rstd, negMean, affine },
+            new long[] { channels, channels, channels, channels, channels, (long)batch * channels * plane },
             "batchnorm2d " + batch + "x" + channels + "x" + height + "x" + width);
     }
 

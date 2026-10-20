@@ -4203,6 +4203,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Softmax(IGpuBuffer A, IGpuBuffer B, int batchSize, int features)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredSoftmax(A, B, batchSize, features)) return;
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxSoftmax(A, B, batchSize, features)) return;
         LaunchSoftmaxKernel(A, B, batchSize, features);
@@ -8689,6 +8691,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
         int batch, int channels, int spatialSize, float epsilon, float momentum, bool training)
     {
+        // The declared program first in training (#890 phase 4a); the kernels below serve any shape it declines.
+        if (training && TryDeclaredBatchNormTraining(input, output, gamma, beta, runningMean, runningVar,
+                saveMean, saveInvVar, batch, channels, spatialSize, epsilon, momentum))
+            return;
         if (TryDirectPtxBatchNormUnit64(
                 input, output, gamma, beta, runningMean, runningVar,
                 saveMean, saveInvVar, batch, channels, spatialSize,
@@ -8874,6 +8880,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatialSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredBatchNormBackward(gradOutput, input, gamma, saveMean, saveInvVar,
+                gradInput, gradGamma, gradBeta, batch, channels, spatialSize))
+            return;
         if (TryDirectPtxBatchNormBackwardUnit64(
                 gradOutput, input, gamma, saveMean, saveInvVar,
                 gradInput, gradGamma, gradBeta,
@@ -8933,6 +8943,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredLayerNormBackward(gradOutput, input, gamma, saveMean, saveInvVar,
+                gradInput, gradGamma, gradBeta, batchSize, normalizedSize))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxLayerNormBackwardD64(
                 gradOutput, input, gamma, saveMean, saveInvVar,
@@ -8958,6 +8972,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredGroupNorm(input, output, gamma, beta, saveMean, saveInvVar,
+                batch, numGroups, channels, spatialSize, epsilon))
+            return;
         if (TryDirectPtxGroupNormUnit64(
                 input, output, gamma, beta, saveMean, saveInvVar,
                 batch, numGroups, channels, spatialSize, epsilon))
@@ -9208,6 +9226,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void RmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
         int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredRmsNorm(input, output, gamma, saveRms, batchSize, normalizedSize, epsilon))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxRmsNormD64(input, output, gamma, saveRms, batchSize, epsilon))
             return;
@@ -9236,6 +9257,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void RmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveRms,
         IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize, float epsilon)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredRmsNormBackward(gradOutput, input, gamma, saveRms, gradInput, gradGamma,
+                batchSize, normalizedSize))
+            return;
         if (normalizedSize == PtxRowNormalizationD64Kernel.Dimension &&
             TryDirectPtxRmsNormBackwardD64(
                 gradOutput, input, gamma, saveRms,
@@ -10498,6 +10523,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void SoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput, int batchSize, int features)
     {
+        // The declared program first (#890 phase 4a); the kernels below serve any shape it declines.
+        if (TryDeclaredSoftmaxBackward(gradOutput, output, gradInput, batchSize, features)) return;
         // Fail-closed direct-PTX fast path (issue #840): dX = S*(dY - sum(dY*S)); S=output, dY=gradOutput.
         if (TryDirectPtxSoftmaxBackward(output, gradOutput, gradInput, batchSize, features)) return;
         if (batchSize > 0 && features > 0 &&

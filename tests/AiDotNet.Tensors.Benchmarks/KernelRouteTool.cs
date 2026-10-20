@@ -1,15 +1,23 @@
 ﻿// Copyright (c) AiDotNet. All rights reserved.
-// --kernel-routes: the production A/B of the declared-program route (#890 phase 4). Each case calls the CUDA BACKEND's
-// own entry point (what DirectGpuTensorEngine calls) twice on identical inputs -- once with the declared route on and
-// once off, so the hand-written kernel serves it. Each route is scored against an fp64 reference of the same
-// contract: the declared route must have fired and must sit within the fp32 conditioning bound of the problem --
-// the data are offset by 1000, so rounding the mean alone moves y by about u * |x| * rstd * |gamma| -- and the
-// hand-written kernel's error is printed beside it. The two paired timings are reported.
+// --kernel-routes: the production A/B of the declared-program routes (#890 phase 4). Each case calls a CUDA BACKEND
+// entry point (what DirectGpuTensorEngine calls) twice on identical inputs -- with the declared route on, and off so
+// the incumbent (the hand-written kernel, or cuDNN where the backend prefers it) serves it -- and scores BOTH against
+// an fp64 reference of the call's contract. A case passes when the declared route fired and its error is within the
+// fp32 conditioning bound of the problem, or no worse than twice the incumbent's own error against the same
+// reference. Paired timings and host bytes per call are reported.
+//
+// Forward normalisations run on data offset by 1000, where rounding the mean alone moves y by about
+// u * |x| * rstd * |gamma|; backward cases take their saved statistics from the fp64 forward, rounded to fp32, so
+// every route and the reference read the same values.
+//
+// --dump <rows> <cols> <dir>: write the LayerNorm program's lowered PTX for sm_75, one file per launch.
 
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
@@ -19,14 +27,36 @@ internal static class KernelRouteTool
 {
     private const double Unit = 1.0 / (1 << 24);   // fp32 unit roundoff
 
+    /// <summary>One routed call: its buffers (inputs first), the call, and what is checked against what.</summary>
+    private sealed class RouteCase
+    {
+        internal RouteCase(string name, DeclaredKey key, float[][] inputs, int[] outputSizes,
+            Action<CudaBackend, IGpuBuffer[]> call, (string Name, int Buffer, double[] Reference)[] checks,
+            double scale, int reduction)
+        {
+            Name = name; Key = key; Inputs = inputs; OutputSizes = outputSizes; Call = call; Checks = checks;
+            Scale = scale; Reduction = reduction;
+        }
+
+        internal string Name { get; }
+        internal DeclaredKey Key { get; }
+        internal float[][] Inputs { get; }
+        internal int[] OutputSizes { get; }
+        internal Action<CudaBackend, IGpuBuffer[]> Call { get; }
+        internal (string Name, int Buffer, double[] Reference)[] Checks { get; }
+
+        /// <summary>The problem's magnitude: the fp32 bound is Unit * (16 + log2 Reduction) * max(1, Scale).</summary>
+        internal double Scale { get; }
+
+        internal int Reduction { get; }
+    }
+
     internal static void Run(string[] args)
     {
-        // --dump <rows> <cols> <dir>: write the LayerNorm program's lowered PTX for sm_75, one file per launch.
         if (args.Length == 4 && args[0] == "--dump")
         {
             int r = int.Parse(args[1], CultureInfo.InvariantCulture), c = int.Parse(args[2], CultureInfo.InvariantCulture);
-            var lowering = AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx.PtxProgramLowering.Create(
-                AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenBackendPrograms.LayerNorm(r, c, 1e-5f),
+            var lowering = PtxProgramLowering.Create(CodegenBackendPrograms.LayerNorm(r, c, 1e-5f),
                 CudaBackend.LayerNormKey(r, c, 1e-5f).ToString(), 7, 5);
             System.IO.Directory.CreateDirectory(args[3]);
             foreach (var step in lowering.Steps)
@@ -34,6 +64,8 @@ internal static class KernelRouteTool
             Console.WriteLine(lowering.Steps.Count + " kernels written to " + args[3]);
             return;
         }
+        string? only = args.Length >= 2 && args[0] == "--family" ? args[1] : null;
+
         using var engine = new DirectGpuEngine();
         if (engine.Backend is not CudaBackend backend)
         {
@@ -42,138 +74,418 @@ internal static class KernelRouteTool
         }
 
         var failures = new List<string>();
-        Console.WriteLine("ROUTES - backend entry points, declared program vs hand-written kernel");
-        Console.WriteLine("case                         routed  declared err  hand-written err   declared us  hand-written us   ratio");
-
-        foreach (var (rows, cols) in new[] { (8192, 1024), (8192, 64), (256, 64), (33, 96), (100, 100), (4, 4096), (128, 1000), (512, 7),
-                     (64, 50000), (16, 50001), (8192, 768), (2048, 4000), (1024, 3136), (4096, 1568) })
+        Console.WriteLine("ROUTES - backend entry points, declared program vs incumbent, each against fp64");
+        Console.WriteLine("case                               routed  declared err  incumbent err      bound   declared us  incumbent us   ratio");
+        foreach (var route in Cases())
         {
-            string name = "LayerNorm " + rows + "x" + cols;
-            int n = rows * cols;
-            var x = Fill(n, 1, 1000.0);   // offset data: the cancellation case
-            var g = Fill(cols, 2, 1.0);
-            var b = Fill(cols, 3, 0.0);
-            using var bx = backend.AllocateBuffer(x);
-            using var bg = backend.AllocateBuffer(g);
-            using var bb = backend.AllocateBuffer(b);
-            var outputs = new Dictionary<bool, (float[] Y, float[] Mean, float[] Rstd)>();
-            var times = new Dictionary<bool, double>();
-            var bytes = new Dictionary<bool, double>();
-            bool routed = false;
-            foreach (bool declared in new[] { true, false })
+            if (only is not null && !route.Name.StartsWith(only, StringComparison.OrdinalIgnoreCase)) continue;
+            RunCase(backend, route, failures);
+        }
+        if (only is null || only.Equals("capture", StringComparison.OrdinalIgnoreCase)) CaptureCheck(backend, failures);
+
+        if (failures.Count != 0)
+            throw new InvalidOperationException("Route failures: " + string.Join("; ", failures));
+    }
+
+    private static void RunCase(CudaBackend backend, RouteCase route, List<string> failures)
+    {
+        var errors = new Dictionary<bool, double>();
+        var times = new Dictionary<bool, double>();
+        var bytes = new Dictionary<bool, double>();
+        bool routed = false;
+        foreach (bool declared in new[] { true, false })
+        {
+            backend.DeclaredKernelsSwitch = declared;
+            var buffers = new IGpuBuffer[route.Inputs.Length + route.OutputSizes.Length];
+            try
             {
-                backend.DeclaredKernelsSwitch = declared;
-                using var by = backend.AllocateBuffer(n);
-                using var bm = backend.AllocateBuffer(rows);
-                using var bv = backend.AllocateBuffer(rows);
+                for (int i = 0; i < route.Inputs.Length; i++) buffers[i] = backend.AllocateBuffer(route.Inputs[i]);
+                for (int o = 0; o < route.OutputSizes.Length; o++)
+                    buffers[route.Inputs.Length + o] = backend.AllocateBuffer(new float[route.OutputSizes[o]]);
                 long before = backend.DeclaredProgramLaunches;
-                void Call() => backend.LayerNorm(bx, by, bg, bb, bm, bv, rows, cols, 1e-5f);
-                Call();
+                route.Call(backend, buffers);
                 backend.Synchronize();
                 if (declared) routed = backend.DeclaredProgramLaunches > before;
-                outputs[declared] = (backend.DownloadBuffer(by), backend.DownloadBuffer(bm), backend.DownloadBuffer(bv));
+                double worst = 0;
+                foreach (var check in route.Checks)
+                    worst = Math.Max(worst, MaxDev(backend.DownloadBuffer(buffers[check.Buffer]), check.Reference));
+                errors[declared] = worst;
+                void Call() => route.Call(backend, buffers);
                 times[declared] = Time(Call, backend.Synchronize);
                 bytes[declared] = AllocatedPerCall(Call, backend.Synchronize);
             }
-            backend.DeclaredKernelsSwitch = null;
-
-            var (refY, refMean, refRstd) = LayerNormReference(x, g, b, rows, cols, 1e-5);
-            double Error(bool declared) => Math.Max(MaxDev(outputs[declared].Y, refY),
-                Math.Max(MaxDev(outputs[declared].Mean, refMean), MaxDev(outputs[declared].Rstd, refRstd)));
-            double declaredError = Error(true), handError = Error(false);
-            double bound = ConditioningBound(x, g, refRstd, cols);
-            bool ok = routed && !double.IsNaN(declaredError) && declaredError <= bound;
-            if (!ok) failures.Add(name + (routed ? ": error " + declaredError.ToString("E3", CultureInfo.InvariantCulture) +
-                " over the bound " + bound.ToString("E3", CultureInfo.InvariantCulture) : ": not routed"));
-            Console.WriteLine(name.PadRight(28) + (routed ? "yes" : "no").PadLeft(7) +
-                declaredError.ToString("E3", CultureInfo.InvariantCulture).PadLeft(14) +
-                handError.ToString("E3", CultureInfo.InvariantCulture).PadLeft(18) +
-                times[true].ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) +
-                times[false].ToString("F1", CultureInfo.InvariantCulture).PadLeft(17) +
-                (times[false] / times[true]).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x" +
-                (ok ? "" : "  FAIL"));
-            var key = CudaBackend.LayerNormKey(rows, cols, 1e-5f);
-            var steps = backend.DescribeDeclaredProgram(key);
-            if (steps is not null) Console.WriteLine("    " + string.Join(" | ", steps) +
-                "   host bytes/call: declared " + bytes[true].ToString("F0", CultureInfo.InvariantCulture) +
-                ", hand-written " + bytes[false].ToString("F0", CultureInfo.InvariantCulture));
-            else Console.WriteLine("    declined: " + backend.DeclaredDeclineReason(key));
-        }
-
-        // Capture: a shape first met under capture falls through; built outside, it captures and replays.
-        {
-            const int rows = 48, cols = 200;
-            var x = Fill(rows * cols, 1, 1000.0);
-            var g = Fill(cols, 2, 1.0);
-            var b = Fill(cols, 3, 0.0);
-            using var bx = backend.AllocateBuffer(x);
-            using var bg = backend.AllocateBuffer(g);
-            using var bb = backend.AllocateBuffer(b);
-            using var by = backend.AllocateBuffer(rows * cols);
-            using var bm = backend.AllocateBuffer(rows);
-            using var bv = backend.AllocateBuffer(rows);
-            void Call() => backend.LayerNorm(bx, by, bg, bb, bm, bv, rows, cols, 1e-5f);
-            var (refY, refMean, refRstd) = LayerNormReference(x, g, b, rows, cols, 1e-5);
-            double bound = ConditioningBound(x, g, refRstd, cols);
-            foreach (bool built in new[] { false, true })
+            finally
             {
-                if (built) Call();
-                long before = backend.DeclaredProgramLaunches;
-                IntPtr graph = backend.CaptureGraph(Call);
-                bool routed = backend.DeclaredProgramLaunches > before;
-                backend.LaunchCapturedGraph(graph);
-                backend.Synchronize();
-                double error = Math.Max(MaxDev(backend.DownloadBuffer(by), refY),
-                    Math.Max(MaxDev(backend.DownloadBuffer(bm), refMean), MaxDev(backend.DownloadBuffer(bv), refRstd)));
-                backend.DestroyCapturedGraph(graph);
-                bool ok = routed == built && error <= bound;
-                Console.WriteLine("capture, program " + (built ? "built first" : "unbuilt") + ": routed " + routed +
-                    ", replay error " + error.ToString("E3", CultureInfo.InvariantCulture) + (ok ? "" : "  FAIL"));
-                if (!ok) failures.Add("capture (" + (built ? "built" : "unbuilt") + ")");
+                foreach (var buffer in buffers) buffer?.Dispose();
+                backend.DeclaredKernelsSwitch = null;
             }
         }
 
-        if (failures.Count != 0)
-            throw new InvalidOperationException("Route disagreement: " + string.Join("; ", failures));
+        double bound = Unit * (16 + Math.Log(Math.Max(2, route.Reduction), 2)) * Math.Max(1.0, route.Scale);
+        double declaredError = errors[true], incumbentError = errors[false];
+        bool ok = routed && !double.IsNaN(declaredError) && (declaredError <= bound || declaredError <= 2 * incumbentError);
+        if (!ok)
+            failures.Add(route.Name + (routed ? ": error " + E(declaredError) + " over bound " + E(bound) : ": not routed"));
+        Console.WriteLine(route.Name.PadRight(34) + (routed ? "yes" : "no").PadLeft(7) + E(declaredError).PadLeft(14) +
+            E(incumbentError).PadLeft(15) + E(bound).PadLeft(11) +
+            times[true].ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) +
+            times[false].ToString("F1", CultureInfo.InvariantCulture).PadLeft(14) +
+            (times[false] / times[true]).ToString("F2", CultureInfo.InvariantCulture).PadLeft(8) + "x" + (ok ? "" : "  FAIL"));
+        var steps = backend.DescribeDeclaredProgram(route.Key);
+        Console.WriteLine("    " + (steps is not null ? string.Join(" | ", steps) : "declined: " + backend.DeclaredDeclineReason(route.Key)) +
+            "   host bytes/call " + bytes[true].ToString("F0", CultureInfo.InvariantCulture) + " / " +
+            bytes[false].ToString("F0", CultureInfo.InvariantCulture));
     }
 
-    private static (double[] Y, double[] Mean, double[] Rstd) LayerNormReference(
-        float[] x, float[] gamma, float[] beta, int rows, int cols, double epsilon)
+    private static string E(double v) => v.ToString("E3", CultureInfo.InvariantCulture);
+
+    // ---- cases --------------------------------------------------------------------------------------------------
+
+    private static IEnumerable<RouteCase> Cases()
+    {
+        const float Eps = 1e-5f;
+        var rows = new[] { (8192, 1024), (8192, 768), (8192, 64), (256, 64), (100, 100), (128, 1000), (512, 7),
+                           (16, 50001), (2048, 4000) };
+        foreach (var (r, c) in rows) yield return LayerNorm(r, c, Eps);
+        foreach (var (r, c) in rows) yield return RmsNorm(r, c, Eps);
+        foreach (var (n, ch, g, s) in new[] { (32, 64, 8, 1024), (8, 64, 32, 3136), (16, 32, 32, 49), (4, 6, 3, 10), (2, 64, 8, 100) })
+            yield return GroupNorm(n, ch, g, s, Eps);
+        foreach (var (n, ch, s) in new[] { (32, 64, 3136), (8, 64, 64), (64, 128, 196), (16, 32, 49), (2, 3, 5) })
+            yield return BatchNorm(n, ch, s, Eps, 0.1f);
+        foreach (var (r, c) in new[] { (8192, 1024), (8192, 64), (100, 100), (16, 50001), (2048, 4000) })
+            yield return LayerNormBackward(r, c, Eps);
+        foreach (var (r, c) in new[] { (8192, 1024), (8192, 64), (100, 100), (16, 50001), (2048, 4000) })
+            yield return RmsNormBackward(r, c, Eps);
+        foreach (var (n, ch, s) in new[] { (32, 64, 3136), (8, 64, 64), (64, 128, 196), (16, 32, 49), (2, 3, 5) })
+            yield return BatchNormBackward(n, ch, s, Eps);
+        foreach (var (r, c) in new[] { (8192, 1024), (8192, 64), (100, 100), (64, 50257), (512, 7) })
+            yield return Softmax(r, c);
+        foreach (var (r, c) in new[] { (8192, 1024), (8192, 64), (100, 100), (64, 50257), (512, 7) })
+            yield return SoftmaxBackward(r, c);
+    }
+
+    private static RouteCase LayerNorm(int rows, int cols, float eps)
+    {
+        var x = Fill(rows * cols, 1, 1000.0);
+        var g = Fill(cols, 2, 1.0);
+        var b = Fill(cols, 3, 0.0);
+        var (y, mean, rstd) = NormRef(x, g, b, rows, cols, eps, rms: false);
+        return new RouteCase("LayerNorm " + rows + "x" + cols, CudaBackend.LayerNormKey(rows, cols, eps),
+            new[] { x, g, b }, new[] { rows * cols, rows, rows },
+            (k, a) => k.LayerNorm(a[0], a[3], a[1], a[2], a[4], a[5], rows, cols, eps),
+            new[] { ("y", 3, y), ("mean", 4, mean), ("rstd", 5, rstd) },
+            MaxAbs(x) * Max(rstd) * Math.Max(1, MaxAbs(g)), cols);
+    }
+
+    private static RouteCase RmsNorm(int rows, int cols, float eps)
+    {
+        var x = Fill(rows * cols, 4, 0.0);
+        var g = Fill(cols, 5, 1.0);
+        var (y, _, rstd) = NormRef(x, g, null, rows, cols, eps, rms: true);
+        var rms = new double[rows];
+        for (int r = 0; r < rows; r++) rms[r] = 1.0 / rstd[r];
+        return new RouteCase("RmsNorm " + rows + "x" + cols, CudaBackend.RmsNormKey(rows, cols, eps),
+            new[] { x, g }, new[] { rows * cols, rows },
+            (k, a) => k.RmsNorm(a[0], a[2], a[1], a[3], rows, cols, eps),
+            new[] { ("y", 2, y), ("rms", 3, rms) },
+            MaxAbs(x) * Max(rstd) * Math.Max(1, MaxAbs(g)), cols);
+    }
+
+    private static RouteCase GroupNorm(int n, int channels, int groups, int spatial, float eps)
+    {
+        int cg = channels / groups;
+        var x = Fill(n * channels * spatial, 6, 1000.0);
+        var g = Fill(channels, 7, 1.0);
+        var b = Fill(channels, 8, 0.0);
+        int rows = n * groups, width = cg * spatial;
+        // A group's elements are contiguous in [n, c, s]: rows of cg*spatial, gamma per channel.
+        var y = new double[x.Length];
+        var (_, mean, rstd) = NormRef(x, new float[width], null, rows, width, eps, rms: false);
+        for (int r = 0; r < rows; r++)
+            for (int j = 0; j < width; j++)
+            {
+                int c = r % groups * cg + j / spatial;
+                y[r * width + j] = (x[r * width + j] - mean[r]) * rstd[r] * g[c] + b[c];
+            }
+        return new RouteCase("GroupNorm " + n + "x" + channels + "/" + groups + "x" + spatial,
+            CudaBackend.GroupNormKey(n, channels, groups, spatial, eps),
+            new[] { x, g, b }, new[] { x.Length, rows, rows },
+            (k, a) => k.GroupNorm(a[0], a[3], a[1], a[2], a[4], a[5], n, groups, channels, spatial, eps),
+            new[] { ("y", 3, y), ("mean", 4, mean), ("rstd", 5, rstd) },
+            MaxAbs(x) * Max(rstd) * Math.Max(1, MaxAbs(g)), width);
+    }
+
+    private static RouteCase BatchNorm(int n, int channels, int spatial, float eps, float momentum)
+    {
+        var x = Fill(n * channels * spatial, 9, 1000.0);
+        var g = Fill(channels, 10, 1.0);
+        var b = Fill(channels, 11, 0.0);
+        var rm = Fill(channels, 12, 999.0);
+        var rv = Fill(channels, 13, 2.0);
+        var (mean, rstd, variance) = ChannelStats(x, n, channels, spatial, eps);
+        var y = new double[x.Length];
+        for (int i = 0; i < x.Length; i++)
+        {
+            int c = i / spatial % channels;
+            y[i] = (x[i] - mean[c]) * rstd[c] * g[c] + b[c];
+        }
+        long count = (long)n * spatial;
+        var rmOut = new double[channels];
+        var rvOut = new double[channels];
+        for (int c = 0; c < channels; c++)
+        {
+            rmOut[c] = (1 - (double)momentum) * rm[c] + momentum * mean[c];
+            double unbiased = count > 1 ? variance[c] * count / (count - 1) : variance[c];
+            rvOut[c] = (1 - (double)momentum) * rv[c] + momentum * unbiased;
+        }
+        return new RouteCase("BatchNorm " + n + "x" + channels + "x" + spatial,
+            CudaBackend.BatchNormKey(n, channels, spatial, eps, momentum),
+            new[] { x, g, b, rm, rv }, new[] { x.Length, channels, channels },
+            (k, a) => k.BatchNorm(a[0], a[5], a[1], a[2], a[3], a[4], a[6], a[7], n, channels, spatial, eps, momentum, true),
+            new[] { ("y", 5, y), ("mean", 6, mean), ("rstd", 7, rstd), ("running_mean", 3, rmOut), ("running_var", 4, rvOut) },
+            MaxAbs(x) * Max(rstd) * Math.Max(1, MaxAbs(g)), n * spatial);
+    }
+
+    // Backward cases: saved statistics from the fp64 forward, rounded to fp32 and used by every party.
+    private static RouteCase LayerNormBackward(int rows, int cols, float eps)
+    {
+        var x = Fill(rows * cols, 14, 1000.0);
+        var g = Fill(cols, 15, 1.0);
+        var dy = Fill(rows * cols, 16, 0.0);
+        var (_, meanD, rstdD) = NormRef(x, g, null, rows, cols, eps, rms: false);
+        var mean = ToFloat(meanD);
+        var rstd = ToFloat(rstdD);
+        var (dx, dgamma, dbeta) = RowNormBackwardRef(dy, x, g, mean, rstd, rows, cols, rms: false);
+        return new RouteCase("LayerNormBackward " + rows + "x" + cols, CudaBackend.LayerNormBackwardKey(rows, cols),
+            new[] { dy, x, g, mean, rstd }, new[] { rows * cols, cols, cols },
+            (k, a) => k.LayerNormBackward(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], rows, cols, eps),
+            new[] { ("dx", 5, dx), ("dgamma", 6, dgamma), ("dbeta", 7, dbeta) },
+            MaxAbs(x) * Max(rstdD) * Math.Max(1, MaxAbs(g)) * Math.Max(1, MaxAbs(dy)) * Math.Sqrt(rows), Math.Max(rows, cols));
+    }
+
+    private static RouteCase RmsNormBackward(int rows, int cols, float eps)
+    {
+        var x = Fill(rows * cols, 17, 0.0);
+        var g = Fill(cols, 18, 1.0);
+        var dy = Fill(rows * cols, 19, 0.0);
+        var (_, _, rstdD) = NormRef(x, g, null, rows, cols, eps, rms: true);
+        var rms = new float[rows];
+        for (int r = 0; r < rows; r++) rms[r] = (float)(1.0 / rstdD[r]);
+        var rstd = new float[rows];
+        for (int r = 0; r < rows; r++) rstd[r] = (float)(1.0 / rms[r]);
+        var (dx, dgamma, _) = RowNormBackwardRef(dy, x, g, new float[rows], rstd, rows, cols, rms: true);
+        return new RouteCase("RmsNormBackward " + rows + "x" + cols, CudaBackend.RmsNormBackwardKey(rows, cols),
+            new[] { dy, x, g, rms }, new[] { rows * cols, cols },
+            (k, a) => k.RmsNormBackward(a[0], a[1], a[2], a[3], a[4], a[5], rows, cols, eps),
+            new[] { ("dx", 4, dx), ("dgamma", 5, dgamma) },
+            MaxAbs(x) * Max(rstdD) * Math.Max(1, MaxAbs(g)) * Math.Max(1, MaxAbs(dy)) * Math.Sqrt(rows), Math.Max(rows, cols));
+    }
+
+    private static RouteCase BatchNormBackward(int n, int channels, int spatial, float eps)
+    {
+        var x = Fill(n * channels * spatial, 20, 1000.0);
+        var g = Fill(channels, 21, 1.0);
+        var dy = Fill(x.Length, 22, 0.0);
+        var (meanD, rstdD, _) = ChannelStats(x, n, channels, spatial, eps);
+        var mean = ToFloat(meanD);
+        var rstd = ToFloat(rstdD);
+        long count = (long)n * spatial;
+        var dbeta = new double[channels];
+        var dgamma = new double[channels];
+        for (int i = 0; i < x.Length; i++)
+        {
+            int c = i / spatial % channels;
+            dbeta[c] += dy[i];
+            dgamma[c] += dy[i] * ((x[i] - (double)mean[c]) * rstd[c]);
+        }
+        var dx = new double[x.Length];
+        for (int i = 0; i < x.Length; i++)
+        {
+            int c = i / spatial % channels;
+            double xhat = (x[i] - (double)mean[c]) * rstd[c];
+            dx[i] = g[c] * (double)rstd[c] * (dy[i] - dbeta[c] / count - xhat * dgamma[c] / count);
+        }
+        return new RouteCase("BatchNormBackward " + n + "x" + channels + "x" + spatial,
+            CudaBackend.BatchNormBackwardKey(n, channels, spatial),
+            new[] { dy, x, g, mean, rstd }, new[] { x.Length, channels, channels },
+            (k, a) => k.BatchNormBackward(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], n, channels, spatial, eps),
+            new[] { ("dx", 5, dx), ("dgamma", 6, dgamma), ("dbeta", 7, dbeta) },
+            MaxAbs(x) * Max(rstdD) * Math.Max(1, MaxAbs(g)) * Math.Sqrt(count), (int)Math.Min(int.MaxValue, count));
+    }
+
+    private static RouteCase Softmax(int rows, int cols)
+    {
+        var x = Fill(rows * cols, 23, 0.0, 8.0);
+        var y = SoftmaxRef(x, rows, cols);
+        return new RouteCase("Softmax " + rows + "x" + cols, CudaBackend.SoftmaxKey(rows, cols),
+            new[] { x }, new[] { rows * cols },
+            (k, a) => k.Softmax(a[0], a[1], rows, cols),
+            new[] { ("y", 1, y) }, MaxAbs(x), cols);
+    }
+
+    private static RouteCase SoftmaxBackward(int rows, int cols)
+    {
+        var y = ToFloat(SoftmaxRef(Fill(rows * cols, 24, 0.0, 8.0), rows, cols));
+        var dy = Fill(rows * cols, 25, 0.0);
+        var dx = new double[y.Length];
+        for (int r = 0; r < rows; r++)
+        {
+            double dot = 0;
+            for (int c = 0; c < cols; c++) dot += (double)dy[r * cols + c] * y[r * cols + c];
+            for (int c = 0; c < cols; c++) dx[r * cols + c] = y[r * cols + c] * (dy[r * cols + c] - dot);
+        }
+        return new RouteCase("SoftmaxBackward " + rows + "x" + cols, CudaBackend.SoftmaxBackwardKey(rows, cols),
+            new[] { dy, y }, new[] { rows * cols },
+            (k, a) => k.SoftmaxBackward(a[0], a[1], a[2], rows, cols),
+            new[] { ("dx", 2, dx) }, MaxAbs(dy), cols);
+    }
+
+    // ---- references -----------------------------------------------------------------------------------------------
+
+    // Row normalisation: LayerNorm (x - mean) * rstd, or RMSNorm x * rstd, times gamma plus beta.
+    private static (double[] Y, double[] Mean, double[] Rstd) NormRef(float[] x, float[] gamma, float[]? beta,
+        int rows, int cols, double eps, bool rms)
     {
         var y = new double[x.Length];
         var mean = new double[rows];
         var rstd = new double[rows];
         for (int r = 0; r < rows; r++)
         {
-            double sum = 0;
-            for (int c = 0; c < cols; c++) sum += x[r * cols + c];
-            double m = sum / cols, sq = 0;
+            double m = 0;
+            if (!rms)
+            {
+                for (int c = 0; c < cols; c++) m += x[r * cols + c];
+                m /= cols;
+            }
+            double sq = 0;
             for (int c = 0; c < cols; c++) { double d = x[r * cols + c] - m; sq += d * d; }
-            double s = 1.0 / Math.Sqrt(sq / cols + epsilon);
+            double s = 1.0 / Math.Sqrt(sq / cols + eps);
             mean[r] = m;
             rstd[r] = s;
-            for (int c = 0; c < cols; c++) y[r * cols + c] = (x[r * cols + c] - m) * s * gamma[c] + beta[c];
+            for (int c = 0; c < cols; c++)
+                y[r * cols + c] = (x[r * cols + c] - m) * s * gamma[c] + (beta is null ? 0 : beta[c]);
         }
         return (y, mean, rstd);
     }
 
-    // 16 roundings of the largest input, carried through rstd and gamma, plus the reduction's log2(n) growth.
-    private static double ConditioningBound(float[] x, float[] gamma, double[] rstd, int cols)
+    private static (double[] Dx, double[] DGamma, double[] DBeta) RowNormBackwardRef(float[] dy, float[] x, float[] gamma,
+        float[] mean, float[] rstd, int rows, int cols, bool rms)
     {
-        double maxX = 0, maxGamma = 1, maxRstd = 0;
-        foreach (float v in x) maxX = Math.Max(maxX, Math.Abs(v));
-        foreach (float v in gamma) maxGamma = Math.Max(maxGamma, Math.Abs(v));
-        foreach (double v in rstd) maxRstd = Math.Max(maxRstd, v);
-        return Unit * (16 + Math.Log(cols, 2)) * Math.Max(1.0, maxX * maxRstd * maxGamma);
+        var dx = new double[x.Length];
+        var dgamma = new double[cols];
+        var dbeta = new double[cols];
+        for (int r = 0; r < rows; r++)
+        {
+            double m1 = 0, m2 = 0;
+            for (int c = 0; c < cols; c++)
+            {
+                double xhat = (x[r * cols + c] - (rms ? 0.0 : mean[r])) * rstd[r];
+                double gdy = (double)dy[r * cols + c] * gamma[c];
+                m1 += gdy;
+                m2 += gdy * xhat;
+                dgamma[c] += dy[r * cols + c] * xhat;
+                dbeta[c] += dy[r * cols + c];
+            }
+            m1 /= cols;
+            m2 /= cols;
+            for (int c = 0; c < cols; c++)
+            {
+                double xhat = (x[r * cols + c] - (rms ? 0.0 : mean[r])) * rstd[r];
+                double gdy = (double)dy[r * cols + c] * gamma[c];
+                dx[r * cols + c] = rstd[r] * (gdy - (rms ? 0.0 : m1) - xhat * m2);
+            }
+        }
+        return (dx, dgamma, dbeta);
     }
 
-    private static float[] Fill(int count, int salt, double offset)
+    private static (double[] Mean, double[] Rstd, double[] Variance) ChannelStats(float[] x, int n, int channels, int spatial, double eps)
+    {
+        var mean = new double[channels];
+        var variance = new double[channels];
+        var rstd = new double[channels];
+        long count = (long)n * spatial;
+        for (int i = 0; i < x.Length; i++) mean[i / spatial % channels] += x[i];
+        for (int c = 0; c < channels; c++) mean[c] /= count;
+        for (int i = 0; i < x.Length; i++) { double d = x[i] - mean[i / spatial % channels]; variance[i / spatial % channels] += d * d; }
+        for (int c = 0; c < channels; c++)
+        {
+            variance[c] /= count;
+            rstd[c] = 1.0 / Math.Sqrt(variance[c] + eps);
+        }
+        return (mean, rstd, variance);
+    }
+
+    private static double[] SoftmaxRef(float[] x, int rows, int cols)
+    {
+        var y = new double[x.Length];
+        for (int r = 0; r < rows; r++)
+        {
+            double max = double.NegativeInfinity, sum = 0;
+            for (int c = 0; c < cols; c++) max = Math.Max(max, x[r * cols + c]);
+            for (int c = 0; c < cols; c++) sum += Math.Exp(x[r * cols + c] - max);
+            for (int c = 0; c < cols; c++) y[r * cols + c] = Math.Exp(x[r * cols + c] - max) / sum;
+        }
+        return y;
+    }
+
+    // ---- capture ------------------------------------------------------------------------------------------------
+
+    // A shape first met under capture falls through; built outside, it captures and replays.
+    private static void CaptureCheck(CudaBackend backend, List<string> failures)
+    {
+        const int rows = 48, cols = 200;
+        var x = Fill(rows * cols, 1, 1000.0);
+        var g = Fill(cols, 2, 1.0);
+        var b = Fill(cols, 3, 0.0);
+        using var bx = backend.AllocateBuffer(x);
+        using var bg = backend.AllocateBuffer(g);
+        using var bb = backend.AllocateBuffer(b);
+        using var by = backend.AllocateBuffer(rows * cols);
+        using var bm = backend.AllocateBuffer(rows);
+        using var bv = backend.AllocateBuffer(rows);
+        void Call() => backend.LayerNorm(bx, by, bg, bb, bm, bv, rows, cols, 1e-5f);
+        var (refY, refMean, refRstd) = NormRef(x, g, b, rows, cols, 1e-5, rms: false);
+        double bound = Unit * (16 + Math.Log(cols, 2)) * Math.Max(1.0, MaxAbs(x) * Max(refRstd) * Math.Max(1, MaxAbs(g)));
+        foreach (bool built in new[] { false, true })
+        {
+            if (built) Call();
+            long before = backend.DeclaredProgramLaunches;
+            IntPtr graph = backend.CaptureGraph(Call);
+            bool routed = backend.DeclaredProgramLaunches > before;
+            backend.LaunchCapturedGraph(graph);
+            backend.Synchronize();
+            double error = Math.Max(MaxDev(backend.DownloadBuffer(by), refY),
+                Math.Max(MaxDev(backend.DownloadBuffer(bm), refMean), MaxDev(backend.DownloadBuffer(bv), refRstd)));
+            backend.DestroyCapturedGraph(graph);
+            bool ok = routed == built && error <= bound;
+            Console.WriteLine("capture, program " + (built ? "built first" : "unbuilt") + ": routed " + routed +
+                ", replay error " + E(error) + (ok ? "" : "  FAIL"));
+            if (!ok) failures.Add("capture (" + (built ? "built" : "unbuilt") + ")");
+        }
+    }
+
+    // ---- helpers ------------------------------------------------------------------------------------------------
+
+    // Deterministic values in offset + [-spread/2, spread/2).
+    private static float[] Fill(int count, int salt, double offset, double spread = 1.5)
     {
         var v = new float[count];
-        for (int i = 0; i < count; i++) v[i] = (float)(((i * 37L + salt * 101) % 97 - 48) / 64.0 + offset);
+        for (int i = 0; i < count; i++) v[i] = (float)(((i * 37L + salt * 101) % 97 - 48) / 96.0 * spread + offset);
         return v;
     }
 
+    private static float[] ToFloat(double[] v)
+    {
+        var f = new float[v.Length];
+        for (int i = 0; i < v.Length; i++) f[i] = (float)v[i];
+        return f;
+    }
+
+    private static double MaxAbs(float[] v) { double m = 0; foreach (float f in v) m = Math.Max(m, Math.Abs(f)); return m; }
+
+    private static double Max(double[] v) { double m = 0; foreach (double d in v) m = Math.Max(m, d); return m; }
+
+    // Worst error relative to max(1, |reference|); NaN anywhere is NaN.
     private static double MaxDev(float[] a, double[] reference)
     {
         double worst = 0;

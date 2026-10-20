@@ -12,7 +12,10 @@
 // sweeps from registers.
 //
 // RAGGED rows (a width no step divides) overhang the row in their last step: a lane past the
-// row loads nothing, contributes the reduction's identity and stores nothing.
+// row loads nothing, contributes the reduction's identity and stores nothing. WRAPPED rows are
+// ragged over several column axes -- BatchNorm's (n, h*w) at 7x7 -- where a step crosses runs
+// of the innermost axis: each lane carries its (outer, inner) column position, advanced by
+// the step's constant increment with one carry, so no step divides.
 //
 // It is a partial of PtxAffineEmitter so that every per-element operation -- the body, the
 // pre-reduction, the epilogue, the activations -- is the SAME instruction sequence the
@@ -42,6 +45,7 @@ public sealed partial class PtxAffineEmitter
             ?? throw new NotSupportedException("No thread geometry fits a " + plan.Width + "-wide row.");
         bool isHeld = shape.Held;
         bool ragged = shape.Ragged;
+        bool wrapped = shape.Wrapped;
         int rowThreads = shape.Threads;
         int vector = shape.Vector;
         int step = shape.Step;
@@ -146,12 +150,11 @@ public sealed partial class PtxAffineEmitter
         }
         string Store() => stepGuard is null ? "st.global" : $"@{stepGuard} st.global";
 
-        // Per-binding base address at this row: base + 4 * rowPart; Matrix bindings also add
-        // this thread's position in the step.
-        var rowBase = new Dictionary<string, string>(StringComparer.Ordinal);
-        string RowBase(CodegenRowBinding b)
+        // Per-binding address of this row's first element: base + 4 * rowPart.
+        var rowStart = new Dictionary<string, string>(StringComparer.Ordinal);
+        string RowStart(CodegenRowBinding b)
         {
-            if (rowBase.TryGetValue(b.Key, out string? p)) return p;
+            if (rowStart.TryGetValue(b.Key, out string? p)) return p;
             string address = basePtr[b.Name];
             if (b.ConstantOffset != 0)
             {
@@ -166,6 +169,15 @@ public sealed partial class PtxAffineEmitter
                 L($"mad.wide.u32 {next}, {rowValue[k]}, {I64(b.RowStrides[k] * 4)}, {address};");
                 address = next;
             }
+            return rowStart[b.Key] = address;
+        }
+
+        // The row start plus, for a Matrix binding, this thread's position in the step.
+        var rowBase = new Dictionary<string, string>(StringComparer.Ordinal);
+        string RowBase(CodegenRowBinding b)
+        {
+            if (rowBase.TryGetValue(b.Key, out string? p)) return p;
+            string address = RowStart(b);
             if (b.Kind == CodegenRowOperandKind.Matrix)
             {
                 string withLane = NextRd();
@@ -173,6 +185,52 @@ public sealed partial class PtxAffineEmitter
                 address = withLane;
             }
             return rowBase[b.Key] = address;
+        }
+
+        // ---- WRAPPED positions: (outer, inner) of this lane's column in a step.
+        int innerExtent = plan.ColumnExtents[plan.ColumnExtents.Count - 1];
+        int outerCount = plan.Width / innerExtent;
+        int stepOuter = step / innerExtent, stepInner = step % innerExtent;
+        (string Outer, string Inner) firstPosition = ("", "");
+        if (wrapped && laneColumn is not null)
+        {
+            string o = NextR(), i = NextR();
+            L($"div.u32 {o}, {laneColumn}, {I(innerExtent)};");
+            L($"rem.u32 {i}, {laneColumn}, {I(innerExtent)};");
+            firstPosition = (o, i);
+        }
+
+        // Advances a position by one step: (o, i) + (stepOuter, stepInner), one carry.
+        void AdvanceInto(string fromOuter, string fromInner, string toOuter, string toInner)
+        {
+            string carry = NextP();
+            L($"add.u32 {toInner}, {fromInner}, {I(stepInner)};");
+            L($"add.u32 {toOuter}, {fromOuter}, {I(stepOuter)};");
+            L($"setp.ge.u32 {carry}, {toInner}, {I(innerExtent)};");
+            L($"@{carry} sub.u32 {toInner}, {toInner}, {I(innerExtent)};");
+            L($"@{carry} add.u32 {toOuter}, {toOuter}, 1;");
+        }
+
+        // A binding's address at a position: row start + outer * outerStride + inner * innerStride.
+        string WrappedAddress(CodegenRowBinding b, (string Outer, string Inner) at)
+        {
+            long outerStride = plan.OuterStride(b)
+                ?? throw new InvalidOperationException(b.Name + "'s outer column axes do not flatten.");
+            long innerStride = b.ColumnStrides[b.ColumnStrides.Count - 1];
+            string address = RowStart(b);
+            if (outerStride != 0)
+            {
+                string next = NextRd();
+                L($"mad.wide.u32 {next}, {at.Outer}, {I64(outerStride * 4)}, {address};");
+                address = next;
+            }
+            if (innerStride != 0)
+            {
+                string next = NextRd();
+                L($"mad.wide.u32 {next}, {at.Inner}, {I64(innerStride * 4)}, {address};");
+                address = next;
+            }
+            return address;
         }
 
         // Compile-time column offset (elements) of step `chunk`: a step never straddles a run
@@ -377,6 +435,22 @@ public sealed partial class PtxAffineEmitter
         {
             // ---- HELD: every step at a compile-time offset, sources cached for the kernel.
             var cache = new Dictionary<string, string[]>(StringComparer.Ordinal);
+            // A wrapped row's per-step positions, in step order (straight-line code, so each
+            // dominates every later use).
+            var positions = new List<(string Outer, string Inner)>();
+            (string Outer, string Inner) PositionOf(int chunk)
+            {
+                if (positions.Count == 0) positions.Add(firstPosition);
+                while (positions.Count <= chunk)
+                {
+                    var last = positions[positions.Count - 1];
+                    string o = NextR(), i = NextR();
+                    AdvanceInto(last.Outer, last.Inner, o, i);
+                    positions.Add((o, i));
+                }
+                return positions[chunk];
+            }
+
             // A ragged row's overhanging steps, each with its predicate (computed once).
             var chunkGuard = new Dictionary<int, string>();
             string? GuardOf(int chunk)
@@ -384,15 +458,28 @@ public sealed partial class PtxAffineEmitter
                 if (laneColumn is null || (long)(chunk + 1) * step <= plan.Width) return null;
                 if (chunkGuard.TryGetValue(chunk, out string? have)) return have;
                 string inRow = NextP();
-                L($"setp.lt.u32 {inRow}, {laneColumn}, {I(plan.Width - chunk * step)};");
+                if (wrapped) L($"setp.lt.u32 {inRow}, {PositionOf(chunk).Outer}, {I(outerCount)};");
+                else L($"setp.lt.u32 {inRow}, {laneColumn}, {I(plan.Width - chunk * step)};");
                 return chunkGuard[chunk] = inRow;
             }
+
+            // The bracketed address of binding b's step `chunk` (Matrix or Feature).
+            var chunkAddress = new Dictionary<string, string>(StringComparer.Ordinal);
+            string AddressOf(CodegenRowBinding b, int chunk)
+            {
+                if (!wrapped) return $"[{RowBase(b)}+{I64(ChunkOffset(b, chunk) * 4)}]";
+                string key = b.Key + "@" + I(chunk);
+                if (!chunkAddress.TryGetValue(key, out string? at))
+                    chunkAddress[key] = at = WrappedAddress(b, PositionOf(chunk));
+                return $"[{at}]";
+            }
+
             operand = (pass, input, e) =>
             {
                 var b = plan.BindingFor(pass.Inputs[input]);
                 if (b.Kind == CodegenRowOperandKind.Row) return RowOperand(b);
                 int chunk = e / vector;
-                string at = $"[{RowBase(b)}+{I64(ChunkOffset(b, chunk) * 4)}]";
+                string at = AddressOf(b, chunk);
                 stepGuard = GuardOf(chunk);
                 return LoadStep(b.Key + "@" + I(chunk), at, b.Kind, cache)[e % vector];
             };
@@ -419,7 +506,7 @@ public sealed partial class PtxAffineEmitter
                 }
                 else
                 {
-                    StorePointwise(pass, perThread, chunk => $"{I64(ChunkOffset(plan.BindingFor(pass.Output), chunk) * 4)}", GuardOf);
+                    StorePointwise(pass, perThread, chunk => AddressOf(plan.BindingFor(pass.Output), chunk), GuardOf);
                 }
             }
         }
@@ -475,6 +562,15 @@ public sealed partial class PtxAffineEmitter
 
             string counter = NextR();
             L($"mov.u32 {counter}, 0;");
+            // A wrapped sweep carries each lane's position in FIXED registers across the loop.
+            string sweepOuter = "", sweepInner = "";
+            if (wrapped)
+            {
+                sweepOuter = NextR();
+                sweepInner = NextR();
+                L($"mov.u32 {sweepOuter}, {firstPosition.Outer};");
+                L($"mov.u32 {sweepInner}, {firstPosition.Inner};");
+            }
             string label = "SWEEP" + I(index);
             _body.Append(label).Append(":\n");
 
@@ -491,7 +587,7 @@ public sealed partial class PtxAffineEmitter
                 // come from (step / stepsPerRun), the innermost from the remainder. A single column
                 // axis has no outer value, and the division is skipped: next to a ragged row's
                 // predicated loads, a div/rem by 196 made ptxas spill 2.7 KB a thread (16x50001).
-                var outerValue = new string[plan.ColumnExtents.Count - 1];
+                var outerValue = new string[wrapped ? 0 : plan.ColumnExtents.Count - 1];
                 string outer = stepIndex, within = stepIndex;
                 if (outerValue.Length > 0)
                 {
@@ -514,7 +610,12 @@ public sealed partial class PtxAffineEmitter
                 L($"mul.lo.u32 {innerColumn}, {within}, {I(step)};");
                 // Every step of a ragged sweep is guarded: which one overhangs is a run-time fact.
                 string? sweepGuard = null;
-                if (laneColumn is not null)
+                if (wrapped)
+                {
+                    sweepGuard = NextP();
+                    L($"setp.lt.u32 {sweepGuard}, {sweepOuter}, {I(outerCount)};");
+                }
+                else if (laneColumn is not null)
                 {
                     string column = NextR();
                     sweepGuard = NextP();
@@ -526,6 +627,7 @@ public sealed partial class PtxAffineEmitter
                 string StepAddress(CodegenRowBinding b)
                 {
                     if (address.TryGetValue(b.Key, out string? a)) return a;
+                    if (wrapped) return address[b.Key] = WrappedAddress(b, (sweepOuter, sweepInner));
                     string at = RowBase(b);
                     for (int k = 0; k < outerValue.Length; k++)
                     {
@@ -580,7 +682,7 @@ public sealed partial class PtxAffineEmitter
                     }
                 }
                 stepGuard = null;
-
+                if (wrapped) AdvanceInto(sweepOuter, sweepInner, sweepOuter, sweepInner);
             }
 
             string more = NextP();
@@ -592,7 +694,7 @@ public sealed partial class PtxAffineEmitter
                 if (pass.Reduce != CodegenReduceKind.None) FinishReduction(pass, accumulator[pass.Name]);
         }
 
-        void StorePointwise(CodegenKernelSpec pass, int count, Func<int, string> byteOffset, Func<int, string?> guardOf)
+        void StorePointwise(CodegenKernelSpec pass, int count, Func<int, string> addressOf, Func<int, string?> guardOf)
         {
             var pending = new string[vector];
             for (int e = 0; e < count; e++)
@@ -600,7 +702,7 @@ public sealed partial class PtxAffineEmitter
                 string value = Epilogue(pass, Term(pass, e), e);
                 pending[e % vector] = value;
                 if (e % vector != vector - 1) continue;
-                string at = $"[{RowBase(plan.BindingFor(pass.Output))}+{byteOffset(e / vector)}]";
+                string at = addressOf(e / vector);
                 stepGuard = guardOf(e / vector);
                 string store = Store();
                 stepGuard = null;

@@ -24,6 +24,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 internal enum DeclaredFamily
 {
     LayerNorm,
+    RmsNorm,
+    GroupNorm,
+    BatchNormTraining,
+    LayerNormBackward,
+    RmsNormBackward,
+    BatchNormBackward,
+    Softmax,
+    SoftmaxBackward,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
@@ -81,18 +89,19 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
 }
 
 /// <summary>
-/// The caller's buffers for one call, in the order of the family's tensor names. Up to eight; a struct, so a call
-/// does not allocate.
+/// The caller's buffers for one call, in the order of the family's tensor names. Up to ten (training BatchNorm binds
+/// its running statistics under two names each); a struct, so a call does not allocate.
 /// </summary>
 internal readonly struct DeclaredBindings
 {
-    internal const int Capacity = 8;
-    private readonly IGpuBuffer? _b0, _b1, _b2, _b3, _b4, _b5, _b6, _b7;
+    internal const int Capacity = 10;
+    private readonly IGpuBuffer? _b0, _b1, _b2, _b3, _b4, _b5, _b6, _b7, _b8, _b9;
 
-    internal DeclaredBindings(IGpuBuffer b0, IGpuBuffer b1, IGpuBuffer b2, IGpuBuffer b3,
-        IGpuBuffer? b4 = null, IGpuBuffer? b5 = null, IGpuBuffer? b6 = null, IGpuBuffer? b7 = null)
+    internal DeclaredBindings(IGpuBuffer b0, IGpuBuffer b1, IGpuBuffer? b2 = null, IGpuBuffer? b3 = null,
+        IGpuBuffer? b4 = null, IGpuBuffer? b5 = null, IGpuBuffer? b6 = null, IGpuBuffer? b7 = null,
+        IGpuBuffer? b8 = null, IGpuBuffer? b9 = null)
     {
-        _b0 = b0; _b1 = b1; _b2 = b2; _b3 = b3; _b4 = b4; _b5 = b5; _b6 = b6; _b7 = b7;
+        _b0 = b0; _b1 = b1; _b2 = b2; _b3 = b3; _b4 = b4; _b5 = b5; _b6 = b6; _b7 = b7; _b8 = b8; _b9 = b9;
     }
 
     internal IGpuBuffer this[int slot] => (slot switch
@@ -105,6 +114,8 @@ internal readonly struct DeclaredBindings
         5 => _b5,
         6 => _b6,
         7 => _b7,
+        8 => _b8,
+        9 => _b9,
         _ => null,
     }) ?? throw new ArgumentException("No buffer is bound to slot " + slot + ".");
 }
@@ -224,7 +235,8 @@ public sealed partial class CudaBackend
                 argv[a] = &handles[a];
             }
             var (module, function) = program.Kernels[s];
-            module.Launch(function, step.Blocks, 1, 1, step.BlockX, step.BlockY, 1, 0, argv);
+            // The caller pushed the context; Launch would query it again on every step.
+            module.LaunchCurrentContext(function, step.Blocks, 1, 1, step.BlockX, step.BlockY, 1, 0, argv);
         }
     }
 
@@ -334,5 +346,159 @@ public sealed partial class CudaBackend
         if (batchSize <= 0 || normalizedSize <= 0) return false;
         return TryRunDeclaredProgram(LayerNormKey(batchSize, normalizedSize, epsilon), s_buildLayerNorm,
             s_layerNormNames, new DeclaredBindings(input, gamma, beta, output, saveMean, saveInvVar));
+    }
+
+    // ---- RmsNorm --------------------------------------------------------------------------------------------------
+
+    private static readonly string[] s_rmsNormNames = { "x", "gamma", "y", "rms" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildRmsNorm =
+        key => CodegenBackendPrograms.RmsNorm(key.D0, key.D1, key.Epsilon);
+
+    internal static DeclaredKey RmsNormKey(int batchSize, int normalizedSize, float epsilon) =>
+        new(DeclaredFamily.RmsNorm, batchSize, normalizedSize, 0, 0, epsilon, 0);
+
+    /// <summary>RmsNorm through its declared program, in CudaBackend.RmsNorm's contract (saveRms = rms).</summary>
+    private bool TryDeclaredRmsNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer saveRms,
+        int batchSize, int normalizedSize, float epsilon)
+    {
+        if (batchSize <= 0 || normalizedSize <= 0) return false;
+        return TryRunDeclaredProgram(RmsNormKey(batchSize, normalizedSize, epsilon), s_buildRmsNorm,
+            s_rmsNormNames, new DeclaredBindings(input, gamma, output, saveRms));
+    }
+
+    // ---- GroupNorm ------------------------------------------------------------------------------------------------
+
+    private static readonly string[] s_groupNormNames = { "x", "gamma", "beta", "y", "mean", "rstd" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildGroupNorm =
+        key => CodegenBackendPrograms.GroupNorm(key.D0, key.D1, key.D2, key.D3, key.Epsilon);
+
+    internal static DeclaredKey GroupNormKey(int batch, int channels, int numGroups, int spatialSize, float epsilon) =>
+        new(DeclaredFamily.GroupNorm, batch, channels, numGroups, spatialSize, epsilon, 0);
+
+    /// <summary>GroupNorm through its declared program, in CudaBackend.GroupNorm's contract.</summary>
+    private bool TryDeclaredGroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batch, int numGroups, int channels, int spatialSize, float epsilon)
+    {
+        if (batch <= 0 || numGroups <= 0 || channels <= 0 || spatialSize <= 0 || channels % numGroups != 0) return false;
+        return TryRunDeclaredProgram(GroupNormKey(batch, channels, numGroups, spatialSize, epsilon), s_buildGroupNorm,
+            s_groupNormNames, new DeclaredBindings(input, gamma, beta, output, saveMean, saveInvVar));
+    }
+
+    // ---- BatchNorm (training) -------------------------------------------------------------------------------------
+
+    // The running statistics are bound twice, as the value read and the value written: one buffer, updated in place.
+    // Each element is read and then written by its channel's leader, and no later pass reads the written value.
+    private static readonly string[] s_batchNormNames =
+    {
+        "x", "gamma", "beta", "running_mean", "running_var", "y", "mean", "rstd", "running_mean_out", "running_var_out",
+    };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildBatchNorm =
+        key => CodegenBackendPrograms.BatchNorm2DTraining(key.D0, key.D1, key.D2, 1, key.Epsilon, key.Momentum);
+
+    internal static DeclaredKey BatchNormKey(int batch, int channels, int spatialSize, float epsilon, float momentum) =>
+        new(DeclaredFamily.BatchNormTraining, batch, channels, spatialSize, 0, epsilon, momentum);
+
+    /// <summary>Training BatchNorm through its declared program, in CudaBackend.BatchNorm's contract.</summary>
+    private bool TryDeclaredBatchNormTraining(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
+        IGpuBuffer runningMean, IGpuBuffer runningVar, IGpuBuffer saveMean, IGpuBuffer saveInvVar,
+        int batch, int channels, int spatialSize, float epsilon, float momentum)
+    {
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0 || !(momentum >= 0 && momentum <= 1)) return false;
+        return TryRunDeclaredProgram(BatchNormKey(batch, channels, spatialSize, epsilon, momentum), s_buildBatchNorm,
+            s_batchNormNames, new DeclaredBindings(input, gamma, beta, runningMean, runningVar, output, saveMean,
+                saveInvVar, runningMean, runningVar));
+    }
+
+    // ---- Backward -------------------------------------------------------------------------------------------------
+
+    private static readonly string[] s_normBackwardNames = { "dy", "x", "gamma", "mean", "rstd", "dx", "dgamma", "dbeta" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildLayerNormBackward =
+        key => CodegenBackendPrograms.LayerNormBackward(key.D0, key.D1);
+
+    internal static DeclaredKey LayerNormBackwardKey(int batchSize, int normalizedSize) =>
+        new(DeclaredFamily.LayerNormBackward, batchSize, normalizedSize, 0, 0, 0, 0);
+
+    /// <summary>LayerNorm backward through its declared program, in CudaBackend.LayerNormBackward's contract.</summary>
+    private bool TryDeclaredLayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int batchSize, int normalizedSize)
+    {
+        if (batchSize <= 0 || normalizedSize <= 0) return false;
+        return TryRunDeclaredProgram(LayerNormBackwardKey(batchSize, normalizedSize), s_buildLayerNormBackward,
+            s_normBackwardNames, new DeclaredBindings(gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
+                gradGamma, gradBeta));
+    }
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildBatchNormBackward =
+        key => CodegenBackendPrograms.BatchNorm2DBackward(key.D0, key.D1, key.D2, 1);
+
+    internal static DeclaredKey BatchNormBackwardKey(int batch, int channels, int spatialSize) =>
+        new(DeclaredFamily.BatchNormBackward, batch, channels, spatialSize, 0, 0, 0);
+
+    /// <summary>BatchNorm backward through its declared program, in CudaBackend.BatchNormBackward's contract.</summary>
+    private bool TryDeclaredBatchNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveMean, IGpuBuffer saveInvVar, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
+        int batch, int channels, int spatialSize)
+    {
+        if (batch <= 0 || channels <= 0 || spatialSize <= 0) return false;
+        return TryRunDeclaredProgram(BatchNormBackwardKey(batch, channels, spatialSize), s_buildBatchNormBackward,
+            s_normBackwardNames, new DeclaredBindings(gradOutput, input, gamma, saveMean, saveInvVar, gradInput,
+                gradGamma, gradBeta));
+    }
+
+    private static readonly string[] s_rmsNormBackwardNames = { "dy", "x", "gamma", "rms", "dx", "dgamma" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildRmsNormBackward =
+        key => CodegenBackendPrograms.RmsNormBackward(key.D0, key.D1);
+
+    internal static DeclaredKey RmsNormBackwardKey(int batchSize, int normalizedSize) =>
+        new(DeclaredFamily.RmsNormBackward, batchSize, normalizedSize, 0, 0, 0, 0);
+
+    /// <summary>RmsNorm backward through its declared program, in CudaBackend.RmsNormBackward's contract.</summary>
+    private bool TryDeclaredRmsNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
+        IGpuBuffer saveRms, IGpuBuffer gradInput, IGpuBuffer gradGamma, int batchSize, int normalizedSize)
+    {
+        if (batchSize <= 0 || normalizedSize <= 0) return false;
+        return TryRunDeclaredProgram(RmsNormBackwardKey(batchSize, normalizedSize), s_buildRmsNormBackward,
+            s_rmsNormBackwardNames, new DeclaredBindings(gradOutput, input, gamma, saveRms, gradInput, gradGamma));
+    }
+
+    // ---- Softmax --------------------------------------------------------------------------------------------------
+
+    private static readonly string[] s_softmaxNames = { "x", "y" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildSoftmax =
+        key => CodegenFusedStatistics.Softmax(key.D0, key.D1);
+
+    internal static DeclaredKey SoftmaxKey(int batchSize, int features) =>
+        new(DeclaredFamily.Softmax, batchSize, features, 0, 0, 0, 0);
+
+    /// <summary>Row softmax through its declared program, in CudaBackend.Softmax's contract.</summary>
+    private bool TryDeclaredSoftmax(IGpuBuffer input, IGpuBuffer output, int batchSize, int features)
+    {
+        if (batchSize <= 0 || features <= 0) return false;
+        return TryRunDeclaredProgram(SoftmaxKey(batchSize, features), s_buildSoftmax,
+            s_softmaxNames, new DeclaredBindings(input, output));
+    }
+
+    private static readonly string[] s_softmaxBackwardNames = { "dy", "y", "dx" };
+
+    private static readonly Func<DeclaredKey, CodegenProgram> s_buildSoftmaxBackward =
+        key => CodegenFusedStatistics.SoftmaxBackward(key.D0, key.D1);
+
+    internal static DeclaredKey SoftmaxBackwardKey(int batchSize, int features) =>
+        new(DeclaredFamily.SoftmaxBackward, batchSize, features, 0, 0, 0, 0);
+
+    /// <summary>Row softmax backward through its declared program, in CudaBackend.SoftmaxBackward's contract.</summary>
+    private bool TryDeclaredSoftmaxBackward(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput,
+        int batchSize, int features)
+    {
+        if (batchSize <= 0 || features <= 0) return false;
+        return TryRunDeclaredProgram(SoftmaxBackwardKey(batchSize, features), s_buildSoftmaxBackward,
+            s_softmaxBackwardNames, new DeclaredBindings(gradOutput, output, gradInput));
     }
 }

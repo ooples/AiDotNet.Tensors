@@ -42,9 +42,10 @@ public class CodegenRowFusionTests
     [Fact]
     public void ProgramsTheRowKernelCannotFitAreRefused()
     {
-        // A row over two column axes that no step divides: (cg, s) = (2, 7). A ragged step
-        // would straddle a channel boundary, so only the single-axis case is ragged.
-        Assert.Null(CodegenRowFusion.TryPlan(CodegenFusedStatistics.GroupNorm(2, 8, 4, 7), out _));
+        // A row over three column axes read TRANSPOSED -- x[r, b, a, c] summed over (a, b, c) --
+        // whose outer axes do not flatten to one stride, and whose innermost run (7) no step
+        // divides: neither exact, ragged nor wrapped.
+        Assert.Null(CodegenRowFusion.TryPlan(TransposedSum(4, 3, 5, 7), out _));
         // The multi-pass softmax over different extents per pass is not one row shape.
         var mixed = new CodegenProgram(
             new[] { CodegenFusedStatistics.Softmax(16, 128).Passes[0], CodegenFusedStatistics.Softmax(16, 256).Passes[2] },
@@ -114,6 +115,61 @@ public class CodegenRowFusionTests
         Assert.DoesNotContain("div.u32", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain("rem.u32", ptx, StringComparison.Ordinal);
         Assert.Contains("selp.f32", ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// BatchNorm at 7x7 is a row of (n, 49): no step divides a 49-element run, so it was six
+    /// separate launches. WRAPPED, each lane walks the flattened columns: one division for its
+    /// first position, then a constant increment with one carry per step, and the last step
+    /// is guarded by its outer position.
+    /// </summary>
+    [Fact]
+    public void ARowOverSeveralColumnAxesWrapsWhenNoStepDividesItsRun()
+    {
+        var plan = Plan(CodegenFusedStatistics.BatchNorm2D(16, 32, 7, 7));
+        var layout = plan.Layout(4) ?? throw new InvalidOperationException("no layout");
+        Assert.True(layout.Wrapped);
+        Assert.True(layout.Held);
+        Assert.Equal(1, layout.Vector);   // 4 and 2 do not divide 49
+
+        string ptx = new PtxAffineEmitter().EmitRowProgram(plan, "rowfused_bn_wrapped", 7, 5);
+        Assert.Equal(1, CountOccurrences(ptx, "div.u32"));
+        Assert.Equal(1, CountOccurrences(ptx, "rem.u32"));
+        Assert.Contains("setp.ge.u32", ptx, StringComparison.Ordinal);       // the carry
+        Assert.Contains("setp.lt.u32", ptx, StringComparison.Ordinal);       // the last step's guard
+        Assert.Contains("selp.f32", ptx, StringComparison.Ordinal);
+
+        // 14x14 runs take 4-wide accesses: 4 divides 196.
+        Assert.Equal(4, (Plan(CodegenFusedStatistics.BatchNorm2D(64, 128, 14, 14)).Layout(4) ?? throw new InvalidOperationException()).Vector);
+    }
+
+    /// <summary>A wrapped row too wide to hold streams, its position carried across the loop.</summary>
+    [Fact]
+    public void AWideWrappedRowStreamsWithItsPositionCarried()
+    {
+        var plan = Plan(CodegenFusedStatistics.BatchNorm2D(256, 8, 14, 14));
+        var layout = plan.Layout(4) ?? throw new InvalidOperationException("no layout");
+        Assert.True(layout.Wrapped);
+        Assert.False(layout.Held);
+        Assert.Equal(CodegenRowFusion.RaggedStreamThreads, layout.Threads);
+
+        string ptx = new PtxAffineEmitter().EmitRowProgram(plan, "rowfused_bn_wrapped_wide", 7, 5);
+        Assert.Contains("SWEEP0:", ptx, StringComparison.Ordinal);
+        // One division in the whole kernel -- the first position -- none per step.
+        Assert.Equal(1, CountOccurrences(ptx, "div.u32"));
+    }
+
+    /// <summary>x[r, b, a, c] summed over (a, b, c): column strides (c, a*c, 1) in (a, b, c) order.</summary>
+    private static CodegenProgram TransposedSum(int rows, int a, int b, int c)
+    {
+        var space = new CodegenIterationSpace(CodegenAxis.Parallel("r", rows), CodegenAxis.Reduce("a", a),
+            CodegenAxis.Reduce("b", b), CodegenAxis.Reduce("c", c));
+        var x = new CodegenTensorBinding(0, "x", new[] { rows, b, a, c },
+            new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(2), CodegenAffineExpr.Axis(1), CodegenAffineExpr.Axis(3) },
+            isOutput: false);
+        var sum = new CodegenTensorBinding(1, "sum", new[] { rows }, new[] { CodegenAffineExpr.Axis(0) }, isOutput: true);
+        var spec = new CodegenKernelSpec("transposed_sum", space, new[] { x }, sum, new[] { 0 }, CodegenReduceKind.Sum);
+        return new CodegenProgram(new[] { spec }, new long[] { rows }, "transposed sum");
     }
 
     /// <summary>A row wider than the registers hold is STREAMED rather than refused.</summary>
