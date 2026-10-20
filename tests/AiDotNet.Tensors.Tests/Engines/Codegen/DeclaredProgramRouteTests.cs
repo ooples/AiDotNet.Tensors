@@ -221,6 +221,50 @@ public class DeclaredProgramRouteTests
         }
     }
 
+    /// <summary>
+    /// The column-fused backward sums dgamma and dbeta per block in row order, combines the
+    /// block partials in block order, and uses no atomics: two runs are bit-identical. Warp
+    /// rows (64 wide, shared-memory warp combine) and block rows (1024 wide) both.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(4096, 64)]
+    [InlineData(1024, 1024)]
+    [InlineData(100, 100)]
+    public void ColumnFusedLayerNormBackwardIsBitIdenticalRunToRun(int rows, int cols)
+    {
+        using var backend = OpenBackendOrSkip();
+        Skip.IfNot(backend.DeclaredKernelsEnabled, "The declared route needs the sm_75+ codegen conveyor.");
+        var rng = new Random(rows + cols);
+        float[] R(int n, double offset)
+        {
+            var v = new float[n];
+            for (int i = 0; i < n; i++) v[i] = (float)(offset + rng.NextDouble() * 2 - 1);
+            return v;
+        }
+        float[] dy = R(rows * cols, 0), x = R(rows * cols, 0), gamma = R(cols, 0), mean = R(rows, 0), rstd = R(rows, 2);
+        using var bdy = backend.AllocateBuffer(dy);
+        using var bx = backend.AllocateBuffer(x);
+        using var bg = backend.AllocateBuffer(gamma);
+        using var bm = backend.AllocateBuffer(mean);
+        using var bv = backend.AllocateBuffer(rstd);
+        var runs = new List<float[][]>();
+        for (int run = 0; run < 2; run++)
+        {
+            using var dx = backend.AllocateBuffer(rows * cols);
+            using var dgamma = backend.AllocateBuffer(cols);
+            using var dbeta = backend.AllocateBuffer(cols);
+            long before = backend.DeclaredProgramLaunches;
+            backend.LayerNormBackward(bdy, bx, bg, bm, bv, dx, dgamma, dbeta, rows, cols, Epsilon);
+            backend.Synchronize();
+            Assert.True(backend.DeclaredProgramLaunches > before, "the call fell through to the incumbent");
+            runs.Add(new[] { backend.DownloadBuffer(dx), backend.DownloadBuffer(dgamma), backend.DownloadBuffer(dbeta) });
+        }
+        for (int o = 0; o < runs[0].Length; o++)
+            for (int i = 0; i < runs[0][o].Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(runs[0][o][i]) == BitConverter.SingleToInt32Bits(runs[1][o][i]),
+                    $"output {o}[{i}]: {runs[0][o][i]} then {runs[1][o][i]}");
+    }
+
     private const float Epsilon = 1e-5f;
 
     private static (float[] Y, float[] Mean, float[] Rstd, bool Routed) RunLayerNorm(

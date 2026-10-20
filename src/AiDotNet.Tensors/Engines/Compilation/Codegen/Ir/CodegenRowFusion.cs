@@ -19,6 +19,12 @@
 //
 // The plan is the IR's half: it decides whether a program has this shape and classifies every
 // binding. Emission is PtxAffineEmitter.EmitRowProgram.
+//
+// COLUMN PASSES reduce DOWN the rows, one output per column -- LayerNorm backward's dgamma and
+// dbeta. As their own kernels each re-read dy and x, and each was a two-kernel split: five
+// launches for LayerNorm backward where the hand-written kernels take two. Fused, the row
+// kernel accumulates each column pass per thread across a persistent loop over rows, writes
+// one partial per block, and one combine kernel sums the partials in block order.
 
 using System;
 using System.Collections.Generic;
@@ -175,6 +181,25 @@ public sealed class CodegenRowFusionPlan
     public IReadOnlyCollection<string> RowPasses { get; internal set; } = Array.Empty<string>();
 
     /// <summary>
+    /// Passes that reduce over the ROW axes, one output per column (LayerNorm backward's
+    /// dgamma). In <see cref="Program"/> they are rewritten into the program's axis order. The
+    /// row kernel writes their per-block partials (<see cref="PartialName"/>); a combine kernel
+    /// (PtxAffineEmitter.EmitColumnCombine) finishes them.
+    /// </summary>
+    public IReadOnlyList<string> ColumnPasses { get; internal set; } = Array.Empty<string>();
+
+    /// <summary>The kernel parameter holding a column pass's per-block partials.</summary>
+    public static string PartialName(string columnPassOutput) => "#" + columnPassOutput + ":partials";
+
+    /// <summary>
+    /// Most elements of one source a thread holds. A plan with column passes holds at most
+    /// <see cref="CodegenRowFusion.ColumnFusedPerThread"/>: each column pass keeps one
+    /// accumulator per held element, so a 1024-wide row is a 128-thread block rather than a
+    /// warp of 32 elements a thread.
+    /// </summary>
+    public int MaxPerThread => ColumnPasses.Count == 0 ? CodegenRowFusion.MaxPerThread : CodegenRowFusion.ColumnFusedPerThread;
+
+    /// <summary>
     /// Threads per row and elements per access for a requested vector width: the
     /// narrowest power-of-two thread count from 32 to 1024 that leaves each thread at most
     /// <see cref="CodegenRowFusion.MaxPerThread"/> elements, such that one STEP (threads x
@@ -193,7 +218,7 @@ public sealed class CodegenRowFusionPlan
                 if (Width % step != 0) continue;
                 if (ColumnExtents[ColumnExtents.Count - 1] % step != 0) continue;
                 long perThread = Width / threads;
-                if (perThread > CodegenRowFusion.MaxPerThread) continue;
+                if (perThread > MaxPerThread) continue;
                 return (threads, vector, (int)step, (int)perThread);
             }
         }
@@ -251,7 +276,7 @@ public sealed class CodegenRowFusionPlan
             {
                 int step = threads * vector;
                 int chunks = (Width + step - 1) / step;
-                if ((long)chunks * vector <= CodegenRowFusion.MaxPerThread)
+                if ((long)chunks * vector <= MaxPerThread)
                     return new CodegenRowGeometry(threads, vector, step, chunks, held: true, ragged: true);
             }
             int blockStep = CodegenRowFusion.RaggedStreamThreads * vector;
@@ -284,7 +309,7 @@ public sealed class CodegenRowFusionPlan
             {
                 int step = threads * vector;
                 int chunks = (Width + step - 1) / step;
-                if ((long)chunks * vector <= CodegenRowFusion.MaxPerThread)
+                if ((long)chunks * vector <= MaxPerThread)
                     return new CodegenRowGeometry(threads, vector, step, chunks, held: true, ragged: true, wrapped: true);
             }
             int blockStep = CodegenRowFusion.RaggedStreamThreads * vector;
@@ -354,6 +379,13 @@ public static class CodegenRowFusion
     public const int MaxRowThreads = 1024;
 
     /// <summary>
+    /// Most elements a thread holds when the plan has column passes: each column pass adds an
+    /// accumulator per element, and at 32 a LayerNorm backward thread held 64 sources and 64
+    /// accumulators.
+    /// </summary>
+    public const int ColumnFusedPerThread = 8;
+
+    /// <summary>
     /// Threads of a ragged streamed row. A 1024-thread block caps ptxas at 64 registers, and an
     /// unrolled sweep of 4-wide loads spilled 72 bytes a thread at that cap (LayerNorm 64x50000).
     /// </summary>
@@ -392,6 +424,8 @@ public static class CodegenRowFusion
         var bindings = new Dictionary<string, CodegenRowBinding>(StringComparer.Ordinal);
         var produced = new HashSet<string>(StringComparer.Ordinal);
         var rowPasses = new HashSet<string>(StringComparer.Ordinal);
+        var columnPasses = new List<string>();
+        var rewrittenPasses = new Dictionary<string, CodegenKernelSpec>(StringComparer.Ordinal);
         foreach (var pass in program.Passes)
         {
             var axes = pass.Space.Axes;
@@ -431,6 +465,44 @@ public static class CodegenRowFusion
                 continue;
             }
 
+            // A COLUMN PASS: a sum down the rows, one output per column. Its axes alone cannot say
+            // so -- (j | i) at 100x100 has the shape of a row reduction (i | j) -- but its maps
+            // can: read as a row reduction it reads x and dy transposed, which does not classify.
+            if (reduces && pass.Space.ParallelAxes.Length == extents.Length - rowAxes &&
+                pass.Space.ReductionAxes.Length == rowAxes && axes.Count == extents.Length &&
+                !ReadsAsARowReduction(pass, rowAxes, extents))
+            {
+                var rewritten = RewriteColumnPass(pass, rowAxes, extents, out string columnReason);
+                if (rewritten is null) { reason = columnReason; return null; }
+                foreach (var input in rewritten.Inputs)
+                {
+                    var binding = Classify(input, rowAxes, extents);
+                    if (binding is null)
+                    {
+                        reason = pass.Name + " reads '" + input.Name + "' with an index map the row kernel does not hold";
+                        return null;
+                    }
+                    if (binding.Kind != CodegenRowOperandKind.Row && produced.Contains(input.Name))
+                    {
+                        reason = pass.Name + " reads the non-row intermediate '" + input.Name + "'";
+                        return null;
+                    }
+                    bindings[binding.Key] = binding;
+                }
+                var columnOut = Classify(rewritten.Output, rowAxes, extents);
+                if (columnOut is null || columnOut.Kind == CodegenRowOperandKind.Row || columnOut.ConstantOffset != 0 ||
+                    !IsContiguousColumnVector(columnOut, columnExtents))
+                {
+                    reason = pass.Name + "'s output is not one contiguous value per column";
+                    return null;
+                }
+                bindings[columnOut.Key] = columnOut;
+                produced.Add(pass.Output.Name);
+                columnPasses.Add(pass.Name);
+                rewrittenPasses[pass.Name] = rewritten;
+                continue;
+            }
+
             if (axes.Count != extents.Length)
             {
                 reason = pass.Name + " has a different axis count";
@@ -454,6 +526,11 @@ public static class CodegenRowFusion
 
             foreach (var input in pass.Inputs)
             {
+                if (rewrittenPasses.ContainsKey(ProducerOf(program, input.Name) ?? ""))
+                {
+                    reason = pass.Name + " reads '" + input.Name + "', which is final only after the combine";
+                    return null;
+                }
                 var binding = Classify(input, rowAxes, extents);
                 if (binding is null)
                 {
@@ -492,14 +569,32 @@ public static class CodegenRowFusion
 
         var parameters = new List<string>();
         foreach (var source in program.Sources()) parameters.Add(source.Name);
-        foreach (var pass in program.Passes) parameters.Add(pass.Output.Name);
-        var plan = new CodegenRowFusionPlan(program, rowExtents, columnExtents, parameters, bindings)
+        foreach (var pass in program.Passes)
+            parameters.Add(rewrittenPasses.ContainsKey(pass.Name)
+                ? CodegenRowFusionPlan.PartialName(pass.Output.Name) : pass.Output.Name);
+        // The emitter reads the column passes in the program's axis order.
+        var fusedProgram = program;
+        if (rewrittenPasses.Count != 0)
+        {
+            var passes = new List<CodegenKernelSpec>(program.Passes.Count);
+            foreach (var pass in program.Passes)
+                passes.Add(rewrittenPasses.TryGetValue(pass.Name, out var rewritten) ? rewritten : pass);
+            fusedProgram = new CodegenProgram(passes, program.TempElements, program.Description);
+        }
+        var plan = new CodegenRowFusionPlan(fusedProgram, rowExtents, columnExtents, parameters, bindings)
         {
             RowPasses = rowPasses,
+            ColumnPasses = columnPasses,
         };
         if (plan.Layout(1) is null)
         {
             reason = "no thread geometry fits a " + plan.Width + "-wide row: its outer column axes do not flatten";
+            return null;
+        }
+        // Column passes accumulate per held element; a streamed row has nothing to hold them in.
+        if (columnPasses.Count != 0 && (plan.Layout(1) is not { Held: true } || plan.Layout(4) is not { Held: true }))
+        {
+            reason = "column passes need the row held in registers";
             return null;
         }
         return plan;
@@ -625,6 +720,117 @@ public static class CodegenRowFusion
         else if (innermost == 0) kind = CodegenRowOperandKind.Feature;
         else return null;   // the innermost column axis is read, but not contiguously
         return new CodegenRowBinding(binding.Name, kind, rowStrides, columnStrides, constantOffset, KeyOf(binding));
+    }
+
+    /// <summary>
+    /// True when the pass reads as an ordinary row reduction: its leading parallel axes are the
+    /// rows, with the program's extents, and every binding classifies with a per-row output.
+    /// </summary>
+    private static bool ReadsAsARowReduction(CodegenKernelSpec pass, int rowAxes, int[] extents)
+    {
+        var axes = pass.Space.Axes;
+        for (int a = 0; a < axes.Count; a++)
+            if (axes[a].IsReduction != (a >= rowAxes) || axes[a].Extent != extents[a]) return false;
+        foreach (var input in pass.Inputs)
+            if (Classify(input, rowAxes, extents) is null) return false;
+        return Classify(pass.Output, rowAxes, extents) is { Kind: CodegenRowOperandKind.Row };
+    }
+
+    /// <summary>The pass that produces <paramref name="name"/>, or null for a source.</summary>
+    private static string? ProducerOf(CodegenProgram program, string name)
+    {
+        foreach (var pass in program.Passes)
+            if (string.Equals(pass.Output.Name, name, StringComparison.Ordinal)) return pass.Name;
+        return null;
+    }
+
+    /// <summary>
+    /// A column pass rewritten into the program's axis order: its k-th reduction axis is row
+    /// axis k and its k-th parallel axis is column axis k, every index map renumbered to match.
+    /// Null, with the reason, when it carries what the combine cannot finish -- an epilogue that
+    /// reads a tensor, extra outputs, a non-real algebra, an indirect index.
+    /// </summary>
+    private static CodegenKernelSpec? RewriteColumnPass(CodegenKernelSpec pass, int rowAxes, int[] extents, out string reason)
+    {
+        reason = "";
+        if (pass.Reduce != CodegenReduceKind.Sum || pass.Algebra != CodegenAlgebra.Real ||
+            pass.ExtraOutputs.Count != 0 || pass.SecondaryOutput is not null ||
+            pass.BiasInput is not null || pass.ScaleInput is not null ||
+            pass.PostScaleInput is not null || pass.PostBiasInput is not null)
+        {
+            reason = pass.Name + " is a column reduction with an epilogue or outputs the combine does not finish";
+            return null;
+        }
+        var axes = pass.Space.Axes;
+        int[] parallel = pass.Space.ParallelAxes, reduction = pass.Space.ReductionAxes;
+        var image = new int[axes.Count];
+        var programAxes = new CodegenAxis[extents.Length];
+        for (int k = 0; k < reduction.Length; k++)
+        {
+            if (axes[reduction[k]].Extent != extents[k])
+            {
+                reason = pass.Name + " reduces over axes that are not the rows";
+                return null;
+            }
+            image[reduction[k]] = k;
+            programAxes[k] = CodegenAxis.Reduce(axes[reduction[k]].Name, extents[k]);
+        }
+        for (int k = 0; k < parallel.Length; k++)
+        {
+            if (axes[parallel[k]].Extent != extents[rowAxes + k])
+            {
+                reason = pass.Name + "'s outputs are not the columns";
+                return null;
+            }
+            image[parallel[k]] = rowAxes + k;
+            programAxes[rowAxes + k] = CodegenAxis.Parallel(axes[parallel[k]].Name, extents[rowAxes + k]);
+        }
+
+        CodegenTensorBinding? Renumber(CodegenTensorBinding binding)
+        {
+            if (binding.HasIndirection) return null;
+            var map = new CodegenAffineExpr[binding.Map.Count];
+            for (int d = 0; d < map.Length; d++)
+            {
+                var expr = binding.Map[d];
+                var terms = new CodegenAffineTerm[expr.Terms.Count];
+                for (int t = 0; t < terms.Length; t++)
+                    terms[t] = new CodegenAffineTerm(image[expr.Terms[t].Axis], expr.Terms[t].Coefficient);
+                map[d] = new CodegenAffineExpr(terms, expr.Constant, expr.Divisor, expr.RequiresExactDivision);
+            }
+            var shape = new int[binding.Shape.Count];
+            for (int d = 0; d < shape.Length; d++) shape[d] = binding.Shape[d];
+            return new CodegenTensorBinding(binding.ParameterIndex, binding.Name, shape, map, binding.IsOutput, binding.ElementType);
+        }
+
+        var inputs = new CodegenTensorBinding[pass.Inputs.Count];
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            var renumbered = Renumber(pass.Inputs[i]);
+            if (renumbered is null) { reason = pass.Name + " reads through an indirect index"; return null; }
+            inputs[i] = renumbered;
+        }
+        var output = Renumber(pass.Output);
+        if (output is null) { reason = pass.Name + " writes through an indirect index"; return null; }
+        var products = new int[pass.ProductInputs.Count];
+        for (int i = 0; i < products.Length; i++) products[i] = pass.ProductInputs[i];
+        return new CodegenKernelSpec(pass.Name, new CodegenIterationSpace(programAxes), inputs, output, products,
+            CodegenReduceKind.Sum, activation: pass.Activation, reduceScale: pass.ReduceScale, preReduce: pass.PreReduce,
+            preBiasInput: pass.PreBiasInput, preBiasScale: pass.PreBiasScale, reduceOffset: pass.ReduceOffset,
+            body: pass.Body);
+    }
+
+    // One value per column, laid out as the flattened column index: the combine writes column c at c.
+    private static bool IsContiguousColumnVector(CodegenRowBinding binding, int[] columnExtents)
+    {
+        foreach (long rowStride in binding.RowStrides) if (rowStride != 0) return false;
+        long expected = 1;
+        for (int k = columnExtents.Length - 1; k >= 0; k--)
+        {
+            if (binding.ColumnStrides[k] != expected) return false;
+            expected *= columnExtents[k];
+        }
+        return true;
     }
 
     /// <summary>The addressing key of a binding: its name and index map.</summary>

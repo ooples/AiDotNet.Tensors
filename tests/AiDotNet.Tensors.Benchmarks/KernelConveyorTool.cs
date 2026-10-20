@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // The conveyor: three stages every kernel passes through, in the same order, with
 // the same gates, driven by a loop over CodegenKernelCatalog rather than by
 // per-kernel code.
@@ -927,6 +927,8 @@ internal static class KernelConveyorTool
         private readonly List<DirectPtxModule> _modules = new();
         private readonly Dictionary<string, DirectPtxBuffer> _named = new(StringComparer.Ordinal);
         private readonly List<DirectPtxBuffer> _temporaries = new();
+        // Every lowering buffer by name, temporaries ("#tempN") included.
+        private readonly Dictionary<string, DirectPtxBuffer> _scratch = new(StringComparer.Ordinal);
         private readonly List<(DirectPtxModule Module, IntPtr Fn, IntPtr[] Args,
             uint Blocks, uint X, uint Y, uint DynamicSharedMemoryBytes)> _steps = new();
         private DirectPtxGraph? _graph;
@@ -971,98 +973,47 @@ internal static class KernelConveyorTool
                     it.HostSources.Add(source.Name, wide);
                 }
 
-                // ROW FUSION: the longest run of two or more consecutive passes that share a
-                // row shape is ONE kernel that reads its sources once -- a whole forward
-                // normalisation, or a backward's input-gradient passes ahead of its column
-                // reductions. Every other pass is lowered on its own below.
-                var passes = program.Passes;
-                int at = 0;
-                while (at < passes.Count)
+                // THE PRODUCTION LOWERING (PtxProgramLowering): what is verified and timed here is what a
+                // backend launches -- row fusion, the planner's splits, scratch by name -- with the
+                // tuner's recorded winner for each pass that is not fused.
+                PtxPassLowering? Tuned(CodegenKernelSpec pass)
                 {
-                    int end = at;
-                    CodegenRowFusionPlan? fused = null;
-                    if (!_noRowFusion)
-                        for (int stop = passes.Count; stop >= at + 2 && fused is null; stop--)
-                        {
-                            var run = new CodegenKernelSpec[stop - at];
-                            for (int k = 0; k < run.Length; k++) run[k] = passes[at + k];
-                            var runTemps = new long[run.Length];
-                            for (int k = 0; k < run.Length; k++) runTemps[k] = run[k].Output.ElementCount;
-                            fused = CodegenRowFusion.TryPlan(
-                                new CodegenProgram(run, runTemps, program.Description), out _);
-                            if (fused is not null) end = stop;
-                        }
-
-                    if (fused is not null)
-                    {
-                        for (int k = at; k < end; k++)
-                            it._named.Add(passes[k].Output.Name,
-                                runtime.AllocateBytes((nuint)(passes[k].Output.ElementCount * sizeof(float))));
-                        var emitter = new PtxAffineEmitter();
-                        string kernelName = "rowfused_" + catalogName + "_" + at.ToString(CultureInfo.InvariantCulture);
-                        string ptx = emitter.EmitRowProgram(
-                            fused, kernelName, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                        var args = new IntPtr[fused.Parameters.Count];
-                        for (int i = 0; i < args.Length; i++) args[i] = it._named[fused.Parameters[i]].Pointer;
-                        var module = runtime.LoadModule(ptx, allowExperimentalJitFallback: true);
-                        it._modules.Add(module);
-                        IntPtr fn = module.GetFunction(kernelName, out DirectPtxFunctionInfo info);
-                        it.RegistersPerThread = Math.Max(it.RegistersPerThread, info.RegistersPerThread);
-                        it._steps.Add((module, fn, args, emitter.LaunchBlocks,
-                            (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, 0u));
-                        for (int k = at; k < end; k++)
-                            it.Lowerings.Add("row-fused x" + (end - at).ToString(CultureInfo.InvariantCulture));
-                        at = end;
-                        continue;
-                    }
-
-                    var pass = passes[at++];
-                    var output = runtime.AllocateBytes((nuint)(pass.Output.ElementCount * sizeof(float)));
-                    it._named.Add(pass.Output.Name, output);
-
                     var tuned = ResolveTuned(runtime, pass, catalogName + "/" + pass.Name);
-                    string label = tuned.Label();
+                    // NO RECORDED WINNER means the modelled choice, and for a program that is what
+                    // the backend does: it splits whenever the planner says one kernel would leave
+                    // the device idle. A BatchNorm's per-channel statistics are 64 threads unsplit.
+                    if (tuned.Winner is null && !tuned.IsSplit && CodegenSplitReduction.TryPlan(pass) is not null)
+                        return null;
+                    var kernels = new List<PtxPassKernel>();
+                    foreach (var k in tuned.Kernels)
+                        kernels.Add(new PtxPassKernel(k.Ptx, k.Spec.Name, k.Blocks, k.BlockX, k.BlockY,
+                            k.DynamicSharedMemoryBytes));
+                    return new PtxPassLowering(kernels, tuned.Split, tuned.Label());
+                }
 
-                    // NO RECORDED WINNER means the modelled choice, and for a program that is
-                    // what the graph compiler does: PtxGraphEmitter splits whenever the planner
-                    // says one kernel would leave the device idle. Benching the single kernel
-                    // here would time a lowering production never runs -- a BatchNorm's
-                    // per-channel statistics are 64 threads unsplit.
-                    if (tuned.Winner is null && !tuned.IsSplit &&
-                        CodegenSplitReduction.TryPlan(pass) is { } modelled)
-                    {
-                        tuned = ModelledSplit(runtime, pass, modelled);
-                        label = "modelled " + tuned.Label();
-                    }
-                    it.Lowerings.Add(label);
-                    IntPtr Operand(int input) => it._named[pass.Inputs[input].Name].Pointer;
-
-                    if (tuned.Split is { } plan)
-                    {
-                        var temp = runtime.AllocateBytes((nuint)(plan.TempElements * sizeof(float)));
-                        it._temporaries.Add(temp);
-
-                        var partialArgs = new IntPtr[plan.Partial.ParameterCount];
-                        int[] partialSources = CodegenSplitReduction.PartialOperandSources(pass);
-                        for (int i = 0; i < partialSources.Length; i++) partialArgs[i] = Operand(partialSources[i]);
-                        partialArgs[partialArgs.Length - 1] = temp.Pointer;
-
-                        var combineArgs = new IntPtr[plan.Combine.ParameterCount];
-                        combineArgs[0] = temp.Pointer;
-                        int[] combineSources = CodegenSplitReduction.CombineOperandSources(pass);
-                        for (int i = 0; i < combineSources.Length; i++) combineArgs[1 + i] = Operand(combineSources[i]);
-                        combineArgs[combineArgs.Length - 1] = output.Pointer;
-
-                        it.Add(runtime, tuned.Kernels[0], partialArgs);
-                        it.Add(runtime, tuned.Kernels[1], combineArgs);
-                    }
-                    else
-                    {
-                        var args = new IntPtr[pass.ParameterCount];
-                        for (int i = 0; i < pass.Inputs.Count; i++) args[i] = Operand(i);
-                        args[pass.Inputs.Count] = output.Pointer;
-                        it.Add(runtime, tuned.Kernels[0], args);
-                    }
+                var lowering = PtxProgramLowering.Create(program, catalogName, runtime.ComputeCapabilityMajor,
+                    runtime.ComputeCapabilityMinor, Tuned, rowFusion: !_noRowFusion);
+                it.Lowerings.AddRange(lowering.PassLowerings);
+                foreach (var pair in lowering.Buffers)
+                {
+                    if (it._named.ContainsKey(pair.Key)) continue;
+                    var buffer = runtime.AllocateBytes((nuint)(pair.Value * sizeof(float)));
+                    if (pair.Key.StartsWith("#", StringComparison.Ordinal)) it._temporaries.Add(buffer);
+                    else it._named.Add(pair.Key, buffer);
+                    it._scratch.Add(pair.Key, buffer);
+                }
+                foreach (var step in lowering.Steps)
+                {
+                    var args = new IntPtr[step.Arguments.Count];
+                    for (int i = 0; i < args.Length; i++)
+                        args[i] = (it._named.TryGetValue(step.Arguments[i], out var named) ? named : it._scratch[step.Arguments[i]]).Pointer;
+                    var module = runtime.LoadModule(step.Ptx, allowExperimentalJitFallback: true);
+                    it._modules.Add(module);
+                    IntPtr fn = module.GetFunction(step.EntryPoint, out DirectPtxFunctionInfo info);
+                    if (step.DynamicSharedMemoryBytes != 0)
+                        module.SetMaxDynamicSharedMemory(fn, checked((int)step.DynamicSharedMemoryBytes));
+                    it.RegistersPerThread = Math.Max(it.RegistersPerThread, info.RegistersPerThread);
+                    it._steps.Add((module, fn, args, step.Blocks, step.BlockX, step.BlockY, step.DynamicSharedMemoryBytes));
                 }
 
                 it._graph = runtime.CaptureGraph(it.LaunchDirect);
@@ -1073,33 +1024,6 @@ internal static class KernelConveyorTool
                 it.Dispose();
                 throw;
             }
-        }
-
-        private void Add(DirectPtxRuntime runtime, ProgramKernel kernel, IntPtr[] args)
-        {
-            var module = runtime.LoadModule(kernel.Ptx, allowExperimentalJitFallback: true);
-            _modules.Add(module);
-            IntPtr fn = module.GetFunction(kernel.Spec.Name, out DirectPtxFunctionInfo info);
-            if (kernel.DynamicSharedMemoryBytes != 0)
-                module.SetMaxDynamicSharedMemory(fn, checked((int)kernel.DynamicSharedMemoryBytes));
-            RegistersPerThread = Math.Max(RegistersPerThread, info.RegistersPerThread);
-            _steps.Add((module, fn, args, kernel.Blocks, kernel.BlockX, kernel.BlockY,
-                kernel.DynamicSharedMemoryBytes));
-        }
-
-        /// <summary>The planner's split, both halves through the affine emitter.</summary>
-        private static TunedProgram ModelledSplit(
-            DirectPtxRuntime runtime, CodegenKernelSpec pass, CodegenSplitPlan plan)
-        {
-            ProgramKernel Half(CodegenKernelSpec half)
-            {
-                var emitter = new PtxAffineEmitter();
-                string text = emitter.Emit(half, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
-                return new ProgramKernel(half, text, emitter.LaunchBlocks,
-                    (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY,
-                    emitter.LoopedAxes, emitter.ElidedGuards, emitter.StagedOperands);
-            }
-            return new TunedProgram(pass, new[] { Half(plan.Partial), Half(plan.Combine) }, plan, null);
         }
 
         private void LaunchDirect()
@@ -1296,7 +1220,10 @@ internal static class KernelConveyorTool
         if (runtime is null) return;
         using var engine = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine();
         var backend = engine.Backend ??
-            throw new InvalidOperationException("No direct GPU backend is available for the incumbent lane.");
+            throw new InvalidOperationException("No direct GPU backend is available for the incumbent lane.");        // The backend now routes these calls to the declared programs themselves; the incumbent is the
+        // hand-written kernel, so the route is switched off for this lane.
+        if (backend is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.DeclaredKernelsSwitch = false;
+
         Console.WriteLine();
         Console.WriteLine("INCUMBENT - declared program vs the hand-written " + engine.BackendName + " kernel, paired rounds");
         Console.WriteLine();
@@ -1319,7 +1246,6 @@ internal static class KernelConveyorTool
                     buffers.Add(b);
                     return b;
                 }
-                long Count(IReadOnlyList<int> shape) => Elements(shape);
 
                 switch (entry.Name)
                 {

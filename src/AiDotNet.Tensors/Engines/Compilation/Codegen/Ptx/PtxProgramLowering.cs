@@ -7,6 +7,9 @@
 // planner's two-kernel split through a temporary; every other pass is one affine kernel. Arguments are named --
 // program tensors by name, and scratch the plan itself needs (a split's partials) by a "#temp" name -- so a caller
 // binds its own buffers and allocates the rest.
+//
+// The conveyor runs THIS lowering too, so what it verifies and times is what a backend launches; it only supplies
+// its tuned winners for the passes that are not fused (lowerPass).
 
 using System;
 using System.Collections.Generic;
@@ -17,16 +20,32 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 
 /// <summary>One kernel launch of a lowered program.</summary>
 public sealed record PtxProgramStep(
-    string Ptx, string EntryPoint, uint Blocks, uint BlockX, uint BlockY, IReadOnlyList<string> Arguments);
+    string Ptx, string EntryPoint, uint Blocks, uint BlockX, uint BlockY, IReadOnlyList<string> Arguments,
+    uint DynamicSharedMemoryBytes = 0);
+
+/// <summary>One kernel of a caller-supplied pass lowering.</summary>
+public sealed record PtxPassKernel(
+    string Ptx, string EntryPoint, uint Blocks, uint BlockX, uint BlockY, uint DynamicSharedMemoryBytes = 0);
+
+/// <summary>
+/// A pass lowered by the caller: one kernel over the pass's own parameters, or -- with <paramref name="Split"/> -- the
+/// split's partial and combine kernels, wired through a temporary as the planner's split is.
+/// </summary>
+public sealed record PtxPassLowering(IReadOnlyList<PtxPassKernel> Kernels, CodegenSplitPlan? Split, string Label);
 
 /// <summary>A program lowered to launches, and the float buffers its tensors and scratch need.</summary>
 public sealed class PtxProgramLowering
 {
-    private PtxProgramLowering(IReadOnlyList<PtxProgramStep> steps, IReadOnlyDictionary<string, long> buffers)
+    private PtxProgramLowering(IReadOnlyList<PtxProgramStep> steps, IReadOnlyDictionary<string, long> buffers,
+        IReadOnlyList<string> passLowerings)
     {
         Steps = steps;
         Buffers = buffers;
+        PassLowerings = passLowerings;
     }
+
+    /// <summary>How each pass was lowered, parallel to the program's passes ("row-fused x3", "split x2", ...).</summary>
+    public IReadOnlyList<string> PassLowerings { get; }
 
     /// <summary>The launches, in order.</summary>
     public IReadOnlyList<PtxProgramStep> Steps { get; }
@@ -34,8 +53,13 @@ public sealed class PtxProgramLowering
     /// <summary>Elements of every buffer the steps name: program tensors and "#temp" scratch.</summary>
     public IReadOnlyDictionary<string, long> Buffers { get; }
 
-    /// <summary>Lowers <paramref name="program"/> for the given architecture.</summary>
-    public static PtxProgramLowering Create(CodegenProgram program, string name, int computeMajor, int computeMinor)
+    /// <summary>
+    /// Lowers <paramref name="program"/> for the given architecture. <paramref name="lowerPass"/>, when it returns a
+    /// lowering, replaces the default for a pass that is not row-fused; <paramref name="rowFusion"/> false lowers every
+    /// pass on its own.
+    /// </summary>
+    public static PtxProgramLowering Create(CodegenProgram program, string name, int computeMajor, int computeMinor,
+        Func<CodegenKernelSpec, PtxPassLowering?>? lowerPass = null, bool rowFusion = true)
     {
         if (program is null) throw new ArgumentNullException(nameof(program));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("A lowering needs a name.", nameof(name));
@@ -47,6 +71,7 @@ public sealed class PtxProgramLowering
                 throw new NotSupportedException(pass.Name + " has outputs a program launch does not bind.");
 
         var steps = new List<PtxProgramStep>();
+        var labels = new List<string>();
         var buffers = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var source in program.Sources()) buffers[source.Name] = source.ElementCount;
         foreach (var pass in program.Passes) buffers[pass.Output.Name] = pass.Output.ElementCount;
@@ -57,7 +82,7 @@ public sealed class PtxProgramLowering
         {
             CodegenRowFusionPlan? fused = null;
             int end = at;
-            for (int stop = passes.Count; stop >= at + 2 && fused is null; stop--)
+            for (int stop = passes.Count; rowFusion && stop >= at + 2 && fused is null; stop--)
             {
                 var run = new CodegenKernelSpec[stop - at];
                 var runTemps = new long[run.Length];
@@ -77,12 +102,39 @@ public sealed class PtxProgramLowering
                 string ptx = emitter.EmitRowProgram(fused, entry, computeMajor, computeMinor);
                 steps.Add(new PtxProgramStep(ptx, entry, emitter.LaunchBlocks,
                     (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, fused.Parameters));
+                string label = "row-fused x" + (end - at).ToString(CultureInfo.InvariantCulture);
+                if (fused.ColumnPasses.Count != 0)
+                {
+                    // Column passes: the row kernel wrote one partial per block; one kernel sums them.
+                    var partials = new List<string>();
+                    var outputs = new List<string>();
+                    foreach (string columnPass in fused.ColumnPasses)
+                        foreach (var candidate in fused.Program.Passes)
+                            if (string.Equals(candidate.Name, columnPass, StringComparison.Ordinal))
+                            {
+                                string partial = CodegenRowFusionPlan.PartialName(candidate.Output.Name);
+                                buffers[partial] = (long)emitter.LaunchBlocks * fused.Width;
+                                partials.Add(partial);
+                                outputs.Add(candidate.Output.Name);
+                            }
+                    var combiner = new PtxAffineEmitter();
+                    string combineEntry = entry + "_combine";
+                    string combinePtx = combiner.EmitColumnCombine(fused, combineEntry, checked((int)emitter.LaunchBlocks),
+                        computeMajor, computeMinor);
+                    partials.AddRange(outputs);
+                    steps.Add(new PtxProgramStep(combinePtx, combineEntry, combiner.LaunchBlocks,
+                        (uint)combiner.LaunchBlockX, (uint)combiner.LaunchBlockY, partials));
+                    label += " + column combine";
+                }
+                for (int k = at; k < end; k++) labels.Add(label);
                 at = end;
                 continue;
             }
 
             var pass = passes[at++];
-            if (CodegenSplitReduction.TryPlan(pass) is { } split)
+            var custom = lowerPass?.Invoke(pass);
+            var split = custom is null ? CodegenSplitReduction.TryPlan(pass) : custom.Split;
+            if (split is not null)
             {
                 string scratch = "#temp" + temp++.ToString(CultureInfo.InvariantCulture);
                 buffers[scratch] = split.TempElements;
@@ -91,23 +143,47 @@ public sealed class PtxProgramLowering
                 foreach (int source in CodegenSplitReduction.PartialOperandSources(pass))
                     partialArgs.Add(pass.Inputs[source].Name);
                 partialArgs.Add(scratch);
-                steps.Add(Single(split.Partial, partialArgs, computeMajor, computeMinor));
 
                 var combineArgs = new List<string> { scratch };
                 foreach (int source in CodegenSplitReduction.CombineOperandSources(pass))
                     combineArgs.Add(pass.Inputs[source].Name);
                 combineArgs.Add(pass.Output.Name);
-                steps.Add(Single(split.Combine, combineArgs, computeMajor, computeMinor));
+
+                if (custom is not null)
+                {
+                    steps.Add(Step(custom.Kernels[0], partialArgs));
+                    steps.Add(Step(custom.Kernels[1], combineArgs));
+                    labels.Add(custom.Label);
+                }
+                else
+                {
+                    steps.Add(Single(split.Partial, partialArgs, computeMajor, computeMinor));
+                    steps.Add(Single(split.Combine, combineArgs, computeMajor, computeMinor));
+                    labels.Add("modelled split x2");
+                }
                 continue;
             }
 
             var args = new List<string>();
             foreach (var input in pass.Inputs) args.Add(input.Name);
             args.Add(pass.Output.Name);
-            steps.Add(Single(pass, args, computeMajor, computeMinor));
+            if (custom is not null)
+            {
+                steps.Add(Step(custom.Kernels[0], args));
+                labels.Add(custom.Label);
+            }
+            else
+            {
+                steps.Add(Single(pass, args, computeMajor, computeMinor));
+                labels.Add("single");
+            }
         }
-        return new PtxProgramLowering(steps, buffers);
+        return new PtxProgramLowering(steps, buffers, labels);
     }
+
+    private static PtxProgramStep Step(PtxPassKernel kernel, IReadOnlyList<string> args) =>
+        new(kernel.Ptx, kernel.EntryPoint, kernel.Blocks, kernel.BlockX, kernel.BlockY, args,
+            kernel.DynamicSharedMemoryBytes);
 
     private static PtxProgramStep Single(CodegenKernelSpec spec, IReadOnlyList<string> args, int major, int minor)
     {

@@ -236,7 +236,8 @@ public sealed partial class CudaBackend
             }
             var (module, function) = program.Kernels[s];
             // The caller pushed the context; Launch would query it again on every step.
-            module.LaunchCurrentContext(function, step.Blocks, 1, 1, step.BlockX, step.BlockY, 1, 0, argv);
+            module.LaunchCurrentContext(function, step.Blocks, 1, 1, step.BlockX, step.BlockY, 1,
+                step.DynamicSharedMemoryBytes, argv);
         }
     }
 
@@ -278,7 +279,10 @@ public sealed partial class CudaBackend
             {
                 var step = lowering.Steps[s];
                 var module = _directPtxRuntime.LoadModule(step.Ptx, allowExperimentalJitFallback: true);
-                kernels.Add((module, module.GetFunction(step.EntryPoint, out _)));
+                IntPtr function = module.GetFunction(step.EntryPoint, out _);
+                if (step.DynamicSharedMemoryBytes != 0)
+                    module.SetMaxDynamicSharedMemory(function, checked((int)step.DynamicSharedMemoryBytes));
+                kernels.Add((module, function));
                 var slots = new int[step.Arguments.Count];
                 for (int a = 0; a < slots.Length; a++)
                     slots[a] = slotOf.TryGetValue(step.Arguments[a], out int k) ? k : -1 - scratchOf[step.Arguments[a]];

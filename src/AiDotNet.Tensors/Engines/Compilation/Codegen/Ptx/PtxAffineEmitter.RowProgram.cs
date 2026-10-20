@@ -17,6 +17,12 @@
 // of the innermost axis: each lane carries its (outer, inner) column position, advanced by
 // the step's constant increment with one carry, so no step divides.
 //
+// COLUMN PASSES (sums down the rows, one output per column) make the kernel PERSISTENT: a fixed
+// grid of at most ColumnPartialBlockCap blocks loops over the rows, each thread accumulating
+// its columns in registers. After the loop a block row writes its partials straight from
+// registers; warp rows first sum their warps through shared memory, in warp order. The
+// partials are summed in block order by EmitColumnCombine, so the result is deterministic.
+//
 // It is a partial of PtxAffineEmitter so that every per-element operation -- the body, the
 // pre-reduction, the epilogue, the activations -- is the SAME instruction sequence the
 // multi-pass kernels emit.
@@ -56,6 +62,15 @@ public sealed partial class PtxAffineEmitter
         int blockThreads = blockRow ? rowThreads : BlockThreads;
         long threads = (long)plan.Rows * rowThreads;
         long blocks = (threads + blockThreads - 1) / blockThreads;
+        bool columnFused = plan.ColumnPasses.Count != 0;
+        int rowsPerBlock = blockRow ? 1 : blockThreads / Lanes;
+        if (columnFused)
+        {
+            if (!isHeld) throw new NotSupportedException("Column passes need the row held in registers.");
+            if (!blockRow && plan.Width > blockThreads)
+                throw new NotSupportedException("A warp row with column passes is at most one block of columns wide.");
+            blocks = Math.Min((plan.Rows + (long)rowsPerBlock - 1) / rowsPerBlock, ColumnPartialBlockCap);
+        }
 
         _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0;
         EmittedLoads = 0; ElidedGuards = 0; IndirectIndexLoads = 0; AtomicStores = 0;
@@ -99,9 +114,14 @@ public sealed partial class PtxAffineEmitter
         // Rows x 32 threads, a multiple of 32, so it retires whole warps; a block row has
         // exactly one block per row and the guard never fires, so every thread reaches
         // every barrier.
-        string guard = NextP();
-        L($"setp.ge.u32 {guard}, {gid}, {I(threads)};");
-        L($"@{guard} bra END;");
+        // A persistent (column-fused) kernel has no early exit: every thread reaches the
+        // barriers that combine its warps' partials, rows or none.
+        if (!columnFused)
+        {
+            string guard = NextP();
+            L($"setp.ge.u32 {guard}, {gid}, {I(threads)};");
+            L($"@{guard} bra END;");
+        }
         if (blockRow)
         {
             L($"mov.u32 {row}, {ctaid};");
@@ -115,18 +135,23 @@ public sealed partial class PtxAffineEmitter
         string leader = NextP();
         L($"setp.eq.u32 {leader}, {lanePos}, 0;");
 
-        // Row-axis values, outermost first, from the flat row index.
+        // Row-axis values, outermost first, from the flat row index. Emitted where the row is
+        // known: here, or at the top of a persistent kernel's row loop.
         var rowValue = new string[plan.RowExtents.Count];
-        string rest = row;
-        for (int k = plan.RowExtents.Count - 1; k >= 0; k--)
+        void EmitRowValues()
         {
-            if (k == 0) { rowValue[k] = rest; break; }
-            string v = NextR(), q = NextR();
-            L($"rem.u32 {v}, {rest}, {I(plan.RowExtents[k])};");
-            L($"div.u32 {q}, {rest}, {I(plan.RowExtents[k])};");
-            rowValue[k] = v;
-            rest = q;
+            string rest = row;
+            for (int k = plan.RowExtents.Count - 1; k >= 0; k--)
+            {
+                if (k == 0) { rowValue[k] = rest; break; }
+                string v = NextR(), q = NextR();
+                L($"rem.u32 {v}, {rest}, {I(plan.RowExtents[k])};");
+                L($"div.u32 {q}, {rest}, {I(plan.RowExtents[k])};");
+                rowValue[k] = v;
+                rest = q;
+            }
         }
+        if (!columnFused) EmitRowValues();
         string laneBytes = NextRd();
         L($"mul.wide.u32 {laneBytes}, {lanePos}, {I(4 * vector)};");
         // A ragged row's guard compares this lane's first column of a step with the width.
@@ -431,6 +456,33 @@ public sealed partial class PtxAffineEmitter
             L($"@{leader} st.global.f32 [{RowBase(plan.BindingFor(pass.Output))}], {value};");
         }
 
+        // ---- PERSISTENT row loop (column-fused): accumulators live outside it, in fixed registers.
+        var columnAccumulators = new Dictionary<string, string[]>(StringComparer.Ordinal);
+        if (columnFused)
+        {
+            foreach (string name in plan.ColumnPasses)
+            {
+                var acc = new string[perThread];
+                for (int e = 0; e < perThread; e++)
+                {
+                    acc[e] = NextF();
+                    L($"mov.f32 {acc[e]}, 0f00000000;");
+                }
+                columnAccumulators[name] = acc;
+            }
+            if (!blockRow)
+            {
+                string warpOfRow = NextR();
+                L($"shr.u32 {warpOfRow}, {tid}, 5;");
+                L($"mad.lo.u32 {row}, {ctaid}, {I(rowsPerBlock)}, {warpOfRow};");
+            }
+            string done = NextP();
+            _body.Append("ROWLOOP:\n");
+            L($"setp.ge.u32 {done}, {row}, {I(plan.Rows)};");
+            L($"@{done} bra ROWDONE;");
+            EmitRowValues();
+        }
+
         if (isHeld)
         {
             // ---- HELD: every step at a compile-time offset, sources cached for the kernel.
@@ -487,6 +539,19 @@ public sealed partial class PtxAffineEmitter
             foreach (var pass in plan.Program.Passes)
             {
                 if (plan.RowPasses.Contains(pass.Name)) { RowPass(pass); continue; }
+                if (columnAccumulators.TryGetValue(pass.Name, out var columnAcc))
+                {
+                    // A column pass: this row's term for each held column, into its accumulator.
+                    for (int e = 0; e < perThread; e++)
+                    {
+                        string term = Term(pass, e);
+                        stepGuard = GuardOf(e / vector);
+                        term = Guarded(pass, term);
+                        stepGuard = null;
+                        L($"add.rn.f32 {columnAcc[e]}, {columnAcc[e]}, {term};");
+                    }
+                    continue;
+                }
                 if (pass.Reduce != CodegenReduceKind.None)
                 {
                     bool max = pass.Reduce == CodegenReduceKind.Max;
@@ -509,7 +574,19 @@ public sealed partial class PtxAffineEmitter
                     StorePointwise(pass, perThread, chunk => AddressOf(plan.BindingFor(pass.Output), chunk), GuardOf);
                 }
             }
+
+            if (columnFused)
+            {
+                // A block row's warps share one slot per statistic, written each row: the next
+                // row must not overwrite a slot a slower warp is still reading.
+                if (laneInWarp is not null) L("bar.sync 0;");
+                L($"add.u32 {row}, {row}, {I((int)blocks * rowsPerBlock)};");
+                L("bra ROWLOOP;");
+                _body.Append("ROWDONE:\n");
+                EmitColumnPartials();
+            }
         }
+
         else
         {
             // ---- STREAMED: sweeps over the row with a runtime step counter.
@@ -534,6 +611,102 @@ public sealed partial class PtxAffineEmitter
                 if (pass.Reduce != CodegenReduceKind.None) sweepOutputs.Add(pass.Output.Name);
             }
             EmitSweep(sweep, sweepIndex);
+        }
+
+        // Each column pass's per-block partial: partial[block, column], column the flattened index
+        // chunk * step + lane * vector. Guards are recomputed here from lane-only values: a warp
+        // whose first row is past the end ran no iteration, so nothing computed in the loop is set.
+        void EmitColumnPartials()
+        {
+            if (!columnFused) return;
+            string laneCol = NextR();
+            L($"mul.lo.u32 {laneCol}, {lanePos}, {I(vector)};");
+            string? Overhang(int chunk)
+            {
+                if ((long)(chunk + 1) * step <= plan.Width) return null;
+                string inRow = NextP();
+                L($"setp.lt.u32 {inRow}, {laneCol}, {I(plan.Width - chunk * step)};");
+                return inRow;
+            }
+            void StoreChunk(string space, string address, string[] acc, int chunk, string? inRow)
+            {
+                string op = (inRow is null ? "" : "@" + inRow + " ") + "st." + space;
+                if (vector == 1) { L($"{op}.f32 [{address}], {acc[chunk]};"); return; }
+                var parts = new string[vector];
+                for (int c = 0; c < vector; c++) parts[c] = acc[chunk * vector + c];
+                L($"{op}.v{I(vector)}.f32 [{address}], {{{string.Join(", ", parts)}}};");
+            }
+
+            if (blockRow)
+            {
+                // One row per block at a time: each thread owns its columns outright.
+                foreach (string name in plan.ColumnPasses)
+                {
+                    var acc = columnAccumulators[name];
+                    string blockAt = NextRd(), laneAt = NextRd();
+                    L($"mad.wide.u32 {blockAt}, {ctaid}, {I64((long)plan.Width * 4)}, {basePtr[CodegenRowFusionPlan.PartialName(OutputOf(name))]};");
+                    L($"add.s64 {laneAt}, {blockAt}, {laneBytes};");
+                    for (int chunk = 0; chunk < chunks; chunk++)
+                    {
+                        string at = NextRd();
+                        L($"add.s64 {at}, {laneAt}, {I64((long)chunk * step * 4)};");
+                        StoreChunk("global", at, acc, chunk, Overhang(chunk));
+                    }
+                }
+                return;
+            }
+
+            // Warp rows: every warp holds the same columns for different rows. Sum them through
+            // shared memory, warp 0 first, then one thread per column writes the block's partial.
+            int slots = rowsPerBlock * plan.Width;
+            _sb.Append("    .shared .align 16 .b8 colred[").Append(I(slots * 4)).Append("];\n");
+            string warp = NextR(), smem = NextRd(), warpRow = NextRd(), laneSlot = NextRd(), owner = NextP();
+            L($"shr.u32 {warp}, {tid}, 5;");
+            L($"mov.u64 {smem}, colred;");
+            L($"mad.wide.u32 {warpRow}, {warp}, {I64((long)plan.Width * 4)}, {smem};");
+            L($"add.s64 {laneSlot}, {warpRow}, {laneBytes};");
+            L($"setp.lt.u32 {owner}, {tid}, {I(plan.Width)};");
+            string columnBytes = NextRd();
+            L($"mul.wide.u32 {columnBytes}, {tid}, 4;");
+            int combineIndex = 0;
+            foreach (string name in plan.ColumnPasses)
+            {
+                var acc = columnAccumulators[name];
+                for (int chunk = 0; chunk < chunks; chunk++)
+                {
+                    string at = NextRd();
+                    L($"add.s64 {at}, {laneSlot}, {I64((long)chunk * step * 4)};");
+                    StoreChunk("shared", at, acc, chunk, Overhang(chunk));
+                }
+                L("bar.sync 0;");
+                string skip = "COLSKIP" + I(combineIndex++);
+                string notOwner = NextP();
+                L($"not.pred {notOwner}, {owner};");
+                L($"@{notOwner} bra {skip};");
+                string column = NextRd(), total = NextF();
+                L($"add.s64 {column}, {smem}, {columnBytes};");
+                L($"ld.shared.f32 {total}, [{column}];");
+                for (int w = 1; w < rowsPerBlock; w++)
+                {
+                    string part = NextF(), next = NextF();
+                    L($"ld.shared.f32 {part}, [{column}+{I64((long)w * plan.Width * 4)}];");
+                    L($"add.rn.f32 {next}, {total}, {part};");
+                    total = next;
+                }
+                string blockAt = NextRd(), at2 = NextRd();
+                L($"mad.wide.u32 {blockAt}, {ctaid}, {I64((long)plan.Width * 4)}, {basePtr[CodegenRowFusionPlan.PartialName(OutputOf(name))]};");
+                L($"add.s64 {at2}, {blockAt}, {columnBytes};");
+                L($"st.global.f32 [{at2}], {total};");
+                _body.Append(skip).Append(":\n");
+                L("bar.sync 0;");
+            }
+        }
+
+        string OutputOf(string passName)
+        {
+            foreach (var pass in plan.Program.Passes)
+                if (string.Equals(pass.Name, passName, StringComparison.Ordinal)) return pass.Output.Name;
+            throw new InvalidOperationException("No pass named '" + passName + "'.");
         }
 
         void EmitSweep(List<CodegenKernelSpec> passes, int index)
@@ -716,6 +889,83 @@ public sealed partial class PtxAffineEmitter
             }
         }
 
+        _body.Append("END:\n    ret;\n}\n");
+        return Assemble();
+    }
+
+    /// <summary>
+    /// Most blocks a column-fused row kernel launches: each writes one partial per column, and
+    /// the combine reads all of them per column, so the grid is capped and the blocks loop.
+    /// </summary>
+    internal const int ColumnPartialBlockCap = 256;
+
+    /// <summary>
+    /// The combine kernel of a column-fused <paramref name="plan"/>: one thread per column sums
+    /// each column pass's <paramref name="partialBlocks"/> partials in block order, applies the
+    /// pass's epilogue and stores it. Parameters: every partial buffer, then every output, in
+    /// <see cref="CodegenRowFusionPlan.ColumnPasses"/> order.
+    /// </summary>
+    public string EmitColumnCombine(CodegenRowFusionPlan plan, string kernelName, int partialBlocks,
+        int computeMajor, int computeMinor)
+    {
+        if (plan is null) throw new ArgumentNullException(nameof(plan));
+        if (plan.ColumnPasses.Count == 0) throw new ArgumentException("The plan has no column passes.", nameof(plan));
+        if (partialBlocks <= 0) throw new ArgumentOutOfRangeException(nameof(partialBlocks));
+        var passes = new List<CodegenKernelSpec>();
+        foreach (string name in plan.ColumnPasses)
+            foreach (var pass in plan.Program.Passes)
+                if (string.Equals(pass.Name, name, StringComparison.Ordinal)) passes.Add(pass);
+
+        _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0;
+        int threads = BlockThreads;
+        LaunchBlockX = threads; LaunchBlockY = 1; LaunchBlockThreads = threads;
+        LaunchBlocks = checked((uint)((plan.Width + threads - 1) / threads));
+        _sb.Append(".version ").Append(PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
+           .Append(".target sm_").Append(I(computeMajor)).Append(I(computeMinor)).Append('\n')
+           .Append(".address_size 64\n\n")
+           .Append("// generated by PtxAffineEmitter.EmitColumnCombine: ").Append(plan.Program.Description)
+           .Append(", ").Append(I(partialBlocks)).Append(" partials per column\n")
+           .Append(".visible .entry ").Append(kernelName).Append("(\n");
+        int parameters = passes.Count * 2;
+        for (int i = 0; i < parameters; i++)
+            _sb.Append("    .param .u64 p").Append(I(i)).Append(i == parameters - 1 ? "\n" : ",\n");
+        _sb.Append(")\n.maxntid ").Append(I(threads)).Append(", 1, 1\n{\n");
+
+        string column = NextR(), ctaid = NextR(), tid = NextR(), outside = NextP(), columnBytes = NextRd();
+        L($"mov.u32 {ctaid}, %ctaid.x;");
+        L($"mov.u32 {tid}, %tid.x;");
+        L($"mad.lo.u32 {column}, {ctaid}, {I(threads)}, {tid};");
+        L($"setp.ge.u32 {outside}, {column}, {I(plan.Width)};");
+        L($"@{outside} bra END;");
+        L($"mul.wide.u32 {columnBytes}, {column}, 4;");
+        for (int k = 0; k < passes.Count; k++)
+        {
+            var pass = passes[k];
+            string partials = NextRd(), output = NextRd(), at = NextRd();
+            L($"ld.param.u64 {partials}, [p{I(k)}];");
+            L($"ld.param.u64 {output}, [p{I(passes.Count + k)}];");
+            L($"add.s64 {at}, {partials}, {columnBytes};");
+            // In block order: the same sum, run to run.
+            string acc = NextF(), counter = NextR(), more = NextP();
+            L($"mov.f32 {acc}, 0f00000000;");
+            L($"mov.u32 {counter}, 0;");
+            string label = "COMBINE" + I(k);
+            _body.Append(label).Append(":\n");
+            string part = NextF();
+            L($"ld.global.f32 {part}, [{at}];");
+            L($"add.rn.f32 {acc}, {acc}, {part};");
+            L($"add.s64 {at}, {at}, {I64((long)plan.Width * 4)};");
+            L($"add.u32 {counter}, {counter}, 1;");
+            L($"setp.lt.u32 {more}, {counter}, {I(partialBlocks)};");
+            L($"@{more} bra {label};");
+            string value = acc;
+            if (pass.ReduceScale != 1.0) { string r = NextF(); L($"mul.rn.f32 {r}, {value}, {F32(pass.ReduceScale)};"); value = r; }
+            if (pass.ReduceOffset != 0.0) { string r = NextF(); L($"add.rn.f32 {r}, {value}, {F32(pass.ReduceOffset)};"); value = r; }
+            value = EmitActivation(pass.Activation, value);
+            string store = NextRd();
+            L($"add.s64 {store}, {output}, {columnBytes};");
+            L($"st.global.f32 [{store}], {value};");
+        }
         _body.Append("END:\n    ret;\n}\n");
         return Assemble();
     }

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Expression bodies and the normalisation backward programs (#890 phase 4a).
 //
 // The backward programs are held to gradients derived independently here -- by finite
@@ -272,15 +272,92 @@ public class CodegenBackwardProgramTests
         CheckAgainstFiniteDifferences(Forward, x, dy, g, b, grads);
     }
 
-    /// <summary>The input-gradient passes fuse into one row kernel; the column reductions do not.</summary>
+    /// <summary>
+    /// The whole backward is one row kernel: the input-gradient passes as rows, dgamma and dbeta
+    /// as COLUMN passes accumulated into per-block partials. Lowered, it is two launches -- the
+    /// row kernel and the combine -- where separate splits took five.
+    /// </summary>
     [Fact]
-    public void TheInputGradientFusesAndTheColumnReductionsStayApart()
+    public void TheWholeBackwardFusesWithTheColumnReductionsAsPartials()
     {
         var program = CodegenFusedStatistics.LayerNormBackward(64, 1024);
         var dx = new CodegenProgram(new[] { program.Passes[0], program.Passes[1], program.Passes[2] },
             new long[] { 64, 64, 64 * 1024 }, "dx");
         Assert.NotNull(CodegenRowFusion.TryPlan(dx, out _));
-        Assert.Null(CodegenRowFusion.TryPlan(program, out _));
+
+        var plan = CodegenRowFusion.TryPlan(program, out string reason) ?? throw new InvalidOperationException(reason);
+        Assert.Equal(new[] { "layernorm_bwd_dgamma", "layernorm_bwd_dbeta" }, plan.ColumnPasses);
+        Assert.Contains(CodegenRowFusionPlan.PartialName("dgamma"), plan.Parameters);
+        Assert.DoesNotContain("dgamma", plan.Parameters);
+
+        var lowering = PtxProgramLowering.Create(program, "layernorm_backward", 7, 5);
+        Assert.Equal(2, lowering.Steps.Count);
+        Assert.EndsWith("_combine", lowering.Steps[1].EntryPoint, StringComparison.Ordinal);
+        Assert.Equal((long)lowering.Steps[0].Blocks * 1024, lowering.Buffers[CodegenRowFusionPlan.PartialName("dgamma")]);
+        Assert.Equal(new[] { CodegenRowFusionPlan.PartialName("dgamma"), CodegenRowFusionPlan.PartialName("dbeta"), "dgamma", "dbeta" },
+            lowering.Steps[1].Arguments);
+    }
+
+    /// <summary>
+    /// At a square shape a column pass (j | i) has exactly the axes of a row reduction (i | j);
+    /// its maps tell them apart -- read as a row reduction it reads x and dy transposed.
+    /// </summary>
+    [Fact]
+    public void AColumnPassIsRecognisedAtASquareShape()
+    {
+        var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNormBackward(100, 100), out string reason)
+            ?? throw new InvalidOperationException(reason);
+        Assert.Equal(2, plan.ColumnPasses.Count);
+        Assert.Equal(new[] { 100 }, plan.RowExtents);
+    }
+
+    /// <summary>A column pass's output is final only after the combine; nothing in the kernel may read it.</summary>
+    [Fact]
+    public void APassReadingAColumnOutputIsNotFused()
+    {
+        var program = CodegenFusedStatistics.LayerNormBackward(64, 256);
+        var dgamma = program.Passes[3];
+        var reader = new CodegenKernelSpec("reads_dgamma",
+            new CodegenIterationSpace(CodegenAxis.Parallel("i", 64), CodegenAxis.Parallel("j", 256)),
+            new[]
+            {
+                new CodegenTensorBinding(0, "x", new[] { 64, 256 }, new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }),
+                new CodegenTensorBinding(1, "dgamma", new[] { 256 }, new[] { CodegenAffineExpr.Axis(1) }),
+            },
+            new CodegenTensorBinding(2, "scaled", new[] { 64, 256 }, new[] { CodegenAffineExpr.Axis(0), CodegenAffineExpr.Axis(1) }, isOutput: true),
+            new[] { 0, 1 }, CodegenReduceKind.None);
+        var passes = new List<CodegenKernelSpec>(program.Passes) { reader };
+        var temps = new List<long>(program.TempElements) { 64 * 256 };
+        Assert.Equal("layernorm_bwd_dgamma", dgamma.Name);
+        Assert.Null(CodegenRowFusion.TryPlan(new CodegenProgram(passes, temps, "reads a column output"), out string reason));
+        Assert.Contains("combine", reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The persistent row loop and the partial writes: warp rows (64 wide) sum their warps
+    /// through shared memory; block rows (1024 wide, 128 threads of 8) write straight from
+    /// registers. The combine sums each column pass in block order.
+    /// </summary>
+    [Fact]
+    public void ColumnFusedKernelsLoopOverRowsAndCombinePartials()
+    {
+        foreach (var (columns, warpRows) in new[] { (64, true), (1024, false) })
+        {
+            var plan = CodegenRowFusion.TryPlan(CodegenFusedStatistics.LayerNormBackward(512, columns), out string reason)
+                ?? throw new InvalidOperationException(reason);
+            var emitter = new PtxAffineEmitter();
+            string ptx = emitter.EmitRowProgram(plan, "rowfused_lnb", 7, 5);
+            Assert.Contains("ROWLOOP:", ptx, StringComparison.Ordinal);
+            Assert.Contains("ROWDONE:", ptx, StringComparison.Ordinal);
+            Assert.DoesNotContain("bra END;", ptx, StringComparison.Ordinal);   // no early exit before the barriers
+            Assert.Equal(warpRows, ptx.Contains("colred", StringComparison.Ordinal));
+            Assert.True(emitter.LaunchBlocks <= PtxAffineEmitter.ColumnPartialBlockCap);
+            Assert.True(plan.Layout(4) is { PerThread: <= CodegenRowFusion.ColumnFusedPerThread });
+
+            string combine = new PtxAffineEmitter().EmitColumnCombine(plan, "rowfused_lnb_combine", (int)emitter.LaunchBlocks, 7, 5);
+            Assert.Contains("COMBINE0:", combine, StringComparison.Ordinal);
+            Assert.Contains("COMBINE1:", combine, StringComparison.Ordinal);
+        }
     }
 
     // ---- column reductions -----------------------------------------------------------------
