@@ -6926,8 +6926,9 @@ namespace AiDotNet.Tensors.Engines.Simd
             // AVX-512 path: 16-wide Vector512 doubles throughput vs the
             // AVX2 8-wide path. Requires CpuFeatures.HasAVX512F (Intel
             // Ice Lake+, Sapphire Rapids, AMD Zen 5). 2×-unroll for
-            // pipelined 16-wide FMAs gives ~2× speedup over the AVX2
-            // Herumi table path, ~4× over the AVX2 polynomial path.
+            // pipelined 16-wide FMAs improves throughput over the AVX2
+            // polynomial path, with the same bits (same polynomial, same
+            // reduction order).
             if (CpuFeatures.HasAVX512F && length >= 32)
             {
                 var vmaxBcast = Vector512.Create(maxVal);
@@ -6977,7 +6978,9 @@ namespace AiDotNet.Tensors.Engines.Simd
                     vsum2 = Avx.Add(vsum2, e2);
                     vsum3 = Avx.Add(vsum3, e3);
                 }
-                vsum0 = Avx.Add(Avx.Add(vsum0, vsum1), Avx.Add(vsum2, vsum3));
+                // The AVX-512 path's grouping: its two accumulators pair group 0 with 2 and 1 with 3, so the two
+                // paths give the same bits.
+                vsum0 = Avx.Add(Avx.Add(vsum0, vsum2), Avx.Add(vsum1, vsum3));
                 sumExp = HorizontalSum(vsum0);
             }
 #endif

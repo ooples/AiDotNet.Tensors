@@ -7,20 +7,13 @@ using System.Runtime.Intrinsics.X86;
 namespace AiDotNet.Tensors.Engines.Simd;
 
 /// <summary>
-/// CPU feature detection for optimal kernel dispatch.
-///
-/// Key differences that affect kernel selection:
-/// - Intel: vpgatherdd is fast (4-8 cycles) → table-driven kernels win
-/// - AMD Zen: vpgatherdd is slow (12-20 cycles) → polynomial kernels win
-/// - Intel: vdivps throughput 5 cycles → divide is acceptable
-/// - AMD Zen: vdivps throughput 10 cycles → avoid divides when possible
+/// CPU feature detection for optimal kernel dispatch. Kernels are chosen by instruction set alone; no kernel
+/// depends on the CPU vendor.
 /// </summary>
 internal static class CpuFeatures
 {
 #pragma warning disable CS0649 // Fields assigned only under #if NET5_0_OR_GREATER
     private static bool _detected;
-    private static bool _isIntel;
-    private static bool _isAMD;
     private static bool _hasAVX2;
     private static bool _hasFMA;
     private static bool _hasAVX512F;
@@ -28,13 +21,7 @@ internal static class CpuFeatures
     private static bool _hasAVX512DQ;
     private static bool _hasAVX512VNNI;
     private static bool _hasAMXTile;
-#pragma warning restore CS0649 // Intel: yes, AMD Zen 1-4: no
-
-    /// <summary>True if CPU is Intel (moderate divide).</summary>
-    internal static bool IsIntel { get { EnsureDetected(); return _isIntel; } }
-
-    /// <summary>True if CPU is AMD (slow divide).</summary>
-    internal static bool IsAMD { get { EnsureDetected(); return _isAMD; } }
+#pragma warning restore CS0649
 
     /// <summary>True if AVX2 is supported.</summary>
     internal static bool HasAVX2 { get { EnsureDetected(); return _hasAVX2; } }
@@ -93,49 +80,6 @@ internal static class CpuFeatures
         // all have non-VNNI fallbacks.
         _hasAVX512VNNI = false;
 #endif
-
-        // Detect vendor from multiple sources for cross-platform support
-        try
-        {
-            // Try Windows PROCESSOR_IDENTIFIER first, then /proc/cpuinfo on Linux
-            string cpuInfo = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "";
-
-            if (string.IsNullOrEmpty(cpuInfo) && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
-                    System.Runtime.InteropServices.OSPlatform.Linux))
-            {
-                try
-                {
-                    // Read /proc/cpuinfo model name on Linux
-                    foreach (var line in System.IO.File.ReadLines("/proc/cpuinfo"))
-                    {
-                        if (line.StartsWith("model name", StringComparison.OrdinalIgnoreCase)
-                            || line.StartsWith("vendor_id", StringComparison.OrdinalIgnoreCase))
-                        {
-                            cpuInfo += " " + line;
-                        }
-                        if (cpuInfo.Length > 200) break;
-                    }
-                }
-                catch { /* /proc/cpuinfo not available */ }
-            }
-
-            if (cpuInfo.Contains("Intel", StringComparison.OrdinalIgnoreCase)
-                || cpuInfo.Contains("GenuineIntel", StringComparison.OrdinalIgnoreCase))
-            {
-                _isIntel = true;
-            }
-            else if (cpuInfo.Contains("AMD", StringComparison.OrdinalIgnoreCase)
-                  || cpuInfo.Contains("AuthenticAMD", StringComparison.OrdinalIgnoreCase)
-                  || cpuInfo.Contains("Ryzen", StringComparison.OrdinalIgnoreCase)
-                  || cpuInfo.Contains("EPYC", StringComparison.OrdinalIgnoreCase))
-            {
-                _isAMD = true;
-            }
-        }
-        catch
-        {
-            // Vendor unknown: no kernel depends on it.
-        }
 #endif
         _detected = true;
     }
