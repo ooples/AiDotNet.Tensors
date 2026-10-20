@@ -87,12 +87,8 @@ public sealed partial class WebGpuBackend
             throw new InvalidOperationException("Generated WGSL has no declared workgroup size.");
         if (!CanExecuteCodegenKernel(sourceKernel))
             throw new NotSupportedException("Generated WGSL exceeds this WebGPU device's workgroup limits.");
+        // Past the per-dimension limit the dispatch folds onto a 2-D grid (WebGpuDispatchFold).
         int workgroups = checked((int)(((long)elementCount + workgroupSize - 1L) / workgroupSize));
-        if (workgroups > _device.MaxWorkgroupsPerDimension)
-        {
-            throw new NotSupportedException(
-                "Generated WGSL requires more X-dimension workgroups than this WebGPU device supports.");
-        }
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(
             pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId,
             workgroups, 1, 1).ConfigureAwait(false);

@@ -95,6 +95,10 @@ public static partial class WebGpuNativeBindings
     /// </summary>
     public static void DestroyDevice()
     {
+        // Every module and pipeline id belongs to the device.
+        s_moduleSources.Clear();
+        s_pipelineEntries.Clear();
+        s_foldedPipelines.Clear();
         if (Host is { } host) host.Invoke("destroyDevice", Args());
         else JsDestroyDevice();
     }
@@ -228,7 +232,11 @@ public static partial class WebGpuNativeBindings
     /// <param name="wgslSource">WGSL shader source code.</param>
     /// <returns>Shader module ID.</returns>
     public static int CreateShaderModule(string wgslSource)
-        => Host is { } host ? HostValue<int>(host.Invoke("createShaderModule", Args(wgslSource))) : JsCreateShaderModule(wgslSource);
+    {
+        int id = Host is { } host ? HostValue<int>(host.Invoke("createShaderModule", Args(wgslSource))) : JsCreateShaderModule(wgslSource);
+        if (id >= 0) s_moduleSources[id] = wgslSource;
+        return id;
+    }
 
     [JSImport("createShaderModule", ModuleName)]
     private static partial int JsCreateShaderModule(string wgslSource);
@@ -239,8 +247,14 @@ public static partial class WebGpuNativeBindings
     /// <param name="shaderModuleId">Shader module ID.</param>
     /// <param name="entryPoint">Entry point function name.</param>
     /// <returns>Pipeline ID.</returns>
-    public static Task<int> CreateComputePipelineAsync(int shaderModuleId, string entryPoint)
-        => Host is { } host ? Task.FromResult(HostValue<int>(host.Invoke("createComputePipeline", Args(shaderModuleId, entryPoint)))) : JsCreateComputePipelineAsync(shaderModuleId, entryPoint);
+    public static async Task<int> CreateComputePipelineAsync(int shaderModuleId, string entryPoint)
+    {
+        int id = Host is { } host
+            ? HostValue<int>(host.Invoke("createComputePipeline", Args(shaderModuleId, entryPoint)))
+            : await JsCreateComputePipelineAsync(shaderModuleId, entryPoint).ConfigureAwait(false);
+        if (id >= 0 && s_moduleSources.TryGetValue(shaderModuleId, out var source)) s_pipelineEntries[id] = (source, entryPoint);
+        return id;
+    }
 
     [JSImport("createComputePipeline", ModuleName)]
     private static partial Task<int> JsCreateComputePipelineAsync(int shaderModuleId, string entryPoint);
@@ -250,6 +264,7 @@ public static partial class WebGpuNativeBindings
     /// </summary>
     public static void DestroyShaderModule(int shaderModuleId)
     {
+        s_moduleSources.TryRemove(shaderModuleId, out _);
         if (Host is { } host) host.Invoke("destroyShaderModule", Args(shaderModuleId));
         else JsDestroyShaderModule(shaderModuleId);
     }
@@ -262,6 +277,8 @@ public static partial class WebGpuNativeBindings
     /// </summary>
     public static void DestroyPipeline(int pipelineId)
     {
+        s_pipelineEntries.TryRemove(pipelineId, out _);
+        if (s_foldedPipelines.TryRemove(pipelineId, out var folded) && folded >= 0) DestroyPipeline(folded);
         if (Host is { } host) host.Invoke("destroyPipeline", Args(pipelineId));
         else JsDestroyPipeline(pipelineId);
     }
@@ -347,6 +364,7 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
     public static Task DispatchComputeAsync(int pipelineId, int bindGroupId, int workgroupsX, int workgroupsY, int workgroupsZ)
     {
+        if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, -1, workgroupsX);
         if (Host is not { } host) return JsDispatchComputeAsync(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchCompute", Args(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ));
         return Task.CompletedTask;
@@ -366,6 +384,7 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
     public static Task DispatchComputeWithUniformsAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroupsX, int workgroupsY, int workgroupsZ)
     {
+        if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX);
         if (Host is not { } host) return JsDispatchComputeWithUniformsAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchComputeWithUniforms", Args(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ));
         return Task.CompletedTask;
@@ -382,6 +401,8 @@ public static partial class WebGpuNativeBindings
     {
         if (pipelineIds.Length != bindGroupIds.Length || pipelineIds.Length != uniformBufferIds.Length || pipelineIds.Length != workgroupsX.Length)
             throw new ArgumentException("Every dispatch needs a pipeline, a bind group, a uniform buffer and a workgroup count.");
+        foreach (int x in workgroupsX)
+            if (NeedsFold(x, 1, 1)) return DispatchChainOneByOneAsync(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX);
         if (Host is not { } host)
             return JsDispatchComputeChainWithUniformsAsync(ToDoubles(pipelineIds), ToDoubles(bindGroupIds), ToDoubles(uniformBufferIds), ToDoubles(workgroupsX));
         host.Invoke("dispatchComputeChainWithUniforms", Args(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX));
@@ -399,6 +420,71 @@ public static partial class WebGpuNativeBindings
     private static partial Task JsDispatchComputeChainWithUniformsAsync([JSMarshalAs<JSType.Array<JSType.Number>>] double[] pipelineIds,
         [JSMarshalAs<JSType.Array<JSType.Number>>] double[] bindGroupIds, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] uniformBufferIds,
         [JSMarshalAs<JSType.Array<JSType.Number>>] double[] workgroupsX);
+
+    // A 1-D dispatch past the per-dimension limit runs the entry point's folded copy on a 2-D grid
+    // (WebGpuDispatchFold), so no caller has to size its work to 65,535 workgroups. Each pipeline remembers its source
+    // and entry point for that; its folded pipeline is built on first need (-1: the entry point cannot be folded).
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> s_moduleSources = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, (string Source, string EntryPoint)> s_pipelineEntries = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, int> s_foldedPipelines = new();
+
+    /// <summary>The device's workgroups per dimension (WebGpuDevice sets it from the adapter's limits).</summary>
+    internal static int MaxWorkgroupsPerDimension { get; set; } = 65535;
+
+    private static bool NeedsFold(int workgroupsX, int workgroupsY, int workgroupsZ)
+        => workgroupsX > MaxWorkgroupsPerDimension && workgroupsY == 1 && workgroupsZ == 1;
+
+    private static async Task DispatchFoldedAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroups)
+    {
+        var (x, y) = WebGpuDispatchFold.Grid(workgroups, MaxWorkgroupsPerDimension);
+        int folded = await FoldedPipelineAsync(pipelineId).ConfigureAwait(false);
+        int groups = CreateBuffer(16, (int)(WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst));
+        if (groups < 0) throw new InvalidOperationException("Could not create the folded dispatch's uniform buffer.");
+        try
+        {
+            var count = new byte[16];
+            BitConverter.GetBytes((uint)workgroups).CopyTo(count, 0);
+            WriteBufferBase64(groups, Convert.ToBase64String(count), 0);
+            if (Host is { } host)
+                host.Invoke("dispatchComputeFolded", Args(folded, bindGroupId, uniformBufferId, groups, x, y));
+            else
+                await JsDispatchComputeFoldedAsync(folded, bindGroupId, uniformBufferId, groups, x, y).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Like a kernel's uniform buffer: work already submitted keeps it alive.
+            DestroyBuffer(groups);
+        }
+    }
+
+    private static async Task<int> FoldedPipelineAsync(int pipelineId)
+    {
+        if (!s_foldedPipelines.TryGetValue(pipelineId, out int folded))
+        {
+            folded = -1;
+            if (s_pipelineEntries.TryGetValue(pipelineId, out var entry)
+                && WebGpuDispatchFold.FoldSource(entry.Source, entry.EntryPoint) is { } source)
+            {
+                int module = CreateShaderModule(source);
+                if (module >= 0) folded = await CreateComputePipelineAsync(module, entry.EntryPoint).ConfigureAwait(false);
+            }
+            folded = s_foldedPipelines.GetOrAdd(pipelineId, folded);
+        }
+        if (folded < 0)
+            throw new GpuCapabilityUnavailableException(
+                $"Pipeline {pipelineId} needs more workgroups than the device dispatches per dimension ({MaxWorkgroupsPerDimension}), and its entry point cannot be folded onto a 2-D grid.");
+        return folded;
+    }
+
+    // A chain with a stage past the limit: the stages one dispatch each, in order (the queue keeps them ordered).
+    private static async Task DispatchChainOneByOneAsync(int[] pipelineIds, int[] bindGroupIds, int[] uniformBufferIds, int[] workgroupsX)
+    {
+        for (int i = 0; i < pipelineIds.Length; i++)
+            await DispatchComputeWithUniformsAsync(pipelineIds[i], bindGroupIds[i], uniformBufferIds[i], workgroupsX[i], 1, 1).ConfigureAwait(false);
+    }
+
+    [JSImport("dispatchComputeFolded", ModuleName)]
+    private static partial Task JsDispatchComputeFoldedAsync(int pipelineId, int bindGroupId, int uniformBufferId, int groupsBufferId, int workgroupsX, int workgroupsY);
 
     /// <summary>
     /// Submits all pending GPU commands and waits for completion.
