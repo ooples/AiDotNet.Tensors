@@ -41,6 +41,15 @@ internal interface IGraphStepIo : IDisposable
     void Flush();
 
     /// <summary>
+    /// Sets a device copy of <paramref name="source"/>'s first <paramref name="count"/> floats into
+    /// <paramref name="destination"/> for the prologue to make at the start of every replay (the compiled plan's
+    /// loss-gradient reseed, which as a copy node of its own cost a launch and a gap per replay). Takes effect at the
+    /// next <see cref="CapturePrologue"/>; null buffers clear it. False when the copy is not taken (the caller then
+    /// records it itself).
+    /// </summary>
+    bool TrySetPrologueCopy(IGpuBuffer? source, IGpuBuffer? destination, int count);
+
+    /// <summary>
     /// Records the copy of every input out of the current slot. Call first inside the capture. <paramref name="parity"/>
     /// is the replay parity the graph being captured runs at (0 or 1) when the plan alternates two graphs, else 0.
     /// </summary>
