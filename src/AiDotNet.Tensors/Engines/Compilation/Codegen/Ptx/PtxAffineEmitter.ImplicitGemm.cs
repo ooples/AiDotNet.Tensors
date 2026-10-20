@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // A tiled implicit-GEMM lowering for any two-operand sum reduction (#890 phase 4b).
 //
 // The specialised tiled convolution covers stride 1, dilation 1, padding 1 only, and the tiled
@@ -87,7 +87,7 @@ public sealed partial class PtxAffineEmitter
         long blocks = mBlocks * nBlocks * bTotal;
         if (blocks > int.MaxValue) throw new NotSupportedException("Too many tiles for one grid.");
 
-        _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0;
+        _sb.Clear(); _body.Clear(); _calledFunctions.Clear(); _r = _f = _p = _rd = 0;
         EmittedLoads = 0; ElidedGuards = 0; IndirectIndexLoads = 0; AtomicStores = 0;
         ExtraOutputStores = 0; VectorisedStores = 0; VectorisedLoads = 0;
         _inputBindings = spec.Inputs;

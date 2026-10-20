@@ -72,7 +72,7 @@ public sealed partial class PtxAffineEmitter
             blocks = Math.Min((plan.Rows + (long)rowsPerBlock - 1) / rowsPerBlock, ColumnPartialBlockCap);
         }
 
-        _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0;
+        _sb.Clear(); _body.Clear(); _calledFunctions.Clear(); _r = _f = _p = _rd = 0;
         EmittedLoads = 0; ElidedGuards = 0; IndirectIndexLoads = 0; AtomicStores = 0;
         ExtraOutputStores = 0; VectorisedStores = 0; VectorisedLoads = 0;
         SharedMemoryBytes = 0; StagedOperands = "none";
@@ -922,7 +922,7 @@ public sealed partial class PtxAffineEmitter
             foreach (var pass in plan.Program.Passes)
                 if (string.Equals(pass.Name, name, StringComparison.Ordinal)) passes.Add(pass);
 
-        _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0;
+        _sb.Clear(); _body.Clear(); _calledFunctions.Clear(); _r = _f = _p = _rd = 0;
         int threads = BlockThreads, groups = threads / Lanes;
         LaunchBlockX = threads; LaunchBlockY = 1; LaunchBlockThreads = threads;
         LaunchBlocks = checked((uint)((plan.Width + Lanes - 1) / Lanes));

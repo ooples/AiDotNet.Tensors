@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Globalization;
@@ -245,6 +245,55 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// Links <paramref name="ptx"/> with relocatable device <paramref name="objects"/> (NVRTC -rdc cubins) through the
+    /// driver linker and loads the result: how a declared kernel that calls a math-library function gets its body.
+    /// </summary>
+    internal unsafe DirectPtxModule LoadLinkedModule(string ptx, IReadOnlyList<byte[]> objects)
+    {
+        if (string.IsNullOrWhiteSpace(ptx)) throw new ArgumentException("PTX cannot be empty.", nameof(ptx));
+        if (objects is null) throw new ArgumentNullException(nameof(objects));
+        using var _ = Enter();
+        const int logBytes = 16 * 1024;
+        IntPtr errorLog = Marshal.AllocHGlobal(logBytes);
+        IntPtr infoLog = Marshal.AllocHGlobal(logBytes);
+        IntPtr state = IntPtr.Zero;
+        try
+        {
+            new Span<byte>((void*)errorLog, logBytes).Clear();
+            new Span<byte>((void*)infoLog, logBytes).Clear();
+            int[] options = [3, 4, 5, 6];
+            IntPtr[] values = [infoLog, (IntPtr)logBytes, errorLog, (IntPtr)logBytes];
+            Check(CudaNativeBindings.cuLinkCreate((uint)options.Length, options, values, out state), "cuLinkCreate");
+            void Add(int inputType, byte[] data, string name)
+            {
+                fixed (byte* bytes = data)
+                {
+                    CudaResult result = CudaNativeBindings.cuLinkAddData(state, inputType, (IntPtr)bytes, (UIntPtr)data.Length,
+                        name, 0, IntPtr.Zero, IntPtr.Zero);
+                    if (result != CudaResult.Success)
+                        throw new InvalidOperationException("cuLinkAddData(" + name + ") failed with CUDA driver status " +
+                            (int)result + " (" + result + ").\nLinker error log:\n" + (Marshal.PtrToStringAnsi(errorLog) ?? ""));
+                }
+            }
+            const int InputCubin = 0, InputPtx = 1;
+            Add(InputPtx, System.Text.Encoding.ASCII.GetBytes(ptx + "\0"), "declared_kernel.ptx");
+            for (int i = 0; i < objects.Count; i++) Add(InputCubin, objects[i], "math_library_" + i + ".cubin");
+            CudaResult linked = CudaNativeBindings.cuLinkComplete(state, out IntPtr cubin, out UIntPtr cubinBytes);
+            if (linked != CudaResult.Success)
+                throw new InvalidOperationException("cuLinkComplete failed with CUDA driver status " + (int)linked + " (" + linked +
+                    ").\nLinker error log:\n" + (Marshal.PtrToStringAnsi(errorLog) ?? ""));
+            // The image (cubinBytes long) belongs to the link state: load it before the state is destroyed.
+            Check(CudaNativeBindings.cuModuleLoadData(out IntPtr module, cubin), "cuModuleLoadData(linked declared kernel)");
+            return new DirectPtxModule(this, module, Marshal.PtrToStringAnsi(infoLog) ?? string.Empty) { AllowsLocalMemory = true };
+        }
+        finally
+        {
+            if (state != IntPtr.Zero) CudaNativeBindings.cuLinkDestroy(state);
+            Marshal.FreeHGlobal(errorLog);
+            Marshal.FreeHGlobal(infoLog);
+        }
+    }
     private unsafe DirectPtxModule LoadJitModule(string ptx)
     {
         IntPtr text = Marshal.StringToHGlobalAnsi(ptx);
@@ -701,6 +750,13 @@ internal sealed class DirectPtxBuffer : IDisposable
 
 internal sealed class DirectPtxModule : IDisposable
 {
+    /// <summary>
+    /// True for a module linked with the math library (LoadLinkedModule): its functions call library routines whose
+    /// call stack and local arrays (precise sinf's argument reduction) are the hand-written kernels' own, so the
+    /// direct-kernel zero-local-memory contract -- written for hand-written PTX -- does not apply to them.
+    /// </summary>
+    internal bool AllowsLocalMemory { get; init; }
+
     private const uint DefaultDynamicSharedMemoryLimitBytes = 48 * 1024;
     private readonly DirectPtxRuntime _runtime;
     private readonly object _dynamicSharedMemoryLock = new();
@@ -761,7 +817,7 @@ internal sealed class DirectPtxModule : IDisposable
                 MaxRegistersPerMultiprocessor = _runtime.MaxRegistersPerMultiprocessor,
                 MaxRegistersPerBlock = _runtime.MaxRegistersPerBlock
             };
-            if (info.LocalBytesPerThread != 0)
+            if (info.LocalBytesPerThread != 0 && !AllowsLocalMemory)
                 throw new InvalidOperationException(
                     $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
                     $"{info.LocalBytesPerThread} local bytes/thread (register spill or local stack). " +

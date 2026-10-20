@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Lowers a CodegenKernelSpec to SM86 PTX.
 //
 // This is the generated-code half of the C#-vs-Rust bake-off. It replaces
@@ -281,10 +281,40 @@ public sealed partial class PtxAffineEmitter
             string d = NextF();
             L(b is null ? $"{op} {d}, {a};" : $"{op} {d}, {a}, {b};");
             return d;
-        });
+        }, EmitCall, index => _scalarRegisters is { } scalars && index < scalars.Length
+            ? scalars[index]
+            : throw new NotSupportedException("This kernel has no runtime scalar parameter " + index + "."));
         string fresh = NextF();
         L($"mov.f32 {fresh}, {result};");
         return fresh;
+    }
+
+    // Library functions the kernel being emitted calls, in first-call order; Assemble declares them.
+    private readonly List<CodegenLibraryFunction> _calledFunctions = new();
+
+    // The registers holding the kernel's runtime scalar parameters (elementwise kernels only).
+    private string[]? _scalarRegisters;
+
+    /// <summary>The library functions the last emitted kernel calls: the module must be linked with them.</summary>
+    public IReadOnlyList<CodegenLibraryFunction> CalledFunctions { get; private set; } = Array.Empty<CodegenLibraryFunction>();
+
+    // A call by the PTX ABI: each float argument and the result in its own .param, inside a scope.
+    private string EmitCall(CodegenLibraryFunction function, string[] arguments)
+    {
+        if (!_calledFunctions.Exists(f => f.Symbol == function.Symbol)) _calledFunctions.Add(function);
+        string result = NextF();
+        _body.Append("    {\n");
+        for (int i = 0; i < arguments.Length; i++)
+            _body.Append("    .param .b32 aidn_arg").Append(I(i)).Append(";\n");
+        _body.Append("    .param .b32 aidn_ret;\n");
+        for (int i = 0; i < arguments.Length; i++)
+            _body.Append("    st.param.f32 [aidn_arg").Append(I(i)).Append("], ").Append(arguments[i]).Append(";\n");
+        _body.Append("    call.uni (aidn_ret), ").Append(function.Symbol).Append(", (");
+        for (int i = 0; i < arguments.Length; i++) _body.Append(i == 0 ? "" : ", ").Append("aidn_arg").Append(I(i));
+        _body.Append(");\n")
+             .Append("    ld.param.f32 ").Append(result).Append(", [aidn_ret];\n")
+             .Append("    }\n");
+        return result;
     }
 
     /// <summary>True when the last emission used the warp-per-output lowering.</summary>
@@ -463,8 +493,14 @@ public sealed partial class PtxAffineEmitter
                 return x;
 
             case CodegenActivationKind.ReLU:
-                L($"max.f32 {x}, {x}, 0f00000000;");
+            {
+                // NaN propagates, as the hand-written relu_nan_safe: max.f32 would return 0 for NaN
+                // (max.NaN exists only from sm_80). x <= 0 is false for NaN, so NaN is kept.
+                string nonPositive = NextP();
+                L($"setp.le.f32 {nonPositive}, {x}, 0f00000000;");
+                L($"selp.f32 {x}, 0f00000000, {x}, {nonPositive};");
                 return x;
+            }
 
             case CodegenActivationKind.Tanh:
                 return EmitTanh(x, Log2E, One);
@@ -1376,7 +1412,7 @@ public sealed partial class PtxAffineEmitter
         CheckLimits(spec, blocks, threadCount);
         LaunchBlocks = (uint)blocks;
 
-        _sb.Clear(); _body.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
+        _sb.Clear(); _body.Clear(); _calledFunctions.Clear(); _r = _f = _p = _rd = 0; EmittedLoads = 0; ElidedGuards = 0;
         IndirectIndexLoads = 0; AtomicStores = 0; ExtraOutputStores = 0; VectorisedStores = 0;
         _inputBindings = spec.Inputs;
         // Reset with the register counters: a label counter that survives between
@@ -2261,6 +2297,24 @@ public sealed partial class PtxAffineEmitter
     /// </remarks>
     private string Assemble()
     {
+        CalledFunctions = _calledFunctions.ToArray();
+        if (_calledFunctions.Count != 0)
+        {
+            // Every called function, declared at module scope ahead of the entry; the linker resolves them.
+            var declarations = new System.Text.StringBuilder();
+            foreach (var function in _calledFunctions)
+            {
+                declarations.Append(".extern .func (.param .b32 func_retval0) ").Append(function.Symbol).Append('(');
+                for (int i = 0; i < function.Arity; i++)
+                    declarations.Append(i == 0 ? "" : ", ").Append(".param .b32 ").Append(function.Symbol).Append("_param_").Append(I(i));
+                declarations.Append(");\n");
+            }
+            string header = _sb.ToString();
+            int entry = header.IndexOf(".visible .entry", StringComparison.Ordinal);
+            if (entry < 0) throw new InvalidOperationException("The kernel has no entry to declare its calls ahead of.");
+            _sb.Clear().Append(header, 0, entry).Append(declarations).Append('\n').Append(header, entry, header.Length - entry);
+            _calledFunctions.Clear();
+        }
         if (SharedMemoryBytes > 0)
             _sb.Append("    .shared .align 4 .b8 stageBuf[")
                .Append(I(SharedMemoryBytes)).Append("];\n");

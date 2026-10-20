@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // CUDA neural network kernels - activation gradients, loss functions, optimizers.
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
@@ -629,7 +629,8 @@ extern ""C"" __global__ __launch_bounds__(256) void charbonnier_loss(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float diff = predicted[idx] - actual[idx];
-    output[idx] = sqrtf(diff * diff + epsilon * epsilon) - epsilon;
+    // eps*eps fused, as this kernel compiles: pinned, so a separately compiled copy rounds the same.
+    output[idx] = sqrtf(fmaf(epsilon, epsilon, diff * diff)) - epsilon;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void charbonnier_gradient(
@@ -639,7 +640,8 @@ extern ""C"" __global__ __launch_bounds__(256) void charbonnier_gradient(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float diff = predicted[idx] - actual[idx];
-    gradient[idx] = diff / sqrtf(diff * diff + epsilon * epsilon);
+    // eps*eps fused, as this kernel compiles: pinned, so a separately compiled copy rounds the same.
+    gradient[idx] = diff / sqrtf(fmaf(epsilon, epsilon, diff * diff));
 }
 
 // Elastic Net Loss

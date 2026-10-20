@@ -330,6 +330,7 @@ public sealed partial class CudaBackend
     private void DisposeDeclaredPrograms()
     {
         DisposeDeclaredResidents();
+        DisposeDeclaredElementwise();
 
         foreach (var program in _declaredPrograms.Values) program?.Dispose();
         _declaredPrograms.Clear();

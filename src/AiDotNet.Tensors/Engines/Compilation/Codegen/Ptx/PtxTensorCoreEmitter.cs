@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 
 using System;
 using System.Collections.Generic;
@@ -569,7 +569,9 @@ public sealed partial class PtxTensorCoreEmitter
         switch (kind)
         {
             case CodegenActivationKind.ReLU:
-                L($"max.f32 {reg}, {reg}, 0f00000000;");
+                // NaN propagates, as PtxAffineEmitter's ReLU and the hand-written relu_nan_safe.
+                L($"setp.le.f32 %p3, {reg}, 0f00000000;");
+                L($"selp.f32 {reg}, 0f00000000, {reg}, %p3;");
                 break;
 
             case CodegenActivationKind.Sigmoid:

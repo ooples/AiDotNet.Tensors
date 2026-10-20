@@ -1017,6 +1017,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr CompileKernelModule(
         int device, string source, string moduleName, string[] kernelNames, bool useFastMath = true)
     {
+        // Which module defines each kernel the cache will hold -- the last to compile it, as the cache keeps -- so the
+        // declared elementwise kernels derive their math from the copy that actually runs (CudaMathLibrary).
+        var defining = new CudaMathModule(moduleName, source, useFastMath);
+        lock (_kernelModules)
+            foreach (string kernelName in kernelNames) _kernelModules[kernelName] = defining;
         source = PrepareNvrtcSource(source);
         var (major, minor) = GetComputeCapability(device);
         string arch = $"--gpu-architecture=sm_{major}{minor}";

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 
 using System;
 using System.Globalization;
@@ -396,7 +396,12 @@ public sealed class PtxTiledContractionEmitter
                 if (scale is not null)
                     L($"mul.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {scale};");
                 if (activation == CodegenActivationKind.ReLU)
-                    L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
+                {
+                    // NaN propagates, as PtxAffineEmitter's ReLU and the hand-written relu_nan_safe.
+                    string nonPositive = NextP();
+                    L($"setp.le.f32 {nonPositive}, {accumulators[i, j]}, 0f00000000;");
+                    L($"selp.f32 {accumulators[i, j]}, 0f00000000, {accumulators[i, j]}, {nonPositive};");
+                }
                 L($"mad.lo.u32 {n}, %r6, {I(plan.ThreadTileN)}, {I(j)};");
                 L($"mad.lo.u32 {element}, {localM}, {I(plan.N)}, %r11;");
                 L($"add.u32 {element}, {element}, {n};");

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 
 using System;
 using System.Globalization;
@@ -613,7 +613,12 @@ public sealed class PtxTiledConv2DEmitter
             for (int j = 0; j < plan.ThreadTileWidth; j++)
             {
                 if (activation == CodegenActivationKind.ReLU)
-                    L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
+                {
+                    // NaN propagates, as PtxAffineEmitter's ReLU and the hand-written relu_nan_safe.
+                    string nonPositive = NextP();
+                    L($"setp.le.f32 {nonPositive}, {accumulators[i, j]}, 0f00000000;");
+                    L($"selp.f32 {accumulators[i, j]}, 0f00000000, {accumulators[i, j]}, {nonPositive};");
+                }
             }
             for (int j = 0; j < plan.ThreadTileWidth; j += StoreVectorWidth)
             {
@@ -641,7 +646,12 @@ public sealed class PtxTiledConv2DEmitter
             {
                 L($"add.rn.f32 {accumulators[i, j]}, {accumulators[i, j]}, {bias};");
                 if (activation == CodegenActivationKind.ReLU)
-                    L($"max.f32 {accumulators[i, j]}, {accumulators[i, j]}, 0f00000000;");
+                {
+                    // NaN propagates, as PtxAffineEmitter's ReLU and the hand-written relu_nan_safe.
+                    string nonPositive = NextP();
+                    L($"setp.le.f32 {nonPositive}, {accumulators[i, j]}, 0f00000000;");
+                    L($"selp.f32 {accumulators[i, j]}, 0f00000000, {accumulators[i, j]}, {nonPositive};");
+                }
                 int byteOffset =
                     (i * plan.OutputHeight * plan.OutputWidth + j) * sizeof(float);
                 L($"@%p2 st.global.f32 [{outputBase}+{I(byteOffset)}], {accumulators[i, j]};");
