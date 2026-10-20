@@ -459,10 +459,11 @@ fn main(@builtin(local_invocation_id) l : vec3<u32>, @builtin(workgroup_id) wg :
     /// Parameters: buffers <c>a, b, c, o</c> then ints <c>op, rows, cols</c>; Metal binds them at indices 0-3 and
     /// 4-6.
     /// </summary>
-    /// <para>With <paramref name="rowKernelOnly"/> the module defines only <see cref="RowProgramKernel"/> (its HIP form is
-    /// also valid CUDA C++): CUDA compiles it beside its own stage and program kernels, which share their names with
-    /// HIP's.</para>
-    internal static string GetModuleSource(ResidentKernelDialect dialect, bool rowKernelOnly = false)
+    /// <para>With <paramref name="cudaBlockReduce"/> (CUDA's <c>res_block_reduce</c>) the module is CUDA's: it defines
+    /// only <see cref="RowProgramKernel"/> (its HIP form is also valid CUDA C++), since CUDA compiles it beside its own
+    /// stage and program kernels, which share their names with HIP's. Its softmax reduces through that function, so it
+    /// adds in the same order as those kernels; this tree's order differs and moves a row's sum by an ulp.</para>
+    internal static string GetModuleSource(ResidentKernelDialect dialect, string? cudaBlockReduce = null)
     {
         if (dialect == ResidentKernelDialect.Glsl) return GlslSource;
         if (dialect == ResidentKernelDialect.Wgsl) return WgslSource;
@@ -488,7 +489,17 @@ fn main(@builtin(local_invocation_id) l : vec3<u32>, @builtin(workgroup_id) wg :
         if (dialect == ResidentKernelDialect.Metal) sb.Append("#include <metal_stdlib>\nusing namespace metal;\n");
         if (dialect == ResidentKernelDialect.Hip) sb.Append("typedef unsigned int uint;\n");
         sb.Append("#define RES_THREADS ").Append(GroupThreads).Append("u\n");
-        sb.Append(fn).Append("float res_reduce(float v, int isMax, ").Append(lq).Append(@" scratch, uint lid)
+        bool rowKernelOnly = cudaBlockReduce is not null;
+        if (rowKernelOnly)
+            sb.Append(cudaBlockReduce).Append(@"
+__device__ float res_reduce(float v, int isMax, float* scratch, uint lid)
+{
+    return res_block_reduce(v, isMax != 0, scratch);
+}
+
+");
+        // The shared-memory tree and res_run_stage, which only the stage kernels call (the row kernel inlines its ops).
+        else sb.Append(fn).Append("float res_reduce(float v, int isMax, ").Append(lq).Append(@" scratch, uint lid)
 {
     scratch[lid] = v;
     ").Append(bar).Append(@";

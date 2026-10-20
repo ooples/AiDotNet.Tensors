@@ -34,6 +34,37 @@ internal static class CudaResidentProgramKernels
 
     internal static string[] GetKernelNames() => new[] { ProgramKernel, StageKernel };
 
+    /// <summary>
+    /// The softmax's block reduction, shared with the CUDA build of <see cref="ResidentProgramKernelTemplate"/>'s row
+    /// kernel: a float sum depends on its order, so the row kernel must add in exactly this order to stay bit-identical
+    /// with these kernels. Needs <c>RES_THREADS</c> defined and a scratch of at least <c>RES_THREADS / 32</c> floats.
+    /// </summary>
+    internal const string BlockReduceSource = @"
+// Block-wide reduction of one value per thread; every thread receives the result. Fixed order for a fixed block size.
+__device__ __forceinline__ float res_block_reduce(float v, bool isMax, float* scratch)
+{
+    for (int o = 16; o > 0; o >>= 1) {
+        float other = __shfl_xor_sync(0xffffffffu, v, o);
+        v = isMax ? fmaxf(v, other) : v + other;
+    }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        v = lane < (RES_THREADS / 32) ? scratch[lane] : (isMax ? __int_as_float(0xff800000) : 0.0f);
+        for (int o = 16; o > 0; o >>= 1) {
+            float other = __shfl_xor_sync(0xffffffffu, v, o);
+            v = isMax ? fmaxf(v, other) : v + other;
+        }
+        if (lane == 0) scratch[0] = v;
+    }
+    __syncthreads();
+    float r = scratch[0];
+    __syncthreads();
+    return r;
+}
+";
+
     internal static string GetSource() => @"
 struct ResStage {
     int op; int rows; int cols; int pad;
@@ -70,31 +101,7 @@ __device__ __forceinline__ void res_grid_barrier(unsigned int* bar)
     }
     __syncthreads();
 }
-
-// Block-wide reduction of one value per thread; every thread receives the result. Fixed order for a fixed block size.
-__device__ __forceinline__ float res_block_reduce(float v, bool isMax, float* scratch)
-{
-    for (int o = 16; o > 0; o >>= 1) {
-        float other = __shfl_xor_sync(0xffffffffu, v, o);
-        v = isMax ? fmaxf(v, other) : v + other;
-    }
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-    if (warp == 0) {
-        v = lane < (RES_THREADS / 32) ? scratch[lane] : (isMax ? __int_as_float(0xff800000) : 0.0f);
-        for (int o = 16; o > 0; o >>= 1) {
-            float other = __shfl_xor_sync(0xffffffffu, v, o);
-            v = isMax ? fmaxf(v, other) : v + other;
-        }
-        if (lane == 0) scratch[0] = v;
-    }
-    __syncthreads();
-    float r = scratch[0];
-    __syncthreads();
-    return r;
-}
-
+" + BlockReduceSource + @"
 // One stage over the whole tensor, the work split over the launch's blocks: elementwise ops by a grid-stride loop,
 // the row softmax one row per block (a block strides over rows).
 __device__ void res_run_stage(const ResStage& s, float* scratch)

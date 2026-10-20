@@ -118,7 +118,7 @@ public sealed partial class CudaBackend
                 {
                     using var ctx = PushContext();
                     _residentRowsModule = CompileKernelModule(_cuDevice,
-                        ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.Hip, rowKernelOnly: true),
+                        ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.Hip, CudaResidentProgramKernels.BlockReduceSource),
                         "resident_rows", new[] { ResidentProgramKernelTemplate.RowProgramKernel }, useFastMath: false);
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
