@@ -81,15 +81,25 @@ for await (const line of rl) {
     // A launch longer than this is a hung shader or a stuck mapAsync, not a slow one.
     private static readonly TimeSpan ReplyTimeout = TimeSpan.FromMinutes(5);
 
-    private readonly Process _node;
-    private readonly IReadOnlyDictionary<string, string>? _modules;
-    private readonly System.Text.StringBuilder _stderr;
+    // dawn.node (webgpu 0.6.x on Windows) dies with an access violation (0xC0000005) a few hundred launches into one
+    // server, whatever the server does with its buffers or the collector, so the launcher starts a fresh server every
+    // this many launches. Each launch is self-contained (its buffers go in and come back with it), so nothing is lost but
+    // the compiled-pipeline cache.
+    private const int LaunchesPerServer = 200;
 
-    private DawnWgslLauncher(Process node, IReadOnlyDictionary<string, string>? modules, System.Text.StringBuilder stderr)
+    private readonly string _script;
+    private readonly IReadOnlyDictionary<string, string>? _modules;
+    private Process _node;
+    private System.Text.StringBuilder _stderr;
+    private int _launches;
+
+    private DawnWgslLauncher(string script, Process node, System.Text.StringBuilder stderr,
+        IReadOnlyDictionary<string, string>? modules)
     {
+        _script = script;
         _node = node;
-        _modules = modules;
         _stderr = stderr;
+        _modules = modules;
     }
 
     /// <summary>A launcher, or null when AIDOTNET_WEBGPU_NODE_DIR is not set up.</summary>
@@ -100,21 +110,45 @@ for await (const line of rl) {
         if (string.IsNullOrEmpty(dir) || !Directory.Exists(Path.Combine(dir, "node_modules", "webgpu"))) return null;
         string script = Path.Combine(dir, "aidotnet-wgsl-server.mjs");
         File.WriteAllText(script, Server);
+        var (node, stderr) = StartServer(script);
+        return node is null ? null : new DawnWgslLauncher(script, node, stderr!, modules);
+    }
+
+    private static (Process? Node, System.Text.StringBuilder? Stderr) StartServer(string script)
+    {
         var start = new ProcessStartInfo("node", $"\"{script}\"")
         {
-            WorkingDirectory = dir,
+            WorkingDirectory = Path.GetDirectoryName(script),
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
         };
         var node = Process.Start(start);
-        if (node is null) return null;
+        if (node is null) return (null, null);
         // Drain stderr as it arrives: a full stderr pipe would block node, and then the reply read below.
         var stderr = new System.Text.StringBuilder();
         node.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (stderr) stderr.AppendLine(e.Data); };
         node.BeginErrorReadLine();
-        return new DawnWgslLauncher(node, modules, stderr);
+        return (node, stderr);
+    }
+
+    // Replaces the server once it has served LaunchesPerServer launches (see there).
+    private void RecycleServerIfDue()
+    {
+        if (++_launches <= LaunchesPerServer) return;
+        StopServer();
+        var (node, stderr) = StartServer(_script);
+        _node = node ?? throw new InvalidOperationException("The Dawn server did not restart.");
+        _stderr = stderr!;
+        _launches = 1;
+    }
+
+    private void StopServer()
+    {
+        try { _node.StandardInput.Close(); _node.WaitForExit(10_000); }
+        catch (InvalidOperationException) { }
+        _node.Dispose();
     }
 
     /// <summary>A <see cref="PortableGenericFft.Launcher"/> that runs each launch's WGSL port on Dawn.</summary>
@@ -131,6 +165,7 @@ for await (const line of rl) {
         if (!(_modules?.TryGetValue(name, out source) ?? false) && !WebGpuBatchExecutionKernels.ByKernelName.TryGetValue(name, out source))
             return $"No WGSL port for {name}.";
         var job = new { code = WebGpuShaderPrelude.Prepare(source ?? ""), compileOnly = true };
+        RecycleServerIfDue();
         _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));
         _node.StandardInput.Flush();
         var read = _node.StandardOutput.ReadLineAsync();
@@ -194,6 +229,7 @@ for await (const line of rl) {
         }
         while (fields.Count % 16 != 0 || fields.Count == 0) fields.Add(0);
         var job = new { code, buffers = encoded, uniform = Convert.ToBase64String(fields.ToArray()), workgroups = (threads + 255) / 256 };
+        RecycleServerIfDue();
         _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));
         _node.StandardInput.Flush();
         var read = _node.StandardOutput.ReadLineAsync();
@@ -226,19 +262,17 @@ for await (const line of rl) {
         }
     }
 
+    // The server's stderr, and its exit code once it has exited: a native crash in dawn.node writes nothing to stderr,
+    // and the code (an NTSTATUS on Windows) is then all there is to go on.
     private string StderrText()
     {
-        lock (_stderr) return _stderr.ToString();
+        string code = _node.WaitForExit(2_000) ? $"(exit code 0x{_node.ExitCode:X8}) " : "";
+        lock (_stderr) return code + _stderr.ToString();
     }
 
     // A byte buffer (AllocateByteBuffer) counts its Size in bytes; a float buffer's SizeInBytes is four times its Size.
     private static bool IsByteBuffer(IGpuBuffer buffer) => buffer.SizeInBytes != (long)buffer.Size * sizeof(float);
 
-    public void Dispose()
-    {
-        try { _node.StandardInput.Close(); _node.WaitForExit(10_000); }
-        catch (InvalidOperationException) { }
-        _node.Dispose();
-    }
+    public void Dispose() => StopServer();
 }
 #endif

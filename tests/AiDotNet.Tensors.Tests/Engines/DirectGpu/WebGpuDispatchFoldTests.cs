@@ -84,7 +84,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) n: vec3<
     {
         var backend = DawnHostedWebGpu.BackendOrSkip();
         const int groups = 70001;   // folds to 35001 x 2: one surplus workgroup
-        var sentinel = BitConverter.Int32BitsToSingle(0x7F80_1234);
+        // A quiet NaN: the host round trip quiets a signalling one (0x7F80_1234 came back 0x7FC0_1234 on Dawn), which
+        // would read as overwritten although nothing touched it.
+        var sentinel = BitConverter.Int32BitsToSingle(0x7FC0_1234);
         var init = new float[2 * groups + 2];
         Array.Fill(init, sentinel);
         using var output = backend.AllocateBuffer(init);
@@ -106,8 +108,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) n: vec3<
                 if (acc != 64u * 64u * (uint)w + 2016u) Assert.Fail($"workgroup {w}: global ids summed to {acc}");
                 if (count != groups) Assert.Fail($"workgroup {w}: num_workgroups.x + the y and z builtins read {count}, not {groups}");
             }
-            Assert.Equal(0x7F80_1234, BitConverter.SingleToInt32Bits(back[2 * groups]));
-            Assert.Equal(0x7F80_1234, BitConverter.SingleToInt32Bits(back[2 * groups + 1]));
+            Assert.Equal(0x7FC0_1234, BitConverter.SingleToInt32Bits(back[2 * groups]));
+            Assert.Equal(0x7FC0_1234, BitConverter.SingleToInt32Bits(back[2 * groups + 1]));
         }
         finally
         {
