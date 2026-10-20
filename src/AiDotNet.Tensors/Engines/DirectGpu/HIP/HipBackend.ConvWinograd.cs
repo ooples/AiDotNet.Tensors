@@ -10,19 +10,36 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 public sealed partial class HipBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
 {
-    private IntPtr _winogradModule;
+    private IntPtr _winogradModule, _winogradFusedModule;
     private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataSlot, _conv2DBackwardFilterSlot;
 
     private bool WinogradKernelsReady => HasTunedKernel(WinogradF23KernelTemplate.Filter);
+
+    /// <summary>
+    /// Whether the fused weight gradient's own module built. It is compiled apart from the transforms because its
+    /// kernels are the only ones here that declare shared memory and a fixed 256-wide group: a device compiler that
+    /// rejects them then drops only the fused candidate, and the transforms keep serving the other three routes.
+    /// </summary>
+    private bool FusedFilterGradientReady =>
+        HasTunedKernel(WinogradF23KernelTemplate.FusedFilterGradient)
+        && HasTunedKernel(WinogradF23KernelTemplate.FusedFilterGradientDirect)
+        && HasTunedKernel(WinogradF23KernelTemplate.FusedFilterGradientFinish);
 
     private void CompileWinogradKernels()
     {
         // Strict math: the transforms' coefficients are 0, +-1 and +-1/2, and contracting or reassociating them would
         // move the result away from the other backends' instances of the same template.
-        var failure = CompileKernelModule(WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Hip), "winograd",
-            ref _winogradModule, WinogradF23KernelTemplate.GetKernelNames(), useFastMath: false);
+        CompileWinogradModule(WinogradKernelGroup.Base, "winograd", ref _winogradModule, "Winograd kernels");
+        CompileWinogradModule(WinogradKernelGroup.Fused, "winograd_fused", ref _winogradFusedModule,
+            "Winograd fused weight-gradient kernels");
+    }
+
+    private void CompileWinogradModule(WinogradKernelGroup group, string moduleName, ref IntPtr module, string label)
+    {
+        var failure = CompileKernelModule(WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Hip, group),
+            moduleName, ref module, WinogradF23KernelTemplate.GetKernelNames(group), useFastMath: false);
         if (failure is not null)
-            System.Diagnostics.Trace.TraceWarning($"HIP Winograd kernels unavailable: {failure.Message}");
+            System.Diagnostics.Trace.TraceWarning($"HIP {label} unavailable: {failure.Message}");
     }
 
     internal TunedKernelSlot<TunedConv2DBackwardArgs> Conv2DBackwardDataSlot
@@ -62,7 +79,7 @@ public sealed partial class HipBackend : IWinogradF23Transforms, IWinogradFusedF
                             true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
                         new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("hip.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
-                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && FusedFilterGradientReady,
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                     });
                 return _conv2DBackwardFilterSlot;
@@ -115,7 +132,7 @@ public sealed partial class HipBackend : IWinogradF23Transforms, IWinogradFusedF
 
     // The fused weight gradient: one launch of 256-wide blocks (plus the finish when the tiles split).
     internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a, int splits = 0)
-        => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
+        => FusedFilterGradientReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
 
     int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => ComputeUnits;
 

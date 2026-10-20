@@ -18,6 +18,24 @@ internal enum WinogradKernelDialect
 }
 
 /// <summary>
+/// Which route's kernels a module or a readiness check covers. The fused weight gradient is the only route whose
+/// kernels declare work-group shared memory and a fixed 256-wide group, so it is the one a device compiler is most
+/// likely to reject; keeping it in its own group means such a rejection drops only the fused candidate, and the
+/// forward, input-gradient and unfused weight-gradient routes still run.
+/// </summary>
+internal enum WinogradKernelGroup
+{
+    /// <summary>Every kernel in the template.</summary>
+    All,
+
+    /// <summary>The forward, input-gradient and unfused weight-gradient kernels.</summary>
+    Base,
+
+    /// <summary>The fused weight gradient's two accumulation kernels and its cross-split finish.</summary>
+    Fused,
+}
+
+/// <summary>
 /// The tile transforms of <see cref="WinogradF23Pipeline"/>, written once and emitted per dialect. The arithmetic is
 /// CUDA's (<c>CUDA/Kernels/CudaConvWinogradKernels.cs</c>), operation for operation, so every backend rounds the same.
 /// </summary>
@@ -461,11 +479,31 @@ internal static class WinogradF23KernelTemplate
 "),
     };
 
-    internal static string[] GetKernelNames()
+    /// <summary>The fused weight gradient's kernels, in <see cref="Kernels"/> order.</summary>
+    internal static readonly string[] FusedKernels =
+        { FusedFilterGradientDirect, FusedFilterGradient, FusedFilterGradientFinish };
+
+    /// <summary>Whether <paramref name="name"/> belongs to the fused weight gradient's route.</summary>
+    internal static bool IsFusedKernel(string name)
     {
-        var names = new string[Kernels.Length];
-        for (int i = 0; i < Kernels.Length; i++) names[i] = Kernels[i].Name;
-        return names;
+        foreach (var fused in FusedKernels)
+            if (fused == name) return true;
+        return false;
+    }
+
+    private static bool InGroup(Spec spec, WinogradKernelGroup group) => group switch
+    {
+        WinogradKernelGroup.Base => !IsFusedKernel(spec.Name),
+        WinogradKernelGroup.Fused => IsFusedKernel(spec.Name),
+        _ => true,
+    };
+
+    internal static string[] GetKernelNames(WinogradKernelGroup group = WinogradKernelGroup.All)
+    {
+        var names = new List<string>(Kernels.Length);
+        foreach (var spec in Kernels)
+            if (InGroup(spec, group)) names.Add(spec.Name);
+        return names.ToArray();
     }
 
     internal static Spec Get(string name)
@@ -480,7 +518,8 @@ internal static class WinogradF23KernelTemplate
     /// its int parameters at 2.., one <c>constant int&amp;</c> each, which is how MetalBackend's 1-D conv dispatcher binds
     /// them (buffers, then each int by setBytes).
     /// </summary>
-    internal static string GetModuleSource(WinogradKernelDialect dialect)
+    internal static string GetModuleSource(WinogradKernelDialect dialect,
+        WinogradKernelGroup group = WinogradKernelGroup.All)
     {
         if (dialect == WinogradKernelDialect.Glsl)
             throw new ArgumentException("GLSL has one kernel per shader; use GetGlslSource.", nameof(dialect));
@@ -488,6 +527,7 @@ internal static class WinogradF23KernelTemplate
         if (dialect == WinogradKernelDialect.Metal) sb.Append("#include <metal_stdlib>\nusing namespace metal;\n");
         foreach (var spec in Kernels)
         {
+            if (!InGroup(spec, group)) continue;
             sb.Append('\n');
             sb.Append(dialect switch
             {

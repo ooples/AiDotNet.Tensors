@@ -11554,12 +11554,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
 
         // Unload all additional kernel modules
-        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _winogradModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule, _residentProgramModule })
+        foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _winogradModule, _winogradFusedModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule, _residentProgramModule })
         {
             if (modField != IntPtr.Zero)
                 HipNativeBindings.hipModuleUnload(modField);
         }
-        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _winogradModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = _residentProgramModule = IntPtr.Zero;
+        _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _winogradModule = _winogradFusedModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = _residentProgramModule = IntPtr.Zero;
 
         // Settle first (ruling the load out if it never ran, or waiting out one in flight), so no handle appears after this.
         SettleHipBlas(load: false);
