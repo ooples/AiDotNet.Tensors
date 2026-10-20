@@ -701,13 +701,17 @@ internal static class DirectConvAvx2
             float* stage = stackalloc float[(StageRun + PositionUnroll) * 32];
             // The input channels run in passes whose kernel slice stays cache-resident: every position triple walks the
             // pass's whole slice, so a slice past L2 (1152 input channels: 1.33 MB) streamed from L3 once per triple.
-            // Later passes accumulate onto the output the first one wrote.
+            // A later pass starts its accumulators from the output the one before wrote, so the passes are one FMA
+            // chain, bit-identical to a single pass. Summing a pass from zero and adding it on lost small terms to
+            // cancellation: 1e8 in one pass, then -1e8 and 1 in the next, gave 0 instead of 1.
             int pass = ForwardInputBlocksPerPass(inBlocks, taps);
             for (int cb0 = 0; cb0 < inBlocks; cb0 += pass)
             {
             int cbEnd = Math.Min(inBlocks, cb0 + pass);
-            bool accumulatePass = accumulate || cb0 > 0;
+            bool seeded = cb0 > 0;
+            bool accumulatePass = accumulate && !seeded;
             float* passKernel = tileKernel + (long)cb0 * taps * Block * Block;
+            int channelBase = tile * OutputBlocksPerTile * Block;
             int runStart = first;
             for (int q = first; q < last; q += PositionUnroll)
             {
@@ -716,9 +720,29 @@ internal static class DirectConvAvx2
                 float* x0 = px + g.InputOrigin(q);
                 float* x1 = px + g.InputOrigin(count > 1 ? q + 1 : q);
                 float* x2 = px + g.InputOrigin(count > 2 ? q + 2 : q);
-                var a00 = Vector256<float>.Zero; var a01 = a00; var a02 = a00; var a03 = a00;
-                var a10 = a00; var a11 = a00; var a12 = a00; var a13 = a00;
-                var a20 = a00; var a21 = a00; var a22 = a00; var a23 = a00;
+                Vector256<float> a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23;
+                if (!seeded)
+                {
+                    a00 = Vector256<float>.Zero; a01 = a00; a02 = a00; a03 = a00;
+                    a10 = a00; a11 = a00; a12 = a00; a13 = a00;
+                    a20 = a00; a21 = a00; a22 = a00; a23 = a00;
+                }
+                else if (staged)
+                {
+                    // The run's outputs are read into the stage once, as contiguous runs per channel.
+                    int slot = q - runStart;
+                    if (slot == 0) SeedStage(po + outputOffset, g, channelBase, runStart, Math.Min(last - runStart, StageRun + PositionUnroll), stage);
+                    float* s = stage + slot * 32;
+                    a00 = Avx.LoadVector256(s); a01 = Avx.LoadVector256(s + 8); a02 = Avx.LoadVector256(s + 16); a03 = Avx.LoadVector256(s + 24);
+                    a10 = Avx.LoadVector256(s + 32); a11 = Avx.LoadVector256(s + 40); a12 = Avx.LoadVector256(s + 48); a13 = Avx.LoadVector256(s + 56);
+                    a20 = Avx.LoadVector256(s + 64); a21 = Avx.LoadVector256(s + 72); a22 = Avx.LoadVector256(s + 80); a23 = Avx.LoadVector256(s + 88);
+                }
+                else
+                {
+                    LoadPosition(po + outputOffset, g, channelBase, q, out a00, out a01, out a02, out a03);
+                    LoadPosition(po + outputOffset, g, channelBase, count > 1 ? q + 1 : q, out a10, out a11, out a12, out a13);
+                    LoadPosition(po + outputOffset, g, channelBase, count > 2 ? q + 2 : q, out a20, out a21, out a22, out a23);
+                }
                 float* w = passKernel;
                 for (int cb = cb0; cb < cbEnd; cb++)
                 {
@@ -758,7 +782,6 @@ internal static class DirectConvAvx2
                         }
                     }
                 }
-                int channelBase = tile * OutputBlocksPerTile * Block;
                 if (staged)
                 {
                     // Stage this position chunk's 32 channels, flushed as contiguous per-channel runs (the plain grid's
@@ -813,6 +836,36 @@ internal static class DirectConvAvx2
             else for (int i = 0; i < run; i++) dst[i] = stage[i * 32 + ch];
         }
     }
+
+    // The reverse of FlushStage: `run` consecutive positions x 32 channels of the output into the stage.
+    [MethodImpl(Hot)]
+    private static unsafe void SeedStage(float* output, in ForwardGeometry g, int channelBase, int q0, int run, float* stage)
+    {
+        int index = g.OutputIndex(q0, out int b);
+        float* d = output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
+        for (int ch = 0; ch < 32; ch++)
+        {
+            float* src = d + (long)ch * g.OutPlane;
+            for (int i = 0; i < run; i++) stage[i * 32 + ch] = src[i];
+        }
+    }
+
+    // The reverse of StorePosition: position q's 32 output channels as four 8-channel vectors.
+    [MethodImpl(HotInline)]
+    private static unsafe void LoadPosition(float* output, in ForwardGeometry g, int channelBase, int q,
+        out Vector256<float> v0, out Vector256<float> v1, out Vector256<float> v2, out Vector256<float> v3)
+    {
+        int index = g.OutputIndex(q, out int b);
+        float* d = output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
+        long stride = g.OutPlane;
+        v0 = LoadLanes(d, stride);
+        v1 = LoadLanes(d + Block * stride, stride);
+        v2 = LoadLanes(d + 2 * Block * stride, stride);
+        v3 = LoadLanes(d + 3 * Block * stride, stride);
+    }
+    [MethodImpl(HotInline)]
+    private static unsafe Vector256<float> LoadLanes(float* d, long stride)
+        => Vector256.Create(d[0], d[stride], d[2 * stride], d[3 * stride], d[4 * stride], d[5 * stride], d[6 * stride], d[7 * stride]);
 
     [MethodImpl(HotInline)]
     private static unsafe void StorePosition(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q,
