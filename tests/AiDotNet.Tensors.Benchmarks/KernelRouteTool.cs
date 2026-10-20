@@ -64,6 +64,11 @@ internal static class KernelRouteTool
             Console.WriteLine(lowering.Steps.Count + " kernels written to " + args[3]);
             return;
         }
+        if (args.Length > 0 && args[0] == "--static")
+        {
+            KernelRouteStaticTool.Run(args);
+            return;
+        }
         string? only = args.Length >= 2 && args[0] == "--family" ? args[1] : null;
 
         using var engine = new DirectGpuEngine();

@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -966,8 +966,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return BitConverter.ToString(hash).Replace("-", "").Substring(0, 32);
     }
 
-    private IntPtr CompileKernelModule(
-        int device, string source, string moduleName, string[] kernelNames, bool useFastMath = true)
+    /// <summary>
+    /// A hand-written CUDA C module's source as NVRTC compiles it: standard headers stripped (NVRTC has the builtins)
+    /// and the constants they would have defined. Shared with the static-metric audit, so it compiles what runs.
+    /// </summary>
+    internal static string PrepareNvrtcSource(string source)
     {
         // NVRTC doesn't support standard C headers — strip #include <math.h> etc.
         source = source.Replace("#include <math.h>", "// math.h stripped for NVRTC (built-in)")
@@ -995,7 +998,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 #endif
 ";
         source = nvrtcPreamble + source;
+        return source;
+    }
 
+    /// <summary>The NVRTC options every hand-written module compiles with, for a device of this capability.</summary>
+    internal static string[] NvrtcOptions(int major, int minor, bool useFastMath)
+    {
+        var optionsList = new List<string> { $"--gpu-architecture=sm_{major}{minor}" };
+        optionsList.AddRange(NvrtcNativeBindings.JitCompatibilityOptions);
+        if (useFastMath)
+            optionsList.Add("--use_fast_math");
+        var cudaInclude = GetCudaIncludePath();
+        if (cudaInclude != null)
+            optionsList.Add($"--include-path={cudaInclude}");
+        return optionsList.ToArray();
+    }
+
+    private IntPtr CompileKernelModule(
+        int device, string source, string moduleName, string[] kernelNames, bool useFastMath = true)
+    {
+        source = PrepareNvrtcSource(source);
         var (major, minor) = GetComputeCapability(device);
         string arch = $"--gpu-architecture=sm_{major}{minor}";
         IReadOnlyList<string> jitOptions = NvrtcNativeBindings.JitCompatibilityOptions;
@@ -1044,15 +1066,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         // Compile with NVRTC
-        var optionsList = new List<string> { arch };
-        optionsList.AddRange(jitOptions);
-        if (useFastMath)
-            optionsList.Add("--use_fast_math");
-        var cudaInclude = GetCudaIncludePath();
-        if (cudaInclude != null)
-            optionsList.Add($"--include-path={cudaInclude}");
-
-        string[] options = optionsList.ToArray();
+        string[] options = NvrtcOptions(major, minor, useFastMath);
 
         IntPtr program = IntPtr.Zero;
         var result = NvrtcNativeBindings.nvrtcCreateProgram(

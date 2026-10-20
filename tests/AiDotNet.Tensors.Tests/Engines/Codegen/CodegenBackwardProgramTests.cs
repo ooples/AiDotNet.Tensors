@@ -354,9 +354,13 @@ public class CodegenBackwardProgramTests
             Assert.True(emitter.LaunchBlocks <= PtxAffineEmitter.ColumnPartialBlockCap);
             Assert.True(plan.Layout(4) is { PerThread: <= CodegenRowFusion.ColumnFusedPerThread });
 
-            string combine = new PtxAffineEmitter().EmitColumnCombine(plan, "rowfused_lnb_combine", (int)emitter.LaunchBlocks, 7, 5);
-            Assert.Contains("COMBINE0:", combine, StringComparison.Ordinal);
-            Assert.Contains("COMBINE1:", combine, StringComparison.Ordinal);
+            // 32 columns x 8 warps a block, the warp sums combined through shared memory; no loop
+            // for ptxas to unroll, a barrier after each of the two column passes.
+            var combiner = new PtxAffineEmitter();
+            string combine = combiner.EmitColumnCombine(plan, "rowfused_lnb_combine", (int)emitter.LaunchBlocks, 7, 5);
+            Assert.Equal((uint)((columns + 31) / 32), combiner.LaunchBlocks);
+            Assert.Equal(2 * 2, combine.Split(new[] { "bar.sync 0;" }, StringSplitOptions.None).Length - 1);
+            Assert.DoesNotContain("bra ", combine, StringComparison.Ordinal);
         }
     }
 
