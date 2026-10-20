@@ -74,6 +74,7 @@ public sealed class MetalShaderCompilationTests
         yield return ("BatchExecution",() => MetalBatchExecutionKernels.Source, true);
         yield return ("TorchParityF32", () => MetalBatchExecutionKernels.TorchParitySource, true);
         yield return ("Winograd", () => WinogradF23KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), true);
+        yield return ("ResidentProgram", () => ResidentProgramKernelTemplate.GetModuleSource(ResidentKernelDialect.Metal), true);
     }
 
     internal static string? FindCompiler()

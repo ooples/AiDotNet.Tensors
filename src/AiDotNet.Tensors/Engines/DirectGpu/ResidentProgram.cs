@@ -390,7 +390,9 @@ fn main(@builtin(local_invocation_id) l : vec3<u32>, @builtin(workgroup_id) w : 
         // Every invocation of a workgroup runs the same number of rows, so the barriers in res_reduce stay uniform.
         for (var r : u32 = w.x; r < u32(p.rows); r = r + ngrp) {
             let base0 = r * ucols;
-            var m : f32 = bitcast<f32>(0xff800000u);
+            // WGSL may not hold -inf even as a constant expression: the lowest finite f32 is the same start for any
+            // row with a finite element.
+            var m : f32 = -0x1.fffffep+127f;
             for (var j : u32 = lid; j < ucols; j = j + RES_THREADS) { m = max(m, a[base0 + j]); }
             m = res_reduce(m, true, lid);
             var sum : f32 = 0.0;
