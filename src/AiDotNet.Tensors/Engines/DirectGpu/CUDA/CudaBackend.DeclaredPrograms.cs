@@ -208,7 +208,13 @@ public sealed partial class CudaBackend
             }
         }
         if (program is null) return false;
+        RunDeclaredProgram(program, names, bound);
+        return true;
+    }
 
+    // Checks the bound buffers against the program's sizes, then launches its steps on the main stream.
+    private void RunDeclaredProgram(DeclaredProgram program, string[] names, in DeclaredBindings bound)
+    {
         for (int k = 0; k < names.Length; k++)
         {
             long needed = program.BoundElements[k];
@@ -222,7 +228,6 @@ public sealed partial class CudaBackend
         // callers' launches interleaved on the stream would read each other's partials.
         lock (program) LaunchSteps(program, bound);
         System.Threading.Interlocked.Increment(ref _declaredProgramLaunches);
-        return true;
     }
 
     private static unsafe void LaunchSteps(DeclaredProgram program, in DeclaredBindings bound)
@@ -252,17 +257,28 @@ public sealed partial class CudaBackend
 
     private DeclaredProgram? BuildDeclaredProgram(DeclaredKey key, Func<DeclaredKey, CodegenProgram> build, string[] names)
     {
+        var program = BuildDeclaredProgram(build(key), key.ToString(), names, lowerPass: null, out string? decline);
+        if (decline is not null) _declaredDeclines[key] = decline;
+        return program;
+    }
+
+    // Lowers and loads a program, or returns null with the reason it has no declared lowering (the hand-written
+    // kernel then serves the shape). lowerPass replaces the default lowering of a pass, as in PtxProgramLowering.
+    private DeclaredProgram? BuildDeclaredProgram(CodegenProgram source, string name, string[] names,
+        Func<CodegenKernelSpec, PtxPassLowering?>? lowerPass, out string? decline)
+    {
+        decline = null;
         if (names.Length > DeclaredBindings.Capacity)
             throw new ArgumentException("A declared call binds at most " + DeclaredBindings.Capacity + " buffers.", nameof(names));
         PtxProgramLowering lowering;
         try
         {
-            lowering = PtxProgramLowering.Create(build(key), key.ToString(), _ccMajor, _ccMinor);
+            lowering = PtxProgramLowering.Create(source, name, _ccMajor, _ccMinor, lowerPass);
         }
         catch (NotSupportedException ex)
         {
-            _declaredDeclines[key] = ex.Message;
-            return null;   // this shape has no declared lowering; the hand-written kernel serves it
+            decline = ex.Message;
+            return null;
         }
 
         var slotOf = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -308,7 +324,7 @@ public sealed partial class CudaBackend
             // forbids): decline, so the hand-written kernel serves the shape.
             foreach (var (module, _) in kernels) module.Dispose();
             foreach (var buffer in scratch) buffer.Dispose();
-            _declaredDeclines[key] = ex.Message;
+            decline = ex.Message;
             return null;
         }
         catch
@@ -343,6 +359,7 @@ public sealed partial class CudaBackend
     {
         DisposeDeclaredResidents();
         DisposeDeclaredElementwise();
+        DisposeDeclaredConvolutions();
 
         foreach (var program in _declaredPrograms.Values) program?.Dispose();
         _declaredPrograms.Clear();

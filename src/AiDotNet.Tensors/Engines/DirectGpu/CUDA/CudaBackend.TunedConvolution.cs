@@ -152,6 +152,8 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                         true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,
                         true, _ => HasTunedKernel("conv2d_direct"), (in CudaConv2DArgs a) => LaunchConv2DDirect(a)));
+                    // #890 phase 4b: the declared implicit-GEMM programs, last, so never the reference.
+                    AddDeclaredConvForwardCandidates(candidates);
                     _conv2DForwardSlot = new TunedKernelSlot<CudaConv2DArgs>(TunedKernelOp.Conv2DForward,
                         TunedDeviceKey,
                         new CudaTunedKernelHarness<CudaConv2DArgs>(this, ConvolutionTolerance,

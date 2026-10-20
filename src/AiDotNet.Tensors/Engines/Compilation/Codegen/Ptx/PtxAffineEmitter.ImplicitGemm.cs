@@ -40,6 +40,10 @@ public sealed partial class PtxAffineEmitter
     /// a block count that fills the last wave. 0 means square.</summary>
     public int ImplicitGemmTileM { get; set; }
 
+    /// <summary>The blocks a multiprocessor must fit (<c>.minnctapersm</c>), which caps registers at 128 a thread for
+    /// two; 0 leaves the JIT unbounded, for a shape whose guards need more than the bound and would spill.</summary>
+    public int ImplicitGemmMinBlocksPerMultiprocessor { get; set; } = 2;
+
     private const int ImplicitGemmThreads = 256;
     private const int ImplicitGemmSide = 16;   // threads per tile edge
     private const int ImplicitGemmChunk = 16;  // reduction terms staged per step
@@ -128,9 +132,12 @@ public sealed partial class PtxAffineEmitter
            .Append(".visible .entry ").Append(spec.Name).Append("(\n");
         for (int i = 0; i < spec.ParameterCount; i++)
             _sb.Append("    .param .u64 p").Append(I(i)).Append(i == spec.ParameterCount - 1 ? "\n" : ",\n");
-        // Two blocks a SM: one block of 256 threads cannot hide a step's barrier, and without the bound the JIT
-        // gives the 8 x 4 micro-tile more than the 128 registers that two blocks leave each thread.
-        _sb.Append(")\n.maxntid ").Append(I(ImplicitGemmThreads)).Append(", 1, 1\n.minnctapersm 2\n{\n");
+        // Two blocks a SM by default: one block of 256 threads cannot hide a step's barrier, and without the bound the
+        // JIT gives the 8 x 4 micro-tile more than the 128 registers that two blocks leave each thread.
+        _sb.Append(")\n.maxntid ").Append(I(ImplicitGemmThreads)).Append(", 1, 1\n");
+        if (ImplicitGemmMinBlocksPerMultiprocessor > 0)
+            _sb.Append(".minnctapersm ").Append(I(ImplicitGemmMinBlocksPerMultiprocessor)).Append('\n');
+        _sb.Append("{\n");
         var basePtr = new string[spec.ParameterCount];
         for (int i = 0; i < basePtr.Length; i++)
         {

@@ -1,0 +1,279 @@
+﻿// Copyright (c) AiDotNet. All rights reserved.
+// Convolutions on declared programs (#890 phase 4b). A convolution's spec -- forward, or the data or weight gradient
+// derived from it by CodegenAdjoint -- is lowered as a tiled implicit GEMM (PtxAffineEmitter.EmitImplicitGemm), on its
+// own or split along a reduction axis (CodegenSplitReduction.TryPlanChunkedForTiles) for small outputs with long
+// reductions. Each schedule is a candidate in the tuned convolution slots, so it serves a shape class only where the
+// slot measured it correct and fastest; the established routes stay the reference.
+//
+// A call allocates nothing: the geometry and schedule are a value key, and the program (modules, scratch, argument
+// slots) is built once per key through the same path as the other declared families.
+
+using System;
+using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+
+/// <summary>Which convolution operator a declared program computes.</summary>
+internal enum DeclaredConvPass : byte
+{
+    Forward,
+    BackwardData,
+    BackwardWeights,
+}
+
+/// <summary>
+/// An implicit-GEMM schedule: the output tile (M rows -- what only the first operand reads -- by N columns) and,
+/// above 1, the factor a reduction axis is split by into a partial pass and a combine.
+/// </summary>
+internal readonly record struct DeclaredConvSchedule(int TileM, int TileN, int SplitFactor)
+{
+    /// <summary>The candidate-name suffix: "m128n64" or "split4.m128n64".</summary>
+    internal string Suffix => (SplitFactor > 1 ? "split" + SplitFactor + "." : "") + "m" + TileM + "n" + TileN;
+}
+
+/// <summary>A declared convolution program: one square-window geometry, the fused bias + ReLU or not, a schedule.</summary>
+internal readonly record struct DeclaredConvKey(
+    DeclaredConvPass Pass, int Batch, int InChannels, int OutChannels, int Height, int Width,
+    int Kernel, int Stride, int Pad, int Dilation, bool BiasRelu, DeclaredConvSchedule Schedule);
+
+public sealed partial class CudaBackend
+{
+    // The schedules registered per slot. Forward and data gradients are large-output GEMMs, where a split only adds
+    // the combine's traffic; the weight gradient's output is filters-sized and its reduction runs over every
+    // position, which is what the split is for (sm_75: the stride-2 weight gradient 962 -> 682 us with split 4).
+    private static readonly DeclaredConvSchedule[] s_declaredConvLargeOutputSchedules =
+    {
+        new(64, 64, 0), new(128, 64, 0),
+    };
+
+    private static readonly DeclaredConvSchedule[] s_declaredConvWeightSchedules =
+    {
+        new(64, 64, 0), new(128, 64, 0), new(128, 64, 2), new(128, 64, 4),
+    };
+
+    private static readonly string[] s_convForwardNames = { "input", "weights", "output" };
+    private static readonly string[] s_convForwardBiasReluNames = { "input", "weights", "bias", "output" };
+    private static readonly string[] s_convBackwardDataNames = { "dOut", "weights", "dinput" };
+    private static readonly string[] s_convBackwardWeightNames = { "dOut", "input", "dweights" };
+
+    // Lowered programs by key; a null entry records a key that declined, so it is not lowered again.
+    private readonly Dictionary<DeclaredConvKey, DeclaredProgram?> _declaredConvPrograms = new();
+    private readonly Dictionary<DeclaredConvKey, string> _declaredConvDeclines = new();
+
+    /// <summary>
+    /// The spec of a convolution pass, or null when the geometry is outside what the declared builder takes: one
+    /// window size, stride, padding and dilation for both axes, and the caller's output extent.
+    /// </summary>
+    internal static CodegenKernelSpec? DeclaredConvSpec(DeclaredConvPass pass, int batch, int inChannels,
+        int outChannels, int height, int width, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, int outHeight, int outWidth, bool biasRelu)
+    {
+        if (!DeclaredConvGeometryFits(batch, inChannels, outChannels, height, width, kernelH, kernelW, strideH, strideW,
+                padH, padW, dilationH, dilationW, outHeight, outWidth))
+            return null;
+        var forward = CodegenKernelCatalog.Conv2D(batch, inChannels, outChannels, height, width, kernelH, strideH, padH,
+            dilationH, groups: 1, epilogue: pass == DeclaredConvPass.Forward && biasRelu);
+        return pass switch
+        {
+            DeclaredConvPass.Forward => forward,
+            DeclaredConvPass.BackwardData => CodegenAdjoint.BackwardData(forward, 0),
+            _ => CodegenAdjoint.BackwardWeights(forward, 1),
+        };
+    }
+
+    // The geometry checks of DeclaredConvSpec without building the spec, so a call can test them without allocating.
+    private static bool DeclaredConvGeometryFits(int batch, int inChannels, int outChannels, int height, int width,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outHeight, int outWidth)
+    {
+        if (kernelH != kernelW || strideH != strideW || padH != padW || dilationH != dilationW) return false;
+        if (batch <= 0 || inChannels <= 0 || outChannels <= 0 || kernelH <= 0 || strideH <= 0 || dilationH <= 0 ||
+            padH < 0)
+            return false;
+        int span = dilationH * (kernelH - 1) + 1;
+        int expectedH = (height + 2 * padH - span) / strideH + 1, expectedW = (width + 2 * padH - span) / strideH + 1;
+        if (height + 2 * padH < span || width + 2 * padH < span || expectedH != outHeight || expectedW != outWidth)
+            return false;
+        // Every tensor is addressed with 32-bit offsets.
+        return (long)batch * inChannels * height * width <= int.MaxValue &&
+            (long)batch * outChannels * outHeight * outWidth <= int.MaxValue;
+    }
+
+    // Whether a schedule can lower a slot's shape class (the slot asks before it measures a candidate).
+    private bool DeclaredConvAdmits(DeclaredConvPass pass, TunedShape s, DeclaredConvSchedule schedule)
+    {
+        if (!DeclaredKernelsEnabled) return false;
+        var spec = DeclaredConvSpec(pass, s[0], s[1], s[4], s[2], s[3], s[5], s[6], s[7], s[8], s[9], s[10], s[11],
+            s[12], s[13], s[14], biasRelu: false);
+        if (spec is null || PtxAffineEmitter.PlanImplicitGemm(spec, out _) is null) return false;
+        if (schedule.SplitFactor <= 1) return true;
+        return CodegenSplitReduction.TryPlanChunkedForTiles(spec, schedule.SplitFactor) is { } split &&
+            PtxAffineEmitter.PlanImplicitGemm(split.Partial, out _) is not null;
+    }
+
+    /// <summary>Runs a forward convolution as a declared program; false when the shape declines.</summary>
+    internal bool TryDeclaredConv2DForward(in CudaConv2DArgs a, DeclaredConvSchedule schedule)
+    {
+        bool biasRelu = a.Bias is not null && a.Activation == FusedActivationType.ReLU;
+        if (!DeclaredConvGeometryFits(a.Batch, a.InChannels, a.OutChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW,
+                a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW, a.OutHeight, a.OutWidth))
+            return false;
+        var key = new DeclaredConvKey(DeclaredConvPass.Forward, a.Batch, a.InChannels, a.OutChannels, a.InHeight,
+            a.InWidth, a.KernelH, a.StrideH, a.PadH, a.DilationH, biasRelu, schedule);
+        bool ran = a.Bias is { } bias && biasRelu
+            ? TryDeclaredConv(key, s_convForwardBiasReluNames, new DeclaredBindings(a.Input, a.Kernel, bias, a.Output))
+            : TryDeclaredConv(key, s_convForwardNames, new DeclaredBindings(a.Input, a.Kernel, a.Output));
+        // Any other epilogue runs after the convolution, as on the routes whose kernels do not take it.
+        if (ran && !biasRelu) RunConvEpiloguePasses(a);
+        return ran;
+    }
+
+    /// <summary>Runs a data or weight gradient as a declared program; false when the shape declines.</summary>
+    internal bool TryDeclaredConv2DBackward(in TunedConv2DBackwardArgs a, DeclaredConvSchedule schedule)
+    {
+        var pass = a.WeightGradient ? DeclaredConvPass.BackwardWeights : DeclaredConvPass.BackwardData;
+        if (!DeclaredConvGeometryFits(a.Batch, a.InChannels, a.OutChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW,
+                a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW, a.OutHeight, a.OutWidth))
+            return false;
+        var key = new DeclaredConvKey(pass, a.Batch, a.InChannels, a.OutChannels, a.InHeight, a.InWidth, a.KernelH,
+            a.StrideH, a.PadH, a.DilationH, BiasRelu: false, schedule);
+        // Weight gradient: First = input, Second = gradOutput. Data gradient: First = gradOutput, Second = kernel.
+        return a.WeightGradient
+            ? TryDeclaredConv(key, s_convBackwardWeightNames, new DeclaredBindings(a.Second, a.First, a.Output))
+            : TryDeclaredConv(key, s_convBackwardDataNames, new DeclaredBindings(a.First, a.Second, a.Output));
+    }
+
+    private bool TryDeclaredConv(in DeclaredConvKey key, string[] names, in DeclaredBindings bound)
+    {
+        if (!DeclaredKernelsEnabled) return false;
+        DeclaredProgram? program;
+        lock (_directPtxLock)
+        {
+            if (!_declaredConvPrograms.TryGetValue(key, out program))
+            {
+                if (IsStreamCapturing()) return false;
+                program = BuildDeclaredConv(key, names);
+                _declaredConvPrograms[key] = program;
+            }
+        }
+        if (program is null) return false;
+        RunDeclaredProgram(program, names, bound);
+        return true;
+    }
+
+    private DeclaredProgram? BuildDeclaredConv(DeclaredConvKey key, string[] names)
+    {
+        int outH = (key.Height + 2 * key.Pad - key.Dilation * (key.Kernel - 1) - 1) / key.Stride + 1;
+        int outW = (key.Width + 2 * key.Pad - key.Dilation * (key.Kernel - 1) - 1) / key.Stride + 1;
+        var spec = DeclaredConvSpec(key.Pass, key.Batch, key.InChannels, key.OutChannels, key.Height, key.Width,
+            key.Kernel, key.Kernel, key.Stride, key.Stride, key.Pad, key.Pad, key.Dilation, key.Dilation, outH, outW,
+            key.BiasRelu);
+        if (spec is null)
+        {
+            _declaredConvDeclines[key] = "the geometry is outside the declared convolution builder";
+            return null;
+        }
+        var schedule = key.Schedule;
+        var source = new CodegenProgram(new[] { spec }, Array.Empty<long>(), spec.Name);
+        var program = BuildDeclaredProgram(source, key.ToString(), names,
+            pass => LowerDeclaredConv(pass, schedule, minBlocks: 2), out string? decline);
+        // The two-blocks-a-SM bound caps registers at 128; a ragged shape's guards can need more, and the JIT then
+        // spills, which the direct-kernel contract rejects. Unbounded, it fits one block a SM instead.
+        if (program is null && decline is not null && decline.IndexOf("local bytes", StringComparison.Ordinal) >= 0)
+            program = BuildDeclaredProgram(source, key.ToString(), names,
+                pass => LowerDeclaredConv(pass, schedule, minBlocks: 0), out decline);
+        if (decline is not null) _declaredConvDeclines[key] = decline;
+        return program;
+    }
+
+    // The schedule's lowering of the convolution pass; NotSupportedException declines the key.
+    private PtxPassLowering LowerDeclaredConv(CodegenKernelSpec pass, DeclaredConvSchedule schedule, int minBlocks)
+    {
+        string label = "implicit-gemm " + schedule.Suffix;
+        if (schedule.SplitFactor <= 1)
+            return new PtxPassLowering(new[] { EmitImplicitGemmKernel(pass, schedule, minBlocks) }, null, label);
+        var split = CodegenSplitReduction.TryPlanChunkedForTiles(pass, schedule.SplitFactor)
+            ?? throw new NotSupportedException(pass.Name + " has no reduction axis " + schedule.SplitFactor + " divides.");
+        var combine = new PtxAffineEmitter();
+        string combinePtx = combine.Emit(split.Combine, _ccMajor, _ccMinor);
+        return new PtxPassLowering(new[]
+        {
+            EmitImplicitGemmKernel(split.Partial, schedule, minBlocks),
+            new PtxPassKernel(combinePtx, split.Combine.Name, combine.LaunchBlocks, (uint)combine.LaunchBlockX,
+                (uint)combine.LaunchBlockY),
+        }, split, label);
+    }
+
+    private PtxPassKernel EmitImplicitGemmKernel(CodegenKernelSpec spec, DeclaredConvSchedule schedule, int minBlocks)
+    {
+        var emitter = new PtxAffineEmitter
+        {
+            ImplicitGemm = true, ImplicitGemmTile = schedule.TileN, ImplicitGemmTileM = schedule.TileM,
+            ImplicitGemmMinBlocksPerMultiprocessor = minBlocks,
+        };
+        string ptx = emitter.Emit(spec, _ccMajor, _ccMinor);
+        // The emitter falls back to its affine lowering when the implicit GEMM does not apply; that is not this
+        // candidate, so the key declines rather than run under its name.
+        if (!emitter.TileDescription.StartsWith("implicit-gemm", StringComparison.Ordinal))
+            throw new NotSupportedException(spec.Name + " has no implicit-GEMM lowering.");
+        return new PtxPassKernel(ptx, spec.Name, emitter.LaunchBlocks, (uint)emitter.LaunchBlockX,
+            (uint)emitter.LaunchBlockY);
+    }
+
+    /// <summary>Why a declared convolution key declined, or null when it lowered (or was never asked for).</summary>
+    internal string? DeclaredConvDeclineReason(DeclaredConvKey key)
+    {
+        lock (_directPtxLock) return _declaredConvDeclines.TryGetValue(key, out string? reason) ? reason : null;
+    }
+
+    private void DisposeDeclaredConvolutions()
+    {
+        foreach (var program in _declaredConvPrograms.Values) program?.Dispose();
+        _declaredConvPrograms.Clear();
+    }
+
+    // Candidates for the tuned slots: one per schedule, registered only while the declared route is on for the process
+    // (persisted decisions are keyed by the registered set). A key that declines at run time -- a capture before it was
+    // built, a driver rejection -- falls back to the given route so the call still completes.
+    private void AddDeclaredConvForwardCandidates(List<ITunedKernelCandidate<CudaConv2DArgs>> candidates)
+    {
+        if (!s_declaredKernels) return;
+        foreach (var schedule in s_declaredConvLargeOutputSchedules)
+        {
+            var sc = schedule;
+            candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("ptx.conv2d.implicit_gemm." + sc.Suffix,
+                TunedKernelOrigin.Generated, true, shape => DeclaredConvAdmits(DeclaredConvPass.Forward, shape, sc),
+                (in CudaConv2DArgs a) =>
+                {
+                    if (TryDeclaredConv2DForward(a, sc)) return;
+                    LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                        a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+                        a.PadH, a.PadW, a.DilationH, a.DilationW);
+                    RunConvEpiloguePasses(a);
+                }));
+        }
+    }
+
+    private void AddDeclaredConvBackwardCandidates(List<ITunedKernelCandidate<TunedConv2DBackwardArgs>> candidates,
+        bool weightGradient)
+    {
+        if (!s_declaredKernels) return;
+        var pass = weightGradient ? DeclaredConvPass.BackwardWeights : DeclaredConvPass.BackwardData;
+        string prefix = weightGradient ? "ptx.conv2d_dw.implicit_gemm." : "ptx.conv2d_dx.implicit_gemm.";
+        foreach (var schedule in weightGradient ? s_declaredConvWeightSchedules : s_declaredConvLargeOutputSchedules)
+        {
+            var sc = schedule;
+            candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>(prefix + sc.Suffix,
+                TunedKernelOrigin.Generated, true, shape => DeclaredConvAdmits(pass, shape, sc),
+                (in TunedConv2DBackwardArgs a) =>
+                {
+                    if (TryDeclaredConv2DBackward(a, sc)) return;
+                    if (a.WeightGradient) LaunchDwDirect(a);
+                    else LaunchDxDirect(a);
+                }));
+        }
+    }
+}

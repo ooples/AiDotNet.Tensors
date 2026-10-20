@@ -450,6 +450,13 @@ internal static class KernelAutotuneTool
             CandidateProgram? program = null;
             try { program = CreateSingle(runtime, spec, Candidates[i]); }
             catch (NotSupportedException) { continue; }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("was rejected", StringComparison.Ordinal))
+            {
+                // The driver refused the kernel (local memory, which the direct-kernel contract forbids): this
+                // configuration is not a candidate for the shape; the rest of the search goes on.
+                Console.WriteLine("    candidate '" + Candidates[i].Name + "' rejected: " + ex.Message);
+                continue;
+            }
             using (program)
             {
                 program.Launch();
@@ -1226,6 +1233,15 @@ internal static class KernelAutotuneTool
         catch (NotSupportedException)
         {
             for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            return null;
+        }
+        catch (InvalidOperationException ex) when (implicitTile is not null)
+        {
+            // The driver rejected the implicit-GEMM partial (a register spill at the two-blocks-a-SM bound, which
+            // the direct-kernel contract forbids): this schedule is not a candidate for the shape, the others are.
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            Console.WriteLine("    candidate ig-chunked-split:x" + chunkFactor.ToString(CultureInfo.InvariantCulture) +
+                ":" + implicitTile + " rejected: " + ex.Message);
             return null;
         }
         catch
