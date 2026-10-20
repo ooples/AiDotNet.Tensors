@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // The tiled implicit-GEMM lowering (#890 phase 4b): which axes become M, N and the batch slices,
 // what it refuses, and the structure of the kernel it emits. Its numerical agreement with the
 // fp64 oracle is the conveyor's --kernel-verify and the autotuner's candidate check, on device.
@@ -22,8 +22,9 @@ public class PtxImplicitGemmTests
     }
 
     /// <summary>
-    /// A strided convolution: M is the output channel (read only by the weights), N the
-    /// batch and output positions (read only by the input), and every reduction axis is R.
+    /// A strided convolution: M is what only the FIRST product operand reads -- the input, so
+    /// the batch and output positions -- N what only the weights read (the output channel),
+    /// and every reduction axis is R.
     /// </summary>
     [Fact]
     public void AConvolutionSplitsIntoChannelsPositionsAndTaps()
@@ -31,8 +32,9 @@ public class PtxImplicitGemmTests
         var spec = CodegenKernelCatalog.Conv2D(2, 8, 16, 12, 12, 3, 2, 1, 1, 1, epilogue: true);
         var roles = PtxAffineEmitter.PlanImplicitGemm(spec, out string reason)
             ?? throw new InvalidOperationException(reason);
-        Assert.Equal(new[] { 1 }, roles.M);
-        Assert.Equal(new[] { 0, 2, 3 }, roles.N);
+        Assert.Equal("input", spec.Inputs[roles.A].Name);
+        Assert.Equal(new[] { 0, 2, 3 }, roles.M);
+        Assert.Equal(new[] { 1 }, roles.N);
         Assert.Empty(roles.Batch);
         Assert.Equal(spec.Space.ReductionAxes, roles.R);
     }

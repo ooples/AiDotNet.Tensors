@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // The assembly line's input: every kernel the conveyor knows how to verify,
 // release and benchmark, declared once as a spec rather than as hand-written PTX.
 //
@@ -284,7 +284,8 @@ public static class CodegenKernelCatalog
 
         new("conv2d_3x3_grouped",
             "grouped 3x3 (8 groups) + bias + ReLU (ResNeXt-style)",
-            Conv2D(2, 16, 16, 16, 16, 3, stride: 1, pad: 1, dilation: 1, groups: 4, epilogue: true),
+            // 8 channels a group -> 72 trips: strip-mined, like the bench shape
+            Conv2D(2, 16, 16, 16, 16, 3, stride: 1, pad: 1, dilation: 1, groups: 2, epilogue: true),
             Conv2D(8, 64, 64, 28, 28, 3, stride: 1, pad: 1, dilation: 1, groups: 8, epilogue: true)),
 
         new("conv2d_3x3_stride2_bwd_data",
@@ -294,7 +295,8 @@ public static class CodegenKernelCatalog
 
         new("conv2d_3x3_stride2_bwd_weights",
             "gradient wrt weights of the stride-2 3x3 (derived)",
-            CodegenAdjoint.BackwardWeights(Conv2D(2, 8, 8, 16, 16, 3, 2, 1, 1, 1, epilogue: false), 1),
+            // 32x32 input: enough (n, oh, ow) trips that two reduction axes loop, like the bench shape
+            CodegenAdjoint.BackwardWeights(Conv2D(2, 8, 8, 32, 32, 3, 2, 1, 1, 1, epilogue: false), 1),
             CodegenAdjoint.BackwardWeights(Conv2D(8, 64, 128, 56, 56, 3, 2, 1, 1, 1, epilogue: false), 1)),
 
         new("conv2d_3x3_dilation2_bwd_data",
@@ -304,7 +306,8 @@ public static class CodegenKernelCatalog
 
         new("conv2d_3x3_grouped_bwd_data",
             "gradient wrt data of the grouped 3x3 (derived)",
-            CodegenAdjoint.BackwardData(Conv2D(2, 16, 16, 16, 16, 3, 1, 1, 1, 4, epilogue: false), 0),
+            // 8 channels a group -> 72 trips: strip-mined, like the bench shape
+            CodegenAdjoint.BackwardData(Conv2D(2, 16, 16, 16, 16, 3, 1, 1, 1, 2, epilogue: false), 0),
             CodegenAdjoint.BackwardData(Conv2D(8, 64, 64, 28, 28, 3, 1, 1, 1, 8, epilogue: false), 0)),
 
         new("conv2d_3x3_grouped_bwd_weights",
