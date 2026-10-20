@@ -20,6 +20,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// channels (four and nine 16-byte shared loads) for 144 FMAs. The co reduction may be split across blockIdx.z into
 /// partial slices of dX's layout, summed in split order by conv2d_wgrad_splitk_reduce (deterministic).
 /// </summary>
+/// <remarks>
+/// CUDA only for now, as a specialization of an operation every backend already serves rather than a CUDA-only
+/// capability: the other five keep computing this gradient through their own tuned input-gradient candidates, so
+/// nothing is unavailable there. The follow-ups for the ports are HIP #1479, Metal #1480, OpenCL #1481,
+/// Vulkan #1482 and WebGPU #1483.
+/// </remarks>
 internal static class CudaConvDgradS2Kernels
 {
     /// <summary>Output channels staged per step; the host rounds split slices to it.</summary>
@@ -31,23 +37,37 @@ internal static class CudaConvDgradS2Kernels
     /// <summary>Input-gradient channels per block.</summary>
     internal const int ChannelTile = 32;
 
-    public static string GetSource() => @"
+    /// <summary>
+    /// Threads per in-block output-channel group. The host multiplies it by the group count for the block size and
+    /// the kernel derives its launch bounds, thread count and thread roles from the same value, so the two geometries
+    /// cannot drift apart.
+    /// </summary>
+    internal const int GroupThreads = 64;
+
+    // log2(GroupThreads), so the thread roles stay a shift and a mask rather than a signed division.
+    private const int GroupThreadsLog2 = 6;
+
+    public static string GetSource() => $@"
+#define S2_GT {GroupThreads}
+#define S2_GT_LOG2 {GroupThreadsLog2}
+" + @"
+static_assert((1 << S2_GT_LOG2) == S2_GT, ""S2_GT_LOG2 must be log2(S2_GT)."");
 #define S2_CO 8
 #define S2_CELLS 32
 #define S2_C 32
 #define S2_YLD 72   // a staged co's dY rows: (S2_CELLS / OW + 1) x (OW + 4) <= 72 for OW in {4, 8, 16, 32}
 
-// G groups of 64 threads share each staged chunk: group g accumulates co0 + g, co0 + g + G, ... of it, and the groups'
+// G groups of S2_GT threads share each staged chunk: group g accumulates co0 + g, co0 + g + G, ... of it, and the groups'
 // sums are added in group order through shared memory at the end (deterministic).
 template <int G>
 __device__ __forceinline__ void conv2d_dgrad_s2k3_body(
     const float* __restrict__ dy, const float* __restrict__ w, float* __restrict__ dx,
     int N, int C, int K, int OH, int OW, int coPerSplit)
 {
-    constexpr int NT = 64 * G, YL = (128 + NT - 1) / NT, WL = (576 + NT - 1) / NT;
+    constexpr int NT = S2_GT * G, YL = (128 + NT - 1) / NT, WL = (576 + NT - 1) / NT;
     __shared__ __align__(16) float Ys[2][S2_CO][S2_YLD];
     __shared__ __align__(16) float Ws[2][S2_CO][9][S2_C];
-    const int tid = threadIdx.x, g = tid >> 6, ct = tid & 63;
+    const int tid = threadIdx.x, g = tid >> S2_GT_LOG2, ct = tid & (S2_GT - 1);
     // The block's dY rows (n, a) are R0 .. R0 + RB - 1 of the N * OH; it stages one more (the row below its last) and
     // a zero column OW, at a 16-byte-aligned row stride.
     const int RB = S2_CELLS / OW, YS = OW + 4;
@@ -192,13 +212,13 @@ __device__ __forceinline__ void conv2d_dgrad_s2k3_body(
             if (g == gg)
             {
                 #pragma unroll
-                for (int v = 0; v < 64; v++) red[v * 64 + ct] = acc[v >> 4][(v >> 2) & 3][v & 3];
+                for (int v = 0; v < 64; v++) red[v * S2_GT + ct] = acc[v >> 4][(v >> 2) & 3][v & 3];
             }
             __syncthreads();
             if (g == 0)
             {
                 #pragma unroll
-                for (int v = 0; v < 64; v++) acc[v >> 4][(v >> 2) & 3][v & 3] += red[v * 64 + ct];
+                for (int v = 0; v < 64; v++) acc[v >> 4][(v >> 2) & 3][v & 3] += red[v * S2_GT + ct];
             }
             __syncthreads();
         }
@@ -221,7 +241,7 @@ __device__ __forceinline__ void conv2d_dgrad_s2k3_body(
 }
 
 #define S2_ENTRY(G) \
-extern ""C"" __global__ __launch_bounds__(64 * G) void conv2d_dgrad_s2k3_g##G( \
+extern ""C"" __global__ __launch_bounds__(S2_GT * G) void conv2d_dgrad_s2k3_g##G( \
     const float* __restrict__ dy, const float* __restrict__ w, float* __restrict__ dx, \
     int N, int C, int K, int OH, int OW, int coPerSplit) \
 { conv2d_dgrad_s2k3_body<G>(dy, w, dx, N, C, K, OH, OW, coPerSplit); }

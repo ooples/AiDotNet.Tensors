@@ -116,7 +116,8 @@ public sealed partial class CudaBackend
         void** args = stackalloc void*[9];
         args[0] = &dyPtr; args[1] = &wPtr; args[2] = &dxPtr; args[3] = &n; args[4] = &c; args[5] = &k;
         args[6] = &oh; args[7] = &ow; args[8] = &cps;
-        LaunchKernel3D(kernel, (uint)gx, (uint)gy, (uint)splits, (uint)(64 * groups), 1, 1, args, 0);
+        LaunchKernel3D(kernel, (uint)gx, (uint)gy, (uint)splits,
+            (uint)(Kernels.CudaConvDgradS2Kernels.GroupThreads * groups), 1, 1, args, 0);
         if (splits > 1) LaunchSplitKReduce(reduce, destination, a.Output, (int)outputs, splits);
         return true;
     }

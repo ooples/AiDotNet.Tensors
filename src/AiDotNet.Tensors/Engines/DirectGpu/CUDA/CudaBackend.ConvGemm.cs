@@ -35,6 +35,43 @@ public sealed partial class CudaBackend
         return slot;
     }
 
+    // Every slot TryConvScratch owns. The backend's Dispose releases them before the buffer pool goes, so the
+    // device memory returns through the pool instead of waiting on cuCtxDestroy, and no CudaGpuBuffer is left to
+    // finalize against a context that has already been destroyed.
+    private void DisposeConvScratch()
+    {
+        static void Release(ref IGpuBuffer? slot)
+        {
+            slot?.Dispose();
+            slot = null;
+        }
+
+        Release(ref _convColScratch);
+        Release(ref _convDgradPartials);
+        Release(ref _convEngineDgradPartials);
+        Release(ref _convEngineDgradWeights);
+        Release(ref _convEngineWgradPartials);
+        Release(ref _convFpropPartials);
+        Release(ref _convWeightPartials);
+        Release(ref _convWgradPartials);
+        Release(ref _dgradS2Partials);
+        Release(ref _fpropR8Partials);
+        Release(ref _winograd4M);
+        Release(ref _winograd4U);
+        Release(ref _winograd4V);
+        Release(ref _winograd4Wm);
+        Release(ref _winograd4Wu);
+        Release(ref _winograd4Wv);
+        Release(ref _winogradDwPartials);
+        Release(ref _winogradFusedPartials);
+        Release(ref _winogradM);
+        Release(ref _winogradU);
+        Release(ref _winogradV);
+        Release(ref _winogradWm);
+        Release(ref _winogradWu);
+        Release(ref _winogradWv);
+    }
+
     private bool ConvGemmUsable()
         => s_convGemmBackward && (!IsStreamCapturing() || CurrentCublasHasWorkspace);
 

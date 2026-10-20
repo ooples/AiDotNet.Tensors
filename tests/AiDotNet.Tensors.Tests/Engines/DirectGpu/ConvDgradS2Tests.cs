@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -108,6 +109,30 @@ public sealed class ConvDgradS2Tests
     {
         CudaBackend.ChooseDgradS2Grid(blocks, outC, sms, out int g, out int s);
         Assert.Equal((groups, splits), (g, s));
+    }
+
+    /// <summary>
+    /// The host block size is GroupThreads * groups, and the kernel's launch bounds, thread count and thread roles
+    /// have to come from the same number: if one side moved alone the launch would either break its launch bounds or
+    /// hand the compute roles to threads that were never launched. Read off the emitted source, so it holds on a
+    /// machine without CUDA.
+    /// </summary>
+    [Fact]
+    public void The_kernel_source_takes_its_thread_geometry_from_the_shared_constant()
+    {
+        string source = CudaConvDgradS2Kernels.GetSource();
+        Assert.Contains($"#define S2_GT {CudaConvDgradS2Kernels.GroupThreads}", source);
+        Assert.Contains("__launch_bounds__(S2_GT * G)", source);
+        Assert.Contains("NT = S2_GT * G", source);
+        Assert.Contains("tid >> S2_GT_LOG2", source);
+        Assert.Contains("tid & (S2_GT - 1)", source);
+        Assert.Contains("static_assert((1 << S2_GT_LOG2) == S2_GT", source);
+
+        // The literals the constant replaced. Each one would have been a second, unconnected copy of the geometry.
+        Assert.DoesNotContain("64 * G", source);
+        Assert.DoesNotContain("tid >> 6", source);
+        Assert.DoesNotContain("tid & 63", source);
+        Assert.DoesNotContain("* 64 + ct", source);
     }
 
     [SkippableFact]
