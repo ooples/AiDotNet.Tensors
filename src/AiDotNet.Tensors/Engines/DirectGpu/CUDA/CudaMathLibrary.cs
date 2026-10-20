@@ -137,7 +137,8 @@ internal static class CudaMathLibrary
         foreach (string name in inputs)
             if (Regex.IsMatch(body, @"\b" + Regex.Escape(name) + @"\b")) { reason = kernel + ": reads " + name + " other than at idx"; return null; }
         if (Regex.IsMatch(body, @"\b" + Regex.Escape(output) + @"\b")) { reason = kernel + ": uses " + output + " other than storing at idx"; return null; }
-        if (Regex.IsMatch(body, @"\b" + Regex.Escape(size) + @"\b")) { reason = kernel + ": reads the length " + size; return null; }        foreach (string forbidden in new[] { "idx", "blockIdx", "threadIdx", "blockDim", "gridDim", "__syncthreads", "__shared__", "atomic" })
+        if (Regex.IsMatch(body, @"\b" + Regex.Escape(size) + @"\b")) { reason = kernel + ": reads the length " + size; return null; }
+        foreach (string forbidden in new[] { "idx", "blockIdx", "threadIdx", "blockDim", "gridDim", "__syncthreads", "__shared__", "atomic" })
             if (Regex.IsMatch(body, @"\b" + forbidden + @"\b")) { reason = kernel + ": the body uses " + forbidden; return null; }
         if (Regex.IsMatch(body, @"\breturn\s*;")) { reason = kernel + ": exits without storing"; return null; }
         if (!body.Contains("return ", StringComparison.Ordinal)) { reason = kernel + ": never stores"; return null; }

@@ -3907,6 +3907,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// and a ReLU were two over the same [M, N] output.</summary>
     private unsafe void LaunchBiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N, bool relu)
     {
+        if (TryDeclaredBiasAdd(A, bias, C, M, N, relu)) return;
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add_out");
 
@@ -4042,9 +4043,22 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchElementwiseKernel("add_vectors", A, B, C, size);
     }
 
-    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Relu(C, C, size); }
-    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Sigmoid(C, C, size); }
-    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) { Add(A, B, C, size); Gelu(C, C, size); }
+    // One declared kernel for the pair (#890 phase 4a) where the hand-written path makes two launches.
+    public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (TryDeclaredAddActivation("relu", A, B, C, size)) return;
+        Add(A, B, C, size); Relu(C, C, size);
+    }
+    public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (TryDeclaredAddActivation("sigmoid", A, B, C, size)) return;
+        Add(A, B, C, size); Sigmoid(C, C, size);
+    }
+    public void AddGelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (TryDeclaredAddActivation("gelu", A, B, C, size)) return;
+        Add(A, B, C, size); Gelu(C, C, size);
+    }
 
     public void Subtract(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
@@ -5935,6 +5949,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchUnaryKernel(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
+        // A declared kernel first (#890 phase 4a), computing this kernel's own expression; the kernels below serve
+        // anything it declines.
+        if (TryDeclaredElementwise(kernelName, output, size, input)) return;
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
         if (size % 4 == 0 && Vec4Aligned(input, output) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
@@ -5980,6 +5997,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (A.Size < size || B.Size < size || C.Size < size)
             throw new InvalidOperationException(
                 $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
+        // A declared kernel first (#890 phase 4a), computing this kernel's own expression.
+        if (TryDeclaredElementwise(kernelName, C, size, A, B)) return;
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
         if (size % 4 == 0 && Vec4Aligned(A, B, C) && _kernelCache.TryGetValue(kernelName + "_vec4", out var vec4Kernel))
         {
@@ -6017,6 +6036,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchScaleKernel(IGpuBuffer A, IGpuBuffer B, float scalar, int size)
     {
+        if (TryDeclaredElementwise("scale_vector", B, size, A, scalarCount: 1, s0: scalar)) return;
         // Try vec4 variant
         if (size % 4 == 0 && Vec4Aligned(A, B) && _kernelCache.TryGetValue("scale_vector_vec4", out var vec4Kernel))
         {
@@ -10589,6 +10609,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void LeakyRelu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
+        if (TryDeclaredElementwise("leaky_relu", B, size, A, scalarCount: 1, s0: alpha)) return;
         if (!_kernelCache.TryGetValue("leaky_relu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: leaky_relu");
 
@@ -10629,6 +10650,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Elu(IGpuBuffer A, IGpuBuffer B, float alpha, int size)
     {
+        if (TryDeclaredElementwise("elu", B, size, A, scalarCount: 1, s0: alpha)) return;
         if (!_kernelCache.TryGetValue("elu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: elu");
 
@@ -10874,6 +10896,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
     {
+        if (TryDeclaredElementwise("relu6", B, size, A)) return;
         if (!_kernelCache.TryGetValue("relu6", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: relu6");
         using var _ = PushContext();
@@ -10966,6 +10989,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
     {
+        if (TryDeclaredElementwise("threshold_forward", output, size, input, scalarCount: 2, s0: threshold, s1: value)) return;
         if (!_kernelCache.TryGetValue("threshold_forward", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: threshold_forward");
         using var _ = PushContext();
@@ -12655,6 +12679,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Clamp(IGpuBuffer A, IGpuBuffer B, float min, float max, int size)
     {
+        if (TryDeclaredElementwise("clamp", B, size, A, scalarCount: 2, s0: min, s1: max)) return;
         if (!_kernelCache.TryGetValue("clamp", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: clamp");
 
@@ -12846,6 +12871,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException($"Buffer 'b' capacity ({b.Size}) is less than size ({size}).", nameof(b));
         if (output.Size < size)
             throw new ArgumentException($"Buffer 'output' capacity ({output.Size}) is less than size ({size}).", nameof(output));
+
+        if (TryDeclaredElementwise("lerp_fused", output, size, a, b, scalarCount: 1, s0: t)) return;
 
         if (!_kernelCache.TryGetValue("lerp_fused", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: lerp_fused");
@@ -13503,6 +13530,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
+        if (TryDeclaredElementwise("where_select", C, size, condition, A, B)) return;
         if (!_kernelCache.TryGetValue("where_select", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: where_select");
 
@@ -18934,6 +18962,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // Helper: launch a kernel by name with stackalloc args
     private unsafe void LaunchFusedUnary(string kernelName, IGpuBuffer input, IGpuBuffer output, int size)
     {
+        if (TryDeclaredElementwise(kernelName, output, size, input)) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
@@ -18945,6 +18974,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchFusedBinary(string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
+        if (TryDeclaredElementwise(kernelName, output, size, a, b)) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();
@@ -18967,6 +18997,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe void LaunchFusedScalar(string kernelName, IGpuBuffer input, IGpuBuffer output, float scalar, int size)
     {
+        if (TryDeclaredElementwise(kernelName, output, size, input, scalarCount: 1, s0: scalar)) return;
         if (!_kernelCache.TryGetValue(kernelName, out var kernel))
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
         using var _ = PushContext();

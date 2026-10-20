@@ -14,6 +14,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
@@ -41,6 +42,15 @@ internal static class KernelElementwiseTool
         }
         if (mode == "--smoke") Smoke(backend, new HashSet<string>(args[1..], StringComparer.Ordinal));
         else if (mode == "--bench") Bench(backend, args[1..]);
+        else if (mode == "--allocations")
+        {
+            Console.WriteLine("route on:");
+            Allocations(backend);
+            backend.DeclaredKernelsSwitch = false;
+            Console.WriteLine("route off (the hand-written kernels):");
+            Allocations(backend);
+            backend.DeclaredKernelsSwitch = null;
+        }
         else throw new ArgumentException("Unknown mode " + mode + ".");
     }
 
@@ -98,6 +108,20 @@ internal static class KernelElementwiseTool
             nextFunction:;
             }
         }
+        // The composites, through the production entry points with the route on and off: one declared kernel against
+        // the hand-written path's two launches (add then activation), and the declared bias broadcast against
+        // bias_add_out.
+        if (only.Count == 0)
+        {
+            foreach (string pair in new[] { "AddRelu", "AddSigmoid", "AddGelu", "BiasAdd", "BiasAddRelu" })
+                foreach (var (rows, columns) in new[] { (256, 1024), (100, 37) })
+                {
+                    checkedCount++;
+                    string? failure = CompareComposite(backend, pair, rows, columns);
+                    if (failure is null) routed++;
+                    else failures.Add(pair + " " + rows + "x" + columns + ": " + failure);
+                }
+        }
         Console.WriteLine(checkedCount + " comparisons, " + routed + " through declared kernels, " + failures.Count + " failures");
         var modules = new SortedSet<string>(StringComparer.Ordinal);
         foreach (var function in backend.DerivableElementwise()) modules.Add(function.Module.Name);
@@ -154,6 +178,36 @@ internal static class KernelElementwiseTool
         }
     }
 
+    // Managed bytes per call through the production entry points (route on), over 1000 calls after warming.
+    private static void Allocations(CudaBackend backend)
+    {
+        const int n = 1 << 16;
+        using var a = backend.AllocateBuffer(n);
+        using var b = backend.AllocateBuffer(n);
+        using var c = backend.AllocateBuffer(n);
+        var calls = new (string Name, Action Call)[]
+        {
+            ("Relu", () => backend.Relu(a, c, n)),
+            ("Add", () => backend.Add(a, b, c, n)),
+            ("LeakyRelu", () => backend.LeakyRelu(a, c, 0.1f, n)),
+            ("AddGelu", () => backend.AddGelu(a, b, c, n)),
+            ("BiasAdd", () => backend.BiasAdd(a, b, c, 256, 256)),
+            ("Clamp", () => backend.Clamp(a, c, -1f, 1f, n)),
+        };
+        long before = backend.DeclaredElementwiseLaunches;
+        foreach (var (name, call) in calls)
+        {
+            for (int i = 0; i < 20; i++) call();
+            backend.Synchronize();
+            long start = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 1000; i++) call();
+            long bytes = GC.GetAllocatedBytesForCurrentThread() - start;
+            backend.Synchronize();
+            Console.WriteLine("  " + name.PadRight(10) + (bytes / 1000.0).ToString("F1", CultureInfo.InvariantCulture) + " bytes/call");
+        }
+        Console.WriteLine("  declared launches: " + (backend.DeclaredElementwiseLaunches - before) + " of " + calls.Length * 1020);
+    }
+
     private static double Median(Action call, CudaBackend backend)
     {
         for (int i = 0; i < 10; i++) call();
@@ -168,6 +222,54 @@ internal static class KernelElementwiseTool
         }
         Array.Sort(samples);
         return samples[samples.Length / 2];
+    }
+
+    private static string? CompareComposite(CudaBackend backend, string op, int rows, int columns)
+    {
+        int n = rows * columns;
+        var rng = new Random(op.GetHashCode() ^ n);
+        float[] Random(int count)
+        {
+            var data = new float[count];
+            var bytes = new byte[4];
+            for (int i = 0; i < count; i++) { rng.NextBytes(bytes); data[i] = BitConverter.ToSingle(bytes, 0); }
+            return data;
+        }
+        using var a = backend.AllocateBuffer(Random(n));
+        using var b = backend.AllocateBuffer(Random(op.StartsWith("Bias", StringComparison.Ordinal) ? columns : n));
+        var results = new float[2][];
+        long before = backend.DeclaredElementwiseLaunches;
+        for (int mode = 0; mode < 2; mode++)
+        {
+            backend.DeclaredKernelsSwitch = mode == 0;
+            try
+            {
+                using var output = backend.AllocateBuffer(n);
+                switch (op)
+                {
+                    case "AddRelu": backend.AddRelu(a, b, output, n); break;
+                    case "AddSigmoid": backend.AddSigmoid(a, b, output, n); break;
+                    case "AddGelu": backend.AddGelu(a, b, output, n); break;
+                    case "BiasAdd": backend.BiasAdd(a, b, output, rows, columns); break;
+                    default:
+                        if (!((IBiasActivationBackend)backend).TryBiasAddActivation(a, b, output, rows, columns, FusedActivationType.ReLU))
+                            throw new InvalidOperationException("The backend refused a fused bias + ReLU.");
+                        break;
+                }
+                backend.Synchronize();
+                results[mode] = backend.DownloadBuffer(output);
+            }
+            finally
+            {
+                backend.DeclaredKernelsSwitch = null;
+            }
+        }
+        if (backend.DeclaredElementwiseLaunches == before) return "not declared (" + backend.LastElementwiseDecline + ")";
+        long mismatches = 0;
+        for (int i = 0; i < n; i++)
+            if (!(float.IsNaN(results[0][i]) && float.IsNaN(results[1][i])) &&
+                BitConverter.SingleToInt32Bits(results[0][i]) != BitConverter.SingleToInt32Bits(results[1][i])) mismatches++;
+        return mismatches == 0 ? null : mismatches + " mismatches";
     }
 
     // The operands of the last comparison's first mismatch, for the report.

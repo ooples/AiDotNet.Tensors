@@ -86,25 +86,55 @@ public sealed partial class CudaBackend
     internal long DeclaredElementwiseLaunches => System.Threading.Interlocked.Read(ref _declaredElementwiseLaunches);
     private long _declaredElementwiseLaunches;
 
+    // The compiled operator for each hand-written kernel name ("call:" operators), looked up without building a key.
+    private readonly Dictionary<string, DeclaredElementwise?> _elementwiseByKernel = new(StringComparer.Ordinal);
+
     /// <summary>
-    /// <paramref name="kernel"/>'s operation on <paramref name="inputs"/> through a declared kernel. False -- having
-    /// launched nothing -- when the route is off, the kernel is not derivable, or its operator cannot be built.
+    /// <paramref name="kernel"/>'s operation through a declared kernel: up to three inputs (<paramref name="i0"/>..),
+    /// up to three scalars (the first <paramref name="scalarCount"/> of <paramref name="s0"/>..), the output and the
+    /// length. False -- having launched nothing -- when the route is off, the kernel is not derivable or takes other
+    /// operands, or its operator cannot be built. A call allocates nothing once its operator exists.
     /// </summary>
+    internal bool TryDeclaredElementwise(string kernel, IGpuBuffer output, int size, IGpuBuffer i0, IGpuBuffer? i1 = null,
+        IGpuBuffer? i2 = null, int scalarCount = 0, float s0 = 0, float s1 = 0, float s2 = 0, IGpuBuffer? i3 = null)
+    {
+        if (!DeclaredKernelsEnabled || size <= 0) return false;
+        int inputs = i3 is not null ? 4 : i2 is not null ? 3 : i1 is not null ? 2 : 1;
+        DeclaredElementwise? operator_;
+        bool known;
+        lock (_directPtxLock) known = _elementwiseByKernel.TryGetValue(kernel, out operator_);
+        if (!known)
+        {
+            var function = ResolveElementwise(kernel);
+            operator_ = function is null ? null : ElementwiseOperator("call:" + kernel, () =>
+            {
+                var arguments = new CodegenExpr[function.Inputs + function.Scalars.Length];
+                for (int i = 0; i < function.Inputs; i++) arguments[i] = CodegenExpr.Operand(i);
+                for (int s = 0; s < function.Scalars.Length; s++) arguments[function.Inputs + s] = CodegenExpr.Scalar(s);
+                return new CodegenElementwiseSpec(kernel, function.Inputs, CodegenExpr.Call(function.Handle, arguments));
+            });
+            // Under capture nothing was built: leave the kernel unrecorded, so the first call outside builds it.
+            if (operator_ is not null || !IsStreamCapturing())
+                lock (_directPtxLock) _elementwiseByKernel[kernel] = operator_;
+        }
+        if (operator_ is null || operator_.Spec.Inputs != inputs || operator_.Spec.Scalars != scalarCount) return false;
+        return LaunchElementwise(operator_, output, size, 0, i0, i1, i2, scalarCount, s0, s1, s2, i3);
+    }
+
+    /// <summary>The span form of <see cref="TryDeclaredElementwise(string, IGpuBuffer, int, IGpuBuffer, IGpuBuffer?, IGpuBuffer?, int, float, float, float)"/>, for tools and tests.</summary>
     internal bool TryDeclaredElementwise(string kernel, ReadOnlySpan<IGpuBuffer> inputs, IGpuBuffer output,
         ReadOnlySpan<float> scalars, int size)
     {
-        if (!DeclaredKernelsEnabled || size <= 0) return false;
-        var function = ResolveElementwise(kernel);
-        if (function is null || function.Inputs != inputs.Length || function.Scalars.Length != scalars.Length) return false;
-        var operator_ = ElementwiseOperator("call:" + kernel, () =>
-        {
-            var arguments = new CodegenExpr[function.Inputs + function.Scalars.Length];
-            for (int i = 0; i < function.Inputs; i++) arguments[i] = CodegenExpr.Operand(i);
-            for (int s = 0; s < function.Scalars.Length; s++) arguments[function.Inputs + s] = CodegenExpr.Scalar(s);
-            return new CodegenElementwiseSpec(kernel, function.Inputs, CodegenExpr.Call(function.Handle, arguments));
-        });
-        return operator_ is not null && LaunchElementwise(operator_, inputs, output, scalars, size, columns: 0);
+        if (inputs.Length < 1 || inputs.Length > 4 || scalars.Length > 3) return false;
+        return TryDeclaredElementwise(kernel, output, size, inputs[0], inputs.Length > 1 ? inputs[1] : null,
+            inputs.Length > 2 ? inputs[2] : null, scalars.Length,
+            scalars.Length > 0 ? scalars[0] : 0, scalars.Length > 1 ? scalars[1] : 0, scalars.Length > 2 ? scalars[2] : 0,
+            inputs.Length > 3 ? inputs[3] : null);
     }
+
+    // The composites' operators by their constant keys.
+    private DeclaredElementwise? _addRelu, _addSigmoid, _addGelu, _biasAdd, _biasAddRelu;
+    private bool _addReluTried, _addSigmoidTried, _addGeluTried, _biasAddTried, _biasAddReluTried;
 
     /// <summary>
     /// <c>activation(a + b)</c> in ONE declared kernel, where the hand-written path launched add_vectors then the
@@ -113,13 +143,22 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredAddActivation(string activationKernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
         if (!DeclaredKernelsEnabled || size <= 0) return false;
-        var add = ResolveElementwise("add_vectors");
-        var activation = ResolveElementwise(activationKernel);
-        if (add is null || activation is null || activation.Inputs != 1 || activation.Scalars.Length != 0 ||
-            add.Module.Name != activation.Module.Name) return false;
-        var operator_ = ElementwiseOperator("add+" + activationKernel, () => new CodegenElementwiseSpec("add_" + activationKernel, 2,
-            CodegenExpr.Call(activation.Handle, CodegenExpr.Call(add.Handle, CodegenExpr.Operand(0), CodegenExpr.Operand(1)))));
-        return operator_ is not null && LaunchElementwise(operator_, new[] { a, b }, output, ReadOnlySpan<float>.Empty, size, columns: 0);
+        ref DeclaredElementwise? slot = ref _addRelu;
+        ref bool tried = ref _addReluTried;
+        if (activationKernel == "sigmoid") { slot = ref _addSigmoid; tried = ref _addSigmoidTried; }
+        else if (activationKernel == "gelu") { slot = ref _addGelu; tried = ref _addGeluTried; }
+        else if (activationKernel != "relu") return false;
+        if (!tried)
+        {
+            var add = ResolveElementwise("add_vectors");
+            var activation = ResolveElementwise(activationKernel);
+            if (add is null || activation is null || activation.Inputs != 1 || activation.Scalars.Length != 0 ||
+                add.Module.Name != activation.Module.Name) { tried = true; return false; }
+            slot = ElementwiseOperator("add+" + activationKernel, () => new CodegenElementwiseSpec("add_" + activationKernel, 2,
+                CodegenExpr.Call(activation.Handle, CodegenExpr.Call(add.Handle, CodegenExpr.Operand(0), CodegenExpr.Operand(1)))));
+            tried = slot is not null || !IsStreamCapturing();
+        }
+        return slot is not null && LaunchElementwise(slot, output, size, 0, a, b, null, 0, 0, 0, 0);
     }
 
     /// <summary>
@@ -129,18 +168,24 @@ public sealed partial class CudaBackend
     internal bool TryDeclaredBiasAdd(IGpuBuffer a, IGpuBuffer bias, IGpuBuffer output, int rows, int columns, bool relu)
     {
         if (!DeclaredKernelsEnabled || rows <= 0 || columns <= 0 || (long)rows * columns > int.MaxValue) return false;
-        var add = ResolveElementwise("add_vectors");
-        var activation = relu ? ResolveElementwise("relu") : null;
-        if (add is null || (relu && (activation is null || activation.Module.Name != add.Module.Name))) return false;
-        var operator_ = ElementwiseOperator(relu ? "bias+relu" : "bias", () =>
+        ref DeclaredElementwise? slot = ref relu ? ref _biasAddRelu : ref _biasAdd;
+        ref bool tried = ref relu ? ref _biasAddReluTried : ref _biasAddTried;
+        if (!tried)
         {
-            var sum = CodegenExpr.Call(add.Handle, CodegenExpr.Operand(0), CodegenExpr.Operand(1));
-            return new CodegenElementwiseSpec(relu ? "bias_add_relu" : "bias_add", 2,
-                activation is null ? sum : CodegenExpr.Call(activation.Handle, sum), ColumnBroadcastInput: 1);
-        });
+            var add = ResolveElementwise("add_vectors");
+            var activation = relu ? ResolveElementwise("relu") : null;
+            if (add is null || (relu && (activation is null || activation.Module.Name != add.Module.Name))) { tried = true; return false; }
+            slot = ElementwiseOperator(relu ? "bias+relu" : "bias", () =>
+            {
+                var sum = CodegenExpr.Call(add.Handle, CodegenExpr.Operand(0), CodegenExpr.Operand(1));
+                return new CodegenElementwiseSpec(relu ? "bias_add_relu" : "bias_add", 2,
+                    activation is null ? sum : CodegenExpr.Call(activation.Handle, sum), ColumnBroadcastInput: 1);
+            });
+            tried = slot is not null || !IsStreamCapturing();
+        }
+        if (slot is null) return false;
         if (bias.Size < columns) throw new ArgumentException("The bias holds " + bias.Size + " elements; " + columns + " columns.", nameof(bias));
-        return operator_ is not null && LaunchElementwise(operator_, new[] { a, bias }, output, ReadOnlySpan<float>.Empty,
-            rows * columns, columns);
+        return LaunchElementwise(slot, output, rows * columns, columns, a, bias, null, 0, 0, 0, 0);
     }
 
     private DeclaredElementwise? ElementwiseOperator(string key, Func<CodegenElementwiseSpec> build)
@@ -267,33 +312,35 @@ public sealed partial class CudaBackend
         }
     }
 
-    private unsafe bool LaunchElementwise(DeclaredElementwise operator_, ReadOnlySpan<IGpuBuffer> inputs, IGpuBuffer output,
-        ReadOnlySpan<float> scalars, int size, int columns)
+    private unsafe bool LaunchElementwise(DeclaredElementwise operator_, IGpuBuffer output, int size, int columns,
+        IGpuBuffer i0, IGpuBuffer? i1, IGpuBuffer? i2, int scalarCount, float s0, float s1, float s2, IGpuBuffer? i3 = null)
     {
         var spec = operator_.Spec;
         if (output.Size < size) throw new ArgumentException("The output holds " + output.Size + " elements; the call needs " + size + ".", nameof(output));
+        int inputCount = spec.Inputs;
+        IntPtr* pointers = stackalloc IntPtr[5];
         bool aligned = size % 4 == 0 && ((long)output.Handle & 15) == 0 && (spec.ColumnBroadcastInput < 0 || columns % 4 == 0);
-        for (int i = 0; i < inputs.Length; i++)
+        for (int i = 0; i < inputCount; i++)
         {
-            if (inputs[i].Handle == IntPtr.Zero) throw new InvalidOperationException("Elementwise operand " + i + " was disposed.");
-            if (i != spec.ColumnBroadcastInput && inputs[i].Size < size)
-                throw new ArgumentException("Operand " + i + " holds " + inputs[i].Size + " elements; the call needs " + size + ".", nameof(inputs));
-            aligned &= ((long)inputs[i].Handle & 15) == 0;
+            var input = (i == 0 ? i0 : i == 1 ? i1 : i == 2 ? i2 : i3)
+                ?? throw new ArgumentException("Elementwise operand " + i + " is missing.");
+            if (input.Handle == IntPtr.Zero) throw new InvalidOperationException("Elementwise operand " + i + " was disposed.");
+            if (i != spec.ColumnBroadcastInput && input.Size < size)
+                throw new ArgumentException("Operand " + i + " holds " + input.Size + " elements; the call needs " + size + ".");
+            aligned &= ((long)input.Handle & 15) == 0;
+            pointers[i] = input.Handle;
         }
-        int vectorized = aligned ? 1 : 0;
-        int count = inputs.Length + 3 + (spec.ColumnBroadcastInput >= 0 ? 1 : 0) + scalars.Length;
-        IntPtr* pointers = stackalloc IntPtr[inputs.Length + 1];
+        pointers[inputCount] = output.Handle;
         int* integers = stackalloc int[3];
-        float* floats = stackalloc float[Math.Max(1, scalars.Length)];
-        void** argv = stackalloc void*[count];
+        float* floats = stackalloc float[3];
+        floats[0] = s0; floats[1] = s1; floats[2] = s2;
+        void** argv = stackalloc void*[inputCount + 4 + scalarCount];
         int a = 0;
-        for (int i = 0; i < inputs.Length; i++) { pointers[i] = inputs[i].Handle; argv[a++] = &pointers[i]; }
-        pointers[inputs.Length] = output.Handle;
-        argv[a++] = &pointers[inputs.Length];
+        for (int i = 0; i <= inputCount; i++) argv[a++] = &pointers[i];
         integers[0] = size; argv[a++] = &integers[0];
-        integers[1] = vectorized; argv[a++] = &integers[1];
+        integers[1] = aligned ? 1 : 0; argv[a++] = &integers[1];
         if (spec.ColumnBroadcastInput >= 0) { integers[2] = columns; argv[a++] = &integers[2]; }
-        for (int s = 0; s < scalars.Length; s++) { floats[s] = scalars[s]; argv[a++] = &floats[s]; }
+        for (int s = 0; s < scalarCount; s++) argv[a++] = &floats[s];
 
         long work = aligned ? size / 4 : size;
         uint grid = (uint)((work + PtxAffineEmitter.ElementwiseBlockThreads - 1) / PtxAffineEmitter.ElementwiseBlockThreads);
@@ -329,8 +376,16 @@ public sealed partial class CudaBackend
                 default: argv[a] = &n; break;
             }
         }
+        // The production launchers take the _vec4 variant when the length and pointers allow: so does the incumbent.
+        bool aligned = size % 4 == 0 && ((long)output.Handle & 15) == 0;
+        foreach (var input_ in inputs) aligned &= ((long)input_.Handle & 15) == 0;
+        if (aligned && scalars.Length == 0 && _kernelCache.TryGetValue(kernel + "_vec4", out var vec4))
+        {
+            n = size / 4;
+            handle = vec4;
+        }
         using var _ = PushContext();
-        LaunchKernel(handle, (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argv);
+        LaunchKernel(handle, (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, argv);
         return true;
     }
 
