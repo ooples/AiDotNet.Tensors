@@ -631,6 +631,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>Step-I/O input copies replays have skipped because the input was unchanged (tests).</summary>
     internal long StepIoInputCopiesSkipped { get; private set; }
     private bool _stepIoLossCaptured;   // the epilogue publishes the loss
+    // The loss-gradient reseed (seed -> destination) the graph being captured makes in its step I/O prologue instead of
+    // a copy node: the buffers handed to IGraphStepIo.TrySetPrologueCopy, or null.
+    private Engines.DirectGpu.IGpuBuffer? _prologueSeedSource, _prologueSeedDestination;
 
     /// <summary>
     /// The optimizer update recorded into the step graph after the backward. It reads its learning rate (and Adam's step
@@ -3769,6 +3772,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>One step graph's capture body: the step I/O prologue, the step, the captured update, the epilogue.</summary>
     private void CaptureStepGraphBody(Engines.DirectGpu.IGpuGraphCapture cb, int parity)
     {
+        _prologueSeedSource = _prologueSeedDestination = null;
+        if (_stepIo is { } prologueIo)
+        {
+            // The loss-gradient reseed rides in the prologue when both buffers are already device-bound (the uncaptured
+            // pre-pass binds them); RunGpuStepBody then records no copy for it.
+            if (typeof(T) == typeof(float) && _lossGradSeed.TryGetGpuBuffer() is { } seed
+                && _lossGradDest?.TryGetGpuBuffer() is { } dest
+                && prologueIo.TrySetPrologueCopy(seed, dest, _lossGradSeed.Length))
+            {
+                _prologueSeedSource = seed;
+                _prologueSeedDestination = dest;
+            }
+            else prologueIo.TrySetPrologueCopy(null, null, 0);
+        }
         _stepIo?.CapturePrologue(parity);
         RunGpuStepBodyForCapture((Engines.DirectGpu.IDirectGpuBackend)cb);
         if (_capturedOptimizer is { } optimizer && _stepIo is { } io)
@@ -3955,8 +3972,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
         {
-            if (cb is Engines.DirectGpu.IFp16ActivationBackend rawCopy) rawCopy.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
-            else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
+            // A graph being captured with the reseed in its step I/O prologue (CaptureStepGraphBody) records no copy.
+            bool inPrologue = capturingNow && ReferenceEquals(seedBuf, _prologueSeedSource)
+                && ReferenceEquals(destBuf, _prologueSeedDestination);
+            if (!inPrologue)
+            {
+                if (cb is Engines.DirectGpu.IFp16ActivationBackend rawCopy) rawCopy.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
+                else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
+            }
             residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, backend);
             if (_lossGradDest is { } seededDestination)
                 seededDestination._gradWriteGeneration = gradWriteGeneration;   // the seed is its first write

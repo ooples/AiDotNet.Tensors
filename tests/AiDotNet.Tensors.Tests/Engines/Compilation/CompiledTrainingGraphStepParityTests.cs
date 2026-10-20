@@ -99,9 +99,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public int PoisonedSkippedCopies;   // clear-mask inputs whose replay staging was overwritten with NaN after the mask was submitted
         public int MixedMaskReplays;   // replays whose copy mask held some inputs but not all
         public long InputCopiesSkipped;   // replays' skipped input copies (unchanged inputs)
+        public bool ClobberedLossGradient;   // the loss gradient's device buffer was zeroed between replays
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -197,6 +198,20 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     y._gpuBuffer = null;
                     y._gpuBackend = null;
                     y._gpuBufferVersion = -1;
+                }
+                if (clobberLossGradient && s >= 5)
+                {
+                    // Zero the loss gradient's device buffer between replays: every replay must reseed it (the step I/O
+                    // prologue does, in place of a copy node), or the backward starts from zero and nothing trains.
+                    var dest = (Tensor<float>?)typeof(CompiledTrainingPlan<float>)
+                        .GetField("_lossGradDest", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete);
+                    if (dest?._gpuBuffer is { } destBuffer && gpu.GetBackend() is { } backend)
+                    {
+                        gpu.SynchronizeStream();
+                        backend.Fill(destBuffer, 0f, dest.Length);
+                        backend.Synchronize();
+                        run.ClobberedLossGradient = true;
+                    }
                 }
                 // Reference loss from the exact host batch and pre-step weights: a mismatch message then says whether the
                 // plan computed a wrong loss or reported one it never downloaded.
@@ -441,6 +456,42 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             Assert.True(captured.PoisonedSkippedCopies > 0, "no replay with a clear mask bit had its staging poisoned");
             if (feedEvery != feedTargetEvery)
                 Assert.True(captured.MixedMaskReplays > 0, "no replay copied one input and skipped the other");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// Every replay reseeds the loss gradient (the step I/O prologue copies the seed in place of a copy node): with its
+    /// device buffer zeroed between replays, a captured step must still train exactly like the eager step. Without the
+    /// reseed the backward would start from zero and the weights would stop moving.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(OptimizerType.Adam)]
+    [InlineData(OptimizerType.SGD)]
+    public void Every_replay_reseeds_the_loss_gradient(OptimizerType optimizer)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false, optimizer: optimizer);
+            var captured = Train(gpu, capture: true, optimizer: optimizer, clobberLossGradient: true);
+            _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+            Assert.True(captured.UpdateCapturedInGraph, "the replayed graph does not run the optimizer update (step I/O)");
+            Assert.True(captured.ClobberedLossGradient, "the loss gradient had no device buffer to zero");
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
