@@ -375,6 +375,32 @@ public static partial class WebGpuNativeBindings
     private static partial Task JsDispatchComputeWithUniformsAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroupsX, int workgroupsY, int workgroupsZ);
 
     /// <summary>
+    /// Dispatches a chain of compute operations, each with its uniform buffer, in one compute pass submitted once
+    /// (#1452). Element <c>i</c> of every array describes dispatch <c>i</c>; the X workgroup count only (Y and Z 1).
+    /// </summary>
+    public static Task DispatchComputeChainWithUniformsAsync(int[] pipelineIds, int[] bindGroupIds, int[] uniformBufferIds, int[] workgroupsX)
+    {
+        if (pipelineIds.Length != bindGroupIds.Length || pipelineIds.Length != uniformBufferIds.Length || pipelineIds.Length != workgroupsX.Length)
+            throw new ArgumentException("Every dispatch needs a pipeline, a bind group, a uniform buffer and a workgroup count.");
+        if (Host is not { } host)
+            return JsDispatchComputeChainWithUniformsAsync(ToDoubles(pipelineIds), ToDoubles(bindGroupIds), ToDoubles(uniformBufferIds), ToDoubles(workgroupsX));
+        host.Invoke("dispatchComputeChainWithUniforms", Args(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX));
+        return Task.CompletedTask;
+    }
+
+    private static double[] ToDoubles(int[] values)
+    {
+        var doubles = new double[values.Length];
+        for (int i = 0; i < values.Length; i++) doubles[i] = values[i];
+        return doubles;
+    }
+
+    [JSImport("dispatchComputeChainWithUniforms", ModuleName)]
+    private static partial Task JsDispatchComputeChainWithUniformsAsync([JSMarshalAs<JSType.Array<JSType.Number>>] double[] pipelineIds,
+        [JSMarshalAs<JSType.Array<JSType.Number>>] double[] bindGroupIds, [JSMarshalAs<JSType.Array<JSType.Number>>] double[] uniformBufferIds,
+        [JSMarshalAs<JSType.Array<JSType.Number>>] double[] workgroupsX);
+
+    /// <summary>
     /// Submits all pending GPU commands and waits for completion.
     /// </summary>
     public static Task SubmitAndWaitAsync()

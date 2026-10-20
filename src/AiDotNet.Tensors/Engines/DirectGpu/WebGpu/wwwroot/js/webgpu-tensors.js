@@ -821,6 +821,46 @@ export async function dispatchComputeWithUniforms(pipelineId, bindGroupId, unifo
 }
 
 /**
+ * Dispatches a chain of compute operations, each with its uniforms, in ONE compute pass of one command encoder,
+ * submitted once (#1452, the resident program). WebGPU orders the dispatches of a pass, with the storage writes of
+ * one visible to the next, so the chain needs no barrier of its own. Every bind group exists before the first
+ * dispatch runs, so none may hold a snapshot of a buffer an earlier dispatch writes (WebGpuBindGroup snapshots a
+ * buffer bound twice).
+ * @param {number[]} pipelineIds - Pipeline ID per dispatch.
+ * @param {number[]} bindGroupIds - Storage bind group ID per dispatch.
+ * @param {number[]} uniformBufferIds - Uniform buffer ID per dispatch.
+ * @param {number[]} workgroupsX - Workgroups in X per dispatch.
+ */
+export async function dispatchComputeChainWithUniforms(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX) {
+    if (!device) return;
+
+    const stages = [];
+    for (let i = 0; i < pipelineIds.length; i++) {
+        const pipeline = pipelines.get(pipelineIds[i]);
+        const bindGroup = bindGroups.get(bindGroupIds[i]);
+        const uniformBuffer = buffers.get(uniformBufferIds[i]);
+        if (!pipeline || !bindGroup || !uniformBuffer) {
+            console.error(`dispatchComputeChainWithUniforms: stage ${i}: pipeline, bind group or uniform buffer not found`);
+            return;
+        }
+        const resolved = await resolveUniformBindGroup(bindGroup, pipeline, uniformBuffer);
+        if (!resolved) return;
+        stages.push({ pipeline: pipeline, group: resolved, workgroups: workgroupsX[i] });
+    }
+
+    const commandEncoder = device.createCommandEncoder();
+    const passEncoder = commandEncoder.beginComputePass();
+    for (const stage of stages) {
+        passEncoder.setPipeline(stage.pipeline);
+        passEncoder.setBindGroup(0, stage.group);
+        passEncoder.dispatchWorkgroups(stage.workgroups, 1, 1);
+    }
+    passEncoder.end();
+
+    queue.submit([commandEncoder.finish()]);
+}
+
+/**
  * Submits all pending commands and waits for completion.
  */
 export async function submitAndWait() {

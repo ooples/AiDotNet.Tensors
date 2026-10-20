@@ -24,6 +24,13 @@ internal interface IGraphStepIo : IDisposable
     /// <summary>Host address of input <paramref name="input"/>'s page-locked staging for <paramref name="slot"/> (0 or 1).</summary>
     IntPtr InputStaging(int input, int slot);
 
+    /// <summary>
+    /// Which inputs replay <paramref name="replay"/> copies out of its staging slot (bit i: input i; all until set). An
+    /// input whose host contents have not changed since the last replay that copied it is still in its device buffer,
+    /// and its staging need not be written. Same timing as the slot's staging.
+    /// </summary>
+    void SetInputsToCopy(uint replay, uint mask);
+
     /// <summary>Replays the graph has completed, as the graph last published it.</summary>
     uint CompletedReplays { get; }
 
@@ -39,6 +46,15 @@ internal interface IGraphStepIo : IDisposable
     /// for the timer (measured ~7.4 ms per step).
     /// </summary>
     void Flush();
+
+    /// <summary>
+    /// Sets a device copy of <paramref name="source"/>'s first <paramref name="count"/> floats into
+    /// <paramref name="destination"/> for the prologue to make at the start of every replay (the compiled plan's
+    /// loss-gradient reseed, which as a copy node of its own cost a launch and a gap per replay). Takes effect at the
+    /// next <see cref="CapturePrologue"/>; null buffers clear it. False when the copy is not taken (the caller then
+    /// records it itself).
+    /// </summary>
+    bool TrySetPrologueCopy(IGpuBuffer? source, IGpuBuffer? destination, int count);
 
     /// <summary>
     /// Records the copy of every input out of the current slot. Call first inside the capture. <paramref name="parity"/>

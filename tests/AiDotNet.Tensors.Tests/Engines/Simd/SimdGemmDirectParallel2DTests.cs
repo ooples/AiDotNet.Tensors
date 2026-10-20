@@ -86,6 +86,76 @@ public class SimdGemmDirectParallel2DTests
         }
     }
 
+#if NET9_0_OR_GREATER
+    // The 512-bit 6x32 tile computes each element as the same FMA chain the 256-bit tiles do, so the output may not
+    // depend on which one the host runs. Forced on, it runs in software where the CPU lacks AVX-512 (same bits).
+    [Theory]
+    [InlineData(64, 784, 512)]    // every strip a full 32 columns
+    [InlineData(37, 300, 77)]     // 2 full strips, then a 13-column strip on the masked 16-wide kernel
+    [InlineData(66, 96, 48)]      // a full strip and a 16-column remainder on the 6x16 kernel
+    [InlineData(7, 40, 32)]       // one full row block (6x32 tile) and a 1-row masked block
+    public void Vector512Tile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
+    {
+        var a = Rand(m * k, m * 13 + k);
+        var b = Rand(k * n, n * 7 + k);
+        var narrow = new float[m * n];
+        var wide = new float[m * n];
+        bool? before = SimdGemm.s_forceVector512Direct;
+        int threads = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = 3;
+            SimdGemm.s_forceVector512Direct = false;
+            Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, narrow, m, k, n, allowParallel: true));
+            SimdGemm.s_forceVector512Direct = true;
+            Assert.True(SimdGemm.TrySgemmDirectParallel2D(a, k, b, n, wide, m, k, n, allowParallel: true));
+        }
+        finally
+        {
+            SimdGemm.s_forceVector512Direct = before;
+            CpuParallelSettings.MaxDegreeOfParallelism = threads;
+        }
+        for (int i = 0; i < narrow.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
+                $"C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {wide[i]:G9}");
+        AssertMatchesReference(Reference(a, b, m, k, n), wide, k, "512-bit");
+    }
+
+    // The transposed-A GEMM (a dense layer's dW = Xt*dY): full 6-row blocks take 32-column steps on the 512-bit tile.
+    [Theory]
+    [InlineData(784, 64, 512)]    // the parity MLP's first-layer dW
+    [InlineData(30, 17, 80)]      // 2 full 32-column steps, then a 16-column step
+    [InlineData(29, 9, 70)]       // a 4-row remainder block, a scalar row, and a 6-column tail (mFull = 28)
+    public void Vector512TransATile_IsBitIdenticalTo256BitTiles(int m, int k, int n)
+    {
+        var a = Rand(k * m, m * 5 + k);   // stored [k, m]
+        var b = Rand(k * n, n * 3 + k);
+        var narrow = new float[m * n];
+        var wide = new float[m * n];
+        bool? before = SimdGemm.s_forceVector512Direct;
+        try
+        {
+            SimdGemm.s_forceVector512Direct = false;
+            SimdGemm.SgemmDirectParallelMIntoTransA(a, b, narrow, m, k, n);
+            SimdGemm.s_forceVector512Direct = true;
+            SimdGemm.SgemmDirectParallelMIntoTransA(a, b, wide, m, k, n);
+        }
+        finally
+        {
+            SimdGemm.s_forceVector512Direct = before;
+        }
+        for (int i = 0; i < narrow.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(narrow[i]) == BitConverter.SingleToInt32Bits(wide[i]),
+                $"C[{i / n},{i % n}]: 256-bit {narrow[i]:G9}, 512-bit {wide[i]:G9}");
+        var expected = new double[m * n];
+        for (int p = 0; p < k; p++)
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    expected[i * n + j] += (double)a[p * m + i] * b[p * n + j];
+        AssertMatchesReference(expected, wide, k, "512-bit");
+    }
+#endif
+
     [Theory]
     [InlineData(128, 784, 512)]   // parity-MLP layer 1 forward at batch 128: 21 row blocks + a 2-row tail
     [InlineData(128, 512, 256)]   // layer 2

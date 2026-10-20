@@ -1,0 +1,252 @@
+{
+  "network": "cnn",
+  "device": "cuda",
+  "machineKey": "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti",
+  "stepRatio": 0.9878174868476419,
+  "medianStepRatio": 0.9901166378116677,
+  "noiseBand": 0.01091135937591845,
+  "protocol": 2,
+  "torch": {
+    "version": "2.11.0\u002Bcu126",
+    "bestMode": "cuda_graph",
+    "best": {
+      "MedianMs": 1.3760500005446374,
+      "IqrMs": 0.010099989594891667,
+      "MinMs": 1.3543999957619235,
+      "Samples": 300
+    },
+    "modes": [
+      {
+        "Name": "eager",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 2.288850002514664,
+          "IqrMs": 0.534399994648993,
+          "MinMs": 2.119600001606159,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "eager\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 2.7893499936908484,
+          "IqrMs": 0.8544000011170283,
+          "MinMs": 2.253500002552755,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "cuda_graph",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.3635499926749617,
+          "IqrMs": 0.00580001506023109,
+          "MinMs": 1.3543999957619235,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "cuda_graph\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.611700005014427,
+          "IqrMs": 0.02309998671989888,
+          "MinMs": 1.5872000076342374,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:default",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 2.9940000022179447,
+          "IqrMs": 0.6696000054944307,
+          "MinMs": 2.304499997990206,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:default\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 3.6983999962103553,
+          "IqrMs": 0.5259000172372907,
+          "MinMs": 2.7532999956747517,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:reduce-overhead",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.6701499989721924,
+          "IqrMs": 0.11860000086016953,
+          "MinMs": 1.5829000039957464,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:reduce-overhead\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.8866000027628615,
+          "IqrMs": 0.23279998276848346,
+          "MinMs": 1.7653000104473904,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:max-autotune",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.692199999524746,
+          "IqrMs": 0.12870000500697643,
+          "MinMs": 1.5750999882584438,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compile:max-autotune\u002Bchannels_last",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.953500002855435,
+          "IqrMs": 0.21830000332556665,
+          "MinMs": 1.745200002915226,
+          "Samples": 100
+        }
+      }
+    ],
+    "phases": {
+      "forward": {
+        "MedianMs": 0.8481499971821904,
+        "IqrMs": 0.39590000233147293,
+        "MinMs": 0.7293999951798469,
+        "Samples": 300
+      },
+      "backward": {
+        "MedianMs": 1.371750004182104,
+        "IqrMs": 0.14119999832473695,
+        "MinMs": 1.3085000100545585,
+        "Samples": 300
+      },
+      "optimizer": {
+        "MedianMs": 0.3700499946717173,
+        "IqrMs": 0.16429998504463583,
+        "MinMs": 0.23430000874213874,
+        "Samples": 300
+      },
+      "step": {
+        "MedianMs": 2.6692500032368116,
+        "IqrMs": 0.5683999916072935,
+        "MinMs": 2.2881000040797517,
+        "Samples": 300
+      }
+    },
+    "losses": [
+      1.067047357559204,
+      1.0535753965377808,
+      1.0457289218902588,
+      1.0405415296554565,
+      1.0367355346679688,
+      1.0335949659347534,
+      1.030869722366333,
+      1.0285619497299194,
+      1.0265616178512573,
+      1.024821400642395
+    ]
+  },
+  "tensors": {
+    "version": "1.0.0.0",
+    "bestMode": "compiled",
+    "best": {
+      "MedianMs": 1.36245,
+      "IqrMs": 0.010999999999999899,
+      "MinMs": 1.3379,
+      "Samples": 300
+    },
+    "modes": [
+      {
+        "Name": "eager (phase-synchronised)",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.84715,
+          "IqrMs": 0.19800000000000018,
+          "MinMs": 1.6994,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "eager",
+        "Status": "ok",
+        "Reason": null,
+        "Step": {
+          "MedianMs": 1.566,
+          "IqrMs": 0.031200000000000117,
+          "MinMs": 1.5165,
+          "Samples": 100
+        }
+      },
+      {
+        "Name": "compiled",
+        "Status": "ok",
+        "Reason": "CUDA graph replay",
+        "Step": {
+          "MedianMs": 1.3639,
+          "IqrMs": 0.0033999999999998476,
+          "MinMs": 1.339,
+          "Samples": 100
+        }
+      }
+    ],
+    "phases": {
+      "forward": {
+        "MedianMs": 2.1310000000000002,
+        "IqrMs": 2.2201,
+        "MinMs": 0.5312,
+        "Samples": 300
+      },
+      "backward": {
+        "MedianMs": 3.71985,
+        "IqrMs": 2.6071000000000017,
+        "MinMs": 1.0989999999999998,
+        "Samples": 300
+      },
+      "optimizer": {
+        "MedianMs": 0.0827,
+        "IqrMs": 0.12340000000000106,
+        "MinMs": 0.03469999999999995,
+        "Samples": 300
+      },
+      "step": {
+        "MedianMs": 5.9099,
+        "IqrMs": 4.8747,
+        "MinMs": 1.6994,
+        "Samples": 300
+      }
+    },
+    "losses": [
+      1.067047357559204,
+      1.0535753965377808,
+      1.0457289218902588,
+      1.0405415296554565,
+      1.0367354154586792,
+      1.0335949659347534,
+      1.030869722366333,
+      1.0285619497299194,
+      1.0265616178512573,
+      1.0248215198516846
+    ]
+  }
+}
