@@ -92,6 +92,13 @@ public abstract class ResidentProgramTestBase<TBackend> where TBackend : class, 
                 $"[{i / cols},{i % cols}]: {what} {expected[i]:G9} vs {actual[i]:G9}");
     }
 
+    private protected static void AssertMatchesReference(Chain chain, float[] actual)
+    {
+        var expected = chain.Reference();
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 2e-6 + 2e-6 * Math.Abs(expected[i]),
+                $"[{i / chain.Cols},{i % chain.Cols}]: expected {expected[i]:G9}, got {actual[i]:G9}");
+    }
     [SkippableTheory]
     [InlineData(64, 256)]     // the launch-bound size the phase-3 benchmark measures
     [InlineData(300, 77)]     // ragged columns; rows not a multiple of anything
@@ -112,10 +119,7 @@ public abstract class ResidentProgramTestBase<TBackend> where TBackend : class, 
             var separate = chain.Download();
 
             AssertBitIdentical(separate, resident, cols, "separate vs resident");
-            var expected = chain.Reference();
-            for (int i = 0; i < expected.Length; i++)
-                Assert.True(Math.Abs(expected[i] - resident[i]) <= 2e-6 + 2e-6 * Math.Abs(expected[i]),
-                    $"[{i / cols},{i % cols}]: expected {expected[i]:G9}, got {resident[i]:G9}");
+            AssertMatchesReference(chain, resident);
         }
         finally
         {
