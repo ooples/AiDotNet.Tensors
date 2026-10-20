@@ -41,13 +41,28 @@ public enum CodegenRowOperandKind
 /// <summary>Where one binding lives: its kind and its element strides per axis.</summary>
 public sealed class CodegenRowBinding
 {
-    internal CodegenRowBinding(string name, CodegenRowOperandKind kind, long[] rowStrides, long[] columnStrides)
+    internal CodegenRowBinding(string name, CodegenRowOperandKind kind, long[] rowStrides, long[] columnStrides,
+        long constantOffset, string key)
     {
         Name = name;
         Kind = kind;
         RowStrides = rowStrides;
         ColumnStrides = columnStrides;
+        ConstantOffset = constantOffset;
+        Key = key;
     }
+
+    /// <summary>
+    /// Element offset of the binding's constant indices -- BatchNorm's shift reads x[0, c, 0],
+    /// which is x at a fixed n and position.
+    /// </summary>
+    public long ConstantOffset { get; }
+
+    /// <summary>
+    /// Identity of this ADDRESSING of the tensor: its name and index map. One tensor may be read
+    /// two ways in one program (streamed, and at a fixed position per row); each is its own key.
+    /// </summary>
+    public string Key { get; }
 
     /// <summary>Tensor name, shared by every pass that reads or writes it.</summary>
     public string Name { get; }
@@ -79,8 +94,10 @@ public sealed class CodegenRowFusionPlan
         Width = checked((int)width);
         Parameters = parameters;
         Bindings = bindings;
+        // By NAME, the first addressing of each tensor: what most callers mean by "x" or "gamma".
         var kinds = new Dictionary<string, CodegenRowOperandKind>(StringComparer.Ordinal);
-        foreach (var pair in bindings) kinds[pair.Key] = pair.Value.Kind;
+        foreach (var binding in bindings.Values)
+            if (!kinds.ContainsKey(binding.Name)) kinds[binding.Name] = binding.Kind;
         Kinds = kinds;
     }
 
@@ -105,8 +122,12 @@ public sealed class CodegenRowFusionPlan
     /// </summary>
     public IReadOnlyList<string> Parameters { get; }
 
-    /// <summary>Address of every named tensor.</summary>
+    /// <summary>Address of every distinct addressing of a tensor, by <see cref="CodegenRowBinding.Key"/>.</summary>
     public IReadOnlyDictionary<string, CodegenRowBinding> Bindings { get; }
+
+    /// <summary>The addressing of <paramref name="binding"/> as it appears in a pass.</summary>
+    public CodegenRowBinding BindingFor(CodegenTensorBinding binding) =>
+        Bindings[CodegenRowFusion.KeyOf(binding ?? throw new ArgumentNullException(nameof(binding)))];
 
     /// <summary>The kind of every named tensor.</summary>
     public IReadOnlyDictionary<string, CodegenRowOperandKind> Kinds { get; }
@@ -208,7 +229,8 @@ public static class CodegenRowFusion
         CodegenKernelSpec? reducing = null;
         foreach (var pass in program.Passes)
             if (pass.Reduce != CodegenReduceKind.None) { reducing = pass; break; }
-        var shape = program.Passes[0].Space.Axes;
+        // The row/column shape is the reducing pass's: a program may OPEN with a row pass.
+        var shape = (reducing ?? program.Passes[0]).Space.Axes;
         int rowAxes = reducing is null ? shape.Count - 1 : reducing.Space.ParallelAxes.Length;
         if (rowAxes < 1 || rowAxes >= shape.Count) { reason = "no row/column split"; return null; }
 
@@ -247,20 +269,15 @@ public static class CodegenRowFusion
                         reason = pass.Name + " is a row pass reading the non-row '" + input.Name + "'";
                         return null;
                     }
-                    if (bindings.TryGetValue(input.Name, out var seen) && !Same(seen, binding))
-                    {
-                        reason = "'" + input.Name + "' is read two different ways";
-                        return null;
-                    }
-                    bindings[input.Name] = binding;
+                    bindings[binding.Key] = binding;
                 }
                 var rowOut = Classify(pass.Output, rowAxes, extents);
-                if (rowOut is null || rowOut.Kind != CodegenRowOperandKind.Row)
+                if (rowOut is null || rowOut.Kind != CodegenRowOperandKind.Row || rowOut.ConstantOffset != 0)
                 {
                     reason = pass.Name + "'s output is not per-row";
                     return null;
                 }
-                bindings[pass.Output.Name] = rowOut;
+                bindings[rowOut.Key] = rowOut;
                 produced.Add(pass.Output.Name);
                 rowPasses.Add(pass.Name);
                 continue;
@@ -295,12 +312,7 @@ public static class CodegenRowFusion
                     reason = pass.Name + " reads '" + input.Name + "' with an index map the row kernel does not hold";
                     return null;
                 }
-                if (bindings.TryGetValue(input.Name, out var known) && !Same(known, binding))
-                {
-                    reason = "'" + input.Name + "' is read two different ways";
-                    return null;
-                }
-                bindings[input.Name] = binding;
+                bindings[binding.Key] = binding;
                 // A matrix the kernel PRODUCED is not held in registers; only sources are.
                 if (binding.Kind != CodegenRowOperandKind.Row && produced.Contains(input.Name))
                 {
@@ -313,7 +325,7 @@ public static class CodegenRowFusion
             // per-row operands; a column-dependent one would have no single value.
             if (reduces)
                 foreach (int? operand in new[] { pass.BiasInput, pass.ScaleInput, pass.PostScaleInput, pass.PostBiasInput })
-                    if (operand is { } at && bindings[pass.Inputs[at].Name].Kind != CodegenRowOperandKind.Row)
+                    if (operand is { } at && bindings[KeyOf(pass.Inputs[at])].Kind != CodegenRowOperandKind.Row)
                     {
                         reason = pass.Name + "'s epilogue reads a non-row operand";
                         return null;
@@ -321,12 +333,12 @@ public static class CodegenRowFusion
 
             var output = Classify(pass.Output, rowAxes, extents);
             var expected = reduces ? CodegenRowOperandKind.Row : CodegenRowOperandKind.Matrix;
-            if (output is null || output.Kind != expected || pass.Output.NeedsAtomicStore)
+            if (output is null || output.Kind != expected || output.ConstantOffset != 0 || pass.Output.NeedsAtomicStore)
             {
                 reason = pass.Name + "'s output is not a " + expected + " binding";
                 return null;
             }
-            bindings[pass.Output.Name] = output;
+            bindings[output.Key] = output;
             produced.Add(pass.Output.Name);
         }
 
@@ -430,10 +442,18 @@ public static class CodegenRowFusion
         if (binding.HasIndirection || binding.ElementType != CodegenElementType.Float32) return null;
         var shape = binding.Shape;
         var strides = new long[extents.Length];
-        long stride = 1;
+        long stride = 1, constantOffset = 0;
         for (int d = shape.Count - 1; d >= 0; d--)
         {
             var expr = binding.Map[d];
+            // A constant index: a fixed position along a dimension no axis walks.
+            if (expr.Terms.Count == 0 && expr.Divisor == 1)
+            {
+                if (expr.Constant < 0 || expr.Constant >= shape[d]) return null;
+                constantOffset += expr.Constant * stride;
+                stride *= shape[d];
+                continue;
+            }
             if (expr.Terms.Count != 1 || expr.Terms[0].Coefficient != 1 || expr.Constant != 0 || expr.Divisor != 1)
                 return null;
             int axis = expr.Terms[0].Axis;
@@ -456,15 +476,20 @@ public static class CodegenRowFusion
         else if (innermost == 1) kind = CodegenRowOperandKind.Matrix;
         else if (innermost == 0) kind = CodegenRowOperandKind.Feature;
         else return null;   // the innermost column axis is read, but not contiguously
-        return new CodegenRowBinding(binding.Name, kind, rowStrides, columnStrides);
+        return new CodegenRowBinding(binding.Name, kind, rowStrides, columnStrides, constantOffset, KeyOf(binding));
     }
 
-    private static bool Same(CodegenRowBinding a, CodegenRowBinding b)
+    /// <summary>The addressing key of a binding: its name and index map.</summary>
+    internal static string KeyOf(CodegenTensorBinding binding)
     {
-        if (a.Kind != b.Kind) return false;
-        for (int i = 0; i < a.RowStrides.Count; i++) if (a.RowStrides[i] != b.RowStrides[i]) return false;
-        for (int i = 0; i < a.ColumnStrides.Count; i++) if (a.ColumnStrides[i] != b.ColumnStrides[i]) return false;
-        return true;
+        var sb = new System.Text.StringBuilder(binding.Name).Append('|');
+        foreach (var expr in binding.Map)
+        {
+            sb.Append(expr.Constant).Append('/').Append(expr.Divisor).Append(':');
+            foreach (var term in expr.Terms) sb.Append(term.Axis).Append('*').Append(term.Coefficient).Append('+');
+            sb.Append(';');
+        }
+        return sb.ToString();
     }
 
     private static bool IsAxis(CodegenAffineExpr expr, int axis) =>

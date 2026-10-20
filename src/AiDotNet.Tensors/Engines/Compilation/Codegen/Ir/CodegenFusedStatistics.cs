@@ -385,14 +385,19 @@ public static class CodegenFusedStatistics
     /// </para>
     /// <para>
     /// THREE TRANSFERS, as cuDNN's. The variance is taken as a moment shifted by
-    /// <c>shift</c> -- the running mean, or any per-channel estimate of the mean:
-    /// <c>var = mean((x - shift)^2) - (mean - shift)^2</c>. That moment does not depend on
-    /// the mean, so both statistics are computed from ONE read of x; rstd is then per-channel
-    /// arithmetic, and the affine pass is the second read and the write. Centring on
-    /// (x - mean) instead needed the mean first -- two reads before the affine, four
-    /// transfers, measured 0.65x the hand-written kernel. The shift only conditions the
-    /// arithmetic: the result is the same for every shift, and near the mean the
-    /// subtraction cancels nothing that matters.
+    /// <c>shift</c>: <c>var = mean((x - shift)^2) - (mean - shift)^2</c>. That moment does
+    /// not depend on the mean, so both statistics are computed from ONE read of x; rstd is
+    /// then per-channel arithmetic, and the affine pass is the second read and the write.
+    /// Centring on (x - mean) instead needed the mean first -- two reads before the affine,
+    /// four transfers, measured 0.65x the hand-written kernel.
+    /// </para>
+    /// <para>
+    /// THE SHIFT IS A SAMPLE OF THE CHANNEL, x[0, c, 0] -- the shifted-data algorithm. The
+    /// subtraction cancels about (shift - mean)^2 / var significant digits' worth, so the
+    /// shift must lie near the data. It was first the running mean, which is 0 at the start
+    /// of training: on a GTX 1660 Ti, data offset by 100 gave rstd 1.5e-2 off and offset by
+    /// 1000 a NEGATIVE variance and NaN. A sample of the channel is within a few standard
+    /// deviations of its mean whatever the offset.
     /// </para>
     /// </remarks>
     public static CodegenProgram BatchNorm2D(int batch, int channels, int height, int width, double epsilon = 1e-5)
@@ -411,6 +416,14 @@ public static class CodegenFusedStatistics
             CodegenAxis.Parallel("c", channels), CodegenAxis.Reduce("n", batch),
             CodegenAxis.Reduce("hw", plane));
         CodegenTensorBinding X(int parameter) => Bind(parameter, "x", planes, Axis(1), Axis(0), Axis(2));
+
+        // shift[c] = x[0, c, 0]: a sample of the channel, so the shifted moment cancels little.
+        var shift = new CodegenKernelSpec(
+            "batchnorm_shift",
+            new CodegenIterationSpace(CodegenAxis.Parallel("c", channels)),
+            new[] { Bind(0, "x", planes, CodegenAffineExpr.Const(0), Axis(0), CodegenAffineExpr.Const(0)) },
+            Bind(1, "shift", channel, isOutput: true, Axis(0)),
+            new[] { 0 }, CodegenReduceKind.None);
 
         var negMean = new CodegenKernelSpec(
             "batchnorm_negmean", Statistics(),
@@ -460,8 +473,8 @@ public static class CodegenFusedStatistics
             scaleInput: 2, preBiasInput: 1, postScaleInput: 3, postBiasInput: 4);
 
         return new CodegenProgram(
-            new[] { negMean, shiftedMoment, rstd, affine },
-            new long[] { channels, channels, channels, (long)batch * channels * plane },
+            new[] { shift, negMean, shiftedMoment, rstd, affine },
+            new long[] { channels, channels, channels, channels, (long)batch * channels * plane },
             "batchnorm2d " + batch + "x" + channels + "x" + height + "x" + width);
     }
 

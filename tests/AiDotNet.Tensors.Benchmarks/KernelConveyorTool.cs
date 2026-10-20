@@ -61,10 +61,18 @@ internal static class KernelConveyorTool
     /// </summary>
     private static bool _noRowFusion;
 
+    /// <summary>
+    /// Added to every value of a program's "x" source (--x-offset). Data far from zero is what
+    /// exposes cancellation in a statistic, which data centred on zero never does.
+    /// </summary>
+    private static double _xOffset;
+
     internal static void Run(string stage, string[] args)
     {
         _forceInputStaging = args.Contains("--input-staging", StringComparer.Ordinal);
         _noRowFusion = args.Contains("--no-row-fusion", StringComparer.Ordinal);
+        _xOffset = ValueOf(args, "--x-offset") is string xo
+            ? double.Parse(xo, CultureInfo.InvariantCulture) : 0.0;
         string selector = KernelToolArgs.Selector(args);
         if (stage == "static-rows")
         {
@@ -949,7 +957,7 @@ internal static class KernelConveyorTool
                     var wide = new double[count];
                     // Parameters (gamma, beta, bias) sit near one rather than near zero, so a
                     // dropped post-scale or post-bias moves the output instead of hiding in it.
-                    double offset = source.Name == "x" ? 0.0 : 1.0;
+                    double offset = source.Name == "x" ? _xOffset : 1.0;
                     for (long e = 0; e < count; e++)
                     {
                         float v = (float)((((e * 37 + salt * 101) % 97) - 48) / 64.0 + offset);
@@ -1139,8 +1147,16 @@ internal static class KernelConveyorTool
         Console.WriteLine("tolerance " + Tolerance.ToString("E0", CultureInfo.InvariantCulture));
         Console.WriteLine();
         Console.WriteLine("program / output                    regs  kernels  lowering             max abs dev   result");
+        // Every program runs TWICE: on data centred on zero, and on the same data offset by
+        // 1000. A statistic that cancels catastrophically passes the first and fails the second
+        // -- BatchNorm's running-mean shift did exactly that (NaN at an offset of 1000) while
+        // the zero-centred check passed. An explicit --x-offset runs that offset alone.
+        double[] offsets = _xOffset != 0.0 ? new[] { _xOffset } : new[] { 0.0, 1000.0 };
+        double savedOffset = _xOffset;
         foreach (var entry in entries)
+        foreach (double offset in offsets)
         {
+            _xOffset = offset;
             try
             {
                 var program = entry.Bench;
@@ -1166,7 +1182,9 @@ internal static class KernelConveyorTool
                     }
                     bool ok = worst <= Tolerance && !double.IsNaN(worst);
                     all &= ok;
-                    Console.WriteLine((entry.Name + " / " + pass.Output.Name).PadRight(36) +
+                    string label = entry.Name + " / " + pass.Output.Name +
+                        (offset == 0.0 ? "" : " @+" + offset.ToString("0", CultureInfo.InvariantCulture));
+                    Console.WriteLine(label.PadRight(36) +
                         launchable.RegistersPerThread.ToString(CultureInfo.InvariantCulture).PadLeft(4) +
                         launchable.KernelCount.ToString(CultureInfo.InvariantCulture).PadLeft(9) + "  " +
                         launchable.Lowerings[p].PadRight(18) +
@@ -1183,14 +1201,16 @@ internal static class KernelConveyorTool
             }
         }
 
+        _xOffset = savedOffset;
         Console.WriteLine();
         Console.WriteLine("verify (programs): " + passed.ToString(CultureInfo.InvariantCulture) + " passed, " +
                           failed.ToString(CultureInfo.InvariantCulture) + " failed");
-        if (failed != 0 || passed != entries.Count)
+        if (failed != 0 || passed != entries.Count * offsets.Length)
             throw new InvalidOperationException(
                 "Program verification failed closed: " +
                 passed.ToString(CultureInfo.InvariantCulture) + " of " +
-                entries.Count.ToString(CultureInfo.InvariantCulture) + " selected programs passed.");
+                (entries.Count * offsets.Length).ToString(CultureInfo.InvariantCulture) +
+                " selected program runs passed.");
     }
 
     /// <summary>Times each whole program as one graph replay, under the stage-3 protocol.</summary>

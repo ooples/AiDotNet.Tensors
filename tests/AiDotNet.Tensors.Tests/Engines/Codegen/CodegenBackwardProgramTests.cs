@@ -251,17 +251,17 @@ public class CodegenBackwardProgramTests
     }
 
     /// <summary>
-    /// BatchNorm backward against differences of the training forward. The forward's shift
-    /// is a constant here, as the running mean is during a step, so it carries no gradient.
+    /// BatchNorm backward against differences of the training forward. The forward's shift is a
+    /// sample of x, but the result does not depend on it, so it contributes no gradient.
     /// </summary>
     [Fact]
     public void BatchNormBackward_MatchesFiniteDifferences()
     {
         const int N = 2, C = 3, H = 2, W = 2;
         double[] x = Fill(N * C * H * W, 2.0, 15), dy = Fill(N * C * H * W, 1.0, 16);
-        double[] g = Fill(C, 0.7, 17), b = Fill(C, 0.3, 18), shift = Fill(C, 0.2, 19);
+        double[] g = Fill(C, 0.7, 17), b = Fill(C, 0.3, 18);
         Dictionary<string, double[]> Sources(double[] xv, double[] gv, double[] bv) => new()
-            { ["x"] = xv, ["gamma"] = gv, ["beta"] = bv, ["shift"] = shift };
+            { ["x"] = xv, ["gamma"] = gv, ["beta"] = bv };
         double[] Forward(double[] xv, double[] gv, double[] bv) =>
             CodegenFusedStatistics.BatchNorm2D(N, C, H, W).Interpret(Sources(xv, gv, bv))["y"];
         var stats = CodegenFusedStatistics.BatchNorm2D(N, C, H, W).Interpret(Sources(x, g, b));

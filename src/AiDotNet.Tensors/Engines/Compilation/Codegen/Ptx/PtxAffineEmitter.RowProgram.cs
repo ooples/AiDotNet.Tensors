@@ -126,11 +126,16 @@ public sealed partial class PtxAffineEmitter
         // Per-binding base address at this row: base + 4 * rowPart; Matrix bindings also add
         // this thread's position in the step.
         var rowBase = new Dictionary<string, string>(StringComparer.Ordinal);
-        string RowBase(string name)
+        string RowBase(CodegenRowBinding b)
         {
-            if (rowBase.TryGetValue(name, out string? p)) return p;
-            var b = plan.Bindings[name];
-            string address = basePtr[name];
+            if (rowBase.TryGetValue(b.Key, out string? p)) return p;
+            string address = basePtr[b.Name];
+            if (b.ConstantOffset != 0)
+            {
+                string fixedAt = NextRd();
+                L($"add.s64 {fixedAt}, {address}, {I64(b.ConstantOffset * 4)};");
+                address = fixedAt;
+            }
             for (int k = 0; k < b.RowStrides.Count; k++)
             {
                 if (b.RowStrides[k] == 0) continue;
@@ -144,7 +149,7 @@ public sealed partial class PtxAffineEmitter
                 L($"add.s64 {withLane}, {address}, {laneBytes};");
                 address = withLane;
             }
-            return rowBase[name] = address;
+            return rowBase[b.Key] = address;
         }
 
         // Compile-time column offset (elements) of step `chunk`: a step never straddles a run
@@ -162,14 +167,17 @@ public sealed partial class PtxAffineEmitter
             return offset;
         }
 
+        // Per-row values: statistics this kernel produced (by NAME) and per-row sources (by
+        // addressing key, since one tensor can also be read at a fixed position per row).
         var rowStat = new Dictionary<string, string>(StringComparer.Ordinal);
-        string RowOperand(string name)
+        string RowOperand(CodegenRowBinding b)
         {
-            if (rowStat.TryGetValue(name, out string? stat)) return stat;
+            if (rowStat.TryGetValue(b.Name, out string? stat)) return stat;
+            if (rowStat.TryGetValue(b.Key, out string? loaded)) return loaded;
             string v = NextF();
-            L($"ld.global.nc.f32 {v}, [{RowBase(name)}];");
+            L($"ld.global.nc.f32 {v}, [{RowBase(b)}];");
             EmittedLoads++;
-            return rowStat[name] = v;
+            return rowStat[b.Key] = v;
         }
 
         // Loads one step of a Matrix binding (vector registers) or a Feature binding's value,
@@ -313,15 +321,26 @@ public sealed partial class PtxAffineEmitter
             statistic++;
             string value = Epilogue(pass, acc, 0);
             rowStat[pass.Output.Name] = value;
-            L($"@{leader} st.global.f32 [{RowBase(pass.Output.Name)}], {value};");
+            L($"@{leader} st.global.f32 [{RowBase(plan.BindingFor(pass.Output))}], {value};");
         }
 
-        // A row pass: arithmetic on statistics, in every thread, from registers.
+        // A row pass: arithmetic on statistics, in every thread, from registers. It reads only
+        // per-row operands, so it uses its own accessor: it can run before any sweep has set one
+        // (BatchNorm's shift opens the program) and must not see a finished sweep's loop cache.
         void RowPass(CodegenKernelSpec pass)
         {
+            var previous = operand;
+            operand = (p, input, _) =>
+            {
+                var b = plan.BindingFor(p.Inputs[input]);
+                if (b.Kind != CodegenRowOperandKind.Row)
+                    throw new InvalidOperationException(p.Name + " is a row pass reading the non-row '" + b.Name + "'.");
+                return RowOperand(b);
+            };
             string value = Epilogue(pass, Term(pass, 0), 0);
+            operand = previous;
             rowStat[pass.Output.Name] = value;
-            L($"@{leader} st.global.f32 [{RowBase(pass.Output.Name)}], {value};");
+            L($"@{leader} st.global.f32 [{RowBase(plan.BindingFor(pass.Output))}], {value};");
         }
 
         if (held is not null)
@@ -330,12 +349,11 @@ public sealed partial class PtxAffineEmitter
             var cache = new Dictionary<string, string[]>(StringComparer.Ordinal);
             operand = (pass, input, e) =>
             {
-                string name = pass.Inputs[input].Name;
-                var b = plan.Bindings[name];
-                if (b.Kind == CodegenRowOperandKind.Row) return RowOperand(name);
+                var b = plan.BindingFor(pass.Inputs[input]);
+                if (b.Kind == CodegenRowOperandKind.Row) return RowOperand(b);
                 int chunk = e / vector;
-                string at = $"[{RowBase(name)}+{I64(ChunkOffset(b, chunk) * 4)}]";
-                return LoadStep(name + "@" + I(chunk), at, b.Kind, cache)[e % vector];
+                string at = $"[{RowBase(b)}+{I64(ChunkOffset(b, chunk) * 4)}]";
+                return LoadStep(b.Key + "@" + I(chunk), at, b.Kind, cache)[e % vector];
             };
 
             foreach (var pass in plan.Program.Passes)
@@ -356,7 +374,7 @@ public sealed partial class PtxAffineEmitter
                 }
                 else
                 {
-                    StorePointwise(pass, perThread, chunk => $"{I64(ChunkOffset(plan.Bindings[pass.Output.Name], chunk) * 4)}");
+                    StorePointwise(pass, perThread, chunk => $"{I64(ChunkOffset(plan.BindingFor(pass.Output), chunk) * 4)}");
                 }
             }
         }
@@ -374,7 +392,8 @@ public sealed partial class PtxAffineEmitter
                     if (sweepOutputs.Contains(input.Name)) dependsOnSweep = true;
                 if (rowPass || dependsOnSweep)
                 {
-                    EmitSweep(sweep, sweepIndex++);
+                    // Only a sweep that has passes takes a label number.
+                    if (sweep.Count > 0) EmitSweep(sweep, sweepIndex++);
                     sweep.Clear();
                     sweepOutputs.Clear();
                 }
@@ -442,11 +461,10 @@ public sealed partial class PtxAffineEmitter
             L($"mul.lo.u32 {innerColumn}, {within}, {I(step)};");
 
             var address = new Dictionary<string, string>(StringComparer.Ordinal);
-            string StepAddress(string name)
+            string StepAddress(CodegenRowBinding b)
             {
-                if (address.TryGetValue(name, out string? a)) return a;
-                var b = plan.Bindings[name];
-                string at = RowBaseNow(name);
+                if (address.TryGetValue(b.Key, out string? a)) return a;
+                string at = RowBase(b);
                 for (int k = 0; k < outerValue.Length; k++)
                 {
                     if (b.ColumnStrides[k] == 0) continue;
@@ -460,16 +478,15 @@ public sealed partial class PtxAffineEmitter
                     L($"mad.wide.u32 {next}, {innerColumn}, 4, {at};");
                     at = next;
                 }
-                return address[name] = at;
+                return address[b.Key] = at;
             }
 
             var cache = new Dictionary<string, string[]>(StringComparer.Ordinal);
             operand = (pass, input, e) =>
             {
-                string name = pass.Inputs[input].Name;
-                var b = plan.Bindings[name];
-                if (b.Kind == CodegenRowOperandKind.Row) return RowOperand(name);
-                return LoadStep(name, $"[{StepAddress(name)}]", b.Kind, cache)[e % vector];
+                var b = plan.BindingFor(pass.Inputs[input]);
+                if (b.Kind == CodegenRowOperandKind.Row) return RowOperand(b);
+                return LoadStep(b.Key, $"[{StepAddress(b)}]", b.Kind, cache)[e % vector];
             };
 
             foreach (var pass in passes)
@@ -484,7 +501,7 @@ public sealed partial class PtxAffineEmitter
                 {
                     var values = new string[vector];
                     for (int e = 0; e < vector; e++) values[e] = Epilogue(pass, Term(pass, e), e);
-                    string at = StepAddress(pass.Output.Name);
+                    string at = StepAddress(plan.BindingFor(pass.Output));
                     if (vector == 1) L($"st.global.f32 [{at}], {values[0]};");
                     else
                     {
@@ -505,11 +522,6 @@ public sealed partial class PtxAffineEmitter
                 if (pass.Reduce != CodegenReduceKind.None) FinishReduction(pass, accumulator[pass.Name]);
         }
 
-        // Row bases are computed before the first sweep's loop label: a register first
-        // defined inside a loop body would be redefined on every trip, which is harmless for
-        // a pure function of the row but wasteful, so streamed sweeps reuse the hoisted base.
-        string RowBaseNow(string name) => RowBase(name);
-
         void StorePointwise(CodegenKernelSpec pass, int count, Func<int, string> byteOffset)
         {
             var pending = new string[vector];
@@ -518,7 +530,7 @@ public sealed partial class PtxAffineEmitter
                 string value = Epilogue(pass, Term(pass, e), e);
                 pending[e % vector] = value;
                 if (e % vector != vector - 1) continue;
-                string at = $"[{RowBase(pass.Output.Name)}+{byteOffset(e / vector)}]";
+                string at = $"[{RowBase(plan.BindingFor(pass.Output))}+{byteOffset(e / vector)}]";
                 if (vector == 1)
                 {
                     L($"st.global.f32 {at}, {value};");

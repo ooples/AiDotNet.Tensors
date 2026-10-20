@@ -38,6 +38,7 @@ layernorm_d64/layernorm_rstd	89	4	0	7	0
 layernorm_d64/layernorm_affine	61	5	3	0	0
 rmsnorm/rmsnorm_rstd	318	32	0	65	0
 rmsnorm/rmsnorm_scale	160	17	16	0	0
+batchnorm2d/batchnorm_shift	79	4	0	13	0
 batchnorm2d/batchnorm_negmean	81	1	0	4	2
 batchnorm2d/batchnorm_shifted_moment	91	2	0	5	2
 batchnorm2d/batchnorm_rstd	94	3	3	4	0

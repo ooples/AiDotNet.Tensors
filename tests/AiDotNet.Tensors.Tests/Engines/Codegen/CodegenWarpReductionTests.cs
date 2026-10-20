@@ -162,7 +162,7 @@ public class CodegenWarpReductionTests
     public void ThePlannerCountsTheWarpsThreads()
     {
         Assert.Null(CodegenSplitReduction.TryPlan(RowReduce(8192, 1024, CodegenReduceKind.Sum)));
-        Assert.NotNull(CodegenSplitReduction.TryPlan(CodegenFusedStatistics.BatchNorm2D(32, 64, 56, 56).Passes[0]));
+        Assert.NotNull(CodegenSplitReduction.TryPlan(CodegenFusedStatistics.BatchNorm2D(32, 64, 56, 56).Passes[1]));
     }
 
     private static int CountOccurrences(string text, string token)
