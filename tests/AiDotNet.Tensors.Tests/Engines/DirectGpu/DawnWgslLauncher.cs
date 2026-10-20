@@ -110,11 +110,11 @@ for await (const line of rl) {
         if (string.IsNullOrEmpty(dir) || !Directory.Exists(Path.Combine(dir, "node_modules", "webgpu"))) return null;
         string script = Path.Combine(dir, "aidotnet-wgsl-server.mjs");
         File.WriteAllText(script, Server);
-        var (node, stderr) = StartServer(script);
-        return node is null ? null : new DawnWgslLauncher(script, node, stderr!, modules);
+        var started = StartServer(script);
+        return started is null ? null : new DawnWgslLauncher(script, started.Value.Node, started.Value.Stderr, modules);
     }
 
-    private static (Process? Node, System.Text.StringBuilder? Stderr) StartServer(string script)
+    private static (Process Node, System.Text.StringBuilder Stderr)? StartServer(string script)
     {
         var start = new ProcessStartInfo("node", $"\"{script}\"")
         {
@@ -125,7 +125,7 @@ for await (const line of rl) {
             UseShellExecute = false,
         };
         var node = Process.Start(start);
-        if (node is null) return (null, null);
+        if (node is null) return null;
         // Drain stderr as it arrives: a full stderr pipe would block node, and then the reply read below.
         var stderr = new System.Text.StringBuilder();
         node.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (stderr) stderr.AppendLine(e.Data); };
@@ -137,16 +137,26 @@ for await (const line of rl) {
     private void RecycleServerIfDue()
     {
         if (++_launches <= LaunchesPerServer) return;
+        // The replacement starts before the old server is disposed. Stopping first and then failing to start
+        // would leave _node pointing at a disposed process, which Dispose would go on to use. The old server is
+        // healthy here - it has only reached its launch budget - so the two overlap for one Process.Start.
+        var started = StartServer(_script)
+            ?? throw new InvalidOperationException("The Dawn server did not restart.");
         StopServer();
-        var (node, stderr) = StartServer(_script);
-        _node = node ?? throw new InvalidOperationException("The Dawn server did not restart.");
-        _stderr = stderr!;
+        _node = started.Node;
+        _stderr = started.Stderr;
         _launches = 1;
     }
 
     private void StopServer()
     {
-        try { _node.StandardInput.Close(); _node.WaitForExit(10_000); }
+        try
+        {
+            _node.StandardInput.Close();
+            // Dispose does not kill the process, so a server that ignores the closed stdin would survive as an
+            // orphan holding its GPU device open.
+            if (!_node.WaitForExit(10_000)) _node.Kill(entireProcessTree: true);
+        }
         catch (InvalidOperationException) { }
         _node.Dispose();
     }
