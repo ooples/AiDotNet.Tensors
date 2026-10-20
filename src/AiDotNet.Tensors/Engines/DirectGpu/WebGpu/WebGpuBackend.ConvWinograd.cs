@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // WinogradF23Pipeline: the WGSL tile transforms of WebGpuWinogradKernels around BatchedGemm. Backward convolution gets
 // tuned slots here for the first time, with the direct kernels it always ran as the references, so Winograd is served
 // only on the shape classes where it measures faster.
-public sealed partial class WebGpuBackend : IWinogradF23Transforms
+public sealed partial class WebGpuBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
 {
     private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataSlot, _conv2DBackwardFilterSlot;
     private bool? _winogradReady;
@@ -84,6 +84,9 @@ public sealed partial class WebGpuBackend : IWinogradF23Transforms
                         new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("webgpu.conv2d_dw.winograd_f32", TunedKernelOrigin.Builtin,
                             true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("webgpu.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
+                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                     });
                 return _conv2DBackwardFilterSlot;
             }
@@ -106,6 +109,30 @@ public sealed partial class WebGpuBackend : IWinogradF23Transforms
 
     internal bool TryConv2DBackwardFilterWinograd(in TunedConv2DBackwardArgs a)
         => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilter(this, this, a);
+
+    // The fused weight gradient: one dispatch of 256-wide workgroups (plus the finish when the tiles split).
+    internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a, int splits = 0)
+        => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
+
+    // WebGPU exposes no multiprocessor count (ComputeUnits is 1), so the splits aim at 64 workgroups, a mid-range
+    // discrete GPU's SM / CU count; the tuned slot still measures the result.
+    private const int FusedFilterGradientGroups = 64;
+
+    int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => FusedFilterGradientGroups;
+
+    void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
+        int groups, int[] ints)
+    {
+        string name = direct ? WinogradF23KernelTemplate.FusedFilterGradientDirect : WinogradF23KernelTemplate.FusedFilterGradient;
+        // A uniform struct is a 16-byte multiple: the ints, bit-cast, then zero padding.
+        var fusedUniforms = new float[(ints.Length + 3) / 4 * 4];
+        for (int i = 0; i < ints.Length; i++) fusedUniforms[i] = BitConverter.Int32BitsToSingle(ints[i]);
+        Dispatch3BufferAsync(WinogradModulePrefix + name, WebGpuWinogradKernels.SourceFor(name), name, x, res, dy,
+            fusedUniforms, groups * WinogradF23KernelTemplate.FusedGroupSize).GetAwaiter().GetResult();
+    }
+
+    void IWinogradFusedFilterGradient.FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits)
+        => RunWinograd(WinogradF23KernelTemplate.FusedFilterGradientFinish, 9L * kc, partials, dw, kc, splits);
 
     private static float[] BackwardUniforms(in TunedConv2DBackwardArgs a)
         => MakeConvUniforms(a.Batch, a.InChannels, a.OutChannels, a.InHeight, a.InWidth, a.OutHeight, a.OutWidth,

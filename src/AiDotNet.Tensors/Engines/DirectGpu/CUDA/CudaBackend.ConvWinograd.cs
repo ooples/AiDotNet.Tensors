@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// dilation 1: filter transform, input transform, sixteen GEMMs on the #1325 engine main loop, output transform.
 /// The module compiles on first use.
 /// </summary>
-public sealed partial class CudaBackend : IWinogradF23Transforms
+public sealed partial class CudaBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
 {
     private readonly object _winogradModuleLock = new();
     private bool _winogradModuleTried, _winogradModuleReady;
@@ -161,12 +161,13 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
     /// <summary>
     /// Weight gradient through Winograd F(3x3, 2x2) in one fused launch (wino_f32w_fused): each block transforms its dY
     /// and x tiles in shared memory, accumulates all sixteen components in registers and output-transforms them, so no
-    /// U, V or M planes go through memory; conv2d_wgrad_winograd_finish sums the tile splits into dW. The tiles are split
-    /// for about one block per SM (measured on an RTX 3080: more blocks per SM lost to the extra partials). ResNet-18,
-    /// batch 8, standalone: 128@16 63 -> 35 us (vs the four-launch pipeline), 256@8 44 -> 38, 64@32 51 -> 39 (vs r8v).
-    /// Overwrites the gradient.
+    /// U, V or M planes go through memory. Unsplit, the kernel writes dW itself (wino_f32w_fused_direct, staged so its
+    /// stores are contiguous rows); split, it writes component-major partials that conv2d_wgrad_winograd_finish sums. The
+    /// tiles are split for about one block per SM (measured on an RTX 3080: more blocks per SM lost to the extra
+    /// partials). ResNet-18, batch 8, standalone: 128@16 63 -> 35 us and 256@8 44 -> 36 (vs the four-launch pipeline),
+    /// 64@32 51 -> 39 and 512@4 53 -> 41 (vs r8v). Overwrites the gradient.
     /// </summary>
-    internal unsafe bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a)
+    internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a)
     {
         if (!WinogradF32AdmitsFilter(a) || !EnsureWinogradModule()) return false;
         int n = a.Batch, c = a.InChannels, k = a.OutChannels, h = a.InHeight, w = a.InWidth, pad = a.PadH;
@@ -181,22 +182,41 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
         splits = (pi + tilesPerSplit - 1) / tilesPerSplit;
         long kc = (long)k * c;
         if (9L * splits * kc > int.MaxValue) return false;
-        var partials = TryConvScratch(ref _winogradDwPartials, 9L * splits * kc);
-        if (partials is null) return false;
+        IGpuBuffer? partials = null;
+        if (splits > 1 && (partials = TryConvScratch(ref _winogradDwPartials, 9L * splits * kc)) is null) return false;
 
         using var _ = PushContext();
-        IntPtr xPtr = a.First.Handle, dyPtr = a.Second.Handle, partPtr = partials.Handle, dwPtr = a.Output.Handle;
-        int tps = tilesPerSplit;
-        void** fa = stackalloc void*[15];
-        fa[0] = &xPtr; fa[1] = &dyPtr; fa[2] = &partPtr; fa[3] = &n; fa[4] = &c; fa[5] = &h; fa[6] = &w; fa[7] = &k;
-        fa[8] = &outH; fa[9] = &outW; fa[10] = &pad; fa[11] = &tilesH; fa[12] = &tilesW; fa[13] = &tps;
-        LaunchKernel3D(_kernelCache["wino_f32w_fused"], (uint)gx, (uint)gy, (uint)splits, (uint)DefaultBlockSize, 1, 1, fa, 0);
-        int kci = (int)kc;
-        void** ra = stackalloc void*[4];
-        ra[0] = &partPtr; ra[1] = &dwPtr; ra[2] = &kci; ra[3] = &splits;
-        LaunchKernel(_kernelCache["conv2d_wgrad_winograd_finish"], (uint)((9 * kc + DefaultBlockSize - 1) / DefaultBlockSize),
-            (uint)DefaultBlockSize, ra);
+        IWinogradFusedFilterGradient fused = this;
+        fused.FusedFilterGradient(splits == 1, a.First, partials ?? a.Output, a.Second, gx * gy * splits,
+            new[] { n, c, h, w, k, outH, outW, pad, tilesH, tilesW, tilesPerSplit });
+        if (partials is not null) fused.FusedFilterGradientFinish(partials, a.Output, (int)kc, splits);
         return true;
+    }
+
+    int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => _multiProcessorCount;
+
+    // CUDA's own fused kernels (CudaConvWinogradKernels): a (ceil(C/32), ceil(K/32), splits) grid of 256-thread blocks,
+    // arguments (x, dy, out, ints), where the template's kernels take a 1-D grid and (x, res, dy, ints).
+    unsafe void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
+        int groups, int[] ints)
+    {
+        int gx = (ints[1] + WinogradFusedTile - 1) / WinogradFusedTile, gy = (ints[4] + WinogradFusedTile - 1) / WinogradFusedTile;
+        IntPtr xPtr = x.Handle, dyPtr = dy.Handle, resPtr = res.Handle;
+        int* fusedInts = stackalloc int[ints.Length];
+        void** fusedArgs = stackalloc void*[3 + ints.Length];
+        fusedArgs[0] = &xPtr; fusedArgs[1] = &dyPtr; fusedArgs[2] = &resPtr;
+        for (int i = 0; i < ints.Length; i++) { fusedInts[i] = ints[i]; fusedArgs[3 + i] = &fusedInts[i]; }
+        LaunchKernel3D(_kernelCache[direct ? "wino_f32w_fused_direct" : "wino_f32w_fused"], (uint)gx, (uint)gy,
+            (uint)(groups / (gx * gy)), (uint)DefaultBlockSize, 1, 1, fusedArgs, 0);
+    }
+
+    unsafe void IWinogradFusedFilterGradient.FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits)
+    {
+        IntPtr partPtr = partials.Handle, dwPtr = dw.Handle;
+        void** finishArgs = stackalloc void*[4];
+        finishArgs[0] = &partPtr; finishArgs[1] = &dwPtr; finishArgs[2] = &kc; finishArgs[3] = &splits;
+        LaunchKernel(_kernelCache["conv2d_wgrad_winograd_finish"], (uint)((9L * kc + DefaultBlockSize - 1) / DefaultBlockSize),
+            (uint)DefaultBlockSize, finishArgs);
     }
 
     // The pipeline for y[n][outC][outH][outW] = conv3x3_s1(x[n][inC][h][w], padding pad): the filter transform of w

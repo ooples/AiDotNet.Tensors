@@ -7,10 +7,11 @@
 // OpenCL instance, whose WinogradF23PortTests run on a real device.
 using System;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
+using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IWinogradF23Transforms
+public sealed partial class MetalBackend : IWinogradF23Transforms, IWinogradFusedFilterGradient
 {
     private const string WinogradLibraryName = "Winograd";
     private IntPtr _winogradLibrary;
@@ -80,6 +81,9 @@ public sealed partial class MetalBackend : IWinogradF23Transforms
                         new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("metal.conv2d_dw.winograd_f32", TunedKernelOrigin.Builtin,
                             true, shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinograd(a)) LaunchDwDirect(a); }),
+                        new DelegateTunedKernelCandidate<TunedConv2DBackwardArgs>("metal.conv2d_dw.winograd_fused", TunedKernelOrigin.Builtin,
+                            true, shape => WinogradF23Pipeline.AdmitsShape(shape) && FusedFilterGradientReady,
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }),
                     });
                 return _conv2DBackwardFilterSlot;
             }
@@ -101,6 +105,37 @@ public sealed partial class MetalBackend : IWinogradF23Transforms
 
     internal bool TryConv2DBackwardFilterWinograd(in TunedConv2DBackwardArgs a)
         => WinogradKernelsReady && WinogradF23Pipeline.TryBackwardFilter(this, this, a);
+
+    // The fused weight gradient: one dispatch of 256-wide threadgroups (plus the finish when the tiles split). Its
+    // thread roles need all 256 in one group, so a pipeline the compiler capped below that (register pressure) declines.
+    internal bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a, int splits = 0)
+        => FusedFilterGradientReady && WinogradF23Pipeline.TryBackwardFilterFused(this, this, a, splits);
+
+    private bool FusedFilterGradientReady
+        => WinogradKernelsReady
+           && GetPipeline(WinogradLibraryName, _winogradLibrary, WinogradF23KernelTemplate.FusedFilterGradient)
+               .MaxTotalThreadsPerThreadgroup >= WinogradF23KernelTemplate.FusedGroupSize
+           && GetPipeline(WinogradLibraryName, _winogradLibrary, WinogradF23KernelTemplate.FusedFilterGradientDirect)
+               .MaxTotalThreadsPerThreadgroup >= WinogradF23KernelTemplate.FusedGroupSize;
+
+    int IWinogradFusedFilterGradient.FusedFilterGradientGroupTarget => ComputeUnits;
+
+    void IWinogradFusedFilterGradient.FusedFilterGradient(bool direct, IGpuBuffer x, IGpuBuffer res, IGpuBuffer dy,
+        int groups, int[] ints)
+    {
+        var pipeline = GetPipeline(WinogradLibraryName, _winogradLibrary,
+            direct ? WinogradF23KernelTemplate.FusedFilterGradientDirect : WinogradF23KernelTemplate.FusedFilterGradient);
+        var fusedBuffers = new[] { x, res, dy };
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        for (int i = 0; i < fusedBuffers.Length; i++) encoder.SetBuffer((MetalGpuBuffer)fusedBuffers[i], i);
+        for (int i = 0; i < ints.Length; i++) encoder.SetBytes((uint)ints[i], (uint)(fusedBuffers.Length + i));
+        encoder.DispatchThreadgroups(new MTLSize((ulong)groups, 1, 1),
+            new MTLSize((ulong)WinogradF23KernelTemplate.FusedGroupSize, 1, 1));
+    }
+
+    void IWinogradFusedFilterGradient.FusedFilterGradientFinish(IGpuBuffer partials, IGpuBuffer dw, int kc, int splits)
+        => RunWinograd(WinogradF23KernelTemplate.FusedFilterGradientFinish, 9L * kc, partials, dw, kc, splits);
 
     private static int[] BackwardInts(in TunedConv2DBackwardArgs a) => new[]
     {
