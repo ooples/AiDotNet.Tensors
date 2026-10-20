@@ -161,10 +161,11 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
     /// <summary>
     /// Weight gradient through Winograd F(3x3, 2x2) in one fused launch (wino_f32w_fused): each block transforms its dY
     /// and x tiles in shared memory, accumulates all sixteen components in registers and output-transforms them, so no
-    /// U, V or M planes go through memory; conv2d_wgrad_winograd_finish sums the tile splits into dW. The tiles are split
-    /// for about one block per SM (measured on an RTX 3080: more blocks per SM lost to the extra partials). ResNet-18,
-    /// batch 8, standalone: 128@16 63 -> 35 us (vs the four-launch pipeline), 256@8 44 -> 38, 64@32 51 -> 39 (vs r8v).
-    /// Overwrites the gradient.
+    /// U, V or M planes go through memory. Unsplit, the kernel writes dW itself (wino_f32w_fused_direct, staged so its
+    /// stores are contiguous rows); split, it writes component-major partials that conv2d_wgrad_winograd_finish sums. The
+    /// tiles are split for about one block per SM (measured on an RTX 3080: more blocks per SM lost to the extra
+    /// partials). ResNet-18, batch 8, standalone: 128@16 63 -> 35 us and 256@8 44 -> 36 (vs the four-launch pipeline),
+    /// 64@32 51 -> 39 and 512@4 53 -> 41 (vs r8v). Overwrites the gradient.
     /// </summary>
     internal unsafe bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a)
     {
@@ -181,16 +182,19 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
         splits = (pi + tilesPerSplit - 1) / tilesPerSplit;
         long kc = (long)k * c;
         if (9L * splits * kc > int.MaxValue) return false;
-        var partials = TryConvScratch(ref _winogradDwPartials, 9L * splits * kc);
-        if (partials is null) return false;
+        IGpuBuffer? partials = null;
+        if (splits > 1 && (partials = TryConvScratch(ref _winogradDwPartials, 9L * splits * kc)) is null) return false;
 
         using var _ = PushContext();
-        IntPtr xPtr = a.First.Handle, dyPtr = a.Second.Handle, partPtr = partials.Handle, dwPtr = a.Output.Handle;
+        IntPtr xPtr = a.First.Handle, dyPtr = a.Second.Handle, dwPtr = a.Output.Handle;
+        IntPtr partPtr = partials?.Handle ?? dwPtr;
         int tps = tilesPerSplit;
         void** fa = stackalloc void*[15];
         fa[0] = &xPtr; fa[1] = &dyPtr; fa[2] = &partPtr; fa[3] = &n; fa[4] = &c; fa[5] = &h; fa[6] = &w; fa[7] = &k;
         fa[8] = &outH; fa[9] = &outW; fa[10] = &pad; fa[11] = &tilesH; fa[12] = &tilesW; fa[13] = &tps;
-        LaunchKernel3D(_kernelCache["wino_f32w_fused"], (uint)gx, (uint)gy, (uint)splits, (uint)DefaultBlockSize, 1, 1, fa, 0);
+        LaunchKernel3D(_kernelCache[splits > 1 ? "wino_f32w_fused" : "wino_f32w_fused_direct"], (uint)gx, (uint)gy,
+            (uint)splits, (uint)DefaultBlockSize, 1, 1, fa, 0);
+        if (splits == 1) return true;
         int kci = (int)kc;
         void** ra = stackalloc void*[4];
         ra[0] = &partPtr; ra[1] = &dwPtr; ra[2] = &kci; ra[3] = &splits;

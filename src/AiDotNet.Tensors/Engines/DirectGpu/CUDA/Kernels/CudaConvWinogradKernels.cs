@@ -351,19 +351,21 @@ extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float
         if (w + 1 < outW) dst[(h + i) * outW + w + 1] = o1;
     }
 }
-// Fused Winograd F(3x3, 2x2) weight gradient: one launch plus conv2d_wgrad_winograd_finish, in place of
-// wino_f32w_dy + wino_f32w_input + wino_gemm + wino_f32w_output (whose 16-plane U and V scratch alone were 4 MB each at
-// ResNet-18's 128-channel layers, mostly DRAM traffic). Block (blockIdx.x, blockIdx.y, blockIdx.z) owns input channels
+// Fused Winograd F(3x3, 2x2) weight gradient: one launch (plus conv2d_wgrad_winograd_finish when the tiles are split),
+// in place of wino_f32w_dy + wino_f32w_input + wino_gemm + wino_f32w_output (whose 16-plane U and V scratch alone were
+// 4 MB each at ResNet-18's 128-channel layers, mostly DRAM traffic). Block (blockIdx.x, blockIdx.y, blockIdx.z) owns input channels
 // c0 .. c0 + 31, output channels k0 .. k0 + 31 and the dY tiles [z * tilesPerSplit, ...). Per chunk of WF_PC tiles it
 // transforms dY (U = A g A^T) and x (V = B^T d B) into shared memory, then thread (tx, tk, tc) accumulates
 // M[x][k][c] += U[x][p][k] V[x][p][c] for components 4tx .. 4tx + 3, channels 4tk .., 4tc .. (64 accumulators). The
 // epilogue gathers each (k, c)'s 16 components through shared memory and writes G^T M G (3x3): to dW when the tiles are
-// not split, else to out[z][k][c][9] for conv2d_wgrad_splitk_reduce.
+// not split (DIRECT: staged through shared memory so the stores are contiguous dW rows), else component-major to
+// out[z][q][k][c] for conv2d_wgrad_winograd_finish.
 #define WF_TK 32
 #define WF_TC 32
 #define WF_PC 8
 #define WF_LD 36   // padded row: a warp's 8 tiles x 4 channels of transform stores hit 32 distinct banks
-extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
+template <bool DIRECT>
+__device__ __forceinline__ void wino_f32w_fused_body(
     const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
     int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
 {
@@ -470,6 +472,67 @@ extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
         __syncthreads();
     }
 
+    if constexpr (DIRECT)
+    {
+    // Epilogue, in quarters of the block's k rows. Ms[x][8 k][33] gathers each (k, c)'s 16 components (row stride 33: the
+    // writers' 4 k rows x 8 column quads hit 32 distinct banks); each (k, c)'s G^T M G goes to Os[8 k][32 c * 9], whose
+    // rows are the contiguous dW[k][c0 .. c0 + 31][3][3] spans, copied out coalesced. out is dW itself (one split) or
+    // split z's dW-shaped slice, summed by conv2d_wgrad_splitk_reduce.
+    float* Ms = smem;                      // [16][8][33]
+    float* Os = smem + 16 * 8 * 33;        // [8][32 * 9]
+    float* dst = out + (long long)blockIdx.z * K * C * 9;
+    const int cw = min(WF_TC, C - c0);     // this block's columns (ragged last tile)
+    #pragma unroll
+    for (int quarter = 0; quarter < 4; quarter++)
+    {
+        if ((tk >> 1) == quarter)
+        {
+            #pragma unroll
+            for (int xi = 0; xi < 4; xi++)
+                #pragma unroll
+                for (int a = 0; a < 4; a++)
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++)
+                        Ms[(tx * 4 + xi) * 264 + ((tk & 1) * 4 + a) * 33 + tc * 4 + b] = acc[xi][a][b];
+        }
+        __syncthreads();
+        {
+            const int pair = tid, kl = pair >> 5, cl = pair & 31;   // 256 pairs: 8 k x 32 c
+            float m[16];
+            #pragma unroll
+            for (int q = 0; q < 16; q++) m[q] = Ms[q * 264 + kl * 33 + cl];
+            float t[3][4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                const float m0 = m[j], m1 = m[4 + j], m2 = m[8 + j], m3 = m[12 + j];
+                t[0][j] = m0 + 0.5f * (m1 + m2);
+                t[1][j] = 0.5f * (m1 - m2);
+                t[2][j] = 0.5f * (m1 + m2) + m3;
+            }
+            float* o = Os + kl * 288 + cl * 9;
+            #pragma unroll
+            for (int i = 0; i < 3; i++)
+            {
+                const float a = t[i][0], b = t[i][1], cc = t[i][2], dd = t[i][3];
+                o[i * 3 + 0] = a + 0.5f * (b + cc);
+                o[i * 3 + 1] = 0.5f * (b - cc);
+                o[i * 3 + 2] = 0.5f * (b + cc) + dd;
+            }
+        }
+        __syncthreads();
+        // Copy the 8 rows of cw * 9 contiguous floats out.
+        for (int i = tid; i < 8 * 288; i += 256)
+        {
+            const int kl = i / 288, r = i - kl * 288;
+            const int k = k0 + quarter * 8 + kl;
+            if (k < K && r < cw * 9) dst[((long long)k * C + c0) * 9 + r] = Os[i];
+        }
+        __syncthreads();
+    }
+    }
+    else
+    {
     // Epilogue, in two halves of the k rows: Ms[x][16 k][33] gathers each (k, c)'s 16 components (row stride 33: the
     // writers' 4 k rows x 8 column quads hit 32 distinct banks). Each (k, c)'s G^T M G goes out component-major,
     // out[z][q][k][c] (q = 3i + j), so a warp's stores are contiguous; conv2d_wgrad_winograd_finish sums the splits and
@@ -522,6 +585,23 @@ extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
         }
         __syncthreads();
     }
+    }
+}
+
+// One split of the tiles: writes dW directly.
+extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused_direct(
+    const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+{
+    wino_f32w_fused_body<true>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit);
+}
+
+// Split tiles: component-major partials for conv2d_wgrad_winograd_finish.
+extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
+    const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+{
+    wino_f32w_fused_body<false>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit);
 }
 
 // dW[k][c][3][3] = sum over the splits of partials[z][q][k][c] (q = 3i + j), in split order.
@@ -535,12 +615,11 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_winograd_finish
     for (int z = 0; z < splits; z++) sum += partials[((long long)z * 9 + q) * KC + kc];
     dw[i] = sum;
 }
-
 ";
 
     public static string[] GetKernelNames() => new[]
     {
         "wino_f23_filter", "wino_f23_filter_flip", "wino_f23_input", "wino_gemm128", "wino_gemm64", "wino_f23_output", "wino_f32w_dy", "wino_f32w_input", "wino_f32w_output",
-        "wino_f32w_fused", "conv2d_wgrad_winograd_finish",
+        "wino_f32w_fused", "wino_f32w_fused_direct", "conv2d_wgrad_winograd_finish",
     };
 }
