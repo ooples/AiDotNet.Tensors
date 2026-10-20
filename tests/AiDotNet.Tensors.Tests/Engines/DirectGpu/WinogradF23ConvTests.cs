@@ -244,6 +244,43 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         _output.WriteLine($"[dW N{batch} C{inC}->K{outC} {size}x{size}] backend {backendUs:F1} us, winograd F(3,2) {winUs:F1} us ({backendUs / winUs:F2}x)");
     }
 
+    // The fused Winograd weight gradient (one launch + the split finish) against the fixed im2col route, over shapes
+    // that split the tiles (64@32, 128@16), leave them whole (256@8, 512@4) and leave ragged channel tiles and edges.
+    [SkippableTheory]
+    [InlineData(8, 64, 64, 32, 1)]
+    [InlineData(8, 128, 128, 16, 1)]
+    [InlineData(8, 256, 256, 8, 1)]
+    [InlineData(8, 512, 512, 4, 1)]
+    [InlineData(3, 5, 7, 9, 1)]
+    [InlineData(2, 16, 24, 11, 0)]
+    [InlineData(3, 40, 72, 11, 1)]
+    public void Fused_winograd_weight_gradient_matches_im2col(int batch, int inC, int outC, int size, int pad)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = (DirectGpuTensorEngine)_fixture.Engine!;
+        var cuda = gpu.GetBackend() as CudaBackend;
+        Skip.If(cuda is null, "CUDA only.");
+        Skip.IfNot(cuda!.EnsureWinogradModule(), "Winograd kernels did not compile.");
+
+        int outSize = size + 2 * pad - 2;
+        using var x = cuda.AllocateBuffer(Rand(batch * inC * size * size, 15, 1f));
+        using var gy = cuda.AllocateBuffer(Rand(batch * outC * outSize * outSize, 16, 1f));
+        using var dwRef = cuda.AllocateBuffer(outC * inC * 9);
+        using var dwFused = cuda.AllocateBuffer(Rand(outC * inC * 9, 17, 100f));   // garbage: every element must be written
+        var refArgs = new TunedConv2DBackwardArgs(x, gy, dwRef, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        var fusedArgs = new TunedConv2DBackwardArgs(x, gy, dwFused, true, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
+        Assert.True(cuda.Conv2DBackwardKernelViaIm2col(refArgs), "im2col reference refused the weight-gradient shape");
+        Assert.True(cuda.TryConv2DBackwardFilterWinogradFused(fusedArgs), "the fused Winograd refused an admitted weight-gradient shape");
+
+        var expected = cuda.DownloadBuffer(dwRef);
+        var actual = cuda.DownloadBuffer(dwFused);
+        double scale = expected.Max(v => Math.Abs((double)v)), maxErr = 0;
+        for (int i = 0; i < expected.Length; i++)
+            maxErr = Math.Max(maxErr, Math.Abs(expected[i] - actual[i]) / Math.Max(1.0, scale));
+        _output.WriteLine($"[fused dW N{batch} C{inC}->K{outC} {size}x{size} pad{pad}] max err / max|dW| vs im2col {maxErr:E2}");
+        Assert.True(maxErr < 1e-5, $"fused Winograd weight gradient disagrees: max err / max|dW| {maxErr:E2}");
+    }
+
     // Input gradient through the flipped-filter Winograd pipeline against the fixed col2im route, timed against the
     // backend's tuned input-gradient route (which may itself pick the Winograd candidate, so it cannot be the reference).
     [SkippableTheory]

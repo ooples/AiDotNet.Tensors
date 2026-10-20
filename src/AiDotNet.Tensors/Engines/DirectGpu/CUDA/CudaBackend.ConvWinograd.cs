@@ -102,7 +102,10 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
             bias: null, epilogue: 0);
     }
 
-    private IGpuBuffer? _winogradWu, _winogradWv, _winogradWm;
+    private IGpuBuffer? _winogradWu, _winogradWv, _winogradWm, _winogradDwPartials;
+
+    // The fused weight gradient's (wino_f32w_fused) tiles per chunk (WF_PC) and channel tile (WF_TK = WF_TC).
+    private const int WinogradFusedChunk = 8, WinogradFusedTile = 32;
 
     /// <summary>True for the weight-gradient shapes this path computes (the forward conv's 3x3, stride 1, dilation 1).</summary>
     internal static bool WinogradF32AdmitsFilter(in TunedConv2DBackwardArgs a)
@@ -152,6 +155,47 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
         LaunchKernel3D(_kernelCache[tile == WinogradLargeTile ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, (uint)(16 * splits), block, 1, 1, ga, 0);
 
         transforms.FilterGradient(m, a.Output, k, c, splits);
+        return true;
+    }
+
+    /// <summary>
+    /// Weight gradient through Winograd F(3x3, 2x2) in one fused launch (wino_f32w_fused): each block transforms its dY
+    /// and x tiles in shared memory, accumulates all sixteen components in registers and output-transforms them, so no
+    /// U, V or M planes go through memory; conv2d_wgrad_winograd_finish sums the tile splits into dW. The tiles are split
+    /// for about one block per SM (measured on an RTX 3080: more blocks per SM lost to the extra partials). ResNet-18,
+    /// batch 8, standalone: 128@16 63 -> 35 us (vs the four-launch pipeline), 256@8 44 -> 38, 64@32 51 -> 39 (vs r8v).
+    /// Overwrites the gradient.
+    /// </summary>
+    internal unsafe bool TryConv2DBackwardFilterWinogradFused(in TunedConv2DBackwardArgs a)
+    {
+        if (!WinogradF32AdmitsFilter(a) || !EnsureWinogradModule()) return false;
+        int n = a.Batch, c = a.InChannels, k = a.OutChannels, h = a.InHeight, w = a.InWidth, pad = a.PadH;
+        int outH = a.OutHeight, outW = a.OutWidth, tilesH = (outH + 1) / 2, tilesW = (outW + 1) / 2;
+        long p = (long)n * tilesH * tilesW;
+        if (p > int.MaxValue || (long)n * c * h * w > int.MaxValue || (long)n * k * outH * outW > int.MaxValue) return false;
+        int pi = (int)p;
+        int gx = (c + WinogradFusedTile - 1) / WinogradFusedTile, gy = (k + WinogradFusedTile - 1) / WinogradFusedTile;
+        int sms = Math.Max(1, _multiProcessorCount);
+        int splits = (int)Math.Max(1, Math.Min(Math.Round((double)sms / ((long)gx * gy)), pi / WinogradFusedChunk));
+        int tilesPerSplit = ((pi + splits - 1) / splits + WinogradFusedChunk - 1) / WinogradFusedChunk * WinogradFusedChunk;
+        splits = (pi + tilesPerSplit - 1) / tilesPerSplit;
+        long kc = (long)k * c;
+        if (9L * splits * kc > int.MaxValue) return false;
+        var partials = TryConvScratch(ref _winogradDwPartials, 9L * splits * kc);
+        if (partials is null) return false;
+
+        using var _ = PushContext();
+        IntPtr xPtr = a.First.Handle, dyPtr = a.Second.Handle, partPtr = partials.Handle, dwPtr = a.Output.Handle;
+        int tps = tilesPerSplit;
+        void** fa = stackalloc void*[15];
+        fa[0] = &xPtr; fa[1] = &dyPtr; fa[2] = &partPtr; fa[3] = &n; fa[4] = &c; fa[5] = &h; fa[6] = &w; fa[7] = &k;
+        fa[8] = &outH; fa[9] = &outW; fa[10] = &pad; fa[11] = &tilesH; fa[12] = &tilesW; fa[13] = &tps;
+        LaunchKernel3D(_kernelCache["wino_f32w_fused"], (uint)gx, (uint)gy, (uint)splits, (uint)DefaultBlockSize, 1, 1, fa, 0);
+        int kci = (int)kc;
+        void** ra = stackalloc void*[4];
+        ra[0] = &partPtr; ra[1] = &dwPtr; ra[2] = &kci; ra[3] = &splits;
+        LaunchKernel(_kernelCache["conv2d_wgrad_winograd_finish"], (uint)((9 * kc + DefaultBlockSize - 1) / DefaultBlockSize),
+            (uint)DefaultBlockSize, ra);
         return true;
     }
 

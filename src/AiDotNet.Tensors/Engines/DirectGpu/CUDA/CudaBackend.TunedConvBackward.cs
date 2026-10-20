@@ -83,6 +83,13 @@ public sealed partial class CudaBackend
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f32",
                             TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                             (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradF32(a)) LaunchDwDirect(a); }));
+                    // The same Winograd weight gradient fused into one launch (transforms and output transform in the
+                    // GEMM's block, no U/V/M planes in memory). Faster than the four-launch pipeline on every ResNet-18
+                    // 3x3 layer measured, and than r8v on the 64-channel 32x32 layers.
+                    if (candidates.Count > 0)
+                        candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_fused",
+                            TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
+                            (in TunedConv2DBackwardArgs a) => { if (!TryConv2DBackwardFilterWinogradFused(a)) LaunchDwDirect(a); }));
                     // Winograd F(3x3,4x4): opt-in only (owner decision, #1335), like the F(4x4) input gradient.
                     if (candidates.Count > 0 && CudaDispatchPolicy.ConvWinogradF4)
                         candidates.Add(new CudaTunedKernelCandidate<TunedConv2DBackwardArgs>("nvrtc.conv2d_dw.winograd_f34",
