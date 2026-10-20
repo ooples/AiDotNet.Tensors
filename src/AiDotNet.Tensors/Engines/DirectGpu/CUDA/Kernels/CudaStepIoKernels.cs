@@ -22,8 +22,13 @@ internal static class CudaStepIoKernels
     // Must match StepIoMaxInputs / the StepIoArgs layout in CudaBackend.StepIo.cs.
     public const int MaxInputs = 16;
 
+    // Copies of each slot's copy mask, one per 128-byte line (SIO_MASK_COPIES / SIO_MASK_STRIDE below).
+    public const int MaskCopies = 32, MaskStrideWords = 32;
+
     public static string GetSource() => @"
 #define SIO_MAX 16
+#define SIO_MASK_COPIES 32
+#define SIO_MASK_STRIDE 32   // words: one copy per 128-byte line
 
 struct StepIoArgs
 {
@@ -39,17 +44,41 @@ struct StepIoArgs
     int len[SIO_MAX];                   // the inputs' float counts
     int vector;                         // 1: every address is 16-byte aligned, copy float4 units
     unsigned long long guard;           // device double: the captured update's finiteness guard, or 0
+    unsigned long long masks;           // page-locked uint[2][SIO_MASK_COPIES][SIO_MASK_STRIDE]: slot s's replay copies
+                                        // input i when bit i is set (every copy the same), or 0: all
+    unsigned long long copySrc;         // device floats copied to copyDst every replay (the loss-gradient seed), or 0
+    unsigned long long copyDst;
+    int copyCount;
 };
 
-// grid-stride over every input float; block 0 thread 0 also resolves the learning rate.
+// grid-stride over every input float; block 0 thread 0 also resolves the learning rate. The optional device copy is the
+// plan's per-replay reseed of the loss gradient: a copy node of its own cost a launch and a gap in every replay.
+// An input the host left unchanged since the replay that last copied it is still in its device buffer: the slot's mask
+// (written by the host with the staging) leaves its bit clear and the copy is skipped. Copying a parity network's fixed
+// batch every replay cost the bus time of the whole batch (6.5 us for the LSTM's 66 KB) that a torch loop reusing
+// device tensors never pays. Each block reads its own copy of the mask, on its own line: every block reading one host
+// word serialized the reads (17 blocks: 13.6 us, against 5.0 for the whole copy).
 extern ""C"" __global__ __launch_bounds__(256) void step_io_prologue(StepIoArgs a)
 {
+    __shared__ unsigned int copyMask;
+    if (a.copyCount > 0) {
+        const float* src = (const float*)a.copySrc;
+        float* dst = (float*)a.copyDst;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < a.copyCount; i += gridDim.x * blockDim.x) dst[i] = src[i];
+    }
     unsigned int* state = (unsigned int*)a.state;
     unsigned int slot = state[0] & 1u;
+    if (threadIdx.x == 0)
+        copyMask = a.masks != 0
+            ? ((volatile const unsigned int*)a.masks)[(slot * SIO_MASK_COPIES + blockIdx.x % SIO_MASK_COPIES) * SIO_MASK_STRIDE]
+            : 0xFFFFFFFFu;
+    __syncthreads();
+    const unsigned int mask = copyMask;
     int total = a.start[a.count];
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         int t = 0;
         while (t + 1 < a.count && a.start[t + 1] <= i) t++;
+        if (((mask >> t) & 1u) == 0) continue;
         const float* src = (const float*)(slot ? a.src1[t] : a.src0[t]);
         float* dst = (float*)a.dst[t];
         int k = i - a.start[t];
@@ -92,27 +121,30 @@ struct StepIoResults
 };
 
 // One warp. guard: the gradients' double sum of squares on the device (0: no captured optimizer); reset to zero after
-// it is read, for the next replay's reduction to accumulate onto.
+// it is read, for the next replay's reduction to accumulate onto. One system fence: lane 0's, after the warp barrier
+// that orders every lane's loss writes before it (fences are cumulative), between all of the replay's results and
+// the progress word. A fence per lane before the barrier and another for lane 0's results waited out two round trips
+// to host memory (5.1 us of the parity LSTM's replay).
 extern ""C"" __global__ __launch_bounds__(32) void step_io_epilogue(
     unsigned long long stateAddress, unsigned long long resultsAddress,
     double* __restrict__ guard, const float* __restrict__ loss, int lossCount)
 {
     unsigned int* state = (unsigned int*)stateAddress;
     volatile StepIoResults* results = (volatile StepIoResults*)resultsAddress;
-    unsigned int slot = state[0] & 1u;
+    unsigned int s0 = state[0], s1 = state[1], s2 = state[2];
+    double sum = threadIdx.x == 0 && guard != 0 ? *guard : 0.0;
+    unsigned int slot = s0 & 1u;
     for (int i = threadIdx.x; i < lossCount; i += 32) results->loss[slot][i] = loss[i];
-    // Every lane's loss writes reach the host before lane 0 publishes the progress that says they are there.
-    __threadfence_system();
     __syncwarp();
     if (threadIdx.x == 0) {
-        double sum = guard != 0 ? *guard : 0.0;
         if (guard != 0) *guard = 0.0;
         results->sumSquares[slot] = sum;
-        if (guard != 0 && isfinite(sum)) state[1] += 1u;
-        unsigned int done = state[0] + 1u;
+        unsigned int applied = guard != 0 && isfinite(sum) ? s1 + 1u : s1;
+        unsigned int done = s0 + 1u;
+        state[1] = applied;
         state[0] = done;
-        results->applied = state[1];
-        results->fault = state[2];
+        results->applied = applied;
+        results->fault = s2;
         __threadfence_system();
         results->progress = done;
     }

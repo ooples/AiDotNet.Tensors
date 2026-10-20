@@ -680,9 +680,12 @@ export function createBindGroupRanges(pipelineId, bufferIds, offsets, sizes) {
  * only known at dispatch. A bind group has to match the pipeline's layout exactly, so it cannot be created without it.
  */
 function resolveBindGroup(record, pipeline) {
-    if (!record.resolved || record.resolvedUniform) {
+    // Keyed on the pipeline too: an automatic layout belongs to one pipeline, and a bind group may be dispatched with
+    // its kernel's folded copy (dispatchComputeFolded).
+    if (!record.resolved || record.resolvedUniform || record.resolvedPipeline !== pipeline) {
         record.resolved = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: record.entries });
         record.resolvedUniform = null;
+        record.resolvedPipeline = pipeline;
     }
     return record.resolved;
 }
@@ -698,7 +701,7 @@ function resolveBindGroup(record, pipeline) {
  * at. The one that validates is remembered per pipeline and storage count, so this costs one probe per kernel.
  */
 async function resolveUniformBindGroup(record, pipeline, uniformBuffer) {
-    if (record.resolved && record.resolvedUniform === uniformBuffer) return record.resolved;
+    if (record.resolved && record.resolvedUniform === uniformBuffer && record.resolvedPipeline === pipeline) return record.resolved;
 
     const info = pipelineUniformBindings.get(pipeline) || { declared: [], resolved: new Map() };
     const storageCount = record.entries.length;
@@ -744,6 +747,7 @@ async function resolveUniformBindGroup(record, pipeline, uniformBuffer) {
     }
     record.resolved = group;
     record.resolvedUniform = uniformBuffer;
+    record.resolvedPipeline = pipeline;
     return group;
 }
 
@@ -815,6 +819,94 @@ export async function dispatchComputeWithUniforms(pipelineId, bindGroupId, unifo
     passEncoder.setPipeline(pipeline);
     passEncoder.setBindGroup(0, resolved);
     passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+    passEncoder.end();
+
+    queue.submit([commandEncoder.finish()]);
+}
+
+/**
+ * Dispatches a kernel's folded copy (WebGpuDispatchFold in the C# backend) on a 2-D grid: a 1-D dispatch of more
+ * workgroups than one dimension holds. The folded entry point reads the true workgroup count from a uniform at group 1.
+ * @param {number} pipelineId - The folded pipeline's ID.
+ * @param {number} bindGroupId - Storage bind group ID (group 0).
+ * @param {number} uniformBufferId - The kernel's uniform buffer ID, or -1 for none.
+ * @param {number} groupsBufferId - Uniform buffer holding the true workgroup count (group 1, binding 0).
+ * @param {number} workgroupsX - Workgroups in X.
+ * @param {number} workgroupsY - Workgroups in Y.
+ */
+export async function dispatchComputeFolded(pipelineId, bindGroupId, uniformBufferId, groupsBufferId, workgroupsX, workgroupsY) {
+    if (!device) return;
+
+    const pipeline = pipelines.get(pipelineId);
+    const bindGroup = bindGroups.get(bindGroupId);
+    const groupsBuffer = buffers.get(groupsBufferId);
+    if (!pipeline || !bindGroup || !groupsBuffer) {
+        console.error('dispatchComputeFolded: pipeline, bind group or workgroup-count buffer not found');
+        return;
+    }
+    let storage;
+    if (uniformBufferId >= 0) {
+        const uniformBuffer = buffers.get(uniformBufferId);
+        if (!uniformBuffer) {
+            console.error(`Uniform buffer ${uniformBufferId} not found`);
+            return;
+        }
+        storage = await resolveUniformBindGroup(bindGroup, pipeline, uniformBuffer);
+        if (!storage) return;
+    } else {
+        storage = resolveBindGroup(bindGroup, pipeline);
+    }
+    const groups = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(1),
+        entries: [{ binding: 0, resource: { buffer: groupsBuffer } }]
+    });
+
+    const commandEncoder = device.createCommandEncoder();
+    const passEncoder = commandEncoder.beginComputePass();
+    passEncoder.setPipeline(pipeline);
+    passEncoder.setBindGroup(0, storage);
+    passEncoder.setBindGroup(1, groups);
+    passEncoder.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+    passEncoder.end();
+
+    queue.submit([commandEncoder.finish()]);
+}
+
+/**
+ * Dispatches a chain of compute operations, each with its uniforms, in ONE compute pass of one command encoder,
+ * submitted once (#1452, the resident program). WebGPU orders the dispatches of a pass, with the storage writes of
+ * one visible to the next, so the chain needs no barrier of its own. Every bind group exists before the first
+ * dispatch runs, so none may hold a snapshot of a buffer an earlier dispatch writes (WebGpuBindGroup snapshots a
+ * buffer bound twice).
+ * @param {number[]} pipelineIds - Pipeline ID per dispatch.
+ * @param {number[]} bindGroupIds - Storage bind group ID per dispatch.
+ * @param {number[]} uniformBufferIds - Uniform buffer ID per dispatch.
+ * @param {number[]} workgroupsX - Workgroups in X per dispatch.
+ */
+export async function dispatchComputeChainWithUniforms(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX) {
+    if (!device) return;
+
+    const stages = [];
+    for (let i = 0; i < pipelineIds.length; i++) {
+        const pipeline = pipelines.get(pipelineIds[i]);
+        const bindGroup = bindGroups.get(bindGroupIds[i]);
+        const uniformBuffer = buffers.get(uniformBufferIds[i]);
+        if (!pipeline || !bindGroup || !uniformBuffer) {
+            console.error(`dispatchComputeChainWithUniforms: stage ${i}: pipeline, bind group or uniform buffer not found`);
+            return;
+        }
+        const resolved = await resolveUniformBindGroup(bindGroup, pipeline, uniformBuffer);
+        if (!resolved) return;
+        stages.push({ pipeline: pipeline, group: resolved, workgroups: workgroupsX[i] });
+    }
+
+    const commandEncoder = device.createCommandEncoder();
+    const passEncoder = commandEncoder.beginComputePass();
+    for (const stage of stages) {
+        passEncoder.setPipeline(stage.pipeline);
+        passEncoder.setBindGroup(0, stage.group);
+        passEncoder.dispatchWorkgroups(stage.workgroups, 1, 1);
+    }
     passEncoder.end();
 
     queue.submit([commandEncoder.finish()]);

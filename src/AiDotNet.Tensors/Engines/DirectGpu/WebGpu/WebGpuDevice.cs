@@ -158,6 +158,7 @@ public sealed class WebGpuDevice : IDisposable
                 };
             }
         }
+        WebGpuNativeBindings.MaxWorkgroupsPerDimension = MaxWorkgroupsPerDimension;
 
         return true;
     }
@@ -213,12 +214,13 @@ public sealed class WebGpuDevice : IDisposable
         workgroupSize = Math.Min(workgroupSize, _limits?.MaxComputeWorkgroupSizeX ?? 256);
         int workgroups = (int)(((long)totalWork + workgroupSize - 1) / workgroupSize);
         int limit = _limits?.MaxComputeWorkgroupsPerDimension ?? 65535;
-        // Clamping instead would leave every invocation past the limit unlaunched: these shaders cover one element per
-        // invocation, so the tail of the output would silently keep whatever the buffer held. The work does not fit
-        // one dispatch on this device, a missing capability the engine answers by taking another route.
-        if (workgroups > limit)
+        // Past the per-dimension limit the dispatch folds onto a 2-D grid (WebGpuNativeBindings, WebGpuDispatchFold),
+        // which holds limit x limit workgroups. Clamping instead would leave every invocation past the limit
+        // unlaunched: these shaders cover one element per invocation, so the tail of the output would silently keep
+        // whatever the buffer held. Work past the folded grid is a missing capability the engine routes around.
+        if ((long)workgroups > (long)limit * limit)
             throw new GpuCapabilityUnavailableException(
-                $"{totalWork} work items need {workgroups} workgroups of {workgroupSize}; this device dispatches at most {limit} per dimension.");
+                $"{totalWork} work items need {workgroups} workgroups of {workgroupSize}; this device dispatches at most {limit} x {limit}.");
 
         return (workgroups, workgroupSize);
     }

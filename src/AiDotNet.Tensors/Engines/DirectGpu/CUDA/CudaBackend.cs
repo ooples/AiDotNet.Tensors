@@ -2395,6 +2395,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         float betaVal = beta;
 
         // Row-major C = A * B. Use cuBLAS column-major trick: C^T = B^T * A^T.
+        // cuBLASLt first: its candidates are timed per problem (CuBlasLtMatmul), where the classic handle's heuristic
+        // ran these layouts as split-K plus a separate reduction kernel, and it takes this thread's workspace
+        // explicitly instead of allocating inside a graph capture.
+        if (TryLtMatmulColumnMajor(transA: false, transB: false, N, M, K, B.Handle, N, A.Handle, K, C.Handle, N, alpha, beta))
+            return;
         BlasSgemm(
                 CublasOperation.None,
                 CublasOperation.None,
@@ -2436,6 +2441,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         //   m_cu=N, n_cu=M, k_cu=K, ldA=K, ldB=K, ldC=N.
         // Earlier version had the transpose flags swapped — produced
         // wrong results for any non-square input.
+        // cuBLASLt first, as in CublasGemm.
+        if (TryLtMatmulColumnMajor(transA: true, transB: false, N, M, K, B.Handle, K, A.Handle, K, C.Handle, N, alpha, beta))
+            return;
         BlasSgemm(
                 CublasOperation.Transpose,   // op(my B) — transposed, becomes N×K
                 CublasOperation.None,        // op(my A) — no transpose, stays K×M
@@ -3129,7 +3137,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private bool TryLtMatmulColumnMajor(bool transA, bool transB, int m, int n, int k,
         IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
     {
-        if (!CurrentCublasHasWorkspace) return false;
+        // cuBLASLt is part of cuBLAS: a caller that opted out of it (TensorCodecOptions.UseCublas) gets the generated kernels.
+        if (!UsesCublas || !CurrentCublasHasWorkspace) return false;
         var lt = TryGetCuBlasLt();
         if (lt is null || _threadCublas?.Value?.Workspace is not { } workspace) return false;
         // The classic handle's fp32 mode: TF32 tensor cores where the init chose them (Ampere+) unless determinism
@@ -3154,7 +3163,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             try
             {
                 if (!CuBlasLtMatmul.IsAvailable) { _cublasLtUnavailable = true; return null; }
-                _cublasLt = new CuBlasLtMatmul();
+                // The device identity turns on its measured, recorded algorithm choice (CuBlasLtMatmul.DeviceIdentity).
+                _cublasLt = new CuBlasLtMatmul { DeviceIdentity = $"{DeviceName}-sm{_ccMajor}{_ccMinor}" };
                 return _cublasLt;
             }
             catch
@@ -14063,7 +14073,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     /// <summary>
     /// The table of one ping-pong SGD direction (sgd_pingpong_update): each tensor's source weights, destination
-    /// weights and gradient, in <see cref="GradientTableChunk"/>-element chunks. The caller owns it.
+    /// weights and gradient, in <see cref="PingPongChunk"/>-element chunks. The caller owns it.
     /// </summary>
     private MultiTensorTable BuildPingPongTable(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations,
         IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes)
@@ -14085,7 +14095,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             handles[n + t] = destinations[t].Handle;
             handles[2 * n + t] = gradients[t].Handle;
             sizeArray[t] = size;
-            totalChunks += (size + GradientTableChunk - 1) / GradientTableChunk;
+            totalChunks += (size + PingPongChunk - 1) / PingPongChunk;
         }
         for (int i = 0; i < handles.Length; i++)
             WriteAddress(addresses, i, handles[i]);
@@ -14094,8 +14104,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int c = 0;
         for (int t = 0; t < n; t++)
         {
-            int chunks = (sizeArray[t] + GradientTableChunk - 1) / GradientTableChunk;
-            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * GradientTableChunk; c++; }
+            int chunks = (sizeArray[t] + PingPongChunk - 1) / PingPongChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * PingPongChunk; c++; }
         }
         var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
         try
@@ -14117,10 +14127,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return table;
     }
 
+    // Elements per ping-pong chunk (PP_CHUNK); the update kernel's grid strides over the chunks with at most this many
+    // blocks per SM, which bounds its partials and its tickets on one counter.
+    private const int PingPongChunk = 1024;
+    private const int PingPongBlocksPerSm = 4;
+
     /// <summary>
     /// One ping-pong SGD step over <paramref name="table"/> (see sgd_pingpong_update): the updated weights to the
-    /// destinations, the gradients' sum of squares onto <paramref name="guard"/> (a double). <paramref name="partials"/>
-    /// holds a double per chunk; <paramref name="done"/> is a zeroed counter the kernel leaves zeroed.
+    /// destinations, the gradients' sum of squares onto <paramref name="guard"/> (a double), and the undo of a step whose
+    /// guard is then not finite. <paramref name="partials"/> holds a double per block (at least one per chunk is
+    /// allocated); <paramref name="done"/> is a zeroed counter the kernel leaves zeroed.
     /// </summary>
     private unsafe void SgdPingPongUpdate(MultiTensorTable table, float weightDecay, IntPtr dynamicScalars,
         IGpuBuffer partials, IGpuBuffer done, IntPtr guard)
@@ -14136,22 +14152,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         void** args = stackalloc void*[11];
         args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &n; args[5] = &totalChunks;
         args[6] = &weightDecay; args[7] = &dynamicScalars; args[8] = &partialsH; args[9] = &doneH; args[10] = &guard;
-        LaunchKernel(kernel, (uint)totalChunks, MultiTensorChunk, args);
-    }
-
-    /// <summary>Copies every source over its destination in <paramref name="table"/> when *<paramref name="guard"/> is not finite.</summary>
-    private unsafe void SgdPingPongRevert(MultiTensorTable table, IntPtr guard)
-    {
-        if (table.TotalChunks == 0) return;
-        if (!_kernelCache.TryGetValue("sgd_pingpong_revert", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: sgd_pingpong_revert");
-        using var _ = PushContext();
-        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
-        int n = table.Sizes.Length, totalChunks = table.TotalChunks;
-        void** args = stackalloc void*[7];
-        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &n; args[5] = &totalChunks; args[6] = &guard;
-        // Every block returns at once on a finite step: a small grid keeps that cheap.
-        uint blocks = (uint)Math.Min(totalChunks, 2 * Math.Max(1, _multiProcessorCount));
+        uint blocks = (uint)Math.Min(totalChunks, PingPongBlocksPerSm * Math.Max(1, _multiProcessorCount));
         LaunchKernel(kernel, blocks, MultiTensorChunk, args);
     }
 
@@ -18568,6 +18569,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CudaNativeBindings.cuStreamDestroy(_mainStream);
                 _mainStream = IntPtr.Zero;
             }
+        }
+
+        if (_residentRowsModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_residentRowsModule);
+            _residentRowsModule = IntPtr.Zero;
+        }
+        if (_residentProgramModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_residentProgramModule);
+            _residentProgramModule = IntPtr.Zero;
+            _residentProgramBlocksPerSm = 0;
         }
 
         if (_convolutionModule != IntPtr.Zero)

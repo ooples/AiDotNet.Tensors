@@ -675,21 +675,11 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         };
         using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
-        // Compute total in long to catch overflow, then cap-check against
-        // the device's 1D dispatch capacity (max workgroups × workgroup
-        // size of 256). Without this, large matrices would silently drop
-        // tail items or attempt to dispatch an out-of-range workgroup
-        // count. A real impl would route oversize problems through a
-        // tiled fallback; we fail fast for now.
+        // One invocation per output. Past 65,535 workgroups the dispatch folds onto a 2-D grid (WebGpuDispatchFold),
+        // so the bound is the element count as an int.
         long total = (long)M * N;
-        const long workgroupSize = 256;
-        const long maxWorkgroupsPerDim = 65535;
-        long maxItems = maxWorkgroupsPerDim * workgroupSize;
-        if (total <= 0 || total > maxItems)
-            throw new ArgumentOutOfRangeException(
-                nameof(M),
-                $"MatMulTransposedAsync: M*N = {total} exceeds the 1D dispatch capacity of {maxItems}. " +
-                "A tiled fallback is required for matrices this large.");
+        if (total <= 0 || total > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(M), $"MatMulTransposedAsync: M*N = {total} must be in 1 .. {int.MaxValue}.");
         var (wg, _) = _device.CalculateWorkgroups1D((int)total);
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, wg, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -717,15 +707,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         };
         using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer, cBuffer);
-        long total = (long)M * N;
-        const long workgroupSize = 256;
-        const long maxWorkgroupsPerDim = 65535;
-        long maxItems = maxWorkgroupsPerDim * workgroupSize;
-        if (total <= 0 || total > maxItems)
-            throw new ArgumentOutOfRangeException(
-                nameof(M),
-                $"MatMulLhsTransposedAsync: M*N = {total} exceeds the 1D dispatch capacity of {maxItems}. " +
-                "A tiled fallback is required for matrices this large.");
+        long total = (long)M * N;   // past 65,535 workgroups the dispatch folds (WebGpuDispatchFold)
+        if (total <= 0 || total > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(M), $"MatMulLhsTransposedAsync: M*N = {total} must be in 1 .. {int.MaxValue}.");
         var (wg, _) = _device.CalculateWorkgroups1D((int)total);
         await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, wg, 1, 1);
         await WebGpuNativeBindings.SubmitAndWaitAsync();
@@ -1224,6 +1208,8 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         _disposed = true;
         _sharedDummyBuffer?.Dispose();
         _sharedDummyBuffer = null;
+        _residentUnusedOperand?.Dispose();
+        _residentUnusedOperand = null;
         DisposeTunedKernelResources();
 
         // Dispose cached complex scratch buffers

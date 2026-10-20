@@ -444,6 +444,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>Test hook: the next capture attempt runs the pre-pass and then fails, like a capture-unsafe op.</summary>
     internal bool FailNextCaptureForTesting { get; set; }
 
+    /// <summary>
+    /// Test hook: runs once per step-I/O replay after its copy mask is submitted and before the graph launches, with the
+    /// staging slot the replay reads and the mask. Writing a clear-bit input's staging here cannot change what the replay
+    /// trains on unless the prologue copies inputs the mask left out.
+    /// </summary>
+    internal Action<Engines.DirectGpu.IGraphStepIo, int, uint>? AfterStepIoMaskForTesting { get; set; }
+
     /// <summary>Test hook: the next capture fails from INSIDE the captured body, after its forward and backward ran.</summary>
     internal bool FailInsideNextCaptureForTesting { get; set; }
 
@@ -617,7 +624,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private Tensor<T>[]? _stepIoLeaves;
     private Engines.DirectGpu.IGpuBuffer[]? _stepIoBuffers;
     private uint _stepIoLaunched;   // replays launched (the device counts the same replays)
+    // Per step-I/O input: the staging slot the last replay that copied it read (what its device buffer holds), or -1.
+    // A later replay whose host contents match that slot byte for byte skips the copy.
+    private int[]? _stepIoCopiedSlot;
+    // Per step-I/O input: its storage version when its device buffer last matched it (copied or compared equal);
+    // int.MinValue before the first copy.
+    private int[]? _stepIoCopiedVersion;
+
+    /// <summary>Step-I/O input copies replays have skipped because the input was unchanged (tests).</summary>
+    internal long StepIoInputCopiesSkipped { get; private set; }
+
+    /// <summary>Of those, the device-resident inputs skipped on an unchanged storage version alone (tests).</summary>
+    internal long StepIoResidentCopiesSkipped { get; private set; }
     private bool _stepIoLossCaptured;   // the epilogue publishes the loss
+    // The loss-gradient reseed (seed -> destination) the graph being captured makes in its step I/O prologue instead of
+    // a copy node: the buffers handed to IGraphStepIo.TrySetPrologueCopy, or null.
+    private Engines.DirectGpu.IGpuBuffer? _prologueSeedSource, _prologueSeedDestination;
 
     /// <summary>
     /// The optimizer update recorded into the step graph after the backward. It reads its learning rate (and Adam's step
@@ -706,6 +728,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _stepIoLeaves = leaves.ToArray();
         _stepIoBuffers = buffers.ToArray();
         _stepIoLaunched = 0;
+        _stepIoCopiedSlot = Enumerable.Repeat(-1, leaves.Count).ToArray();
+        _stepIoCopiedVersion = Enumerable.Repeat(int.MinValue, leaves.Count).ToArray();
         return io;
     }
 
@@ -722,7 +746,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     /// <summary>
     /// Launches the next replay through the step I/O: fills its staging slot (once the replay that last read it has
-    /// completed) with each input's current host contents, then launches the graph.
+    /// completed) with the host contents of each input that changed since the replay that last copied it, then launches
+    /// the graph. An input whose host contents equal, byte for byte, the staging its device buffer was last copied from
+    /// is left out of the replay's copy mask: the buffer already holds it. (Content, not a version: a write through a
+    /// host span advances neither the storage's GPU-cache epoch nor its device-valid flag.) The comparison reads what
+    /// the copy into the staging would have; the device buffers are written only by these copies, or by uploads of the
+    /// same host contents.
+    /// <para>A device-resident input whose storage version has not moved since its buffer last matched it skips the
+    /// comparison as well: its graph buffer is its own storage, and every write that changes a resident tensor bumps
+    /// the version (SetInputs bumps it after its unmarked copy). That makes the common parity loop - a batch uploaded
+    /// once - cost one integer compare per input instead of a host read of the whole batch.</para>
     /// </summary>
     private unsafe void LaunchStepGraphWithStepIo(Engines.DirectGpu.IGpuGraphCapture cb, IntPtr exec)
     {
@@ -730,16 +763,39 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         uint replay = _stepIoLaunched;
         if (replay >= 2) io.WaitForReplays(replay - 1);   // slot replay % 2 was last read by replay - 2
         var leaves = _stepIoLeaves!;
+        var copiedSlot = _stepIoCopiedSlot!;
+        var copiedVersion = _stepIoCopiedVersion!;
+        int slot = (int)(replay & 1);
+        uint copyMask = 0;
         for (int i = 0; i < leaves.Length; i++)
         {
             var leaf = leaves[i];
+            int version = leaf.GpuCacheVersion;
+            if (leaf.IsGpuResident && copiedSlot[i] >= 0 && copiedVersion[i] == version)
+            {
+                StepIoInputCopiesSkipped++;
+                StepIoResidentCopiesSkipped++;
+                leaf._gpuBufferVersion = version;
+                continue;
+            }
+            copiedVersion[i] = version;
             using var lease = leaf.LeaseArray();
-            var data = (float[])(object)lease.Array;
-            int count = io.InputLength(i);
-            fixed (float* src = data)
-                Buffer.MemoryCopy(src, (void*)io.InputStaging(i, (int)(replay & 1)), (long)count * sizeof(float), (long)count * sizeof(float));
+            var data = new ReadOnlySpan<float>((float[])(object)lease.Array, 0, io.InputLength(i));
+            int last = copiedSlot[i];
+            bool unchanged = last >= 0
+                && System.Runtime.InteropServices.MemoryMarshal.AsBytes(data).SequenceEqual(
+                    new ReadOnlySpan<byte>((void*)io.InputStaging(i, last), data.Length * sizeof(float)));
+            if (!unchanged)
+            {
+                data.CopyTo(new Span<float>((void*)io.InputStaging(i, slot), data.Length));
+                copyMask |= 1u << i;
+                copiedSlot[i] = slot;
+            }
+            else StepIoInputCopiesSkipped++;
             leaf._gpuBufferVersion = leaf.GpuCacheVersion;
         }
+        io.SetInputsToCopy(replay, copyMask);
+        AfterStepIoMaskForTesting?.Invoke(io, slot, copyMask);
         if (_capturedOptimizer is { } optimizer)
         {
             // The device's applied count when this replay runs is between what the last completed replay published
@@ -1794,6 +1850,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var srcKeep1 = new KeepAliveScope(src);
         using var dstKeep1 = new KeepAliveScope(dst);
         src.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
+        // The unmarked span does not advance the version, and the step I/O skips re-staging a device-resident input whose
+        // version it has already matched - so without this bump a replay after a new SetInputs trains on the previous input.
+        dst.IncrementVersion();
     }
 
     internal void SetInput(Tensor<T> input)
@@ -1811,6 +1870,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         using var inputKeep1 = new KeepAliveScope(input);
         using var dstKeep2 = new KeepAliveScope(dst);
         input.AsSpanUnmarked().CopyTo(dst.AsWritableSpanUnmarked());
+        dst.IncrementVersion();   // see SetInputs: the step I/O skips a resident input whose version has not moved
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
@@ -3737,6 +3797,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>One step graph's capture body: the step I/O prologue, the step, the captured update, the epilogue.</summary>
     private void CaptureStepGraphBody(Engines.DirectGpu.IGpuGraphCapture cb, int parity)
     {
+        _prologueSeedSource = _prologueSeedDestination = null;
+        if (_stepIo is { } prologueIo)
+        {
+            // The loss-gradient reseed rides in the prologue when both buffers are already device-bound (the uncaptured
+            // pre-pass binds them); RunGpuStepBody then records no copy for it.
+            if (typeof(T) == typeof(float) && _lossGradSeed.TryGetGpuBuffer() is { } seed
+                && _lossGradDest?.TryGetGpuBuffer() is { } dest
+                && prologueIo.TrySetPrologueCopy(seed, dest, _lossGradSeed.Length))
+            {
+                _prologueSeedSource = seed;
+                _prologueSeedDestination = dest;
+            }
+            else prologueIo.TrySetPrologueCopy(null, null, 0);
+        }
         _stepIo?.CapturePrologue(parity);
         RunGpuStepBodyForCapture((Engines.DirectGpu.IDirectGpuBackend)cb);
         if (_capturedOptimizer is { } optimizer && _stepIo is { } io)
@@ -3923,8 +3997,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
         {
-            if (cb is Engines.DirectGpu.IFp16ActivationBackend rawCopy) rawCopy.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
-            else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
+            // A graph being captured with the reseed in its step I/O prologue (CaptureStepGraphBody) records no copy.
+            bool inPrologue = capturingNow && ReferenceEquals(seedBuf, _prologueSeedSource)
+                && ReferenceEquals(destBuf, _prologueSeedDestination);
+            if (!inPrologue)
+            {
+                if (cb is Engines.DirectGpu.IFp16ActivationBackend rawCopy) rawCopy.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
+                else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
+            }
             residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, backend);
             if (_lossGradDest is { } seededDestination)
                 seededDestination._gradWriteGeneration = gradWriteGeneration;   // the seed is its first write
