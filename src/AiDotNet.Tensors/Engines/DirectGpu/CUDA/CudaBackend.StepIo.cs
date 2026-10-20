@@ -73,6 +73,7 @@ public sealed partial class CudaBackend
         public fixed int Len[StepIoMaxInputs];
         public int Vector;
         public ulong Guard;
+        public ulong Masks;
         public ulong CopySrc;
         public ulong CopyDst;
         public int CopyCount;
@@ -94,6 +95,9 @@ public sealed partial class CudaBackend
         private readonly IntPtr[] _staging;   // [input * 2 + slot], host addresses
         private readonly IntPtr[] _stagingDevice;
         private IntPtr _results;              // page-locked StepIoResults
+        private IntPtr _masks;                // page-locked uint[2][MaskCopies][MaskStrideWords]: each slot's copy mask
+        private const int MaskWords = 2 * Kernels.CudaStepIoKernels.MaskCopies * Kernels.CudaStepIoKernels.MaskStrideWords;
+        private IntPtr _masksDevice;
         private IntPtr _resultsDevice;
         private IGpuBuffer? _state;           // device uint[4]: replays, applied, fault, unused
         private IntPtr[] _lrTable = new IntPtr[2];        // page-locked [first step, n, rates...] per slot
@@ -141,6 +145,10 @@ public sealed partial class CudaBackend
                 new Span<byte>((void*)_results, StepIoResultsBytes).Clear();
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemHostGetDevicePointer(out _resultsDevice, _results, 0),
                     "cuMemHostGetDevicePointer(step io results)");
+                CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAllocHost(out _masks, MaskWords * sizeof(uint)), "cuMemAllocHost(step io masks)");
+                new Span<uint>((void*)_masks, MaskWords).Fill(uint.MaxValue);
+                CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemHostGetDevicePointer(out _masksDevice, _masks, 0),
+                    "cuMemHostGetDevicePointer(step io masks)");
                 _state = backend.AllocateBuffer(4);
                 ((IDeviceZeroFill)backend).ZeroBuffer(_state, 4);
             }
@@ -156,6 +164,15 @@ public sealed partial class CudaBackend
         public int InputLength(int input) => _lengths[input];
 
         public IntPtr InputStaging(int input, int slot) => _staging[2 * input + (slot & 1)];
+
+        public void SetInputsToCopy(uint replay, uint mask)
+        {
+            if (_masks == IntPtr.Zero) throw new ObjectDisposedException(nameof(CudaGraphStepIo));
+            const int copies = Kernels.CudaStepIoKernels.MaskCopies, stride = Kernels.CudaStepIoKernels.MaskStrideWords;
+            uint* slot = (uint*)_masks + (replay & 1) * copies * stride;
+            if (Volatile.Read(ref slot[0]) == mask) return;
+            for (int c = 0; c < copies; c++) Volatile.Write(ref slot[c * stride], mask);
+        }
 
         public uint CompletedReplays
         {
@@ -362,6 +379,7 @@ public sealed partial class CudaBackend
             args.Start[_inputs.Length] = total;
             args.Count = _inputs.Length;
             args.State = (ulong)_state!.Handle.ToInt64();
+            args.Masks = (ulong)_masksDevice.ToInt64();
             if (_dynamicScalars is not null)
             {
                 args.LrTable0 = (ulong)_lrTableDevice[0].ToInt64();
@@ -421,6 +439,8 @@ public sealed partial class CudaBackend
             DisposePingPong();
             if (_results != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_results);
             _results = IntPtr.Zero;
+            if (_masks != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_masks);
+            _masks = IntPtr.Zero;
             _state?.Dispose();
             _state = null;
         }
