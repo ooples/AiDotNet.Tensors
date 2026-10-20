@@ -95,7 +95,7 @@ public sealed partial class CudaBackend
             if (groups <= 0) groups = g;
             if (splits <= 0) splits = s;
         }
-        if (!_kernelCache.TryGetValue("conv2d_dgrad_s2k3_g" + groups, out var kernel)) return false;
+        if (!_kernelCache.TryGetValue(Kernels.CudaConvDgradS2Kernels.KernelName(groups), out var kernel)) return false;
         int coSteps = (k + CoTile - 1) / CoTile;
         int coPerSplit = (coSteps + splits - 1) / splits * CoTile;
         splits = (k + coPerSplit - 1) / coPerSplit;

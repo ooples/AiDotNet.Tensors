@@ -230,5 +230,10 @@ S2_ENTRY(2)
 S2_ENTRY(4)
 ";
 
-    public static string[] GetKernelNames() => new[] { "conv2d_dgrad_s2k3_g1", "conv2d_dgrad_s2k3_g2", "conv2d_dgrad_s2k3_g4" };
+    /// <summary>The in-block output-channel group counts compiled.</summary>
+    internal static readonly int[] Groups = { 1, 2, 4 };
+
+    public static string[] GetKernelNames() => System.Array.ConvertAll(Groups, KernelName);
+
+    internal static string KernelName(int groups) => $"conv2d_dgrad_s2k3_g{groups}";
 }
