@@ -33,7 +33,11 @@ internal static class CudaConvWinogradFusedKernels
 // 180 degrees. Warps 8-15 load and transform each step's 8 x 32 (r, o) filters themselves (U = G g G^T): no separate
 // transform launch, and 9 floats read per filter instead of a pre-transformed U's 16 written and re-read (on 512@4x4
 // that U was 16.8 MB, past L2; measured: dX 512@4 82 -> 39 us, 256@8 47.5 -> 34.7 us).
-template <int WMODE>
+// PAIR (host: tilesW even, so tiles 2k and 2k+1 of a block are horizontal neighbours in one image row): threads 0-127
+// each load one 4 x 6 window covering two adjacent tiles' 4 x 4 patches (24 loads instead of 32; columns 2-3 are both
+// tiles') and share its column transforms (6 instead of 8); the row transforms are per tile, as before, so V is
+// bit-identical to the one-tile loader's.
+template <int WMODE, bool PAIR = false>
 __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, const float* __restrict__ wt,
     float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW,
     int rPerSplit)
@@ -52,11 +56,14 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
     // partial output slice; with one split the slice is the output itself.
     const int rBegin = blockIdx.z * rPerSplit, rEnd = min(R, rBegin + rPerSplit);
 
-    const bool patchLoader = tid < 256;
-    const int lp = tid & 31, lc = (tid >> 5) & 7;
+    const bool patchLoader = PAIR ? tid < 128 : tid < 256;
+    const bool filterLoader = tid >= 256;   // PAIR leaves threads 128-255 without a loader role
+    const int lp = PAIR ? (tid & 15) * 2 : tid & 31, lc = PAIR ? (tid >> 4) & 7 : (tid >> 5) & 7;
     const int gp = p0 + lp;
-    // pm bit i*4+j: element (i, j) of this thread's 4x4 patch lies inside the image (fixed for the whole reduction,
-    // so each step's loads test one bit instead of recomputing the bounds).
+    constexpr int WC = PAIR ? 6 : 4;   // window columns
+    // pm bit i*WC+j: element (i, j) of this thread's window lies inside the image (fixed for the whole reduction, so
+    // each step's loads test one bit instead of recomputing the bounds). PAIR: gp is even and P is even (tilesW even),
+    // so the pair's second tile is inside exactly when the first is.
     unsigned pm = 0;
     long long inOff = 0;
     if (patchLoader && gp < P)
@@ -67,8 +74,8 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
         #pragma unroll
         for (int i = 0; i < 4; i++)
             #pragma unroll
-            for (int j = 0; j < 4; j++)
-                if (h0 + i >= 0 && h0 + i < IH && w0 + j >= 0 && w0 + j < IW) pm |= 1u << (i * 4 + j);
+            for (int j = 0; j < WC; j++)
+                if (h0 + i >= 0 && h0 + i < IH && w0 + j >= 0 && w0 + j < IW) pm |= 1u << (i * WC + j);
         inOff = (long long)n * R * IH * IW + (long long)h0 * IW + w0;
     }
     const long long chanStride = (long long)IH * IW;
@@ -86,7 +93,7 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
     // layout (8 consecutive r are 72 contiguous floats) and along o for the input-gradient layout.
     const int ft = tid - 256;
     const int fr = WMODE == 1 ? (ft & 7) : (ft >> 5), fo = WMODE == 1 ? (ft >> 3) : (ft & 31);
-    float d[16], wv[9];
+    float d[4 * WC], wv[9];
     auto load = [&](int r0)
     {
         const int r = r0 + lc;
@@ -101,10 +108,10 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
             {
                 const float* row = src + i * IW;
                 #pragma unroll
-                for (int j = 0; j < 4; j++) d[i * 4 + j] = ((m >> (i * 4 + j)) & 1u) ? __ldg(row + j) : 0.0f;
+                for (int j = 0; j < WC; j++) d[i * WC + j] = ((m >> (i * WC + j)) & 1u) ? __ldg(row + j) : 0.0f;
             }
         }
-        if (!patchLoader)
+        if (filterLoader)
         {
             const int wr = r0 + fr, wo = o0 + fo;
             const bool wvOk = wr < rEnd && wo < O;
@@ -127,27 +134,33 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
     {
         if (patchLoader)
         {
-            // V = B^T d B, B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]].
-            float t[4][4];
+            // V = B^T d B, B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]]: the column transforms over the window,
+            // then each tile's row transforms (PAIR: tile lp + 1 reads window columns 2-5).
+            float t[4][WC];
             #pragma unroll
-            for (int j = 0; j < 4; j++)
+            for (int j = 0; j < WC; j++)
             {
-                t[0][j] = d[0 * 4 + j] - d[2 * 4 + j];
-                t[1][j] = d[1 * 4 + j] + d[2 * 4 + j];
-                t[2][j] = d[2 * 4 + j] - d[1 * 4 + j];
-                t[3][j] = d[1 * 4 + j] - d[3 * 4 + j];
+                t[0][j] = d[0 * WC + j] - d[2 * WC + j];
+                t[1][j] = d[1 * WC + j] + d[2 * WC + j];
+                t[2][j] = d[2 * WC + j] - d[1 * WC + j];
+                t[3][j] = d[1 * WC + j] - d[3 * WC + j];
             }
-            float* v = vs + lc * 32 + lp;
             #pragma unroll
-            for (int i = 0; i < 4; i++)
+            for (int k = 0; k < (PAIR ? 2 : 1); k++)
             {
-                v[(i * 4 + 0) * WFZ_CK * 32] = t[i][0] - t[i][2];
-                v[(i * 4 + 1) * WFZ_CK * 32] = t[i][1] + t[i][2];
-                v[(i * 4 + 2) * WFZ_CK * 32] = t[i][2] - t[i][1];
-                v[(i * 4 + 3) * WFZ_CK * 32] = t[i][1] - t[i][3];
+                float* v = vs + lc * 32 + lp + k;
+                const int c = 2 * k;
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                {
+                    v[(i * 4 + 0) * WFZ_CK * 32] = t[i][c + 0] - t[i][c + 2];
+                    v[(i * 4 + 1) * WFZ_CK * 32] = t[i][c + 1] + t[i][c + 2];
+                    v[(i * 4 + 2) * WFZ_CK * 32] = t[i][c + 2] - t[i][c + 1];
+                    v[(i * 4 + 3) * WFZ_CK * 32] = t[i][c + 1] - t[i][c + 3];
+                }
             }
         }
-        if (!patchLoader)
+        if (filterLoader)
         {
             // U = G g G^T, G = [[1,0,0],[1/2,1/2,1/2],[1/2,-1/2,1/2],[0,0,1]], the unfused path's filter transform.
             float g[3][3];
@@ -247,14 +260,16 @@ __device__ __forceinline__ void wfz_conv_body(const float* __restrict__ in, cons
     }
 }
 
-#define WFZ_ENTRY(NAME, MODE) \
+#define WFZ_ENTRY(NAME, MODE, PAIR) \
 extern ""C"" __global__ __launch_bounds__(512, 1) void NAME(const float* __restrict__ in, const float* __restrict__ wt, \
     float* __restrict__ out, int N, int R, int IH, int IW, int O, int OH, int OW, int pad, int tilesH, int tilesW, \
     int rPerSplit) \
-{ wfz_conv_body<MODE>(in, wt, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW, rPerSplit); }
-WFZ_ENTRY(wfz_conv_w, 1)
-WFZ_ENTRY(wfz_conv_wf, 2)
+{ wfz_conv_body<MODE, PAIR>(in, wt, out, N, R, IH, IW, O, OH, OW, pad, tilesH, tilesW, rPerSplit); }
+WFZ_ENTRY(wfz_conv_w, 1, false)
+WFZ_ENTRY(wfz_conv_wf, 2, false)
+WFZ_ENTRY(wfz_conv_w_pair, 1, true)
+WFZ_ENTRY(wfz_conv_wf_pair, 2, true)
 ";
 
-    public static string[] GetKernelNames() => new[] { "wfz_conv_w", "wfz_conv_wf" };
+    public static string[] GetKernelNames() => new[] { "wfz_conv_w", "wfz_conv_wf", "wfz_conv_w_pair", "wfz_conv_wf_pair" };
 }
