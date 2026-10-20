@@ -408,6 +408,22 @@ internal static class KernelConveyorTool
     /// looking up by the spec name silently found nothing, so those kernels ran the
     /// modelled lowering while the cache said they had been tuned.
     /// </param>
+    /// <summary>Implicit-GEMM tile tokens of the split winners ("m128n64"): no 'x', which the chunk factor uses.</summary>
+    internal static readonly string[] ImplicitSplitTiles = { "m64n64", "m96n64", "m128n64" };
+
+    /// <summary>Configures an emitter for an implicit-GEMM tile token such as "m128n64".</summary>
+    internal static void ApplyImplicitTile(PtxAffineEmitter emitter, string token)
+    {
+        int n = token.IndexOf('n');
+        if (!token.StartsWith("m", StringComparison.Ordinal) || n < 2 ||
+            !int.TryParse(token.Substring(1, n - 1), NumberStyles.None, CultureInfo.InvariantCulture, out int m) ||
+            !int.TryParse(token.Substring(n + 1), NumberStyles.None, CultureInfo.InvariantCulture, out int nEdge))
+            throw new ArgumentException("Not an implicit-GEMM tile token: '" + token + "'.", nameof(token));
+        emitter.ImplicitGemm = true;
+        emitter.ImplicitGemmTile = nEdge;
+        emitter.ImplicitGemmTileM = m;
+    }
+
     internal static void ApplyTuned(
         PtxAffineEmitter emitter, string kernelName, string? winner)
     {
@@ -691,16 +707,22 @@ internal static class KernelConveyorTool
 
         bool tiledSplit = winner is not null &&
             winner.StartsWith("tiled-split:", StringComparison.Ordinal);
+        bool implicitSplit = winner is not null &&
+            winner.StartsWith("ig-chunked-split:", StringComparison.Ordinal);
         bool tiledChunkedSplit = winner is not null &&
             winner.StartsWith("tiled-chunked-split:", StringComparison.Ordinal);
         if (winner is not null &&
             (winner.StartsWith("split:", StringComparison.Ordinal) || tiledSplit ||
-             tiledChunkedSplit))
+             tiledChunkedSplit || implicitSplit))
         {
             CodegenSplitPlan? plan = null;
             try
             {
-                if (tiledChunkedSplit)
+                if (implicitSplit)
+                    plan = TryParseChunkFactor(winner, out int implicitFactor)
+                        ? CodegenSplitReduction.TryPlanChunkedForTiles(spec, implicitFactor)
+                        : null;
+                else if (tiledChunkedSplit)
                     plan = TryParseChunkFactor(winner, out int chunkFactor)
                         ? CodegenSplitReduction.TryPlanChunked(spec, chunkFactor)
                         : null;
@@ -733,6 +755,8 @@ internal static class KernelConveyorTool
                 else
                 {
                     var partial = new PtxAffineEmitter();
+                    // ig-chunked-split winners lower the partial pass as an implicit GEMM; the tile is the last field.
+                    if (implicitSplit) ApplyImplicitTile(partial, winner.Substring(winner.LastIndexOf(':') + 1));
                     try
                     {
                         string text = partial.Emit(plan.Partial,

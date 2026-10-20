@@ -674,6 +674,30 @@ internal static class KernelAutotuneTool
             }
         }
 
+        // Split reductions whose partial pass is an implicit GEMM: the promoted reduction axis becomes a batch
+        // slice, which adds blocks where the output alone leaves the last wave mostly empty.
+        foreach (string implicitTile in KernelConveyorTool.ImplicitSplitTiles)
+        {
+            foreach (int chunkFactor in CodegenAutotuneIdentity.ChunkedSplitFactors)
+            {
+                using CandidateProgram? split = TryCreateSplit(
+                    runtime, spec, tiledPartial: false, chunkFactor: chunkFactor, implicitTile: implicitTile);
+                if (split is null || !CandidateEnabled(candidateSelector, split.Name)) continue;
+
+                split.Launch();
+                runtime.Synchronize();
+                if (!Agrees(split.ReadOutput(), reference, out double deviation))
+                {
+                    Console.WriteLine("    candidate '" + split.Name + "' disagrees by " +
+                                      deviation.ToString("E3", CultureInfo.InvariantCulture) +
+                                      " relative; rejected");
+                    continue;
+                }
+
+                Consider(runtime, modelled, split, workUnits, state);
+            }
+        }
+
         foreach (int chunkFactor in CodegenAutotuneIdentity.ChunkedSplitFactors)
         {
             foreach (CodegenTiledOuterProductSchedule outerSchedule in
@@ -733,7 +757,8 @@ internal static class KernelAutotuneTool
             string.Equals(selector, "library-bwd-input-direct", StringComparison.OrdinalIgnoreCase) ||
             selector.StartsWith("split:", StringComparison.OrdinalIgnoreCase) ||
             selector.StartsWith("tiled-split:", StringComparison.OrdinalIgnoreCase) ||
-            selector.StartsWith("tiled-chunked-split:", StringComparison.OrdinalIgnoreCase))
+            selector.StartsWith("tiled-chunked-split:", StringComparison.OrdinalIgnoreCase) ||
+            selector.StartsWith("ig-chunked-split:", StringComparison.OrdinalIgnoreCase))
             return;
 
         throw new ArgumentException("Unknown autotune candidate '" + selector + "'.");
@@ -1073,12 +1098,14 @@ internal static class KernelAutotuneTool
     private static CandidateProgram? TryCreateSplit(
         DirectPtxRuntime runtime, CodegenKernelSpec spec,
         bool tiledPartial = false, int chunkFactor = 0,
-        CodegenTiledOuterProductSchedule? outerSchedule = null)
+        CodegenTiledOuterProductSchedule? outerSchedule = null, string? implicitTile = null)
     {
         CodegenSplitPlan? plan;
         try
         {
-            plan = chunkFactor > 0
+            plan = implicitTile is not null
+                ? CodegenSplitReduction.TryPlanChunkedForTiles(spec, chunkFactor)
+                : chunkFactor > 0
                 ? CodegenSplitReduction.TryPlanChunked(spec, chunkFactor)
                 : CodegenSplitReduction.TryPlan(spec);
         }
@@ -1106,8 +1133,14 @@ internal static class KernelAutotuneTool
             else
             {
                 var partialEmitter = new PtxAffineEmitter();
+                if (implicitTile is not null) KernelConveyorTool.ApplyImplicitTile(partialEmitter, implicitTile);
                 partialPtx = partialEmitter.Emit(
                     plan.Partial, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
+                // The emitter falls back to its affine lowering when the implicit GEMM does not apply; that
+                // program is already a plain split candidate, so it is not a new one.
+                if (implicitTile is not null &&
+                    !partialEmitter.TileDescription.StartsWith("implicit-gemm", StringComparison.Ordinal))
+                    return null;
                 partialBlocks = partialEmitter.LaunchBlocks;
                 partialBlockX = checked((uint)partialEmitter.LaunchBlockX);
                 partialBlockY = checked((uint)partialEmitter.LaunchBlockY);
@@ -1174,7 +1207,10 @@ internal static class KernelAutotuneTool
             string scheduleSuffix = outerSchedule is { IsDefault: false }
                 ? ":" + outerSchedule.Suffix
                 : string.Empty;
-            string name = chunkFactor > 0
+            string name = implicitTile is not null
+                ? "ig-chunked-split:" + string.Join("+", plan.PromotedAxes) + "x" +
+                    chunkFactor.ToString(CultureInfo.InvariantCulture) + ":" + implicitTile
+                : chunkFactor > 0
                 ? "tiled-chunked-split:" + string.Join("+", plan.PromotedAxes) +
                     "x" + chunkFactor.ToString(CultureInfo.InvariantCulture) + scheduleSuffix
                 : (tiledPartial ? "tiled-split:" : "split:") +

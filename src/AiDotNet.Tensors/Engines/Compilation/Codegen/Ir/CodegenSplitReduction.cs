@@ -252,6 +252,33 @@ public static class CodegenSplitReduction
     }
 
     /// <summary>Largest divisor of <paramref name="extent"/> not above <paramref name="cap"/>.</summary>
+    /// <summary>
+    /// A chunked split for a TILED partial (an implicit GEMM): the largest reduction axis that the factor
+    /// divides becomes <paramref name="splitFactor"/> parallel chunks, whatever the output size.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TryPlanChunked"/> declines once the output alone gives four blocks a multiprocessor at one
+    /// thread per output, which is the right test for the affine lowering. A tiled lowering gives a block a
+    /// whole output tile, so the same output can leave most of the last wave empty; whether a split pays is
+    /// then the autotuner's measurement, and this plan only has to exist. Ties between equal extents go to
+    /// the lower axis, so emission stays deterministic.
+    /// </remarks>
+    public static CodegenSplitPlan? TryPlanChunkedForTiles(CodegenKernelSpec spec, int splitFactor)
+    {
+        if (spec is null) throw new ArgumentNullException(nameof(spec));
+        if (!IsSplittable(spec) || splitFactor <= 1) return null;
+        int axis = -1;
+        foreach (int a in spec.Space.ReductionAxes)
+        {
+            int extent = spec.Space.Axes[a].Extent;
+            if (extent <= splitFactor || extent % splitFactor != 0) continue;
+            if (axis < 0 || extent > spec.Space.Axes[axis].Extent) axis = a;
+        }
+        if (axis < 0 || spec.Output.ElementCount * splitFactor > MaxPartialElements) return null;
+        var (partial, combine) = SplitChunked(spec, axis, splitFactor);
+        return new CodegenSplitPlan(partial, combine, partial.Output.ElementCount, new[] { axis });
+    }
+
     private static int LargestDivisorAtMost(int extent, int cap)
     {
         if (cap < 2) return 1;
