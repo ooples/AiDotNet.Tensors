@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     {
         public static string GetSource()
         {
-            return @"
+            return CudaOptimizerKernels.PingPongDevice + @"
 #include <math.h>
 
 // ===========================================================================
@@ -1131,6 +1131,26 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce(
     float sum = 0.0f;
     for (int z = 0; z < splits; z++) sum += partials[(long long)z * count + i];
     gradKernel[i] = sum;
+}
+
+// conv2d_wgrad_splitk_reduce with the ping-pong SGD step fused (PpFused, CudaOptimizerKernels.PingPongDevice): dW,
+// the updated weights, and each block's sum of dW^2 in f.partials[f.slot + blockIdx.x].
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce_sgd(
+    const float* __restrict__ partials, float* __restrict__ gradKernel, int count, int splits, PpFused f)
+{
+    __shared__ double warpSums[8];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double sumSquares = 0.0;
+    if (i < count)
+    {
+        float sum = 0.0f;
+        for (int z = 0; z < splits; z++) sum += partials[(long long)z * count + i];
+        gradKernel[i] = sum;
+        sumSquares = (double)sum * (double)sum;
+        f.dst[i] = pp_sgd_step(f.src[i], sum, f.dyn[0], f.weightDecay);
+    }
+    const double blockSum = pp_block_sum(sumSquares, warpSums);
+    if (threadIdx.x == 0) f.partials[f.slot + blockIdx.x] = blockSum;
 }
 
 // The dgrad engine's weight layout: wt[tap][co][ci] = w[co][ci][tap] (tap = kh * kW + kw).
@@ -2283,7 +2303,7 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
                 "depthwise_conv2d_backward_input",
                 "depthwise_conv2d_backward_weights",
                 "conv2d_wgrad_implicit_gemm",
-                "conv2d_wgrad_splitk_reduce", "conv2d_dgrad_phase_reduce", "conv2d_dgrad_weight_tapmajor",
+                "conv2d_wgrad_splitk_reduce", "conv2d_wgrad_splitk_reduce_sgd", "conv2d_dgrad_phase_reduce", "conv2d_dgrad_weight_tapmajor",
                 "conv2d_dgrad_implicit_gemm",
                 "conv2d_dgrad_implicit_gemm_c16",
                 "conv2d_dgrad_implicit_gemm_c16_phase",
