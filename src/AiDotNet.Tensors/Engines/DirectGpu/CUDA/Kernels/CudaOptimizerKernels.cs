@@ -1215,9 +1215,9 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device
 // Two step graphs alternate: one reads the weights from buffer A and writes the updated weights to buffer B, the
 // other the reverse. Writing the update elsewhere lets one pass over the gradients both update and take their sum of
 // squares: an in-place update has to wait for the whole reduction (a non-finite gradient anywhere skips the step), so
-// it read the gradients twice. A non-finite step is undone afterwards by copying the old weights over the new ones.
-// Table: ptrs[t] = tensor t's source weights, ptrs[n + t] its destination, ptrs[2n + t] its gradient; MT_CHUNK-element
-// chunks, one block each.
+// it read the gradients twice. A non-finite step is undone inside sgd_pingpong_update, by the last block to finish.
+// Table: ptrs[t] = tensor t's source weights, ptrs[n + t] its destination, ptrs[2n + t] its gradient, cut into
+// PP_CHUNK-element chunks (CudaBackend.PingPongChunk, 1024) that a bounded grid strides over.
 
 // The block's sum, valid in thread 0. warpSums: 8 doubles of shared memory, free on entry and on return.
 __device__ __forceinline__ double pp_block_sum(double v, double* warpSums)
@@ -1249,10 +1249,10 @@ __device__ __forceinline__ double pp_block_sum(double v, double* warpSums)
 // loads before that quad's store (one quad per thread at 256 threads; the quad loop strides by blockDim.x, so any block
 // size covers the chunk). Each block leaves one partial sum; the last block to finish has one warp add them in block
 // order, so on one device the sum does not depend on scheduling (its last bits do depend on the SM count, which sets
-// the grid: the guard only gates finiteness, which no grouping changes), adds that onto the guard and resets *done. If the guard is then not finite
-// (a non-finite gradient, or a learning-rate fault that poisoned it), that block also undoes the step, copying every
-// source over its destination: slow, but only on a step that is being discarded. dyn: device float[2], [0] = this
-// step's learning rate.
+// the grid: the guard only gates finiteness, which no grouping changes), adds that onto the guard and resets *done.
+// If the guard is then not finite (a non-finite gradient, or a learning-rate fault that poisoned it), that block also
+// undoes the step, copying every source over its destination: slow, but only on a step that is being discarded.
+// dyn: device float[2], [0] = this step's learning rate.
 extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
     const unsigned long long* __restrict__ ptrs,
     const int* __restrict__ sizes,
