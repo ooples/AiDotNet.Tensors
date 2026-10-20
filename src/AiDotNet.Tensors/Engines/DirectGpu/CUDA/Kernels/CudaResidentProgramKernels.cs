@@ -15,9 +15,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 /// safe because a cooperative launch guarantees every block is co-resident.
 /// </para>
 /// <para>
-/// CUDA only for now; the other backends are tracked per backend, since each needs a different design for the
-/// barrier: HIP #1448 (cooperative launch, a direct port), OpenCL #1449, Vulkan #1450, Metal #1451 and WebGPU #1452
-/// (no cross-work-group forward-progress guarantee, so one submission of ordered dispatches instead of a spin barrier).
+/// The other backends emit their stage kernel from <see cref="ResidentProgramKernelTemplate"/>. HIP (#1448) ports this
+/// persistent kernel, since its cooperative launch gives the same co-residency guarantee. OpenCL (#1449), Vulkan
+/// (#1450), Metal (#1451) and WebGPU (#1452) guarantee no forward progress across work-groups, so they run the chain
+/// as one submission of ordered stage dispatches instead of spinning on a barrier.
 /// </para>
 /// </summary>
 internal static class CudaResidentProgramKernels
