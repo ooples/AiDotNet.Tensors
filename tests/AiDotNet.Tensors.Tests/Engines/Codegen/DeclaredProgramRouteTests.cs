@@ -261,7 +261,7 @@ public class DeclaredProgramRouteTests
         }
         for (int o = 0; o < runs[0].Length; o++)
             for (int i = 0; i < runs[0][o].Length; i++)
-                Assert.True(BitConverter.SingleToInt32Bits(runs[0][o][i]) == BitConverter.SingleToInt32Bits(runs[1][o][i]),
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(runs[0][o][i]) == TestHelpers.MathCompat.SingleToInt32Bits(runs[1][o][i]),
                     $"output {o}[{i}]: {runs[0][o][i]} then {runs[1][o][i]}");
     }
 
