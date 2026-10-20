@@ -4,8 +4,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 // #1450: the resident program on Vulkan. Vulkan compute guarantees no forward progress across workgroups, so a
 // persistent dispatch spinning on a grid barrier is unsafe in general. The chain is instead every stage recorded into
-// ONE command buffer (the backend's batch mode) with a compute memory barrier between dispatches, submitted once: no
-// host round trip between stages. Separately, each stage is its own submission. Both run
+// ONE command buffer with a compute memory barrier between dispatches, submitted once: no host round trip between
+// stages. Separately, each stage is its own submission. Both run
 // ResidentProgramKernelTemplate's stage shader, so the two give bit-identical results.
 public sealed unsafe partial class VulkanBackend
 {
@@ -41,9 +41,9 @@ public sealed unsafe partial class VulkanBackend
     private const uint ResidentPushBytes = 3 * sizeof(uint);
 
     /// <summary>
-    /// Runs <paramref name="stages"/> in order as one command buffer and one submission, which this call waits for.
-    /// Inside a batch the caller already opened, the stages join that batch instead. Returns the number of stage
-    /// dispatches recorded.
+    /// Runs <paramref name="stages"/> in order as one command buffer and one submission, not waited for (waited in
+    /// submit-and-wait mode). Inside a batch the caller already opened, the stages join that batch instead. Returns
+    /// the number of stage dispatches recorded.
     /// </summary>
     internal int RunResidentProgram(ReadOnlySpan<ResidentStage> stages)
     {
@@ -56,6 +56,18 @@ public sealed unsafe partial class VulkanBackend
                 foreach (var stage in stages) DispatchResidentStage(stage);
                 return stages.Length;
             }
+            if (SubmitsWithoutWaiting)
+            {
+                // The open command buffer is submitted first, so the chain has one to itself; every stage is then
+                // recorded into the next one (a compute memory barrier before each dispatch), submitted once,
+                // without waiting, like any other unwaited dispatch. The compute lock keeps other threads' dispatches
+                // out of it, and the chain is shorter than the coalescing limit.
+                _device.SubmitOpenCommands();
+                foreach (var stage in stages) DispatchResidentStage(stage);
+                _device.SubmitOpenCommands();
+                return stages.Length;
+            }
+            // Submit-and-wait mode (AIDOTNET_VULKAN_SYNC_SUBMIT): the batch is the one command buffer.
             BeginBatch();
             try
             {
