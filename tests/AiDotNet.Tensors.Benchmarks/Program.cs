@@ -17,7 +17,7 @@ class Program
         // GPU-free cubin generation and verification for the spectral family.
         if (args.Length > 0 && args[0] == "--resident-program")
         {
-            Environment.ExitCode = ResidentProgramBench.Run();
+            Environment.ExitCode = ResidentProgramBench.Run(args);
             return;
         }
 
