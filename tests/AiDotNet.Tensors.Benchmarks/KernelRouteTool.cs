@@ -486,6 +486,34 @@ internal static class KernelRouteTool
                 (7, dxRef), MaxAbs(x) * Max(rstdD) * Math.Max(1, MaxAbs(g)) * Math.Sqrt(r), Math.Max(r, c));
         }
 
+        // Elementwise stages (#1437's pointwise family): LayerNorm, then gelu on its output, then leaky_relu(0.1),
+        // then softmax -- the pointwise stages calling the same derived library functions the routed calls do.
+        foreach (var (r, c) in new[] { (64, 1024), (256, 64) })
+        {
+            var x = Fill(r * c, 41, 0.0);
+            var g = Fill(c, 42, 1.0);
+            var b = Fill(c, 43, 0.0);
+            var (yRef, _, _) = NormRef(x, g, b, r, c, Eps, rms: false);
+            var act = new double[r * c];
+            for (int i = 0; i < act.Length; i++)
+            {
+                double v = yRef[i];
+                double gelu = 0.5 * v * (1 + Math.Tanh(0.7978845608 * (v + 0.044715 * v * v * v)));
+                act[i] = gelu > 0 ? gelu : 0.1 * gelu;
+            }
+            var softRef = SoftmaxRef(ToFloat(act), r, c);
+            RunChain(backend, barrier, failures, "LayerNorm -> gelu -> leaky_relu -> Softmax " + r + "x" + c,
+                new[] { x, g, b }, new[] { r * c, r, r, r * c, r * c, r * c },
+                a => new[]
+                {
+                    CudaBackend.LayerNormStage(a[0], a[3], a[1], a[2], a[4], a[5], r, c, Eps),
+                    backend.ElementwiseStage("gelu", a[6], r * c, a[3]),
+                    backend.ElementwiseStage("leaky_relu", a[7], r * c, a[6], scalars: 0.1f),
+                    CudaBackend.SoftmaxStage(a[7], a[8], r, c),
+                },
+                (8, softRef), MaxAbs(x) * 4, c);
+        }
+
         {
             const int r = 128, c = 512;
             var x = Fill(r * c, 38, 0.0);

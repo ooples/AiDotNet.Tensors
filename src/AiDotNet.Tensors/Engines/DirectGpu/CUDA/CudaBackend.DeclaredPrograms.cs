@@ -32,13 +32,17 @@ internal enum DeclaredFamily
     BatchNormBackward,
     Softmax,
     SoftmaxBackward,
+
+    /// <summary>A derived elementwise kernel at a fixed length (a resident stage); the key's Name says which.</summary>
+    Elementwise,
 }
 
 /// <summary>One declared program: its family and shape (unused dimensions are 0).</summary>
 internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
 {
-    internal DeclaredKey(DeclaredFamily family, int d0, int d1, int d2, int d3, float epsilon, float momentum)
+    internal DeclaredKey(DeclaredFamily family, int d0, int d1, int d2, int d3, float epsilon, float momentum, string? name = null)
     {
+        Name = name;
         Family = family;
         D0 = d0;
         D1 = d1;
@@ -56,9 +60,12 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
     internal float Epsilon { get; }
     internal float Momentum { get; }
 
+    /// <summary>What the dimensions do not say -- an elementwise stage's kernel and scalars; null otherwise.</summary>
+    internal string? Name { get; }
+
     public bool Equals(DeclaredKey other) =>
         Family == other.Family && D0 == other.D0 && D1 == other.D1 && D2 == other.D2 && D3 == other.D3 &&
-        Epsilon.Equals(other.Epsilon) && Momentum.Equals(other.Momentum);
+        Epsilon.Equals(other.Epsilon) && Momentum.Equals(other.Momentum) && string.Equals(Name, other.Name, StringComparison.Ordinal);
 
     public override bool Equals(object? obj) => obj is DeclaredKey other && Equals(other);
 
@@ -72,6 +79,7 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
             h = h * 31 + D2;
             h = h * 31 + D3;
             h = h * 31 + Epsilon.GetHashCode();
+            h = h * 31 + (Name is null ? 0 : StringComparer.Ordinal.GetHashCode(Name));
             return h * 31 + Momentum.GetHashCode();
         }
     }
@@ -84,6 +92,7 @@ internal readonly struct DeclaredKey : IEquatable<DeclaredKey>
             if (d != 0) sb.Append(sb.Length > Family.ToString().Length ? "x" : ":").Append(d.ToString(CultureInfo.InvariantCulture));
         if (Epsilon != 0) sb.Append(":e").Append(Epsilon.ToString("R", CultureInfo.InvariantCulture));
         if (Momentum != 0) sb.Append(":m").Append(Momentum.ToString("R", CultureInfo.InvariantCulture));
+        if (Name is not null) sb.Append(':').Append(Name);
         return sb.ToString();
     }
 }
@@ -278,7 +287,10 @@ public sealed partial class CudaBackend
             for (int s = 0; s < lowering.Steps.Count; s++)
             {
                 var step = lowering.Steps[s];
-                var module = _directPtxRuntime.LoadModule(step.Ptx, allowExperimentalJitFallback: true);
+                // A step that calls math-library functions is linked with their libraries.
+                var module = step.Calls.Count == 0
+                    ? _directPtxRuntime.LoadModule(step.Ptx, allowExperimentalJitFallback: true)
+                    : _directPtxRuntime.LoadLinkedModule(step.Ptx, LibrariesFor(step.Calls));
                 IntPtr function = module.GetFunction(step.EntryPoint, out _);
                 if (step.DynamicSharedMemoryBytes != 0)
                     module.SetMaxDynamicSharedMemory(function, checked((int)step.DynamicSharedMemoryBytes));

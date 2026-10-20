@@ -341,6 +341,56 @@ public class DeclaredProgramRouteTests
         }
     }
 
+    /// <summary>
+    /// The pointwise family as resident stages: LayerNorm, then gelu and leaky_relu(0.1) on its output -- elementwise
+    /// stages calling the derived library functions -- then softmax, as one launch, bit-identical to the same stages
+    /// launched separately.
+    /// </summary>
+    [SkippableFact]
+    public void ElementwiseStagesJoinAResidentChainBitIdentically()
+    {
+        using var backend = OpenBackendOrSkip();
+        Skip.IfNot(backend.DeclaredKernelsEnabled && backend.SupportsResidentProgram,
+            "A declared resident program needs the sm_75+ conveyor and a cooperative launch.");
+        const int rows = 64, cols = 1024;
+        var rng = new Random(11);
+        float[] R(int n)
+        {
+            var v = new float[n];
+            for (int i = 0; i < n; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
+            return v;
+        }
+        float[] x = R(rows * cols), gamma = R(cols), beta = R(cols);
+        using var barrier = backend.AllocateResidentBarrier();
+        var results = new float[2][];
+        for (int mode = 0; mode < 2; mode++)
+        {
+            using var bx = backend.AllocateBuffer(x);
+            using var bg = backend.AllocateBuffer(gamma);
+            using var bb = backend.AllocateBuffer(beta);
+            using var y = backend.AllocateBuffer(rows * cols);
+            using var mean = backend.AllocateBuffer(rows);
+            using var rstd = backend.AllocateBuffer(rows);
+            using var g = backend.AllocateBuffer(rows * cols);
+            using var l = backend.AllocateBuffer(rows * cols);
+            using var soft = backend.AllocateBuffer(rows * cols);
+            var stages = new[]
+            {
+                CudaBackend.LayerNormStage(bx, y, bg, bb, mean, rstd, rows, cols, Epsilon),
+                backend.ElementwiseStage("gelu", g, rows * cols, y),
+                backend.ElementwiseStage("leaky_relu", l, rows * cols, g, scalars: 0.1f),
+                CudaBackend.SoftmaxStage(l, soft, rows, cols),
+            };
+            if (mode == 0) backend.RunDeclaredStagesSeparately(stages);
+            else backend.RunDeclaredResidentProgram(stages, barrier);
+            backend.Synchronize();
+            results[mode] = backend.DownloadBuffer(soft);
+        }
+        for (int i = 0; i < results[0].Length; i++)
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(results[0][i]) == TestHelpers.MathCompat.SingleToInt32Bits(results[1][i]),
+                $"[{i}]: separate {results[0][i]} resident {results[1][i]}");
+    }
+
     private const float Epsilon = 1e-5f;
 
     private static (float[] Y, float[] Mean, float[] Rstd, bool Routed) RunLayerNorm(

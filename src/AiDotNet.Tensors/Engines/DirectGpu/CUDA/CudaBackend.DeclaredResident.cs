@@ -104,6 +104,45 @@ public sealed partial class CudaBackend
         new(BatchNormBackwardKey(batch, channels, spatialSize), s_buildBatchNormBackward, s_normBackwardNames,
             new DeclaredBindings(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, gradGamma, gradBeta));
 
+    /// <summary>
+    /// A derived elementwise kernel (relu, gelu, sinf, leaky_relu, ...) as a resident stage over <paramref name="length"/>
+    /// elements: the same library function the routed call applies, with any scalars fixed for the stage.
+    /// </summary>
+    internal DeclaredResidentStage ElementwiseStage(string kernel, IGpuBuffer output, int length, IGpuBuffer input0,
+        IGpuBuffer? input1 = null, IGpuBuffer? input2 = null, params float[] scalars)
+    {
+        var function = ResolveElementwise(kernel) ?? throw new NotSupportedException(ElementwiseRefusal(kernel));
+        int inputs = input2 is not null ? 3 : input1 is not null ? 2 : 1;
+        if (function.Inputs != inputs || function.Scalars.Length != scalars.Length)
+            throw new ArgumentException(kernel + " takes " + function.Inputs + " inputs and " + function.Scalars.Length + " scalars.");
+        if (length <= 0) throw new ArgumentOutOfRangeException(nameof(length));
+        var name = new System.Text.StringBuilder(kernel);
+        foreach (float s in scalars) name.Append(':').Append(s.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+        var names = new string[inputs + 1];
+        for (int i = 0; i < inputs; i++) names[i] = "in" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        names[inputs] = "out";
+        var fixedScalars = (float[])scalars.Clone();
+        return new DeclaredResidentStage(new DeclaredKey(DeclaredFamily.Elementwise, length, 0, 0, 0, 0, 0, name.ToString()),
+            key =>
+            {
+                var arguments = new CodegenExpr[function.Inputs + fixedScalars.Length];
+                var bindings = new CodegenTensorBinding[function.Inputs];
+                for (int i = 0; i < function.Inputs; i++)
+                {
+                    arguments[i] = CodegenExpr.Operand(i);
+                    bindings[i] = new CodegenTensorBinding(i, names[i], new[] { key.D0 }, new[] { CodegenAffineExpr.Axis(0) });
+                }
+                for (int s = 0; s < fixedScalars.Length; s++) arguments[function.Inputs + s] = CodegenExpr.Constant(fixedScalars[s]);
+                var body = CodegenExpr.Call(function.Handle, arguments);
+                var products = body.Operands();
+                var spec = new CodegenKernelSpec("elementwise_" + kernel, new CodegenIterationSpace(CodegenAxis.Parallel("i", key.D0)),
+                    bindings, new CodegenTensorBinding(function.Inputs, "out", new[] { key.D0 }, new[] { CodegenAffineExpr.Axis(0) }, isOutput: true),
+                    products, CodegenReduceKind.None, body: body);
+                return new CodegenProgram(new[] { spec }, new long[] { key.D0 }, "elementwise " + kernel + " " + key.D0);
+            },
+            names, new DeclaredBindings(input0, input1 ?? output, input2 ?? output, output, output));
+    }
+
     /// <summary>Row softmax as a resident stage, in CudaBackend.Softmax's contract.</summary>
     internal static DeclaredResidentStage SoftmaxStage(IGpuBuffer input, IGpuBuffer output, int batchSize, int features) =>
         new(SoftmaxKey(batchSize, features), s_buildSoftmax, s_softmaxNames, new DeclaredBindings(input, output));
@@ -225,7 +264,18 @@ public sealed partial class CudaBackend
         sources[at] = (-1, 0);   // the barrier
 
         _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
-        var module = _directPtxRuntime.LoadModule(composition.Ptx, allowExperimentalJitFallback: true);
+        DirectPtxModule module;
+        try
+        {
+            module = composition.Calls.Count == 0
+                ? _directPtxRuntime.LoadModule(composition.Ptx, allowExperimentalJitFallback: true)
+                : _directPtxRuntime.LoadLinkedModule(composition.Ptx, LibrariesFor(composition.Calls));
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
+        {
+            LastResidentDecline = chain + ": " + ex.Message;
+            return null;
+        }
         try
         {
             IntPtr function = module.GetFunction(composition.EntryPoint, out _);

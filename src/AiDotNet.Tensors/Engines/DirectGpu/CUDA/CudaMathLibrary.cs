@@ -75,11 +75,45 @@ internal static class CudaMathLibrary
     /// </summary>
     internal static string LibrarySource(CudaMathModule module, IEnumerable<CudaMathFunction> functions)
     {
-        var sb = new StringBuilder(CudaBackend.PrepareNvrtcSource(module.Source));
+        var sb = new StringBuilder(CudaBackend.PrepareNvrtcSource(Internalize(module.Source)));
         sb.Append("\n// ---- the declared kernels' library: one function per derived kernel\n");
         foreach (var function in functions)
             if (function.Module.Name == module.Name) sb.Append(function.Wrapper).Append('\n');
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// A module's source as a LIBRARY: its __global__ kernels removed (the library never launches them) and every
+    /// remaining device function and variable given internal linkage (static). Under -rdc they were external, and a
+    /// kernel linking two modules' libraries -- gelu from one, leaky_relu from another -- met each name both define
+    /// twice. Only the derived aidn_ wrappers, unique by kernel, stay external.
+    /// </summary>
+    internal static string Internalize(string source)
+    {
+        var sb = new StringBuilder(source.Length);
+        int at = 0;
+        foreach (Match kernel in Regex.Matches(source, @"extern\s+""C""\s+__global__"))
+        {
+            if (kernel.Index < at) continue;
+            int open = source.IndexOf('{', kernel.Index);
+            int semicolon = source.IndexOf(';', kernel.Index);
+            if (open < 0 || (semicolon >= 0 && semicolon < open)) continue;   // a declaration, not a definition
+            int depth = 0, close = -1;
+            for (int i = open; i < source.Length; i++)
+            {
+                if (source[i] == '{') depth++;
+                else if (source[i] == '}' && --depth == 0) { close = i; break; }
+            }
+            if (close < 0) break;
+            sb.Append(source, at, kernel.Index - at);
+            at = close + 1;
+        }
+        sb.Append(source, at, source.Length - at);
+        string library = sb.ToString();
+        // static before a device function or variable that is not already static and not extern "C".
+        return Regex.Replace(library,
+            @"(?m)^(?<indent>[ \t]*)(?!static\b)(?!extern\b)(?!template\b)(?<head>(?:inline\s+|__forceinline__\s+|__noinline__\s+)*(?:__device__|__constant__)\b)",
+            "${indent}static ${head}");
     }
 
     private static CudaMathFunction? Derive(string kernel, CudaMathModule module, string source, out string reason)

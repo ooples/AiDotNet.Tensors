@@ -389,6 +389,19 @@ public sealed partial class CudaBackend
         return true;
     }
 
+    // The relocatable libraries a kernel's calls come from, each once.
+    private List<byte[]> LibrariesFor(IReadOnlyList<CodegenLibraryFunction> calls)
+    {
+        var objects = new List<byte[]>();
+        foreach (var call in calls)
+        {
+            var library = MathLibrary(call.Library)
+                ?? throw new NotSupportedException("The " + call.Library + " library did not compile: " + MathLibraryLog(call.Library));
+            if (!objects.Contains(library)) objects.Add(library);
+        }
+        return objects;
+    }
+
     /// <summary>Loads diagnostic PTX (verification tooling) into this backend's context.</summary>
     internal (DirectPtxModule Module, IntPtr Function) LoadDiagnosticKernel(string ptx, string entry)
     {

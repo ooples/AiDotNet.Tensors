@@ -21,7 +21,11 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 /// <summary>One kernel launch of a lowered program.</summary>
 public sealed record PtxProgramStep(
     string Ptx, string EntryPoint, uint Blocks, uint BlockX, uint BlockY, IReadOnlyList<string> Arguments,
-    uint DynamicSharedMemoryBytes = 0);
+    uint DynamicSharedMemoryBytes = 0)
+{
+    /// <summary>Math-library functions the kernel calls: its module must be linked with their libraries.</summary>
+    public IReadOnlyList<CodegenLibraryFunction> Calls { get; init; } = Array.Empty<CodegenLibraryFunction>();
+}
 
 /// <summary>One kernel of a caller-supplied pass lowering.</summary>
 public sealed record PtxPassKernel(
@@ -101,7 +105,7 @@ public sealed class PtxProgramLowering
                 string entry = Entry(name, at);
                 string ptx = emitter.EmitRowProgram(fused, entry, computeMajor, computeMinor);
                 steps.Add(new PtxProgramStep(ptx, entry, emitter.LaunchBlocks,
-                    (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, fused.Parameters));
+                    (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, fused.Parameters) { Calls = emitter.CalledFunctions });
                 string label = "row-fused x" + (end - at).ToString(CultureInfo.InvariantCulture);
                 if (fused.ColumnPasses.Count != 0)
                 {
@@ -190,7 +194,7 @@ public sealed class PtxProgramLowering
         var emitter = new PtxAffineEmitter();
         string ptx = emitter.Emit(spec, major, minor);
         return new PtxProgramStep(ptx, spec.Name, emitter.LaunchBlocks,
-            (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, args);
+            (uint)emitter.LaunchBlockX, (uint)emitter.LaunchBlockY, args) { Calls = emitter.CalledFunctions };
     }
 
     // Row-fused entry points are named after the program and the run's first pass index, so two runs of one program

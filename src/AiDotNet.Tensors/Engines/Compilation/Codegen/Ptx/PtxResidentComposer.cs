@@ -25,6 +25,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 
@@ -32,8 +33,9 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ptx;
 public sealed class PtxResidentComposition
 {
     internal PtxResidentComposition(string ptx, string entryPoint, uint blockX, IReadOnlyList<string> arguments,
-        uint maxStageBlocks, int sharedBytes)
+        uint maxStageBlocks, int sharedBytes, IReadOnlyList<CodegenLibraryFunction> calls)
     {
+        Calls = calls;
         Ptx = ptx;
         EntryPoint = entryPoint;
         BlockX = blockX;
@@ -56,6 +58,9 @@ public sealed class PtxResidentComposition
 
     /// <summary>Static shared memory, summed over the stages.</summary>
     public int SharedBytes { get; }
+
+    /// <summary>Math-library functions any stage calls: the composed module is linked with their libraries.</summary>
+    public IReadOnlyList<CodegenLibraryFunction> Calls { get; }
 }
 
 /// <summary>Composes lowered kernels into one resident (persistent cooperative) kernel.</summary>
@@ -79,6 +84,8 @@ public static class PtxResidentComposer
         var arguments = new List<string>();
         var shared = new StringBuilder();
         var body = new StringBuilder();
+        var externs = new List<string>();
+        var calls = new List<CodegenLibraryFunction>();
         int maxP = 0, maxR = 0, maxRd = 0, maxF = 0, sharedBytes = 0;
         uint maxBlocks = 0;
 
@@ -92,6 +99,10 @@ public static class PtxResidentComposer
             maxBlocks = Math.Max(maxBlocks, step.Blocks);
             string prefix = "s" + k.ToString(CultureInfo.InvariantCulture) + "_";
             var stage = Parse(step, prefix);
+            foreach (string declaration in stage.Externs)
+                if (!externs.Contains(declaration)) externs.Add(declaration);
+            foreach (var call in step.Calls)
+                if (!calls.Exists(c => c.Symbol == call.Symbol)) calls.Add(call);
             maxP = Math.Max(maxP, stage.P); maxR = Math.Max(maxR, stage.R); maxRd = Math.Max(maxRd, stage.Rd); maxF = Math.Max(maxF, stage.F);
             foreach (string parameter in stage.Parameters) parameters.Add(prefix + parameter);
             arguments.AddRange(step.Arguments);
@@ -124,8 +135,9 @@ public static class PtxResidentComposer
            .Append(computeMinor.ToString(CultureInfo.InvariantCulture)).Append('\n')
            .Append(".address_size 64\n\n")
            .Append("// composed by PtxResidentComposer: ").Append(steps.Count.ToString(CultureInfo.InvariantCulture))
-           .Append(" stage(s), one cooperative launch\n")
-           .Append(".visible .entry ").Append(entryPoint).Append("(\n");
+           .Append(" stage(s), one cooperative launch\n");
+        foreach (string declaration in externs) ptx.Append(declaration).Append('\n');
+        ptx.Append(".visible .entry ").Append(entryPoint).Append("(\n");
         for (int i = 0; i < parameters.Count; i++)
             ptx.Append("    .param .u64 ").Append(parameters[i]).Append(i == parameters.Count - 1 ? "\n" : ",\n");
         ptx.Append(")\n.maxntid ").Append(blockX.ToString(CultureInfo.InvariantCulture)).Append(", 1, 1\n{\n")
@@ -141,7 +153,7 @@ public static class PtxResidentComposer
            .Append("    mov.u32 %resnct, %nctaid.x;\n")
            .Append(body)
            .Append("    ret;\n}\n");
-        return new PtxResidentComposition(ptx.ToString(), entryPoint, blockX, arguments, maxBlocks, sharedBytes);
+        return new PtxResidentComposition(ptx.ToString(), entryPoint, blockX, arguments, maxBlocks, sharedBytes, calls);
     }
 
     // The phase-3 grid barrier, in PTX. Every thread reaches both block barriers.
@@ -175,6 +187,7 @@ public static class PtxResidentComposer
     private sealed class Stage
     {
         internal List<string> Parameters { get; } = new();
+        internal List<string> Externs { get; } = new();
         internal List<(string Name, string Declaration, int Bytes)> Shared { get; } = new();
         internal int P, R, Rd, F;
         internal string Body = "";
@@ -189,8 +202,12 @@ public static class PtxResidentComposer
         var stage = new Stage();
         string[] lines = step.Ptx.Replace("\r\n", "\n").Split('\n');
         int at = 0;
-        // Header: parameters until ")".
-        while (at < lines.Length && !lines[at].Contains(".entry", StringComparison.Ordinal)) at++;
+        // Module scope ahead of the entry: the library functions the stage calls are declared there.
+        while (at < lines.Length && !lines[at].Contains(".entry", StringComparison.Ordinal))
+        {
+            if (lines[at].TrimStart().StartsWith(".extern .func", StringComparison.Ordinal)) stage.Externs.Add(lines[at].Trim());
+            at++;
+        }
         if (at == lines.Length) throw new NotSupportedException(step.EntryPoint + " has no entry.");
         for (at++; at < lines.Length && !lines[at].TrimStart().StartsWith(")", StringComparison.Ordinal); at++)
         {
@@ -211,6 +228,8 @@ public static class PtxResidentComposer
         {
             string line = lines[at];
             string trimmed = line.Trim();
+            // A library call opens its own { } scope for its .param slots: only the entry's own brace ends the body.
+            if (trimmed == "{") depth++;
             if (trimmed == "}" && --depth == 0) break;
             var reg = RegDecl.Match(line);
             if (reg.Success)

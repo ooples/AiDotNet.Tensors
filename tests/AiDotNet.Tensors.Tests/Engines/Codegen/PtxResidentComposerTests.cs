@@ -1,4 +1,4 @@
-// Copyright (c) AiDotNet. All rights reserved.
+﻿// Copyright (c) AiDotNet. All rights reserved.
 // Declared kernels composed into one resident (persistent cooperative) kernel (#890 phase 4 on #1430). These pin the
 // composition's structure -- what it renames, what it rewrites, where the grid barriers go, what it refuses -- on the
 // CPU; DeclaredProgramRouteTests runs the composed chains on a device against the stages launched separately.
@@ -61,6 +61,34 @@ public class PtxResidentComposerTests
         Assert.Equal(1, Count(composed.Ptx, "ret;"));                       // the composed kernel's own
         Assert.Contains("bra s0_NEXTBLOCK;", composed.Ptx, StringComparison.Ordinal);
         Assert.Contains("bra s1_NEXTBLOCK;", composed.Ptx, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A stage whose body calls a math-library function: the call's extern declaration is carried into the composed
+    /// module once, ahead of the entry, and the call's own { } scope does not end the stage's body early.
+    /// </summary>
+    [Fact]
+    public void AStageThatCallsALibraryFunctionComposes()
+    {
+        var twice = new CodegenLibraryFunction("aidn_twice", "test_module", 1);
+        var spec = new CodegenKernelSpec("twice", new CodegenIterationSpace(CodegenAxis.Parallel("i", 4096)),
+            new[] { new CodegenTensorBinding(0, "x", new[] { 4096 }, new[] { CodegenAffineExpr.Axis(0) }) },
+            new CodegenTensorBinding(1, "y", new[] { 4096 }, new[] { CodegenAffineExpr.Axis(0) }, isOutput: true),
+            new[] { 0 }, CodegenReduceKind.None, body: CodegenExpr.Call(twice, CodegenExpr.Operand(0)));
+        var program = new CodegenProgram(new[] { spec }, new long[] { 4096 }, "twice");
+        var steps = Steps(program, program);
+        Assert.Equal(new[] { twice }, steps[0].Calls);
+        var composed = PtxResidentComposer.Compose(steps, "resident_calls", 7, 5);
+
+        Assert.Equal(1, Count(composed.Ptx, ".extern .func"));
+        Assert.True(composed.Ptx.IndexOf(".extern .func", StringComparison.Ordinal) < composed.Ptx.IndexOf(".entry", StringComparison.Ordinal));
+        Assert.Equal(new[] { twice }, composed.Calls);
+        // Both stages' bodies survive whole: each still reaches its own end-of-block branch after the call.
+        int call0 = composed.Ptx.IndexOf("call.uni", StringComparison.Ordinal);
+        Assert.True(call0 >= 0 && composed.Ptx.IndexOf("s0_NEXTBLOCK:", StringComparison.Ordinal) > call0);
+        Assert.Contains("s1_NEXTBLOCK:", composed.Ptx, StringComparison.Ordinal);
+        // Every call of both stages survives (a held row calls once per element it holds).
+        Assert.Equal(2 * Count(steps[0].Ptx, "call.uni"), Count(composed.Ptx, "call.uni"));
     }
 
     /// <summary>Stages that do not share a block size, or that use a 2-D block, are refused.</summary>
