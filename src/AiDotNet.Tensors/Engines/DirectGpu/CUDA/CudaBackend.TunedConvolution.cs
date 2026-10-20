@@ -114,6 +114,25 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("cublas.conv2d.im2col_gemm",
                             TunedKernelOrigin.Vendor, true, ConvGemmForwardFits,
                             (in CudaConv2DArgs a) => { ExecuteConv2DForwardGemm(a); RunConvEpiloguePasses(a); }));
+                    // The 8x8-micro-tile implicit GEMM (conv2d_fprop_r8_*): never the reference. Measured against the
+                    // engine's FMA mainloop (RTX 3080, batch 8): 64->128 s2 47.2 -> 36.5 us, 128->256 s2 53.3 -> 41.3,
+                    // 256->512 s2 55.8 -> 44.7, 512@4 84.4 -> 64.9; slower on the 1x1 shortcuts, where the slot keeps the
+                    // engine.
+                    if (s_convR8FpropEnv)
+                        foreach (var (tileM, tileN) in Kernels.CudaConvFpropR8Kernels.TileShapes)
+                        {
+                            int tm = tileM, tn = tileN;
+                            candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>($"nvrtc.conv2d.r8_{tm}x{tn}",
+                                TunedKernelOrigin.Builtin, true, shape => shape[1] % 4 == 0 && EnsureFpropR8Module(),
+                                (in CudaConv2DArgs a) =>
+                                {
+                                    if (!TryConv2DForwardR8(a, tm, tn))
+                                        LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                                            a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+                                            a.PadH, a.PadW, a.DilationH, a.DilationW);
+                                    RunConvEpiloguePasses(a);
+                                }));
+                        }
                     // #1274's narrow-layer implicit GEMM (Cout <= 64). It used to run ahead of the slot for every shape it
                     // admits; as a candidate it is chosen only where it measures fastest.
                     if (ImplicitConvEnabled)
