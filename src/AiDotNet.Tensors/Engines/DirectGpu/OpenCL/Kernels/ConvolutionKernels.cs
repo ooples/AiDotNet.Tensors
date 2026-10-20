@@ -152,7 +152,9 @@ __kernel void conv2d_direct(
     const int padH,
     const int padW,
     const int dilationH,
-    const int dilationW)
+    const int dilationW,
+    __global const float* bias,
+    const int epi)
 {
     const int ow = get_global_id(0);
     const int oh = get_global_id(1);
@@ -179,7 +181,11 @@ __kernel void conv2d_direct(
         }
     }
 
-    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+    // The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
+    float r = sum;
+    if (epi & 1) r += bias[oc];
+    if ((epi & 2) && r < 0.0f) r = 0.0f;
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
 }
 
 // Conv2D backward pass for input gradients
@@ -520,7 +526,9 @@ __kernel void conv2d_tiled(
     const int padW,
     const int dilationH,
     const int dilationW,
-    __local float* sharedInput)
+    __local float* sharedInput,
+    __global const float* bias,
+    const int epi)
 {
     // Each workgroup handles one output tile for one (batch, outChannel) pair
     const int tileX = get_group_id(0);  // output tile column
@@ -578,7 +586,11 @@ __kernel void conv2d_tiled(
     }
 
     if (outX < outWidth && outY < outHeight) {
-        output[((b * outChannels + oc) * outHeight + outY) * outWidth + outX] = sum;
+        // The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
+        float r = sum;
+        if (epi & 1) r += bias[oc];
+        if ((epi & 2) && r < 0.0f) r = 0.0f;
+        output[((b * outChannels + oc) * outHeight + outY) * outWidth + outX] = r;
     }
 }
 

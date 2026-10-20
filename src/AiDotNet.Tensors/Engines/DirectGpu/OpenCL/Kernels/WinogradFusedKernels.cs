@@ -26,10 +26,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 #define WF_BP 32
 #define WF_CK 8
 #define WF_ULD 36
+// A convolution's epilogue: epi bit 0 adds bias[channel], bit 1 applies ReLU (NaN passes through, as the relu kernel).
+// The same arithmetic as the conv2d_bias_add and relu passes it replaces.
+float conv_epilogue(float v, __global const float* bias, int channel, int epi)
+{
+    if (epi & 1) v += bias[channel];
+    if (epi & 2) v = isnan(v) ? v : fmax(0.0f, v);
+    return v;
+}
 __kernel __attribute__((reqd_work_group_size(256, 1, 1)))
 void wino_f23_fused_forward(__global const float* restrict in, __global const float* restrict wt,
     __global float* restrict out, const int N, const int R, const int IH, const int IW, const int O, const int OH,
-    const int OW, const int pad, const int tilesH, const int tilesW)
+    const int OW, const int pad, const int tilesH, const int tilesW, __global const float* bias, const int epi)
 {
     // U | V during the reduction; the epilogue reuses the first 16 x 16 x 32 floats.
     __local float sm[16 * WF_CK * WF_ULD + 16 * WF_CK * 32];
@@ -159,12 +167,12 @@ void wino_f23_fused_forward(__global const float* restrict in, __global const fl
                 int th = t / tilesW, tw = t - th * tilesW;
                 int h = th * 2, w = tw * 2;
                 __global float* dst = out + (((long)n * O + o) * OH + h) * OW + w;
-                dst[0] = t0[0] + t0[1] + t0[2];
-                if (w + 1 < OW) dst[1] = t0[1] - t0[2] - t0[3];
+                dst[0] = conv_epilogue(t0[0] + t0[1] + t0[2], bias, o, epi);
+                if (w + 1 < OW) dst[1] = conv_epilogue(t0[1] - t0[2] - t0[3], bias, o, epi);
                 if (h + 1 < OH)
                 {
-                    dst[OW] = t1[0] + t1[1] + t1[2];
-                    if (w + 1 < OW) dst[OW + 1] = t1[1] - t1[2] - t1[3];
+                    dst[OW] = conv_epilogue(t1[0] + t1[1] + t1[2], bias, o, epi);
+                    if (w + 1 < OW) dst[OW + 1] = conv_epilogue(t1[1] - t1[2] - t1[3], bias, o, epi);
                 }
             }
         }

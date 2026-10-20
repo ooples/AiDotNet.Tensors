@@ -1032,18 +1032,19 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
 
-        // For NCHW: broadcast bias[c] across all [b, c, h*w] positions
-        // Treat as 2D: outer = batch * channels, inner = spatialSize
-        // Each thread handles one (b*channels + c, s) position
-        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "broadcast_add_last");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate2DDispatch(spatialSize, batch * channels);
+        // For NCHW: bias[c] across every [b, c, h*w] position. This used broadcast_add_last, which adds B[j] for the
+        // SPATIAL index j: it read the bias by pixel, past its end once H*W exceeded the channel count.
+        int total = batch * channels * spatialSize;
+        if (total <= 0) return;
+        var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "conv2d_bias_add");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
 
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(outBuffer, 0);   // A (in-place)
-        encoder.SetBuffer(biasBuffer, 1);  // B (bias repeated per channel)
-        encoder.SetBuffer(outBuffer, 2);   // C (output, same as A for in-place)
-        encoder.SetBytes((uint)(batch * channels), 3);
+        encoder.SetBuffer(outBuffer, 0);
+        encoder.SetBuffer(biasBuffer, 1);
+        encoder.SetBytes((uint)total, 2);
+        encoder.SetBytes((uint)channels, 3);
         encoder.SetBytes((uint)spatialSize, 4);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }

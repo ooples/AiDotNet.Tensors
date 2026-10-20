@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 // Convolution forward through the tuned-kernel registry on WebGPU (#1117): the established direct kernel as the
 // reference, im2col + GEMM as the candidate (see VulkanBackend.TunedConvolution).
-public sealed partial class WebGpuBackend
+public sealed partial class WebGpuBackend : IConvBiasActivationBackend
 {
     private const double ConvolutionTolerance = 1e-4;
     private TunedKernelSlot<TunedConv2DArgs>? _conv2DForwardSlot;
@@ -63,7 +63,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             _ => true, (in TunedConv2DArgs a) => Conv2DDirectReference(a)),
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("webgpu.conv2d.im2col_gemm", TunedKernelOrigin.Generated, true,
                             shape => IsAvailable && TunedConv2DArgs.GemmScratchFits(shape),
-                            (in TunedConv2DArgs a) => Conv2DIm2ColGemm(a)),
+                            (in TunedConv2DArgs a) => { Conv2DIm2ColGemm(a); ConvEpilogue.RunPasses(this, a); }),
                         // #1372: Winograd F(2x2,3x3) as transforms around one batched GEMM.
                         new DelegateTunedKernelCandidate<TunedConv2DArgs>("webgpu.conv2d.winograd_gemm", TunedKernelOrigin.Builtin, true,
                             shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradKernelsReady,
@@ -80,15 +80,83 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // The direct kernel with the args' epilogue (ConvEpilogue): its own module, since the bias is a fourth binding (input,
+    // kernel and bias read, then the output, as WithDistinctBindings orders them). Without an epilogue the established
+    // conv2d kernel runs.
     private void Conv2DDirectReference(in TunedConv2DArgs a)
     {
         var uniforms = MakeConvUniforms(a.Batch, a.InChannels, a.OutChannels, a.InHeight, a.InWidth, a.OutHeight, a.OutWidth,
             a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW);
         var (wgX, wgY, wgZ) = CalcWorkgroups8x8(a.OutWidth, a.OutHeight, a.Batch * a.OutChannels);
-        WithDistinctBindings(new[] { a.Input, a.Kernel, a.Output }, b =>
-            Dispatch3Buffer3DAsync("Convolution", WebGpuKernels.ConvolutionSource, "conv2d",
-                b[0], b[1], b[2], uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult());
+        int flags = ConvEpilogue.Flags(a);
+        if (flags == 0)
+        {
+            WithDistinctBindings(new[] { a.Input, a.Kernel, a.Output }, b =>
+                Dispatch3Buffer3DAsync("Convolution", WebGpuKernels.ConvolutionSource, "conv2d",
+                    b[0], b[1], b[2], uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult());
+            return;
+        }
+        // The uniform struct gains the flags in its first padding slot (see ConvEpilogueSource).
+        var withFlags = new float[Math.Max(uniforms.Length, 16)];
+        Array.Copy(uniforms, withFlags, uniforms.Length);
+        withFlags[15] = BitConverter.Int32BitsToSingle(flags);
+        using var placeholder = a.Bias is null ? AllocateBuffer(1) : null;
+        var bias = a.Bias ?? placeholder ?? a.Output;
+        WithDistinctBindings(new[] { a.Input, a.Kernel, bias, a.Output }, b =>
+            Dispatch4Buffer3DAsync("ConvolutionEpilogue", ConvEpilogueSource, "conv2d_epilogue",
+                b[0], b[1], b[2], b[3], withFlags, wgX, wgY, wgZ).GetAwaiter().GetResult());
     }
+
+    // WebGpuKernels.ConvolutionSource's conv2d with the epilogue: bias at binding 2, the output at 3, the uniform at 4.
+    // epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
+    private const string ConvEpilogueSource = @"
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> kernel: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+struct ConvParams {
+    batch_size: u32, in_channels: u32, out_channels: u32, in_height: u32, in_width: u32, out_height: u32, out_width: u32,
+    kernel_height: u32, kernel_width: u32, stride_h: u32, stride_w: u32, pad_h: u32, pad_w: u32, dilation_h: u32,
+    dilation_w: u32, epi: u32,
+}
+@group(0) @binding(4) var<uniform> params: ConvParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn conv2d_epilogue(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let out_x = gid.x;
+    let out_y = gid.y;
+    let out_c = gid.z % params.out_channels;
+    let batch = gid.z / params.out_channels;
+    if (out_x >= params.out_width || out_y >= params.out_height || batch >= params.batch_size) {
+        return;
+    }
+    var acc: f32 = 0.0;
+    for (var ic: u32 = 0u; ic < params.in_channels; ic = ic + 1u) {
+        for (var ky: u32 = 0u; ky < params.kernel_height; ky = ky + 1u) {
+            for (var kx: u32 = 0u; kx < params.kernel_width; kx = kx + 1u) {
+                let in_y = i32(out_y * params.stride_h + ky * params.dilation_h) - i32(params.pad_h);
+                let in_x = i32(out_x * params.stride_w + kx * params.dilation_w) - i32(params.pad_w);
+                if (in_y >= 0 && in_y < i32(params.in_height) && in_x >= 0 && in_x < i32(params.in_width)) {
+                    let in_idx = batch * params.in_channels * params.in_height * params.in_width
+                               + ic * params.in_height * params.in_width
+                               + u32(in_y) * params.in_width + u32(in_x);
+                    let k_idx = out_c * params.in_channels * params.kernel_height * params.kernel_width
+                              + ic * params.kernel_height * params.kernel_width
+                              + ky * params.kernel_width + kx;
+                    acc = acc + input[in_idx] * kernel[k_idx];
+                }
+            }
+        }
+    }
+    var r = acc;
+    if ((params.epi & 1u) != 0u) { r = r + bias[out_c]; }
+    if ((params.epi & 2u) != 0u && r < 0.0) { r = 0.0; }
+    let out_idx = batch * params.out_channels * params.out_height * params.out_width
+                + out_c * params.out_height * params.out_width
+                + out_y * params.out_width + out_x;
+    output[out_idx] = r;
+}
+";
 
     // tmp[Cout, B * L] = W[Cout, P] * col[P, B * L] as ONE GEMM, then a permute to the output's [B, Cout, L] (none for B = 1).
     private void Conv2DIm2ColGemm(in TunedConv2DArgs a)
@@ -116,6 +184,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         using var tmp = AllocateBuffer(checked(a.OutChannels * a.Batch * l));
         Gemm(a.Kernel, col, tmp, a.OutChannels, a.Batch * l, p);
         Permute(tmp, a.Output, new[] { a.OutChannels, a.Batch, l }, new[] { 1, 0, 2 });
+    }
+
+    /// <inheritdoc/>
+    public bool TryConv2DBiasActivation(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer? bias, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, FusedActivationType activation)
+    {
+        if (!ConvEpilogue.Fuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+        var args = new TunedConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
+        if (!Conv2DForwardSlot.TryExecute(args.Shape(), args)) Conv2DDirectReference(args);
+        return true;
     }
 }
 #endif

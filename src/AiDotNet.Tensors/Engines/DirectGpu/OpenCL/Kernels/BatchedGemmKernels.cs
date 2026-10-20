@@ -22,6 +22,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 #define RB_BM 64
 #define RB_BN 64
 #define RB_BK 16
+// A convolution's epilogue: epi bit 0 adds bias[channel], bit 1 applies ReLU (NaN passes through, as the relu kernel).
+// The same arithmetic as the conv2d_bias_add and relu passes it replaces.
+float conv_epilogue(float v, __global const float* bias, int channel, int epi)
+{
+    if (epi & 1) v += bias[channel];
+    if (epi & 2) v = isnan(v) ? v : fmax(0.0f, v);
+    return v;
+}
 __kernel __attribute__((reqd_work_group_size(16, 16, 1)))
 void gemm_batched_rb64(__global const float* restrict A, __global const float* restrict B, __global float* restrict C,
     const int M, const int N, const int K)
@@ -79,7 +87,8 @@ void gemm_batched_rb64(__global const float* restrict A, __global const float* r
 // With one slice the plane is C itself.
 __kernel __attribute__((reqd_work_group_size(16, 16, 1)))
 void gemm_rb64_splitk(__global const float* restrict A, __global const float* restrict B, __global float* restrict C,
-    const int M, const int N, const int K, const int lda, const int ldb, const int kChunk)
+    const int M, const int N, const int K, const int lda, const int ldb, const int kChunk, __global const float* bias,
+    const int epi)
 {
     const int tx = get_local_id(0), ty = get_local_id(1);
     const int bn0 = get_group_id(0) * RB_BN, bm0 = get_group_id(1) * RB_BM;
@@ -125,20 +134,20 @@ void gemm_rb64_splitk(__global const float* restrict A, __global const float* re
         for (int j = 0; j < 4; j++)
         {
             int c = bn0 + tx + 16 * j;
-            if (c < N) C[(long)r * N + c] = acc[i][j];
+            if (c < N) C[(long)r * N + c] = conv_epilogue(acc[i][j], bias, r, epi);
         }
     }
 }
 
-// y[i] = sum over s of partial[s][i], i < count.
+// y[i] = sum over s of partial[s][i], i < count; row i / n of y gets the epilogue (a convolution's output channel).
 __kernel void gemm_splitk_reduce(__global const float* restrict partial, __global float* restrict y, const int count,
-    const int splits)
+    const int splits, __global const float* bias, const int epi, const int n)
 {
     int i = get_global_id(0);
     if (i >= count) return;
     float sum = 0.0f;
     for (int s = 0; s < splits; s++) sum += partial[(long)s * count + i];
-    y[i] = sum;
+    y[i] = conv_epilogue(sum, bias, i / n, epi);
 }
 // col[P x L] for one image (P = C*kH*kW, L = outH*outW), one work item per element: row q = (c, kh, kw), column s. The
 // per-pixel im2col loops a work item over all of P, which leaves a late layer (14 x 14 output, P = 2304) 196 work items.

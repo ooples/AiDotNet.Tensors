@@ -140,8 +140,11 @@ public sealed partial class MetalBackend : IWinogradF23Transforms
     void IWinogradF23Transforms.Input(IGpuBuffer x, IGpuBuffer v, int n, int c, int h, int w, int pad, int tilesH, int tilesW)
         => RunWinograd(WinogradF23KernelTemplate.Input, (long)c * n * tilesH * tilesW, x, v, n, c, h, w, pad, tilesH, tilesW);
 
-    void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW)
-        => RunWinograd(WinogradF23KernelTemplate.Output, (long)k * n * tilesH * tilesW, m, y, n, k, outH, outW, tilesH, tilesW);
+    void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH, int tilesW,
+        IGpuBuffer? bias, int epilogue)
+        => TryDispatchConvPoolMetal(_winogradLibrary, WinogradLibraryName, WinogradF23KernelTemplate.Output,
+            checked((int)((long)k * n * tilesH * tilesW)), new[] { m, y, bias ?? y },
+            new[] { n, k, outH, outW, tilesH, tilesW, epilogue });
 
     void IWinogradF23Transforms.GradOutputTiles(IGpuBuffer dy, IGpuBuffer u, int n, int k, int outH, int outW, int tilesH,
         int tilesW)

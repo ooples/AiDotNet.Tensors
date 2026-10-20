@@ -9,9 +9,10 @@ internal readonly struct CudaConv2DArgs
 {
     internal CudaConv2DArgs(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        IGpuBuffer? bias = null, FusedActivationType activation = FusedActivationType.None)
     {
-        Input = input; Kernel = kernel; Output = output;
+        Input = input; Kernel = kernel; Output = output; Bias = bias; Activation = activation;
         Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
         OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
         KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW;
@@ -21,6 +22,16 @@ internal readonly struct CudaConv2DArgs
     internal IGpuBuffer Input { get; }
     internal IGpuBuffer Kernel { get; }
     internal IGpuBuffer Output { get; }
+
+    /// <summary>A per-output-channel bias added to the convolution's result, or null (see <see cref="ConvEpilogue"/>).</summary>
+    internal IGpuBuffer? Bias { get; }
+
+    /// <summary>The activation after the bias; every route produces the same result, fused or as passes after it.</summary>
+    internal FusedActivationType Activation { get; }
+
+    /// <summary>The output kernels' epilogue flags: bit 0 bias, bit 1 ReLU.</summary>
+    internal int EpilogueFlags => (Bias is null ? 0 : 1) | (Activation == FusedActivationType.ReLU ? 2 : 0);
+
     internal int Batch { get; }
     internal int InChannels { get; }
     internal int InHeight { get; }
@@ -56,7 +67,7 @@ internal readonly struct CudaConv2DArgs
 /// direct kernels and im2col + one strided-batched cuBLAS GEMM (the implicit-GEMM formulation the backward pass
 /// already uses), each selected per shape class only after the correctness and paired-timing gate.
 /// </summary>
-public sealed partial class CudaBackend
+public sealed partial class CudaBackend : IConvBiasActivationBackend
 {
     // Convolution reassociates long K = Cin*kH*kW dot products; Winograd and GEMM differ from the direct sum by
     // a few ulps of the output scale.
@@ -88,16 +99,21 @@ public sealed partial class CudaBackend
                             candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>(
                                 "nvrtc.conv2d.implicit_engine" + ConvMainloopSuffix(ml), TunedKernelOrigin.Builtin, true,
                                 _ => HasTunedKernel("conv2d_fprop_ig128_tap" + ConvMainloopSuffix(ml)),
-                                (in CudaConv2DArgs a) => ExecuteConv2DForwardEngine(a, ml)));
+                                (in CudaConv2DArgs a) => { ExecuteConv2DForwardEngine(a, ml); RunConvEpiloguePasses(a); }));
                         }
                     candidates.Add(
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.generic", TunedKernelOrigin.Builtin,
-                            true, _ => true, (in CudaConv2DArgs a) => LaunchConv2DGeneric(a.Input, a.Kernel, a.Output,
-                                a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels, a.OutHeight, a.OutWidth,
-                                a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW)));
+                            true, _ => true, (in CudaConv2DArgs a) =>
+                            {
+                                LaunchConv2DGeneric(a.Input, a.Kernel, a.Output,
+                                    a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels, a.OutHeight, a.OutWidth,
+                                    a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW);
+                                RunConvEpiloguePasses(a);
+                            }));
                     if (s_convGemmBackward)
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("cublas.conv2d.im2col_gemm",
-                            TunedKernelOrigin.Vendor, true, ConvGemmForwardFits, (in CudaConv2DArgs a) => ExecuteConv2DForwardGemm(a)));
+                            TunedKernelOrigin.Vendor, true, ConvGemmForwardFits,
+                            (in CudaConv2DArgs a) => { ExecuteConv2DForwardGemm(a); RunConvEpiloguePasses(a); }));
                     // #1274's narrow-layer implicit GEMM (Cout <= 64). It used to run ahead of the slot for every shape it
                     // admits; as a candidate it is chosen only where it measures fastest.
                     if (ImplicitConvEnabled)
@@ -105,7 +121,7 @@ public sealed partial class CudaBackend
                             TunedKernelOrigin.Builtin, true,
                             shape => HasTunedKernel("conv2d_implicit_gemm") && ImplicitConvAdmits(shape[0], shape[1],
                                 shape[4], shape[13], shape[14], shape[5], shape[6], shape[7], shape[8], shape[11], shape[12]),
-                            (in CudaConv2DArgs a) => ExecuteConv2DForwardNarrow(a)));
+                            (in CudaConv2DArgs a) => { ExecuteConv2DForwardNarrow(a); RunConvEpiloguePasses(a); }));
                     // Winograd F(2x2,3x3): 2.25x fewer multiplies for 3x3 stride-1 (what cuDNN runs for ResNet's mid
                     // layers). Never the reference: it loses where the tile count is small (ResNet-18's 512@4x4).
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.winograd_f23",
@@ -113,9 +129,12 @@ public sealed partial class CudaBackend
                         (in CudaConv2DArgs a) =>
                         {
                             if (!TryConv2DForwardWinogradF23(a))
+                            {
                                 LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                                     a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
                                     a.PadH, a.PadW, a.DilationH, a.DilationW);
+                                RunConvEpiloguePasses(a);
+                            }
                         }));
                     // The same F(2x2) arithmetic fused into one kernel after the filter transform: no V/M round trips
                     // through global memory.
@@ -127,6 +146,7 @@ public sealed partial class CudaBackend
                                 LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                                     a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
                                     a.PadH, a.PadW, a.DilationH, a.DilationW);
+                            RunConvEpiloguePasses(a);
                         }));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
                         true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)));
@@ -142,6 +162,13 @@ public sealed partial class CudaBackend
                 return Created(_conv2DForwardSlot);
             }
         }
+    }
+
+    // The bias add and ReLU after a route whose kernels do not take the epilogue (ConvEpilogue).
+    private void RunConvEpiloguePasses(in CudaConv2DArgs a)
+    {
+        if (a.Bias is { } bias) Conv2DBiasAdd(a.Output, bias, a.Batch, a.OutChannels, a.OutHeight * a.OutWidth);
+        if (a.Activation == FusedActivationType.ReLU) Relu(a.Output, a.Output, a.OutputCount);
     }
 
     // The im2col scratch is batch * Cin*kH*kW * outH*outW floats; keep it under 256 MiB.
@@ -242,19 +269,47 @@ public sealed partial class CudaBackend
             (uint)((a.OutHeight + BLOCK - 1) / BLOCK), BLOCK, 0);
     }
 
-    // conv2d_tiled and conv2d_direct share the 18-parameter ABI (in, w, out, B, Cin, H, W, Cout, OH, OW, kH, kW,
-    // sH, sW, pH, pW, dH, dW) and a (OW tiles, OH tiles, B*Cout) grid.
+    // conv2d_tiled and conv2d_direct share the 20-parameter ABI (in, w, out, B, Cin, H, W, Cout, OH, OW, kH, kW,
+    // sH, sW, pH, pW, dH, dW, bias, epilogue flags) and a (OW tiles, OH tiles, B*Cout) grid; both apply the epilogue.
     private unsafe void LaunchConv2DGrid(IntPtr function, in CudaConv2DArgs a, uint gx, uint gy, int block, uint sharedMem)
     {
         IntPtr inputPtr = a.Input.Handle, kernelPtr = a.Kernel.Handle, outputPtr = a.Output.Handle;
         int batch = a.Batch, inC = a.InChannels, inH = a.InHeight, inW = a.InWidth, outC = a.OutChannels;
         int outH = a.OutHeight, outW = a.OutWidth, kH = a.KernelH, kW = a.KernelW, sH = a.StrideH, sW = a.StrideW;
         int pH = a.PadH, pW = a.PadW, dH = a.DilationH, dW = a.DilationW;
-        void** args = stackalloc void*[18];
+        IntPtr biasPtr = (a.Bias ?? a.Output).Handle;
+        int epilogue = a.EpilogueFlags;
+        void** args = stackalloc void*[20];
         args[0] = &inputPtr; args[1] = &kernelPtr; args[2] = &outputPtr; args[3] = &batch; args[4] = &inC;
         args[5] = &inH; args[6] = &inW; args[7] = &outC; args[8] = &outH; args[9] = &outW; args[10] = &kH;
         args[11] = &kW; args[12] = &sH; args[13] = &sW; args[14] = &pH; args[15] = &pW; args[16] = &dH;
-        args[17] = &dW;
+        args[17] = &dW; args[18] = &biasPtr; args[19] = &epilogue;
         LaunchKernel3D(function, gx, gy, (uint)(batch * outC), (uint)block, (uint)block, 1, args, sharedMem);
+    }
+
+    /// <inheritdoc/>
+    public bool TryConv2DBiasActivation(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer? bias, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, FusedActivationType activation)
+    {
+        if (!ConvEpilogue.Fuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+        var args = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
+        // cuDNN, when the policy routes convolutions there, then the passes; otherwise the tuned routes (each applies the
+        // epilogue, in its output kernel or as passes after it), else the generic dispatch and the passes.
+        if (CudaDispatchPolicy.UseCudnnForConv || !Conv2DForwardSlot.TryExecute(args.Shape(), args))
+        {
+            if (CudaDispatchPolicy.UseCudnnForConv)
+                Conv2D(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            else
+                LaunchConv2DGeneric(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            RunConvEpiloguePasses(args);
+        }
+        return true;
     }
 }

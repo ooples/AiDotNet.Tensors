@@ -81,7 +81,8 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
         if (!WinogradF23Admits(a) || !EnsureWinogradModule()) return false;
         // y[n][K] = conv(x[n][C], w[K][C]): U[x][K][C] from w, GEMM rows = K, reduction = C.
         return RunWinogradF23(a.Input, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.PadH,
-            flip: false, a.Kernel, a.OutChannels, a.InChannels, a.Output, a.OutChannels, a.OutHeight, a.OutWidth);
+            flip: false, a.Kernel, a.OutChannels, a.InChannels, a.Output, a.OutChannels, a.OutHeight, a.OutWidth,
+            a.Bias, a.EpilogueFlags);
     }
 
     /// <summary>True for the input-gradient shapes this path computes (the forward conv's 3x3, stride 1, dilation 1).</summary>
@@ -97,7 +98,8 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
     {
         if (!WinogradF23AdmitsData(a) || !EnsureWinogradModule()) return false;
         return RunWinogradF23(a.First, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth, 2 - a.PadH,
-            flip: true, a.Second, a.OutChannels, a.InChannels, a.Output, a.InChannels, a.InHeight, a.InWidth);
+            flip: true, a.Second, a.OutChannels, a.InChannels, a.Output, a.InChannels, a.InHeight, a.InWidth,
+            bias: null, epilogue: 0);
     }
 
     private IGpuBuffer? _winogradWu, _winogradWv, _winogradWm;
@@ -158,7 +160,8 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
     // sixteen GEMMs, the output transform. The tile transforms are this backend's IWinogradF23Transforms; the GEMM is
     // CUDA's own, on the engine main loop, where the other backends' shared pipeline uses BatchedGemm.
     private unsafe bool RunWinogradF23(IGpuBuffer x, int n, int inC, int h, int w, int pad,
-        bool flip, IGpuBuffer weights, int fwdK, int fwdC, IGpuBuffer y, int outC, int outH, int outW)
+        bool flip, IGpuBuffer weights, int fwdK, int fwdC, IGpuBuffer y, int outC, int outH, int outW, IGpuBuffer? bias,
+        int epilogue)
     {
         int tilesH = (outH + 1) / 2, tilesW = (outW + 1) / 2;
         long p = (long)n * tilesH * tilesW;
@@ -183,7 +186,7 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
         ga[0] = &uPtr; ga[1] = &vPtr; ga[2] = &mPtr; ga[3] = &outC; ga[4] = &pi; ga[5] = &inC; ga[6] = &oneSplit; ga[7] = &wholeK;
         LaunchKernel3D(_kernelCache[tile == WinogradLargeTile ? "wino_gemm128" : "wino_gemm64"], (uint)gx, (uint)gy, 16, block, 1, 1, ga, 0);
 
-        transforms.Output(m, y, n, outC, outH, outW, tilesH, tilesW);
+        transforms.Output(m, y, n, outC, outH, outW, tilesH, tilesW, bias, epilogue);
         return true;
     }
 
@@ -214,10 +217,17 @@ public sealed partial class CudaBackend : IWinogradF23Transforms
     }
 
     unsafe void IWinogradF23Transforms.Output(IGpuBuffer m, IGpuBuffer y, int n, int k, int outH, int outW, int tilesH,
-        int tilesW)
+        int tilesW, IGpuBuffer? bias, int epilogue)
     {
-        int* ints = stackalloc int[] { n, k, outH, outW, tilesH, tilesW };
-        LaunchWinograd("wino_f23_output", (long)k * n * tilesH * tilesW, m, y, ints, 6);
+        using var _ = PushContext();
+        IntPtr readPtr = m.Handle, writePtr = y.Handle, biasPtr = (bias ?? y).Handle;
+        int* ints = stackalloc int[] { n, k, outH, outW, tilesH, tilesW, epilogue };
+        void** args = stackalloc void*[10];
+        args[0] = &readPtr; args[1] = &writePtr; args[2] = &biasPtr;
+        for (int i = 0; i < 7; i++) args[3 + i] = &ints[i];
+        long threads = (long)k * n * tilesH * tilesW;
+        uint block = (uint)DefaultBlockSize;
+        LaunchKernel(_kernelCache["wino_f23_output"], (uint)((threads + block - 1) / block), block, args);
     }
 
     unsafe void IWinogradF23Transforms.GradOutputTiles(IGpuBuffer dy, IGpuBuffer u, int n, int k, int outH, int outW,

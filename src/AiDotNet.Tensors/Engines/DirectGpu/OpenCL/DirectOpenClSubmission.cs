@@ -143,13 +143,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-        /// <summary>Commits queue ownership after, and only after, a successful native enqueue.</summary>
+        /// <summary>Commits queue ownership after, and only after, a successful native enqueue, and flushes the queue
+        /// when <see cref="DirectOpenClFlushPolicy"/> says the device needs the work.</summary>
         internal static void CommitLocked(
             IntPtr destinationQueue,
             IReadOnlyList<IDirectOpenClMemoryObject> memories)
         {
             for (int i = 0; i < memories.Count; i++)
                 memories[i].LastSubmissionQueue = destinationQueue;
+            if (DirectOpenClFlushPolicy.OnSubmitted())
+            {
+                int flushError = OpenClNativeBindings.Flush(destinationQueue);
+                if (flushError != OpenClNativeBindings.CL_SUCCESS)
+                    throw new InvalidOperationException($"clFlush failed after a submission: {flushError}");
+                DirectOpenClFlushPolicy.OnFlushed();
+            }
         }
 
         internal readonly struct SubmissionWaitList : IDisposable

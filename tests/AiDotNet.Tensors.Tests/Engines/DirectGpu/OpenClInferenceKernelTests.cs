@@ -250,4 +250,51 @@ public class OpenClInferenceKernelTests
         Assert.Equal(new[] { 0, 6, 9, 7 }, actual.Shape.ToArray());
         AssertClose(cpu.BatchNormInference(x, gamma, beta, mean, variance, 1e-5, activation), actual, 1e-5, $"empty bn {activation}");
     }
+// Every convolution route with the bias and ReLU: the fused routes apply them in their output kernel, the others
+    // after it, and all must equal the CPU's convolution, bias add and ReLU. Shapes: 3x3 stride 1 (the Winograd routes),
+    // 1x1 (the split-K GEMM on the input itself, one slice and several), and 3x3 stride 2 (im2col + GEMM).
+    [SkippableTheory]
+    [InlineData("opencl.conv2d.generic")]
+    [InlineData("opencl.conv2d.im2col_gemm")]
+    [InlineData("opencl.conv2d.tiled")]
+    [InlineData("opencl.conv2d.direct")]
+    [InlineData("opencl.conv2d.winograd_gemm")]
+    [InlineData("opencl.conv2d.winograd_f43_gemm")]
+    [InlineData("opencl.conv2d.winograd_fused")]
+    [InlineData("opencl.conv2d.im2col_rb_gemm")]
+    public void Fused_convolution_bias_and_relu_match_cpu_on_every_route(string route)
+    {
+        using var gpu = RequireEngine();
+        var cpu = new CpuEngine();
+        var op = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.Conv2DForward;
+        var previous = AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.OverrideFor(op);
+        AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.SetOverride(op, route);
+        try
+        {
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(37);
+            var shapes = new (int C, int H, int W, int O, int K, int S, int P)[]
+            {
+                (8, 13, 11, 6, 3, 1, 1), (24, 9, 10, 40, 3, 1, 1), (16, 7, 7, 12, 1, 1, 0), (512, 7, 7, 70, 1, 1, 0),
+                (6, 15, 13, 9, 3, 2, 1),
+            };
+            foreach (var (c, h, w, o, k, s, pad) in shapes)
+            {
+                var x = Random(rng, 1, c, h, w);
+                var kernel = Random(rng, o, c, k, k);
+                var bias = Random(rng, o);
+                foreach (var withBias in new[] { true, false })
+                    foreach (var activation in new[] { FusedActivationType.None, FusedActivationType.ReLU })
+                    {
+                        var b = withBias ? bias : null;
+                        AssertClose(cpu.FusedConv2D(x, kernel, b, s, s, pad, pad, 1, 1, activation),
+                            gpu.FusedConv2D(x, kernel, b, s, s, pad, pad, 1, 1, activation), 1e-4,
+                            $"{route} {c}x{h}x{w}->{o} k{k} s{s} bias={withBias} {activation}");
+                    }
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelPolicy.SetOverride(op, previous);
+        }
+    }
 }

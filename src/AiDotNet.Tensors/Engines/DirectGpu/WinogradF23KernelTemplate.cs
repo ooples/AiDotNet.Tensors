@@ -38,7 +38,8 @@ internal static class WinogradF23KernelTemplate
     internal const string InputTilesTileMajor = "wino_f32w_input";
     internal const string FilterGradient = "wino_f32w_output";
 
-    /// <summary>One kernel: its buffers in binding order (the first read, the second written) and its int parameters.</summary>
+    /// <summary>One kernel: its buffers in binding order (the second written, every other one read) and its int
+    /// parameters.</summary>
     internal sealed class Spec
     {
         internal Spec(string name, string[] buffers, string[] ints, string body)
@@ -145,8 +146,9 @@ internal static class WinogradF23KernelTemplate
     int p = idx / C, c = idx - p * C;
 " + InputTail),
 
-        // Y = A^T m A, A^T = [[1,1,1,0],[0,1,-1,-1]]; writes the in-bounds 2x2 outputs of tile p of channel k.
-        new Spec(Output, new[] { "mm", "y" }, new[] { "N", "K", "outH", "outW", "tilesH", "tilesW" }, @"
+        // Y = A^T m A, A^T = [[1,1,1,0],[0,1,-1,-1]]; writes the in-bounds 2x2 outputs of tile p of channel k. The
+        // convolution's epilogue: epi bit 0 adds bias[k], bit 1 applies ReLU (v < 0 is false for NaN, which passes).
+        new Spec(Output, new[] { "mm", "y", "bias" }, new[] { "N", "K", "outH", "outW", "tilesH", "tilesW", "epi" }, @"
     int P = N * tilesH * tilesW;
     int idx = gid;
     if (idx >= K * P) return;
@@ -164,11 +166,20 @@ internal static class WinogradF23KernelTemplate
     }
     int dst = (n * K + k) * outH * outW;
     int h = th * 2, w2 = tw * 2;
+    float bk = ((epi & 1) != 0) ? bias[k] : 0.0f;
+    bool relu = (epi & 2) != 0;
     for (int i = 0; i < 2; i++)
     {
         if (h + i >= outH) break;
-        y[dst + (h + i) * outW + w2] = s[i * 4] + s[i * 4 + 1] + s[i * 4 + 2];
-        if (w2 + 1 < outW) y[dst + (h + i) * outW + w2 + 1] = s[i * 4 + 1] - s[i * 4 + 2] - s[i * 4 + 3];
+        float o0 = s[i * 4] + s[i * 4 + 1] + s[i * 4 + 2] + bk;
+        if (relu && o0 < 0.0f) o0 = 0.0f;
+        y[dst + (h + i) * outW + w2] = o0;
+        if (w2 + 1 < outW)
+        {
+            float o1 = s[i * 4 + 1] - s[i * 4 + 2] - s[i * 4 + 3] + bk;
+            if (relu && o1 < 0.0f) o1 = 0.0f;
+            y[dst + (h + i) * outW + w2 + 1] = o1;
+        }
     }
 "),
 
@@ -273,7 +284,7 @@ internal static class WinogradF23KernelTemplate
             var parameters = new List<string>();
             for (int i = 0; i < spec.Buffers.Length; i++)
             {
-                bool read = i == 0;
+                bool read = i != 1;
                 parameters.Add(dialect switch
                 {
                     WinogradKernelDialect.OpenCl => (read ? "__global const float* restrict " : "__global float* restrict ") + spec.Buffers[i],
