@@ -87,7 +87,7 @@ public sealed class ConvFpropR8Tests
                             }
                         int idx = ((b * outC + co) * outH + oh) * outW + ow;
                         Assert.False(float.IsNaN(got[idx]), $"y[{idx}] was never written");
-                        Assert.True(BitConverter.SingleToInt32Bits(got[idx]) == BitConverter.SingleToInt32Bits(again[idx]),
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(got[idx]) == TestHelpers.MathCompat.SingleToInt32Bits(again[idx]),
                             $"y[{idx}] differs between two identical runs");
                         double rel = Math.Abs(got[idx] - s) / Math.Max(1.0, m);
                         worst = Math.Max(worst, rel);
