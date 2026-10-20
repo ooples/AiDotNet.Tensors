@@ -118,10 +118,13 @@ internal interface IGraphStepIo : IDisposable
     /// <summary>
     /// Builds, before the captures, the tables of a ping-pong SGD update: direction 0 reads the weights from
     /// <paramref name="first"/> and writes the updated weights to <paramref name="second"/>, direction 1 the reverse.
+    /// A tensor marked in <paramref name="fusable"/> (null: none) has its gradient written by one backward op, which
+    /// overwrites it: the backend may apply that tensor's update in the kernel writing the gradient instead.
     /// </summary>
     void PrepareSgdPingPong(System.Collections.Generic.IReadOnlyList<IGpuBuffer> first,
         System.Collections.Generic.IReadOnlyList<IGpuBuffer> second,
-        System.Collections.Generic.IReadOnlyList<IGpuBuffer> gradients, System.Collections.Generic.IReadOnlyList<int> sizes);
+        System.Collections.Generic.IReadOnlyList<IGpuBuffer> gradients, System.Collections.Generic.IReadOnlyList<int> sizes,
+        System.Collections.Generic.IReadOnlyList<bool>? fusable, float weightDecay);
 
     /// <summary>
     /// Records, inside the capture, one direction of the ping-pong SGD update: the updated weights written to the other

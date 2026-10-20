@@ -81,7 +81,7 @@ __device__ __forceinline__ void wino_gemm_body(const float* __restrict__ A, cons
 }
 ";
 
-    public static string GetSource() => WinogradGemmCore + @"
+    public static string GetSource() => CudaOptimizerKernels.PingPongDevice + WinogradGemmCore + @"
 
 // U[x][k][c] = (G g G^T)[x], G = [[1,0,0],[1/2,1/2,1/2],[1/2,-1/2,1/2],[0,0,1]].
 extern ""C"" __global__ void wino_f23_filter(const float* __restrict__ w, float* __restrict__ u, int K, int C)
@@ -366,10 +366,13 @@ extern ""C"" __global__ void wino_f23_output(const float* __restrict__ mm, float
 #define WF_TC 32
 #define WF_PC 8
 #define WF_LD 36   // padded row: a warp's 8 tiles x 4 channels of transform stores hit 32 distinct banks
-template <bool DIRECT>
+// SGD (direct only): the ping-pong SGD step fused into the epilogue (PpFused): besides dW, each element's updated weight
+// goes to f.dst, and the block's sum of dW^2 to f.partials (sgd_pingpong_update then skips this tensor).
+template <bool DIRECT, bool SGD = false>
 __device__ __forceinline__ void wino_f32w_fused_body(
     const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
-    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit)
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit,
+    PpFused f = PpFused())
 {
     __shared__ __align__(16) float smem[2 * 16 * WF_PC * WF_LD];
     float (*Us)[WF_PC][WF_LD] = reinterpret_cast<float (*)[WF_PC][WF_LD]>(smem);
@@ -485,6 +488,8 @@ __device__ __forceinline__ void wino_f32w_fused_body(
     float* Os = smem + 16 * 8 * 33;        // [8][32 * 9]
     float* dst = out + (long long)blockIdx.z * K * C * 9;
     const int cw = min(WF_TC, C - c0);     // this block's columns (ragged last tile)
+    double sumSquares = 0.0;
+    const float learningRate = SGD ? f.dyn[0] : 0.0f;
     #pragma unroll
     for (int quarter = 0; quarter < 4; quarter++)
     {
@@ -529,9 +534,25 @@ __device__ __forceinline__ void wino_f32w_fused_body(
         {
             const int kl = i / 288, r = i - kl * 288;
             const int k = k0 + quarter * 8 + kl;
-            if (k < K && r < cw * 9) dst[((long long)k * C + c0) * 9 + r] = Os[i];
+            if (k < K && r < cw * 9)
+            {
+                const long long e = ((long long)k * C + c0) * 9 + r;
+                const float g = Os[i];
+                dst[e] = g;
+                if constexpr (SGD)
+                {
+                    sumSquares += (double)g * (double)g;
+                    f.dst[e] = pp_sgd_step(f.src[e], g, learningRate, f.weightDecay);
+                }
+            }
         }
         __syncthreads();
+    }
+    if constexpr (SGD)
+    {
+        __shared__ double warpSums[8];
+        const double blockSum = pp_block_sum(sumSquares, warpSums);
+        if (tid == 0) f.partials[f.slot + blockIdx.y * gridDim.x + blockIdx.x] = blockSum;
     }
     }
     else
@@ -599,6 +620,14 @@ extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused_direct(
     wino_f32w_fused_body<true>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit);
 }
 
+// wino_f32w_fused_direct with the ping-pong SGD step fused into its epilogue (one split; grid z = 1).
+extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused_direct_sgd(
+    const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
+    int N, int C, int H, int W, int K, int outH, int outW, int pad, int tilesH, int tilesW, int tilesPerSplit, PpFused f)
+{
+    wino_f32w_fused_body<true, true>(x, dy, out, N, C, H, W, K, outH, outW, pad, tilesH, tilesW, tilesPerSplit, f);
+}
+
 // Split tiles: component-major partials for conv2d_wgrad_winograd_finish.
 extern ""C"" __global__ __launch_bounds__(256) void wino_f32w_fused(
     const float* __restrict__ x, const float* __restrict__ dy, float* __restrict__ out,
@@ -618,11 +647,52 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_winograd_finish
     for (int z = 0; z < splits; z++) sum += partials[((long long)z * 9 + q) * KC + kc];
     dw[i] = sum;
 }
+
+// conv2d_wgrad_winograd_finish with the ping-pong SGD step fused (PpFused): dW, the updated weights, and each block's
+// sum of dW^2 in f.partials[f.slot + blockIdx.x].
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_winograd_finish_sgd(
+    const float* __restrict__ partials, float* __restrict__ dw, int KC, int splits, PpFused f)
+{
+    __shared__ double warpSums[8];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double sumSquares = 0.0;
+    if (i < KC * 9)
+    {
+        const int kc = i / 9, q = i - kc * 9;
+        float sum = 0.0f;
+        for (int z = 0; z < splits; z++) sum += partials[((long long)z * 9 + q) * KC + kc];
+        dw[i] = sum;
+        sumSquares = (double)sum * (double)sum;
+        f.dst[i] = pp_sgd_step(f.src[i], sum, f.dyn[0], f.weightDecay);
+    }
+    const double blockSum = pp_block_sum(sumSquares, warpSums);
+    if (threadIdx.x == 0) f.partials[f.slot + blockIdx.x] = blockSum;
+}
+
+// conv2d_wgrad_splitk_reduce (CudaConvolutionKernels) with the ping-pong SGD step fused, as above.
+extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce_sgd(
+    const float* __restrict__ partials, float* __restrict__ gradKernel, int count, int splits, PpFused f)
+{
+    __shared__ double warpSums[8];
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double sumSquares = 0.0;
+    if (i < count)
+    {
+        float sum = 0.0f;
+        for (int z = 0; z < splits; z++) sum += partials[(long long)z * count + i];
+        gradKernel[i] = sum;
+        sumSquares = (double)sum * (double)sum;
+        f.dst[i] = pp_sgd_step(f.src[i], sum, f.dyn[0], f.weightDecay);
+    }
+    const double blockSum = pp_block_sum(sumSquares, warpSums);
+    if (threadIdx.x == 0) f.partials[f.slot + blockIdx.x] = blockSum;
+}
 ";
 
     public static string[] GetKernelNames() => new[]
     {
         "wino_f23_filter", "wino_f23_filter_flip", "wino_f23_input", "wino_gemm128", "wino_gemm64", "wino_f23_output", "wino_f32w_dy", "wino_f32w_input", "wino_f32w_output",
         "wino_f32w_fused", "wino_f32w_fused_direct", "conv2d_wgrad_winograd_finish",
+        "wino_f32w_fused_direct_sgd", "conv2d_wgrad_winograd_finish_sgd", "conv2d_wgrad_splitk_reduce_sgd",
     };
 }

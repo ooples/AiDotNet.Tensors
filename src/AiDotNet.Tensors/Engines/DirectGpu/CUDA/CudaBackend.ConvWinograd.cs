@@ -187,9 +187,42 @@ public sealed partial class CudaBackend : IWinogradF23Transforms, IWinogradFused
 
         using var _ = PushContext();
         IWinogradFusedFilterGradient fused = this;
-        fused.FusedFilterGradient(splits == 1, a.First, partials ?? a.Output, a.Second, gx * gy * splits,
-            new[] { n, c, h, w, k, outH, outW, pad, tilesH, tilesW, tilesPerSplit });
+        var ints = new[] { n, c, h, w, k, outH, outW, pad, tilesH, tilesW, tilesPerSplit };
+        if (_fusedSgdCapture is not null && TryLaunchWinogradFusedWithSgd(a, partials, ints, gx, gy, splits, (int)kc)) return true;
+        fused.FusedFilterGradient(splits == 1, a.First, partials ?? a.Output, a.Second, gx * gy * splits, ints);
         if (partials is not null) fused.FusedFilterGradientFinish(partials, a.Output, (int)kc, splits);
+        return true;
+    }
+
+    // In a step graph whose ping-pong update this gradient feeds (FusedSgd): the direct kernel, or the split finish, applies
+    // the update as it writes dW. False, with nothing launched, when the update stays in sgd_pingpong_update.
+    private unsafe bool TryLaunchWinogradFusedWithSgd(in TunedConv2DBackwardArgs a, IGpuBuffer? partials, int[] ints,
+        int gx, int gy, int splits, int kc)
+    {
+        int count = 9 * kc;
+        if (partials is null)
+        {
+            if (!_kernelCache.TryGetValue("wino_f32w_fused_direct_sgd", out var directSgd)
+                || !TryClaimFusedSgd(a.Output, count, gx * gy, out var directUpdate))
+                return false;
+            IntPtr xPtr = a.First.Handle, dyPtr = a.Second.Handle, dwPtr = a.Output.Handle;
+            int* directInts = stackalloc int[ints.Length];
+            void** directArgs = stackalloc void*[4 + ints.Length];
+            directArgs[0] = &xPtr; directArgs[1] = &dyPtr; directArgs[2] = &dwPtr;
+            for (int i = 0; i < ints.Length; i++) { directInts[i] = ints[i]; directArgs[3 + i] = &directInts[i]; }
+            directArgs[3 + ints.Length] = &directUpdate;
+            LaunchKernel3D(directSgd, (uint)gx, (uint)gy, 1, (uint)DefaultBlockSize, 1, 1, directArgs, 0);
+            return true;
+        }
+        int finishBlocks = (count + DefaultBlockSize - 1) / DefaultBlockSize;
+        if (!_kernelCache.TryGetValue("conv2d_wgrad_winograd_finish_sgd", out var finishSgd)
+            || !TryClaimFusedSgd(a.Output, count, finishBlocks, out var finishUpdate))
+            return false;
+        ((IWinogradFusedFilterGradient)this).FusedFilterGradient(false, a.First, partials, a.Second, gx * gy * splits, ints);
+        IntPtr partPtr = partials.Handle, outPtr = a.Output.Handle;
+        void** finishArgs = stackalloc void*[5];
+        finishArgs[0] = &partPtr; finishArgs[1] = &outPtr; finishArgs[2] = &kc; finishArgs[3] = &splits; finishArgs[4] = &finishUpdate;
+        LaunchKernel(finishSgd, (uint)finishBlocks, (uint)DefaultBlockSize, finishArgs);
         return true;
     }
 

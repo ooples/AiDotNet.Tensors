@@ -204,6 +204,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // How each step's backward was built ("specialized:Op", "generic:Op", "fused:..."), in build order. Test hook.
     private string[]? _backwardStepKinds;
 
+    // Per parameter: exactly one forward step consumes it, so one backward op writes (overwrites) its gradient. Only
+    // these may have their ping-pong update fused into the kernel that writes the gradient (IGraphStepIo.PrepareSgdPingPong).
+    private bool[]? _singleConsumerParameters;
+
     /// <summary>True once one eager step has run with every candidate zeroed and recorded which ones it wrote.</summary>
     private bool _eagerFirstWriteVerified;
     // #1624 liveness pooling: re-zero schedule indexed by backward action index.
@@ -6390,7 +6394,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     try
                     {
-                        io.PrepareSgdPingPong(capParams, pingPong, capGrads, capSizes);
+                        io.PrepareSgdPingPong(capParams, pingPong, capGrads, capSizes,
+                            _singleConsumerParameters is { } single && single.Length == paramCount ? single : null, (float)wd);
                         return;
                     }
                     catch (Exception prepareFailure)
@@ -9144,6 +9149,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan._backwardStepKinds = backwardStepNames.ToArray();
+            var singleConsumer = new bool[parameters.Length];
+            for (int i = 0; i < parameters.Length; i++)
+                singleConsumer[i] = consumerCount.TryGetValue(parameters[i], out int uses) && uses == 1;
+            plan._singleConsumerParameters = singleConsumer;
             scope.ReleaseStorageLeases();
             return plan;
         }

@@ -344,6 +344,17 @@ public sealed partial class CudaBackend
     // dst[i] = sum over z of partials[z][i], in z order (conv2d_wgrad_splitk_reduce).
     private unsafe void LaunchSplitKReduce(IntPtr reduce, IGpuBuffer partials, IGpuBuffer destination, int count, int splits)
     {
+        uint reduceBlocks = (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize);
+        // In a step graph whose ping-pong update this gradient feeds, the reduce applies the update too (FusedSgd).
+        if (_fusedSgdCapture is not null && _kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce_sgd", out var reduceSgd)
+            && TryClaimFusedSgd(destination, count, (int)reduceBlocks, out var fused))
+        {
+            IntPtr fusedPart = partials.Handle, fusedDst = destination.Handle;
+            void** fargs = stackalloc void*[5];
+            fargs[0] = &fusedPart; fargs[1] = &fusedDst; fargs[2] = &count; fargs[3] = &splits; fargs[4] = &fused;
+            LaunchKernel(reduceSgd, reduceBlocks, DefaultBlockSize, fargs);
+            return;
+        }
         IntPtr partPtr = partials.Handle, dstPtr = destination.Handle;
         void** rargs = stackalloc void*[4];
         rargs[0] = &partPtr; rargs[1] = &dstPtr; rargs[2] = &count; rargs[3] = &splits;

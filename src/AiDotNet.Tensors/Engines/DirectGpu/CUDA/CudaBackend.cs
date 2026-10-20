@@ -14136,10 +14136,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// One ping-pong SGD step over <paramref name="table"/> (see sgd_pingpong_update): the updated weights to the
     /// destinations, the gradients' sum of squares onto <paramref name="guard"/> (a double), and the undo of a step whose
     /// guard is then not finite. <paramref name="partials"/> holds a double per block (at least one per chunk is
-    /// allocated); <paramref name="done"/> is a zeroed counter the kernel leaves zeroed.
+    /// allocated); <paramref name="done"/> is a zeroed counter the kernel leaves zeroed. The tensors in
+    /// <paramref name="skip"/> were updated by their weight-gradient kernels (FusedSgd): the kernel leaves their update
+    /// alone, adds the <paramref name="fusedPartialCount"/> sums those kernels left in <paramref name="fusedPartials"/>
+    /// to the guard, and still undoes them when it is not finite.
     /// </summary>
     private unsafe void SgdPingPongUpdate(MultiTensorTable table, float weightDecay, IntPtr dynamicScalars,
-        IGpuBuffer partials, IGpuBuffer done, IntPtr guard)
+        IGpuBuffer partials, IGpuBuffer done, IntPtr guard, PpSkipArgs skip = default, IntPtr fusedPartials = default,
+        int fusedPartialCount = 0)
     {
         if (table.TotalChunks == 0) return;
         if (partials.Size < 2 * table.TotalChunks) throw new ArgumentException("The partials need a double per chunk.", nameof(partials));
@@ -14149,9 +14153,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
         IntPtr partialsH = partials.Handle, doneH = done.Handle;
         int n = table.Sizes.Length, totalChunks = table.TotalChunks;
-        void** args = stackalloc void*[11];
+        void** args = stackalloc void*[14];
         args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &n; args[5] = &totalChunks;
         args[6] = &weightDecay; args[7] = &dynamicScalars; args[8] = &partialsH; args[9] = &doneH; args[10] = &guard;
+        args[11] = &skip; args[12] = &fusedPartials; args[13] = &fusedPartialCount;
         uint blocks = (uint)Math.Min(totalChunks, PingPongBlocksPerSm * Math.Max(1, _multiProcessorCount));
         LaunchKernel(kernel, blocks, MultiTensorChunk, args);
     }

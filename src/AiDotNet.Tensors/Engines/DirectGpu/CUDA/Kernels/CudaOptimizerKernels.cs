@@ -12,6 +12,57 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 internal static class CudaOptimizerKernels
 {
     /// <summary>
+    /// The ping-pong SGD step's device helpers, shared by sgd_pingpong_update and the weight-gradient kernels that fuse
+    /// the update into their epilogue (CudaConvWinogradKernels' *_sgd entries), so every parameter rounds the same
+    /// whichever kernel updates it. Both modules compile with the same NVRTC options.
+    /// </summary>
+    internal const string PingPongDevice = @"
+// The block's sum, valid in thread 0. warpSums: 8 doubles of shared memory, free on entry and on return.
+__device__ __forceinline__ double pp_block_sum(double v, double* warpSums)
+{
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        v += __shfl_down_sync(0xFFFFFFFF, v, o);
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) warpSums[warp] = v;
+    __syncthreads();
+    v = 0.0;
+    if (warp == 0)
+    {
+        v = lane < (int)((blockDim.x + 31) >> 5) ? warpSums[lane] : 0.0;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            v += __shfl_down_sync(0xFFFFFFFF, v, o);
+    }
+    __syncthreads();
+    return v;
+}
+
+// One parameter's SGD step: src - lr * (g + wd * src) (sgd_multi_tensor_update's arithmetic).
+__device__ __forceinline__ float pp_sgd_step(float w, float g, float learningRate, float weightDecay)
+{
+    if (weightDecay > 0.0f) g += weightDecay * w;
+    return w - learningRate * g;
+}
+
+// The tensors (t < 256) whose update a weight-gradient kernel already applied in its epilogue: sgd_pingpong_update
+// skips their update and their sum of squares (the fusing kernels left theirs in fusedPartials), but still undoes them.
+struct PpSkip { unsigned int bits[8]; };
+
+// A weight-gradient kernel's fused update: dst = pp_sgd_step(src, dW), and the sum of dW^2 of block b in
+// partials[slot + b]. dyn[0] is the step's learning rate.
+struct PpFused
+{
+    const float* src;
+    float* dst;
+    const float* dyn;
+    double* partials;
+    float weightDecay;
+    int slot;
+};
+";
+
+    /// <summary>
     /// Gets all optimizer kernel sources.
     /// </summary>
     public static string GetSource()
@@ -1219,27 +1270,7 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device
 // Table: ptrs[t] = tensor t's source weights, ptrs[n + t] its destination, ptrs[2n + t] its gradient, cut into
 // PP_CHUNK-element chunks (CudaBackend.PingPongChunk, 1024) that a bounded grid strides over.
 
-// The block's sum, valid in thread 0. warpSums: 8 doubles of shared memory, free on entry and on return.
-__device__ __forceinline__ double pp_block_sum(double v, double* warpSums)
-{
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        v += __shfl_down_sync(0xFFFFFFFF, v, o);
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    if (lane == 0) warpSums[warp] = v;
-    __syncthreads();
-    v = 0.0;
-    if (warp == 0)
-    {
-        v = lane < (int)((blockDim.x + 31) >> 5) ? warpSums[lane] : 0.0;
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1)
-            v += __shfl_down_sync(0xFFFFFFFF, v, o);
-    }
-    __syncthreads();
-    return v;
-}
-
+" + PingPongDevice + @"
 // Elements per ping-pong chunk (CudaBackend.PingPongChunk must match): one 16-byte load of each operand per thread.
 #define PP_CHUNK 1024
 
@@ -1262,7 +1293,10 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
     const float* __restrict__ dyn,
     double* __restrict__ partials,
     unsigned int* __restrict__ done,
-    double* __restrict__ guard)
+    double* __restrict__ guard,
+    PpSkip skip,
+    const double* __restrict__ fusedPartials,
+    int fusedCount)
 {
     __shared__ double warpSums[8];
     __shared__ int isLast, undo;
@@ -1271,6 +1305,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
     for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
     {
         const int t = chunkTensor[c];
+        if (t < 256 && ((skip.bits[t >> 5] >> (t & 31)) & 1u) != 0u) continue;   // updated by its dW kernel
         const int start = chunkStart[c];
         const int end = min(start + PP_CHUNK, sizes[t]);
         const float* src = (const float*)ptrs[t];
@@ -1287,10 +1322,10 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
                     float s = g.x * g.x + g.y * g.y + g.z * g.z + g.w * g.w;
                     v += isfinite(s) ? (double)s
                         : (double)g.x * (double)g.x + (double)g.y * (double)g.y + (double)g.z * (double)g.z + (double)g.w * (double)g.w;
-                    if (weightDecay > 0.0f) {
-                        g.x += weightDecay * w.x; g.y += weightDecay * w.y; g.z += weightDecay * w.z; g.w += weightDecay * w.w;
-                    }
-                    w.x -= learningRate * g.x; w.y -= learningRate * g.y; w.z -= learningRate * g.z; w.w -= learningRate * g.w;
+                    w.x = pp_sgd_step(w.x, g.x, learningRate, weightDecay);
+                    w.y = pp_sgd_step(w.y, g.y, learningRate, weightDecay);
+                    w.z = pp_sgd_step(w.z, g.z, learningRate, weightDecay);
+                    w.w = pp_sgd_step(w.w, g.w, learningRate, weightDecay);
                     *reinterpret_cast<float4*>(dst + e) = w;
                 }
                 else
@@ -1300,11 +1335,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
                         float g = gradient[i];
                         float w = src[i];
                         v += (double)g * (double)g;
-                        if (weightDecay > 0.0f) {
-                            g += weightDecay * w;
-                        }
-                        w -= learningRate * g;
-                        dst[i] = w;
+                        dst[i] = pp_sgd_step(w, g, learningRate, weightDecay);
                     }
                 }
             }
@@ -1316,11 +1347,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
                 float g = gradient[i];
                 float w = src[i];
                 v += (double)g * (double)g;
-                if (weightDecay > 0.0f) {
-                    g += weightDecay * w;
-                }
-                w -= learningRate * g;
-                dst[i] = w;
+                dst[i] = pp_sgd_step(w, g, learningRate, weightDecay);
             }
         }
     }
@@ -1337,6 +1364,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
     {
         double total = 0.0;
         for (int k = threadIdx.x; k < (int)gridDim.x; k += 32) total += __ldcg(partials + k);
+        for (int k = threadIdx.x; k < fusedCount; k += 32) total += __ldcg(fusedPartials + k);   // the fused updates' sums
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1)
             total += __shfl_down_sync(0xFFFFFFFF, total, o);

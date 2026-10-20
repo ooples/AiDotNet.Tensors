@@ -110,6 +110,17 @@ public sealed partial class CudaBackend
         private readonly MultiTensorTable?[] _pingPong = new MultiTensorTable?[2];   // A -> B, B -> A (PrepareSgdPingPong)
         private IGpuBuffer? _pingPongPartials;   // a double per chunk
         private IGpuBuffer? _pingPongDone;       // the kernel's finished-block counter, zero between launches
+        private bool[]? _pingPongFusable;        // tensors a dW kernel may update (PrepareSgdPingPong)
+        private float _pingPongWeightDecay;
+        private IGpuBuffer? _fusedPartials;      // the fused updates' per-block sums of squares (doubles)
+        private CudaBackend.FusedSgdCapture? _fusedCapture;   // the graph being captured's claims
+        private int _fusedCaptureDirection = -1;
+
+        // Per-block partial sums the fused dW kernels of one step graph may write (ResNet-18 uses ~3K).
+        private const int FusedPartialCapacity = 16384;
+
+        /// <summary>Tensors a dW kernel updated in the last captured graph of each direction (tests).</summary>
+        internal int[] FusedTensorCounts { get; } = new int[2];
         private IGpuBuffer? _copySource, _copyDestination;   // the prologue's per-replay device copy (TrySetPrologueCopy)
         private int _copyCount;
         private bool _disposed;
@@ -291,7 +302,7 @@ public sealed partial class CudaBackend
         }
 
         public void PrepareSgdPingPong(IReadOnlyList<IGpuBuffer> first, IReadOnlyList<IGpuBuffer> second,
-            IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes)
+            IReadOnlyList<IGpuBuffer> gradients, IReadOnlyList<int> sizes, IReadOnlyList<bool>? fusable, float weightDecay)
         {
             EnsureOptimizerBuffers();
             DisposePingPong();
@@ -300,14 +311,58 @@ public sealed partial class CudaBackend
             _pingPongPartials = _backend.AllocateBuffer(Math.Max(2, 2 * _pingPong[0]!.TotalChunks));
             _pingPongDone = _backend.AllocateBuffer(2);
             ((IDeviceZeroFill)_backend).ZeroBuffer(_pingPongDone, 2);
+            _pingPongWeightDecay = weightDecay;
+            _pingPongFusable = null;
+            if (fusable is not null && fusable.Count == sizes.Count && CudaBackend.FusedSgdEnabled)
+            {
+                var flags = new bool[sizes.Count];
+                bool any = false;
+                for (int t = 0; t < flags.Length; t++) any |= flags[t] = fusable[t];
+                if (any)
+                {
+                    _pingPongFusable = flags;
+                    _fusedPartials = _backend.AllocateBuffer(2 * FusedPartialCapacity);
+                }
+            }
+        }
+
+        // Arms the fused updates for the step graph of `parity` about to be captured (its ping-pong direction).
+        private void ArmFusedSgd(int parity)
+        {
+            _backend._fusedSgdCapture = null;
+            _fusedCapture = null;
+            _fusedCaptureDirection = -1;
+            if (_pingPongFusable is not { } fusable || _fusedPartials is null || _pingPong[parity & 1] is not { } table) return;
+            int n = table.Sizes.Length;
+            var src = new IntPtr[n];
+            var dst = new IntPtr[n];
+            var grads = new IntPtr[n];
+            for (int t = 0; t < n; t++)
+            {
+                src[t] = table.Handles[t];
+                dst[t] = table.Handles[n + t];
+                grads[t] = table.Handles[2 * n + t];
+            }
+            _fusedCapture = new CudaBackend.FusedSgdCapture(src, dst, grads, table.Sizes, fusable, _dynamicScalars!.Handle,
+                _fusedPartials, _pingPongWeightDecay);
+            _fusedCaptureDirection = parity & 1;
+            _backend._fusedSgdCapture = _fusedCapture;
         }
 
         public void CaptureSgdPingPongUpdate(int direction, float weightDecay)
         {
             var table = _pingPong[direction & 1]
                 ?? throw new InvalidOperationException("PrepareSgdPingPong was not called before the capture.");
+            // The tensors whose dW kernel applied the update already (armed by CapturePrologue for this graph).
+            var capture = _fusedCaptureDirection == (direction & 1) ? _fusedCapture : null;
+            _backend._fusedSgdCapture = null;
+            _fusedCapture = null;
+            _fusedCaptureDirection = -1;
+            var (skip, fusedCount) = capture?.Snapshot() ?? default;
+            FusedTensorCounts[direction & 1] = capture?.ClaimedCount ?? 0;
             // The update and the gradients' sum of squares in one pass; the same launch undoes a non-finite step.
-            _backend.SgdPingPongUpdate(table, weightDecay, _dynamicScalars!.Handle, _pingPongPartials!, _pingPongDone!, _guard!.Handle);
+            _backend.SgdPingPongUpdate(table, weightDecay, _dynamicScalars!.Handle, _pingPongPartials!, _pingPongDone!,
+                _guard!.Handle, skip, fusedCount > 0 ? _fusedPartials!.Handle : IntPtr.Zero, fusedCount);
         }
 
         public bool CapturedGraphReads(IntPtr graphExec, IReadOnlyList<IGpuBuffer> buffers)
@@ -319,6 +374,11 @@ public sealed partial class CudaBackend
             _pingPong[1]?.Dispose(); _pingPong[1] = null;
             _pingPongPartials?.Dispose(); _pingPongPartials = null;
             _pingPongDone?.Dispose(); _pingPongDone = null;
+            if (ReferenceEquals(_backend._fusedSgdCapture, _fusedCapture)) _backend._fusedSgdCapture = null;
+            _fusedCapture = null;
+            _fusedCaptureDirection = -1;
+            _fusedPartials?.Dispose(); _fusedPartials = null;
+            _pingPongFusable = null;
         }
 
         public void CaptureAdamUpdate(bool decoupled, IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
@@ -358,6 +418,7 @@ public sealed partial class CudaBackend
 
         public void CapturePrologue(int parity)
         {
+            ArmFusedSgd(parity);
             if (!_backend._kernelCache.TryGetValue("step_io_prologue", out var prologueKernel))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: step_io_prologue");
             var args = default(StepIoArgs);
