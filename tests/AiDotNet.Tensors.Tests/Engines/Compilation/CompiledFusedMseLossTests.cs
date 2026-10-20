@@ -54,7 +54,9 @@ public class CompiledFusedMseLossTests : IDisposable
         ICompiledTrainingPlan<float> plan;
         using (var scope = GraphMode.EnableTraining(parameters))
         {
-            var pred = engine.FusedLinear(x, w, b, FusedActivationType.None);
+            // A ReLU head: a plain linear head into the loss fuses further, into FusedLinearMseLoss
+            // (CompiledFusedLinearMseLossTests).
+            var pred = engine.FusedLinear(x, w, b, FusedActivationType.ReLU);
             engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(pred, y)), new[] { 0, 1 }, keepDims);
             plan = scope.CompileTraining(parameters);
         }
