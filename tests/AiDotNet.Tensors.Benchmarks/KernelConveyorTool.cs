@@ -154,7 +154,12 @@ internal static class KernelConveyorTool
         foreach (var entry in entries)
         {
             var emitter = new PtxAffineEmitter();
-            string ptx = emitter.Emit(entry.Bench, 8, 6);
+            // --winner applies a tuned configuration, so a candidate's PTX can be inspected
+            // (and its emission failures reproduced) without a device; --arch 75 targets Turing.
+            ApplyTuned(emitter, entry.Name, ValueOf(args, "--winner"));
+            int major = ValueOf(args, "--arch") is string arch ? int.Parse(arch, CultureInfo.InvariantCulture) / 10 : 8;
+            int minor = ValueOf(args, "--arch") is string arch2 ? int.Parse(arch2, CultureInfo.InvariantCulture) % 10 : 6;
+            string ptx = emitter.Emit(entry.Bench, major, minor);
             string path = Path.Combine(dir, entry.Name + ".ptx");
             File.WriteAllText(path, ptx);
             File.WriteAllText(Path.Combine(dir, entry.Name + ".spec.txt"), entry.Bench.Describe());
@@ -403,6 +408,8 @@ internal static class KernelConveyorTool
             case "no-staging": emitter.EnableSharedStaging = false; break;
             case "no-vector": emitter.EnableVectorLoads = false; break;
             case "input-staging": emitter.EnableInputStaging = true; break;
+            case "implicit-gemm": emitter.ImplicitGemm = true; break;
+            case "implicit-gemm-32": emitter.ImplicitGemm = true; emitter.ImplicitGemmTile = 32; break;
 
             // A split winner is not a knob -- it is a different PROGRAM, two kernels and a
             // temporary, which this single-kernel path cannot launch. Saying so is the

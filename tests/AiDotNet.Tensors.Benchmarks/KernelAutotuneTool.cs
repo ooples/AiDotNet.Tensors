@@ -185,6 +185,11 @@ internal static class KernelAutotuneTool
         // it adds two barriers per strip-mine step, and staging the wrong operand cost
         // conv_transpose 104 -> 131.4 us.
         new("input-staging", e => e.EnableInputStaging = true),
+        // The tiled implicit GEMM, which gathers both operands through their maps: the lowering
+        // for strided, dilated and exact-division (data-gradient) windows the specialised tiles
+        // refuse. Two tile edges, since a 32-channel layer wastes half a 64 tile.
+        new("implicit-gemm", e => e.ImplicitGemm = true),
+        new("implicit-gemm-32", e => { e.ImplicitGemm = true; e.ImplicitGemmTile = 32; }),
     };
 
     internal static void Run(string[] args)

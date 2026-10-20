@@ -1051,6 +1051,9 @@ public sealed partial class PtxAffineEmitter
         if (EnableStreamingRows && CodegenRowFusion.TryPlanStreaming(spec) is { } stream)
             return EmitRowProgram(stream, spec.Name, computeMajor, computeMinor);
 
+        if (ImplicitGemm && PlanImplicitGemm(spec, out _) is { } gemm)
+            return EmitImplicitGemm(spec, computeMajor, computeMinor, gemm);
+
         // WARP PER OUTPUT. Everything below emits the lane-interleaved spec unchanged except
         // for three things the lowering forbids -- tiling, staging and a block that is not a
         // whole number of warps -- and the shuffle that closes the reduction.
