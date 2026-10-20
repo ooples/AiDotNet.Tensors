@@ -42,6 +42,7 @@ internal static class KernelElementwiseTool
         }
         if (mode == "--smoke") Smoke(backend, new HashSet<string>(args[1..], StringComparer.Ordinal));
         else if (mode == "--bench") Bench(backend, args[1..]);
+        else if (mode == "--exhaustive") Exhaustive(backend, new HashSet<string>(args[1..], StringComparer.Ordinal));
         else if (mode == "--allocations")
         {
             Console.WriteLine("route on:");
@@ -134,6 +135,108 @@ internal static class KernelElementwiseTool
             }
         foreach (string failure in failures) Console.WriteLine("  " + failure);
         if (failures.Count != 0) throw new InvalidOperationException(failures.Count + " elementwise failures.");
+    }
+
+    private const string DiagnosticPtx = @"
+.version 7.0
+.target sm_75
+.address_size 64
+.visible .entry aidn_iota_bits(.param .u64 out, .param .u32 n, .param .u32 base)
+{
+    .reg .pred %p<2>; .reg .b32 %r<8>; .reg .b64 %rd<4>;
+    ld.param.u64 %rd0, [out]; ld.param.u32 %r0, [n]; ld.param.u32 %r1, [base];
+    mov.u32 %r2, %ctaid.x; mov.u32 %r3, %tid.x; mad.lo.u32 %r4, %r2, 256, %r3;
+    setp.ge.u32 %p0, %r4, %r0; @%p0 bra DONE;
+    add.u32 %r5, %r1, %r4;
+    mul.wide.u32 %rd1, %r4, 4; add.s64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r5;
+DONE:
+    ret;
+}
+.visible .entry aidn_compare_bits(.param .u64 a, .param .u64 b, .param .u64 counter, .param .u32 n, .param .u32 base)
+{
+    .reg .pred %p<8>; .reg .b32 %r<12>; .reg .b64 %rd<8>;
+    ld.param.u64 %rd0, [a]; ld.param.u64 %rd1, [b]; ld.param.u64 %rd2, [counter];
+    ld.param.u32 %r0, [n]; ld.param.u32 %r1, [base];
+    mov.u32 %r2, %ctaid.x; mov.u32 %r3, %tid.x; mad.lo.u32 %r4, %r2, 256, %r3;
+    setp.ge.u32 %p0, %r4, %r0; @%p0 bra DONE;
+    mul.wide.u32 %rd3, %r4, 4;
+    add.s64 %rd4, %rd0, %rd3; add.s64 %rd5, %rd1, %rd3;
+    ld.global.u32 %r5, [%rd4]; ld.global.u32 %r6, [%rd5];
+    setp.eq.u32 %p1, %r5, %r6; @%p1 bra DONE;
+    and.b32 %r7, %r5, 0x7fffffff; and.b32 %r8, %r6, 0x7fffffff;
+    setp.gt.u32 %p2, %r7, 0x7f800000; setp.gt.u32 %p3, %r8, 0x7f800000;
+    and.pred %p4, %p2, %p3; @%p4 bra DONE;
+    atom.global.add.u32 %r9, [%rd2], 1;
+    add.u32 %r10, %r1, %r4;
+    atom.global.min.u32 %r11, [%rd2+4], %r10;
+DONE:
+    ret;
+}
+";
+
+    // Every one of the 2^32 inputs of each one-input kernel, declared vs hand-written, compared on the device in
+    // chunks of 2^24: a mismatch count and the first mismatching input per kernel.
+    private static unsafe void Exhaustive(CudaBackend backend, HashSet<string> only)
+    {
+        const int Chunk = 1 << 24;
+        bool control = only.Remove("--control");
+        var (module, iota) = backend.LoadDiagnosticKernel(DiagnosticPtx, "aidn_iota_bits");
+        var compare = module.GetFunction("aidn_compare_bits", out _);
+        using var input = backend.AllocateBuffer(Chunk);
+        using var declared = backend.AllocateBuffer(Chunk);
+        using var hand = backend.AllocateBuffer(Chunk);
+        int failures = 0, kernels = 0;
+        // Argument blocks reused by every launch: a stackalloc inside the chunk loop grew the stack until it overflowed.
+        void** gen = stackalloc void*[3];
+        void** cmp = stackalloc void*[5];
+        try
+        {
+            foreach (var function in backend.DerivableElementwise())
+            {
+                if (function.Inputs != 1 || (only.Count != 0 && !only.Contains(function.Kernel))) continue;
+                var scalars = new float[function.Scalars.Length];
+                for (int i = 0; i < scalars.Length; i++) scalars[i] = 0.25f + 0.5f * i;
+                using var counter = backend.AllocateBuffer(new[] { 0f, BitConverter.Int32BitsToSingle(-1) });
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                for (long first = 0; first < 1L << 32; first += Chunk)
+                {
+                    uint baseBits = (uint)first;
+                    int n = Chunk;
+                    IntPtr inPtr = input.Handle, aPtr = declared.Handle, bPtr = hand.Handle, cPtr = counter.Handle;
+                    uint gridN = (uint)(n / 256);
+                    gen[0] = &inPtr; gen[1] = &n; gen[2] = &baseBits;
+                    backend.LaunchDiagnostic(module, iota, gridN, 256, gen);
+                    if (!backend.TryDeclaredElementwise(function.Kernel, new[] { input }, declared, scalars, n))
+                        throw new InvalidOperationException(function.Kernel + " was not declared: " + backend.LastElementwiseDecline);
+                    // --control: the hand-written side runs a DIFFERENT kernel, so the comparison must find mismatches.
+                    backend.LaunchHandWrittenElementwise(control ? (function.Kernel == "sigmoid" ? "relu" : "sigmoid") : function.Kernel,
+                        new[] { input }, hand, control ? Array.Empty<float>() : scalars, n);
+                    cmp[0] = &aPtr; cmp[1] = &bPtr; cmp[2] = &cPtr; cmp[3] = &n; cmp[4] = &baseBits;
+                    backend.LaunchDiagnostic(module, compare, gridN, 256, cmp);
+                }
+                var words = backend.DownloadBuffer(counter);
+                uint mismatches = (uint)BitConverter.SingleToInt32Bits(words[0]);
+                uint firstBad = (uint)BitConverter.SingleToInt32Bits(words[1]);
+                kernels++;
+                if (mismatches != 0) failures++;
+                Console.WriteLine(function.Kernel.PadRight(30) + (mismatches == 0 ? "all 2^32 identical" :
+                    mismatches + " mismatches, first input 0x" + firstBad.ToString("X8", CultureInfo.InvariantCulture)) +
+                    "  (" + timer.Elapsed.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + " s)");
+            }
+        }
+        finally
+        {
+            module.Dispose();
+        }
+        Console.WriteLine(kernels + " one-input kernels, " + failures + " with mismatches");
+        if (control)
+        {
+            if (failures != kernels) throw new InvalidOperationException("The control did not detect a deliberate difference.");
+            Console.WriteLine("control: every deliberate difference detected");
+            return;
+        }
+        if (failures != 0) throw new InvalidOperationException(failures + " kernels differ on some input.");
     }
 
     // Declared vs hand-written wall clock: median of 21 samples of 20 calls, paired, per kernel and length.

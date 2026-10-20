@@ -389,6 +389,24 @@ public sealed partial class CudaBackend
         return true;
     }
 
+    /// <summary>Loads diagnostic PTX (verification tooling) into this backend's context.</summary>
+    internal (DirectPtxModule Module, IntPtr Function) LoadDiagnosticKernel(string ptx, string entry)
+    {
+        lock (_directPtxLock)
+        {
+            _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
+            var module = _directPtxRuntime.LoadModule(ptx, allowExperimentalJitFallback: true);
+            return (module, module.GetFunction(entry, out _));
+        }
+    }
+
+    /// <summary>Launches a diagnostic kernel on this backend's stream.</summary>
+    internal unsafe void LaunchDiagnostic(DirectPtxModule module, IntPtr function, uint grid, uint block, void** args)
+    {
+        using var _ = PushContext();
+        module.LaunchCurrentContext(function, grid, 1, 1, block, 1, 1, 0, args);
+    }
+
     private static string SafeName(string name)
     {
         var sb = new System.Text.StringBuilder(name.Length);
