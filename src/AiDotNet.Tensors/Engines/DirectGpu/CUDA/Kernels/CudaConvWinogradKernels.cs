@@ -493,6 +493,19 @@ __device__ __forceinline__ void wino_f32w_fused_body(
     #pragma unroll
     for (int quarter = 0; quarter < 4; quarter++)
     {
+        // SGD: this quarter's old weights, the 9 elements each thread updates in the copy loop below, loaded now so the
+        // loads overlap the gather and the transform rather than stalling each store in turn.
+        float oldWeights[9];
+        if constexpr (SGD)
+        {
+            #pragma unroll
+            for (int j = 0; j < 9; j++)
+            {
+                const int i = tid + j * 256, kl = i / 288, r = i - kl * 288;
+                const int k = k0 + quarter * 8 + kl;
+                oldWeights[j] = (k < K && r < cw * 9) ? __ldg(f.src + ((long long)k * C + c0) * 9 + r) : 0.0f;
+            }
+        }
         if ((tk >> 1) == quarter)
         {
             #pragma unroll
@@ -529,10 +542,11 @@ __device__ __forceinline__ void wino_f32w_fused_body(
             }
         }
         __syncthreads();
-        // Copy the 8 rows of cw * 9 contiguous floats out.
-        for (int i = tid; i < 8 * 288; i += 256)
+        // Copy the 8 rows of cw * 9 contiguous floats out (8 * 288 = 9 * 256: nine elements per thread).
+        #pragma unroll
+        for (int j = 0; j < 9; j++)
         {
-            const int kl = i / 288, r = i - kl * 288;
+            const int i = tid + j * 256, kl = i / 288, r = i - kl * 288;
             const int k = k0 + quarter * 8 + kl;
             if (k < K && r < cw * 9)
             {
@@ -542,7 +556,7 @@ __device__ __forceinline__ void wino_f32w_fused_body(
                 if constexpr (SGD)
                 {
                     sumSquares += (double)g * (double)g;
-                    f.dst[e] = pp_sgd_step(f.src[e], g, learningRate, f.weightDecay);
+                    f.dst[e] = pp_sgd_step(oldWeights[j], g, learningRate, f.weightDecay);
                 }
             }
         }
@@ -658,12 +672,13 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_winograd_finish
     double sumSquares = 0.0;
     if (i < KC * 9)
     {
+        const float oldWeight = __ldg(f.src + i);   // issued first: its latency overlaps the split loads
         const int kc = i / 9, q = i - kc * 9;
         float sum = 0.0f;
         for (int z = 0; z < splits; z++) sum += partials[((long long)z * 9 + q) * KC + kc];
         dw[i] = sum;
         sumSquares = (double)sum * (double)sum;
-        f.dst[i] = pp_sgd_step(f.src[i], sum, f.dyn[0], f.weightDecay);
+        f.dst[i] = pp_sgd_step(oldWeight, sum, f.dyn[0], f.weightDecay);
     }
     const double blockSum = pp_block_sum(sumSquares, warpSums);
     if (threadIdx.x == 0) f.partials[f.slot + blockIdx.x] = blockSum;

@@ -1360,22 +1360,19 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
     }
     __syncthreads();
     if (!isLast) return;
-    if (threadIdx.x < 32)
+    // The whole last block sums the partials: the fused updates leave thousands, which one warp read in a ~100-step
+    // serial loop on the update's tail.
+    double total = 0.0;
+    for (int k = threadIdx.x; k < (int)gridDim.x; k += blockDim.x) total += __ldcg(partials + k);
+    for (int k = threadIdx.x; k < fusedCount; k += blockDim.x) total += __ldcg(fusedPartials + k);   // the fused updates' sums
+    total = pp_block_sum(total, warpSums);
+    if (threadIdx.x == 0)
     {
-        double total = 0.0;
-        for (int k = threadIdx.x; k < (int)gridDim.x; k += 32) total += __ldcg(partials + k);
-        for (int k = threadIdx.x; k < fusedCount; k += 32) total += __ldcg(fusedPartials + k);   // the fused updates' sums
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1)
-            total += __shfl_down_sync(0xFFFFFFFF, total, o);
-        if (threadIdx.x == 0)
-        {
-            double g = *guard + total;   // onto the guard, which a learning-rate fault may already have poisoned
-            *guard = g;
-            *done = 0u;
-            // Exponent bits, not isfinite(): see clip_scale_from_sum_squares.
-            undo = (__double_as_longlong(g) & 0x7ff0000000000000LL) == 0x7ff0000000000000LL;
-        }
+        double g = *guard + total;   // onto the guard, which a learning-rate fault may already have poisoned
+        *guard = g;
+        *done = 0u;
+        // Exponent bits, not isfinite(): see clip_scale_from_sum_squares.
+        undo = (__double_as_longlong(g) & 0x7ff0000000000000LL) == 0x7ff0000000000000LL;
     }
     __syncthreads();
     if (!undo) return;

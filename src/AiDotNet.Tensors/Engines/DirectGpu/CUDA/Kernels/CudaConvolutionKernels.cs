@@ -1143,11 +1143,12 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce_s
     double sumSquares = 0.0;
     if (i < count)
     {
+        const float oldWeight = __ldg(f.src + i);   // issued first: its latency overlaps the split loads
         float sum = 0.0f;
         for (int z = 0; z < splits; z++) sum += partials[(long long)z * count + i];
         gradKernel[i] = sum;
         sumSquares = (double)sum * (double)sum;
-        f.dst[i] = pp_sgd_step(f.src[i], sum, f.dyn[0], f.weightDecay);
+        f.dst[i] = pp_sgd_step(oldWeight, sum, f.dyn[0], f.weightDecay);
     }
     const double blockSum = pp_block_sum(sumSquares, warpSums);
     if (threadIdx.x == 0) f.partials[f.slot + blockIdx.x] = blockSum;
